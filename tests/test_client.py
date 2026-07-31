@@ -194,6 +194,42 @@ def test_wait_for_guest_ignores_errors_while_booting(client: gc.Client) -> None:
     gc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
 
 
+# --- schedule -------------------------------------------------------------
+
+
+@respx.mock
+def test_schedule_never_run_is_null_not_year_one(client: gc.Client) -> None:
+    """The server projects Go's zero time to null.
+
+    `0001-01-01T00:00:00Z` parses as a real date, so a freshness check would
+    silently report the last backup as two millennia old and alert forever.
+    Pinned here so a regression in the platform's projector is caught by the
+    client that depends on it.
+    """
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(
+        httpx.Response(
+            200,
+            json={"enabled": False, "hour": 0, "minute": 0, "tz": "UTC", "last_run": None},
+        )
+    )
+    sched = gc.Computer(client._t, COMPUTER).schedule()
+    assert sched["last_run"] is None
+    # Empty string would mean "UTC" to the daemon but is rejected by every
+    # timezone library, so the surface must name the zone.
+    assert sched["tz"] == "UTC"
+
+
+@respx.mock
+def test_set_schedule_validates_before_sending(client: gc.Client) -> None:
+    route = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
+    c = gc.Computer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="hour"):
+        c.set_schedule(enabled=True, hour=24)
+    with pytest.raises(ValueError, match="minute"):
+        c.set_schedule(enabled=True, minute=60)
+    assert not route.called, "invalid input must not reach the API"
+
+
 # --- ephemeral ------------------------------------------------------------
 
 
