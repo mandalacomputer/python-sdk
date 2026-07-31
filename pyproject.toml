@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gorillacloud"
-version = "0.0.0"
+version = "0.1.0"
 description = "Python SDK for GorillaCloud — cloud desktops for AI agents"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["gorillacloud", "cloud-desktop", "ai-agents", "computer-use", "vm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -34,9 +34,10 @@ packages = ["src/gorillacloud"]
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+target-version = "py310"
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 strict = true
 files = ["src"]
 

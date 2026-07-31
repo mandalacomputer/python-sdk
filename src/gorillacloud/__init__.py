@@ -1,11 +1,89 @@
 """Python SDK for GorillaCloud — cloud desktops for AI agents.
 
-Nothing is implemented yet. This package binds only to the platform's curated
-``/api/v1`` surface, which does not exist as a stable contract yet; see the
-README for why the SDK deliberately does not reach past it to the hypervisor
-daemon's own routes.
+    from gorillacloud import Client
+
+    client = Client()                                   # GORILLACLOUD_API_KEY
+    with client.computers.ephemeral(template="base") as c:
+        c.wait_for_guest()
+        c.exec("xdg-open https://example.com")
+        png = c.screenshot()
+        c.click(640, 400)
+        c.type("hello")
+
+This binds only to the platform's curated ``/api/v1`` surface, never to the
+hypervisor daemon's own routes — see the README for why that boundary exists.
 """
 
-__version__ = "0.0.0"
+from __future__ import annotations
 
-__all__ = ["__version__"]
+import httpx
+
+from ._client import DEFAULT_BASE_URL, Transport
+from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, Computer
+from ._exceptions import (
+    APIError,
+    AuthenticationError,
+    GorillaCloudError,
+    NotFoundError,
+    PermissionDeniedError,
+    PlanLimitError,
+    TimeoutError,
+)
+from ._models import ExecResult, Snapshot, Template
+from ._resources import Computers, Snapshots, Templates
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "DEFAULT_BASE_URL",
+    "SCREEN_HEIGHT",
+    "SCREEN_WIDTH",
+    "APIError",
+    "AuthenticationError",
+    "Client",
+    "Computer",
+    "ExecResult",
+    "GorillaCloudError",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "PlanLimitError",
+    "Snapshot",
+    "Template",
+    "TimeoutError",
+    "__version__",
+]
+
+
+class Client:
+    """Entry point to the GorillaCloud API.
+
+    :param api_key: defaults to ``GORILLACLOUD_API_KEY``.
+    :param base_url: defaults to ``GORILLACLOUD_BASE_URL``, then the public API.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        base_url: str | None = None,
+        timeout: float = 60.0,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        self._t = Transport(api_key, base_url=base_url, timeout=timeout, client=http_client)
+        self.computers = Computers(self._t)
+        self.snapshots = Snapshots(self._t)
+        self.templates = Templates(self._t)
+
+    @property
+    def base_url(self) -> str:
+        return self._t.base_url
+
+    def close(self) -> None:
+        self._t.close()
+
+    # typing.Self is 3.11+; the floor here is 3.10, so name the class instead.
+    def __enter__(self) -> Client:  # noqa: PYI034
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
