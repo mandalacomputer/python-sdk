@@ -10,6 +10,15 @@
         c.click(640, 400)
         c.type("hello")
 
+``AsyncClient`` mirrors it method for method:
+
+    from gorillacloud import AsyncClient
+
+    async with AsyncClient() as client:
+        async with client.computers.ephemeral(template="base") as c:
+            await c.wait_for_guest()
+            png = await c.screenshot()
+
 This binds only to the platform's curated ``/api/v1`` surface, never to the
 hypervisor daemon's own routes — see the README for why that boundary exists.
 """
@@ -18,7 +27,9 @@ from __future__ import annotations
 
 import httpx
 
-from ._client import DEFAULT_BASE_URL, Transport
+from ._async_computer import AsyncComputer
+from ._async_resources import AsyncComputers, AsyncSnapshots, AsyncTemplates
+from ._client import DEFAULT_BASE_URL, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, Computer
 from ._exceptions import (
     APIError,
@@ -39,6 +50,8 @@ __all__ = [
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
     "APIError",
+    "AsyncClient",
+    "AsyncComputer",
     "AuthenticationError",
     "Client",
     "Computer",
@@ -87,3 +100,40 @@ class Client:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+class AsyncClient:
+    """Entry point to the GorillaCloud API, driven with ``await``.
+
+    Same arguments and behaviour as :class:`Client`; every method that performs
+    IO is a coroutine.
+
+    :param api_key: defaults to ``GORILLACLOUD_API_KEY``.
+    :param base_url: defaults to ``GORILLACLOUD_BASE_URL``, then the public API.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        base_url: str | None = None,
+        timeout: float = 60.0,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._t = AsyncTransport(api_key, base_url=base_url, timeout=timeout, client=http_client)
+        self.computers = AsyncComputers(self._t)
+        self.snapshots = AsyncSnapshots(self._t)
+        self.templates = AsyncTemplates(self._t)
+
+    @property
+    def base_url(self) -> str:
+        return self._t.base_url
+
+    async def aclose(self) -> None:
+        await self._t.aclose()
+
+    async def __aenter__(self) -> AsyncClient:  # noqa: PYI034
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()

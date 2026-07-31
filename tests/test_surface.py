@@ -59,6 +59,38 @@ def client() -> gc.Client:
     return gc.Client("gck_test", base_url=BASE)
 
 
+@pytest.fixture
+def async_client() -> gc.AsyncClient:
+    return gc.AsyncClient("gck_test", base_url=BASE)
+
+
+def api_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    get = request.method == "GET"
+    if path.endswith("/screenshot"):
+        return httpx.Response(200, content=b"png")
+    if path.endswith("/exec"):
+        return httpx.Response(
+            200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+        )
+    if path.endswith("/templates"):
+        return httpx.Response(200, json=[])
+    # Collections list on GET and return a single object on POST — getting this
+    # backwards is what made the first version of this test fail.
+    if path.endswith("/snapshots"):
+        return httpx.Response(200, json=[SNAPSHOT] if get else SNAPSHOT)
+    if path.endswith("/computers"):
+        return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
+    return httpx.Response(200, json=COMPUTER)
+
+
+def called_routes(calls: object) -> set[tuple[str, str]]:
+    return {
+        (call.request.method, pattern_for(call.request.url.path.replace("/api/v1", "", 1)))
+        for call in calls  # type: ignore[attr-defined]
+    }
+
+
 def exercise_everything(client: gc.Client) -> None:
     """Call every method the SDK exposes that performs a request."""
     client.templates.list()
@@ -93,34 +125,81 @@ def exercise_everything(client: gc.Client) -> None:
     c.delete()
 
 
+async def exercise_everything_async(client: gc.AsyncClient) -> None:
+    """The async mirror of exercise_everything."""
+    await client.templates.list()
+    await client.computers.list()
+    await client.computers.get("vm-1")
+    c = await client.computers.create(template="base")
+    await c.refresh()
+    await c.start()
+    await c.stop()
+    await c.restart()
+    await c.clone(name="copy")
+    await c.screenshot()
+    await c.screenshot(width=320)
+    await c.move(1, 2)
+    await c.click(1, 2)
+    await c.right_click(1, 2)
+    await c.middle_click(1, 2)
+    await c.double_click(1, 2)
+    await c.scroll(1, 2, direction="up")
+    await c.type("hi")
+    await c.key("ctrl", "c")
+    await c.exec("true")
+    await c.snapshot()
+    await c.snapshot(memory=True)
+    await c.snapshots()
+    await c.schedule()
+    await c.set_schedule(enabled=True, hour=4, tz="UTC")
+    await client.snapshots.list()
+    await client.snapshots.restore("snap-1")
+    await client.snapshots.clone("snap-1")
+    await client.snapshots.delete("snap-1")
+    await c.delete()
+
+
 @respx.mock
 def test_every_call_lands_on_an_allowlisted_route(client: gc.Client) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        get = request.method == "GET"
-        if path.endswith("/screenshot"):
-            return httpx.Response(200, content=b"png")
-        if path.endswith("/exec"):
-            return httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
-        if path.endswith("/templates"):
-            return httpx.Response(200, json=[])
-        # Collections list on GET and return a single object on POST — getting
-        # this backwards is what made the first version of this test fail.
-        if path.endswith("/snapshots"):
-            return httpx.Response(200, json=[SNAPSHOT] if get else SNAPSHOT)
-        if path.endswith("/computers"):
-            return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
-        return httpx.Response(200, json=COMPUTER)
-
-    route = respx.route(host="api.test").mock(side_effect=handler)
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
     exercise_everything(client)
 
-    called = {
-        (call.request.method, pattern_for(call.request.url.path.replace("/api/v1", "", 1)))
-        for call in route.calls
-    }
+    called = called_routes(route.calls)
     assert called, "no requests were made — the exercise is not exercising anything"
     assert called <= ALLOWED, f"SDK calls routes the server does not expose: {sorted(called - ALLOWED)}"
+
+
+@respx.mock
+async def test_async_every_call_lands_on_an_allowlisted_route(
+    async_client: gc.AsyncClient,
+) -> None:
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    await exercise_everything_async(async_client)
+
+    called = called_routes(route.calls)
+    assert called, "no requests were made — the exercise is not exercising anything"
+    assert called <= ALLOWED, f"SDK calls routes the server does not expose: {sorted(called - ALLOWED)}"
+
+
+@respx.mock
+async def test_both_clients_hit_exactly_the_same_routes(
+    client: gc.Client, async_client: gc.AsyncClient
+) -> None:
+    """Same routes, not merely each-inside-the-allowlist.
+
+    Either client silently dropping a call would still satisfy the allowlist
+    check above; only comparing them to each other catches that.
+    """
+    sync_route = respx.route(host="api.test").mock(side_effect=api_handler)
+    exercise_everything(client)
+    sync_called = called_routes(sync_route.calls)
+
+    respx.reset()
+    async_route = respx.route(host="api.test").mock(side_effect=api_handler)
+    await exercise_everything_async(async_client)
+    async_called = called_routes(async_route.calls)
+
+    assert sync_called == async_called
 
 
 def test_pattern_for_treats_ids_as_ids() -> None:

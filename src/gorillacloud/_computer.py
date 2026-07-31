@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from . import _api
 from ._client import Transport
 from ._exceptions import GorillaCloudError, TimeoutError
 from ._models import ExecResult, Snapshot
@@ -17,18 +18,14 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 800
 
 
-class Computer:
-    """A cloud desktop.
+class ComputerFields:
+    """Read-only accessors over a computer payload.
 
-    Obtain one from :class:`gorillacloud.Client` — ``client.computers.create()``,
-    ``.get()``, or ``.list()`` — rather than constructing it directly.
+    Shared by the sync and async handles — the field names are the API contract
+    and there is no reason for two copies of them.
     """
 
-    def __init__(self, transport: Transport, data: Mapping[str, Any]) -> None:
-        self._t = transport
-        self._data = dict(data)
-
-    # --- identity -------------------------------------------------------
+    _data: dict[str, Any]
 
     @property
     def id(self) -> str:
@@ -73,38 +70,49 @@ class Computer:
         return dict(self._data)
 
     def __repr__(self) -> str:
-        return f"<Computer {self.id} {self.name!r} {self.status}>"
+        return f"<{type(self).__name__} {self.id} {self.name!r} {self.status}>"
+
+
+class Computer(ComputerFields):
+    """A cloud desktop.
+
+    Obtain one from :class:`gorillacloud.Client` — ``client.computers.create()``,
+    ``.get()``, or ``.list()`` — rather than constructing it directly.
+    """
+
+    def __init__(self, transport: Transport, data: Mapping[str, Any]) -> None:
+        self._t = transport
+        self._data = dict(data)
 
     # --- lifecycle ------------------------------------------------------
 
     def refresh(self) -> Computer:
         """Re-read this computer's state from the API."""
-        self._data = dict(self._t.json("GET", f"computers/{self.id}") or {})
+        self._data = dict(self._t.json("GET", _api.computer(self.id)) or {})
         return self
 
     def start(self) -> Computer:
-        self._t.request("POST", f"computers/{self.id}/start")
+        self._t.request("POST", _api.computer_action(self.id, "start"))
         return self.refresh()
 
     def stop(self) -> Computer:
-        self._t.request("POST", f"computers/{self.id}/stop")
+        self._t.request("POST", _api.computer_action(self.id, "stop"))
         return self.refresh()
 
     def restart(self) -> Computer:
-        self._t.request("POST", f"computers/{self.id}/restart")
+        self._t.request("POST", _api.computer_action(self.id, "restart"))
         return self.refresh()
 
     def clone(self, name: str | None = None) -> Computer:
         """Copy this computer into a new one. The source must be stopped."""
-        body: dict[str, Any] = {}
-        if name is not None:
-            body["name"] = name
-        data = self._t.json("POST", f"computers/{self.id}/clone", json=body)
+        data = self._t.json(
+            "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
+        )
         return Computer(self._t, data or {})
 
     def delete(self) -> None:
         """Destroy this computer and its disk. Snapshots taken from it survive."""
-        self._t.request("DELETE", f"computers/{self.id}")
+        self._t.request("DELETE", _api.computer(self.id))
 
     # --- readiness ------------------------------------------------------
 
@@ -121,9 +129,7 @@ class Computer:
             if self.status == "running":
                 return self
             if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"{self.id} was still {self.status!r} after {timeout:g}s"
-                )
+                raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
             time.sleep(poll)
 
     def wait_for_guest(self, timeout: float = 180.0, poll: float = 3.0) -> Computer:
@@ -153,36 +159,37 @@ class Computer:
         JPEG instead — much cheaper, and enough for a thumbnail or a quick
         "has anything changed" check.
         """
-        params = {"w": width} if width else None
-        resp = self._t.request("GET", f"computers/{self.id}/screenshot", params=params)
+        resp = self._t.request(
+            "GET",
+            _api.computer_action(self.id, "screenshot"),
+            params=_api.screenshot_params(width),
+        )
         return resp.content
 
     # --- controlling ----------------------------------------------------
 
-    def _input(self, action: str, **kw: Any) -> None:
-        self._t.request("POST", f"computers/{self.id}/input", json={"action": action, **kw})
+    def _input(self, body: dict[str, Any]) -> None:
+        self._t.request("POST", _api.computer_action(self.id, "input"), json=body)
 
     def move(self, x: int, y: int) -> None:
         """Move the pointer to ``(x, y)`` in the guest's 1280x800 screen space."""
-        self._input("move", x=x, y=y)
+        self._input(_api.pointer_body("move", x, y))
 
     def click(self, x: int, y: int) -> None:
-        self._input("left_click", x=x, y=y)
+        self._input(_api.pointer_body("left_click", x, y))
 
     def right_click(self, x: int, y: int) -> None:
-        self._input("right_click", x=x, y=y)
+        self._input(_api.pointer_body("right_click", x, y))
 
     def middle_click(self, x: int, y: int) -> None:
-        self._input("middle_click", x=x, y=y)
+        self._input(_api.pointer_body("middle_click", x, y))
 
     def double_click(self, x: int, y: int) -> None:
-        self._input("double_click", x=x, y=y)
+        self._input(_api.pointer_body("double_click", x, y))
 
     def scroll(self, x: int = 0, y: int = 0, *, direction: str = "down", amount: int = 3) -> None:
         """Scroll the wheel, first moving to ``(x, y)`` when either is non-zero."""
-        if direction not in ("up", "down"):
-            raise ValueError('direction must be "up" or "down"')
-        self._input("scroll", x=x, y=y, button=direction, amount=amount)
+        self._input(_api.scroll_body(x, y, direction, amount))
 
     def type(self, text: str) -> None:
         """Type text as keystrokes.
@@ -190,13 +197,11 @@ class Computer:
         Characters with no key mapping are skipped rather than raising, so a
         stray emoji in a prompt cannot fail the whole call.
         """
-        self._input("type", text=text)
+        self._input(_api.type_body(text))
 
     def key(self, *keys: str) -> None:
         """Press a chord, e.g. ``key("ctrl", "c")`` or ``key("Return")``."""
-        if not keys:
-            raise ValueError("key() needs at least one key")
-        self._input("key", keys=list(keys))
+        self._input(_api.key_body(keys))
 
     def exec(self, command: str, timeout_s: int = 30) -> ExecResult:
         """Run a shell command inside the guest.
@@ -206,8 +211,8 @@ class Computer:
         """
         data = self._t.json(
             "POST",
-            f"computers/{self.id}/exec",
-            json={"command": command, "timeout_s": timeout_s},
+            _api.computer_action(self.id, "exec"),
+            json=_api.exec_body(command, timeout_s),
         )
         return ExecResult.from_api(data or {})
 
@@ -221,18 +226,20 @@ class Computer:
         of booting — the computer must be running for that.
         """
         data = self._t.json(
-            "POST", f"computers/{self.id}/snapshots", json={"memory": memory}
+            "POST",
+            _api.computer_action(self.id, "snapshots"),
+            json=_api.snapshot_body(memory),
         )
         return Snapshot.from_api(data or {})
 
     def snapshots(self) -> list[Snapshot]:
-        """This computer's snapshots, newest first as returned by the API."""
-        data = self._t.json("GET", "snapshots") or []
+        """This computer's snapshots, in the order the API returns them."""
+        data = self._t.json("GET", _api.SNAPSHOTS) or []
         return [Snapshot.from_api(s) for s in data if s.get("computer_id") == self.id]
 
     def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
-        return self._t.json("GET", f"computers/{self.id}/schedule") or {}
+        return self._t.json("GET", _api.computer_action(self.id, "schedule")) or {}
 
     def set_schedule(
         self,
@@ -243,6 +250,9 @@ class Computer:
         tz: str = "UTC",
     ) -> Mapping[str, Any]:
         """Set the automatic daily snapshot window, in the given IANA timezone."""
-        body = {"enabled": enabled, "hour": hour, "minute": minute, "tz": tz}
-        self._t.request("PUT", f"computers/{self.id}/schedule", json=body)
+        self._t.request(
+            "PUT",
+            _api.computer_action(self.id, "schedule"),
+            json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
+        )
         return self.schedule()

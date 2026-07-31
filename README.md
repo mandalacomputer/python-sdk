@@ -44,6 +44,38 @@ destroys its disk, so tying that to a `with` block is only safe when the block i
 unambiguously the machine's whole lifetime — which `ephemeral()` declares and
 `create()` does not.
 
+### Async
+
+`AsyncClient` mirrors `Client` method for method — same names, same arguments,
+same errors. Everything that performs IO is a coroutine.
+
+```python
+import asyncio
+from gorillacloud import AsyncClient
+
+async def main():
+    async with AsyncClient() as client:
+        async with client.computers.ephemeral(template="base") as c:
+            await c.wait_for_guest()
+            png = await c.screenshot()
+            await c.type("hello")
+
+asyncio.run(main())
+```
+
+Independent calls can overlap:
+
+```python
+templates, computers, snapshots = await asyncio.gather(
+    client.templates.list(), client.computers.list(), client.snapshots.list()
+)
+```
+
+One caveat worth knowing: the platform serialises QMP access **per computer**, so
+concurrent screenshots or input against the *same* machine queue server-side.
+Concurrency pays off across different computers, and for overlapping the waiting
+rather than the work.
+
 ### Driving the desktop
 
 Coordinates are in the guest's fixed 1280×800 space (`gorillacloud.SCREEN_WIDTH`
@@ -113,11 +145,29 @@ daemon's own routes.** That boundary is deliberate and load-bearing:
 
 Practically: if something the SDK needs isn't in `/api/v1`, the fix is to add it
 there, not to reach past it. `tests/test_surface.py` enforces this — it exercises
-every method that makes a request and asserts each one lands on an allowlisted
-route, so drift fails here rather than in a user's hands.
+every method that makes a request, for **both** clients, and asserts each call
+lands on an allowlisted route, so drift fails here rather than in a user's hands.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients.
+
+### Keeping sync and async honest
+
+Two implementations of one API drift. The defence is structural rather than
+diligent:
+
+- Paths, request bodies, and argument validation live in `_api.py`; both clients
+  call the same functions, so neither can invent its own URL or payload.
+- Field accessors live in one `ComputerFields` base shared by both handles.
+- Auth, URL building, and status→exception mapping live on one transport base.
+- `tests/test_parity.py` asserts the two expose the same method names with the
+  same signatures, that every async IO method is a coroutine, and that the field
+  accessors are literally the same objects.
+- `tests/test_surface.py` asserts both clients hit *exactly the same routes* —
+  not merely that each stays inside the allowlist, which a client that silently
+  skipped a call would also satisfy.
+
+What is left duplicated is the awaits, which is the irreducible part.
 
 ## Development
 
@@ -127,9 +177,6 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/ruff check .
 .venv/bin/mypy
 ```
-
-Not yet implemented: an async client. The transport is separated from the
-resource classes so it can be added without restating auth, URL, and error rules.
 
 ## License
 
