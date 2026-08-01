@@ -220,6 +220,20 @@ def test_schedule_never_run_is_null_not_year_one(client: gc.Client) -> None:
 
 
 @respx.mock
+def test_clear_schedule_is_a_delete_not_a_disable(client: gc.Client) -> None:
+    """Disabling keeps the time and the bookkeeping; clearing removes both."""
+    cleared = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC", "last_run": None}
+    route = respx.delete(f"{BASE}/computers/vm-1/schedule").mock(
+        httpx.Response(200, json=cleared)
+    )
+    put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
+
+    assert gc.Computer(client._t, COMPUTER).clear_schedule() == cleared
+    assert route.called
+    assert not put.called, "clearing must not go through the set path"
+
+
+@respx.mock
 def test_set_schedule_validates_before_sending(client: gc.Client) -> None:
     route = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
     c = gc.Computer(client._t, COMPUTER)

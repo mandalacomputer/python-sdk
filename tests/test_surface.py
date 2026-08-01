@@ -39,6 +39,7 @@ ALLOWED = {
     ("DELETE", "snapshots/:id"),
     ("GET", "computers/:id/schedule"),
     ("PUT", "computers/:id/schedule"),
+    ("DELETE", "computers/:id/schedule"),
 }
 
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
@@ -118,6 +119,7 @@ def exercise_everything(client: gc.Client) -> None:
     c.snapshots()
     c.schedule()
     c.set_schedule(enabled=True, hour=4, tz="UTC")
+    c.clear_schedule()
     client.snapshots.list()
     client.snapshots.restore("snap-1")
     client.snapshots.clone("snap-1")
@@ -152,6 +154,7 @@ async def exercise_everything_async(client: gc.AsyncClient) -> None:
     await c.snapshots()
     await c.schedule()
     await c.set_schedule(enabled=True, hour=4, tz="UTC")
+    await c.clear_schedule()
     await client.snapshots.list()
     await client.snapshots.restore("snap-1")
     await client.snapshots.clone("snap-1")

@@ -112,7 +112,18 @@ snap = c.snapshot(memory=True)          # + live RAM, resumes without booting
 client.snapshots.restore(snap.id)
 twin = client.snapshots.clone(snap.id)  # a fork, for memory snapshots
 c.set_schedule(enabled=True, hour=4, tz="America/Chicago")
+c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the time
+c.clear_schedule()                                           # removed entirely
 ```
+
+Disabling and clearing differ. `set_schedule(enabled=False)` is deliberately
+non-destructive — it keeps the chosen time so toggling back on restores it, and
+keeps the scheduler's bookkeeping with it. `clear_schedule()` returns the
+computer to never having had a schedule.
+
+`last_run` is `None` until an automatic snapshot has actually run. Note it
+reflects the *scheduler's* bookkeeping, not your snapshot history — for "when
+was my last backup", read `c.snapshots()`, which carries real capture times.
 
 ### Errors
 

@@ -256,3 +256,12 @@ class Computer(ComputerFields):
             json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
         )
         return self.schedule()
+
+    def clear_schedule(self) -> Mapping[str, Any]:
+        """Remove the schedule, as distinct from disabling it.
+
+        ``set_schedule(enabled=False)`` keeps the chosen time so toggling back on
+        restores it, and keeps the scheduler's bookkeeping with it. Clearing
+        returns the computer to never having had a schedule.
+        """
+        return self._t.json("DELETE", _api.computer_action(self.id, "schedule")) or {}
