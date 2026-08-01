@@ -37,8 +37,48 @@ class ComputerFields:
 
     @property
     def status(self) -> str:
-        """``"running"`` or ``"stopped"`` as of the last refresh."""
+        """State as of the last refresh.
+
+        ``"running"`` or ``"stopped"`` for an ordinary computer. A computer
+        made by cloning — from a snapshot or from another computer — starts as
+        ``"building"`` while its disk is copied, and becomes ``"build-failed"``
+        if that copy never finished. See :attr:`is_building`.
+        """
         return str(self._data.get("status", ""))
+
+    @property
+    def is_building(self) -> bool:
+        """True while this computer's disk is still being copied.
+
+        A clone returns before its disk exists, because copying one can run for
+        minutes. Until it lands there is nothing to boot, and starting,
+        stopping, snapshotting or cloning it raises
+        :class:`~gorillacloud.ConflictError`. Wait with
+        :meth:`Computer.wait_until_built`.
+        """
+        return self.status == "building"
+
+    @property
+    def build_failed(self) -> bool:
+        """True if this computer's disk copy never finished.
+
+        The computer exists and is listed, and is holding whatever the copy got
+        through, but it has no usable disk. Nothing will fix it on its own:
+        delete it and clone again. :attr:`build_error` says what went wrong.
+        """
+        return self.status == "build-failed"
+
+    @property
+    def build_error(self) -> str:
+        """Why the disk copy failed, or ``""`` if it did not.
+
+        Empty is also what an older server returns, which reported that a build
+        had failed without saying why.
+        """
+        build = self._data.get("build")
+        if isinstance(build, Mapping):
+            return str(build.get("failed") or "")
+        return ""
 
     @property
     def os(self) -> str:
@@ -104,7 +144,13 @@ class Computer(ComputerFields):
         return self.refresh()
 
     def clone(self, name: str | None = None) -> Computer:
-        """Copy this computer into a new one. The source must be stopped."""
+        """Copy this computer into a new one. The source must be stopped.
+
+        Returns as soon as the new computer exists, which is before its disk
+        does: copying a disk runs for minutes, so the clone comes back
+        ``"building"`` and fills in behind you. Follow with
+        :meth:`wait_until_built` before starting it.
+        """
         data = self._t.json(
             "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
         )
@@ -115,6 +161,34 @@ class Computer(ComputerFields):
         self._t.request("DELETE", _api.computer(self.id))
 
     # --- readiness ------------------------------------------------------
+
+    def wait_until_built(self, timeout: float = 900.0, poll: float = 5.0) -> Computer:
+        """Block until a cloned computer's disk has been copied.
+
+        Returns immediately for anything not being built, so it is safe to call
+        on any computer. Raises :class:`~gorillacloud.GorillaCloudError` if the
+        copy failed, and :class:`~gorillacloud.TimeoutError` if it is still
+        going when ``timeout`` runs out — the computer keeps building either
+        way; only the waiting stops.
+
+        The default timeout is generous because the work is: a compressed
+        conversion of a 40 GB Windows disk takes several minutes on a busy host.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.build_failed:
+                raise GorillaCloudError(
+                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+                )
+            if not self.is_building:
+                return self
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"{self.id} was still building after {timeout:g}s "
+                    "(it has not stopped; only this wait has)"
+                )
+            time.sleep(poll)
+            self.refresh()
 
     def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> Computer:
         """Block until the machine is running.
@@ -128,6 +202,12 @@ class Computer(ComputerFields):
             self.refresh()
             if self.status == "running":
                 return self
+            # A computer with no disk will never start on its own, and waiting
+            # out the full timeout to say so helps nobody.
+            if self.build_failed:
+                raise GorillaCloudError(
+                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+                )
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
             time.sleep(poll)

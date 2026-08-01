@@ -17,6 +17,7 @@ import httpx
 from ._exceptions import (
     APIError,
     AuthenticationError,
+    ConflictError,
     GorillaCloudError,
     NotFoundError,
     PermissionDeniedError,
@@ -30,6 +31,7 @@ _STATUS_ERRORS = {
     402: PlanLimitError,
     403: PermissionDeniedError,
     404: NotFoundError,
+    409: ConflictError,
 }
 
 

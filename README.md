@@ -100,9 +100,43 @@ A non-zero exit is returned, not raised — check `res.ok`.
 
 `create()` returns as soon as the API does; the machine is starting, not ready.
 
+- `wait_until_built()` — a cloned computer's disk has been copied. Only clones
+  need this; it returns at once for anything else.
 - `wait_until_running()` — the VM is up. The guest OS is still booting.
 - `wait_for_guest()` — something inside the guest answers. Linux only; it uses
   the guest agent, which Windows images do not ship yet.
+
+### Computers that are still being built
+
+`create()` is instant, because a new computer's disk is an overlay on the golden
+image — nothing is copied. A **clone** is not: cloning a computer copies its
+whole disk, and cloning a snapshot copies it out of backup storage, collapsing a
+whole incremental chain on the way. That runs for minutes.
+
+So both clone calls return before the disk exists, with the computer in
+`building`. It is listed and has an id you can navigate to, but there is nothing
+to boot yet — starting, stopping, snapshotting or cloning it raises
+`ConflictError` until the copy lands.
+
+```python
+c = client.snapshots.clone(snap.id)
+c.is_building          # True
+c.wait_until_built()   # minutes, for a large disk
+c.start().wait_for_guest()
+```
+
+If the copy fails the computer stays, so you can see it and reclaim the space it
+took. It never becomes usable — delete it and clone again.
+
+```python
+if c.build_failed:
+    print(c.build_error)   # e.g. "no space left on device"
+    c.delete()
+```
+
+`wait_until_built()` raises rather than waiting out the timeout if the build
+failed, and its `TimeoutError` means only that the wait stopped — the copy is
+still going.
 
 ### Snapshots
 
@@ -111,6 +145,7 @@ snap = c.snapshot()                     # disk, works while running
 snap = c.snapshot(memory=True)          # + live RAM, resumes without booting
 client.snapshots.restore(snap.id)
 twin = client.snapshots.clone(snap.id)  # a fork, for memory snapshots
+twin.wait_until_built()                 # the disk is copied out of backup first
 c.set_schedule(enabled=True, hour=4, tz="America/Chicago")
 c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the time
 c.clear_schedule()                                           # removed entirely
@@ -144,10 +179,24 @@ Everything derives from `GorillaCloudError`.
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
+| `ConflictError` | 409 — right request, wrong moment; retry |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up |
 
 `PlanLimitError`'s message names the limit that was hit.
+
+`ConflictError` is the one worth catching separately, because it is the only one
+that clears itself: something is in flight that the operation cannot run
+alongside — a disk still being copied, a snapshot being taken, a delete already
+under way. Waiting and retrying is the fix; changing the request is not.
+
+```python
+try:
+    c.snapshot()
+except gorillacloud.ConflictError:
+    c.wait_until_built()   # or just try again shortly
+    c.snapshot()
+```
 
 ## Design notes
 

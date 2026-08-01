@@ -5,7 +5,7 @@ there, but a client that calls a route the server does not expose fails at
 runtime in a user's hands rather than here. This asserts every request the SDK
 can issue lands on an allowlisted route.
 
-Keep ALLOWED in step with `web/lib/v1.ts` in the platform repo.
+Keep ALLOWED in step with V1_ROUTES in `web/lib/surface.ts` in the platform repo.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import gorillacloud as gc
 
 BASE = "https://api.test/api/v1"
 
-# (method, pattern) with ids replaced by ":id" — mirrors lib/v1.ts ROUTES.
+# (method, pattern) with ids replaced by ":id" — mirrors surface.ts V1_ROUTES.
 ALLOWED = {
     ("GET", "templates"),
     ("GET", "computers"),

@@ -82,6 +82,13 @@ class AsyncSnapshots:
         Cloning a memory snapshot forks it: the new machine resumes from the
         captured RAM rather than booting, so it starts as a live twin of the
         original — same hostname and network identity until it is re-identified.
+
+        Returns as soon as the computer exists, which is before its disk does.
+        A snapshot has to be copied out — and a snapshot taken incrementally is
+        collapsed out of its whole chain — which runs for minutes, so the
+        computer comes back ``"building"``. Until that lands there is nothing to
+        boot and starting it raises :class:`~gorillacloud.ConflictError`; wait
+        with :meth:`AsyncComputer.wait_until_built`.
         """
         data = await self._t.json(
             "POST", _api.snapshot_action(snapshot_id, "clone"), json=_api.name_body(name)

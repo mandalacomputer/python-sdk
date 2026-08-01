@@ -34,6 +34,7 @@ from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, Computer
 from ._exceptions import (
     APIError,
     AuthenticationError,
+    ConflictError,
     GorillaCloudError,
     NotFoundError,
     PermissionDeniedError,
@@ -55,6 +56,7 @@ __all__ = [
     "AuthenticationError",
     "Client",
     "Computer",
+    "ConflictError",
     "ExecResult",
     "GorillaCloudError",
     "NotFoundError",
