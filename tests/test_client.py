@@ -198,31 +198,50 @@ def test_wait_for_guest_ignores_errors_while_booting(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_schedule_never_run_is_null_not_year_one(client: gc.Client) -> None:
-    """The server projects Go's zero time to null.
+def test_schedule_is_the_window_only(client: gc.Client) -> None:
+    """The schedule carries no last_run, by design.
 
-    `0001-01-01T00:00:00Z` parses as a real date, so a freshness check would
-    silently report the last backup as two millennia old and alert forever.
-    Pinned here so a regression in the platform's projector is caught by the
-    client that depends on it.
+    It was the scheduler's own bookkeeping and lied in both directions — as a
+    zero time it reported the last backup two millennia ago, and as a creation
+    stamp it reported one that never happened. Snapshot capture times are the
+    honest source; pinned here so it cannot quietly come back.
     """
     respx.get(f"{BASE}/computers/vm-1/schedule").mock(
-        httpx.Response(
-            200,
-            json={"enabled": False, "hour": 0, "minute": 0, "tz": "UTC", "last_run": None},
-        )
+        httpx.Response(200, json={"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"})
     )
     sched = gc.Computer(client._t, COMPUTER).schedule()
-    assert sched["last_run"] is None
+    assert "last_run" not in sched
     # Empty string would mean "UTC" to the daemon but is rejected by every
     # timezone library, so the surface must name the zone.
     assert sched["tz"] == "UTC"
 
 
 @respx.mock
+def test_scheduled_snapshots_are_distinguishable(client: gc.Client) -> None:
+    """`auto` is what makes snapshot times usable as backup history.
+
+    It also marks the only snapshots retention will ever age out.
+    """
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(
+            200,
+            json=[
+                {"id": "s1", "computer_id": "vm-1", "created_at": "2026-07-31T04:00:00Z", "auto": True},
+                {"id": "s2", "computer_id": "vm-1", "created_at": "2026-07-30T12:00:00Z", "auto": False},
+            ],
+        )
+    )
+    snaps = client.snapshots.list()
+    assert [s.auto for s in snaps] == [True, False]
+    assert [s.is_scheduled for s in snaps] == [True, False]
+    last_backup = max((s.created_at for s in snaps if s.auto), default=None)
+    assert last_backup == "2026-07-31T04:00:00Z"
+
+
+@respx.mock
 def test_clear_schedule_is_a_delete_not_a_disable(client: gc.Client) -> None:
     """Disabling keeps the time and the bookkeeping; clearing removes both."""
-    cleared = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC", "last_run": None}
+    cleared = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"}
     route = respx.delete(f"{BASE}/computers/vm-1/schedule").mock(
         httpx.Response(200, json=cleared)
     )

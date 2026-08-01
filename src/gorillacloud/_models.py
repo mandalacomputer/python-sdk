@@ -46,6 +46,7 @@ class Snapshot:
     size_bytes: int
     created_at: str
     incremental: bool
+    auto: bool
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -58,6 +59,15 @@ class Snapshot:
         """True once the snapshot has been replicated to backup storage."""
         return self.state == "durable"
 
+    @property
+    def is_scheduled(self) -> bool:
+        """True if the scheduler took this, rather than a person.
+
+        Also what makes it eligible for retention: snapshots you take yourself
+        are never aged out automatically.
+        """
+        return self.auto
+
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Snapshot:
         return cls(
@@ -69,6 +79,7 @@ class Snapshot:
             size_bytes=int(d.get("size_bytes", 0)),
             created_at=d.get("created_at", ""),
             incremental=bool(d.get("incremental", False)),
+            auto=bool(d.get("auto", False)),
             raw=dict(d),
         )
 

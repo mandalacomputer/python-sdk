@@ -117,13 +117,22 @@ c.clear_schedule()                                           # removed entirely
 ```
 
 Disabling and clearing differ. `set_schedule(enabled=False)` is deliberately
-non-destructive — it keeps the chosen time so toggling back on restores it, and
-keeps the scheduler's bookkeeping with it. `clear_schedule()` returns the
-computer to never having had a schedule.
+non-destructive — it keeps the chosen time so toggling back on restores it.
+`clear_schedule()` returns the computer to never having had a schedule.
 
-`last_run` is `None` until an automatic snapshot has actually run. Note it
-reflects the *scheduler's* bookkeeping, not your snapshot history — for "when
-was my last backup", read `c.snapshots()`, which carries real capture times.
+The schedule describes the *window* and nothing else — there is no `last_run`.
+For "when did my backups last run", read the snapshots, which carry real capture
+times; `auto` marks the ones the scheduler took:
+
+```python
+backups = [s for s in c.snapshots() if s.auto]      # or s.is_scheduled
+last = max((s.created_at for s in backups), default=None)
+if last is None:
+    print("no automatic backup has ever run")
+```
+
+`auto` also marks the only snapshots retention will age out — ones you take
+yourself are never removed automatically.
 
 ### Errors
 
