@@ -167,3 +167,23 @@ async def test_supplied_http_client_is_not_closed() -> None:
         await client.computers.list()
     assert not http.is_closed
     await http.aclose()
+
+
+@respx.mock
+async def test_rename_updates_the_handle_in_place() -> None:
+    """The async mirror of the sync rename test."""
+    client = gc.AsyncClient("gck_test", base_url=BASE)
+    route = respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "name": "build box"})
+    )
+    c = gc.AsyncComputer(client._t, COMPUTER)
+    assert await c.rename("build box") is c
+    assert c.name == "build box"
+    assert json.loads(route.calls[0].request.content) == {"name": "build box"}
+
+
+async def test_rename_refuses_an_empty_name_without_asking() -> None:
+    client = gc.AsyncClient("gck_test", base_url=BASE)
+    c = gc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="must not be empty"):
+        await c.rename("   ")

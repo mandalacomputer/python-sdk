@@ -76,6 +76,26 @@ concurrent screenshots or input against the *same* machine queue server-side.
 Concurrency pays off across different computers, and for overlapping the waiting
 rather than the work.
 
+### Renaming
+
+```python
+c.rename("build box")
+c.name                  # "build box" — the handle is updated in place
+```
+
+The name is a label; nothing is derived from it, and it need not be unique. The
+id is what identifies a computer, so renaming moves nothing and invalidates no
+handle, id or snapshot anyone is holding.
+
+The server trims surrounding whitespace and control characters and caps the
+result at 64 characters, so read `c.name` back rather than assuming it kept what
+you sent. An empty name raises `ValueError` before the request goes out.
+
+Snapshots already taken keep the name they were captured under. While the
+computer exists they are listed under its current name; once it is deleted they
+fall back to what it was called at the time, which is then the only thing left
+identifying where those bytes came from.
+
 ### Driving the desktop
 
 Coordinates are in the guest's fixed 1280×800 space (`gorillacloud.SCREEN_WIDTH`

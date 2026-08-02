@@ -194,6 +194,44 @@ def test_wait_for_guest_ignores_errors_while_booting(client: gc.Client) -> None:
     gc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
 
 
+# --- rename ---------------------------------------------------------------
+
+
+@respx.mock
+def test_rename_updates_the_handle_in_place(client: gc.Client) -> None:
+    """The handle a caller is already holding is the one that must be right.
+
+    Renaming through a stale handle and then reading .name off it is the
+    obvious next line of anyone's script.
+    """
+    route = respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "name": "build box"})
+    )
+    c = gc.Computer(client._t, COMPUTER)
+    assert c.rename("build box") is c
+    assert c.name == "build box"
+    assert json.loads(route.calls[0].request.content) == {"name": "build box"}
+
+
+@respx.mock
+def test_rename_reports_the_name_the_server_settled_on(client: gc.Client) -> None:
+    """The server trims and caps, so the stored name may not be the one sent."""
+    respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "name": "two lines tabbed"})
+    )
+    c = gc.Computer(client._t, COMPUTER)
+    assert c.rename("  two\nlines\ttabbed  ").name == "two lines tabbed"
+
+
+def test_rename_refuses_an_empty_name_without_asking(client: gc.Client) -> None:
+    """The server refuses it too; there is no reason to spend a round trip."""
+    c = gc.Computer(client._t, COMPUTER)
+    for name in ("", "   ", "\t\n"):
+        with pytest.raises(ValueError, match="must not be empty"):
+            c.rename(name)
+    assert c.name == "dev", "a refused rename must not touch the handle"
+
+
 # --- schedule -------------------------------------------------------------
 
 

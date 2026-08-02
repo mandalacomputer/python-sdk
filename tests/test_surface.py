@@ -24,6 +24,7 @@ ALLOWED = {
     ("GET", "computers"),
     ("POST", "computers"),
     ("GET", "computers/:id"),
+    ("PATCH", "computers/:id"),
     ("DELETE", "computers/:id"),
     ("POST", "computers/:id/start"),
     ("POST", "computers/:id/stop"),
@@ -103,6 +104,7 @@ def exercise_everything(client: gc.Client) -> None:
     c.stop()
     c.restart()
     c.clone(name="copy")
+    c.rename("renamed")
     c.screenshot()
     c.screenshot(width=320)
     c.move(1, 2)
@@ -138,6 +140,7 @@ async def exercise_everything_async(client: gc.AsyncClient) -> None:
     await c.stop()
     await c.restart()
     await c.clone(name="copy")
+    await c.rename("renamed")
     await c.screenshot()
     await c.screenshot(width=320)
     await c.move(1, 2)

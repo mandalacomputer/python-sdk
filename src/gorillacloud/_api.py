@@ -69,6 +69,19 @@ def name_body(name: str | None) -> dict[str, Any]:
     return {} if name is None else {"name": name}
 
 
+def rename_body(name: str) -> dict[str, Any]:
+    """The rename payload.
+
+    Empty is refused here rather than at the server, which refuses it too. On
+    create an omitted name means "you pick one"; on rename it can only mean a
+    caller cleared the field, and a round trip to be told so is a round trip
+    that never had to happen.
+    """
+    if not name.strip():
+        raise ValueError("name must not be empty")
+    return {"name": name}
+
+
 def exec_body(command: str, timeout_s: int) -> dict[str, Any]:
     return {"command": command, "timeout_s": timeout_s}
 

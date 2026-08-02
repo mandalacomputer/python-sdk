@@ -64,6 +64,27 @@ class AsyncComputer(ComputerFields):
         )
         return AsyncComputer(self._t, data or {})
 
+    async def rename(self, name: str) -> AsyncComputer:
+        """Give this computer a new name, and return it renamed.
+
+        The name is a label. Nothing is derived from it — the id is what
+        identifies a computer everywhere — so this moves no bytes and breaks no
+        reference anything else is holding. Names need not be unique.
+
+        The server trims surrounding whitespace and control characters and caps
+        the result at 64 characters, so :attr:`name` afterwards may not be
+        exactly what was passed in. Read it back rather than assuming.
+
+        Snapshots already taken keep the name they were captured under. While
+        this computer exists they are listed under its current name; once it is
+        deleted they fall back to what it was called at the time, which is then
+        all that is left of it.
+        """
+        self._data = dict(
+            await self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name)) or {}
+        )
+        return self
+
     async def delete(self) -> None:
         """Destroy this computer and its disk. Snapshots taken from it survive."""
         await self._t.request("DELETE", _api.computer(self.id))
