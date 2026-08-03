@@ -6,7 +6,7 @@
     with client.computers.ephemeral(template="base") as c:
         c.wait_for_guest()
         # desktop=True puts it on the screen; without it exec() runs as root
-        c.exec("nohup xdg-open https://example.com >/dev/null 2>&1 &", desktop=True)
+        c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
         png = c.screenshot()
         c.click(640, 400)
         c.type("hello")

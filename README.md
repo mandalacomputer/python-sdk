@@ -23,7 +23,7 @@ client = Client()
 
 with client.computers.ephemeral(template="base") as c:
     c.wait_for_guest()                      # desktop is up and answering
-    c.exec("nohup xdg-open https://example.com >/dev/null 2>&1 &", desktop=True)
+    c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
     c.click(640, 400)
     c.type("hello")
     png = c.screenshot()
@@ -142,9 +142,12 @@ so a foreground launch blocks until `timeout_s` kills it and comes back as a
 failure — having opened the window anyway, which is a confusing pair of outcomes.
 Detach it and the call returns in well under a second.
 
-`xdg-open` is on the `base` template, as are `exo-open` and `x-www-browser`, if
-you would rather ask for the default handler than name a browser; Firefox is what
-they resolve to, and there is no Chromium. There is no `xdotool` or `wmctrl`,
+**Name the browser.** `xdg-open` is on the `base` template, as are `exo-open`,
+`sensible-browser` and `x-www-browser` — and none of them work. Every one exits
+0 and launches nothing, because the image's default-browser association points
+at a desktop entry it does not ship. Exit 0 and an unchanged screen is a bad
+failure to debug, so ask for `firefox` by name until the image is fixed. Firefox
+is the only browser there; there is no Chromium. There is no `xdotool` or `wmctrl`,
 which you should not need — `click()`, `type()` and `key()` are that, and they
 work without anything installed in the guest.
 
