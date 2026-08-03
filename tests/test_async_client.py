@@ -207,3 +207,19 @@ async def test_rename_refuses_an_empty_name_without_asking() -> None:
     c = gc.AsyncComputer(client._t, COMPUTER)
     with pytest.raises(ValueError, match="must not be empty"):
         await c.rename("   ")
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_open_sends_the_same_command_as_the_sync_client(
+    client: gc.AsyncClient,
+) -> None:
+    """Both build it in _api, so the only way they diverge is one of them
+    stopping calling it — which a shape-only parity test would not catch."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    await gc.AsyncComputer(client._t, COMPUTER).open("https://example.com")
+    body = json.loads(route.calls.last.request.content)
+    assert body["command"] == gc._api.open_url_command("https://example.com")
+    assert body["session"] == "desktop"

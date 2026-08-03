@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 
 import httpx
 import pytest
@@ -349,3 +350,65 @@ def test_create_does_not_delete(client: gc.Client) -> None:
     delete = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200))
     client.computers.create(template="base")
     assert not delete.called
+
+
+# --- open() ---------------------------------------------------------------
+
+
+@respx.mock
+def test_open_runs_in_the_desktop_session(client: gc.Client) -> None:
+    """A browser with no DISPLAY is the bug open() exists to stop anyone hitting."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    gc.Computer(client._t, COMPUTER).open("https://example.com")
+    body = json.loads(route.calls.last.request.content)
+    assert body["session"] == "desktop"
+
+
+@respx.mock
+def test_open_detaches_the_launch(client: gc.Client) -> None:
+    """A foreground browser blocks until the timeout kills it, then reports a
+    failure it did not have — having opened the window anyway."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    gc.Computer(client._t, COMPUTER).open("https://example.com")
+    command = json.loads(route.calls.last.request.content)["command"]
+    assert command.endswith("&")
+    assert "nohup" in command
+
+
+@respx.mock
+def test_open_does_not_ask_for_the_default_handler(client: gc.Client) -> None:
+    """xdg-open and friends are installed and all exit 0 without launching
+    anything, so naming the browser is the whole point of this method."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    gc.Computer(client._t, COMPUTER).open("https://example.com")
+    command = json.loads(route.calls.last.request.content)["command"]
+    for handler in ("xdg-open", "exo-open", "sensible-browser", "x-www-browser"):
+        assert handler not in command
+
+
+def test_open_url_reaches_the_shell_as_one_argument() -> None:
+    """The URL is interpolated into a shell command, so a URL that is also shell
+    syntax must not become shell syntax. Parsed the way the shell would parse
+    it, the whole URL has to come back as a single word — a substring check
+    would pass on quoting that does not actually hold."""
+    url = "https://x/?a=b; touch /tmp/pwned"
+    assert url in shlex.split(gc._api.open_url_command(url))
+
+
+def test_open_refuses_a_url_a_browser_would_read_as_a_flag() -> None:
+    """Quoting stops the shell seeing it; nothing stops the browser seeing it.
+    No URL starts with a dash, so this is refused rather than escaped."""
+    with pytest.raises(ValueError, match="must not start with"):
+        gc._api.open_url_command("--profile=/tmp/evil")
+
+
+def test_open_refuses_an_empty_url() -> None:
+    for blank in ("", "   "):
+        with pytest.raises(ValueError, match="must not be empty"):
+            gc._api.open_url_command(blank)

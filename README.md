@@ -23,15 +23,15 @@ client = Client()
 
 with client.computers.ephemeral(template="base") as c:
     c.wait_for_guest()                      # desktop is up and answering
-    c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+    c.open("https://example.com")           # on the screen, not as root
     c.click(640, 400)
     c.type("hello")
     png = c.screenshot()
 # computer is destroyed here, even if the block raised
 ```
 
-`desktop=True` is what puts that command on the screen; without it `exec()` runs
-as `root` with no display. See [Launching GUI
+`open()` puts a URL on the screen; `exec()` without `desktop=True` runs as `root`
+with no display, where nothing with a window can start. See [Launching GUI
 applications](#launching-gui-applications).
 
 For a computer that outlives the block, use `create()` — it never deletes:
@@ -142,16 +142,40 @@ so a foreground launch blocks until `timeout_s` kills it and comes back as a
 failure — having opened the window anyway, which is a confusing pair of outcomes.
 Detach it and the call returns in well under a second.
 
-**Name the browser.** `xdg-open` is on the `base` template, as are `exo-open`,
-`sensible-browser` and `x-www-browser` — and none of them work. Every one exits
-0 and launches nothing, because the image's default-browser association points
-at a desktop entry it does not ship. Exit 0 and an unchanged screen is a bad
-failure to debug, so ask for `firefox` by name until the image is fixed. Firefox
-is the only browser there; there is no Chromium. There is no `xdotool` or `wmctrl`,
-which you should not need — `click()`, `type()` and `key()` are that, and they
-work without anything installed in the guest.
+### `open()`
 
-**Windows does not support this yet.** `exec()` there runs as `NT AUTHORITY\SYSTEM`
+Opening a URL is common enough, and has enough ways to get it subtly wrong, that
+it has its own method:
+
+```python
+c.open("https://example.com")
+```
+
+That is `exec(desktop=True)` with the session, the detaching and the browser
+already decided. The result describes the launch, not the page — a zero exit
+means the shell started the browser, not that the URL resolved. Screenshot it to
+see what loaded.
+
+**Why it names a browser.** `xdg-open` is the portable way to want this and is
+installed on the `base` template, along with `exo-open`, `sensible-browser` and
+`x-www-browser` — and none of them work. Every one exits 0 and launches nothing,
+because the image's default-browser association points at a desktop entry it does
+not ship. Exit 0 and an unchanged screen is the worst shape a failure can take,
+so `open()` asks for Firefox, which is the only browser on the image anyway;
+there is no Chromium. When the platform fixes the association, `open()` changes
+in one place and your code does not change at all — which is most of the reason
+to call it rather than write the `exec()` yourself.
+
+The URL is shell-quoted, so one containing `&` or `;` stays a URL. One starting
+with `-` is refused rather than escaped: quoting stops the *shell* reading it as
+a flag, nothing stops the *browser* doing so, and no real URL starts with a dash.
+
+There is no `xdotool` or `wmctrl` on the image, which you should not need —
+`click()`, `type()` and `key()` are that, and they work without anything
+installed in the guest.
+
+**Windows does not support this yet**, and neither does `open()`, which is a
+`desktop=True` exec underneath. `exec()` there runs as `NT AUTHORITY\SYSTEM`
 in session 0 while the desktop is session 1, and session 0 isolation means a GUI
 process started that way never reaches the screen. `desktop=True` does not paper
 over it — the API rejects it with a clear message rather than running the command

@@ -331,6 +331,8 @@ class Computer(ComputerFields):
         blocks until ``timeout_s`` kills it::
 
             c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+
+        Or call :meth:`open` and let the SDK write that line.
         """
         data = self._t.json(
             "POST",
@@ -338,6 +340,25 @@ class Computer(ComputerFields):
             json=_api.exec_body(command, timeout_s, desktop),
         )
         return ExecResult.from_api(data or {})
+
+    def open(self, url: str, *, timeout_s: int = 30) -> ExecResult:
+        """Open a URL in the guest's browser, on the screen::
+
+            c.open("https://example.com")
+
+        Sugar over :meth:`exec` with ``desktop=True``: it names a browser that
+        works on the image, quotes the URL, and detaches the launch so the call
+        returns in well under a second instead of blocking until ``timeout_s``.
+
+        The result describes the *launch*, not the page — a zero exit means the
+        shell started the browser, not that the URL resolved. Take a
+        :meth:`screenshot` to see what actually loaded.
+
+        Raises ``ValueError`` for an empty URL or one starting with ``-``, which
+        a browser would read as a flag rather than an address. On Windows the
+        API rejects it, the same as any ``desktop=True`` exec.
+        """
+        return self.exec(_api.open_url_command(url), timeout_s, desktop=True)
 
     # --- snapshots ------------------------------------------------------
 

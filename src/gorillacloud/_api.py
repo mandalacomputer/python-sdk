@@ -8,6 +8,7 @@ platform's allowlist would only be checking one of them.
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 # --- paths ----------------------------------------------------------------
@@ -93,6 +94,36 @@ def exec_body(command: str, timeout_s: int, desktop: bool = False) -> dict[str, 
     if desktop:
         body["session"] = "desktop"
     return body
+
+
+def open_url_command(url: str) -> str:
+    """Build the shell command that puts ``url`` on the guest's screen.
+
+    The browser is named rather than asked for. ``xdg-open`` is the portable way
+    to want this and is installed on the base template, along with ``exo-open``,
+    ``sensible-browser`` and ``x-www-browser`` — and every one of them exits 0
+    and launches nothing, because the image's default-browser association points
+    at a desktop entry it does not ship. Exit 0 and an unchanged screen is the
+    worst shape a failure can take, so this asks for Firefox, which is the only
+    browser on the image anyway.
+
+    This function is the one place that decision lives. When the platform fixes
+    the association (OPL-3376), this is the line that changes, rather than every
+    caller's prompt.
+
+    Detached, because a browser does not exit on its own: in the foreground the
+    call would block until the timeout killed it and come back as a failure,
+    having opened the window anyway.
+    """
+    url = url.strip()
+    if not url:
+        raise ValueError("url must not be empty")
+    # shlex.quote stops the URL reaching the shell as anything but one argument.
+    # It cannot stop the *browser* reading a leading dash as a flag, and no URL
+    # starts with one, so that is refused outright rather than quoted.
+    if url.startswith("-"):
+        raise ValueError(f"url must not start with '-': {url!r}")
+    return f"nohup firefox {shlex.quote(url)} >/dev/null 2>&1 &"
 
 
 def snapshot_body(memory: bool) -> dict[str, Any]:

@@ -5,8 +5,7 @@
     client = Client()                                   # GORILLACLOUD_API_KEY
     with client.computers.ephemeral(template="base") as c:
         c.wait_for_guest()
-        # desktop=True puts it on the screen; without it exec() runs as root
-        c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+        c.open("https://example.com")           # on the screen, not as root
         png = c.screenshot()
         c.click(640, 400)
         c.type("hello")
