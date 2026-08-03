@@ -23,12 +23,16 @@ client = Client()
 
 with client.computers.ephemeral(template="base") as c:
     c.wait_for_guest()                      # desktop is up and answering
-    c.exec("xdg-open https://example.com")
+    c.exec("nohup xdg-open https://example.com >/dev/null 2>&1 &", desktop=True)
     c.click(640, 400)
     c.type("hello")
     png = c.screenshot()
 # computer is destroyed here, even if the block raised
 ```
+
+`desktop=True` is what puts that command on the screen; without it `exec()` runs
+as `root` with no display. See [Launching GUI
+applications](#launching-gui-applications).
 
 For a computer that outlives the block, use `create()` — it never deletes:
 
@@ -116,6 +120,47 @@ res.ok, res.exit_code, res.stdout, res.stderr
 
 A non-zero exit is returned, not raised — check `res.ok`.
 
+### Launching GUI applications
+
+By default `exec()` runs in the system context — as `root` on Linux, with no
+`DISPLAY` and no `HOME` — which is right for installing packages and wrong for
+anything with a window. The obvious call therefore does nothing:
+
+```python
+c.exec("firefox https://example.com")     # no DISPLAY — dies, and exec() reports it
+```
+
+`desktop=True` runs the command in the logged-in desktop session instead, as the
+desktop user with `DISPLAY`, `HOME` and `XAUTHORITY` set:
+
+```python
+c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+```
+
+The `nohup … &` is still yours to write. A GUI program does not exit on its own,
+so a foreground launch blocks until `timeout_s` kills it and comes back as a
+failure — having opened the window anyway, which is a confusing pair of outcomes.
+Detach it and the call returns in well under a second.
+
+`xdg-open` is on the `base` template, as are `exo-open` and `x-www-browser`, if
+you would rather ask for the default handler than name a browser; Firefox is what
+they resolve to, and there is no Chromium. There is no `xdotool` or `wmctrl`,
+which you should not need — `click()`, `type()` and `key()` are that, and they
+work without anything installed in the guest.
+
+**Windows does not support this yet.** `exec()` there runs as `NT AUTHORITY\SYSTEM`
+in session 0 while the desktop is session 1, and session 0 isolation means a GUI
+process started that way never reaches the screen. `desktop=True` does not paper
+over it — the API rejects it with a clear message rather than running the command
+somewhere nobody can see:
+
+```
+APIError: session "desktop" is not supported on Windows guests yet
+```
+
+Until that lands, drive the Windows desktop through `click()`, `type()` and
+`key()` — open the browser from the taskbar the way a person would.
+
 ### Readiness
 
 `create()` returns as soon as the API does; the machine is starting, not ready.
@@ -123,8 +168,13 @@ A non-zero exit is returned, not raised — check `res.ok`.
 - `wait_until_built()` — a cloned computer's disk has been copied. Only clones
   need this; it returns at once for anything else.
 - `wait_until_running()` — the VM is up. The guest OS is still booting.
-- `wait_for_guest()` — something inside the guest answers. Linux only; it uses
-  the guest agent, which Windows images do not ship yet.
+- `wait_for_guest()` — the guest agent answers. Linux and Windows both; the probe
+  is `exit 0`, which bash and cmd.exe both have as a builtin.
+
+The last of those is about the agent, not the desktop, and the agent answers
+first — on Windows by a wide margin, since it runs in session 0 and replies
+before anyone has logged in. To wait for a desktop somebody could use, poll
+`screenshot()` until it looks right.
 
 ### Computers that are still being built
 

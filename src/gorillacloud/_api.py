@@ -82,8 +82,17 @@ def rename_body(name: str) -> dict[str, Any]:
     return {"name": name}
 
 
-def exec_body(command: str, timeout_s: int) -> dict[str, Any]:
-    return {"command": command, "timeout_s": timeout_s}
+def exec_body(command: str, timeout_s: int, desktop: bool = False) -> dict[str, Any]:
+    """Build an exec payload.
+
+    ``session`` is omitted rather than sent empty when ``desktop`` is false: the
+    server's default is the system context, and the only value it accepts is
+    ``"desktop"``.
+    """
+    body: dict[str, Any] = {"command": command, "timeout_s": timeout_s}
+    if desktop:
+        body["session"] = "desktop"
+    return body
 
 
 def snapshot_body(memory: bool) -> dict[str, Any]:

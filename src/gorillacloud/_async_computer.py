@@ -14,7 +14,7 @@ from typing import Any
 
 from . import _api
 from ._client import AsyncTransport
-from ._computer import ComputerFields
+from ._computer import GUEST_PROBE, ComputerFields
 from ._exceptions import GorillaCloudError, TimeoutError
 from ._models import ExecResult, Snapshot
 
@@ -148,14 +148,19 @@ class AsyncComputer(ComputerFields):
     async def wait_for_guest(self, timeout: float = 180.0, poll: float = 3.0) -> AsyncComputer:
         """Await until the guest OS answers, by running a trivial command in it.
 
-        Linux only — it relies on the guest agent, which Windows images do not
-        ship yet. On Windows use :meth:`wait_until_running` and poll
-        :meth:`screenshot` instead.
+        Works on Linux and Windows: the probe is ``exit 0``, a builtin of both
+        bash and cmd.exe, so it needs nothing on the guest's PATH and nothing
+        about which OS this is.
+
+        What it establishes is that the *guest agent* answers, which is earlier
+        than the desktop being usable — on Windows especially, since the agent
+        runs in session 0 and replies well before anyone has logged in. When you
+        need the desktop rather than the machine, poll :meth:`screenshot`.
         """
         deadline = time.monotonic() + timeout
         while True:
             try:
-                res = await self.exec("true", timeout_s=5)
+                res = await self.exec(GUEST_PROBE, timeout_s=5)
                 if res.ok:
                     return self
             except GorillaCloudError:
@@ -219,16 +224,28 @@ class AsyncComputer(ComputerFields):
         """Press a chord, e.g. ``await key("ctrl", "c")``."""
         await self._input(_api.key_body(keys))
 
-    async def exec(self, command: str, timeout_s: int = 30) -> ExecResult:
+    async def exec(
+        self, command: str, timeout_s: int = 30, *, desktop: bool = False
+    ) -> ExecResult:
         """Run a shell command inside the guest.
 
         Uses the guest's native shell — bash on Linux, cmd.exe on Windows. A
         non-zero exit is returned, not raised; check :attr:`ExecResult.ok`.
+
+        By default the command runs in the system context: as ``root`` on Linux,
+        with no display attached. Pass ``desktop=True`` to run it in the logged-in
+        desktop session instead — as the desktop user, with ``DISPLAY``, ``HOME``
+        and ``XAUTHORITY`` set — which is what anything with a window needs.
+
+        A GUI program does not exit on its own, so launch it detached or the call
+        blocks until ``timeout_s`` kills it::
+
+            await c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
         """
         data = await self._t.json(
             "POST",
             _api.computer_action(self.id, "exec"),
-            json=_api.exec_body(command, timeout_s),
+            json=_api.exec_body(command, timeout_s, desktop),
         )
         return ExecResult.from_api(data or {})
 

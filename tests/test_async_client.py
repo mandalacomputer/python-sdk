@@ -111,6 +111,26 @@ async def test_exec_nonzero_exit_is_returned_not_raised(client: gc.AsyncClient) 
 
 
 @respx.mock
+@pytest.mark.asyncio
+async def test_exec_omits_session_unless_desktop_requested(client: gc.AsyncClient) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    await gc.AsyncComputer(client._t, COMPUTER).exec("whoami")
+    assert "session" not in json.loads(route.calls.last.request.content)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_exec_desktop_sends_session_desktop(client: gc.AsyncClient) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    await gc.AsyncComputer(client._t, COMPUTER).exec("whoami", desktop=True)
+    assert json.loads(route.calls.last.request.content)["session"] == "desktop"
+
+
+@respx.mock
 async def test_wait_until_running_polls(client: gc.AsyncClient) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(
         side_effect=[

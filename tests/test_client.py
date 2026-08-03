@@ -158,6 +158,26 @@ def test_exec_nonzero_exit_is_returned_not_raised(client: gc.Client) -> None:
     assert res.exit_code == 1 and res.stderr == "boom" and not res.ok
 
 
+@respx.mock
+def test_exec_omits_session_unless_desktop_requested(client: gc.Client) -> None:
+    """The server defaults to the system context; an empty session is not the same
+    as an absent one, so the key stays off the wire until it is asked for."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    gc.Computer(client._t, COMPUTER).exec("whoami")
+    assert "session" not in json.loads(route.calls.last.request.content)
+
+
+@respx.mock
+def test_exec_desktop_sends_session_desktop(client: gc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+    )
+    gc.Computer(client._t, COMPUTER).exec("whoami", desktop=True)
+    assert json.loads(route.calls.last.request.content)["session"] == "desktop"
+
+
 # --- waiting --------------------------------------------------------------
 
 
