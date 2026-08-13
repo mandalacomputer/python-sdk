@@ -412,3 +412,150 @@ def test_open_refuses_an_empty_url() -> None:
     for blank in ("", "   "):
         with pytest.raises(ValueError, match="must not be empty"):
             gc._api.open_url_command(blank)
+
+
+# --- the computer-use verb set (OPL-3567) ---------------------------------
+#
+# Every action Anthropic's computer tool can emit has a method here. The point
+# is not coverage for its own sake: a caller wiring the standard tool definition
+# to this SDK has to stub whatever is missing, and drag, triple click, held
+# buttons, held keys and wait are exactly the actions a model reaches for when a
+# click has not worked.
+
+
+def _computer(client: gc.Client) -> gc.Computer:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    return client.computers.get("vm-1")
+
+
+@respx.mock
+def test_a_click_with_no_coordinate_clicks_where_the_pointer_is(client: gc.Client) -> None:
+    # Absent and (0, 0) are different requests. A model emits a bare click after
+    # a move; sending zeros would click the corner of the screen instead.
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.click()
+    assert json.loads(route.calls[0].request.content) == {"action": "left_click"}
+    c.click(10, 20)
+    assert json.loads(route.calls[1].request.content) == {"action": "left_click", "x": 10, "y": 20}
+
+
+@respx.mock
+def test_modifiers_are_held_for_the_click(client: gc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    _computer(client).click(10, 20, "ctrl", "shift")
+    assert json.loads(route.calls[0].request.content)["text"] == "ctrl+shift"
+
+
+@respx.mock
+def test_a_drag_sends_both_ends(client: gc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.drag(90, 80, from_x=10, from_y=20)
+    assert json.loads(route.calls[0].request.content) == {
+        "action": "left_click_drag",
+        "coordinate": [90, 80],
+        "start_coordinate": [10, 20],
+    }
+    # Without an origin the platform is asked to start from wherever the pointer
+    # is — it refuses if nothing has put it anywhere, rather than guessing.
+    c.drag(90, 80)
+    assert "start_coordinate" not in json.loads(route.calls[1].request.content)
+
+
+@respx.mock
+def test_the_cursor_position_is_none_until_something_places_it(client: gc.Client) -> None:
+    # The virtual pointing device takes coordinates and reports none back, so an
+    # untouched pointer has no position anybody knows. Zeros here would be
+    # indistinguishable from the top-left corner, which is the exact wrong thing
+    # to hand a caller about to move relative to it.
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        httpx.Response(200, json={"ok": True, "x": 0, "y": 0, "known": False})
+    )
+    assert _computer(client).cursor_position() is None
+
+
+@respx.mock
+def test_the_cursor_position_is_returned_once_it_is_known(client: gc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        httpx.Response(200, json={"ok": True, "x": 640, "y": 400, "known": True})
+    )
+    assert _computer(client).cursor_position() == (640, 400)
+
+
+@respx.mock
+def test_scroll_takes_all_four_directions_and_refuses_the_rest(client: gc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    for direction in ("up", "down", "left", "right"):
+        c.scroll(1, 2, direction=direction)
+    with pytest.raises(ValueError):
+        c.scroll(1, 2, direction="sideways")
+
+
+@respx.mock
+def test_hold_key_and_wait_refuse_a_non_positive_duration(client: gc.Client) -> None:
+    c = _computer(client)
+    with pytest.raises(ValueError):
+        c.hold_key("shift", seconds=0)
+    with pytest.raises(ValueError):
+        c.wait(-1)
+    with pytest.raises(ValueError):
+        c.hold_key(seconds=1)
+
+
+# --- resolution (OPL-3567) -------------------------------------------------
+
+
+@respx.mock
+def test_resolution_is_sent_on_create_and_read_back(client: gc.Client) -> None:
+    route = respx.post(f"{BASE}/computers").mock(
+        httpx.Response(200, json={**COMPUTER, "id": "vm-2", "resolution": "1920x1080x24"})
+    )
+    c = client.computers.create(template="base", resolution="1920x1080")
+    assert json.loads(route.calls[0].request.content)["resolution"] == "1920x1080"
+    assert c.resolution == "1920x1080x24"
+    assert c.screen == (1920, 1080)
+
+
+@respx.mock
+def test_a_computer_that_reports_no_resolution_reads_as_the_default(client: gc.Client) -> None:
+    # A server old enough not to report one has computers that render at
+    # 1280x800x24, so that is the answer rather than an empty string — a caller
+    # sizing a coordinate space needs a number.
+    c = _computer(client)
+    assert c.resolution == "1280x800x24"
+    assert c.screen == (1280, 800)
+
+
+@respx.mock
+def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: gc.Client) -> None:
+    # scroll() used to send x=0,y=0 always, and the server reads a flat
+    # coordinate as a position — so a defaulted scroll moved to the top-left
+    # first and scrolled whatever was there rather than what the caller was
+    # looking at. Omitted means "under the pointer", which is what it has
+    # always meant.
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.scroll(direction="down")
+    body = json.loads(route.calls[0].request.content)
+    assert "x" not in body and "y" not in body
+    # And a point the caller did give still travels, including the corner —
+    # sent as `coordinate`, which is the one spelling the platform cannot
+    # confuse with a defaulted scroll. Asserting on `x` here passed while the
+    # end-to-end operation scrolled under the pointer instead.
+    c.scroll(0, 0, direction="down")
+    sent = json.loads(route.calls[1].request.content)
+    assert sent["coordinate"] == [0, 0]
+    assert "x" not in sent
+
+
+@respx.mock
+def test_half_a_drag_origin_is_refused_rather_than_dropped(client: gc.Client) -> None:
+    # Dropping it produces a drag that succeeds while selecting a different
+    # region — the worst shape a mistake can take, because nothing reports it.
+    c = _computer(client)
+    with pytest.raises(ValueError):
+        c.drag(90, 80, from_x=10)
+    with pytest.raises(ValueError):
+        c.drag(90, 80, from_y=20)

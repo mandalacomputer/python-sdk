@@ -14,7 +14,7 @@ from typing import Any
 
 from . import _api
 from ._client import AsyncTransport
-from ._computer import GUEST_PROBE, ComputerFields
+from ._computer import GUEST_PROBE, ComputerFields, _cursor
 from ._exceptions import GorillaCloudError, TimeoutError
 from ._models import ExecResult, Snapshot
 
@@ -187,30 +187,93 @@ class AsyncComputer(ComputerFields):
 
     # --- controlling ----------------------------------------------------
 
-    async def _input(self, body: dict[str, Any]) -> None:
-        await self._t.request("POST", _api.computer_action(self.id, "input"), json=body)
+    async def _input(self, body: dict[str, Any]) -> Mapping[str, Any]:
+        return await self._t.json("POST", _api.computer_action(self.id, "input"), json=body) or {}
 
     async def move(self, x: int, y: int) -> None:
-        """Move the pointer to ``(x, y)`` in the guest's 1280x800 screen space."""
+        """Move the pointer to ``(x, y)`` in this computer's screen space.
+
+        Coordinates are in the computer's own :attr:`resolution`, which is a
+        create-time choice — not a fixed 1280x800.
+        """
         await self._input(_api.pointer_body("move", x, y))
 
-    async def click(self, x: int, y: int) -> None:
-        await self._input(_api.pointer_body("left_click", x, y))
+    async def click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
+        """Click. With no coordinate, clicks wherever the pointer already is.
 
-    async def right_click(self, x: int, y: int) -> None:
-        await self._input(_api.pointer_body("right_click", x, y))
+        ``modifiers`` are held down for the click, e.g.
+        ``await click(100, 200, "shift")`` to extend a selection.
+        """
+        await self._input(_api.click_body("left_click", x, y, modifiers))
 
-    async def middle_click(self, x: int, y: int) -> None:
-        await self._input(_api.pointer_body("middle_click", x, y))
+    async def right_click(
+        self, x: int | None = None, y: int | None = None, *modifiers: str
+    ) -> None:
+        await self._input(_api.click_body("right_click", x, y, modifiers))
 
-    async def double_click(self, x: int, y: int) -> None:
-        await self._input(_api.pointer_body("double_click", x, y))
+    async def middle_click(
+        self, x: int | None = None, y: int | None = None, *modifiers: str
+    ) -> None:
+        await self._input(_api.click_body("middle_click", x, y, modifiers))
+
+    async def double_click(
+        self, x: int | None = None, y: int | None = None, *modifiers: str
+    ) -> None:
+        await self._input(_api.click_body("double_click", x, y, modifiers))
+
+    async def triple_click(
+        self, x: int | None = None, y: int | None = None, *modifiers: str
+    ) -> None:
+        """Three clicks, which is how most editors select a whole line."""
+        await self._input(_api.click_body("triple_click", x, y, modifiers))
+
+    async def drag(
+        self, to_x: int, to_y: int, *, from_x: int | None = None, from_y: int | None = None
+    ) -> None:
+        """Press, move, release — one gesture.
+
+        The pointer passes through intermediate positions, which is what makes
+        this a drag rather than two clicks: text selection, canvas tools and
+        drag-and-drop all watch for the motion between the ends.
+
+        Without ``from_x``/``from_y`` the drag starts wherever the pointer is.
+        That is refused if nothing has moved it yet, rather than guessing at an
+        origin and selecting the wrong thing.
+        """
+        await self._input(_api.drag_body(from_x, from_y, to_x, to_y))
+
+    async def mouse_down(self, x: int | None = None, y: int | None = None) -> None:
+        """Press the left button and leave it down.
+
+        Pair with :meth:`mouse_up`. Between the two the desktop is mid-gesture,
+        so a call that raises in between leaves the button held — wrap them in
+        ``try``/``finally`` if that matters.
+        """
+        await self._input(_api.button_body("left_mouse_down", x, y))
+
+    async def mouse_up(self, x: int | None = None, y: int | None = None) -> None:
+        """Release the left button."""
+        await self._input(_api.button_body("left_mouse_up", x, y))
 
     async def scroll(
-        self, x: int = 0, y: int = 0, *, direction: str = "down", amount: int = 3
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *,
+        direction: str = "down",
+        amount: int = 3,
+        modifiers: tuple[str, ...] = (),
     ) -> None:
-        """Scroll the wheel, first moving to ``(x, y)`` when either is non-zero."""
-        await self._input(_api.scroll_body(x, y, direction, amount))
+        """Scroll the wheel, first moving to ``(x, y)`` when a point is given.
+
+        With no coordinate it scrolls whatever is under the pointer, which is
+        what a bare ``scroll()`` has always meant.
+
+        ``direction`` is up, down, left or right. Horizontal scrolling needs a
+        hypervisor running QEMU 7.1 or newer; an older one refuses it by name
+        rather than scrolling the wrong way.
+        """
+        await self._input(_api.scroll_body(x, y, direction, amount, modifiers))
 
     async def type(self, text: str) -> None:
         """Type text as keystrokes.
@@ -221,8 +284,42 @@ class AsyncComputer(ComputerFields):
         await self._input(_api.type_body(text))
 
     async def key(self, *keys: str) -> None:
-        """Press a chord, e.g. ``await key("ctrl", "c")``."""
+        """Press a chord, e.g. ``await key("ctrl", "c")``.
+
+        Both this SDK's names and X11 keysyms are accepted, so the spellings a
+        computer-use model produces — ``Page_Down``, ``BackSpace``, ``period`` —
+        work without translation. An unknown key raises and names itself rather
+        than being silently dropped from the chord.
+        """
         await self._input(_api.key_body(keys))
+
+    async def hold_key(self, *keys: str, seconds: float) -> None:
+        """Hold a chord down for ``seconds``, then release it.
+
+        For the keys that mean something while held rather than when tapped — an
+        arrow key that repeats, a modifier that changes what a UI shows.
+        """
+        await self._input(_api.hold_key_body(keys, seconds))
+
+    async def wait(self, seconds: float) -> None:
+        """Pause, inside the platform, without holding this computer's monitor.
+
+        Sleeping locally does the same thing for a script. This exists because a
+        computer-use model emits ``wait`` as an action, and because it does not
+        block the screenshot polls of anything else watching the desktop.
+        """
+        await self._input(_api.wait_body(seconds))
+
+    async def cursor_position(self) -> tuple[int, int] | None:
+        """Where the pointer is, or ``None`` if nothing has placed it yet.
+
+        This is where the *platform* last put the pointer. The virtual pointing
+        device accepts coordinates and reports none back, so there is nothing to
+        read from the guest: after a fresh boot, before anything has moved it,
+        the honest answer is that nobody knows — hence ``None`` rather than a
+        confident ``(0, 0)``.
+        """
+        return _cursor(await self._input(_api.cursor_body()))
 
     async def exec(
         self, command: str, timeout_s: int = 30, *, desktop: bool = False

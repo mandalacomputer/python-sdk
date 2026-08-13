@@ -47,6 +47,7 @@ def create_body(
     ram_mb: int | None,
     disk_gb: int | None,
     start: bool,
+    resolution: str | None = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -60,6 +61,7 @@ def create_body(
         ("cpu", cpu),
         ("ram_mb", ram_mb),
         ("disk_gb", disk_gb),
+        ("resolution", resolution),
     ):
         if value is not None:
             body[key] = value
@@ -138,14 +140,99 @@ def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str
     return {"enabled": enabled, "hour": hour, "minute": minute, "tz": tz}
 
 
+# --- input ----------------------------------------------------------------
+#
+# The verb set is Anthropic's computer tool, in full. The platform accepts both
+# that vocabulary and this SDK's flatter one, so these bodies use whichever is
+# clearer for each action — what matters is that every verb a computer-use model
+# can emit has a method here, because the alternative is every user of this SDK
+# writing the same seven stubs.
+
+
 def pointer_body(action: str, x: int, y: int) -> dict[str, Any]:
     return {"action": action, "x": x, "y": y}
 
 
-def scroll_body(x: int, y: int, direction: str, amount: int) -> dict[str, Any]:
-    if direction not in ("up", "down"):
-        raise ValueError('direction must be "up" or "down"')
-    return {"action": "scroll", "x": x, "y": y, "button": direction, "amount": amount}
+def click_body(
+    action: str, x: int | None, y: int | None, modifiers: tuple[str, ...]
+) -> dict[str, Any]:
+    """A click, optionally at a point and optionally with keys held down.
+
+    No coordinate means "where the pointer already is", which is a real and
+    different request from clicking (0, 0) — so the keys are omitted rather than
+    sent as zeros.
+    """
+    body: dict[str, Any] = {"action": action}
+    if x is not None or y is not None:
+        body["x"] = x or 0
+        body["y"] = y or 0
+    if modifiers:
+        body["text"] = "+".join(modifiers)
+    return body
+
+
+def drag_body(from_x: int | None, from_y: int | None, to_x: int, to_y: int) -> dict[str, Any]:
+    """A press, a move, and a release — one gesture, not two clicks.
+
+    ``start_coordinate`` is omitted when the caller did not give one, which asks
+    the platform to drag from wherever the pointer is. It refuses that if nothing
+    has moved the pointer yet, rather than guessing at an origin.
+
+    Half an origin is refused here rather than dropped. ``drag(90, 80,
+    from_x=10)`` reads as a caller who meant to name a starting point, and
+    silently ignoring the half they gave produces a drag that succeeds while
+    selecting a different region — the worst shape a mistake can take, because
+    nothing reports it.
+    """
+    if (from_x is None) != (from_y is None):
+        raise ValueError("give both from_x and from_y, or neither")
+    body: dict[str, Any] = {"action": "left_click_drag", "coordinate": [to_x, to_y]}
+    if from_x is not None and from_y is not None:
+        body["start_coordinate"] = [from_x, from_y]
+    return body
+
+
+def button_body(action: str, x: int | None, y: int | None) -> dict[str, Any]:
+    """left_mouse_down / left_mouse_up, optionally moving first."""
+    body: dict[str, Any] = {"action": action}
+    if x is not None or y is not None:
+        body["x"] = x or 0
+        body["y"] = y or 0
+    return body
+
+
+_SCROLL_DIRECTIONS = ("up", "down", "left", "right")
+
+
+def scroll_body(
+    x: int | None, y: int | None, direction: str, amount: int, modifiers: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """A wheel scroll, optionally at a point and optionally with keys held.
+
+    The coordinate is omitted when the caller did not give one, which scrolls
+    whatever is under the pointer. Sending zeros instead would move the pointer
+    to the top-left corner first and scroll whatever happens to be there — which
+    is what a defaulted ``scroll()`` did before the coordinate keys became
+    optional.
+    """
+    if direction not in _SCROLL_DIRECTIONS:
+        raise ValueError(f"direction must be one of {_SCROLL_DIRECTIONS}")
+    body: dict[str, Any] = {
+        "action": "scroll",
+        "scroll_direction": direction,
+        "amount": amount,
+    }
+    if x is not None or y is not None:
+        # The tool-native spelling, not the flat pair. The platform reads a flat
+        # x/y of 0,0 on a scroll as "no position" — it has to, because that is
+        # what this SDK sent for every defaulted scroll before the arguments
+        # became optional — so a caller who genuinely means the top-left corner
+        # cannot say so that way. `coordinate` has no such history and is
+        # unambiguous, which makes scroll(0, 0) mean the corner again.
+        body["coordinate"] = [x or 0, y or 0]
+    if modifiers:
+        body["text"] = "+".join(modifiers)
+    return body
 
 
 def type_body(text: str) -> dict[str, Any]:
@@ -156,6 +243,24 @@ def key_body(keys: tuple[str, ...]) -> dict[str, Any]:
     if not keys:
         raise ValueError("key() needs at least one key")
     return {"action": "key", "keys": list(keys)}
+
+
+def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
+    if not keys:
+        raise ValueError("hold_key() needs at least one key")
+    if seconds <= 0:
+        raise ValueError("seconds must be positive")
+    return {"action": "hold_key", "keys": list(keys), "duration": seconds}
+
+
+def wait_body(seconds: float) -> dict[str, Any]:
+    if seconds <= 0:
+        raise ValueError("seconds must be positive")
+    return {"action": "wait", "duration": seconds}
+
+
+def cursor_body() -> dict[str, Any]:
+    return {"action": "cursor_position"}
 
 
 def screenshot_params(width: int | None) -> dict[str, Any] | None:
