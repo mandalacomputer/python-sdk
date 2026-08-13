@@ -46,6 +46,7 @@ class Computers:
         ram_mb: int | None = None,
         disk_gb: int | None = None,
         start: bool = True,
+        resolution: str | None = None,
     ) -> Computer:
         """Provision a computer.
 
@@ -53,11 +54,25 @@ class Computers:
         by the account's plan; exceeding a cap raises
         :class:`~gorillacloud.PlanLimitError` naming the limit.
 
+        ``resolution`` is ``"WIDTHxHEIGHT"`` or ``"WIDTHxHEIGHTxDEPTH"`` and
+        defaults to ``"1280x800x24"``. It is a create-time choice and only a
+        create-time choice: the screen is part of the machine QEMU builds, so
+        changing it needs a new one, and there is no method that resizes a
+        computer's display. Pick it deliberately if a model is going to drive
+        this desktop — computer-use accuracy is resolution-sensitive, and every
+        coordinate the model produces is in this space.
+
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`Computer.wait_for_guest`.
         """
         body = _api.create_body(
-            name=name, template=template, cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb, start=start
+            name=name,
+            template=template,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            start=start,
+            resolution=resolution,
         )
         data = self._t.json("POST", _api.COMPUTERS, json=body)
         return Computer(self._t, data or {})
