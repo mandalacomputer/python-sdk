@@ -540,9 +540,14 @@ def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: gc.C
     c.scroll(direction="down")
     body = json.loads(route.calls[0].request.content)
     assert "x" not in body and "y" not in body
-    # And a point the caller did give still travels, including the corner.
+    # And a point the caller did give still travels, including the corner —
+    # sent as `coordinate`, which is the one spelling the platform cannot
+    # confuse with a defaulted scroll. Asserting on `x` here passed while the
+    # end-to-end operation scrolled under the pointer instead.
     c.scroll(0, 0, direction="down")
-    assert json.loads(route.calls[1].request.content)["x"] == 0
+    sent = json.loads(route.calls[1].request.content)
+    assert sent["coordinate"] == [0, 0]
+    assert "x" not in sent
 
 
 @respx.mock

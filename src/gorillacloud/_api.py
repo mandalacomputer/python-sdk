@@ -223,8 +223,13 @@ def scroll_body(
         "amount": amount,
     }
     if x is not None or y is not None:
-        body["x"] = x or 0
-        body["y"] = y or 0
+        # The tool-native spelling, not the flat pair. The platform reads a flat
+        # x/y of 0,0 on a scroll as "no position" — it has to, because that is
+        # what this SDK sent for every defaulted scroll before the arguments
+        # became optional — so a caller who genuinely means the top-left corner
+        # cannot say so that way. `coordinate` has no such history and is
+        # unambiguous, which makes scroll(0, 0) mean the corner again.
+        body["coordinate"] = [x or 0, y or 0]
     if modifiers:
         body["text"] = "+".join(modifiers)
     return body
