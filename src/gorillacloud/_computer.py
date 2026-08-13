@@ -394,14 +394,17 @@ class Computer(ComputerFields):
 
     def scroll(
         self,
-        x: int = 0,
-        y: int = 0,
+        x: int | None = None,
+        y: int | None = None,
         *,
         direction: str = "down",
         amount: int = 3,
         modifiers: tuple[str, ...] = (),
     ) -> None:
-        """Scroll the wheel, first moving to ``(x, y)`` when either is non-zero.
+        """Scroll the wheel, first moving to ``(x, y)`` when a point is given.
+
+        With no coordinate it scrolls whatever is under the pointer, which is
+        what a bare ``scroll()`` has always meant.
 
         ``direction`` is up, down, left or right. Horizontal scrolling needs a
         hypervisor running QEMU 7.1 or newer; an older one refuses it by name

@@ -177,7 +177,15 @@ def drag_body(from_x: int | None, from_y: int | None, to_x: int, to_y: int) -> d
     ``start_coordinate`` is omitted when the caller did not give one, which asks
     the platform to drag from wherever the pointer is. It refuses that if nothing
     has moved the pointer yet, rather than guessing at an origin.
+
+    Half an origin is refused here rather than dropped. ``drag(90, 80,
+    from_x=10)`` reads as a caller who meant to name a starting point, and
+    silently ignoring the half they gave produces a drag that succeeds while
+    selecting a different region — the worst shape a mistake can take, because
+    nothing reports it.
     """
+    if (from_x is None) != (from_y is None):
+        raise ValueError("give both from_x and from_y, or neither")
     body: dict[str, Any] = {"action": "left_click_drag", "coordinate": [to_x, to_y]}
     if from_x is not None and from_y is not None:
         body["start_coordinate"] = [from_x, from_y]
@@ -197,17 +205,26 @@ _SCROLL_DIRECTIONS = ("up", "down", "left", "right")
 
 
 def scroll_body(
-    x: int, y: int, direction: str, amount: int, modifiers: tuple[str, ...] = ()
+    x: int | None, y: int | None, direction: str, amount: int, modifiers: tuple[str, ...] = ()
 ) -> dict[str, Any]:
+    """A wheel scroll, optionally at a point and optionally with keys held.
+
+    The coordinate is omitted when the caller did not give one, which scrolls
+    whatever is under the pointer. Sending zeros instead would move the pointer
+    to the top-left corner first and scroll whatever happens to be there — which
+    is what a defaulted ``scroll()`` did before the coordinate keys became
+    optional.
+    """
     if direction not in _SCROLL_DIRECTIONS:
         raise ValueError(f"direction must be one of {_SCROLL_DIRECTIONS}")
     body: dict[str, Any] = {
         "action": "scroll",
-        "x": x,
-        "y": y,
         "scroll_direction": direction,
         "amount": amount,
     }
+    if x is not None or y is not None:
+        body["x"] = x or 0
+        body["y"] = y or 0
     if modifiers:
         body["text"] = "+".join(modifiers)
     return body

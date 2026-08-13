@@ -526,3 +526,31 @@ def test_a_computer_that_reports_no_resolution_reads_as_the_default(client: gc.C
     c = _computer(client)
     assert c.resolution == "1280x800x24"
     assert c.screen == (1280, 800)
+
+
+@respx.mock
+def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: gc.Client) -> None:
+    # scroll() used to send x=0,y=0 always, and the server reads a flat
+    # coordinate as a position — so a defaulted scroll moved to the top-left
+    # first and scrolled whatever was there rather than what the caller was
+    # looking at. Omitted means "under the pointer", which is what it has
+    # always meant.
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.scroll(direction="down")
+    body = json.loads(route.calls[0].request.content)
+    assert "x" not in body and "y" not in body
+    # And a point the caller did give still travels, including the corner.
+    c.scroll(0, 0, direction="down")
+    assert json.loads(route.calls[1].request.content)["x"] == 0
+
+
+@respx.mock
+def test_half_a_drag_origin_is_refused_rather_than_dropped(client: gc.Client) -> None:
+    # Dropping it produces a drag that succeeds while selecting a different
+    # region — the worst shape a mistake can take, because nothing reports it.
+    c = _computer(client)
+    with pytest.raises(ValueError):
+        c.drag(90, 80, from_x=10)
+    with pytest.raises(ValueError):
+        c.drag(90, 80, from_y=20)
