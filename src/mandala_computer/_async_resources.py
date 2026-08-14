@@ -26,7 +26,7 @@ class AsyncComputers:
 
     async def get(self, computer_id: str) -> AsyncComputer:
         data = await self._t.json("GET", _api.computer(computer_id))
-        return AsyncComputer(self._t, data or {})
+        return AsyncComputer(self._t, _api.computer_payload(data))
 
     async def create(
         self,
@@ -43,7 +43,7 @@ class AsyncComputers:
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
-        :class:`~gorillacloud.PlanLimitError` naming the limit.
+        :class:`~mandala_computer.PlanLimitError` naming the limit.
 
         ``resolution`` is ``"WIDTHxHEIGHT"`` or ``"WIDTHxHEIGHTxDEPTH"`` and
         defaults to ``"1280x800x24"``. It is a create-time choice and only a
@@ -55,6 +55,13 @@ class AsyncComputers:
 
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
+
+        A create that builds a computer which then will not boot is *not* an
+        error: it returns the computer, stopped, with
+        :attr:`AsyncComputer.start_error` saying what went wrong. The machine
+        exists and is billable either way, so it comes back rather than being
+        thrown away with the exception — check ``start_error`` if it matters,
+        and :meth:`AsyncComputer.start` may work on a second attempt.
         """
         body = _api.create_body(
             name=name,
@@ -66,7 +73,7 @@ class AsyncComputers:
             resolution=resolution,
         )
         data = await self._t.json("POST", _api.COMPUTERS, json=body)
-        return AsyncComputer(self._t, data or {})
+        return AsyncComputer(self._t, _api.computer_payload(data))
 
     @asynccontextmanager
     async def ephemeral(self, **kwargs: Any) -> AsyncIterator[AsyncComputer]:
@@ -102,13 +109,13 @@ class AsyncSnapshots:
         A snapshot has to be copied out — and a snapshot taken incrementally is
         collapsed out of its whole chain — which runs for minutes, so the
         computer comes back ``"building"``. Until that lands there is nothing to
-        boot and starting it raises :class:`~gorillacloud.ConflictError`; wait
+        boot and starting it raises :class:`~mandala_computer.ConflictError`; wait
         with :meth:`AsyncComputer.wait_until_built`.
         """
         data = await self._t.json(
             "POST", _api.snapshot_action(snapshot_id, "clone"), json=_api.name_body(name)
         )
-        return AsyncComputer(self._t, data or {})
+        return AsyncComputer(self._t, _api.computer_payload(data))
 
     async def delete(self, snapshot_id: str) -> None:
         await self._t.request("DELETE", _api.snapshot(snapshot_id))

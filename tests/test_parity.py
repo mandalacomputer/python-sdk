@@ -10,8 +10,8 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-import gorillacloud as gc
-from gorillacloud import _async_resources, _resources
+import mandala_computer as mc
+from mandala_computer import _async_resources, _resources
 
 
 def public_methods(cls: type) -> dict[str, inspect.Signature]:
@@ -28,8 +28,8 @@ def params(sig: inspect.Signature) -> list[tuple[str, Any, Any]]:
 
 
 PAIRS = [
-    (gc.Client, gc.AsyncClient),
-    (gc.Computer, gc.AsyncComputer),
+    (mc.Client, mc.AsyncClient),
+    (mc.Computer, mc.AsyncComputer),
     (_resources.Computers, _async_resources.AsyncComputers),
     (_resources.Snapshots, _async_resources.AsyncSnapshots),
     (_resources.Templates, _async_resources.AsyncTemplates),
@@ -81,9 +81,9 @@ def test_async_io_methods_are_coroutines() -> None:
 
 def test_field_accessors_are_shared_not_copied() -> None:
     """Both handles read fields through the same code, so they cannot disagree."""
-    from gorillacloud._computer import ComputerFields
+    from mandala_computer._computer import ComputerFields
 
-    assert issubclass(gc.Computer, ComputerFields)
-    assert issubclass(gc.AsyncComputer, ComputerFields)
+    assert issubclass(mc.Computer, ComputerFields)
+    assert issubclass(mc.AsyncComputer, ComputerFields)
     for field in ("id", "name", "status", "os", "template", "cpu", "ram_mb", "disk_gb", "raw"):
-        assert getattr(gc.Computer, field) is getattr(gc.AsyncComputer, field)
+        assert getattr(mc.Computer, field) is getattr(mc.AsyncComputer, field)

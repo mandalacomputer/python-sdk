@@ -6,6 +6,9 @@ runtime in a user's hands rather than here. This asserts every request the SDK
 can issue lands on an allowlisted route.
 
 Keep ALLOWED in step with V1_ROUTES in `web/lib/surface.ts` in the platform repo.
+It mirrors that table in full, including the routes this SDK cannot yet call —
+those are named in UNIMPLEMENTED, which is what keeps the distance between the
+two visible rather than letting it grow quietly.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import httpx
 import pytest
 import respx
 
-import gorillacloud as gc
+import mandala_computer as mc
 
 BASE = "https://api.test/api/v1"
 
@@ -28,6 +31,7 @@ ALLOWED = {
     ("DELETE", "computers/:id"),
     ("POST", "computers/:id/start"),
     ("POST", "computers/:id/stop"),
+    ("POST", "computers/:id/suspend"),
     ("POST", "computers/:id/restart"),
     ("POST", "computers/:id/clone"),
     ("GET", "computers/:id/screenshot"),
@@ -41,6 +45,34 @@ ALLOWED = {
     ("GET", "computers/:id/schedule"),
     ("PUT", "computers/:id/schedule"),
     ("DELETE", "computers/:id/schedule"),
+    # Reachable, and not yet reached from here — see UNIMPLEMENTED.
+    ("GET", "computers/:id/windows"),
+    ("POST", "computers/:id/windows/:window"),
+    ("POST", "computers/:id/agent"),
+    ("POST", "chat/completions"),
+    ("PUT", "computers/:id/files"),
+    ("GET", "computers/:id/files"),
+}
+
+# Routes the platform exposes that this SDK cannot yet call.
+#
+# ALLOWED mirrors the platform's table, so without this the two tests below
+# would pass forever while the SDK fell further behind: "every call lands on an
+# allowlisted route" stays true no matter how few calls there are. Pinning the
+# difference makes the gap a number that has to be edited down deliberately, and
+# makes a route added upstream show up here as a failing test rather than as a
+# feature nobody noticed.
+UNIMPLEMENTED = {
+    # OPL-3583. List what is on the desktop, and act on one window.
+    ("GET", "computers/:id/windows"),
+    ("POST", "computers/:id/windows/:window"),
+    # OPL-3567. One call that drives the computer until the task is done, and
+    # the same engine behind an OpenAI-shaped door. Both need SSE.
+    ("POST", "computers/:id/agent"),
+    ("POST", "chat/completions"),
+    # OPL-3360. Files in and out; needs raw request/response bodies.
+    ("PUT", "computers/:id/files"),
+    ("GET", "computers/:id/files"),
 }
 
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
@@ -57,13 +89,13 @@ def pattern_for(path: str) -> str:
 
 
 @pytest.fixture
-def client() -> gc.Client:
-    return gc.Client("gck_test", base_url=BASE)
+def client() -> mc.Client:
+    return mc.Client("gck_test", base_url=BASE)
 
 
 @pytest.fixture
-def async_client() -> gc.AsyncClient:
-    return gc.AsyncClient("gck_test", base_url=BASE)
+def async_client() -> mc.AsyncClient:
+    return mc.AsyncClient("gck_test", base_url=BASE)
 
 
 def api_handler(request: httpx.Request) -> httpx.Response:
@@ -93,7 +125,7 @@ def called_routes(calls: object) -> set[tuple[str, str]]:
     }
 
 
-def exercise_everything(client: gc.Client) -> None:
+def exercise_everything(client: mc.Client) -> None:
     """Call every method the SDK exposes that performs a request."""
     client.templates.list()
     client.computers.list()
@@ -102,6 +134,7 @@ def exercise_everything(client: gc.Client) -> None:
     c.refresh()
     c.start()
     c.stop()
+    c.suspend()
     c.restart()
     c.clone(name="copy")
     c.rename("renamed")
@@ -139,7 +172,7 @@ def exercise_everything(client: gc.Client) -> None:
     c.delete()
 
 
-async def exercise_everything_async(client: gc.AsyncClient) -> None:
+async def exercise_everything_async(client: mc.AsyncClient) -> None:
     """The async mirror of exercise_everything."""
     await client.templates.list()
     await client.computers.list()
@@ -148,6 +181,7 @@ async def exercise_everything_async(client: gc.AsyncClient) -> None:
     await c.refresh()
     await c.start()
     await c.stop()
+    await c.suspend()
     await c.restart()
     await c.clone(name="copy")
     await c.rename("renamed")
@@ -186,7 +220,7 @@ async def exercise_everything_async(client: gc.AsyncClient) -> None:
 
 
 @respx.mock
-def test_every_call_lands_on_an_allowlisted_route(client: gc.Client) -> None:
+def test_every_call_lands_on_an_allowlisted_route(client: mc.Client) -> None:
     route = respx.route(host="api.test").mock(side_effect=api_handler)
     exercise_everything(client)
 
@@ -197,7 +231,7 @@ def test_every_call_lands_on_an_allowlisted_route(client: gc.Client) -> None:
 
 @respx.mock
 async def test_async_every_call_lands_on_an_allowlisted_route(
-    async_client: gc.AsyncClient,
+    async_client: mc.AsyncClient,
 ) -> None:
     route = respx.route(host="api.test").mock(side_effect=api_handler)
     await exercise_everything_async(async_client)
@@ -209,7 +243,7 @@ async def test_async_every_call_lands_on_an_allowlisted_route(
 
 @respx.mock
 async def test_both_clients_hit_exactly_the_same_routes(
-    client: gc.Client, async_client: gc.AsyncClient
+    client: mc.Client, async_client: mc.AsyncClient
 ) -> None:
     """Same routes, not merely each-inside-the-allowlist.
 
@@ -226,6 +260,22 @@ async def test_both_clients_hit_exactly_the_same_routes(
     async_called = called_routes(async_route.calls)
 
     assert sync_called == async_called
+
+
+@respx.mock
+def test_the_unreached_part_of_the_surface_is_exactly_what_we_think(
+    client: mc.Client,
+) -> None:
+    """The gap between the platform's surface and this SDK is the pinned one.
+
+    Closing one of these means deleting its line from UNIMPLEMENTED, which is
+    the point: the alternative is a set of routes nobody is tracking, on a
+    surface whose whole design is that it is enumerable.
+    """
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    exercise_everything(client)
+
+    assert ALLOWED - called_routes(route.calls) == UNIMPLEMENTED
 
 
 def test_pattern_for_treats_ids_as_ids() -> None:

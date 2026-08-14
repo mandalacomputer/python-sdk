@@ -1,8 +1,8 @@
-"""Python SDK for GorillaCloud — cloud desktops for AI agents.
+"""Python SDK for Mandala Computer — cloud desktops for AI agents.
 
-    from gorillacloud import Client
+    from mandala_computer import Client
 
-    client = Client()                                   # GORILLACLOUD_API_KEY
+    client = Client()                                   # MANDALA_API_KEY
     with client.computers.ephemeral(template="base") as c:
         c.wait_for_guest()
         c.open("https://example.com")           # on the screen, not as root
@@ -12,7 +12,7 @@
 
 ``AsyncClient`` mirrors it method for method:
 
-    from gorillacloud import AsyncClient
+    from mandala_computer import AsyncClient
 
     async with AsyncClient() as client:
         async with client.computers.ephemeral(template="base") as c:
@@ -35,13 +35,13 @@ from ._exceptions import (
     APIError,
     AuthenticationError,
     ConflictError,
-    GorillaCloudError,
+    MandalaError,
     NotFoundError,
     PermissionDeniedError,
     PlanLimitError,
     TimeoutError,
 )
-from ._models import ExecResult, Snapshot, Template
+from ._models import ExecResult, Snapshot, Template, VncConnect
 from ._resources import Computers, Snapshots, Templates
 
 __version__ = "0.1.0"
@@ -58,22 +58,23 @@ __all__ = [
     "Computer",
     "ConflictError",
     "ExecResult",
-    "GorillaCloudError",
+    "MandalaError",
     "NotFoundError",
     "PermissionDeniedError",
     "PlanLimitError",
     "Snapshot",
     "Template",
     "TimeoutError",
+    "VncConnect",
     "__version__",
 ]
 
 
 class Client:
-    """Entry point to the GorillaCloud API.
+    """Entry point to the Mandala Computer API.
 
-    :param api_key: defaults to ``GORILLACLOUD_API_KEY``.
-    :param base_url: defaults to ``GORILLACLOUD_BASE_URL``, then the public API.
+    :param api_key: defaults to ``MANDALA_API_KEY``.
+    :param base_url: defaults to ``MANDALA_BASE_URL``, then the public API.
     """
 
     def __init__(
@@ -105,13 +106,13 @@ class Client:
 
 
 class AsyncClient:
-    """Entry point to the GorillaCloud API, driven with ``await``.
+    """Entry point to the Mandala Computer API, driven with ``await``.
 
     Same arguments and behaviour as :class:`Client`; every method that performs
     IO is a coroutine.
 
-    :param api_key: defaults to ``GORILLACLOUD_API_KEY``.
-    :param base_url: defaults to ``GORILLACLOUD_BASE_URL``, then the public API.
+    :param api_key: defaults to ``MANDALA_API_KEY``.
+    :param base_url: defaults to ``MANDALA_BASE_URL``, then the public API.
     """
 
     def __init__(

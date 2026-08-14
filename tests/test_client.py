@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-import gorillacloud as gc
+import mandala_computer as mc
 
 BASE = "https://api.test/api/v1"
 
@@ -27,37 +27,37 @@ COMPUTER = {
 
 
 @pytest.fixture
-def client() -> gc.Client:
-    return gc.Client("gck_test", base_url=BASE)
+def client() -> mc.Client:
+    return mc.Client("gck_test", base_url=BASE)
 
 
 def test_api_key_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GORILLACLOUD_API_KEY", raising=False)
-    with pytest.raises(gc.GorillaCloudError, match="No API key"):
-        gc.Client()
+    monkeypatch.delenv("MANDALA_API_KEY", raising=False)
+    with pytest.raises(mc.MandalaError, match="No API key"):
+        mc.Client()
 
 
 def test_api_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GORILLACLOUD_API_KEY", "gck_env")
-    assert gc.Client(base_url=BASE).base_url == BASE
+    monkeypatch.setenv("MANDALA_API_KEY", "gck_env")
+    assert mc.Client(base_url=BASE).base_url == BASE
 
 
 @respx.mock
-def test_sends_bearer_token(client: gc.Client) -> None:
+def test_sends_bearer_token(client: mc.Client) -> None:
     route = respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[COMPUTER]))
     client.computers.list()
     assert route.calls.last.request.headers["Authorization"] == "Bearer gck_test"
 
 
 @respx.mock
-def test_list_and_fields(client: gc.Client) -> None:
+def test_list_and_fields(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[COMPUTER]))
     (c,) = client.computers.list()
     assert (c.id, c.name, c.status, c.cpu, c.ram_mb) == ("vm-1", "dev", "running", 2, 2048)
 
 
 @respx.mock
-def test_create_omits_unset_fields(client: gc.Client) -> None:
+def test_create_omits_unset_fields(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     client.computers.create(name="dev", template="base")
     body = route.calls.last.request.content.decode()
@@ -68,7 +68,7 @@ def test_create_omits_unset_fields(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_unknown_response_fields_survive(client: gc.Client) -> None:
+def test_unknown_response_fields_survive(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "future_field": 42})
     )
@@ -82,14 +82,14 @@ def test_unknown_response_fields_survive(client: gc.Client) -> None:
 @pytest.mark.parametrize(
     ("status", "exc"),
     [
-        (401, gc.AuthenticationError),
-        (402, gc.PlanLimitError),
-        (403, gc.PermissionDeniedError),
-        (404, gc.NotFoundError),
-        (500, gc.APIError),
+        (401, mc.AuthenticationError),
+        (402, mc.PlanLimitError),
+        (403, mc.PermissionDeniedError),
+        (404, mc.NotFoundError),
+        (500, mc.APIError),
     ],
 )
-def test_status_maps_to_exception(client: gc.Client, status: int, exc: type) -> None:
+def test_status_maps_to_exception(client: mc.Client, status: int, exc: type) -> None:
     respx.get(f"{BASE}/computers").mock(httpx.Response(status, json={"error": "nope"}))
     with pytest.raises(exc) as e:
         client.computers.list()
@@ -98,9 +98,9 @@ def test_status_maps_to_exception(client: gc.Client, status: int, exc: type) -> 
 
 
 @respx.mock
-def test_non_json_error_still_raises(client: gc.Client) -> None:
+def test_non_json_error_still_raises(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers").mock(httpx.Response(502, text="bad gateway"))
-    with pytest.raises(gc.APIError, match="bad gateway"):
+    with pytest.raises(mc.APIError, match="bad gateway"):
         client.computers.list()
 
 
@@ -108,9 +108,9 @@ def test_non_json_error_still_raises(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_click_payload(client: gc.Client) -> None:
+def test_click_payload(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
-    gc.Computer(client._t, COMPUTER).click(10, 20)
+    mc.Computer(client._t, COMPUTER).click(10, 20)
     assert json.loads(route.calls.last.request.content) == {
         "action": "left_click",
         "x": 10,
@@ -119,63 +119,63 @@ def test_click_payload(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_key_chord(client: gc.Client) -> None:
+def test_key_chord(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
-    gc.Computer(client._t, COMPUTER).key("ctrl", "c")
+    mc.Computer(client._t, COMPUTER).key("ctrl", "c")
     assert json.loads(route.calls.last.request.content)["keys"] == ["ctrl", "c"]
 
 
-def test_key_requires_at_least_one(client: gc.Client) -> None:
+def test_key_requires_at_least_one(client: mc.Client) -> None:
     with pytest.raises(ValueError):
-        gc.Computer(client._t, COMPUTER).key()
+        mc.Computer(client._t, COMPUTER).key()
 
 
-def test_scroll_rejects_bad_direction(client: gc.Client) -> None:
+def test_scroll_rejects_bad_direction(client: mc.Client) -> None:
     with pytest.raises(ValueError, match="up.*down"):
-        gc.Computer(client._t, COMPUTER).scroll(direction="sideways")
+        mc.Computer(client._t, COMPUTER).scroll(direction="sideways")
 
 
 @respx.mock
-def test_screenshot_returns_bytes(client: gc.Client) -> None:
+def test_screenshot_returns_bytes(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
         httpx.Response(200, content=b"\x89PNG\r\n", headers={"Content-Type": "image/png"})
     )
-    assert gc.Computer(client._t, COMPUTER).screenshot().startswith(b"\x89PNG")
+    assert mc.Computer(client._t, COMPUTER).screenshot().startswith(b"\x89PNG")
 
 
 @respx.mock
-def test_screenshot_width_becomes_query_param(client: gc.Client) -> None:
+def test_screenshot_width_becomes_query_param(client: mc.Client) -> None:
     route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"jpg"))
-    gc.Computer(client._t, COMPUTER).screenshot(width=320)
+    mc.Computer(client._t, COMPUTER).screenshot(width=320)
     assert route.calls.last.request.url.params["w"] == "320"
 
 
 @respx.mock
-def test_exec_nonzero_exit_is_returned_not_raised(client: gc.Client) -> None:
+def test_exec_nonzero_exit_is_returned_not_raised(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 1, "stdout": "", "stderr": "boom", "timed_out": False})
     )
-    res = gc.Computer(client._t, COMPUTER).exec("false")
+    res = mc.Computer(client._t, COMPUTER).exec("false")
     assert res.exit_code == 1 and res.stderr == "boom" and not res.ok
 
 
 @respx.mock
-def test_exec_omits_session_unless_desktop_requested(client: gc.Client) -> None:
+def test_exec_omits_session_unless_desktop_requested(client: mc.Client) -> None:
     """The server defaults to the system context; an empty session is not the same
     as an absent one, so the key stays off the wire until it is asked for."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
     )
-    gc.Computer(client._t, COMPUTER).exec("whoami")
+    mc.Computer(client._t, COMPUTER).exec("whoami")
     assert "session" not in json.loads(route.calls.last.request.content)
 
 
 @respx.mock
-def test_exec_desktop_sends_session_desktop(client: gc.Client) -> None:
+def test_exec_desktop_sends_session_desktop(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
     )
-    gc.Computer(client._t, COMPUTER).exec("whoami", desktop=True)
+    mc.Computer(client._t, COMPUTER).exec("whoami", desktop=True)
     assert json.loads(route.calls.last.request.content)["session"] == "desktop"
 
 
@@ -183,43 +183,43 @@ def test_exec_desktop_sends_session_desktop(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_wait_until_running_polls_until_ready(client: gc.Client) -> None:
+def test_wait_until_running_polls_until_ready(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(
         side_effect=[
             httpx.Response(200, json={**COMPUTER, "status": "stopped"}),
             httpx.Response(200, json={**COMPUTER, "status": "running"}),
         ]
     )
-    c = gc.Computer(client._t, {**COMPUTER, "status": "stopped"})
+    c = mc.Computer(client._t, {**COMPUTER, "status": "stopped"})
     assert c.wait_until_running(timeout=5, poll=0).status == "running"
 
 
 @respx.mock
-def test_wait_until_running_times_out(client: gc.Client) -> None:
+def test_wait_until_running_times_out(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "status": "stopped"})
     )
-    c = gc.Computer(client._t, COMPUTER)
-    with pytest.raises(gc.TimeoutError):
+    c = mc.Computer(client._t, COMPUTER)
+    with pytest.raises(mc.TimeoutError):
         c.wait_until_running(timeout=0, poll=0)
 
 
 @respx.mock
-def test_wait_for_guest_ignores_errors_while_booting(client: gc.Client) -> None:
+def test_wait_for_guest_ignores_errors_while_booting(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
             httpx.Response(400, json={"error": "not running"}),
             httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}),
         ]
     )
-    gc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
+    mc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
 
 
 # --- rename ---------------------------------------------------------------
 
 
 @respx.mock
-def test_rename_updates_the_handle_in_place(client: gc.Client) -> None:
+def test_rename_updates_the_handle_in_place(client: mc.Client) -> None:
     """The handle a caller is already holding is the one that must be right.
 
     Renaming through a stale handle and then reading .name off it is the
@@ -228,25 +228,25 @@ def test_rename_updates_the_handle_in_place(client: gc.Client) -> None:
     route = respx.patch(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "name": "build box"})
     )
-    c = gc.Computer(client._t, COMPUTER)
+    c = mc.Computer(client._t, COMPUTER)
     assert c.rename("build box") is c
     assert c.name == "build box"
     assert json.loads(route.calls[0].request.content) == {"name": "build box"}
 
 
 @respx.mock
-def test_rename_reports_the_name_the_server_settled_on(client: gc.Client) -> None:
+def test_rename_reports_the_name_the_server_settled_on(client: mc.Client) -> None:
     """The server trims and caps, so the stored name may not be the one sent."""
     respx.patch(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "name": "two lines tabbed"})
     )
-    c = gc.Computer(client._t, COMPUTER)
+    c = mc.Computer(client._t, COMPUTER)
     assert c.rename("  two\nlines\ttabbed  ").name == "two lines tabbed"
 
 
-def test_rename_refuses_an_empty_name_without_asking(client: gc.Client) -> None:
+def test_rename_refuses_an_empty_name_without_asking(client: mc.Client) -> None:
     """The server refuses it too; there is no reason to spend a round trip."""
-    c = gc.Computer(client._t, COMPUTER)
+    c = mc.Computer(client._t, COMPUTER)
     for name in ("", "   ", "\t\n"):
         with pytest.raises(ValueError, match="must not be empty"):
             c.rename(name)
@@ -257,7 +257,7 @@ def test_rename_refuses_an_empty_name_without_asking(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_schedule_is_the_window_only(client: gc.Client) -> None:
+def test_schedule_is_the_window_only(client: mc.Client) -> None:
     """The schedule carries no last_run, by design.
 
     It was the scheduler's own bookkeeping and lied in both directions — as a
@@ -268,7 +268,7 @@ def test_schedule_is_the_window_only(client: gc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1/schedule").mock(
         httpx.Response(200, json={"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"})
     )
-    sched = gc.Computer(client._t, COMPUTER).schedule()
+    sched = mc.Computer(client._t, COMPUTER).schedule()
     assert "last_run" not in sched
     # Empty string would mean "UTC" to the daemon but is rejected by every
     # timezone library, so the surface must name the zone.
@@ -276,7 +276,7 @@ def test_schedule_is_the_window_only(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_scheduled_snapshots_are_distinguishable(client: gc.Client) -> None:
+def test_scheduled_snapshots_are_distinguishable(client: mc.Client) -> None:
     """`auto` is what makes snapshot times usable as backup history.
 
     It also marks the only snapshots retention will ever age out.
@@ -298,7 +298,7 @@ def test_scheduled_snapshots_are_distinguishable(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_clear_schedule_is_a_delete_not_a_disable(client: gc.Client) -> None:
+def test_clear_schedule_is_a_delete_not_a_disable(client: mc.Client) -> None:
     """Disabling keeps the time and the bookkeeping; clearing removes both."""
     cleared = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"}
     route = respx.delete(f"{BASE}/computers/vm-1/schedule").mock(
@@ -306,15 +306,15 @@ def test_clear_schedule_is_a_delete_not_a_disable(client: gc.Client) -> None:
     )
     put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
 
-    assert gc.Computer(client._t, COMPUTER).clear_schedule() == cleared
+    assert mc.Computer(client._t, COMPUTER).clear_schedule() == cleared
     assert route.called
     assert not put.called, "clearing must not go through the set path"
 
 
 @respx.mock
-def test_set_schedule_validates_before_sending(client: gc.Client) -> None:
+def test_set_schedule_validates_before_sending(client: mc.Client) -> None:
     route = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
-    c = gc.Computer(client._t, COMPUTER)
+    c = mc.Computer(client._t, COMPUTER)
     with pytest.raises(ValueError, match="hour"):
         c.set_schedule(enabled=True, hour=24)
     with pytest.raises(ValueError, match="minute"):
@@ -326,7 +326,7 @@ def test_set_schedule_validates_before_sending(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_ephemeral_deletes_on_exit(client: gc.Client) -> None:
+def test_ephemeral_deletes_on_exit(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     delete = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
     with client.computers.ephemeral(template="base") as c:
@@ -335,7 +335,7 @@ def test_ephemeral_deletes_on_exit(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_ephemeral_deletes_even_when_block_raises(client: gc.Client) -> None:
+def test_ephemeral_deletes_even_when_block_raises(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     delete = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
     with pytest.raises(RuntimeError), client.computers.ephemeral(template="base"):
@@ -344,7 +344,7 @@ def test_ephemeral_deletes_even_when_block_raises(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_create_does_not_delete(client: gc.Client) -> None:
+def test_create_does_not_delete(client: mc.Client) -> None:
     """create() is not scoped to a block — only ephemeral() may destroy a disk."""
     respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     delete = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200))
@@ -356,37 +356,37 @@ def test_create_does_not_delete(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_open_runs_in_the_desktop_session(client: gc.Client) -> None:
+def test_open_runs_in_the_desktop_session(client: mc.Client) -> None:
     """A browser with no DISPLAY is the bug open() exists to stop anyone hitting."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
     )
-    gc.Computer(client._t, COMPUTER).open("https://example.com")
+    mc.Computer(client._t, COMPUTER).open("https://example.com")
     body = json.loads(route.calls.last.request.content)
     assert body["session"] == "desktop"
 
 
 @respx.mock
-def test_open_detaches_the_launch(client: gc.Client) -> None:
+def test_open_detaches_the_launch(client: mc.Client) -> None:
     """A foreground browser blocks until the timeout kills it, then reports a
     failure it did not have — having opened the window anyway."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
     )
-    gc.Computer(client._t, COMPUTER).open("https://example.com")
+    mc.Computer(client._t, COMPUTER).open("https://example.com")
     command = json.loads(route.calls.last.request.content)["command"]
     assert command.endswith("&")
     assert "nohup" in command
 
 
 @respx.mock
-def test_open_does_not_ask_for_the_default_handler(client: gc.Client) -> None:
+def test_open_does_not_ask_for_the_default_handler(client: mc.Client) -> None:
     """xdg-open and friends are installed and all exit 0 without launching
     anything, so naming the browser is the whole point of this method."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
     )
-    gc.Computer(client._t, COMPUTER).open("https://example.com")
+    mc.Computer(client._t, COMPUTER).open("https://example.com")
     command = json.loads(route.calls.last.request.content)["command"]
     for handler in ("xdg-open", "exo-open", "sensible-browser", "x-www-browser"):
         assert handler not in command
@@ -398,20 +398,20 @@ def test_open_url_reaches_the_shell_as_one_argument() -> None:
     it, the whole URL has to come back as a single word — a substring check
     would pass on quoting that does not actually hold."""
     url = "https://x/?a=b; touch /tmp/pwned"
-    assert url in shlex.split(gc._api.open_url_command(url))
+    assert url in shlex.split(mc._api.open_url_command(url))
 
 
 def test_open_refuses_a_url_a_browser_would_read_as_a_flag() -> None:
     """Quoting stops the shell seeing it; nothing stops the browser seeing it.
     No URL starts with a dash, so this is refused rather than escaped."""
     with pytest.raises(ValueError, match="must not start with"):
-        gc._api.open_url_command("--profile=/tmp/evil")
+        mc._api.open_url_command("--profile=/tmp/evil")
 
 
 def test_open_refuses_an_empty_url() -> None:
     for blank in ("", "   "):
         with pytest.raises(ValueError, match="must not be empty"):
-            gc._api.open_url_command(blank)
+            mc._api.open_url_command(blank)
 
 
 # --- the computer-use verb set (OPL-3567) ---------------------------------
@@ -423,13 +423,13 @@ def test_open_refuses_an_empty_url() -> None:
 # click has not worked.
 
 
-def _computer(client: gc.Client) -> gc.Computer:
+def _computer(client: mc.Client) -> mc.Computer:
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     return client.computers.get("vm-1")
 
 
 @respx.mock
-def test_a_click_with_no_coordinate_clicks_where_the_pointer_is(client: gc.Client) -> None:
+def test_a_click_with_no_coordinate_clicks_where_the_pointer_is(client: mc.Client) -> None:
     # Absent and (0, 0) are different requests. A model emits a bare click after
     # a move; sending zeros would click the corner of the screen instead.
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
@@ -441,14 +441,14 @@ def test_a_click_with_no_coordinate_clicks_where_the_pointer_is(client: gc.Clien
 
 
 @respx.mock
-def test_modifiers_are_held_for_the_click(client: gc.Client) -> None:
+def test_modifiers_are_held_for_the_click(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     _computer(client).click(10, 20, "ctrl", "shift")
     assert json.loads(route.calls[0].request.content)["text"] == "ctrl+shift"
 
 
 @respx.mock
-def test_a_drag_sends_both_ends(client: gc.Client) -> None:
+def test_a_drag_sends_both_ends(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = _computer(client)
     c.drag(90, 80, from_x=10, from_y=20)
@@ -464,7 +464,7 @@ def test_a_drag_sends_both_ends(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_the_cursor_position_is_none_until_something_places_it(client: gc.Client) -> None:
+def test_the_cursor_position_is_none_until_something_places_it(client: mc.Client) -> None:
     # The virtual pointing device takes coordinates and reports none back, so an
     # untouched pointer has no position anybody knows. Zeros here would be
     # indistinguishable from the top-left corner, which is the exact wrong thing
@@ -476,7 +476,7 @@ def test_the_cursor_position_is_none_until_something_places_it(client: gc.Client
 
 
 @respx.mock
-def test_the_cursor_position_is_returned_once_it_is_known(client: gc.Client) -> None:
+def test_the_cursor_position_is_returned_once_it_is_known(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/input").mock(
         httpx.Response(200, json={"ok": True, "x": 640, "y": 400, "known": True})
     )
@@ -484,7 +484,7 @@ def test_the_cursor_position_is_returned_once_it_is_known(client: gc.Client) -> 
 
 
 @respx.mock
-def test_scroll_takes_all_four_directions_and_refuses_the_rest(client: gc.Client) -> None:
+def test_scroll_takes_all_four_directions_and_refuses_the_rest(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = _computer(client)
     for direction in ("up", "down", "left", "right"):
@@ -494,7 +494,7 @@ def test_scroll_takes_all_four_directions_and_refuses_the_rest(client: gc.Client
 
 
 @respx.mock
-def test_hold_key_and_wait_refuse_a_non_positive_duration(client: gc.Client) -> None:
+def test_hold_key_and_wait_refuse_a_non_positive_duration(client: mc.Client) -> None:
     c = _computer(client)
     with pytest.raises(ValueError):
         c.hold_key("shift", seconds=0)
@@ -508,7 +508,7 @@ def test_hold_key_and_wait_refuse_a_non_positive_duration(client: gc.Client) -> 
 
 
 @respx.mock
-def test_resolution_is_sent_on_create_and_read_back(client: gc.Client) -> None:
+def test_resolution_is_sent_on_create_and_read_back(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers").mock(
         httpx.Response(200, json={**COMPUTER, "id": "vm-2", "resolution": "1920x1080x24"})
     )
@@ -519,7 +519,7 @@ def test_resolution_is_sent_on_create_and_read_back(client: gc.Client) -> None:
 
 
 @respx.mock
-def test_a_computer_that_reports_no_resolution_reads_as_the_default(client: gc.Client) -> None:
+def test_a_computer_that_reports_no_resolution_reads_as_the_default(client: mc.Client) -> None:
     # A server old enough not to report one has computers that render at
     # 1280x800x24, so that is the answer rather than an empty string — a caller
     # sizing a coordinate space needs a number.
@@ -529,7 +529,7 @@ def test_a_computer_that_reports_no_resolution_reads_as_the_default(client: gc.C
 
 
 @respx.mock
-def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: gc.Client) -> None:
+def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: mc.Client) -> None:
     # scroll() used to send x=0,y=0 always, and the server reads a flat
     # coordinate as a position — so a defaulted scroll moved to the top-left
     # first and scrolled whatever was there rather than what the caller was
@@ -551,7 +551,7 @@ def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: gc.C
 
 
 @respx.mock
-def test_half_a_drag_origin_is_refused_rather_than_dropped(client: gc.Client) -> None:
+def test_half_a_drag_origin_is_refused_rather_than_dropped(client: mc.Client) -> None:
     # Dropping it produces a drag that succeeds while selecting a different
     # region — the worst shape a mistake can take, because nothing reports it.
     c = _computer(client)
@@ -559,3 +559,178 @@ def test_half_a_drag_origin_is_refused_rather_than_dropped(client: gc.Client) ->
         c.drag(90, 80, from_x=10)
     with pytest.raises(ValueError):
         c.drag(90, 80, from_y=20)
+
+
+# --- the create envelope ----------------------------------------------------
+
+
+VNC = {
+    "url": "wss://api.test/api/v1/computers/vm-1/vnc?token=abc",
+    "view_url": "wss://api.test/api/v1/computers/vm-1/vnc?token=view-def",
+    "token": "abc",
+    "view_token": "view-def",
+    "embed_url": "https://api.test/embed/desktop#computer=vm-1&token=view-def",
+}
+
+
+@respx.mock
+def test_a_create_that_could_not_boot_still_hands_back_the_computer(
+    client: mc.Client,
+) -> None:
+    """The platform answers 201 {computer, start_error} rather than an error.
+
+    Read as an ordinary computer that envelope has no id — and the id is the
+    whole reason it is sent, because the machine exists and is being paid for.
+    """
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(
+            201,
+            json={"computer": COMPUTER, "start_error": "no host had room to start it"},
+        )
+    )
+    c = client.computers.create(template="base")
+    assert c.id == "vm-1"
+    assert c.cpu == 2
+    assert c.start_error == "no host had room to start it"
+
+
+@respx.mock
+def test_an_ordinary_create_reports_no_start_error(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(201, json=COMPUTER))
+    assert client.computers.create(template="base").start_error == ""
+
+
+@respx.mock
+def test_a_refresh_clears_the_start_error(client: mc.Client) -> None:
+    # It describes one start attempt, not the machine.
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(201, json={"computer": COMPUTER, "start_error": "boom"})
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    c = client.computers.create(template="base")
+    assert c.refresh().start_error == ""
+
+
+# --- suspend ----------------------------------------------------------------
+
+
+@respx.mock
+def test_suspend_posts_and_reads_the_state_back(client: mc.Client) -> None:
+    suspended = {**COMPUTER, "status": "suspended", "suspended": {"at": "2026-08-14T09:00:00Z"}}
+    route = respx.post(f"{BASE}/computers/vm-1/suspend").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    # Running when it is fetched, suspended when it is read back afterwards.
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=[
+            httpx.Response(200, json=COMPUTER),
+            httpx.Response(200, json=suspended),
+        ]
+    )
+    c = client.computers.get("vm-1").suspend()
+    assert route.called
+    assert c.is_suspended
+    assert c.suspended_at == "2026-08-14T09:00:00Z"
+
+
+@respx.mock
+def test_a_running_computer_is_not_suspended(client: mc.Client) -> None:
+    c = _computer(client)
+    assert not c.is_suspended
+    assert c.suspended_at == ""
+
+
+@respx.mock
+def test_waiting_for_a_suspended_computer_says_so_rather_than_timing_out(
+    client: mc.Client,
+) -> None:
+    # It will not become "running" on its own, and a timeout is the least
+    # informative answer available about the one case a caller fixes in a line.
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "suspended"})
+    )
+    c = client.computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="suspended"):
+        c.wait_until_running(timeout=30)
+
+
+# --- the connect surface ----------------------------------------------------
+
+
+@respx.mock
+def test_a_single_computer_carries_the_desktop_credentials(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "vnc": VNC})
+    )
+    vnc = client.computers.get("vm-1").vnc
+    assert vnc is not None
+    assert vnc.token == "abc"
+    assert vnc.view_token == "view-def"
+    assert vnc.embed_url.endswith("token=view-def")
+
+
+@respx.mock
+def test_a_listed_computer_has_no_credentials_until_it_is_refreshed(
+    client: mc.Client,
+) -> None:
+    # The platform keeps them off the list deliberately: a credential in every
+    # list response is a credential in every log line that captured one.
+    respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[COMPUTER]))
+    (c,) = client.computers.list()
+    assert c.vnc is None
+
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "vnc": VNC})
+    )
+    assert c.refresh().vnc is not None
+
+
+@respx.mock
+def test_half_a_connect_surface_is_no_connect_surface(client: mc.Client) -> None:
+    # A URL built over a missing credential is indistinguishable from a working
+    # one and answers 401 forever, so anything short of both is None.
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "vnc": {**VNC, "view_token": ""}})
+    )
+    assert client.computers.get("vm-1").vnc is None
+
+
+# --- truncated guest output -------------------------------------------------
+
+
+@respx.mock
+def test_exec_reports_output_the_guest_agent_stopped_capturing(client: mc.Client) -> None:
+    """16 MiB in, qemu-ga stops capturing and says so.
+
+    Dropped, a command whose output passed the cap comes back short and looks
+    complete — a failure with no symptom.
+    """
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(
+            200,
+            json={
+                "exit_code": 0,
+                "stdout": "half a file",
+                "stderr": "",
+                "timed_out": False,
+                "out_truncated": True,
+            },
+        )
+    )
+    res = _computer(client).exec("cat /var/log/big")
+    assert res.truncated
+    assert res.out_truncated and not res.err_truncated
+    # Still a command that succeeded — whether a short answer is acceptable is
+    # the caller's call, so `ok` deliberately does not fold this in.
+    assert res.ok
+
+
+@respx.mock
+def test_an_ordinary_exec_is_not_truncated(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(
+            200,
+            json={"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False},
+        )
+    )
+    assert not _computer(client).exec("echo ok").truncated

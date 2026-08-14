@@ -1,6 +1,7 @@
-# gorillacloud-python
+# mandala-computer-python
 
-Python SDK for [GorillaCloud](https://gorillacloud.ai) — cloud desktops for AI agents.
+Python SDK for [Mandala Computer](https://mandala.computer) — cloud desktops for
+AI agents.
 
 > **Status: alpha, unpublished.** The API surface is settling; expect breaking
 > changes before 1.0.
@@ -8,16 +9,16 @@ Python SDK for [GorillaCloud](https://gorillacloud.ai) — cloud desktops for AI
 ## Install
 
 ```sh
-pip install gorillacloud       # not yet published
+pip install mandala-computer       # not yet published
 ```
 
 ## Use
 
 Authentication is an API key from the dashboard (Settings → API keys), read from
-`GORILLACLOUD_API_KEY` unless you pass one.
+`MANDALA_API_KEY` unless you pass one.
 
 ```python
-from gorillacloud import Client
+from mandala_computer import Client
 
 client = Client()
 
@@ -48,6 +49,65 @@ destroys its disk, so tying that to a `with` block is only safe when the block i
 unambiguously the machine's whole lifetime — which `ephemeral()` declares and
 `create()` does not.
 
+A create that builds a computer which then will not boot is not an error. The
+machine exists and is billable, so it comes back — stopped, with the reason on
+it — rather than being thrown away with an exception:
+
+```python
+c = client.computers.create(template="base")
+if c.start_error:
+    print(c.start_error)   # e.g. "no host had room to start it"
+    c.start()              # often works on a second attempt
+```
+
+### Suspending
+
+A suspend writes the guest's RAM to disk and gives the host its memory back.
+It is a pause, not a stop: `start()` afterwards resumes the same session — same
+processes, same open windows — in about a second, instead of booting.
+
+```python
+c.suspend()
+c.is_suspended     # True
+c.suspended_at     # when the session was saved
+c.start()          # resumes it; ~1s, not a boot
+c.stop()           # discards the session instead
+```
+
+`restart()` is refused with `ConflictError` while a session is saved, since it
+would have to guess which of those two you meant. Start it or stop it first.
+
+**A computer can suspend without you asking.** Its host puts down anything
+nobody has used for the host's idle window — 30 minutes by default. Input,
+`exec()` and file transfers all count as use and resume it automatically;
+**`screenshot()` deliberately does not**, so a loop that only polls the screen
+can watch its own machine go down under it. Drive the desktop, or accept the
+resume.
+
+`wait_until_running()` raises rather than spinning if it finds a suspended
+computer, because that state does not resolve on its own — `start()` is the fix.
+
+### Showing somebody the desktop
+
+Every response that *is* one computer carries the credentials and URLs to open
+its live desktop, so putting a screen on your own page costs no extra call:
+
+```python
+c = client.computers.get(computer_id)
+c.vnc.embed_url    # watch-only, drop straight into an <iframe>
+c.vnc.url          # full control: keyboard, pointer, clipboard
+c.vnc.view_url     # watch only — the platform drops input on this socket
+```
+
+Two credentials, because they are not the same permission. `view_token` cannot
+type even from a patched client; `token` is root-equivalent on that machine.
+Neither is your API key — which is every computer on the account, forever, and
+must never reach a browser. Both end when the computer restarts.
+
+`vnc` is `None` on a computer that came from `list()`. That is deliberate on the
+platform's side: a desktop credential in every list response is a credential in
+every log line that ever captured one. Call `refresh()` to get one.
+
 ### Async
 
 `AsyncClient` mirrors `Client` method for method — same names, same arguments,
@@ -55,7 +115,7 @@ same errors. Everything that performs IO is a coroutine.
 
 ```python
 import asyncio
-from gorillacloud import AsyncClient
+from mandala_computer import AsyncClient
 
 async def main():
     async with AsyncClient() as client:
@@ -102,8 +162,11 @@ identifying where those bytes came from.
 
 ### Driving the desktop
 
-Coordinates are in the guest's fixed 1280×800 space (`gorillacloud.SCREEN_WIDTH`
-/ `SCREEN_HEIGHT`).
+Coordinates are in the computer's own screen space. That is a create-time choice
+now rather than a fixed size, so read `c.resolution` (or `c.screen` for the two
+numbers) instead of assuming — `mandala_computer.SCREEN_WIDTH` / `SCREEN_HEIGHT`
+are the 1280×800 default, which is only what a computer that asked for nothing
+else renders at.
 
 ```python
 c.move(x, y); c.click(x, y); c.right_click(x, y); c.double_click(x, y)
@@ -119,6 +182,21 @@ res.ok, res.exit_code, res.stdout, res.stderr
 ```
 
 A non-zero exit is returned, not raised — check `res.ok`.
+
+The guest agent stops capturing a command's output at 16 MiB while the command
+keeps producing it, so what comes back can be the first 16 MiB with nothing else
+to say there was more. `res.truncated` is that signal, and it is worth checking
+before parsing anything that could be large:
+
+```python
+res = c.exec("cat /var/log/syslog")
+if res.truncated:
+    ...     # redirect to a file inside the guest and fetch it instead
+```
+
+`res.ok` deliberately ignores truncation: a command that succeeded and produced
+a lot of output still succeeded, and whether a short answer is acceptable depends
+on what you were going to do with it.
 
 ### Launching GUI applications
 
@@ -194,7 +272,9 @@ Until that lands, drive the Windows desktop through `click()`, `type()` and
 
 - `wait_until_built()` — a cloned computer's disk has been copied. Only clones
   need this; it returns at once for anything else.
-- `wait_until_running()` — the VM is up. The guest OS is still booting.
+- `wait_until_running()` — the VM is up. The guest OS is still booting. Raises
+  rather than waiting out the timeout on a failed build or a suspended session,
+  neither of which becomes "running" on its own.
 - `wait_for_guest()` — the guest agent answers. Linux and Windows both; the probe
   is `exit 0`, which bash and cmd.exe both have as a builtin.
 
@@ -268,7 +348,7 @@ yourself are never removed automatically.
 
 ### Errors
 
-Everything derives from `GorillaCloudError`.
+Everything derives from `MandalaError`.
 
 | Exception | When |
 |---|---|
@@ -285,12 +365,18 @@ Everything derives from `GorillaCloudError`.
 `ConflictError` is the one worth catching separately, because it is the only one
 that clears itself: something is in flight that the operation cannot run
 alongside — a disk still being copied, a snapshot being taken, a delete already
-under way. Waiting and retrying is the fix; changing the request is not.
+under way, a guest agent that has not finished coming up, or a suspend committed
+to the computer a moment before your call. Waiting and retrying is the fix;
+changing the request is not.
+
+A retry loop on it terminates rather than spinning forever: a guest agent that
+stays silent past its boot window stops being a conflict and becomes a 502
+`APIError`, which is the platform saying the agent is broken rather than late.
 
 ```python
 try:
     c.snapshot()
-except gorillacloud.ConflictError:
+except mandala_computer.ConflictError:
     c.wait_until_built()   # or just try again shortly
     c.snapshot()
 ```
@@ -313,6 +399,13 @@ Practically: if something the SDK needs isn't in `/api/v1`, the fix is to add it
 there, not to reach past it. `tests/test_surface.py` enforces this — it exercises
 every method that makes a request, for **both** clients, and asserts each call
 lands on an allowlisted route, so drift fails here rather than in a user's hands.
+
+Drift has two directions, and that test pins both. `ALLOWED` mirrors the
+platform's route table in full, and `UNIMPLEMENTED` names the part of it this
+SDK cannot yet reach — currently the agent loop and its OpenAI-shaped door, file
+transfer, and the guest window list. Without the second set the first proves
+nothing over time: "every call lands on an allowlisted route" stays true no
+matter how far behind the client falls.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients.
