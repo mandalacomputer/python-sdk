@@ -9,6 +9,7 @@ platform's allowlist would only be checking one of them.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Mapping
 from typing import Any
 
 # --- paths ----------------------------------------------------------------
@@ -23,7 +24,8 @@ def computer(computer_id: str) -> str:
 
 
 def computer_action(computer_id: str, action: str) -> str:
-    """start | stop | restart | clone | screenshot | input | exec | snapshots | schedule."""
+    """start | stop | suspend | restart | clone | screenshot | input | exec |
+    snapshots | schedule."""
     return f"computers/{computer_id}/{action}"
 
 
@@ -34,6 +36,40 @@ def snapshot(snapshot_id: str) -> str:
 def snapshot_action(snapshot_id: str, action: str) -> str:
     """restore | clone."""
     return f"snapshots/{snapshot_id}/{action}"
+
+
+# --- responses ------------------------------------------------------------
+
+
+def computer_payload(data: Any) -> dict[str, Any]:
+    """Flatten a response that is one computer, in either shape it can arrive in.
+
+    A create whose guest was made and then would not boot answers 201 with
+    ``{"computer": {...}, "start_error": "..."}`` rather than an error alone —
+    deliberately, so the caller learns the id of the machine it is now paying
+    for instead of having to list to find it.
+
+    Read as an ordinary computer that envelope is a computer with no id: every
+    field reads off the wrapper, finds nothing, and the id the platform went out
+    of its way to return is the one thing dropped. So it is unwrapped here, and
+    the failure travels on the record beside the fields it belongs to — see
+    :attr:`~mandala_computer.Computer.start_error`.
+
+    Every response that is one computer goes through this, not just the create.
+    The envelope is the platform's shape for "here is your machine, and here is
+    what went wrong with it", and a second route answering that way should not
+    need a second discovery of this function.
+    """
+    if not isinstance(data, Mapping):
+        return {}
+    inner = data.get("computer")
+    if not isinstance(inner, Mapping):
+        return dict(data)
+    # start_error kept alongside the fields rather than in a parallel return, so
+    # it survives into `raw` and cannot be dropped by a caller that only wanted
+    # the computer. A refresh replaces the record and clears it, which is right:
+    # it describes one start attempt, not the machine.
+    return {**inner, "start_error": data.get("start_error")}
 
 
 # --- bodies ---------------------------------------------------------------

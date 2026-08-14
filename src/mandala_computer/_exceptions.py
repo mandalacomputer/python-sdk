@@ -6,7 +6,7 @@ __all__ = [
     "APIError",
     "AuthenticationError",
     "ConflictError",
-    "GorillaCloudError",
+    "MandalaError",
     "NotFoundError",
     "PermissionDeniedError",
     "PlanLimitError",
@@ -14,11 +14,11 @@ __all__ = [
 ]
 
 
-class GorillaCloudError(Exception):
+class MandalaError(Exception):
     """Base class for every error this SDK raises."""
 
 
-class APIError(GorillaCloudError):
+class APIError(MandalaError):
     """The API returned an unsuccessful response."""
 
     def __init__(self, message: str, *, status: int, body: object = None) -> None:
@@ -65,11 +65,23 @@ class ConflictError(APIError):
     - it is already being deleted
     - a snapshot being deleted is one another is chaining onto
     - a purge was confirmed against a set of snapshots that has since changed
+    - the guest agent has not answered yet, in the first seconds of a start —
+      so retrying is the remedy, and giving up here abandons a machine that was
+      about to answer
+    - another operation is holding that computer's guest agent
+    - a restart was asked of a computer with a suspended session, or a suspend
+      of one that is not running
+    - something is driving the guest at the moment a suspend was asked for, or
+      a suspend has committed to the computer a request just arrived for — the
+      retry resumes it, which is what the caller wanted
 
     Distinct from :class:`PlanLimitError`, which will not clear on its own, and
-    from a plain :class:`APIError`, which usually will not either.
+    from a plain :class:`APIError`, which usually will not either. A guest agent
+    that stays silent past its boot window stops being a conflict and becomes a
+    502 :class:`APIError`, so a retry loop on this exception terminates rather
+    than being told "still booting" forever.
     """
 
 
-class TimeoutError(GorillaCloudError):
+class TimeoutError(MandalaError):
     """A wait helper gave up before the computer reached the expected state."""

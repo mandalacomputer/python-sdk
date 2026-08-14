@@ -8,8 +8,8 @@ from typing import Any
 
 from . import _api
 from ._client import Transport
-from ._exceptions import GorillaCloudError, TimeoutError
-from ._models import ExecResult, Snapshot
+from ._exceptions import MandalaError, TimeoutError
+from ._models import ExecResult, Snapshot, VncConnect
 
 __all__ = ["Computer"]
 
@@ -68,12 +68,59 @@ class ComputerFields:
     def status(self) -> str:
         """State as of the last refresh.
 
-        ``"running"`` or ``"stopped"`` for an ordinary computer. A computer
-        made by cloning — from a snapshot or from another computer — starts as
-        ``"building"`` while its disk is copied, and becomes ``"build-failed"``
-        if that copy never finished. See :attr:`is_building`.
+        ``"running"`` or ``"stopped"`` for an ordinary computer, and
+        ``"suspended"`` for one whose session has been written to disk — see
+        :attr:`is_suspended`. A computer made by cloning — from a snapshot or
+        from another computer — starts as ``"building"`` while its disk is
+        copied, and becomes ``"build-failed"`` if that copy never finished. See
+        :attr:`is_building`.
         """
         return str(self._data.get("status", ""))
+
+    @property
+    def is_suspended(self) -> bool:
+        """True while this computer's RAM is on disk rather than in the host.
+
+        A suspend is a pause, not a stop: the session is written down, the host
+        gets its memory back, and the next :meth:`Computer.start` resumes the
+        same processes and the same open windows in about a second rather than
+        booting. :attr:`suspended_at` says when it was saved.
+
+        A computer can arrive here without anyone asking. Its host suspends
+        anything nobody has used for the host's idle window — 30 minutes by
+        default — and input, exec and file transfers resume it automatically.
+        Screenshots deliberately do not count as use and do not resume it, so a
+        loop that only polls the screen can be suspended out from under itself.
+        """
+        return self.status == "suspended"
+
+    @property
+    def suspended_at(self) -> str:
+        """When this computer's session was saved, or ``""`` if it is not saved.
+
+        How old the desktop behind the suspend is, which is the one part of the
+        platform's suspend record that is a caller's business — the rest of it
+        describes the host's QEMU rather than this machine.
+        """
+        suspended = self._data.get("suspended")
+        if isinstance(suspended, Mapping):
+            return str(suspended.get("at") or "")
+        return ""
+
+    @property
+    def start_error(self) -> str:
+        """Why this computer was made but would not boot, or ``""``.
+
+        Only ever set on the response to a create that asked for a running
+        machine and got as far as building one. The computer exists and is
+        billable, which is why the platform answers with it rather than with an
+        error alone; it is simply stopped, and :meth:`Computer.start` may well
+        work on a second attempt.
+
+        Cleared by :meth:`Computer.refresh`, because it describes one start
+        attempt rather than the machine.
+        """
+        return str(self._data.get("start_error") or "")
 
     @property
     def is_building(self) -> bool:
@@ -82,7 +129,7 @@ class ComputerFields:
         A clone returns before its disk exists, because copying one can run for
         minutes. Until it lands there is nothing to boot, and starting,
         stopping, snapshotting or cloning it raises
-        :class:`~gorillacloud.ConflictError`. Wait with
+        :class:`~mandala_computer.ConflictError`. Wait with
         :meth:`Computer.wait_until_built`.
         """
         return self.status == "building"
@@ -163,6 +210,28 @@ class ComputerFields:
         return str(self._data.get("created_at", ""))
 
     @property
+    def vnc(self) -> VncConnect | None:
+        """Credentials and URLs for this computer's live desktop, or ``None``.
+
+        What makes it possible to show somebody their own screen — in your page,
+        not the platform's dashboard — without a second call. See
+        :class:`~mandala_computer.VncConnect` for why there are two credentials.
+
+        ``None`` on a computer that came from :meth:`Computers.list`, and that is
+        the platform's decision rather than an omission: a desktop credential in
+        every list response is a credential in every log line that ever captured
+        one, whereas a caller holding a single machine is the caller about to
+        connect to it. Every response that *is* one computer — a create, a clone,
+        a :meth:`Computer.refresh`, a rename — carries it, so
+        ``c.refresh().vnc`` is how a listed computer gets one.
+
+        Also ``None`` when the platform could not reach the host holding this
+        computer, since a URL built over a missing credential answers 401 forever
+        rather than failing where it was built.
+        """
+        return VncConnect.from_api(self._data.get("vnc"))
+
+    @property
     def raw(self) -> Mapping[str, Any]:
         """The API response verbatim, including any fields this SDK predates."""
         return dict(self._data)
@@ -174,7 +243,7 @@ class ComputerFields:
 class Computer(ComputerFields):
     """A cloud desktop.
 
-    Obtain one from :class:`gorillacloud.Client` — ``client.computers.create()``,
+    Obtain one from :class:`mandala_computer.Client` — ``client.computers.create()``,
     ``.get()``, or ``.list()`` — rather than constructing it directly.
     """
 
@@ -185,19 +254,57 @@ class Computer(ComputerFields):
     # --- lifecycle ------------------------------------------------------
 
     def refresh(self) -> Computer:
-        """Re-read this computer's state from the API."""
-        self._data = dict(self._t.json("GET", _api.computer(self.id)) or {})
+        """Re-read this computer's state from the API.
+
+        Also how a computer from :meth:`Computers.list` acquires a :attr:`vnc`
+        connect surface, which the list deliberately omits.
+        """
+        self._data = _api.computer_payload(self._t.json("GET", _api.computer(self.id)))
         return self
 
     def start(self) -> Computer:
+        """Start this computer, or resume it if its session was suspended.
+
+        A suspended computer does not boot: its saved RAM is read back and the
+        same processes and windows come up roughly a second later. An ordinary
+        stopped computer boots as usual.
+        """
         self._t.request("POST", _api.computer_action(self.id, "start"))
         return self.refresh()
 
     def stop(self) -> Computer:
+        """Stop this computer, discarding a suspended session if it has one.
+
+        Use :meth:`suspend` to keep it.
+        """
         self._t.request("POST", _api.computer_action(self.id, "stop"))
         return self.refresh()
 
+    def suspend(self) -> Computer:
+        """Write this computer's RAM to disk and give the host its memory back.
+
+        A pause rather than a stop: :meth:`start` afterwards resumes the same
+        session — same processes, same open windows — in about a second instead
+        of booting. :meth:`stop` discards it and leaves an ordinary stopped
+        computer.
+
+        The computer must be running. Raises
+        :class:`~mandala_computer.ConflictError` for the states that clear on their
+        own — a capture or a clone reading the disk, a migration in flight, or
+        somebody driving the guest at that moment.
+        """
+        self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        return self.refresh()
+
     def restart(self) -> Computer:
+        """Reset this computer.
+
+        Raises :class:`~mandala_computer.ConflictError` while a suspended session is
+        saved, since a restart would have to guess whether you meant to resume
+        that session or throw it away. Start it or stop it first.
+
+        Desktop credentials do not survive this — see :attr:`vnc`.
+        """
         self._t.request("POST", _api.computer_action(self.id, "restart"))
         return self.refresh()
 
@@ -212,7 +319,7 @@ class Computer(ComputerFields):
         data = self._t.json(
             "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
         )
-        return Computer(self._t, data or {})
+        return Computer(self._t, _api.computer_payload(data))
 
     def rename(self, name: str) -> Computer:
         """Give this computer a new name, and return it renamed.
@@ -230,8 +337,8 @@ class Computer(ComputerFields):
         deleted they fall back to what it was called at the time, which is then
         all that is left of it.
         """
-        self._data = dict(
-            self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name)) or {}
+        self._data = _api.computer_payload(
+            self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name))
         )
         return self
 
@@ -245,8 +352,8 @@ class Computer(ComputerFields):
         """Block until a cloned computer's disk has been copied.
 
         Returns immediately for anything not being built, so it is safe to call
-        on any computer. Raises :class:`~gorillacloud.GorillaCloudError` if the
-        copy failed, and :class:`~gorillacloud.TimeoutError` if it is still
+        on any computer. Raises :class:`~mandala_computer.MandalaError` if the
+        copy failed, and :class:`~mandala_computer.TimeoutError` if it is still
         going when ``timeout`` runs out — the computer keeps building either
         way; only the waiting stops.
 
@@ -256,7 +363,7 @@ class Computer(ComputerFields):
         deadline = time.monotonic() + timeout
         while True:
             if self.build_failed:
-                raise GorillaCloudError(
+                raise MandalaError(
                     f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
                 )
             if not self.is_building:
@@ -275,6 +382,10 @@ class Computer(ComputerFields):
         This is the *machine*, not the desktop: it returns as soon as the VM is
         up, while the guest OS is still booting. Use :meth:`wait_for_guest` when
         you need something inside the guest to be ready.
+
+        Raises :class:`~mandala_computer.MandalaError` rather than waiting out
+        the timeout for the two states that will not become "running" on their
+        own — a failed build, and a suspended session nobody has resumed.
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -284,8 +395,17 @@ class Computer(ComputerFields):
             # A computer with no disk will never start on its own, and waiting
             # out the full timeout to say so helps nobody.
             if self.build_failed:
-                raise GorillaCloudError(
+                raise MandalaError(
                     f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+                )
+            # Nor will a suspended one. It is a state this wait predates, and
+            # left to spin it reports a machine that is one call from running as
+            # a timeout — the least informative answer available about the one
+            # case the caller can fix in a line.
+            if self.is_suspended:
+                raise MandalaError(
+                    f"{self.id} is suspended and will not start on its own: "
+                    "call start() to resume it"
                 )
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
@@ -308,7 +428,7 @@ class Computer(ComputerFields):
             try:
                 if self.exec(GUEST_PROBE, timeout_s=5).ok:
                     return self
-            except GorillaCloudError:
+            except MandalaError:
                 pass  # agent not up yet
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
@@ -322,6 +442,13 @@ class Computer(ComputerFields):
         Full-resolution PNG by default. Passing ``width`` returns a downscaled
         JPEG instead — much cheaper, and enough for a thumbnail or a quick
         "has anything changed" check.
+
+        A screenshot is not *use* as far as the platform's idle sweep is
+        concerned, and does not resume a suspended computer. A loop that only
+        polls the screen can therefore watch its own machine be suspended out
+        from under it after the host's idle window; anything that drives the
+        desktop — :meth:`click`, :meth:`type`, :meth:`exec` — both counts as use
+        and resumes it.
         """
         resp = self._t.request(
             "GET",

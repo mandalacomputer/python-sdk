@@ -11,7 +11,7 @@ import pytest
 import respx
 from tests.test_building import BASE, BUILDING, BUILT, FAILED
 
-import gorillacloud as gc
+import mandala_computer as mc
 
 pytestmark = pytest.mark.anyio
 
@@ -22,13 +22,13 @@ def anyio_backend() -> str:
 
 
 @pytest.fixture
-async def client() -> gc.AsyncClient:
-    return gc.AsyncClient("gck_test", base_url=BASE)
+async def client() -> mc.AsyncClient:
+    return mc.AsyncClient("gck_test", base_url=BASE)
 
 
 @respx.mock
 async def test_cloning_a_snapshot_returns_a_computer_that_is_still_building(
-    client: gc.AsyncClient,
+    client: mc.AsyncClient,
 ) -> None:
     respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
         return_value=httpx.Response(201, json=BUILDING)
@@ -40,7 +40,7 @@ async def test_cloning_a_snapshot_returns_a_computer_that_is_still_building(
 
 @respx.mock
 async def test_wait_until_built_polls_until_the_disk_lands(
-    client: gc.AsyncClient,
+    client: mc.AsyncClient,
 ) -> None:
     route = respx.get(f"{BASE}/computers/vm-new").mock(
         side_effect=[
@@ -48,27 +48,27 @@ async def test_wait_until_built_polls_until_the_disk_lands(
             httpx.Response(200, json=BUILT),
         ]
     )
-    computer = await gc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=5, poll=0)
+    computer = await mc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=5, poll=0)
     assert computer.status == "stopped"
     assert route.call_count == 2
     await client.aclose()
 
 
 @respx.mock
-async def test_wait_until_built_raises_with_the_reason(client: gc.AsyncClient) -> None:
+async def test_wait_until_built_raises_with_the_reason(client: mc.AsyncClient) -> None:
     respx.get(f"{BASE}/computers/vm-new").mock(return_value=httpx.Response(200, json=FAILED))
-    with pytest.raises(gc.GorillaCloudError, match="no space left on device"):
-        await gc.AsyncComputer(client._t, FAILED).wait_until_built(timeout=5, poll=0)
+    with pytest.raises(mc.MandalaError, match="no space left on device"):
+        await mc.AsyncComputer(client._t, FAILED).wait_until_built(timeout=5, poll=0)
     await client.aclose()
 
 
 @respx.mock
 async def test_starting_a_computer_that_is_still_building_raises_conflict(
-    client: gc.AsyncClient,
+    client: mc.AsyncClient,
 ) -> None:
     respx.post(f"{BASE}/computers/vm-new/start").mock(
         return_value=httpx.Response(409, json={"error": "still being copied"})
     )
-    with pytest.raises(gc.ConflictError):
-        await gc.AsyncComputer(client._t, BUILDING).start()
+    with pytest.raises(mc.ConflictError):
+        await mc.AsyncComputer(client._t, BUILDING).start()
     await client.aclose()

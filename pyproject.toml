@@ -3,13 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "gorillacloud"
+name = "mandala-computer"
 version = "0.1.0"
-description = "Python SDK for GorillaCloud — cloud desktops for AI agents"
+description = "Python SDK for Mandala Computer — cloud desktops for AI agents"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-keywords = ["gorillacloud", "cloud-desktop", "ai-agents", "computer-use", "vm"]
+keywords = ["mandala", "cloud-desktop", "ai-agents", "computer-use", "vm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -25,11 +25,11 @@ dependencies = ["httpx>=0.27"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "ruff>=0.6", "mypy>=1.11"]
 
 [project.urls]
-Homepage = "https://gorillacloud.ai"
-Source = "https://github.com/mboyd1/gorillacloud-python"
+Homepage = "https://mandala.computer"
+Source = "https://github.com/mboyd1/mandala-computer-python"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gorillacloud"]
+packages = ["src/mandala_computer"]
 
 [tool.ruff]
 line-length = 100

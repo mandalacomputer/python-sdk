@@ -1,4 +1,4 @@
-"""HTTP transports for the GorillaCloud API.
+"""HTTP transports for the Mandala Computer API.
 
 The sync and async transports differ only in where the awaits go. Everything
 that decides *meaning* — key resolution, URL building, and which exception a
@@ -18,13 +18,13 @@ from ._exceptions import (
     APIError,
     AuthenticationError,
     ConflictError,
-    GorillaCloudError,
+    MandalaError,
     NotFoundError,
     PermissionDeniedError,
     PlanLimitError,
 )
 
-DEFAULT_BASE_URL = "https://gorillacloud.ai/api/v1"
+DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
 
 _STATUS_ERRORS = {
     401: AuthenticationError,
@@ -39,14 +39,14 @@ class _BaseTransport:
     """Auth, URL, and error rules — everything about a request except the IO."""
 
     def __init__(self, api_key: str | None, base_url: str | None) -> None:
-        key = api_key or os.environ.get("GORILLACLOUD_API_KEY")
+        key = api_key or os.environ.get("MANDALA_API_KEY")
         if not key:
-            raise GorillaCloudError(
-                "No API key. Pass api_key=... or set GORILLACLOUD_API_KEY "
+            raise MandalaError(
+                "No API key. Pass api_key=... or set MANDALA_API_KEY "
                 "(create one at Settings -> API keys)."
             )
         self.base_url = (
-            base_url or os.environ.get("GORILLACLOUD_BASE_URL") or DEFAULT_BASE_URL
+            base_url or os.environ.get("MANDALA_BASE_URL") or DEFAULT_BASE_URL
         ).rstrip("/")
         self._headers = {
             "Authorization": f"Bearer {key}",

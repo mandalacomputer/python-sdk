@@ -17,7 +17,7 @@ import httpx
 import pytest
 import respx
 
-import gorillacloud as gc
+import mandala_computer as mc
 
 BASE = "https://api.test/api/v1"
 
@@ -42,32 +42,32 @@ FAILED = {
 
 
 @pytest.fixture
-def client() -> gc.Client:
-    return gc.Client("gck_test", base_url=BASE)
+def client() -> mc.Client:
+    return mc.Client("gck_test", base_url=BASE)
 
 
 # --- reading the state ------------------------------------------------------
 
 
 def test_build_state_reads_off_the_payload() -> None:
-    building = gc.Computer(None, BUILDING)  # type: ignore[arg-type]
+    building = mc.Computer(None, BUILDING)  # type: ignore[arg-type]
     assert building.is_building
     assert not building.build_failed
     assert building.build_error == ""
 
-    failed = gc.Computer(None, FAILED)  # type: ignore[arg-type]
+    failed = mc.Computer(None, FAILED)  # type: ignore[arg-type]
     assert failed.build_failed
     assert not failed.is_building
     assert failed.build_error == "no space left on device"
 
-    done = gc.Computer(None, BUILT)  # type: ignore[arg-type]
+    done = mc.Computer(None, BUILT)  # type: ignore[arg-type]
     assert not done.is_building
     assert not done.build_failed
 
 
 def test_an_older_server_that_says_nothing_about_why() -> None:
     """build-failed with no detail must still read as failed, not as fine."""
-    c = gc.Computer(None, {**BUILDING, "status": "build-failed", "build": None})  # type: ignore[arg-type]
+    c = mc.Computer(None, {**BUILDING, "status": "build-failed", "build": None})  # type: ignore[arg-type]
     assert c.build_failed
     assert c.build_error == ""
 
@@ -77,7 +77,7 @@ def test_an_older_server_that_says_nothing_about_why() -> None:
 
 @respx.mock
 def test_cloning_a_snapshot_returns_a_computer_that_is_still_building(
-    client: gc.Client,
+    client: mc.Client,
 ) -> None:
     respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
         return_value=httpx.Response(201, json=BUILDING)
@@ -88,7 +88,7 @@ def test_cloning_a_snapshot_returns_a_computer_that_is_still_building(
 
 
 @respx.mock
-def test_wait_until_built_polls_until_the_disk_lands(client: gc.Client) -> None:
+def test_wait_until_built_polls_until_the_disk_lands(client: mc.Client) -> None:
     respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
         return_value=httpx.Response(201, json=BUILDING)
     )
@@ -106,43 +106,43 @@ def test_wait_until_built_polls_until_the_disk_lands(client: gc.Client) -> None:
 
 @respx.mock
 def test_wait_until_built_returns_at_once_for_anything_not_building(
-    client: gc.Client,
+    client: mc.Client,
 ) -> None:
     """Safe to call on any computer, so a caller need not ask first."""
     route = respx.get(f"{BASE}/computers/vm-new").mock(return_value=httpx.Response(200, json=BUILT))
-    gc.Computer(client._t, BUILT).wait_until_built(timeout=5, poll=0)
+    mc.Computer(client._t, BUILT).wait_until_built(timeout=5, poll=0)
     assert route.call_count == 0
 
 
 @respx.mock
-def test_wait_until_built_raises_with_the_reason(client: gc.Client) -> None:
+def test_wait_until_built_raises_with_the_reason(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-new").mock(
         side_effect=[
             httpx.Response(200, json=BUILDING),
             httpx.Response(200, json=FAILED),
         ]
     )
-    with pytest.raises(gc.GorillaCloudError, match="no space left on device"):
-        gc.Computer(client._t, BUILDING).wait_until_built(timeout=5, poll=0)
+    with pytest.raises(mc.MandalaError, match="no space left on device"):
+        mc.Computer(client._t, BUILDING).wait_until_built(timeout=5, poll=0)
 
 
 @respx.mock
 def test_wait_until_built_times_out_without_claiming_the_build_stopped(
-    client: gc.Client,
+    client: mc.Client,
 ) -> None:
     respx.get(f"{BASE}/computers/vm-new").mock(return_value=httpx.Response(200, json=BUILDING))
-    with pytest.raises(gc.TimeoutError, match="only this wait has"):
-        gc.Computer(client._t, BUILDING).wait_until_built(timeout=0, poll=0)
+    with pytest.raises(mc.TimeoutError, match="only this wait has"):
+        mc.Computer(client._t, BUILDING).wait_until_built(timeout=0, poll=0)
 
 
 @respx.mock
 def test_wait_until_running_gives_up_on_a_computer_with_no_disk(
-    client: gc.Client,
+    client: mc.Client,
 ) -> None:
     """It will never start, and waiting out the full timeout to say so is no help."""
     respx.get(f"{BASE}/computers/vm-new").mock(return_value=httpx.Response(200, json=FAILED))
-    with pytest.raises(gc.GorillaCloudError, match="no space left on device"):
-        gc.Computer(client._t, FAILED).wait_until_running(timeout=30, poll=0)
+    with pytest.raises(mc.MandalaError, match="no space left on device"):
+        mc.Computer(client._t, FAILED).wait_until_running(timeout=30, poll=0)
 
 
 # --- the refusal ------------------------------------------------------------
@@ -150,7 +150,7 @@ def test_wait_until_running_gives_up_on_a_computer_with_no_disk(
 
 @respx.mock
 def test_starting_a_computer_that_is_still_building_raises_conflict(
-    client: gc.Client,
+    client: mc.Client,
 ) -> None:
     respx.post(f"{BASE}/computers/vm-new/start").mock(
         return_value=httpx.Response(
@@ -161,14 +161,14 @@ def test_starting_a_computer_that_is_still_building_raises_conflict(
             },
         )
     )
-    with pytest.raises(gc.ConflictError, match="still being copied") as e:
-        gc.Computer(client._t, BUILDING).start()
+    with pytest.raises(mc.ConflictError, match="still being copied") as e:
+        mc.Computer(client._t, BUILDING).start()
     assert e.value.status == 409
 
 
 @respx.mock
 def test_conflict_is_distinct_from_a_plan_limit_and_a_plain_error(
-    client: gc.Client,
+    client: mc.Client,
 ) -> None:
     """The two mean opposite things: come back later, versus do not."""
     respx.post(f"{BASE}/computers/vm-1/start").mock(
@@ -177,10 +177,10 @@ def test_conflict_is_distinct_from_a_plan_limit_and_a_plain_error(
     respx.post(f"{BASE}/computers/vm-2/start").mock(
         return_value=httpx.Response(402, json={"error": "your plan allows 2 computers"})
     )
-    with pytest.raises(gc.ConflictError):
-        gc.Computer(client._t, {"id": "vm-1"}).start()
-    with pytest.raises(gc.PlanLimitError):
-        gc.Computer(client._t, {"id": "vm-2"}).start()
+    with pytest.raises(mc.ConflictError):
+        mc.Computer(client._t, {"id": "vm-1"}).start()
+    with pytest.raises(mc.PlanLimitError):
+        mc.Computer(client._t, {"id": "vm-2"}).start()
     # And a ConflictError is not mistaken for one by an except clause upstream.
-    assert not issubclass(gc.ConflictError, gc.PlanLimitError)
-    assert issubclass(gc.ConflictError, gc.APIError)
+    assert not issubclass(mc.ConflictError, mc.PlanLimitError)
+    assert issubclass(mc.ConflictError, mc.APIError)

@@ -35,7 +35,7 @@ class Computers:
 
     def get(self, computer_id: str) -> Computer:
         data = self._t.json("GET", _api.computer(computer_id))
-        return Computer(self._t, data or {})
+        return Computer(self._t, _api.computer_payload(data))
 
     def create(
         self,
@@ -52,7 +52,7 @@ class Computers:
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
-        :class:`~gorillacloud.PlanLimitError` naming the limit.
+        :class:`~mandala_computer.PlanLimitError` naming the limit.
 
         ``resolution`` is ``"WIDTHxHEIGHT"`` or ``"WIDTHxHEIGHTxDEPTH"`` and
         defaults to ``"1280x800x24"``. It is a create-time choice and only a
@@ -64,6 +64,13 @@ class Computers:
 
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`Computer.wait_for_guest`.
+
+        A create that builds a computer which then will not boot is *not* an
+        error: it returns the computer, stopped, with
+        :attr:`Computer.start_error` saying what went wrong. The machine exists
+        and is billable either way, so it comes back rather than being thrown
+        away with the exception — check ``start_error`` if it matters, and
+        :meth:`Computer.start` may work on a second attempt.
         """
         body = _api.create_body(
             name=name,
@@ -75,7 +82,7 @@ class Computers:
             resolution=resolution,
         )
         data = self._t.json("POST", _api.COMPUTERS, json=body)
-        return Computer(self._t, data or {})
+        return Computer(self._t, _api.computer_payload(data))
 
     @contextmanager
     def ephemeral(self, **kwargs: Any) -> Iterator[Computer]:
@@ -111,13 +118,13 @@ class Snapshots:
         A snapshot has to be copied out — and a snapshot taken incrementally is
         collapsed out of its whole chain — which runs for minutes, so the
         computer comes back ``"building"``. Until that lands there is nothing to
-        boot and starting it raises :class:`~gorillacloud.ConflictError`; wait
+        boot and starting it raises :class:`~mandala_computer.ConflictError`; wait
         with :meth:`Computer.wait_until_built`.
         """
         data = self._t.json(
             "POST", _api.snapshot_action(snapshot_id, "clone"), json=_api.name_body(name)
         )
-        return Computer(self._t, data or {})
+        return Computer(self._t, _api.computer_payload(data))
 
     def delete(self, snapshot_id: str) -> None:
         self._t.request("DELETE", _api.snapshot(snapshot_id))

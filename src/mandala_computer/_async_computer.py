@@ -1,6 +1,6 @@
 """The async Computer handle.
 
-Mirrors :class:`gorillacloud.Computer` method for method. Field accessors come
+Mirrors :class:`mandala_computer.Computer` method for method. Field accessors come
 from the shared ``ComputerFields``; paths, payloads, and validation come from
 ``_api``. What is left here is genuinely only the awaits.
 """
@@ -15,7 +15,7 @@ from typing import Any
 from . import _api
 from ._client import AsyncTransport
 from ._computer import GUEST_PROBE, ComputerFields, _cursor
-from ._exceptions import GorillaCloudError, TimeoutError
+from ._exceptions import MandalaError, TimeoutError
 from ._models import ExecResult, Snapshot
 
 __all__ = ["AsyncComputer"]
@@ -24,7 +24,7 @@ __all__ = ["AsyncComputer"]
 class AsyncComputer(ComputerFields):
     """A cloud desktop, driven with ``await``.
 
-    Obtain one from :class:`gorillacloud.AsyncClient` rather than constructing
+    Obtain one from :class:`mandala_computer.AsyncClient` rather than constructing
     it directly.
     """
 
@@ -35,19 +35,57 @@ class AsyncComputer(ComputerFields):
     # --- lifecycle ------------------------------------------------------
 
     async def refresh(self) -> AsyncComputer:
-        """Re-read this computer's state from the API."""
-        self._data = dict(await self._t.json("GET", _api.computer(self.id)) or {})
+        """Re-read this computer's state from the API.
+
+        Also how a computer from :meth:`AsyncComputers.list` acquires a
+        :attr:`vnc` connect surface, which the list deliberately omits.
+        """
+        self._data = _api.computer_payload(await self._t.json("GET", _api.computer(self.id)))
         return self
 
     async def start(self) -> AsyncComputer:
+        """Start this computer, or resume it if its session was suspended.
+
+        A suspended computer does not boot: its saved RAM is read back and the
+        same processes and windows come up roughly a second later. An ordinary
+        stopped computer boots as usual.
+        """
         await self._t.request("POST", _api.computer_action(self.id, "start"))
         return await self.refresh()
 
     async def stop(self) -> AsyncComputer:
+        """Stop this computer, discarding a suspended session if it has one.
+
+        Use :meth:`suspend` to keep it.
+        """
         await self._t.request("POST", _api.computer_action(self.id, "stop"))
         return await self.refresh()
 
+    async def suspend(self) -> AsyncComputer:
+        """Write this computer's RAM to disk and give the host its memory back.
+
+        A pause rather than a stop: :meth:`start` afterwards resumes the same
+        session — same processes, same open windows — in about a second instead
+        of booting. :meth:`stop` discards it and leaves an ordinary stopped
+        computer.
+
+        The computer must be running. Raises
+        :class:`~mandala_computer.ConflictError` for the states that clear on their
+        own — a capture or a clone reading the disk, a migration in flight, or
+        somebody driving the guest at that moment.
+        """
+        await self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        return await self.refresh()
+
     async def restart(self) -> AsyncComputer:
+        """Reset this computer.
+
+        Raises :class:`~mandala_computer.ConflictError` while a suspended session is
+        saved, since a restart would have to guess whether you meant to resume
+        that session or throw it away. Start it or stop it first.
+
+        Desktop credentials do not survive this — see :attr:`vnc`.
+        """
         await self._t.request("POST", _api.computer_action(self.id, "restart"))
         return await self.refresh()
 
@@ -62,7 +100,7 @@ class AsyncComputer(ComputerFields):
         data = await self._t.json(
             "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
         )
-        return AsyncComputer(self._t, data or {})
+        return AsyncComputer(self._t, _api.computer_payload(data))
 
     async def rename(self, name: str) -> AsyncComputer:
         """Give this computer a new name, and return it renamed.
@@ -80,8 +118,8 @@ class AsyncComputer(ComputerFields):
         deleted they fall back to what it was called at the time, which is then
         all that is left of it.
         """
-        self._data = dict(
-            await self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name)) or {}
+        self._data = _api.computer_payload(
+            await self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name))
         )
         return self
 
@@ -97,8 +135,8 @@ class AsyncComputer(ComputerFields):
         """Await until a cloned computer's disk has been copied.
 
         Returns immediately for anything not being built, so it is safe to call
-        on any computer. Raises :class:`~gorillacloud.GorillaCloudError` if the
-        copy failed, and :class:`~gorillacloud.TimeoutError` if it is still
+        on any computer. Raises :class:`~mandala_computer.MandalaError` if the
+        copy failed, and :class:`~mandala_computer.TimeoutError` if it is still
         going when ``timeout`` runs out — the computer keeps building either
         way; only the waiting stops.
 
@@ -108,7 +146,7 @@ class AsyncComputer(ComputerFields):
         deadline = time.monotonic() + timeout
         while True:
             if self.build_failed:
-                raise GorillaCloudError(
+                raise MandalaError(
                     f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
                 )
             if not self.is_building:
@@ -129,6 +167,10 @@ class AsyncComputer(ComputerFields):
         This is the *machine*, not the desktop: it returns as soon as the VM is
         up, while the guest OS is still booting. Use :meth:`wait_for_guest` when
         you need something inside the guest to be ready.
+
+        Raises :class:`~mandala_computer.MandalaError` rather than waiting out
+        the timeout for the two states that will not become "running" on their
+        own — a failed build, and a suspended session nobody has resumed.
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -138,8 +180,17 @@ class AsyncComputer(ComputerFields):
             # A computer with no disk will never start on its own, and waiting
             # out the full timeout to say so helps nobody.
             if self.build_failed:
-                raise GorillaCloudError(
+                raise MandalaError(
                     f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+                )
+            # Nor will a suspended one. It is a state this wait predates, and
+            # left to spin it reports a machine that is one call from running as
+            # a timeout — the least informative answer available about the one
+            # case the caller can fix in a line.
+            if self.is_suspended:
+                raise MandalaError(
+                    f"{self.id} is suspended and will not start on its own: "
+                    "call start() to resume it"
                 )
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
@@ -163,7 +214,7 @@ class AsyncComputer(ComputerFields):
                 res = await self.exec(GUEST_PROBE, timeout_s=5)
                 if res.ok:
                     return self
-            except GorillaCloudError:
+            except MandalaError:
                 pass  # agent not up yet
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
@@ -177,6 +228,13 @@ class AsyncComputer(ComputerFields):
         Full-resolution PNG by default. Passing ``width`` returns a downscaled
         JPEG instead — much cheaper, and enough for a thumbnail or a quick
         "has anything changed" check.
+
+        A screenshot is not *use* as far as the platform's idle sweep is
+        concerned, and does not resume a suspended computer. A loop that only
+        polls the screen can therefore watch its own machine be suspended out
+        from under it after the host's idle window; anything that drives the
+        desktop — :meth:`click`, :meth:`type`, :meth:`exec` — both counts as use
+        and resumes it.
         """
         resp = await self._t.request(
             "GET",
