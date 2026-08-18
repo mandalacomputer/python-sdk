@@ -10,10 +10,10 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Snapshot, Template
+from ._models import Size, Snapshot, Template
 from ._resources import EPHEMERAL_DOC
 
-__all__ = ["AsyncComputers", "AsyncSnapshots", "AsyncTemplates"]
+__all__ = ["AsyncComputers", "AsyncSizes", "AsyncSnapshots", "AsyncTemplates"]
 
 
 class AsyncComputers:
@@ -32,6 +32,7 @@ class AsyncComputers:
         self,
         *,
         name: str | None = None,
+        size: str | None = None,
         template: str | None = None,
         cpu: int | None = None,
         ram_mb: int | None = None,
@@ -44,6 +45,13 @@ class AsyncComputers:
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
         :class:`~mandala_computer.PlanLimitError` naming the limit.
+
+        ``size`` is a named size from :meth:`Client.sizes` — a template and a
+        CPU/RAM/disk shape together, and the shapes the platform keeps
+        pre-booted, so naming one is the likeliest way to get a computer in
+        about a second rather than a cold boot. It cannot be combined with
+        ``template``, ``cpu``, ``ram_mb`` or ``disk_gb``; sending both raises
+        :class:`ValueError` before any request is made.
 
         ``resolution`` is ``"WIDTHxHEIGHT"`` or ``"WIDTHxHEIGHTxDEPTH"`` and
         defaults to ``"1280x800x24"``. It is a create-time choice and only a
@@ -71,6 +79,7 @@ class AsyncComputers:
             disk_gb=disk_gb,
             start=start,
             resolution=resolution,
+            size=size,
         )
         data = await self._t.json("POST", _api.COMPUTERS, json=body)
         return AsyncComputer(self._t, _api.computer_payload(data))
@@ -128,3 +137,12 @@ class AsyncTemplates:
     async def list(self) -> builtins.list[Template]:
         data = await self._t.json("GET", _api.TEMPLATES) or []
         return [Template.from_api(t) for t in data]
+
+
+class AsyncSizes:
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self) -> builtins.list[Size]:
+        data = await self._t.json("GET", _api.SIZES) or []
+        return [Size.from_api(s) for s in data]

@@ -33,6 +33,7 @@ PAIRS = [
     (_resources.Computers, _async_resources.AsyncComputers),
     (_resources.Snapshots, _async_resources.AsyncSnapshots),
     (_resources.Templates, _async_resources.AsyncTemplates),
+    (_resources.Sizes, _async_resources.AsyncSizes),
 ]
 
 

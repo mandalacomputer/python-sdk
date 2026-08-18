@@ -24,6 +24,7 @@ BASE = "https://api.test/api/v1"
 # (method, pattern) with ids replaced by ":id" — mirrors surface.ts V1_ROUTES.
 ALLOWED = {
     ("GET", "templates"),
+    ("GET", "sizes"),
     ("GET", "computers"),
     ("POST", "computers"),
     ("GET", "computers/:id"),
@@ -107,7 +108,7 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
         )
-    if path.endswith("/templates"):
+    if path.endswith(("/templates", "/sizes")):
         return httpx.Response(200, json=[])
     # Collections list on GET and return a single object on POST — getting this
     # backwards is what made the first version of this test fail.
@@ -128,6 +129,7 @@ def called_routes(calls: object) -> set[tuple[str, str]]:
 def exercise_everything(client: mc.Client) -> None:
     """Call every method the SDK exposes that performs a request."""
     client.templates.list()
+    client.sizes.list()
     client.computers.list()
     client.computers.get("vm-1")
     c = client.computers.create(template="base")
@@ -175,6 +177,7 @@ def exercise_everything(client: mc.Client) -> None:
 async def exercise_everything_async(client: mc.AsyncClient) -> None:
     """The async mirror of exercise_everything."""
     await client.templates.list()
+    await client.sizes.list()
     await client.computers.list()
     await client.computers.get("vm-1")
     c = await client.computers.create(template="base")
