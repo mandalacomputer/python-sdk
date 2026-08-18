@@ -15,6 +15,7 @@ from typing import Any
 # --- paths ----------------------------------------------------------------
 
 TEMPLATES = "templates"
+SIZES = "sizes"
 COMPUTERS = "computers"
 SNAPSHOTS = "snapshots"
 
@@ -84,15 +85,27 @@ def create_body(
     disk_gb: int | None,
     start: bool,
     resolution: str | None = None,
+    size: str | None = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
     Omission is meaningful: the server applies the template's defaults only when
     a key is absent, so sending explicit nulls would override them with nothing.
+
+    A ``size`` names a template and a shape together, so combining it with any
+    of the four it stands in for is refused here — the server refuses it too,
+    but this mistake is knowable without the round trip, and the server's
+    refusal exists for callers who are not this SDK.
     """
+    if size is not None and any(v is not None for v in (template, cpu, ram_mb, disk_gb)):
+        raise ValueError(
+            "size already names a template and a shape; send size alone, "
+            "or template/cpu/ram_mb/disk_gb without it"
+        )
     body: dict[str, Any] = {"start": start}
     for key, value in (
         ("name", name),
+        ("size", size),
         ("template", template),
         ("cpu", cpu),
         ("ram_mb", ram_mb),

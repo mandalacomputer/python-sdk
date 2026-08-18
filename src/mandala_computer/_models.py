@@ -96,6 +96,45 @@ class Template:
 
 
 @dataclass(frozen=True)
+class Size:
+    """A named size: a template plus a CPU/RAM/disk shape, from ``GET /sizes``.
+
+    These are the shapes the platform keeps pre-booted, so a create that passes
+    ``id`` as ``size`` is typically answered from the warm pool in about a
+    second where a custom shape boots cold.
+
+    ``allowed`` is about the plan's per-computer ceilings only — what the
+    account already holds is not counted, so a create at an allowed size can
+    still be refused against the plan's pools. ``cheapest_plan`` is the plan to
+    name when it is False, or ``None`` if no purchasable plan admits the row.
+    """
+
+    id: str
+    label: str
+    template: str
+    cpu: int
+    ram_mb: int
+    disk_gb: int
+    allowed: bool
+    cheapest_plan: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> Size:
+        return cls(
+            id=d.get("id", ""),
+            label=d.get("label", ""),
+            template=d.get("template", ""),
+            cpu=int(d.get("cpu", 0)),
+            ram_mb=int(d.get("ram_mb", 0)),
+            disk_gb=int(d.get("disk_gb", 0)),
+            allowed=bool(d.get("allowed", False)),
+            cheapest_plan=d.get("cheapest_plan"),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
 class Snapshot:
     id: str
     computer_id: str

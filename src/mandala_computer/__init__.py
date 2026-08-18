@@ -28,7 +28,7 @@ from __future__ import annotations
 import httpx
 
 from ._async_computer import AsyncComputer
-from ._async_resources import AsyncComputers, AsyncSnapshots, AsyncTemplates
+from ._async_resources import AsyncComputers, AsyncSizes, AsyncSnapshots, AsyncTemplates
 from ._client import DEFAULT_BASE_URL, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, Computer
 from ._exceptions import (
@@ -41,8 +41,8 @@ from ._exceptions import (
     PlanLimitError,
     TimeoutError,
 )
-from ._models import ExecResult, Snapshot, Template, VncConnect
-from ._resources import Computers, Snapshots, Templates
+from ._models import ExecResult, Size, Snapshot, Template, VncConnect
+from ._resources import Computers, Sizes, Snapshots, Templates
 
 __version__ = "0.1.0"
 
@@ -62,6 +62,7 @@ __all__ = [
     "NotFoundError",
     "PermissionDeniedError",
     "PlanLimitError",
+    "Size",
     "Snapshot",
     "Template",
     "TimeoutError",
@@ -89,6 +90,7 @@ class Client:
         self.computers = Computers(self._t)
         self.snapshots = Snapshots(self._t)
         self.templates = Templates(self._t)
+        self.sizes = Sizes(self._t)
 
     @property
     def base_url(self) -> str:
@@ -127,6 +129,7 @@ class AsyncClient:
         self.computers = AsyncComputers(self._t)
         self.snapshots = AsyncSnapshots(self._t)
         self.templates = AsyncTemplates(self._t)
+        self.sizes = AsyncSizes(self._t)
 
     @property
     def base_url(self) -> str:

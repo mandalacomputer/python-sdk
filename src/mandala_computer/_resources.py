@@ -10,9 +10,9 @@ from typing import Any
 from . import _api
 from ._client import Transport
 from ._computer import Computer
-from ._models import Snapshot, Template
+from ._models import Size, Snapshot, Template
 
-__all__ = ["Computers", "Snapshots", "Templates"]
+__all__ = ["Computers", "Sizes", "Snapshots", "Templates"]
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
 
@@ -41,6 +41,7 @@ class Computers:
         self,
         *,
         name: str | None = None,
+        size: str | None = None,
         template: str | None = None,
         cpu: int | None = None,
         ram_mb: int | None = None,
@@ -53,6 +54,13 @@ class Computers:
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
         :class:`~mandala_computer.PlanLimitError` naming the limit.
+
+        ``size`` is a named size from :meth:`Client.sizes` — a template and a
+        CPU/RAM/disk shape together, and the shapes the platform keeps
+        pre-booted, so naming one is the likeliest way to get a computer in
+        about a second rather than a cold boot. It cannot be combined with
+        ``template``, ``cpu``, ``ram_mb`` or ``disk_gb``; sending both raises
+        :class:`ValueError` before any request is made.
 
         ``resolution`` is ``"WIDTHxHEIGHT"`` or ``"WIDTHxHEIGHTxDEPTH"`` and
         defaults to ``"1280x800x24"``. It is a create-time choice and only a
@@ -80,6 +88,7 @@ class Computers:
             disk_gb=disk_gb,
             start=start,
             resolution=resolution,
+            size=size,
         )
         data = self._t.json("POST", _api.COMPUTERS, json=body)
         return Computer(self._t, _api.computer_payload(data))
@@ -137,3 +146,12 @@ class Templates:
     def list(self) -> builtins.list[Template]:
         data = self._t.json("GET", _api.TEMPLATES) or []
         return [Template.from_api(t) for t in data]
+
+
+class Sizes:
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self) -> builtins.list[Size]:
+        data = self._t.json("GET", _api.SIZES) or []
+        return [Size.from_api(s) for s in data]
