@@ -68,6 +68,48 @@ def test_create_omits_unset_fields(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_create_by_size_sends_the_word_alone(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    client.computers.create(name="dev", size="large")
+    body = json.loads(route.calls.last.request.content)
+    # The server expands the row into template and numbers; the SDK's half of
+    # the contract is to send the name and nothing it stands in for.
+    assert body["size"] == "large"
+    assert "template" not in body and "cpu" not in body
+
+
+def test_create_refuses_size_beside_explicit_sizing(client: mc.Client) -> None:
+    # The server refuses this too, but the mistake is knowable without the
+    # round trip — no request is mocked, so reaching the wire would fail loud.
+    with pytest.raises(ValueError, match="size"):
+        client.computers.create(size="large", cpu=4)
+
+
+@respx.mock
+def test_sizes_list(client: mc.Client) -> None:
+    respx.get(f"{BASE}/sizes").mock(
+        httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "large",
+                    "label": "Large",
+                    "template": "base",
+                    "cpu": 4,
+                    "ram_mb": 8192,
+                    "disk_gb": 40,
+                    "allowed": True,
+                    "cheapest_plan": "solo",
+                }
+            ],
+        )
+    )
+    (s,) = client.sizes.list()
+    assert (s.id, s.template, s.cpu, s.ram_mb, s.disk_gb) == ("large", "base", 4, 8192, 40)
+    assert s.allowed is True and s.cheapest_plan == "solo"
+
+
+@respx.mock
 def test_unknown_response_fields_survive(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "future_field": 42})

@@ -44,6 +44,27 @@ c.wait_until_running()
 c.stop()
 ```
 
+### Sizes
+
+Rather than inventing numbers, name a size. `client.sizes.list()` is the
+catalogue — each entry is a template plus a CPU/RAM/disk shape, and these are
+the shapes the platform keeps pre-booted, so a create that names one is
+typically answered from the warm pool in about a second where a custom shape
+boots cold:
+
+```python
+for s in client.sizes.list():
+    print(s.id, s.cpu, s.ram_mb, s.disk_gb, s.allowed)
+
+c = client.computers.create(name="dev", size="large")
+```
+
+`size` sets the template and the three numbers together, so it cannot be
+combined with `template`, `cpu`, `ram_mb` or `disk_gb` — that raises
+`ValueError` before any request is made. Explicit numbers remain fully
+supported, and `allowed=False` rows name the `cheapest_plan` that would take
+them.
+
 `ephemeral()` and `create()` are separate on purpose. Deleting a computer
 destroys its disk, so tying that to a `with` block is only safe when the block is
 unambiguously the machine's whole lifetime — which `ephemeral()` declares and
