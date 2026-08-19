@@ -10,7 +10,7 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Size, Snapshot, Template
+from ._models import Listing, Size, Snapshot, Template
 from ._resources import EPHEMERAL_DOC
 
 __all__ = ["AsyncComputers", "AsyncSizes", "AsyncSnapshots", "AsyncTemplates"]
@@ -20,9 +20,26 @@ class AsyncComputers:
     def __init__(self, transport: AsyncTransport) -> None:
         self._t = transport
 
-    async def list(self) -> builtins.list[AsyncComputer]:
-        data = await self._t.json("GET", _api.COMPUTERS) or []
-        return [AsyncComputer(self._t, c) for c in data]
+    async def list(self, *, allow_partial: bool = False) -> Listing[AsyncComputer]:
+        """Every computer on the account, or every one in the key's workspace.
+
+        No ``vnc`` on these rows — fetch one computer to get its desktop
+        credentials, or call :meth:`AsyncComputer.refresh` on a listed one.
+
+        ``allow_partial`` accepts a listing the platform knows is short. Without
+        it a hypervisor that cannot be reached makes this raise
+        :class:`~mandala_computer.UnavailableError` rather than answering short,
+        because a short list is not a smaller truth: it reads exactly like the
+        missing computers were deleted, and the obvious next thing a script does
+        with a computer that has disappeared is tidy up after it. With it, the
+        returned :class:`~mandala_computer.Listing` says so —
+        ``is_complete`` — and the rows that could not be read carry
+        :attr:`AsyncComputer.unreachable` and nothing else.
+        """
+        data, incomplete = await self._t.listing(
+            _api.COMPUTERS, params=_api.partial_params(allow_partial)
+        )
+        return Listing.of([AsyncComputer(self._t, c) for c in data or []], incomplete)
 
     async def get(self, computer_id: str) -> AsyncComputer:
         data = await self._t.json("GET", _api.computer(computer_id))
@@ -99,9 +116,30 @@ class AsyncSnapshots:
     def __init__(self, transport: AsyncTransport) -> None:
         self._t = transport
 
-    async def list(self) -> builtins.list[Snapshot]:
-        data = await self._t.json("GET", _api.SNAPSHOTS) or []
-        return [Snapshot.from_api(s) for s in data]
+    async def list(
+        self, *, include_unfinished: bool = False, allow_partial: bool = False
+    ) -> Listing[Snapshot]:
+        """Every snapshot on the account that you can act on.
+
+        Snapshots outlive the computers they came from, so this routinely
+        contains rows whose :attr:`Snapshot.computer_id` resolves to nothing —
+        those carry :attr:`Snapshot.orphaned`, and :meth:`clone` is the
+        operation that still works on them.
+
+        ``include_unfinished`` widens it to deletions that began and did not
+        finish. Nothing can be restored or cloned from one, but they still hold
+        objects and are still billed, so it is the flag for a question about
+        storage rather than about what can be used.
+
+        ``allow_partial`` is :meth:`AsyncComputers.list`'s, with the same warning.
+        """
+        data, incomplete = await self._t.listing(
+            _api.SNAPSHOTS,
+            params=_api.snapshot_listing_params(
+                include_unfinished=include_unfinished, allow_partial=allow_partial
+            ),
+        )
+        return Listing.of([Snapshot.from_api(s) for s in data or []], incomplete)
 
     async def restore(self, snapshot_id: str) -> None:
         """Roll a computer back to a snapshot, replacing its current disk."""

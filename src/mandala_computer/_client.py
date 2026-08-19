@@ -22,6 +22,7 @@ from ._exceptions import (
     NotFoundError,
     PermissionDeniedError,
     PlanLimitError,
+    UnavailableError,
 )
 
 DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
@@ -32,7 +33,38 @@ _STATUS_ERRORS = {
     403: PermissionDeniedError,
     404: NotFoundError,
     409: ConflictError,
+    # A fan-out listing that would have been short, without allow_partial. Its
+    # own class rather than a bare APIError because it is the one 5xx on this
+    # surface that is not a fault: nothing is broken from the caller's side, the
+    # platform is declining to hand over a list it knows is incomplete.
+    503: UnavailableError,
 }
+
+#: How many rows a listing is short by. Present means short; the number can be
+#: 0, which means "short, by an amount the placement cache cannot state" rather
+#: than "not short". So the presence is the signal and the count is detail —
+#: which is why :attr:`Listing.incomplete` is ``None``-or-a-number rather than a
+#: count that would read as complete at zero.
+INCOMPLETE_HEADER = "X-GC-Incomplete"
+
+
+def _incomplete(resp: httpx.Response) -> int | None:
+    """How many rows this listing is short by, or ``None`` when it is complete.
+
+    A malformed or negative count becomes ``0`` rather than ``None``. The header
+    being there at all is the platform saying the list is short, and letting an
+    unparseable number promote that to "complete" would turn a warning into its
+    opposite — which is the one wrong answer this whole mechanism exists to
+    prevent.
+    """
+    raw = resp.headers.get(INCOMPLETE_HEADER)
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    return max(n, 0)
 
 
 class _BaseTransport:
@@ -120,6 +152,15 @@ class Transport(_BaseTransport):
     def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(self.request(method, path, **kw))
 
+    def listing(self, path: str, **kw: Any) -> tuple[Any, int | None]:
+        """A collection read, and whether the platform had to answer it short.
+
+        Separate from :meth:`json` because the news is in a header, and a header
+        nothing reads is not a warning. See :data:`INCOMPLETE_HEADER`.
+        """
+        resp = self.request("GET", path, **kw)
+        return self._parse(resp), _incomplete(resp)
+
     def close(self) -> None:
         if self._owns_client:
             self._http.close()
@@ -163,6 +204,15 @@ class AsyncTransport(_BaseTransport):
 
     async def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(await self.request(method, path, **kw))
+
+    async def listing(self, path: str, **kw: Any) -> tuple[Any, int | None]:
+        """A collection read, and whether the platform had to answer it short.
+
+        Separate from :meth:`json` because the news is in a header, and a header
+        nothing reads is not a warning. See :data:`INCOMPLETE_HEADER`.
+        """
+        resp = await self.request("GET", path, **kw)
+        return self._parse(resp), _incomplete(resp)
 
     async def aclose(self) -> None:
         if self._owns_client:

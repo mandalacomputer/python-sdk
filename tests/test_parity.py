@@ -30,6 +30,7 @@ def params(sig: inspect.Signature) -> list[tuple[str, Any, Any]]:
 PAIRS = [
     (mc.Client, mc.AsyncClient),
     (mc.Computer, mc.AsyncComputer),
+    (mc.BackgroundCommand, mc.AsyncBackgroundCommand),
     (_resources.Computers, _async_resources.AsyncComputers),
     (_resources.Snapshots, _async_resources.AsyncSnapshots),
     (_resources.Templates, _async_resources.AsyncTemplates),
@@ -67,7 +68,13 @@ def test_same_call_signatures() -> None:
 
 def test_async_io_methods_are_coroutines() -> None:
     """Anything that talks to the API must be awaitable, or it silently blocks."""
-    non_io = {"ephemeral"}  # an async context manager, not a coroutine function
+    non_io = {
+        "ephemeral",  # an async context manager, not a coroutine function
+        # Builds a handle around a pid the caller already has. It makes no
+        # request — the first poll() is what discovers whether the daemon still
+        # knows that pid — so awaiting it would promise IO that never happens.
+        "background_command",
+    }
     for _, async_cls in PAIRS:
         for name, fn in public_methods(async_cls).items():
             if name in non_io or isinstance(
@@ -88,3 +95,10 @@ def test_field_accessors_are_shared_not_copied() -> None:
     assert issubclass(mc.AsyncComputer, ComputerFields)
     for field in ("id", "name", "status", "os", "template", "cpu", "ram_mb", "disk_gb", "raw"):
         assert getattr(mc.Computer, field) is getattr(mc.AsyncComputer, field)
+
+    from mandala_computer._computer import BackgroundCommandFields
+
+    assert issubclass(mc.BackgroundCommand, BackgroundCommandFields)
+    assert issubclass(mc.AsyncBackgroundCommand, BackgroundCommandFields)
+    for field in ("pid", "command", "started_at", "raw"):
+        assert getattr(mc.BackgroundCommand, field) is getattr(mc.AsyncBackgroundCommand, field)
