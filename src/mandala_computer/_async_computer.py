@@ -14,11 +14,19 @@ from typing import Any
 
 from . import _api
 from ._client import AsyncTransport
-from ._computer import GUEST_PROBE, ComputerFields, _cursor
+from ._computer import GUEST_PROBE, BackgroundCommandFields, ComputerFields, _cursor
 from ._exceptions import MandalaError, TimeoutError
-from ._models import ExecResult, Snapshot
+from ._models import (
+    ExecResult,
+    ExecStatus,
+    Listing,
+    Snapshot,
+    SnapshotHoldings,
+    Window,
+    WindowResult,
+)
 
-__all__ = ["AsyncComputer"]
+__all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
 
 
 class AsyncComputer(ComputerFields):
@@ -123,9 +131,92 @@ class AsyncComputer(ComputerFields):
         )
         return self
 
-    async def delete(self) -> None:
-        """Destroy this computer and its disk. Snapshots taken from it survive."""
-        await self._t.request("DELETE", _api.computer(self.id))
+    async def resize(
+        self, *, cpu: int | None = None, ram_mb: int | None = None, disk_gb: int | None = None
+    ) -> AsyncComputer:
+        """Give this computer a new shape, and return it resized.
+
+        The computer must be **stopped** — the shape is what QEMU builds the
+        machine from, so changing it on a running one raises
+        :class:`~mandala_computer.ConflictError`. Disks grow only.
+
+        Its own method rather than keywords on :meth:`rename`, because the
+        platform refuses a resize in combination with a rename or an idle window
+        and is right to: those two do not need the computer stopped and this
+        does, so one request could not honour both without applying half of it.
+
+        Sizing is capped by the account's plan; exceeding a cap raises
+        :class:`~mandala_computer.PlanLimitError` naming the limit. The screen is
+        not part of this — see :attr:`resolution`, which is fixed at create.
+        """
+        self._data = _api.computer_payload(
+            await self._t.json(
+                "PATCH",
+                _api.computer(self.id),
+                json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
+            )
+        )
+        return self
+
+    async def set_idle_suspend(self, minutes: int | None) -> AsyncComputer:
+        """Set how long this computer may go untouched before it is suspended.
+
+        ``None`` clears the override and returns it to its host's own sweep. See
+        :attr:`idle_suspend_min` for why that is not the same as reading a
+        number back.
+
+        A suspend is a pause, not a stop — :meth:`start` resumes the same
+        session in about a second — and input, exec and file transfers resume it
+        automatically. Screenshots deliberately do not, so a loop that only
+        polls the screen is the one thing this setting can surprise.
+        """
+        self._data = _api.computer_payload(
+            await self._t.json(
+                "PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes)
+            )
+        )
+        return self
+
+    async def delete(
+        self, *, purge_snapshots: bool = False, expect: str | None = None
+    ) -> int | None:
+        """Destroy this computer and its disk.
+
+        Snapshots taken from it **survive by default** and become orphans, which
+        can still be cloned into a new computer but can no longer be restored —
+        a restore puts the disk back on a source that no longer exists.
+
+        ``purge_snapshots=True`` destroys them with it, and needs ``expect``: the
+        fingerprint from :meth:`snapshot_holdings`, which binds the sweep to the
+        set you were actually shown. Read the holdings, check the count and the
+        size are what you meant to destroy, then pass the fingerprint you read::
+
+            held = await c.snapshot_holdings()
+            if held.count == 2:
+                await c.delete(purge_snapshots=True, expect=held.fingerprint)
+
+        Do not fetch the fingerprint on the line above the delete. That binds
+        the purge to whatever the set is now rather than to what anyone agreed
+        to, which is precisely the race the interlock exists for: a capture that
+        finishes between the decision and the call, then gets destroyed by a
+        confirmation that predates it. A fingerprint that has gone stale raises
+        :class:`~mandala_computer.ConflictError` and destroys nothing.
+
+        Returns how many snapshots went with it, or ``None`` when the platform
+        did not say. ``None`` rather than ``0``: this is the one irreversible
+        call on this object, and reporting "nothing was destroyed" because the
+        server was quiet is the one wrong answer worth going out of the way to
+        avoid.
+        """
+        data = await self._t.json(
+            "DELETE",
+            _api.computer(self.id),
+            params=_api.delete_params(purge_snapshots=purge_snapshots, expect=expect),
+        )
+        if not isinstance(data, Mapping):
+            return None
+        deleted = data.get("snapshots_deleted")
+        return None if deleted is None else int(deleted)
 
     # --- readiness ------------------------------------------------------
 
@@ -375,7 +466,15 @@ class AsyncComputer(ComputerFields):
         """
         return _cursor(await self._input(_api.cursor_body()))
 
-    async def exec(self, command: str, timeout_s: int = 30, *, desktop: bool = False) -> ExecResult:
+    async def exec(
+        self,
+        command: str,
+        timeout_s: int = 30,
+        *,
+        desktop: bool = False,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> ExecResult:
         """Run a shell command inside the guest.
 
         Uses the guest's native shell — bash on Linux, cmd.exe on Windows. A
@@ -392,13 +491,65 @@ class AsyncComputer(ComputerFields):
             await c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 
         Or call :meth:`open` and let the SDK write that line.
+
+        ``cwd`` is an absolute path inside the guest and ``env`` is extra
+        environment for this command alone. A command slower than a few seconds
+        wants :meth:`start_exec` instead: hitting ``timeout_s`` means this call
+        stopped waiting, not that the work was destroyed, and the output and the
+        exit code are lost with the request.
         """
         data = await self._t.json(
             "POST",
             _api.computer_action(self.id, "exec"),
-            json=_api.exec_body(command, timeout_s, desktop),
+            json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
         )
         return ExecResult.from_api(data or {})
+
+    async def start_exec(
+        self,
+        command: str,
+        *,
+        desktop: bool = False,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> AsyncBackgroundCommand:
+        """Start a command that outlives the request, and return a handle to it.
+
+        For builds, installers, test suites and servers — anything slower than
+        the request it would otherwise be waiting inside. Strictly better than
+        backgrounding with ``&`` in :meth:`exec`, which throws away both the exit
+        code and the output::
+
+            job = await c.start_exec("apt-get install -y build-essential")
+            while True:
+                status = await job.poll()
+                print(status.stdout, end="")
+                if status.done and not status.more:
+                    break
+                if not status.more:
+                    await asyncio.sleep(2)
+
+        The handle is the guest pid. It survives this process — a later session
+        can rebuild one with :meth:`background_command` — but not a restart of
+        the computer, and only commands this API started can be read back.
+        """
+        data = await self._t.json(
+            "POST",
+            _api.computer_action(self.id, "exec"),
+            json=_api.exec_body(command, 0, desktop, background=True, cwd=cwd, env=env),
+        )
+        return AsyncBackgroundCommand(self._t, self.id, data or {})
+
+    def background_command(self, pid: int) -> AsyncBackgroundCommand:
+        """A handle onto a command :meth:`start_exec` started earlier.
+
+        For picking up a pid carried across a process boundary — a job id in a
+        queue, a build started by the run before this one. Makes no request, so
+        it does not verify the pid: the first :meth:`AsyncBackgroundCommand.poll`
+        raises :class:`~mandala_computer.NotFoundError` if the daemon has no
+        such handle.
+        """
+        return AsyncBackgroundCommand(self._t, self.id, {"pid": pid})
 
     async def open(self, url: str, *, timeout_s: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::
@@ -439,26 +590,122 @@ class AsyncComputer(ComputerFields):
             "PUT", _api.files(self.id), params=_api.files_params(path), content=body
         )
 
+    # --- windows --------------------------------------------------------
+
+    async def windows(self, *, include_all: bool = False) -> list[Window]:
+        """What is on the desktop, as a list rather than a picture.
+
+        A screenshot says what the desktop looks like; this says what any of it
+        is — which is how a browser that failed to launch is told apart from one
+        that has not painted yet, without asking a model to find it in a PNG.
+
+        ``include_all`` keeps the desktop's own furniture: panels, docks and the
+        wallpaper window. Off by default because a stock guest showing one
+        terminal has five windows, four of which are not applications.
+
+        Linux only.
+        """
+        data = await self._t.json(
+            "GET",
+            _api.computer_action(self.id, "windows"),
+            params=_api.windows_params(include_all),
+        )
+        rows = data.get("windows") if isinstance(data, Mapping) else None
+        return [Window.from_api(w) for w in rows or []]
+
+    async def window_action(
+        self,
+        window_id: str,
+        action: str,
+        *,
+        x: int | None = None,
+        y: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> WindowResult:
+        """Act on one window — focus, raise, minimize, maximize, unmaximize,
+        close, move or resize.
+
+        ``window_id`` comes from :meth:`windows`. ``x``/``y`` are for ``move``
+        and ``width``/``height`` for ``resize``; each pair goes together or not
+        at all.
+
+        Prefer ``focus`` over ``raise``. Raising without focusing gives a window
+        that is visibly in front and silently not receiving keystrokes, which
+        looks in a screenshot exactly like one that is.
+
+        The result is the window *as it now is* rather than an acknowledgement —
+        see :class:`~mandala_computer.WindowResult`, and believe it rather than
+        the request.
+        """
+        data = await self._t.json(
+            "POST",
+            _api.window(self.id, window_id),
+            json=_api.window_body(action, x=x, y=y, width=width, height=height),
+        )
+        return WindowResult.from_api(data if isinstance(data, Mapping) else {})
+
     # --- snapshots ------------------------------------------------------
 
-    async def snapshot(self, *, memory: bool = False) -> Snapshot:
+    async def snapshot(self, *, memory: bool = False, name: str | None = None) -> Snapshot:
         """Capture a snapshot of this computer.
 
         Works while it is running. ``memory=True`` also captures live RAM and
         device state, so a restore or fork resumes exactly where it was instead
-        of booting — the computer must be running for that.
+        of booting — the computer must be running for that. An omitted ``name``
+        asks the platform to generate one.
         """
         data = await self._t.json(
             "POST",
             _api.computer_action(self.id, "snapshots"),
-            json=_api.snapshot_body(memory),
+            json=_api.snapshot_body(memory, name),
         )
         return Snapshot.from_api(data or {})
 
-    async def snapshots(self) -> list[Snapshot]:
-        """This computer's snapshots, in the order the API returns them."""
-        data = await self._t.json("GET", _api.SNAPSHOTS) or []
-        return [Snapshot.from_api(s) for s in data if s.get("computer_id") == self.id]
+    async def snapshots(
+        self, *, include_unfinished: bool = False, allow_partial: bool = False
+    ) -> Listing[Snapshot]:
+        """This computer's snapshots, in the order the API returns them.
+
+        One account-wide read and a filter, which is what listing one computer's
+        snapshots has always been — ``GET /computers/{id}/snapshots`` is not a
+        narrower version of this. It answers a count, a byte total and a
+        fingerprint, and never the snapshots themselves; see
+        :meth:`snapshot_holdings`.
+
+        ``allow_partial`` matters more here than it looks. Without it a short
+        inventory is a 503, so this filter can never quietly narrow one; with
+        it, a short list arrives as an ordinary 200 and the only thing saying so
+        is the returned :class:`~mandala_computer.Listing`. Rows the platform
+        could not read are kept rather than filtered out, even though they
+        cannot be attributed to this computer — they are the markers that say
+        something is missing, and dropping them would turn "some hosts did not
+        answer" into a confident wrong number about one machine.
+        """
+        data, incomplete = await self._t.listing(
+            _api.SNAPSHOTS,
+            params=_api.snapshot_listing_params(
+                include_unfinished=include_unfinished, allow_partial=allow_partial
+            ),
+        )
+        rows = [
+            Snapshot.from_api(s)
+            for s in data or []
+            if s.get("computer_id") == self.id or s.get("unreachable")
+        ]
+        return Listing.of(rows, incomplete)
+
+    async def snapshot_holdings(self) -> SnapshotHoldings:
+        """How many snapshots this computer has, what they weigh, and their
+        fingerprint.
+
+        Not a listing — that is :meth:`snapshots`, and the two routes answer
+        different shapes deliberately. Read this before an irreversible delete:
+        the fingerprint is the only interlock on a purge, and it is not
+        something a caller can compute from a listing. See :meth:`delete`.
+        """
+        data = await self._t.json("GET", _api.computer_action(self.id, "snapshots"))
+        return SnapshotHoldings.from_api(data if isinstance(data, Mapping) else {})
 
     async def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
@@ -488,3 +735,43 @@ class AsyncComputer(ComputerFields):
         returns the computer to never having had a schedule.
         """
         return await self._t.json("DELETE", _api.computer_action(self.id, "schedule")) or {}
+
+
+class AsyncBackgroundCommand(BackgroundCommandFields):
+    """A command running inside a guest, outliving the request that started it.
+
+    Obtain one from :meth:`AsyncComputer.start_exec`, or rebuild one around a pid you
+    already have with :meth:`AsyncComputer.background_command`.
+
+    Reads are consuming — see :class:`~mandala_computer.ExecStatus` — so one
+    handle per command, polled in one place. Two pollers on one pid split the
+    output between them and neither sees all of it.
+    """
+
+    def __init__(
+        self, transport: AsyncTransport, computer_id: str, data: Mapping[str, Any]
+    ) -> None:
+        self._t = transport
+        self._computer_id = computer_id
+        self._data = dict(data)
+
+    async def poll(self) -> ExecStatus:
+        """Read what it has printed since the last poll, and whether it is done.
+
+        Each call advances the daemon's cursor, so what comes back is only the
+        new bytes and dropping them drops them for good. Poll again immediately
+        while :attr:`~mandala_computer.ExecStatus.more` is set; there is output
+        waiting, and sleeping on it only makes the next read bigger.
+        """
+        data = await self._t.json("GET", _api.exec_handle(self._computer_id, self.pid))
+        return ExecStatus.from_api(data if isinstance(data, Mapping) else {})
+
+    async def kill(self) -> ExecStatus:
+        """Stop it, and everything it started.
+
+        Answers with its final state, including whatever it printed that had not
+        been read — so this is a way to end a command and collect its tail in
+        one call, not only a way to abandon one.
+        """
+        data = await self._t.json("DELETE", _api.exec_handle(self._computer_id, self.pid))
+        return ExecStatus.from_api(data if isinstance(data, Mapping) else {})
