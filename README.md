@@ -26,8 +26,8 @@ from mandala_computer import Client
 client = Client()
 
 with client.computers.ephemeral(template="base") as c:
-    c.wait_for_guest()                      # desktop is up and answering
-    c.open("https://example.com")           # on the screen, not as root
+    c.wait_for_guest()  # desktop is up and answering
+    c.open("https://example.com")  # on the screen, not as root
     c.click(640, 400)
     c.type("hello")
     png = c.screenshot()
@@ -80,8 +80,8 @@ it — rather than being thrown away with an exception:
 ```python
 c = client.computers.create(template="base")
 if c.start_error:
-    print(c.start_error)   # e.g. "no host had room to start it"
-    c.start()              # often works on a second attempt
+    print(c.start_error)  # e.g. "no host had room to start it"
+    c.start()  # often works on a second attempt
 ```
 
 ### Suspending
@@ -92,10 +92,10 @@ processes, same open windows — in about a second, instead of booting.
 
 ```python
 c.suspend()
-c.is_suspended     # True
-c.suspended_at     # when the session was saved
-c.start()          # resumes it; ~1s, not a boot
-c.stop()           # discards the session instead
+c.is_suspended  # True
+c.suspended_at  # when the session was saved
+c.start()  # resumes it; ~1s, not a boot
+c.stop()  # discards the session instead
 ```
 
 `restart()` is refused with `ConflictError` while a session is saved, since it
@@ -118,9 +118,9 @@ its live desktop, so putting a screen on your own page costs no extra call:
 
 ```python
 c = client.computers.get(computer_id)
-c.vnc.embed_url    # watch-only, drop straight into an <iframe>
-c.vnc.url          # full control: keyboard, pointer, clipboard
-c.vnc.view_url     # watch only — the platform drops input on this socket
+c.vnc.embed_url  # watch-only, drop straight into an <iframe>
+c.vnc.url  # full control: keyboard, pointer, clipboard
+c.vnc.view_url  # watch only — the platform drops input on this socket
 ```
 
 Two credentials, because they are not the same permission. `view_token` cannot
@@ -141,12 +141,14 @@ same errors. Everything that performs IO is a coroutine.
 import asyncio
 from mandala_computer import AsyncClient
 
+
 async def main():
     async with AsyncClient() as client:
         async with client.computers.ephemeral(template="base") as c:
             await c.wait_for_guest()
             png = await c.screenshot()
             await c.type("hello")
+
 
 asyncio.run(main())
 ```
@@ -168,7 +170,7 @@ rather than the work.
 
 ```python
 c.rename("build box")
-c.name                  # "build box" — the handle is updated in place
+c.name  # "build box" — the handle is updated in place
 ```
 
 The name is a label; nothing is derived from it, and it need not be unique. The
@@ -184,6 +186,28 @@ computer exists they are listed under its current name; once it is deleted they
 fall back to what it was called at the time, which is then the only thing left
 identifying where those bytes came from.
 
+### Resizing, and the idle window
+
+```python
+c.stop()
+c.resize(cpu=4, ram_mb=8192)  # the computer must be stopped; disks grow only
+c.set_idle_suspend(120)  # minutes untouched before the host suspends it
+c.set_idle_suspend(None)  # back to the host's own sweep
+```
+
+Three methods rather than one `update()`, because the platform refuses these in
+combination and is right to: a resize needs the computer stopped and the other
+two do not, so one request could not honour both without applying half of it.
+
+`c.idle_suspend_min` is `None` on a computer with no override of its own. That
+is not the same as "never suspends" — it follows whatever its host is sweeping
+at, 30 minutes at the time of writing. The host's number is deliberately not
+reported in its place, because it is a property of the host and changes when an
+operator changes it.
+
+The screen is not part of this. `resolution` is fixed for the life of a
+computer — see [Sizes](#sizes).
+
 ### Driving the desktop
 
 Coordinates are in the computer's own screen space. That is a create-time choice
@@ -193,15 +217,18 @@ are the 1280×800 default, which is only what a computer that asked for nothing
 else renders at.
 
 ```python
-c.move(x, y); c.click(x, y); c.right_click(x, y); c.double_click(x, y)
+c.move(x, y)
+c.click(x, y)
+c.right_click(x, y)
+c.double_click(x, y)
 c.scroll(x, y, direction="up", amount=3)
 c.type("some text")
 c.key("ctrl", "c")
 
-png  = c.screenshot()             # full-resolution PNG
-jpg  = c.screenshot(width=320)    # downscaled JPEG — cheap enough to poll
+png = c.screenshot()  # full-resolution PNG
+jpg = c.screenshot(width=320)  # downscaled JPEG — cheap enough to poll
 
-res = c.exec("ls /tmp")           # native shell: bash on Linux, cmd.exe on Windows
+res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
 res.ok, res.exit_code, res.stdout, res.stderr
 ```
 
@@ -215,7 +242,7 @@ before parsing anything that could be large:
 ```python
 res = c.exec("cat /var/log/syslog")
 if res.truncated:
-    ...     # redirect to a file inside the guest and fetch it instead
+    ...  # redirect to a file inside the guest and fetch it instead
 ```
 
 `res.ok` deliberately ignores truncation: a command that succeeded and produced
@@ -229,7 +256,7 @@ By default `exec()` runs in the system context — as `root` on Linux, with no
 anything with a window. The obvious call therefore does nothing:
 
 ```python
-c.exec("firefox https://example.com")     # no DISPLAY — dies, and exec() reports it
+c.exec("firefox https://example.com")  # no DISPLAY — dies, and exec() reports it
 ```
 
 `desktop=True` runs the command in the logged-in desktop session instead, as the
@@ -290,6 +317,75 @@ APIError: session "desktop" is not supported on Windows guests yet
 Until that lands, drive the Windows desktop through `click()`, `type()` and
 `key()` — open the browser from the taskbar the way a person would.
 
+### Long-running commands
+
+`exec()` waits, and `timeout_s` passing means *you* stopped waiting — the
+command keeps running inside the guest, and its output and exit code are lost
+with the request. For anything slower than a few seconds, start it instead:
+
+```python
+job = c.start_exec("apt-get install -y build-essential", cwd="/root")
+
+while True:
+    status = job.poll()
+    print(status.stdout, end="")
+    if status.done and not status.more:
+        break
+    if not status.more:
+        time.sleep(2)
+
+print(status.exit_code)
+```
+
+Strictly better than backgrounding with `&`, which throws away both the exit
+code and the output.
+
+The read is a **cursor, not a buffer**: each `poll()` returns what has arrived
+since the last one and advances the daemon's own offset. Output you receive and
+drop is gone, and two pollers on one pid split the stream between them rather
+than each seeing all of it — so keep one handle per command. `status.more`
+means there is output waiting right now, which is why the loop above only sleeps
+when it is clear.
+
+`job.kill()` stops the command and everything it started, and answers with its
+final state including whatever it printed that you had not read — so it collects
+the tail as well as ending the job. `job.pid` survives the process: a later run
+can pick the command back up with `c.background_command(pid)`, which makes no
+request until you poll it.
+
+### What is on the desktop
+
+A screenshot says what the desktop looks like; `windows()` says what any of it
+*is*. That is how a browser that failed to launch is told apart from one that
+has not painted yet, without asking a model to find it in a PNG.
+
+```python
+for w in c.windows():
+    print(w.id, w.wm_class, w.title, w.width, w.height, w.focused)
+
+firefox = next(w for w in c.windows() if w.wm_class == "Navigator")
+c.window_action(firefox.id, "focus")
+c.window_action(firefox.id, "move", x=0, y=0)
+c.window_action(firefox.id, "resize", width=1280, height=760)
+```
+
+Match on `wm_class`, not `title`: the class is the application and is stable,
+the title is whatever page it happens to be showing.
+
+Prefer `focus` over `raise`. Raising without focusing gives a window that is
+visibly in front and silently not receiving keystrokes — which in a screenshot
+looks exactly like one that is.
+
+The result is the window *as it now is*, not an acknowledgement. Believe it
+rather than the request: the window manager places the frame and applications
+snap to their own increments, so a move to (300, 200) routinely lands at
+(305, 229). After a `close` there is no window to describe, and `res.gone` is
+what separates that from an action the guest simply could not report on.
+
+`include_all=True` keeps the desktop's own furniture — panels, docks, the
+wallpaper window. Off by default because a stock guest showing one terminal has
+five windows, four of which are not applications. Linux only.
+
 ### Readiness
 
 `create()` returns as soon as the API does; the machine is starting, not ready.
@@ -321,8 +417,8 @@ to boot yet — starting, stopping, snapshotting or cloning it raises
 
 ```python
 c = client.snapshots.clone(snap.id)
-c.is_building          # True
-c.wait_until_built()   # minutes, for a large disk
+c.is_building  # True
+c.wait_until_built()  # minutes, for a large disk
 c.start().wait_for_guest()
 ```
 
@@ -331,7 +427,7 @@ took. It never becomes usable — delete it and clone again.
 
 ```python
 if c.build_failed:
-    print(c.build_error)   # e.g. "no space left on device"
+    print(c.build_error)  # e.g. "no space left on device"
     c.delete()
 ```
 
@@ -342,14 +438,14 @@ still going.
 ### Snapshots
 
 ```python
-snap = c.snapshot()                     # disk, works while running
-snap = c.snapshot(memory=True)          # + live RAM, resumes without booting
+snap = c.snapshot()  # disk, works while running
+snap = c.snapshot(memory=True, name="before-upgrade")  # + live RAM, resumes without booting
 client.snapshots.restore(snap.id)
 twin = client.snapshots.clone(snap.id)  # a fork, for memory snapshots
-twin.wait_until_built()                 # the disk is copied out of backup first
+twin.wait_until_built()  # the disk is copied out of backup first
 c.set_schedule(enabled=True, hour=4, tz="America/Chicago")
 c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the time
-c.clear_schedule()                                           # removed entirely
+c.clear_schedule()  # removed entirely
 ```
 
 Disabling and clearing differ. `set_schedule(enabled=False)` is deliberately
@@ -361,7 +457,7 @@ For "when did my backups last run", read the snapshots, which carry real capture
 times; `auto` marks the ones the scheduler took:
 
 ```python
-backups = [s for s in c.snapshots() if s.auto]      # or s.is_scheduled
+backups = [s for s in c.snapshots() if s.auto]  # or s.is_scheduled
 last = max((s.created_at for s in backups), default=None)
 if last is None:
     print("no automatic backup has ever run")
@@ -369,6 +465,82 @@ if last is None:
 
 `auto` also marks the only snapshots retention will age out — ones you take
 yourself are never removed automatically.
+
+#### Orphans
+
+Snapshots outlive the computers they came from, so an ordinary account's listing
+contains rows whose `computer_id` resolves to nothing. Those carry
+`orphaned=True`, and it decides which of the two operations still works: `clone`
+builds a new computer out of the snapshot alone and is fine, while `restore`
+puts the disk back on a source that no longer exists.
+
+`include_unfinished=True` widens a listing to deletions that began and did not
+finish. Nothing can be restored or cloned from one, but they still hold objects
+and are still billed — so it is the flag for a question about storage rather
+than about what you can act on.
+
+#### Deleting a computer, and its snapshots
+
+Deleting a computer keeps its snapshots by default; they become the orphans
+above. Destroying them with it is opt-in, and bound to what you were shown:
+
+```python
+held = c.snapshot_holdings()
+print(held.count, held.size_bytes)
+
+if held.count == 2:  # you looked, and decided
+    c.delete(purge_snapshots=True, expect=held.fingerprint)
+```
+
+`snapshot_holdings()` is not a listing — the snapshots themselves come from
+`c.snapshots()`, and the two routes answer different shapes deliberately. What
+it has that a listing cannot give you is `fingerprint`, which names that exact
+set and cannot be computed from the rows. It is the only interlock on an
+irreversible operation: the daemon refuses the sweep if a capture has landed
+since you read it.
+
+Which is why the fingerprint must not be fetched on the line above the delete.
+That binds the purge to whatever the set is *now* rather than to what anybody
+agreed to, and the race it exists for is precisely a capture that finishes
+between the decision and the call. A stale one raises `ConflictError` and
+destroys nothing. Purging without one raises `ValueError` before any request is
+made — the platform itself allows an unguarded purge, for callers that have no
+way to read the holdings, and this SDK has one call away.
+
+`delete()` returns how many snapshots went with the computer, or `None` when the
+platform did not say. `None` rather than `0`: reporting "nothing was destroyed"
+because the server was quiet is the one wrong answer worth going out of the way
+to avoid.
+
+### Partial listings
+
+`client.computers.list()` and `client.snapshots.list()` fan out across every
+hypervisor holding something of yours, so one that cannot be reached makes the
+answer incomplete. By default the platform refuses to send it and this raises
+`UnavailableError` — because a short list is not a smaller truth. It reads
+exactly like the missing computers were deleted, and the obvious next thing a
+script does with a computer that has disappeared is tidy up after it.
+
+```python
+computers = client.computers.list(allow_partial=True)
+if not computers.is_complete:
+    ...  # do not treat anything absent from this as deleted
+```
+
+The return is a `Listing`, which is a `list` — everything written against the
+old return type still works. What it adds is `is_complete`, and `incomplete` for
+the count. Branch on `is_complete`, never on the number: `incomplete` is what
+the platform's placement cache could account for, and it is legitimately `0`,
+because a computer created during the outage was never cached against the host
+now holding it.
+
+Rows the platform could not read come back marked rather than omitted —
+`c.unreachable` on a computer, `s.unreachable` on a snapshot — carrying an id
+and nothing else. Everything else on such a row is absent, so `status` reads
+`""` rather than anything true. `c.snapshots()` keeps them for that reason even
+though they cannot be attributed to a computer: dropping them would remove
+precisely the markers saying the answer is short, and then report a confident
+count.
 
 ### Files
 
@@ -395,6 +567,7 @@ Everything derives from `MandalaError`.
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
 | `ConflictError` | 409 — right request, wrong moment; retry |
+| `UnavailableError` | 503 — a listing would have been short; see [Partial listings](#partial-listings) |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up |
 
@@ -415,7 +588,7 @@ stays silent past its boot window stops being a conflict and becomes a 502
 try:
     c.snapshot()
 except mandala_computer.ConflictError:
-    c.wait_until_built()   # or just try again shortly
+    c.wait_until_built()  # or just try again shortly
     c.snapshot()
 ```
 
@@ -466,11 +639,22 @@ every method that makes a request, for **both** clients, and asserts each call
 lands on an allowlisted route, so drift fails here rather than in a user's hands.
 
 Drift has two directions, and that test pins both. `ALLOWED` mirrors the
-platform's route table in full, and `UNIMPLEMENTED` names the part of it this
-SDK cannot yet reach — currently the agent loop and its OpenAI-shaped door, file
-transfer, and the guest window list. Without the second set the first proves
-nothing over time: "every call lands on an allowlisted route" stays true no
-matter how far behind the client falls.
+platform's `V1_ROUTES` table in full, and `UNIMPLEMENTED` names the part of it
+this SDK cannot yet reach — currently `POST computers/:id/agent` and `POST
+chat/completions`, both of which need SSE. Without the second set the first
+proves nothing over time: "every call lands on an allowlisted route" stays true
+no matter how far behind the client falls, so closing a gap means deleting a
+line from `UNIMPLEMENTED` rather than nobody noticing.
+
+A mirror nobody compares is a comment, though, and that is not hypothetical:
+background exec and the snapshot holdings landed upstream and stayed invisible
+here for exactly as long as there was nothing doing the comparison, with the
+whole suite green throughout — neither of those tests can see a route the
+mirror has never heard of. `scripts/check_surface.py` closes that hole. It
+parses the real table out of the platform repo whenever it happens to be checked
+out next door, or wherever `MANDALA_PLATFORM_REPO` points, and says so and exits
+0 when it is not — the ordinary case in CI here, and failing over it would make
+this a check people learn to ignore.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients.
@@ -500,6 +684,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest
 .venv/bin/ruff check .
 .venv/bin/mypy
+.venv/bin/python scripts/check_surface.py   # needs the platform repo checked out
 ```
 
 ## License

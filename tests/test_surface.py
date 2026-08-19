@@ -9,6 +9,13 @@ Keep ALLOWED in step with V1_ROUTES in `web/lib/surface.ts` in the platform repo
 It mirrors that table in full, including the routes this SDK cannot yet call —
 those are named in UNIMPLEMENTED, which is what keeps the distance between the
 two visible rather than letting it grow quietly.
+
+A mirror nobody compares is a comment. `scripts/check_surface.py` does the
+comparison whenever the platform repo happens to be checked out, and its absence
+is how three routes — background exec and the snapshot holdings — landed
+upstream and stayed invisible here: the two tests below both stayed green,
+because "every call lands on an allowlisted route" is trivially true of a
+mirror that never learned the route exists.
 """
 
 from __future__ import annotations
@@ -38,7 +45,12 @@ ALLOWED = {
     ("GET", "computers/:id/screenshot"),
     ("POST", "computers/:id/input"),
     ("POST", "computers/:id/exec"),
+    ("GET", "computers/:id/exec/:pid"),
+    ("DELETE", "computers/:id/exec/:pid"),
+    ("GET", "computers/:id/windows"),
+    ("POST", "computers/:id/windows/:window"),
     ("GET", "snapshots"),
+    ("GET", "computers/:id/snapshots"),
     ("POST", "computers/:id/snapshots"),
     ("POST", "snapshots/:id/restore"),
     ("POST", "snapshots/:id/clone"),
@@ -46,13 +58,11 @@ ALLOWED = {
     ("GET", "computers/:id/schedule"),
     ("PUT", "computers/:id/schedule"),
     ("DELETE", "computers/:id/schedule"),
-    # Reachable, and not yet reached from here — see UNIMPLEMENTED.
-    ("GET", "computers/:id/windows"),
-    ("POST", "computers/:id/windows/:window"),
-    ("POST", "computers/:id/agent"),
-    ("POST", "chat/completions"),
     ("PUT", "computers/:id/files"),
     ("GET", "computers/:id/files"),
+    # Reachable, and not yet reached from here — see UNIMPLEMENTED.
+    ("POST", "computers/:id/agent"),
+    ("POST", "chat/completions"),
 }
 
 # Routes the platform exposes that this SDK cannot yet call.
@@ -64,9 +74,6 @@ ALLOWED = {
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # OPL-3583. List what is on the desktop, and act on one window.
-    ("GET", "computers/:id/windows"),
-    ("POST", "computers/:id/windows/:window"),
     # OPL-3567. One call that drives the computer until the task is done, and
     # the same engine behind an OpenAI-shaped door. Both need SSE.
     ("POST", "computers/:id/agent"),
@@ -75,15 +82,34 @@ UNIMPLEMENTED = {
 
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
 SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", "state": "durable"}
+HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
+WINDOW = {"id": "0x2600003", "title": "T", "class": "Firefox"}
+EXEC_STATUS = {"pid": 4242, "running": False, "exited": True, "exit_code": 0}
 
 
 def pattern_for(path: str) -> str:
-    """Reduce a concrete path to its route shape, as the server's proxy does."""
+    """Reduce a concrete path to its route shape, as the server's proxy does.
+
+    By position and by parent, never by a regex over the raw path, so an id can
+    never be mistaken for a route segment — and the two ids that name something
+    *inside* a computer get their own placeholders rather than a second ":id".
+    Pinned to exactly position 3 for the same reason the platform pins it: a
+    bare "parent is windows" rule makes the word a wildcard parent everywhere,
+    and a later literal route like "computers/:id/windows/close-all" could then
+    never match, being shadowed by the pattern it reduces to.
+    """
     parts = [p for p in path.strip("/").split("/") if p]
-    return "/".join(
-        ":id" if i and parts[i - 1] in ("computers", "snapshots") else seg
-        for i, seg in enumerate(parts)
-    )
+
+    def one(i: int, seg: str) -> str:
+        if i and parts[i - 1] in ("computers", "snapshots"):
+            return ":id"
+        if i == 3 and parts[0] == "computers" and parts[2] == "windows":
+            return ":window"
+        if i == 3 and parts[0] == "computers" and parts[2] == "exec":
+            return ":pid"
+        return seg
+
+    return "/".join(one(i, seg) for i, seg in enumerate(parts))
 
 
 @pytest.fixture
@@ -105,14 +131,25 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"bytes")
     if path.endswith("/exec"):
         return httpx.Response(
-            200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+            200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False, "pid": 4242}
         )
+    if "/exec/" in path:
+        return httpx.Response(200, json=EXEC_STATUS)
+    if path.endswith("/windows"):
+        return httpx.Response(200, json={"windows": [WINDOW]})
+    if "/windows/" in path:
+        return httpx.Response(200, json={"ok": True, "window": WINDOW, "gone": False})
     if path.endswith(("/templates", "/sizes")):
         return httpx.Response(200, json=[])
     # Collections list on GET and return a single object on POST — getting this
     # backwards is what made the first version of this test fail.
     if path.endswith("/snapshots"):
-        return httpx.Response(200, json=[SNAPSHOT] if get else SNAPSHOT)
+        # Three shapes on two routes: the account-wide GET lists, a computer's
+        # GET answers holdings — a count, a size and a fingerprint, not a
+        # listing — and the POST returns the one snapshot it took.
+        if not get:
+            return httpx.Response(200, json=SNAPSHOT)
+        return httpx.Response(200, json=HOLDINGS if "/computers/" in path else [SNAPSHOT])
     if path.endswith("/computers"):
         return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
     return httpx.Response(200, json=COMPUTER)
@@ -160,18 +197,35 @@ def exercise_everything(client: mc.Client) -> None:
     c.wait(1)
     c.cursor_position()
     c.exec("true")
+    c.exec("true", cwd="/tmp", env={"CI": "1"})
+    job = c.start_exec("sleep 60")
+    job.poll()
+    job.kill()
+    c.background_command(4242).poll()
+    c.windows()
+    c.windows(include_all=True)
+    c.window_action("0x2600003", "focus")
+    c.window_action("0x2600003", "move", x=10, y=20)
+    c.resize(cpu=4, ram_mb=8192)
+    c.set_idle_suspend(15)
+    c.set_idle_suspend(None)
     c.read_file("/home/user/out.txt")
     c.write_file("/home/user/in.txt", b"hello")
     c.snapshot()
-    c.snapshot(memory=True)
+    c.snapshot(memory=True, name="before-upgrade")
     c.snapshots()
+    c.snapshots(include_unfinished=True, allow_partial=True)
+    c.snapshot_holdings()
     c.schedule()
     c.set_schedule(enabled=True, hour=4, tz="UTC")
     c.clear_schedule()
+    client.computers.list(allow_partial=True)
     client.snapshots.list()
+    client.snapshots.list(include_unfinished=True, allow_partial=True)
     client.snapshots.restore("snap-1")
     client.snapshots.clone("snap-1")
     client.snapshots.delete("snap-1")
+    c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
 
@@ -210,18 +264,35 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.wait(1)
     await c.cursor_position()
     await c.exec("true")
+    await c.exec("true", cwd="/tmp", env={"CI": "1"})
+    job = await c.start_exec("sleep 60")
+    await job.poll()
+    await job.kill()
+    await c.background_command(4242).poll()
+    await c.windows()
+    await c.windows(include_all=True)
+    await c.window_action("0x2600003", "focus")
+    await c.window_action("0x2600003", "move", x=10, y=20)
+    await c.resize(cpu=4, ram_mb=8192)
+    await c.set_idle_suspend(15)
+    await c.set_idle_suspend(None)
     await c.read_file("/home/user/out.txt")
     await c.write_file("/home/user/in.txt", b"hello")
     await c.snapshot()
-    await c.snapshot(memory=True)
+    await c.snapshot(memory=True, name="before-upgrade")
     await c.snapshots()
+    await c.snapshots(include_unfinished=True, allow_partial=True)
+    await c.snapshot_holdings()
     await c.schedule()
     await c.set_schedule(enabled=True, hour=4, tz="UTC")
     await c.clear_schedule()
+    await client.computers.list(allow_partial=True)
     await client.snapshots.list()
+    await client.snapshots.list(include_unfinished=True, allow_partial=True)
     await client.snapshots.restore("snap-1")
     await client.snapshots.clone("snap-1")
     await client.snapshots.delete("snap-1")
+    await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 
 

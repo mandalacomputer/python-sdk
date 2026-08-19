@@ -27,10 +27,10 @@ from __future__ import annotations
 
 import httpx
 
-from ._async_computer import AsyncComputer
+from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import AsyncComputers, AsyncSizes, AsyncSnapshots, AsyncTemplates
 from ._client import DEFAULT_BASE_URL, AsyncTransport, Transport
-from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, Computer
+from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
 from ._exceptions import (
     APIError,
     AuthenticationError,
@@ -40,8 +40,20 @@ from ._exceptions import (
     PermissionDeniedError,
     PlanLimitError,
     TimeoutError,
+    UnavailableError,
 )
-from ._models import ExecResult, Size, Snapshot, Template, VncConnect
+from ._models import (
+    ExecResult,
+    ExecStatus,
+    Listing,
+    Size,
+    Snapshot,
+    SnapshotHoldings,
+    Template,
+    VncConnect,
+    Window,
+    WindowResult,
+)
 from ._resources import Computers, Sizes, Snapshots, Templates
 
 __version__ = "0.1.0"
@@ -51,22 +63,30 @@ __all__ = [
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
     "APIError",
+    "AsyncBackgroundCommand",
     "AsyncClient",
     "AsyncComputer",
     "AuthenticationError",
+    "BackgroundCommand",
     "Client",
     "Computer",
     "ConflictError",
     "ExecResult",
+    "ExecStatus",
+    "Listing",
     "MandalaError",
     "NotFoundError",
     "PermissionDeniedError",
     "PlanLimitError",
     "Size",
     "Snapshot",
+    "SnapshotHoldings",
     "Template",
     "TimeoutError",
+    "UnavailableError",
     "VncConnect",
+    "Window",
+    "WindowResult",
     "__version__",
 ]
 

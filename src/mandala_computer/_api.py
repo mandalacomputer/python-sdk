@@ -11,6 +11,7 @@ from __future__ import annotations
 import shlex
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import quote
 
 # --- paths ----------------------------------------------------------------
 
@@ -28,6 +29,28 @@ def computer_action(computer_id: str, action: str) -> str:
     """start | stop | suspend | restart | clone | screenshot | input | exec |
     snapshots | schedule."""
     return f"computers/{computer_id}/{action}"
+
+
+def exec_handle(computer_id: str, pid: int) -> str:
+    """A backgrounded command, addressed by the guest pid ``exec`` answered with.
+
+    Not ``computer_action``: the pid is a second path segment, and the platform's
+    own ``patternFor`` reduces it to ``:pid`` rather than to ``:id`` — it names
+    something inside a computer rather than a thing the platform owns.
+    """
+    return f"computers/{computer_id}/exec/{pid}"
+
+
+def window(computer_id: str, window_id: str) -> str:
+    """One window on the guest's desktop, addressed by its X id.
+
+    The id is percent-encoded, unlike the computer and snapshot ids above, and
+    the difference is real rather than untidy: those are minted by the platform
+    in a known alphabet, while this one is whatever the guest's window manager
+    called a window. An unescaped ``/`` in it would not merely 404 — it would
+    add a path segment, and the request would land on a route nobody meant.
+    """
+    return f"computers/{computer_id}/windows/{quote(window_id, safe='')}"
 
 
 def snapshot(snapshot_id: str) -> str:
@@ -53,6 +76,66 @@ def files_params(path: str) -> dict[str, str]:
     if not path.startswith("/"):
         raise ValueError(f"guest path must be absolute: {path!r}")
     return {"path": path}
+
+
+def partial_params(allow_partial: bool) -> dict[str, str] | None:
+    """The opt-in to a knowingly short fan-out listing.
+
+    Omitted rather than sent as ``0`` when the caller did not ask: the platform
+    reads the key's presence, and an explicit falsey value is the kind of thing
+    a proxy or a future server version could read either way. Nothing is the
+    unambiguous spelling of "I did not ask for this".
+    """
+    return {"allow_partial": "1"} if allow_partial else None
+
+
+def snapshot_listing_params(*, include_unfinished: bool, allow_partial: bool) -> dict[str, str]:
+    """The query on ``GET /snapshots``.
+
+    ``include=unfinished`` widens the listing to deletions that began and did
+    not finish. They are not restorable or clonable — their state reads
+    ``deleting`` — but they still hold objects and are still billed, so this is
+    the flag for a question about storage rather than about what can be used.
+    """
+    params = dict(partial_params(allow_partial) or {})
+    if include_unfinished:
+        params["include"] = "unfinished"
+    return params
+
+
+def windows_params(include_all: bool) -> dict[str, str] | None:
+    """``include=all`` to keep the desktop's own furniture in the listing.
+
+    Off by default because panels, docks and the wallpaper window are not
+    windows a caller acts on — a stock guest showing one terminal has five.
+    """
+    return {"include": "all"} if include_all else None
+
+
+def delete_params(*, purge_snapshots: bool, expect: str | None) -> dict[str, str] | None:
+    """The query that turns a delete into a delete-and-purge.
+
+    ``expect`` is required here, and the platform's own rule is weaker — it
+    accepts an unguarded purge, for callers with no way to read the holdings.
+    This SDK has one call away, so the refusal costs nothing and buys the
+    interlock: the fingerprint binds the sweep to the set that was actually
+    looked at, and the daemon refuses it if a capture has landed since. Without
+    it the purge is bound to whatever the set happens to be at the moment it
+    fires, which is not the thing anybody agreed to destroy.
+
+    ``expect`` is dropped rather than carried when nothing is being purged. A
+    stale fingerprint on an ordinary delete would refuse it for a reason that
+    has nothing to do with what was asked.
+    """
+    if not purge_snapshots:
+        return None
+    if not expect:
+        raise ValueError(
+            "purging snapshots needs the fingerprint from snapshot_holdings(): "
+            "read it, check the count and size are what you meant to destroy, "
+            "and pass it as expect=. Nothing has been deleted."
+        )
+    return {"snapshots": "delete", "expect": expect}
 
 
 # --- responses ------------------------------------------------------------
@@ -150,16 +233,43 @@ def rename_body(name: str) -> dict[str, Any]:
     return {"name": name}
 
 
-def exec_body(command: str, timeout_s: int, desktop: bool = False) -> dict[str, Any]:
+def exec_body(
+    command: str,
+    timeout_s: int,
+    desktop: bool = False,
+    *,
+    background: bool = False,
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     """Build an exec payload.
 
     ``session`` is omitted rather than sent empty when ``desktop`` is false: the
     server's default is the system context, and the only value it accepts is
     ``"desktop"``.
+
+    ``timeout_s`` is omitted alongside ``background`` rather than sent and
+    ignored. The server does ignore it — not waiting is the whole request — but
+    a payload carrying a deadline that means nothing is a payload somebody will
+    later read as a promise the platform never made.
+
+    ``cwd`` must be absolute for the reason a file transfer's path must be: the
+    guest agent inherits whatever directory it was started in, so a relative one
+    resolves somewhere nobody named.
     """
-    body: dict[str, Any] = {"command": command, "timeout_s": timeout_s}
+    body: dict[str, Any] = {"command": command}
+    if not background:
+        body["timeout_s"] = timeout_s
     if desktop:
         body["session"] = "desktop"
+    if background:
+        body["background"] = True
+    if cwd is not None:
+        if not cwd.startswith("/"):
+            raise ValueError(f"cwd must be absolute: {cwd!r}")
+        body["cwd"] = cwd
+    if env:
+        body["env"] = dict(env)
     return body
 
 
@@ -193,8 +303,98 @@ def open_url_command(url: str) -> str:
     return f"nohup firefox {shlex.quote(url)} >/dev/null 2>&1 &"
 
 
-def snapshot_body(memory: bool) -> dict[str, Any]:
-    return {"memory": memory}
+def snapshot_body(memory: bool, name: str | None = None) -> dict[str, Any]:
+    """A capture request. An omitted name asks the platform to generate one."""
+    body: dict[str, Any] = {"memory": memory}
+    if name is not None:
+        body["name"] = name
+    return body
+
+
+# The seven things the window manager will do to one window. Checked here rather
+# than left to the server, because a typo'd action is knowable without the round
+# trip and the error naming the set is more use than a 400 naming the field.
+WINDOW_ACTIONS = (
+    "focus",
+    "raise",
+    "minimize",
+    "maximize",
+    "unmaximize",
+    "close",
+    "move",
+    "resize",
+)
+
+
+def window_body(
+    action: str,
+    *,
+    x: int | None = None,
+    y: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, Any]:
+    """One action on one window, with the geometry the action needs.
+
+    Half a point and half a size are refused rather than completed with a zero,
+    for the reason ``drag_body`` refuses half an origin: a caller naming only
+    ``x`` meant to name a position, and quietly filling the other half moves the
+    window to the edge of the screen while the call reports success. The action
+    happens, in the wrong place, and nothing says so.
+    """
+    if action not in WINDOW_ACTIONS:
+        raise ValueError(f"action must be one of {WINDOW_ACTIONS}")
+    if (x is None) != (y is None):
+        raise ValueError("give both x and y, or neither")
+    if (width is None) != (height is None):
+        raise ValueError("give both width and height, or neither")
+    body: dict[str, Any] = {"action": action}
+    if x is not None and y is not None:
+        body["x"], body["y"] = x, y
+    if width is not None and height is not None:
+        body["width"], body["height"] = width, height
+    return body
+
+
+def resize_body(*, cpu: int | None, ram_mb: int | None, disk_gb: int | None) -> dict[str, Any]:
+    """A new shape for a stopped computer.
+
+    Its own body rather than a field on a general update, because the platform
+    refuses a resize in combination with a rename or an idle window and is right
+    to: a resize needs the computer stopped and the other two do not, so one
+    request cannot honour both without applying half of it. Three methods that
+    each send one group is the shape that cannot ask for the refused thing.
+
+    A disk grows only. That is the server's rule, not checked here — shrinking
+    is a coherent request that this SDK has no way to know is refused for this
+    computer, and guessing at the current size to reject it would be a client
+    inventing a limit.
+    """
+    body = {
+        key: value
+        for key, value in (("cpu", cpu), ("ram_mb", ram_mb), ("disk_gb", disk_gb))
+        if value is not None
+    }
+    if not body:
+        raise ValueError("resize() needs at least one of cpu, ram_mb or disk_gb")
+    return body
+
+
+def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
+    """How long this computer may sit untouched before its host suspends it.
+
+    ``None`` is sent, not omitted, and that is the whole reason this is not
+    folded into a generic body builder that drops falsey values: an explicit
+    null is how the override is cleared, returning the computer to whatever its
+    host is sweeping at. Dropped, it would mean "change nothing", which is the
+    opposite request.
+
+    The platform requires this to be the only field in the PATCH, which is why
+    it has a method of its own rather than a keyword on ``rename``.
+    """
+    if minutes is not None and minutes <= 0:
+        raise ValueError("idle_suspend_min must be positive, or None to clear the override")
+    return {"idle_suspend_min": minutes}
 
 
 def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str, Any]:

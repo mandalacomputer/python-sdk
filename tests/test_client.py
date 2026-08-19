@@ -784,3 +784,427 @@ def test_an_ordinary_exec_is_not_truncated(client: mc.Client) -> None:
         )
     )
     assert not _computer(client).exec("echo ok").truncated
+
+
+# --- partial listings -------------------------------------------------------
+
+
+@respx.mock
+def test_a_complete_listing_says_it_is_complete(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[COMPUTER]))
+    computers = client.computers.list()
+    assert computers.is_complete
+    assert computers.incomplete is None
+
+
+@respx.mock
+def test_allow_partial_is_opt_in_and_absent_otherwise(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[COMPUTER]))
+    client.computers.list()
+    assert "allow_partial" not in route.calls.last.request.url.params
+    client.computers.list(allow_partial=True)
+    assert route.calls.last.request.url.params["allow_partial"] == "1"
+
+
+@respx.mock
+def test_a_short_listing_says_so_rather_than_reading_as_a_smaller_fleet(
+    client: mc.Client,
+) -> None:
+    """The header is the only thing that distinguishes short from deleted."""
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(200, json=[COMPUTER], headers={"X-GC-Incomplete": "3"})
+    )
+    computers = client.computers.list(allow_partial=True)
+    assert len(computers) == 1
+    assert not computers.is_complete
+    assert computers.incomplete == 3
+
+
+@respx.mock
+def test_a_short_listing_that_cannot_say_by_how_much_is_still_short(
+    client: mc.Client,
+) -> None:
+    """Zero is a real answer and is not the same as complete.
+
+    A computer created during the outage was never cached against the host now
+    holding it, so the count is 0 while the list is genuinely short. Branching
+    on the number rather than on `is_complete` reads that as "nothing missing".
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(200, json=[], headers={"X-GC-Incomplete": "0"})
+    )
+    computers = client.computers.list(allow_partial=True)
+    assert computers.incomplete == 0
+    assert not computers.is_complete
+
+
+@respx.mock
+def test_a_listing_that_would_be_short_is_refused_by_default(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(503, json={"error": "a hypervisor cannot be reached"})
+    )
+    with pytest.raises(mc.UnavailableError) as e:
+        client.computers.list()
+    assert e.value.status == 503
+    # Its own class, and not a conflict: nothing here clears by retrying the
+    # same request differently, but passing allow_partial does change it.
+    assert not isinstance(e.value, mc.ConflictError)
+
+
+@respx.mock
+def test_unreachable_rows_are_marked_rather_than_believed(client: mc.Client) -> None:
+    """A cached row carries an id and nothing else — including no status."""
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[COMPUTER, {"id": "vm-2", "unreachable": True}],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    listed, missing = client.computers.list(allow_partial=True)
+    assert not listed.unreachable
+    assert missing.unreachable
+    assert missing.status == ""
+
+
+@respx.mock
+def test_snapshot_listing_carries_include_and_partial(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
+    client.snapshots.list()
+    assert not route.calls.last.request.url.params
+    client.snapshots.list(include_unfinished=True, allow_partial=True)
+    params = route.calls.last.request.url.params
+    assert params["include"] == "unfinished" and params["allow_partial"] == "1"
+
+
+@respx.mock
+def test_an_orphaned_snapshot_says_which_operation_still_works(client: mc.Client) -> None:
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "snap-1",
+                    "computer_id": "vm-gone",
+                    "orphaned": True,
+                    "computer_name": "was-dev",
+                },
+            ],
+        )
+    )
+    (s,) = client.snapshots.list()
+    assert s.orphaned
+    assert s.computer_name == "was-dev"
+
+
+@respx.mock
+def test_a_computers_snapshots_keep_the_rows_nobody_could_read(client: mc.Client) -> None:
+    """Filtering by computer must not delete the markers saying it is short.
+
+    An unreachable stub has no computer_id — there was no daemon to say which
+    computer it belongs to — so an equality filter drops precisely the rows that
+    say the answer is incomplete, and then reports a confident count.
+    """
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(
+            200,
+            json=[
+                {"id": "snap-1", "computer_id": "vm-1"},
+                {"id": "snap-2", "computer_id": "vm-other"},
+                {"id": "snap-3", "unreachable": True},
+            ],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    snapshots = _computer(client).snapshots(allow_partial=True)
+    assert [s.id for s in snapshots] == ["snap-1", "snap-3"]
+    assert not snapshots.is_complete
+
+
+# --- snapshot holdings and the purge interlock ------------------------------
+
+
+@respx.mock
+def test_holdings_is_a_summary_and_not_a_listing(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(200, json={"count": 2, "size_bytes": 6_100_000_000, "fingerprint": "fp-abc"})
+    )
+    held = _computer(client).snapshot_holdings()
+    assert (held.count, held.size_bytes, held.fingerprint) == (2, 6_100_000_000, "fp-abc")
+
+
+@respx.mock
+def test_an_ordinary_delete_sends_no_purge_query(client: mc.Client) -> None:
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
+    _computer(client).delete()
+    assert not route.calls.last.request.url.params
+
+
+@respx.mock
+def test_a_purge_is_bound_to_the_fingerprint_it_was_given(client: mc.Client) -> None:
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"ok": True, "snapshots_deleted": 2})
+    )
+    deleted = _computer(client).delete(purge_snapshots=True, expect="fp-abc")
+    params = route.calls.last.request.url.params
+    assert params["snapshots"] == "delete"
+    assert params["expect"] == "fp-abc"
+    assert deleted == 2
+
+
+@respx.mock
+def test_a_purge_without_a_fingerprint_deletes_nothing(client: mc.Client) -> None:
+    """Refused here, before the round trip. The platform would accept it.
+
+    An unguarded purge is bound to whatever the set is at the moment it fires
+    rather than to what anybody agreed to destroy — the race being that a
+    capture finishes between the decision and the call.
+    """
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    with pytest.raises(ValueError, match="snapshot_holdings"):
+        c.delete(purge_snapshots=True)
+    assert not route.called
+
+
+@respx.mock
+def test_a_stale_fingerprint_is_not_smuggled_onto_an_ordinary_delete(
+    client: mc.Client,
+) -> None:
+    """It would refuse the delete for a reason that has nothing to do with it."""
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
+    _computer(client).delete(expect="fp-stale")
+    assert "expect" not in route.calls.last.request.url.params
+
+
+@respx.mock
+def test_a_quiet_server_is_not_reported_as_nothing_destroyed(client: mc.Client) -> None:
+    """None, not 0. This is the one irreversible call on the object."""
+    respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
+    assert _computer(client).delete(purge_snapshots=True, expect="fp-abc") is None
+
+
+# --- background exec --------------------------------------------------------
+
+
+@respx.mock
+def test_a_background_exec_returns_a_handle_and_no_deadline(client: mc.Client) -> None:
+    """timeout_s is omitted rather than sent and ignored.
+
+    The server does ignore it — not waiting is the whole request — but a payload
+    carrying a deadline that means nothing is one somebody later reads as a
+    promise the platform never made.
+    """
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"pid": 4242, "command": "make", "running": True})
+    )
+    job = _computer(client).start_exec("make", cwd="/src")
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"command": "make", "background": True, "cwd": "/src"}
+    assert (job.pid, job.command) == (4242, "make")
+
+
+@respx.mock
+def test_a_foreground_exec_still_carries_its_deadline(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    _computer(client).exec("true", timeout_s=5, env={"CI": "1"})
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"command": "true", "timeout_s": 5, "env": {"CI": "1"}}
+
+
+def test_a_relative_cwd_is_refused_before_the_request() -> None:
+    with pytest.raises(ValueError, match="cwd must be absolute"):
+        mc._api.exec_body("make", 30, cwd="src")
+
+
+@respx.mock
+def test_polling_reads_the_new_output_and_whether_more_is_waiting(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={"pid": 4242}))
+    respx.get(f"{BASE}/computers/vm-1/exec/4242").mock(
+        httpx.Response(
+            200,
+            json={
+                "pid": 4242,
+                "running": True,
+                "stdout": "compiling\n",
+                "stdout_offset": 10,
+                "more": True,
+            },
+        )
+    )
+    status = _computer(client).start_exec("make").poll()
+    assert status.stdout == "compiling\n"
+    assert status.more and not status.done
+    # Absent rather than 0 until it has exited: 0 is the one value that reads as
+    # success to anything not checking `done` first.
+    assert status.exit_code is None
+
+
+@respx.mock
+def test_a_finished_command_reports_its_exit_code(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={"pid": 4242}))
+    respx.get(f"{BASE}/computers/vm-1/exec/4242").mock(
+        httpx.Response(200, json={"pid": 4242, "running": False, "exited": True, "exit_code": 2})
+    )
+    status = _computer(client).start_exec("make").poll()
+    assert status.done and status.exit_code == 2
+
+
+@respx.mock
+def test_killing_answers_with_the_tail_nobody_had_read(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={"pid": 4242}))
+    route = respx.delete(f"{BASE}/computers/vm-1/exec/4242").mock(
+        httpx.Response(200, json={"pid": 4242, "killed": True, "stdout": "last line\n"})
+    )
+    status = _computer(client).start_exec("tail -f /var/log/syslog").kill()
+    assert route.called
+    assert status.killed and status.stdout == "last line\n"
+
+
+@respx.mock
+def test_a_pid_from_a_previous_session_needs_no_request_to_rebuild(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/exec/99").mock(
+        httpx.Response(200, json={"pid": 99, "running": True})
+    )
+    job = _computer(client).background_command(99)
+    assert not route.called  # nothing is verified until it is polled
+    assert job.poll().pid == 99
+
+
+# --- windows ----------------------------------------------------------------
+
+
+@respx.mock
+def test_listing_windows_reads_the_named_array(client: mc.Client) -> None:
+    """`{"windows": []}`, not a bare array — an empty desktop says so."""
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(
+            200,
+            json={
+                "windows": [
+                    {
+                        "id": "0x2600003",
+                        "title": "Example — Mozilla Firefox",
+                        "class": "Navigator",
+                        "type": "normal",
+                        "x": 10,
+                        "y": 20,
+                        "width": 1200,
+                        "height": 700,
+                        "focused": True,
+                    }
+                ]
+            },
+        )
+    )
+    (w,) = _computer(client).windows()
+    # The class is the application and is stable; the title is whatever page it
+    # happens to be showing, which is why matching goes on the class.
+    assert w.wm_class == "Navigator"
+    assert w.title.endswith("Firefox")
+    assert (w.x, w.y, w.width, w.height) == (10, 20, 1200, 700)
+    assert w.focused
+
+
+@respx.mock
+def test_the_desktops_own_furniture_is_left_out_unless_asked_for(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(200, json={"windows": []})
+    )
+    c = _computer(client)
+    c.windows()
+    assert "include" not in route.calls.last.request.url.params
+    c.windows(include_all=True)
+    assert route.calls.last.request.url.params["include"] == "all"
+
+
+@respx.mock
+def test_a_window_action_answers_with_the_window_as_it_now_is(client: mc.Client) -> None:
+    """The window manager places the frame; a move to 300,200 lands where it lands."""
+    respx.post(f"{BASE}/computers/vm-1/windows/0x2600003").mock(
+        httpx.Response(
+            200,
+            json={"ok": True, "window": {"id": "0x2600003", "x": 305, "y": 229}, "gone": False},
+        )
+    )
+    res = _computer(client).window_action("0x2600003", "move", x=300, y=200)
+    assert res.window is not None
+    assert (res.window.x, res.window.y) == (305, 229)
+    assert not res.gone
+
+
+@respx.mock
+def test_a_closed_window_is_gone_rather_than_undescribable(client: mc.Client) -> None:
+    """Both outcomes have no window; `gone` is what separates them."""
+    respx.post(f"{BASE}/computers/vm-1/windows/0x2600003").mock(
+        httpx.Response(200, json={"ok": True, "window": None, "gone": True})
+    )
+    res = _computer(client).window_action("0x2600003", "close")
+    assert res.window is None
+    assert res.gone
+
+
+def test_a_window_id_cannot_add_a_path_segment() -> None:
+    """Unescaped, a "/" in a window id would land the request on another route.
+
+    Unlike a computer or a snapshot id, this one is minted by the guest's window
+    manager rather than by the platform, so it is not from a known alphabet.
+    """
+    assert mc._api.window("vm-1", "0x2600003") == "computers/vm-1/windows/0x2600003"
+    assert mc._api.window("vm-1", "a/b") == "computers/vm-1/windows/a%2Fb"
+
+
+def test_a_typo_in_a_window_action_names_the_set() -> None:
+    with pytest.raises(ValueError, match="action must be one of"):
+        mc._api.window_body("focuss")
+
+
+def test_half_a_window_geometry_is_refused_rather_than_zeroed() -> None:
+    """The same reasoning as half a drag origin: it succeeds in the wrong place."""
+    with pytest.raises(ValueError, match="both x and y"):
+        mc._api.window_body("move", x=300)
+    with pytest.raises(ValueError, match="both width and height"):
+        mc._api.window_body("resize", width=800)
+
+
+# --- resize and the idle window ---------------------------------------------
+
+
+@respx.mock
+def test_a_resize_sends_only_the_sizing_group(client: mc.Client) -> None:
+    """The platform refuses a resize combined with a rename, and is right to.
+
+    A resize needs the computer stopped and a rename does not, so one request
+    cannot honour both without applying half of it.
+    """
+    route = respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "cpu": 4, "ram_mb": 8192})
+    )
+    c = _computer(client).resize(cpu=4, ram_mb=8192)
+    assert json.loads(route.calls.last.request.content) == {"cpu": 4, "ram_mb": 8192}
+    assert (c.cpu, c.ram_mb) == (4, 8192)
+
+
+def test_a_resize_that_changes_nothing_is_refused() -> None:
+    with pytest.raises(ValueError, match="at least one of cpu"):
+        mc._api.resize_body(cpu=None, ram_mb=None, disk_gb=None)
+
+
+@respx.mock
+def test_the_idle_window_is_read_back_and_cleared_with_null(client: mc.Client) -> None:
+    """None is SENT, not omitted — dropped it would mean "change nothing"."""
+    route = respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "idle_suspend_min": 15})
+    )
+    c = _computer(client).set_idle_suspend(15)
+    assert json.loads(route.calls.last.request.content) == {"idle_suspend_min": 15}
+    assert c.idle_suspend_min == 15
+
+    route.mock(httpx.Response(200, json=COMPUTER))
+    c.set_idle_suspend(None)
+    assert json.loads(route.calls.last.request.content) == {"idle_suspend_min": None}
+    # Absent, not zero: the host's own sweep is a property of the host and is
+    # deliberately not reported in its place.
+    assert c.idle_suspend_min is None
