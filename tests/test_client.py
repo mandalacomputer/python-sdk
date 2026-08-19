@@ -195,7 +195,9 @@ def test_screenshot_width_becomes_query_param(client: mc.Client) -> None:
 @respx.mock
 def test_exec_nonzero_exit_is_returned_not_raised(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 1, "stdout": "", "stderr": "boom", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 1, "stdout": "", "stderr": "boom", "timed_out": False}
+        )
     )
     res = mc.Computer(client._t, COMPUTER).exec("false")
     assert res.exit_code == 1 and res.stderr == "boom" and not res.ok
@@ -251,7 +253,9 @@ def test_wait_for_guest_ignores_errors_while_booting(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
             httpx.Response(400, json={"error": "not running"}),
-            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}),
+            httpx.Response(
+                200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+            ),
         ]
     )
     mc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
@@ -327,8 +331,18 @@ def test_scheduled_snapshots_are_distinguishable(client: mc.Client) -> None:
         httpx.Response(
             200,
             json=[
-                {"id": "s1", "computer_id": "vm-1", "created_at": "2026-07-31T04:00:00Z", "auto": True},
-                {"id": "s2", "computer_id": "vm-1", "created_at": "2026-07-30T12:00:00Z", "auto": False},
+                {
+                    "id": "s1",
+                    "computer_id": "vm-1",
+                    "created_at": "2026-07-31T04:00:00Z",
+                    "auto": True,
+                },
+                {
+                    "id": "s2",
+                    "computer_id": "vm-1",
+                    "created_at": "2026-07-30T12:00:00Z",
+                    "auto": False,
+                },
             ],
         )
     )
@@ -343,9 +357,7 @@ def test_scheduled_snapshots_are_distinguishable(client: mc.Client) -> None:
 def test_clear_schedule_is_a_delete_not_a_disable(client: mc.Client) -> None:
     """Disabling keeps the time and the bookkeeping; clearing removes both."""
     cleared = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"}
-    route = respx.delete(f"{BASE}/computers/vm-1/schedule").mock(
-        httpx.Response(200, json=cleared)
-    )
+    route = respx.delete(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=cleared))
     put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
 
     assert mc.Computer(client._t, COMPUTER).clear_schedule() == cleared
@@ -701,9 +713,7 @@ def test_waiting_for_a_suspended_computer_says_so_rather_than_timing_out(
 
 @respx.mock
 def test_a_single_computer_carries_the_desktop_credentials(client: mc.Client) -> None:
-    respx.get(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(200, json={**COMPUTER, "vnc": VNC})
-    )
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={**COMPUTER, "vnc": VNC}))
     vnc = client.computers.get("vm-1").vnc
     assert vnc is not None
     assert vnc.token == "abc"
@@ -721,9 +731,7 @@ def test_a_listed_computer_has_no_credentials_until_it_is_refreshed(
     (c,) = client.computers.list()
     assert c.vnc is None
 
-    respx.get(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(200, json={**COMPUTER, "vnc": VNC})
-    )
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={**COMPUTER, "vnc": VNC}))
     assert c.refresh().vnc is not None
 
 

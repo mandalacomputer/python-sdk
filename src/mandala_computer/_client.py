@@ -45,9 +45,9 @@ class _BaseTransport:
                 "No API key. Pass api_key=... or set MANDALA_API_KEY "
                 "(create one at Settings -> API keys)."
             )
-        self.base_url = (
-            base_url or os.environ.get("MANDALA_BASE_URL") or DEFAULT_BASE_URL
-        ).rstrip("/")
+        self.base_url = (base_url or os.environ.get("MANDALA_BASE_URL") or DEFAULT_BASE_URL).rstrip(
+            "/"
+        )
         self._headers = {
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
@@ -103,9 +103,15 @@ class Transport(_BaseTransport):
         *,
         json: Any = None,
         params: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
     ) -> httpx.Response:
         resp = self._http.request(
-            method, self._url(path), json=json, params=params, headers=self._headers
+            method,
+            self._url(path),
+            json=json,
+            params=params,
+            content=content,
+            headers=self._headers,
         )
         if resp.is_success:
             return resp
@@ -141,9 +147,15 @@ class AsyncTransport(_BaseTransport):
         *,
         json: Any = None,
         params: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
     ) -> httpx.Response:
         resp = await self._http.request(
-            method, self._url(path), json=json, params=params, headers=self._headers
+            method,
+            self._url(path),
+            json=json,
+            params=params,
+            content=content,
+            headers=self._headers,
         )
         if resp.is_success:
             return resp

@@ -129,9 +129,7 @@ class AsyncComputer(ComputerFields):
 
     # --- readiness ------------------------------------------------------
 
-    async def wait_until_built(
-        self, timeout: float = 900.0, poll: float = 5.0
-    ) -> AsyncComputer:
+    async def wait_until_built(self, timeout: float = 900.0, poll: float = 5.0) -> AsyncComputer:
         """Await until a cloned computer's disk has been copied.
 
         Returns immediately for anything not being built, so it is safe to call
@@ -159,9 +157,7 @@ class AsyncComputer(ComputerFields):
             await asyncio.sleep(poll)
             await self.refresh()
 
-    async def wait_until_running(
-        self, timeout: float = 120.0, poll: float = 2.0
-    ) -> AsyncComputer:
+    async def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> AsyncComputer:
         """Await until the machine is running.
 
         This is the *machine*, not the desktop: it returns as soon as the VM is
@@ -379,9 +375,7 @@ class AsyncComputer(ComputerFields):
         """
         return _cursor(await self._input(_api.cursor_body()))
 
-    async def exec(
-        self, command: str, timeout_s: int = 30, *, desktop: bool = False
-    ) -> ExecResult:
+    async def exec(self, command: str, timeout_s: int = 30, *, desktop: bool = False) -> ExecResult:
         """Run a shell command inside the guest.
 
         Uses the guest's native shell — bash on Linux, cmd.exe on Windows. A
@@ -424,6 +418,26 @@ class AsyncComputer(ComputerFields):
         API rejects it, the same as any ``desktop=True`` exec.
         """
         return await self.exec(_api.open_url_command(url), timeout_s, desktop=True)
+
+    # --- files ----------------------------------------------------------
+
+    async def read_file(self, path: str) -> bytes:
+        """Read one file out of the guest, as bytes.
+
+        See :meth:`mandala_computer.Computer.read_file`.
+        """
+        resp = await self._t.request("GET", _api.files(self.id), params=_api.files_params(path))
+        return resp.content
+
+    async def write_file(self, path: str, data: bytes | str) -> None:
+        """Write ``data`` to one file inside the guest, creating it if needed.
+
+        See :meth:`mandala_computer.Computer.write_file`.
+        """
+        body = data.encode() if isinstance(data, str) else data
+        await self._t.request(
+            "PUT", _api.files(self.id), params=_api.files_params(path), content=body
+        )
 
     # --- snapshots ------------------------------------------------------
 
