@@ -1,0 +1,276 @@
+"""The ``mandala`` command — a computer's shell and files from your own terminal.
+
+Two subcommands, both addressing a computer by name or id:
+
+``mandala ssh <computer>``
+    An interactive shell in the guest, over the platform's terminal websocket —
+    a PTY the platform keeps alive server-side. Disconnecting detaches the
+    session rather than ending it; running the same command reattaches and
+    replays recent output. ``--session`` names one of several.
+
+``mandala scp <src> <dst>``
+    Copy one file in or out, ``scp``-style: the side spelled
+    ``<computer>:/path`` is the guest. Rides the files API, so it needs no
+    shell in the guest at all.
+
+Authentication is the SDK's: ``MANDALA_API_KEY`` (and optionally
+``MANDALA_BASE_URL``) in the environment.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import sys
+import threading
+from contextlib import suppress
+from typing import TYPE_CHECKING, NoReturn
+
+from ._computer import Computer
+from ._exceptions import MandalaError
+
+if TYPE_CHECKING:
+    from websockets.sync.client import ClientConnection
+
+    from mandala_computer import Client
+
+# The whole guest-side scrollback is smaller than this; anything bigger in one
+# frame is not the terminal protocol.
+_MAX_FRAME = 1 << 22
+
+
+def _die(message: str) -> NoReturn:
+    raise SystemExit(f"mandala: {message}")
+
+
+def _client() -> Client:
+    # Imported at call time: the package's __init__ imports nothing from here,
+    # so the cycle stays one-way.
+    from mandala_computer import Client
+
+    return Client()
+
+
+def _resolve(client: Client, target: str) -> Computer:
+    """The computer ``target`` names — an exact id, or a unique name."""
+    computers = client.computers.list()
+    for c in computers:
+        if c.id == target:
+            return c
+    named = [c for c in computers if c.name == target]
+    if len(named) == 1:
+        return named[0]
+    if named:
+        ids = ", ".join(c.id for c in named)
+        _die(f"{target!r} names {len(named)} computers — use an id: {ids}")
+    if not computers:
+        _die(f"no computer named {target!r}; the account has no computers")
+    have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
+    _die(f"no computer named {target!r}. You have:\n{have}")
+
+
+# --- ssh -------------------------------------------------------------------
+
+
+def _cmd_ssh(args: argparse.Namespace) -> int:
+    c = _resolve(_client(), args.target).refresh()
+    vnc = c.vnc
+    if vnc is None or not vnc.terminal_url:
+        if c.os == "windows":
+            _die(f"{c.name} is a Windows computer; terminals are Linux-only for now")
+        if c.status not in ("running", "suspended"):
+            _die(f"{c.name} is {c.status or 'not running'} — start it, then retry")
+        _die(f"{c.name} has no terminal endpoint (server too old?)")
+    url = vnc.terminal_url
+    if args.session != "main":
+        from urllib.parse import quote
+
+        url += ("&" if "?" in url else "?") + "session=" + quote(args.session)
+    return _interact(url)
+
+
+def _connect(url: str) -> ClientConnection:
+    from websockets.exceptions import InvalidStatus
+    from websockets.sync.client import connect
+
+    try:
+        return connect(url, max_size=_MAX_FRAME, compression=None)
+    except InvalidStatus as e:
+        status = e.response.status_code
+        if status == 409:
+            # The terminal channel is added to a computer at cold boot only —
+            # a machine running since before its host learned the feature
+            # answers 409 until it picks the device up.
+            _die(
+                "this computer predates the terminal channel — "
+                "stop it and start it again (a restart is not enough), then retry"
+            )
+        _die(f"terminal refused: HTTP {status}")
+    except OSError as e:
+        _die(f"could not reach the terminal: {e}")
+
+
+def _interact(url: str) -> int:
+    """Pump the local terminal into the websocket and back, until the shell ends.
+
+    Binary frames are the terminal's bytes in both directions; text frames are
+    control — resize out, exit in. The local TTY goes raw so every keystroke
+    (including Ctrl-C) belongs to the remote shell.
+    """
+    from websockets.exceptions import ConnectionClosed
+
+    ws = _connect(url)
+    stdin = sys.stdin.fileno()
+    stdout = sys.stdout.fileno()
+    closed = threading.Event()
+
+    def send_size(*_sig: object) -> None:
+        cols, rows = shutil.get_terminal_size()
+        # Racing a close is fine; the close is the news, not this.
+        with suppress(ConnectionClosed, OSError):
+            ws.send(json.dumps({"type": "resize", "cols": cols, "rows": rows}))
+
+    def pump_stdin() -> None:
+        # The socket closing under us is fine; the main loop reports it.
+        with suppress(ConnectionClosed, OSError):
+            while not closed.is_set():
+                data = os.read(stdin, 4096)
+                if not data:
+                    return  # piped stdin ran dry; the shell decides what's next
+                ws.send(data)
+
+    saved_tty = None
+    if sys.stdin.isatty():
+        import termios
+        import tty
+
+        saved_tty = termios.tcgetattr(stdin)
+        tty.setraw(stdin)
+    if sys.stdout.isatty():
+        send_size()
+        signal.signal(signal.SIGWINCH, send_size)
+
+    exit_code: int | None = None
+    try:
+        threading.Thread(target=pump_stdin, daemon=True).start()
+        while True:
+            message = ws.recv()
+            if isinstance(message, bytes):
+                os.write(stdout, message)
+                continue
+            try:
+                control = json.loads(message)
+            except ValueError:
+                continue
+            if control.get("type") == "exit":
+                exit_code = int(control.get("code") or 0)
+    except ConnectionClosed:
+        pass
+    except KeyboardInterrupt:
+        # Only reachable with a non-tty stdin; raw mode sends ^C to the guest.
+        exit_code = 130
+    finally:
+        closed.set()
+        if saved_tty is not None:
+            import termios
+
+            termios.tcsetattr(stdin, termios.TCSADRAIN, saved_tty)
+        ws.close()
+    if exit_code is None:
+        # The link dropped without the shell ending: the session is still
+        # alive server-side, and saying so is what makes that a feature.
+        print("mandala: detached — run the same command to reattach", file=sys.stderr)
+        return 0
+    return exit_code
+
+
+# --- scp -------------------------------------------------------------------
+
+
+def _remote_side(arg: str) -> tuple[str, str] | None:
+    """``<computer>:<path>`` split apart, or ``None`` for a local path.
+
+    scp's own rule: a colon marks the remote side unless a ``/`` comes before
+    it, so ``./odd:name`` stays a local file.
+    """
+    head, sep, tail = arg.partition(":")
+    if not sep or not head or "/" in head:
+        return None
+    return head, tail
+
+
+def _cmd_scp(args: argparse.Namespace) -> int:
+    src, dst = _remote_side(args.src), _remote_side(args.dst)
+    if (src is None) == (dst is None):
+        _die("exactly one side must be a computer, spelled <computer>:/path")
+
+    if src is not None:
+        target, remote_path = src
+        if not remote_path:
+            _die(f"say which file: {target}:/absolute/path")
+        data = _resolve(_client(), target).read_file(remote_path)
+        local = args.dst
+        if os.path.isdir(local):
+            local = os.path.join(local, os.path.basename(remote_path))
+        with open(local, "wb") as f:
+            f.write(data)
+        print(f"{target}:{remote_path} -> {local} ({len(data)} bytes)", file=sys.stderr)
+        return 0
+
+    assert dst is not None
+    target, remote_path = dst
+    if not remote_path:
+        _die(f"say where in the guest: {target}:/absolute/path")
+    if remote_path.endswith("/"):
+        remote_path += os.path.basename(args.src)
+    with open(args.src, "rb") as f:
+        data = f.read()
+    _resolve(_client(), target).write_file(remote_path, data)
+    print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
+    return 0
+
+
+# --- entry -----------------------------------------------------------------
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mandala",
+        description="Your own terminal, against a Mandala computer.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    ssh = sub.add_parser("ssh", help="an interactive shell in the guest")
+    ssh.add_argument("target", metavar="computer", help="computer name or id")
+    ssh.add_argument(
+        "-s",
+        "--session",
+        default="main",
+        help="named session to attach; sessions persist across disconnects (default: main)",
+    )
+    ssh.set_defaults(fn=_cmd_ssh)
+
+    scp = sub.add_parser("scp", help="copy one file in or out of the guest")
+    scp.add_argument("src", metavar="SRC", help="local path, or <computer>:/path")
+    scp.add_argument("dst", metavar="DST", help="local path, or <computer>:/path")
+    scp.set_defaults(fn=_cmd_scp)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        return int(args.fn(args))
+    except (MandalaError, ValueError) as e:
+        print(f"mandala: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"mandala: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

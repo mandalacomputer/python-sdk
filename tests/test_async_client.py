@@ -60,9 +60,7 @@ async def test_sends_bearer_token(client: mc.AsyncClient) -> None:
         (500, mc.APIError),
     ],
 )
-async def test_status_maps_to_exception(
-    client: mc.AsyncClient, status: int, exc: type
-) -> None:
+async def test_status_maps_to_exception(client: mc.AsyncClient, status: int, exc: type) -> None:
     respx.get(f"{BASE}/computers").mock(httpx.Response(status, json={"error": "nope"}))
     with pytest.raises(exc) as e:
         await client.computers.list()
@@ -93,9 +91,7 @@ async def test_validation_happens_before_any_request(client: mc.AsyncClient) -> 
 
 @respx.mock
 async def test_screenshot_returns_bytes(client: mc.AsyncClient) -> None:
-    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
-        httpx.Response(200, content=b"\x89PNG\r\n")
-    )
+    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"\x89PNG\r\n"))
     assert (await mc.AsyncComputer(client._t, COMPUTER).screenshot()).startswith(b"\x89PNG")
 
 
