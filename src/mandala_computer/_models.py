@@ -8,9 +8,62 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
-__all__ = ["ExecResult", "Snapshot", "Template", "VncConnect"]
+__all__ = [
+    "ExecResult",
+    "ExecStatus",
+    "Listing",
+    "Size",
+    "Snapshot",
+    "SnapshotHoldings",
+    "Template",
+    "VncConnect",
+    "Window",
+    "WindowResult",
+]
+
+T = TypeVar("T")
+
+
+class Listing(list[T]):
+    """A collection read that the platform may have had to answer short.
+
+    A ``list``, so everything written against the old return type keeps working
+    and nothing has to be unwrapped. What it adds is the answer to a question a
+    bare list cannot carry: whether this is all of them.
+
+    ``GET /computers`` and ``GET /snapshots`` fan out across every hypervisor
+    holding something of yours. One that cannot be reached makes the answer
+    incomplete, and by default the platform refuses to send it —
+    :class:`~mandala_computer.UnavailableError`. Passing ``allow_partial=True``
+    takes the short answer instead, and this is where it says so::
+
+        computers = client.computers.list(allow_partial=True)
+        if not computers.is_complete:
+            ...  # do not treat anything absent from this as deleted
+
+    :attr:`incomplete` is ``None`` when the listing is whole. When it is not, it
+    is how many rows the platform's placement cache could account for — which is
+    legitimately ``0``, because a computer created during the outage was never
+    cached against the host now holding it. So branch on
+    :attr:`is_complete`, never on the number.
+    """
+
+    #: Rows missing, or ``None`` when nothing was missing. See the class note on
+    #: why ``0`` is not the same as ``None``.
+    incomplete: int | None = None
+
+    @property
+    def is_complete(self) -> bool:
+        """False when the platform said this listing is short."""
+        return self.incomplete is None
+
+    @classmethod
+    def of(cls, items: list[T], incomplete: int | None = None) -> Listing[T]:
+        listing = cls(items)
+        listing.incomplete = incomplete
+        return listing
 
 
 @dataclass(frozen=True)
@@ -151,6 +204,28 @@ class Snapshot:
     created_at: str
     incremental: bool
     auto: bool
+    #: For a computer that still exists, its current name — so a rename shows up
+    #: here without re-reading anything. For an orphan, the name it had at
+    #: capture, which is all that is left of it.
+    computer_name: str = ""
+    #: The computer this was captured from no longer exists, which decides which
+    #: of the two things you can do with a snapshot still works:
+    #: :meth:`~mandala_computer.Snapshots.clone` builds a new computer out of it
+    #: and is fine, while :meth:`~mandala_computer.Snapshots.restore` puts the
+    #: disk back on the source and has nowhere to put it. Snapshots outlive
+    #: their computers on purpose, so an ordinary account's listing has these in
+    #: it as a matter of course rather than as a fault.
+    orphaned: bool = False
+    #: This is a placeholder standing in for a snapshot nobody could read, seen
+    #: only in a listing taken with ``allow_partial=True``. The platform does
+    #: not merely omit what it could not reach — it appends one of these per
+    #: missing row, carrying an id and nothing else, so that something short is
+    #: visibly short rather than quietly smaller. Such a row has no
+    #: :attr:`computer_id`: there was no daemon to say which computer it belongs
+    #: to. Which is why filtering a partial listing by computer keeps these —
+    #: dropping them removes precisely the markers saying the answer is
+    #: incomplete, and then reports a confident count.
+    unreachable: bool = False
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -184,6 +259,181 @@ class Snapshot:
             created_at=d.get("created_at", ""),
             incremental=bool(d.get("incremental", False)),
             auto=bool(d.get("auto", False)),
+            computer_name=str(d.get("computer_name", "")),
+            orphaned=bool(d.get("orphaned", False)),
+            unreachable=bool(d.get("unreachable", False)),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class SnapshotHoldings:
+    """What a computer would leave behind — and the interlock on destroying it.
+
+    From ``GET /computers/{id}/snapshots``, which is not a listing: the
+    snapshots themselves come from :meth:`~mandala_computer.Snapshots.list`,
+    and these two routes answer different shapes on purpose.
+
+    :attr:`fingerprint` is the reason to come here. It names the exact set the
+    count and the size describe, it cannot be reconstructed from a listing, and
+    it is what makes a purge binding — see
+    :meth:`~mandala_computer.Computer.delete`. Read the numbers, decide, then
+    pass the fingerprint you were shown; the daemon refuses the sweep if a
+    capture has landed in between, which is exactly the race that would
+    otherwise destroy something nobody agreed to.
+    """
+
+    count: int
+    size_bytes: int
+    fingerprint: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> SnapshotHoldings:
+        return cls(
+            count=int(d.get("count", 0)),
+            size_bytes=int(d.get("size_bytes", 0)),
+            fingerprint=str(d.get("fingerprint", "")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class Window:
+    """One window on the guest's desktop.
+
+    What a screenshot cannot tell you: a picture says what the desktop looks
+    like, this says what any of it *is* — which is how a browser that failed to
+    launch is told apart from one that has not painted yet.
+
+    Match on :attr:`wm_class` rather than :attr:`title`. The class is the
+    application and is stable; the title is whatever page or document it happens
+    to be showing.
+    """
+
+    id: str
+    title: str
+    #: The X11 ``WM_CLASS`` — the application, e.g. ``"Firefox"``. Spelled with
+    #: the prefix because ``class`` is a Python keyword and cannot be a field.
+    wm_class: str
+    #: The window manager's own type, e.g. ``"normal"``, ``"dock"``.
+    type: str
+    x: int
+    y: int
+    width: int
+    height: int
+    focused: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> Window:
+        return cls(
+            id=str(d.get("id", "")),
+            title=str(d.get("title", "")),
+            wm_class=str(d.get("class", "")),
+            type=str(d.get("type", "")),
+            x=int(d.get("x", 0)),
+            y=int(d.get("y", 0)),
+            width=int(d.get("width", 0)),
+            height=int(d.get("height", 0)),
+            focused=bool(d.get("focused", False)),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class WindowResult:
+    """What a window action left behind.
+
+    :attr:`window` is the window *as it now is*, not an acknowledgement of what
+    was asked. Believe it rather than the request: the window manager places the
+    frame and applications snap to their own increments, so a move to (300, 200)
+    routinely lands at (305, 229).
+
+    It is ``None`` in two different situations, and :attr:`gone` is what tells
+    them apart — ``True`` after a ``close``, which is the action succeeding, and
+    ``False`` when the action happened but the guest could not describe the
+    result.
+    """
+
+    window: Window | None
+    gone: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> WindowResult:
+        w = d.get("window")
+        return cls(
+            window=Window.from_api(w) if isinstance(w, Mapping) else None,
+            gone=bool(d.get("gone", False)),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class ExecStatus:
+    """A backgrounded command's state, and what it has printed since last time.
+
+    The output is a **cursor, not a buffer**. Each read returns what has arrived
+    since the previous read and advances the daemon's own offset, so output you
+    receive and drop is gone, and two readers polling one pid split the stream
+    between them rather than each seeing all of it. :attr:`stdout_offset` and
+    :attr:`stderr_offset` report how far it has read — they are not parameters
+    to send back.
+
+    :attr:`more` is the flag to poll on: it says there is further output waiting
+    right now.
+    """
+
+    pid: int
+    #: The command line, echoed back.
+    command: str
+    running: bool
+    exited: bool
+    #: ``None`` until it has exited — ``None`` rather than ``0``, which is the
+    #: one value that would be read as success by anything not checking first.
+    exit_code: int | None
+    #: What it has printed since the previous read. This read consumed it.
+    stdout: str
+    stderr: str
+    #: How far the daemon has now read, reported rather than requested.
+    stdout_offset: int
+    stderr_offset: int
+    #: There is further output waiting right now — poll again straight away
+    #: rather than sleeping first.
+    more: bool
+    #: It was stopped by :meth:`~mandala_computer.BackgroundCommand.kill` rather
+    #: than ending on its own.
+    killed: bool
+    started_at: str = ""
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def done(self) -> bool:
+        """True once the command has stopped, however it stopped.
+
+        Read with :attr:`more`, not instead of it: a command can exit with
+        output still queued, and a loop that stops at ``done`` alone drops
+        whatever the last read did not reach.
+        """
+        return self.exited or not self.running
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> ExecStatus:
+        code = d.get("exit_code")
+        return cls(
+            pid=int(d.get("pid", 0)),
+            command=str(d.get("command", "")),
+            running=bool(d.get("running", False)),
+            exited=bool(d.get("exited", False)),
+            exit_code=None if code is None else int(code),
+            stdout=str(d.get("stdout") or ""),
+            stderr=str(d.get("stderr") or ""),
+            stdout_offset=int(d.get("stdout_offset", 0)),
+            stderr_offset=int(d.get("stderr_offset", 0)),
+            more=bool(d.get("more", False)),
+            killed=bool(d.get("killed", False)),
+            started_at=str(d.get("started_at", "")),
             raw=dict(d),
         )
 

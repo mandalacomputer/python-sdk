@@ -10,7 +10,7 @@ from typing import Any
 from . import _api
 from ._client import Transport
 from ._computer import Computer
-from ._models import Size, Snapshot, Template
+from ._models import Listing, Size, Snapshot, Template
 
 __all__ = ["Computers", "Sizes", "Snapshots", "Templates"]
 
@@ -29,9 +29,26 @@ class Computers:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
 
-    def list(self) -> builtins.list[Computer]:
-        data = self._t.json("GET", _api.COMPUTERS) or []
-        return [Computer(self._t, c) for c in data]
+    def list(self, *, allow_partial: bool = False) -> Listing[Computer]:
+        """Every computer on the account, or every one in the key's workspace.
+
+        No ``vnc`` on these rows — fetch one computer to get its desktop
+        credentials, or call :meth:`Computer.refresh` on a listed one.
+
+        ``allow_partial`` accepts a listing the platform knows is short. Without
+        it a hypervisor that cannot be reached makes this raise
+        :class:`~mandala_computer.UnavailableError` rather than answering short,
+        because a short list is not a smaller truth: it reads exactly like the
+        missing computers were deleted, and the obvious next thing a script does
+        with a computer that has disappeared is tidy up after it. With it, the
+        returned :class:`~mandala_computer.Listing` says so —
+        ``is_complete`` — and the rows that could not be read carry
+        :attr:`Computer.unreachable` and nothing else.
+        """
+        data, incomplete = self._t.listing(
+            _api.COMPUTERS, params=_api.partial_params(allow_partial)
+        )
+        return Listing.of([Computer(self._t, c) for c in data or []], incomplete)
 
     def get(self, computer_id: str) -> Computer:
         data = self._t.json("GET", _api.computer(computer_id))
@@ -108,9 +125,30 @@ class Snapshots:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
 
-    def list(self) -> builtins.list[Snapshot]:
-        data = self._t.json("GET", _api.SNAPSHOTS) or []
-        return [Snapshot.from_api(s) for s in data]
+    def list(
+        self, *, include_unfinished: bool = False, allow_partial: bool = False
+    ) -> Listing[Snapshot]:
+        """Every snapshot on the account that you can act on.
+
+        Snapshots outlive the computers they came from, so this routinely
+        contains rows whose :attr:`Snapshot.computer_id` resolves to nothing —
+        those carry :attr:`Snapshot.orphaned`, and :meth:`clone` is the
+        operation that still works on them.
+
+        ``include_unfinished`` widens it to deletions that began and did not
+        finish. Nothing can be restored or cloned from one, but they still hold
+        objects and are still billed, so it is the flag for a question about
+        storage rather than about what can be used.
+
+        ``allow_partial`` is :meth:`Computers.list`'s, with the same warning.
+        """
+        data, incomplete = self._t.listing(
+            _api.SNAPSHOTS,
+            params=_api.snapshot_listing_params(
+                include_unfinished=include_unfinished, allow_partial=allow_partial
+            ),
+        )
+        return Listing.of([Snapshot.from_api(s) for s in data or []], incomplete)
 
     def restore(self, snapshot_id: str) -> None:
         """Roll a computer back to a snapshot, replacing its current disk."""

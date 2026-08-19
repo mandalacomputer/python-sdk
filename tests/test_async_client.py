@@ -219,3 +219,114 @@ async def test_open_sends_the_same_command_as_the_sync_client(
     body = json.loads(route.calls.last.request.content)
     assert body["command"] == mc._api.open_url_command("https://example.com")
     assert body["session"] == "desktop"
+
+
+# --- the routes added in this pass, on the async side -----------------------
+#
+# Shape is held to the sync client by test_parity and the two clients are held
+# to the same routes by test_surface, so what is worth covering here is the
+# behaviour that reads a response rather than merely sending one — an await in
+# the wrong place turns each of these into a coroutine nobody ran.
+
+
+@respx.mock
+async def test_a_short_listing_says_so(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(200, json=[COMPUTER], headers={"X-GC-Incomplete": "2"})
+    )
+    computers = await client.computers.list(allow_partial=True)
+    assert not computers.is_complete
+    assert computers.incomplete == 2
+
+
+@respx.mock
+async def test_a_listing_that_would_be_short_is_refused_by_default(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers").mock(httpx.Response(503, json={"error": "host unreachable"}))
+    with pytest.raises(mc.UnavailableError):
+        await client.computers.list()
+
+
+@respx.mock
+async def test_a_purge_is_bound_to_its_fingerprint(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.get(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(200, json={"count": 2, "size_bytes": 42, "fingerprint": "fp-abc"})
+    )
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"ok": True, "snapshots_deleted": 2})
+    )
+    c = await client.computers.get("vm-1")
+    held = await c.snapshot_holdings()
+    assert held.fingerprint == "fp-abc"
+    assert await c.delete(purge_snapshots=True, expect=held.fingerprint) == 2
+    assert route.calls.last.request.url.params["expect"] == "fp-abc"
+
+
+@respx.mock
+async def test_a_purge_without_a_fingerprint_deletes_nothing(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
+    c = await client.computers.get("vm-1")
+    with pytest.raises(ValueError, match="snapshot_holdings"):
+        await c.delete(purge_snapshots=True)
+    assert not route.called
+
+
+@respx.mock
+async def test_a_background_command_polls_and_is_killed(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"pid": 4242, "command": "make", "running": True})
+    )
+    respx.get(f"{BASE}/computers/vm-1/exec/4242").mock(
+        httpx.Response(200, json={"pid": 4242, "running": True, "stdout": "cc\n", "more": True})
+    )
+    respx.delete(f"{BASE}/computers/vm-1/exec/4242").mock(
+        httpx.Response(200, json={"pid": 4242, "killed": True, "stdout": "tail\n"})
+    )
+    c = await client.computers.get("vm-1")
+    job = await c.start_exec("make")
+    assert job.pid == 4242
+
+    status = await job.poll()
+    assert status.stdout == "cc\n" and status.more and not status.done
+
+    final = await job.kill()
+    assert final.killed and final.stdout == "tail\n"
+
+
+@respx.mock
+async def test_windows_and_one_window_acted_on(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(200, json={"windows": [{"id": "0x26", "class": "Navigator"}]})
+    )
+    respx.post(f"{BASE}/computers/vm-1/windows/0x26").mock(
+        httpx.Response(200, json={"ok": True, "window": {"id": "0x26", "focused": True}})
+    )
+    c = await client.computers.get("vm-1")
+    (w,) = await c.windows()
+    assert w.wm_class == "Navigator"
+
+    res = await c.window_action(w.id, "focus")
+    assert res.window is not None and res.window.focused
+    assert not res.gone
+
+
+@respx.mock
+async def test_resize_and_the_idle_window(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "cpu": 8})
+    )
+    c = await client.computers.get("vm-1")
+    await c.resize(cpu=8)
+    assert json.loads(route.calls.last.request.content) == {"cpu": 8}
+    assert c.cpu == 8
+
+    route.mock(httpx.Response(200, json={**COMPUTER, "idle_suspend_min": 30}))
+    await c.set_idle_suspend(30)
+    assert json.loads(route.calls.last.request.content) == {"idle_suspend_min": 30}
+    assert c.idle_suspend_min == 30
