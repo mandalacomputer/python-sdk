@@ -567,11 +567,20 @@ Everything derives from `MandalaError`.
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
 | `ConflictError` | 409 — right request, wrong moment; retry |
+| `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up |
 
 `PlanLimitError`'s message names the limit that was hit.
+
+`RateLimitError` is the only refusal that says how long to wait:
+`retry_after` carries the `Retry-After` header in seconds. Every route on this
+surface is metered, including ones that go on to answer 404 — the meter runs
+before the routing does — so a burst of anything counts against the same budget.
+That budget is generous, in the low thousands of requests a minute even at the
+bottom of the range, so hitting it usually means a poll loop with no sleep in it
+rather than real load.
 
 `UnavailableError` is not only about listings. Every route on this surface ends
 at a hypervisor, so any call naming a computer on a host that cannot be reached

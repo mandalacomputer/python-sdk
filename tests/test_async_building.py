@@ -13,13 +13,6 @@ from tests.test_building import BASE, BUILDING, BUILT, FAILED
 
 import mandala_computer as mc
 
-pytestmark = pytest.mark.anyio
-
-
-@pytest.fixture
-def anyio_backend() -> str:
-    return "asyncio"
-
 
 @pytest.fixture
 async def client() -> mc.AsyncClient:
