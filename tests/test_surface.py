@@ -71,9 +71,6 @@ UNIMPLEMENTED = {
     # the same engine behind an OpenAI-shaped door. Both need SSE.
     ("POST", "computers/:id/agent"),
     ("POST", "chat/completions"),
-    # OPL-3360. Files in and out; needs raw request/response bodies.
-    ("PUT", "computers/:id/files"),
-    ("GET", "computers/:id/files"),
 }
 
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
@@ -104,6 +101,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
     get = request.method == "GET"
     if path.endswith("/screenshot"):
         return httpx.Response(200, content=b"png")
+    if path.endswith("/files"):
+        return httpx.Response(200, content=b"bytes")
     if path.endswith("/exec"):
         return httpx.Response(
             200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
@@ -161,6 +160,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.wait(1)
     c.cursor_position()
     c.exec("true")
+    c.read_file("/home/user/out.txt")
+    c.write_file("/home/user/in.txt", b"hello")
     c.snapshot()
     c.snapshot(memory=True)
     c.snapshots()
@@ -209,6 +210,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.wait(1)
     await c.cursor_position()
     await c.exec("true")
+    await c.read_file("/home/user/out.txt")
+    await c.write_file("/home/user/in.txt", b"hello")
     await c.snapshot()
     await c.snapshot(memory=True)
     await c.snapshots()
@@ -229,7 +232,9 @@ def test_every_call_lands_on_an_allowlisted_route(client: mc.Client) -> None:
 
     called = called_routes(route.calls)
     assert called, "no requests were made — the exercise is not exercising anything"
-    assert called <= ALLOWED, f"SDK calls routes the server does not expose: {sorted(called - ALLOWED)}"
+    assert called <= ALLOWED, (
+        f"SDK calls routes the server does not expose: {sorted(called - ALLOWED)}"
+    )
 
 
 @respx.mock
@@ -241,7 +246,9 @@ async def test_async_every_call_lands_on_an_allowlisted_route(
 
     called = called_routes(route.calls)
     assert called, "no requests were made — the exercise is not exercising anything"
-    assert called <= ALLOWED, f"SDK calls routes the server does not expose: {sorted(called - ALLOWED)}"
+    assert called <= ALLOWED, (
+        f"SDK calls routes the server does not expose: {sorted(called - ALLOWED)}"
+    )
 
 
 @respx.mock

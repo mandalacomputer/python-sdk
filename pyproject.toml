@@ -18,8 +18,13 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 # httpx over requests: the SDK needs a sync and an async client from the same
-# surface, and agent frameworks are overwhelmingly async.
-dependencies = ["httpx>=0.27"]
+# surface, and agent frameworks are overwhelmingly async. websockets carries
+# `mandala ssh`; it is pure Python with no dependencies of its own, which is
+# why it rides in the core install instead of an extra nobody would discover.
+dependencies = ["httpx>=0.27", "websockets>=13"]
+
+[project.scripts]
+mandala = "mandala_computer._cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "ruff>=0.6", "mypy>=1.11"]

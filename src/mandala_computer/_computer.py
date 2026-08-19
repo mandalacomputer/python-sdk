@@ -629,6 +629,29 @@ class Computer(ComputerFields):
         """
         return self.exec(_api.open_url_command(url), timeout_s, desktop=True)
 
+    # --- files ----------------------------------------------------------
+
+    def read_file(self, path: str) -> bytes:
+        """Read one file out of the guest, as bytes.
+
+        ``path`` is absolute, inside the guest — there is no shell and no
+        working directory behind this, so a relative path is refused before the
+        request is made. Works while the computer is running or suspended
+        (a transfer resumes a suspended computer, like any other use).
+        """
+        resp = self._t.request("GET", _api.files(self.id), params=_api.files_params(path))
+        return resp.content
+
+    def write_file(self, path: str, data: bytes | str) -> None:
+        """Write ``data`` to one file inside the guest, creating it if needed.
+
+        A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
+        The bytes land exactly as given — this is how a credential reaches a
+        guest ``.env`` without echoing it through a shell command line.
+        """
+        body = data.encode() if isinstance(data, str) else data
+        self._t.request("PUT", _api.files(self.id), params=_api.files_params(path), content=body)
+
     # --- snapshots ------------------------------------------------------
 
     def snapshot(self, *, memory: bool = False) -> Snapshot:

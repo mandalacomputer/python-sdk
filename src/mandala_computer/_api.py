@@ -39,6 +39,22 @@ def snapshot_action(snapshot_id: str, action: str) -> str:
     return f"snapshots/{snapshot_id}/{action}"
 
 
+def files(computer_id: str) -> str:
+    return f"computers/{computer_id}/files"
+
+
+def files_params(path: str) -> dict[str, str]:
+    """The query naming which guest file, checked before the round trip.
+
+    The path must be absolute: nothing about a transfer runs in a shell, so a
+    relative path has no working directory to be relative to. The daemon
+    refuses it too, but this mistake is knowable without the round trip.
+    """
+    if not path.startswith("/"):
+        raise ValueError(f"guest path must be absolute: {path!r}")
+    return {"path": path}
+
+
 # --- responses ------------------------------------------------------------
 
 

@@ -12,6 +12,9 @@ AI agents.
 pip install mandala-computer       # not yet published
 ```
 
+The install also puts a `mandala` command on your PATH — see
+[The `mandala` CLI](#the-mandala-cli).
+
 ## Use
 
 Authentication is an API key from the dashboard (Settings → API keys), read from
@@ -367,6 +370,20 @@ if last is None:
 `auto` also marks the only snapshots retention will age out — ones you take
 yourself are never removed automatically.
 
+### Files
+
+One file in or out of the guest, no shell involved — the way a credential
+reaches a `.env` without echoing it through a command line:
+
+```python
+c.write_file("/home/user/app/.env", "API_TOKEN=hunter2\n")
+report = c.read_file("/home/user/report.csv")
+```
+
+Guest paths are absolute; a relative path is refused before the request is
+made, because nothing about a transfer runs in a shell with a working
+directory. A transfer resumes a suspended computer, like any other use.
+
 ### Errors
 
 Everything derives from `MandalaError`.
@@ -401,6 +418,33 @@ except mandala_computer.ConflictError:
     c.wait_until_built()   # or just try again shortly
     c.snapshot()
 ```
+
+## The `mandala` CLI
+
+Your own terminal against a computer, addressed by name or id. Authentication
+is the SDK's: `MANDALA_API_KEY` in the environment.
+
+```sh
+mandala ssh dev                    # an interactive shell in the guest
+mandala scp .env dev:/home/user/app/.env
+mandala scp dev:/home/user/report.csv .
+```
+
+`ssh` opens the platform's terminal websocket: a PTY the platform keeps alive
+server-side, running as the desktop user. Disconnecting *detaches* rather than
+ends it — the shell and whatever it was running keep going, and running the
+same command reattaches with recent output replayed. `--session <name>` keeps
+several; the shell's exit code becomes the command's own. Inside, plain
+`nano`/`vim`/`echo` work as they would over real ssh.
+
+`scp` copies one file per invocation, the side spelled `<computer>:/path` being
+the guest. It rides the files API rather than the terminal, so it works
+without any shell in the guest at all.
+
+Two answers worth recognizing: a computer that predates the terminal feature
+answers 409 until it is stopped and started again (a restart is not enough,
+deliberately — a resumed session must match its saved device topology), and
+Windows guests have no terminal yet.
 
 ## Design notes
 

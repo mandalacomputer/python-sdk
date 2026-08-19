@@ -45,6 +45,11 @@ class VncConnect:
     #: so it stays out of access logs and out of ``Referer`` on everything the
     #: page then loads.
     embed_url: str
+    #: Websocket URL opening an interactive terminal — a PTY in the guest,
+    #: carried on the same controlling credential as :attr:`url`, so treat it
+    #: as that credential. ``""`` on a Windows guest, which has no terminal
+    #: yet, and on a server from before the terminal existed.
+    terminal_url: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -68,6 +73,7 @@ class VncConnect:
             token=token,
             view_token=view_token,
             embed_url=str(d.get("embed_url", "")),
+            terminal_url=str(d.get("terminal_url") or ""),
             raw=dict(d),
         )
 
