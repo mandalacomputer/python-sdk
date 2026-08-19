@@ -46,6 +46,20 @@ def _die(message: str) -> NoReturn:
     raise SystemExit(f"mandala: {message}")
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte, however many calls that takes.
+
+    ``os.write`` is allowed to write less than it was given, and here it will:
+    frames run to :data:`_MAX_FRAME` on a scrollback replay, against a pipe
+    whose buffer is a few kilobytes, and a SIGWINCH landing mid-write ends it
+    early with a short count rather than being retried. The unwritten tail is
+    guest output, and dropping it silently corrupts the terminal.
+    """
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
 def _client() -> Client:
     # Imported at call time: the package's __init__ imports nothing from here,
     # so the cycle stays one-way.
@@ -159,7 +173,7 @@ def _interact(url: str) -> int:
         while True:
             message = ws.recv()
             if isinstance(message, bytes):
-                os.write(stdout, message)
+                _write_all(stdout, message)
                 continue
             try:
                 control = json.loads(message)
@@ -202,6 +216,23 @@ def _remote_side(arg: str) -> tuple[str, str] | None:
     return head, tail
 
 
+def _guest_basename(path: str) -> str:
+    r"""The last component of a guest path, on either OS family.
+
+    Not :func:`os.path.basename`, which is the *local* machine's rule: on a
+    POSIX host it does not know ``\`` is a separator, so a Windows guest's
+    ``C:\Users\me\notes.txt`` comes back whole and lands in a local file
+    named exactly that — one file with backslashes in its name, in the
+    directory the user asked us to write into.
+    """
+    tail = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    # `C:notes.txt` is drive-relative on Windows: the drive is not part of the
+    # name, and the daemon's own path rules accept the spelling.
+    if len(tail) > 2 and tail[1] == ":" and tail[0].isascii() and tail[0].isalpha():
+        tail = tail[2:]
+    return tail
+
+
 def _cmd_scp(args: argparse.Namespace) -> int:
     src, dst = _remote_side(args.src), _remote_side(args.dst)
     if (src is None) == (dst is None):
@@ -214,7 +245,7 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         data = _resolve(_client(), target).read_file(remote_path)
         local = args.dst
         if os.path.isdir(local):
-            local = os.path.join(local, os.path.basename(remote_path))
+            local = os.path.join(local, _guest_basename(remote_path))
         with open(local, "wb") as f:
             f.write(data)
         print(f"{target}:{remote_path} -> {local} ({len(data)} bytes)", file=sys.stderr)

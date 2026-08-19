@@ -66,7 +66,7 @@ class Listing(list[T]):
         return listing
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class VncConnect:
     """Everything needed to put a computer's live desktop on a page.
 
@@ -128,6 +128,39 @@ class VncConnect:
             embed_url=str(d.get("embed_url", "")),
             terminal_url=str(d.get("terminal_url") or ""),
             raw=dict(d),
+        )
+
+    @staticmethod
+    def _without_credential(url: str) -> str:
+        """A URL with everything after the path dropped.
+
+        Each of these URLs carries a token in its query or its fragment, so the
+        origin and path are the whole of what can be shown.
+        """
+        if not url:
+            return ""
+        bare = url.split("?", 1)[0].split("#", 1)[0]
+        return bare if bare == url else f"{bare}?<redacted>"
+
+    def __repr__(self) -> str:
+        """Deliberately hand-written, and lossy.
+
+        The generated one printed both tokens and the three URLs carrying them.
+        These credentials have no expiry — they last until the computer restarts
+        or somebody rotates them — and ``token`` is root-equivalent on that
+        machine, so a single log line or traceback rendering this object hands
+        over the desktop for as long as it runs. Everything a repr is actually
+        for survives: which computer this is, and whether each field is set.
+
+        :attr:`raw` still holds the real values, and it is excluded from the
+        repr for the same reason.
+        """
+        return (
+            f"VncConnect(url={self._without_credential(self.url)!r}, "
+            f"view_url={self._without_credential(self.view_url)!r}, "
+            f"token=<redacted>, view_token=<redacted>, "
+            f"embed_url={self._without_credential(self.embed_url)!r}, "
+            f"terminal_url={self._without_credential(self.terminal_url)!r})"
         )
 
 
@@ -451,6 +484,7 @@ class ExecResult:
     out_truncated: bool = False
     #: The same for stderr.
     err_truncated: bool = False
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -486,4 +520,5 @@ class ExecResult:
             timed_out=bool(d.get("timed_out", False)),
             out_truncated=bool(d.get("out_truncated", False)),
             err_truncated=bool(d.get("err_truncated", False)),
+            raw=dict(d),
         )

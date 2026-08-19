@@ -1242,3 +1242,224 @@ def test_zero_pins_a_computer_against_the_idle_sweep() -> None:
     assert mc._api.idle_suspend_body(0) == {"idle_suspend_min": 0}
     with pytest.raises(ValueError, match="cannot be negative"):
         mc._api.idle_suspend_body(-1)
+
+
+# --- ids are not trusted to be shaped like ids -----------------------------
+
+
+def test_ids_are_percent_encoded_into_the_path() -> None:
+    """A path segment stays one segment, whatever the caller passed.
+
+    Real ids are platform-minted hex, but `get()` takes any string, and the
+    damage from one that is not is not a 404: `..` re-points the request at a
+    route nobody meant, with the account's bearer token on it, and `?` puts
+    query keys on a request whose own parameters carry interlocks.
+    """
+    assert mc._api.computer("../../admin") == "computers/..%2F..%2Fadmin"
+    assert mc._api.snapshot("../computers") == "snapshots/..%2Fcomputers"
+    assert mc._api.computer_action("a/b", "start") == "computers/a%2Fb/start"
+    assert mc._api.snapshot_action("a?x=1", "restore") == "snapshots/a%3Fx%3D1/restore"
+    assert mc._api.files("a b") == "computers/a%20b/files"
+    assert mc._api.exec_handle("a/b", 7) == "computers/a%2Fb/exec/7"
+    assert mc._api.window("a/b", "0x1/2") == "computers/a%2Fb/windows/0x1%2F2"
+    # The ordinary case is untouched, which is why this was invisible.
+    assert mc._api.computer("vm-1a2b3c4d5e6f") == "computers/vm-1a2b3c4d5e6f"
+
+
+@respx.mock
+def test_a_hostile_id_cannot_escape_the_api_prefix(client: mc.Client) -> None:
+    route = respx.get(url__startswith=BASE).mock(httpx.Response(200, json=COMPUTER))
+    client.computers.get("../../admin")
+    # raw_path, not path: `path` is the decoded view, and what matters is the
+    # bytes on the wire. Unencoded, httpx resolves the dot segments away and
+    # this lands on /api/admin — off the versioned surface, bearer token on it.
+    assert route.calls.last.request.url.raw_path == b"/api/v1/computers/..%2F..%2Fadmin"
+
+
+# --- half a coordinate is a mistake, not a default -------------------------
+
+
+def test_half_a_coordinate_is_refused_rather_than_zero_filled() -> None:
+    """`click(100)` used to click (100, 0) and report success.
+
+    Both coordinates or neither: neither means "wherever the pointer is", which
+    is a real request. One of the two is a caller who meant to name a point, and
+    zero-filling the other half acts somewhere else entirely with nothing said.
+    It is the case `drag_body` already refuses for an origin.
+    """
+    for x, y in ((5, None), (None, 5), (0, None), (None, 0)):
+        with pytest.raises(ValueError, match="both x and y"):
+            mc._api.click_body("left_click", x, y, ())
+        with pytest.raises(ValueError, match="both x and y"):
+            mc._api.button_body("left_mouse_down", x, y)
+        with pytest.raises(ValueError, match="both x and y"):
+            mc._api.scroll_body(x, y, "down", 3)
+
+    # Neither and both still work, and 0 is still a real coordinate.
+    assert mc._api.click_body("left_click", None, None, ()) == {"action": "left_click"}
+    assert mc._api.click_body("left_click", 0, 0, ())["x"] == 0
+    assert mc._api.scroll_body(0, 0, "down", 3)["coordinate"] == [0, 0]
+
+
+@respx.mock
+def test_a_half_coordinate_click_never_reaches_the_wire(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    with pytest.raises(ValueError, match="both x and y"):
+        _computer(client).click(100)
+    assert not route.calls
+
+
+# --- credentials stay out of the repr --------------------------------------
+
+
+def test_the_vnc_repr_does_not_carry_the_credentials() -> None:
+    """`token` is root-equivalent on that machine and does not expire.
+
+    It lasts until the computer restarts or somebody rotates it, so one log line
+    or traceback rendering this object hands over the desktop for as long as the
+    machine runs. What a repr is for survives: which URLs are set, and where.
+    """
+    vnc = mc.VncConnect.from_api(
+        {
+            "url": "wss://h/vnc?token=SECRET",
+            "view_url": "wss://h/vnc?token=VIEWONLY",
+            "token": "SECRET",
+            "view_token": "VIEWONLY",
+            "embed_url": "https://h/embed#token=SECRET",
+            "terminal_url": "wss://h/term?token=SECRET",
+        }
+    )
+    assert vnc is not None
+    text = repr(vnc)
+    assert "SECRET" not in text
+    assert "VIEWONLY" not in text
+    assert "wss://h/vnc?<redacted>" in text
+    assert "https://h/embed?<redacted>" in text
+    # The values themselves are untouched — only the repr is lossy.
+    assert vnc.token == "SECRET"
+    assert vnc.raw["token"] == "SECRET"
+
+
+def test_the_vnc_repr_survives_an_empty_terminal_url() -> None:
+    vnc = mc.VncConnect.from_api({"url": "wss://h/v", "token": "a", "view_token": "b"})
+    assert vnc is not None
+    assert "terminal_url=''" in repr(vnc)
+
+
+# --- exec results carry what they were built from --------------------------
+
+
+def test_exec_result_keeps_the_raw_payload() -> None:
+    """The forward-compatibility promise the other models keep.
+
+    A server that starts returning more should not need a new SDK for the
+    caller to reach it, and `exec` is the most-used route on the surface.
+    """
+    result = mc.ExecResult.from_api(
+        {"exit_code": 0, "stdout": "hi", "stderr": "", "duration_ms": 12}
+    )
+    assert result.raw["duration_ms"] == 12
+    assert result.stdout == "hi"
+
+
+# --- 429 is its own answer -------------------------------------------------
+
+
+@respx.mock
+def test_rate_limit_is_its_own_error_carrying_the_wait(client: mc.Client) -> None:
+    """Every route on this surface is metered, so 429 is reachable everywhere.
+
+    It is the one refusal that says exactly how long to wait, which is no use to
+    a caller who cannot tell it apart from any other failure.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(429, headers={"Retry-After": "30"}, json={"error": "slow down"})
+    )
+    with pytest.raises(mc.RateLimitError) as caught:
+        client.computers.list()
+    assert caught.value.retry_after == 30.0
+    assert caught.value.status == 429
+    assert str(caught.value) == "slow down"
+
+
+@respx.mock
+def test_a_rate_limit_without_a_usable_header_still_classifies(client: mc.Client) -> None:
+    # The HTTP-date form is legal and this surface does not send it; guessing at
+    # it against a clock that may disagree is worse than saying nothing.
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+    )
+    with pytest.raises(mc.RateLimitError) as caught:
+        client.computers.list()
+    assert caught.value.retry_after is None
+
+
+# --- waiting for a guest waits only on things that can change --------------
+
+
+@respx.mock
+def test_wait_for_guest_does_not_wait_out_a_revoked_key(client: mc.Client) -> None:
+    """401 will not clear by waiting.
+
+    It used to cost the full 180-second timeout and then report "the guest did
+    not respond", which is both wrong and the least useful thing this method
+    could say about a revoked key.
+    """
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(401, json={"error": "revoked"}))
+    with pytest.raises(mc.AuthenticationError):
+        _computer(client).wait_for_guest(timeout=30, poll=0.01)
+
+
+@respx.mock
+def test_wait_for_guest_still_waits_through_a_booting_agent(client: mc.Client) -> None:
+    """409 is what the agent answers with in the first seconds of a start."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec")
+    route.side_effect = [
+        httpx.Response(409, json={"error": "guest agent not ready"}),
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+    ]
+    c = _computer(client)
+    assert c.wait_for_guest(timeout=30, poll=0.01) is c
+    assert len(route.calls) == 2
+
+
+# --- ephemeral cleanup does not displace the caller's exception ------------
+
+
+@respx.mock
+def test_a_failing_ephemeral_cleanup_keeps_the_original_error(client: mc.Client) -> None:
+    """The block's exception is the news; a failed delete is a footnote.
+
+    It used to be the other way round: a 409 from the delete replaced whatever
+    the user's code raised, so `except MyError:` around the block stopped
+    firing.
+    """
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(409, json={"error": "a snapshot is being taken"})
+    )
+
+    def caller_raises() -> None:
+        with client.computers.ephemeral():
+            raise ZeroDivisionError("the caller's own bug")
+
+    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+        caller_raises()
+
+
+@respx.mock
+def test_ephemeral_still_deletes_on_the_ordinary_path(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={}))
+    with client.computers.ephemeral() as c:
+        assert c.id == "vm-1"
+    assert route.called
+
+
+@respx.mock
+def test_a_failing_ephemeral_cleanup_still_raises_on_a_clean_exit(client: mc.Client) -> None:
+    """With nothing else propagating, the delete's own error is the news."""
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(409, json={"error": "in flight"}))
+    with pytest.raises(mc.ConflictError), client.computers.ephemeral():
+        pass

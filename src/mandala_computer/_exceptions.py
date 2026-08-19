@@ -10,6 +10,7 @@ __all__ = [
     "NotFoundError",
     "PermissionDeniedError",
     "PlanLimitError",
+    "RateLimitError",
     "TimeoutError",
     "UnavailableError",
 ]
@@ -51,6 +52,36 @@ class PlanLimitError(APIError):
     and storage pools, and OS entitlements. ``str(e)`` carries the API's
     explanation of which limit was hit.
     """
+
+
+class RateLimitError(APIError):
+    """Too many requests, too fast (429).
+
+    Every route on this surface is metered, including the ones that go on to
+    answer 404 — the meter runs before the allowlist, the role gate and the
+    forward, so a burst of anything counts against the same budget. The budget
+    is generous (a plan's ``apiRatePerMin``, in the low thousands even at the
+    bottom of the range), which is why hitting this usually means a loop with no
+    sleep in it rather than real load.
+
+    Its own class rather than a bare :class:`APIError` because it is the one
+    refusal on this surface that says exactly how long to wait:
+    :attr:`retry_after` carries the ``Retry-After`` header in seconds. Sleeping
+    that long and repeating the request is the whole remedy.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        body: object = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message, status=status, body=body)
+        #: Seconds to wait before retrying, from ``Retry-After``. ``None`` only
+        #: if the header was missing or unparseable, which should not happen.
+        self.retry_after = retry_after
 
 
 class ConflictError(APIError):

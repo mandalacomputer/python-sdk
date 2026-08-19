@@ -8,7 +8,14 @@ from typing import Any
 
 from . import _api
 from ._client import Transport
-from ._exceptions import MandalaError, TimeoutError
+from ._exceptions import (
+    AuthenticationError,
+    MandalaError,
+    NotFoundError,
+    PermissionDeniedError,
+    PlanLimitError,
+    TimeoutError,
+)
 from ._models import (
     ExecResult,
     ExecStatus,
@@ -54,6 +61,19 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
 # probe and silently made the wait Linux-only: cmd.exe has no such command, so
 # on Windows it could only spin until it timed out.
 GUEST_PROBE = "exit 0"
+
+#: Errors that no amount of waiting resolves, so :meth:`Computer.wait_for_guest`
+#: re-raises them rather than polling through them. Everything else in the
+#: hierarchy is either transient by definition (:class:`ConflictError`, which
+#: the guest agent answers with in the first seconds of a start, and
+#: :class:`UnavailableError`) or a 502 from an agent that has not spoken yet —
+#: all of which are exactly what this method exists to wait out.
+_FATAL_WHILE_WAITING = (
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    PlanLimitError,
+)
 
 
 class ComputerFields:
@@ -536,12 +556,21 @@ class Computer(ComputerFields):
         than the desktop being usable — on Windows especially, since the agent
         runs in session 0 and replies well before anyone has logged in. When you
         need the desktop rather than the machine, poll :meth:`screenshot`.
+
+    What it does not wait through is a refusal that will never clear: a revoked
+        key, a computer that is not there, an account that is not allowed, a
+        plan that does not cover this. Those are raised at once. Waiting on one
+        of them costs the full timeout and then reports "the guest did not
+        respond", which is both wrong and the least useful thing this method
+        could say about a 401.
         """
         deadline = time.monotonic() + timeout
         while True:
             try:
                 if self.exec(GUEST_PROBE, timeout_s=5).ok:
                     return self
+            except _FATAL_WHILE_WAITING:
+                raise
             except MandalaError:
                 pass  # agent not up yet
             if time.monotonic() >= deadline:

@@ -330,3 +330,40 @@ async def test_resize_and_the_idle_window(client: mc.AsyncClient) -> None:
     await c.set_idle_suspend(30)
     assert json.loads(route.calls.last.request.content) == {"idle_suspend_min": 30}
     assert c.idle_suspend_min == 30
+
+
+@respx.mock
+async def test_wait_for_guest_does_not_wait_out_a_revoked_key(client: mc.AsyncClient) -> None:
+    """The async half of the same rule: 401 will not clear by waiting."""
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(401, json={"error": "revoked"}))
+    with pytest.raises(mc.AuthenticationError):
+        await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0.01)
+    await client.aclose()
+
+
+@respx.mock
+async def test_a_failing_ephemeral_cleanup_keeps_the_original_error(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half of the same rule: the block's exception is the news."""
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(409, json={"error": "a snapshot is being taken"})
+    )
+    async def caller_raises() -> None:
+        async with client.computers.ephemeral():
+            raise ZeroDivisionError("the caller's own bug")
+
+    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+        await caller_raises()
+    await client.aclose()
+
+
+@respx.mock
+async def test_ephemeral_still_deletes_on_the_ordinary_path(client: mc.AsyncClient) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={}))
+    async with client.computers.ephemeral() as c:
+        assert c.id == "vm-1"
+    assert route.called
+    await client.aclose()

@@ -22,6 +22,7 @@ from ._exceptions import (
     NotFoundError,
     PermissionDeniedError,
     PlanLimitError,
+    RateLimitError,
     UnavailableError,
 )
 
@@ -33,6 +34,7 @@ _STATUS_ERRORS = {
     403: PermissionDeniedError,
     404: NotFoundError,
     409: ConflictError,
+    429: RateLimitError,
     # A fan-out listing that would have been short, without allow_partial. Its
     # own class rather than a bare APIError because it is the one 5xx on this
     # surface that is not a fault: nothing is broken from the caller's side, the
@@ -110,7 +112,30 @@ class _BaseTransport:
             if text:
                 message = text[:500]
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
+        if cls is RateLimitError:
+            return RateLimitError(
+                message,
+                status=resp.status_code,
+                body=body,
+                retry_after=_retry_after(resp),
+            )
         return cls(message, status=resp.status_code, body=body)
+
+
+def _retry_after(resp: httpx.Response) -> float | None:
+    """``Retry-After`` in seconds, or ``None`` if it was not usable.
+
+    Only the delta-seconds form is read. The HTTP-date form is legal and this
+    surface does not send it, and guessing at a date against a clock that may
+    disagree with the server's is worse than saying nothing.
+    """
+    raw = resp.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return None
 
 
 class Transport(_BaseTransport):

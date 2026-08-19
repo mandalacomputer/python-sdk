@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from . import _api
 from ._client import Transport
 from ._computer import Computer
+from ._exceptions import MandalaError
 from ._models import Listing, Size, Snapshot, Template
 
 __all__ = ["Computers", "Sizes", "Snapshots", "Templates"]
@@ -21,7 +23,11 @@ disk, so tying that to a ``with`` block is only safe when the block is
 unambiguously the machine's whole lifetime — which is exactly what this method
 declares and ``create()`` does not.
 
-Cleanup runs even if the block raises.
+Cleanup runs even if the block raises, and does not displace the exception that
+was on its way out: if the delete itself fails while the block is already
+raising, the computer is reported with a warning rather than a second exception,
+so what you catch is still your own error. That warning means a machine outlived
+its block and is still billable.
 """
 
 
@@ -115,10 +121,37 @@ class Computers:
         computer = self.create(**kwargs)
         try:
             yield computer
-        finally:
+        except BaseException:
+            # Not a bare `finally`. A delete that fails here would replace the
+            # exception on its way out, and the caller would see a
+            # ConflictError about a snapshot in flight instead of the error
+            # their own code raised. The machine is billable until it goes, so
+            # a failed cleanup is still news — it is warned about rather than
+            # raised, which says it without taking the exception's place.
+            try:
+                computer.delete()
+            except MandalaError as cleanup_failed:
+                warn_cleanup_failed(computer.id, cleanup_failed)
+            raise
+        else:
             computer.delete()
 
     ephemeral.__doc__ = EPHEMERAL_DOC
+
+
+def warn_cleanup_failed(computer_id: str, error: MandalaError) -> None:
+    """Report an ``ephemeral`` cleanup that did not happen, without raising.
+
+    Shared by both halves. This runs only while another exception is already on
+    its way out, so raising would take that exception's place — but a computer
+    that outlived its block is billing, and silence about it is worse than a
+    warning nobody reads.
+    """
+    warnings.warn(
+        f"ephemeral: could not delete {computer_id}: {error}. "
+        "It is still running and still billable.",
+        stacklevel=2,
+    )
 
 
 class Snapshots:

@@ -10,8 +10,9 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
+from ._exceptions import MandalaError
 from ._models import Listing, Size, Snapshot, Template
-from ._resources import EPHEMERAL_DOC
+from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
 
 __all__ = ["AsyncComputers", "AsyncSizes", "AsyncSnapshots", "AsyncTemplates"]
 
@@ -106,7 +107,15 @@ class AsyncComputers:
         computer = await self.create(**kwargs)
         try:
             yield computer
-        finally:
+        except BaseException:
+            # See the sync half: a failing delete must not displace the
+            # caller's exception.
+            try:
+                await computer.delete()
+            except MandalaError as cleanup_failed:
+                warn_cleanup_failed(computer.id, cleanup_failed)
+            raise
+        else:
             await computer.delete()
 
     ephemeral.__doc__ = EPHEMERAL_DOC

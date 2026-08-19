@@ -184,3 +184,75 @@ def test_ssh_stopped_computer_says_start_it() -> None:
     _computer({"status": "stopped", "os": "linux"})
     with pytest.raises(SystemExit, match="start it"):
         _cli.main(["ssh", "dev"])
+
+
+# --- guest paths are not local paths ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("remote", "want"),
+    [
+        ("/home/user/notes.txt", "notes.txt"),
+        (r"C:\Users\me\notes.txt", "notes.txt"),
+        (r"C:/Users/me/notes.txt", "notes.txt"),
+        (r"\\share\team\notes.txt", "notes.txt"),
+        (r"C:\notes.txt", "notes.txt"),
+        ("C:notes.txt", "notes.txt"),  # drive-relative: the drive is not a name
+        ("/trailing/slash/", "slash"),
+        ("bare.txt", "bare.txt"),
+    ],
+)
+def test_guest_basename_understands_both_families(remote: str, want: str) -> None:
+    r"""os.path.basename is the *local* machine's rule.
+
+    On a POSIX host it does not know `\` separates anything, so a Windows
+    guest's path came back whole and scp wrote one local file literally named
+    `C:\Users\me\notes.txt`.
+    """
+    assert _cli._guest_basename(remote) == want
+
+
+@respx.mock
+def test_scp_from_a_windows_guest_into_a_directory(tmp_path) -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "vm-9", "name": "win", "status": "running", "os": "windows"}]
+        )
+    )
+    respx.get(f"{BASE}/computers/vm-9/files").mock(
+        return_value=httpx.Response(200, content=b"payload")
+    )
+    assert _cli.main(["scp", r"win:C:\Users\me\notes.txt", str(tmp_path)]) == 0
+    assert (tmp_path / "notes.txt").read_bytes() == b"payload"
+    assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+
+
+# --- the terminal pump loses no output -------------------------------------
+
+
+def test_write_all_drains_a_short_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """os.write may write less than it was given, and here it will.
+
+    Frames run to 4 MiB on a scrollback replay against a pipe buffered in
+    kilobytes, and a SIGWINCH landing mid-write ends it early with a short
+    count. The unwritten tail is guest output; dropping it corrupts the
+    terminal with nothing said.
+    """
+    written = bytearray()
+
+    def short_write(fd: int, data: object) -> int:
+        chunk = bytes(data)[:7]  # a stubborn pipe: seven bytes at a time
+        written.extend(chunk)
+        return len(chunk)
+
+    monkeypatch.setattr(_cli.os, "write", short_write)
+    payload = bytes(range(256)) * 400
+    _cli._write_all(1, payload)
+    assert bytes(written) == payload
+
+
+def test_write_all_handles_an_empty_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(_cli.os, "write", lambda fd, data: calls.append(data) or len(data))
+    _cli._write_all(1, b"")
+    assert not calls
