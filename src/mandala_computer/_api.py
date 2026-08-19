@@ -21,14 +21,39 @@ COMPUTERS = "computers"
 SNAPSHOTS = "snapshots"
 
 
+def seg(value: str) -> str:
+    """One path segment, percent-encoded — including ``/``.
+
+    Every id the caller can hand us goes through here. Computer and snapshot
+    ids are minted by the platform in a known alphabet, so in the ordinary case
+    this changes nothing; but ``get()`` takes whatever string it is given, and
+    an id is the one part of these URLs that does not come from this file. An
+    unescaped ``/`` would not merely 404 — it would re-point the request at a
+    route nobody meant, with the account's bearer token on it, and a ``?``
+    would put query keys on a request whose own parameters are what interlocks
+    like the snapshot-purge fingerprint are carried in.
+
+    Encoding cannot answer ``.`` and ``..``: ``quote`` leaves a dot alone
+    whatever ``safe`` says, and the dot-segment removal in RFC 3986 is applied
+    by the client to the assembled URL, so ``get("..")`` would climb a level
+    and address ``/api/v1`` itself — and an id of ``..`` would turn one
+    computer's ``/snapshots`` into the account's whole snapshot list, which is
+    a bad thing to hand a purge loop. An empty id does the same to the
+    collection route. Neither is a real id, so both are refused here.
+    """
+    if not value.strip("."):
+        raise ValueError(f"id must not be empty or all dots: {value!r}")
+    return quote(value, safe="")
+
+
 def computer(computer_id: str) -> str:
-    return f"computers/{computer_id}"
+    return f"computers/{seg(computer_id)}"
 
 
 def computer_action(computer_id: str, action: str) -> str:
     """start | stop | suspend | restart | clone | screenshot | input | exec |
     snapshots | schedule."""
-    return f"computers/{computer_id}/{action}"
+    return f"computers/{seg(computer_id)}/{action}"
 
 
 def exec_handle(computer_id: str, pid: int) -> str:
@@ -38,32 +63,32 @@ def exec_handle(computer_id: str, pid: int) -> str:
     own ``patternFor`` reduces it to ``:pid`` rather than to ``:id`` — it names
     something inside a computer rather than a thing the platform owns.
     """
-    return f"computers/{computer_id}/exec/{pid}"
+    return f"computers/{seg(computer_id)}/exec/{pid}"
 
 
 def window(computer_id: str, window_id: str) -> str:
     """One window on the guest's desktop, addressed by its X id.
 
-    The id is percent-encoded, unlike the computer and snapshot ids above, and
-    the difference is real rather than untidy: those are minted by the platform
-    in a known alphabet, while this one is whatever the guest's window manager
-    called a window. An unescaped ``/`` in it would not merely 404 — it would
-    add a path segment, and the request would land on a route nobody meant.
+    The window id has the most room to surprise of any id here — it is whatever
+    the guest's window manager called a window, rather than something the
+    platform minted — but it is encoded by the same :func:`seg` every other id
+    goes through, because the consequence of a stray separator does not depend
+    on who chose the string.
     """
-    return f"computers/{computer_id}/windows/{quote(window_id, safe='')}"
+    return f"computers/{seg(computer_id)}/windows/{seg(window_id)}"
 
 
 def snapshot(snapshot_id: str) -> str:
-    return f"snapshots/{snapshot_id}"
+    return f"snapshots/{seg(snapshot_id)}"
 
 
 def snapshot_action(snapshot_id: str, action: str) -> str:
     """restore | clone."""
-    return f"snapshots/{snapshot_id}/{action}"
+    return f"snapshots/{seg(snapshot_id)}/{action}"
 
 
 def files(computer_id: str) -> str:
-    return f"computers/{computer_id}/files"
+    return f"computers/{seg(computer_id)}/files"
 
 
 def is_absolute_guest_path(path: str) -> bool:
@@ -90,6 +115,25 @@ def is_absolute_guest_path(path: str) -> bool:
         and path[1] == ":"
         and path[2] in "\\/"
     )
+
+
+def looks_windows_guest_path(path: str) -> bool:
+    r"""Whether the path is spelled the way only a Windows guest spells it.
+
+    Weaker than :func:`is_absolute_guest_path` on purpose: this asks which
+    *family* a path belongs to, not whether it is absolute, so the
+    drive-relative ``C:notes.txt`` counts here and does not there.
+
+    What it is for is the rules that must not be applied to the other family. A
+    ``\`` separates nothing on Linux and a ``:`` is an ordinary character in a
+    Linux filename, so treating every path as possibly-Windows quietly renames
+    ``/tmp/a:b.txt`` to ``b.txt``. A leading ``/`` says Linux; a drive or a UNC
+    prefix says Windows; a bare relative name says neither, and is left to the
+    permissive reading, where the two families agree anyway.
+    """
+    if path.startswith("\\\\"):  # UNC share
+        return True
+    return len(path) >= 2 and path[0].isascii() and path[0].isalpha() and path[1] == ":"
 
 
 def files_params(path: str) -> dict[str, str]:
@@ -454,6 +498,20 @@ def pointer_body(action: str, x: int, y: int) -> dict[str, Any]:
     return {"action": action, "x": x, "y": y}
 
 
+def _whole_point(x: int | None, y: int | None) -> None:
+    """Refuse half a coordinate, for the reason :func:`drag_body` refuses half
+    an origin.
+
+    Omitting both is a real request — "wherever the pointer already is" — and a
+    different one from (0, 0). Giving one of the two is neither: it reads as a
+    caller who meant to name a point, and zero-filling the half they left out
+    produces a click or a scroll that succeeds somewhere else entirely. Nothing
+    reports that, which is what makes it worth a ``ValueError`` here.
+    """
+    if (x is None) != (y is None):
+        raise ValueError("give both x and y, or neither")
+
+
 def click_body(
     action: str, x: int | None, y: int | None, modifiers: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -463,10 +521,11 @@ def click_body(
     different request from clicking (0, 0) — so the keys are omitted rather than
     sent as zeros.
     """
+    _whole_point(x, y)
     body: dict[str, Any] = {"action": action}
-    if x is not None or y is not None:
-        body["x"] = x or 0
-        body["y"] = y or 0
+    if x is not None and y is not None:
+        body["x"] = x
+        body["y"] = y
     if modifiers:
         body["text"] = "+".join(modifiers)
     return body
@@ -495,10 +554,11 @@ def drag_body(from_x: int | None, from_y: int | None, to_x: int, to_y: int) -> d
 
 def button_body(action: str, x: int | None, y: int | None) -> dict[str, Any]:
     """left_mouse_down / left_mouse_up, optionally moving first."""
+    _whole_point(x, y)
     body: dict[str, Any] = {"action": action}
-    if x is not None or y is not None:
-        body["x"] = x or 0
-        body["y"] = y or 0
+    if x is not None and y is not None:
+        body["x"] = x
+        body["y"] = y
     return body
 
 
@@ -518,19 +578,20 @@ def scroll_body(
     """
     if direction not in _SCROLL_DIRECTIONS:
         raise ValueError(f"direction must be one of {_SCROLL_DIRECTIONS}")
+    _whole_point(x, y)
     body: dict[str, Any] = {
         "action": "scroll",
         "scroll_direction": direction,
         "amount": amount,
     }
-    if x is not None or y is not None:
+    if x is not None and y is not None:
         # The tool-native spelling, not the flat pair. The platform reads a flat
         # x/y of 0,0 on a scroll as "no position" — it has to, because that is
         # what this SDK sent for every defaulted scroll before the arguments
         # became optional — so a caller who genuinely means the top-left corner
         # cannot say so that way. `coordinate` has no such history and is
         # unambiguous, which makes scroll(0, 0) mean the corner again.
-        body["coordinate"] = [x or 0, y or 0]
+        body["coordinate"] = [x, y]
     if modifiers:
         body["text"] = "+".join(modifiers)
     return body

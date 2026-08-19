@@ -29,6 +29,7 @@ import threading
 from contextlib import suppress
 from typing import TYPE_CHECKING, NoReturn
 
+from ._api import looks_windows_guest_path
 from ._computer import Computer
 from ._exceptions import MandalaError
 
@@ -44,6 +45,20 @@ _MAX_FRAME = 1 << 22
 
 def _die(message: str) -> NoReturn:
     raise SystemExit(f"mandala: {message}")
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte, however many calls that takes.
+
+    ``os.write`` is allowed to write less than it was given, and here it will:
+    frames run to :data:`_MAX_FRAME` on a scrollback replay, against a pipe
+    whose buffer is a few kilobytes, and a SIGWINCH landing mid-write ends it
+    early with a short count rather than being retried. The unwritten tail is
+    guest output, and dropping it silently corrupts the terminal.
+    """
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
 
 
 def _client() -> Client:
@@ -159,7 +174,7 @@ def _interact(url: str) -> int:
         while True:
             message = ws.recv()
             if isinstance(message, bytes):
-                os.write(stdout, message)
+                _write_all(stdout, message)
                 continue
             try:
                 control = json.loads(message)
@@ -202,6 +217,32 @@ def _remote_side(arg: str) -> tuple[str, str] | None:
     return head, tail
 
 
+def _guest_basename(path: str) -> str:
+    r"""The last component of a guest path, on the family the path is spelled in.
+
+    Not :func:`os.path.basename`, which is the *local* machine's rule: on a
+    POSIX host it does not know ``\`` is a separator, so a Windows guest's
+    ``C:\Users\me\notes.txt`` comes back whole and lands in a local file
+    named exactly that — one file with backslashes in its name, in the
+    directory the user asked us to write into.
+
+    But the Windows rules are just as wrong applied the other way: ``\`` and
+    ``:`` are ordinary characters in a Linux filename, so reading every path as
+    possibly-Windows would write ``/tmp/a:b.txt`` to a local file called
+    ``b.txt`` and ``/tmp/back\slash.txt`` to one called ``slash.txt`` — the
+    same silent wrong-filename outcome, on the far more common guest. So the
+    path's own spelling picks the rule.
+    """
+    if not looks_windows_guest_path(path):
+        return path.rstrip("/").rsplit("/", 1)[-1]
+    tail = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    # `C:notes.txt` is drive-relative on Windows: the drive is not part of the
+    # name, and the daemon's own path rules accept the spelling.
+    if len(tail) > 2 and tail[1] == ":" and tail[0].isascii() and tail[0].isalpha():
+        tail = tail[2:]
+    return tail
+
+
 def _cmd_scp(args: argparse.Namespace) -> int:
     src, dst = _remote_side(args.src), _remote_side(args.dst)
     if (src is None) == (dst is None):
@@ -214,7 +255,7 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         data = _resolve(_client(), target).read_file(remote_path)
         local = args.dst
         if os.path.isdir(local):
-            local = os.path.join(local, os.path.basename(remote_path))
+            local = os.path.join(local, _guest_basename(remote_path))
         with open(local, "wb") as f:
             f.write(data)
         print(f"{target}:{remote_path} -> {local} ({len(data)} bytes)", file=sys.stderr)
@@ -224,7 +265,10 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     target, remote_path = dst
     if not remote_path:
         _die(f"say where in the guest: {target}:/absolute/path")
-    if remote_path.endswith("/"):
+    # The guest's separator, not this machine's: `win:C:\Users\me\` names a
+    # directory just as `box:/tmp/` does, and appending to a path that already
+    # ends in a separator joins with whichever one the caller wrote.
+    if remote_path.endswith(("/", "\\")):
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
         data = f.read()

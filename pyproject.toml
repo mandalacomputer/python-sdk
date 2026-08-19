@@ -49,3 +49,8 @@ files = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# `tests` is imported as a package by the async halves, which share fixtures
+# and payloads with their sync counterparts rather than restating them. Without
+# this, only `python -m pytest` works — it puts the cwd on sys.path, while the
+# `pytest` entry point does not, and the suite fails collection outright.
+pythonpath = ["."]

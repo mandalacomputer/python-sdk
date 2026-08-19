@@ -102,3 +102,19 @@ def test_field_accessors_are_shared_not_copied() -> None:
     assert issubclass(mc.AsyncBackgroundCommand, BackgroundCommandFields)
     for field in ("pid", "command", "started_at", "raw"):
         assert getattr(mc.BackgroundCommand, field) is getattr(mc.AsyncBackgroundCommand, field)
+
+
+def test_wait_for_guest_docstring_renders_as_prose() -> None:
+    """`inspect.getdoc` strips the *common* indent, so one shallow line ruins it.
+
+    A paragraph left a level short of the rest of the body dedents to nothing
+    while every other line keeps four spaces, and `help()` then prints the
+    remainder of the method's documentation as an indented literal block
+    (Sphinx warns about it too). It happened to the same paragraph in both
+    halves, which is what makes this a parity test.
+    """
+    for cls in (mc.Computer, mc.AsyncComputer):
+        doc = inspect.getdoc(cls.wait_for_guest)
+        assert doc is not None
+        indented = [line for line in doc.splitlines() if line.strip() and line[0].isspace()]
+        assert not indented, f"{cls.__name__}.wait_for_guest: {indented}"

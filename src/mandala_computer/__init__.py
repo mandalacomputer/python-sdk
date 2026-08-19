@@ -39,6 +39,7 @@ from ._exceptions import (
     NotFoundError,
     PermissionDeniedError,
     PlanLimitError,
+    RateLimitError,
     TimeoutError,
     UnavailableError,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "NotFoundError",
     "PermissionDeniedError",
     "PlanLimitError",
+    "RateLimitError",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
