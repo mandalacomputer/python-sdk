@@ -1017,6 +1017,27 @@ def test_a_foreground_exec_still_carries_its_deadline(client: mc.Client) -> None
 def test_a_relative_cwd_is_refused_before_the_request() -> None:
     with pytest.raises(ValueError, match="cwd must be absolute"):
         mc._api.exec_body("make", 30, cwd="src")
+    with pytest.raises(ValueError, match="cwd must be absolute"):
+        mc._api.exec_body("make", 30, cwd=r"..\build")
+
+
+def test_a_windows_guest_path_is_absolute_too() -> None:
+    r"""The check does not know the guest's OS, so it cannot insist on a slash.
+
+    A leading `/` is drive-relative on Windows, which the daemon refuses; the
+    forms it accepts there are `C:\...` and a `\\` UNC share. Insisting on a
+    slash here would leave `cwd` and the file transfers unusable on a Windows
+    guest, refusing locally exactly the values the server wants.
+    """
+    assert mc._api.exec_body("dir", 30, cwd=r"C:\build")["cwd"] == r"C:\build"
+    assert mc._api.exec_body("dir", 30, cwd="C:/build")["cwd"] == "C:/build"
+    assert mc._api.files_params(r"\\share\out.zip") == {"path": r"\\share\out.zip"}
+    # One backslash is drive-relative, not a UNC share, and the daemon refuses
+    # it with the rest of the relative paths.
+    with pytest.raises(ValueError, match="must be absolute"):
+        mc._api.files_params(r"\share\out.zip")
+    with pytest.raises(ValueError, match="must be absolute"):
+        mc._api.files_params("C:")
 
 
 @respx.mock
@@ -1208,3 +1229,16 @@ def test_the_idle_window_is_read_back_and_cleared_with_null(client: mc.Client) -
     # Absent, not zero: the host's own sweep is a property of the host and is
     # deliberately not reported in its place.
     assert c.idle_suspend_min is None
+
+
+def test_zero_pins_a_computer_against_the_idle_sweep() -> None:
+    """0 is the platform's "never suspend", not a malformed duration.
+
+    It is what a long job started inside the guest needs — nothing reaches the
+    host from outside while it runs, so it is idle by every measure the host can
+    take. Refusing 0 here would leave no way to say it, and the obvious
+    substitute, None, asks for the opposite: follow the host's own window.
+    """
+    assert mc._api.idle_suspend_body(0) == {"idle_suspend_min": 0}
+    with pytest.raises(ValueError, match="cannot be negative"):
+        mc._api.idle_suspend_body(-1)

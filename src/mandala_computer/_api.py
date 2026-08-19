@@ -66,6 +66,32 @@ def files(computer_id: str) -> str:
     return f"computers/{computer_id}/files"
 
 
+def is_absolute_guest_path(path: str) -> bool:
+    r"""Whether a guest would read this path as absolute, on either family.
+
+    Nothing here knows which OS the guest runs — a ``Computer`` does not say —
+    and the two families disagree about what absolute means. A leading ``/`` is
+    absolute on Linux and *drive-relative* on Windows, where the daemon's own
+    ``validGuestPath`` refuses it and wants ``C:\...`` or a ``\\`` UNC share. So
+    both spellings pass here and the server, which does know which guest it is
+    talking to, keeps the final say.
+
+    What this still catches without a round trip is the mistake worth catching:
+    a bare relative path, which has no working directory to be relative to on
+    either family.
+    """
+    if path.startswith(("/", "\\\\")):
+        return True
+    # Drive-qualified: C:\ or C:/, both of which the daemon accepts.
+    return (
+        len(path) >= 3
+        and path[0].isascii()
+        and path[0].isalpha()
+        and path[1] == ":"
+        and path[2] in "\\/"
+    )
+
+
 def files_params(path: str) -> dict[str, str]:
     """The query naming which guest file, checked before the round trip.
 
@@ -73,7 +99,7 @@ def files_params(path: str) -> dict[str, str]:
     relative path has no working directory to be relative to. The daemon
     refuses it too, but this mistake is knowable without the round trip.
     """
-    if not path.startswith("/"):
+    if not is_absolute_guest_path(path):
         raise ValueError(f"guest path must be absolute: {path!r}")
     return {"path": path}
 
@@ -265,7 +291,7 @@ def exec_body(
     if background:
         body["background"] = True
     if cwd is not None:
-        if not cwd.startswith("/"):
+        if not is_absolute_guest_path(cwd):
             raise ValueError(f"cwd must be absolute: {cwd!r}")
         body["cwd"] = cwd
     if env:
@@ -311,7 +337,7 @@ def snapshot_body(memory: bool, name: str | None = None) -> dict[str, Any]:
     return body
 
 
-# The seven things the window manager will do to one window. Checked here rather
+# The eight things the window manager will do to one window. Checked here rather
 # than left to the server, because a typo'd action is knowable without the round
 # trip and the error naming the set is more use than a 400 naming the field.
 WINDOW_ACTIONS = (
@@ -389,11 +415,21 @@ def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
     host is sweeping at. Dropped, it would mean "change nothing", which is the
     opposite request.
 
+    ``0`` is the third state and the only one that is not a duration: it pins
+    the computer against the sweep entirely. That is what a long job started
+    inside the guest needs — a build or a batch run sends nothing from outside,
+    so it is idle by every measure the host can take, and it would otherwise be
+    suspended under its own feet. So ``0`` and ``None`` are opposites here
+    rather than two spellings of "no setting", and only a negative is refused.
+
     The platform requires this to be the only field in the PATCH, which is why
     it has a method of its own rather than a keyword on ``rename``.
     """
-    if minutes is not None and minutes <= 0:
-        raise ValueError("idle_suspend_min must be positive, or None to clear the override")
+    if minutes is not None and minutes < 0:
+        raise ValueError(
+            f"idle_suspend_min cannot be negative: {minutes!r}. Send 0 to stop this computer "
+            "being suspended for idleness, or None to follow its host's own window"
+        )
     return {"idle_suspend_min": minutes}
 
 

@@ -567,11 +567,20 @@ Everything derives from `MandalaError`.
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
 | `ConflictError` | 409 — right request, wrong moment; retry |
-| `UnavailableError` | 503 — a listing would have been short; see [Partial listings](#partial-listings) |
+| `UnavailableError` | 503 — a hypervisor could not be reached; retry |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up |
 
 `PlanLimitError`'s message names the limit that was hit.
+
+`UnavailableError` is not only about listings. Every route on this surface ends
+at a hypervisor, so any call naming a computer on a host that cannot be reached
+raises it — `start()`, `exec()`, `screenshot()` — rather than a `NotFoundError`,
+because the computer has not gone anywhere. Creates and resizes raise it when
+the fan-out that checks your plan comes back short, and so does a host with no
+room left for another guest. Retrying is the fix; `allow_partial=True` applies
+only to the two listings, which are the one case where a partial answer exists
+(see [Partial listings](#partial-listings)).
 
 `ConflictError` is the one worth catching separately, because it is the only one
 that clears itself: something is in flight that the operation cannot run
@@ -656,6 +665,11 @@ out next door, or wherever `MANDALA_PLATFORM_REPO` points, and says so and exits
 0 when it is not — the ordinary case in CI here, and failing over it would make
 this a check people learn to ignore.
 
+The suite runs it too, and that is the part that matters: a script somebody has
+to remember is the same hole one step further back. `pytest` skips it where the
+platform is not checked out and fails on drift where it is, which covers every
+machine this mirror actually gets edited on.
+
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients.
 
@@ -684,7 +698,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest
 .venv/bin/ruff check .
 .venv/bin/mypy
-.venv/bin/python scripts/check_surface.py   # needs the platform repo checked out
+.venv/bin/python scripts/check_surface.py   # the drift check on its own, with output
 ```
 
 ## License

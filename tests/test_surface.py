@@ -15,10 +15,15 @@ comparison whenever the platform repo happens to be checked out, and its absence
 is how three routes — background exec and the snapshot holdings — landed
 upstream and stayed invisible here: the two tests below both stayed green,
 because "every call lands on an allowlisted route" is trivially true of a
-mirror that never learned the route exists.
+mirror that never learned the route exists. That script is run from this file,
+rather than left as a command in the README, because a check somebody has to
+remember is the same hole one step further back.
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -365,6 +370,32 @@ def test_pattern_for_treats_ids_as_ids() -> None:
     assert pattern_for("/computers/vm-1/snapshots") == "computers/:id/snapshots"
     # A computer whose id looks like a route segment is still an id.
     assert pattern_for("/computers/audit") == "computers/:id"
+
+
+def test_the_mirror_is_in_step_with_the_platform() -> None:
+    """The drift check, run by the suite rather than only by hand.
+
+    `scripts/check_surface.py` is what compares ALLOWED against the platform's
+    own V1_ROUTES, and until this test existed nothing ran it — it was a line in
+    the README, which is a thing somebody has to remember. That is the exact
+    failure it was written for: the routes it would have caught went missing
+    because no one thought to look.
+
+    Skipped rather than failed where the platform is not checked out, which is
+    the ordinary case on this repository and in its CI. Where it earns its keep
+    is on a machine with both — which is every machine this file gets edited on.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import check_surface
+
+    platform = check_surface.platform_repo()
+    if platform is None:
+        pytest.skip("platform repo not checked out; set MANDALA_PLATFORM_REPO to compare")
+
+    # Compared as sets rather than through main(), so a drift prints as the
+    # routes that differ instead of as a non-zero exit code.
+    upstream = check_surface.table((platform / check_surface.SURFACE).read_text(), "V1_ROUTES")
+    assert upstream == ALLOWED
 
 
 def test_allowlist_excludes_the_daemons_internal_routes() -> None:

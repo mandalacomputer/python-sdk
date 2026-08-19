@@ -85,19 +85,36 @@ class ConflictError(APIError):
 
 
 class UnavailableError(APIError):
-    """A listing would have been short, and nothing said you would accept one (503).
+    """Something between the request and a hypervisor could not be reached (503).
 
-    ``GET /computers`` and ``GET /snapshots`` fan out across every hypervisor
-    holding something of yours, so one that cannot be reached makes the answer
-    incomplete. The platform fails closed about that rather than answering a
-    short 200: a short list is not a smaller truth — it reads exactly like the
-    missing rows were deleted, and the obvious next thing a script does with a
-    computer that has disappeared is tidy up after it.
+    Universal on this surface rather than particular to listings, because every
+    route on it ends at a hypervisor. Four things raise it:
 
-    So this is the platform declining to let that happen silently. Retry — these
-    clear on their own — or pass ``allow_partial=True`` to take the short answer
-    knowingly, which returns a :class:`~mandala_computer.Listing` whose
-    :attr:`~mandala_computer.Listing.is_complete` is False.
+    - **A listing would have been short.** ``GET /computers`` and ``GET
+      /snapshots`` fan out across every hypervisor holding something of yours,
+      so one that cannot be reached makes the answer incomplete, and the
+      platform fails closed rather than answering a short 200. A short list is
+      not a smaller truth — it reads exactly like the missing rows were deleted,
+      and the obvious next thing a script does with a computer that has
+      disappeared is tidy up after it. Pass ``allow_partial=True`` to take the
+      short answer knowingly, which returns a
+      :class:`~mandala_computer.Listing` whose
+      :attr:`~mandala_computer.Listing.is_complete` is False.
+    - **The host holding one named computer is unreachable.** Every route that
+      names a computer answers this rather than a 404, on the same reasoning:
+      the computer has not gone anywhere. So ``start()``, ``exec()``,
+      ``screenshot()`` and the rest can all raise it, and none of them takes an
+      ``allow_partial``, because there is no partial version of them.
+    - **A create or a resize could not check the plan**, because the fan-out
+      that counts what you already hold came back short.
+    - **The host has no room for another guest**, which clears when something
+      on it stops.
+
+    None of these is a fault on the caller's side, which is why this is its own
+    class rather than a bare :class:`APIError`: the answer is to wait and try
+    again rather than to change the request. Unlike :class:`ConflictError`,
+    which is about something in flight on your own resources, this is about
+    something we have to clear.
     """
 
 
