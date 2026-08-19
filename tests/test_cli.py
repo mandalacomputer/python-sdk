@@ -200,6 +200,11 @@ def test_ssh_stopped_computer_says_start_it() -> None:
         ("C:notes.txt", "notes.txt"),  # drive-relative: the drive is not a name
         ("/trailing/slash/", "slash"),
         ("bare.txt", "bare.txt"),
+        # A Linux path is read by Linux rules: `:` and `\` are ordinary
+        # characters in a filename there, and the Windows reading renamed the
+        # file on the way to disk.
+        ("/tmp/a:b.txt", "a:b.txt"),
+        (r"/tmp/back\slash.txt", r"back\slash.txt"),
     ],
 )
 def test_guest_basename_understands_both_families(remote: str, want: str) -> None:
@@ -225,6 +230,26 @@ def test_scp_from_a_windows_guest_into_a_directory(tmp_path) -> None:
     assert _cli.main(["scp", r"win:C:\Users\me\notes.txt", str(tmp_path)]) == 0
     assert (tmp_path / "notes.txt").read_bytes() == b"payload"
     assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+
+
+@respx.mock
+def test_scp_into_a_windows_directory_appends_the_name(tmp_path) -> None:
+    r"""`C:\Users\me\` names a directory the way `/tmp/` does.
+
+    The trailing-separator rule was the local machine's: only `/` counted, so
+    a guest directory spelled the Windows way had the file's name never
+    appended, and the PUT went to a path ending in a separator.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "vm-9", "name": "win", "status": "running", "os": "windows"}]
+        )
+    )
+    put = respx.put(f"{BASE}/computers/vm-9/files").mock(return_value=httpx.Response(200, json={}))
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"payload")
+    assert _cli.main(["scp", str(src), r"win:C:\Users\me" + "\\"]) == 0
+    assert put.calls.last.request.url.params["path"] == r"C:\Users\me\notes.txt"
 
 
 # --- the terminal pump loses no output -------------------------------------

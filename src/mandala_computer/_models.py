@@ -484,7 +484,13 @@ class ExecResult:
     out_truncated: bool = False
     #: The same for stderr.
     err_truncated: bool = False
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    #: ``compare=False``, unlike the other models here. An ``ExecResult`` is a
+    #: value, not a handle: callers assert on one against a result they built
+    #: themselves, and put them in sets. Comparing the unknown fields the
+    #: server happened to send would make ``res == ExecResult(0, "hi", "",
+    #: False)`` false for a command that did exactly that, and comparing a
+    #: ``dict`` at all makes the frozen dataclass unhashable.
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:

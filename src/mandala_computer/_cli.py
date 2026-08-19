@@ -29,6 +29,7 @@ import threading
 from contextlib import suppress
 from typing import TYPE_CHECKING, NoReturn
 
+from ._api import looks_windows_guest_path
 from ._computer import Computer
 from ._exceptions import MandalaError
 
@@ -217,14 +218,23 @@ def _remote_side(arg: str) -> tuple[str, str] | None:
 
 
 def _guest_basename(path: str) -> str:
-    r"""The last component of a guest path, on either OS family.
+    r"""The last component of a guest path, on the family the path is spelled in.
 
     Not :func:`os.path.basename`, which is the *local* machine's rule: on a
     POSIX host it does not know ``\`` is a separator, so a Windows guest's
     ``C:\Users\me\notes.txt`` comes back whole and lands in a local file
     named exactly that — one file with backslashes in its name, in the
     directory the user asked us to write into.
+
+    But the Windows rules are just as wrong applied the other way: ``\`` and
+    ``:`` are ordinary characters in a Linux filename, so reading every path as
+    possibly-Windows would write ``/tmp/a:b.txt`` to a local file called
+    ``b.txt`` and ``/tmp/back\slash.txt`` to one called ``slash.txt`` — the
+    same silent wrong-filename outcome, on the far more common guest. So the
+    path's own spelling picks the rule.
     """
+    if not looks_windows_guest_path(path):
+        return path.rstrip("/").rsplit("/", 1)[-1]
     tail = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     # `C:notes.txt` is drive-relative on Windows: the drive is not part of the
     # name, and the daemon's own path rules accept the spelling.
@@ -255,7 +265,10 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     target, remote_path = dst
     if not remote_path:
         _die(f"say where in the guest: {target}:/absolute/path")
-    if remote_path.endswith("/"):
+    # The guest's separator, not this machine's: `win:C:\Users\me\` names a
+    # directory just as `box:/tmp/` does, and appending to a path that already
+    # ends in a separator joins with whichever one the caller wrote.
+    if remote_path.endswith(("/", "\\")):
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
         data = f.read()

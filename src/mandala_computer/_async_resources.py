@@ -10,7 +10,6 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._exceptions import MandalaError
 from ._models import Listing, Size, Snapshot, Template
 from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
 
@@ -112,7 +111,8 @@ class AsyncComputers:
             # caller's exception.
             try:
                 await computer.delete()
-            except MandalaError as cleanup_failed:
+            except Exception as cleanup_failed:  # noqa: BLE001
+                # See the sync half: every failure, transport errors included.
                 warn_cleanup_failed(computer.id, cleanup_failed)
             raise
         else:

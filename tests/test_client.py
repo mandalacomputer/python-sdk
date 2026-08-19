@@ -1266,6 +1266,34 @@ def test_ids_are_percent_encoded_into_the_path() -> None:
     assert mc._api.computer("vm-1a2b3c4d5e6f") == "computers/vm-1a2b3c4d5e6f"
 
 
+def test_a_dot_only_id_is_refused_rather_than_encoded() -> None:
+    """Encoding cannot save `..` — only refusing it can.
+
+    `quote` leaves a dot alone whatever `safe` says, and the dot-segment
+    removal in RFC 3986 is applied by the client to the assembled URL. So
+    `get("..")` addressed /api/v1 itself, and a computer whose id was `..`
+    turned that computer's /snapshots into the account's whole snapshot list —
+    which is a bad thing to hand a purge loop. An empty id does the same to the
+    collection route, and then builds a Computer over a list payload.
+    """
+    for bad in ("", ".", "..", "...."):
+        with pytest.raises(ValueError, match="empty or all dots"):
+            mc._api.computer(bad)
+        with pytest.raises(ValueError, match="empty or all dots"):
+            mc._api.snapshot(bad)
+    # A dot inside a real id is an ordinary character and stays one.
+    assert mc._api.computer("vm-1.2") == "computers/vm-1.2"
+
+
+@respx.mock
+def test_a_dot_only_id_never_reaches_the_wire(client: mc.Client) -> None:
+    route = respx.get(url__startswith=BASE).mock(httpx.Response(200, json=COMPUTER))
+    for bad in ("..", ""):
+        with pytest.raises(ValueError):
+            client.computers.get(bad)
+    assert not route.called, "the request that must not happen is the whole point"
+
+
 @respx.mock
 def test_a_hostile_id_cannot_escape_the_api_prefix(client: mc.Client) -> None:
     route = respx.get(url__startswith=BASE).mock(httpx.Response(200, json=COMPUTER))
@@ -1463,3 +1491,40 @@ def test_a_failing_ephemeral_cleanup_still_raises_on_a_clean_exit(client: mc.Cli
     respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(409, json={"error": "in flight"}))
     with pytest.raises(mc.ConflictError), client.computers.ephemeral():
         pass
+
+
+@respx.mock
+def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
+    client: mc.Client,
+) -> None:
+    """Not every failed delete is a MandalaError.
+
+    The transport does not wrap httpx, so a connection reset on the cleanup
+    request arrives as itself — and a handler that caught only MandalaError let
+    it past, displacing the caller's exception exactly the way the 409 used to.
+    A network blip during teardown is at least as likely as the 409.
+    """
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(side_effect=httpx.ConnectError("reset"))
+
+    def caller_raises() -> None:
+        with client.computers.ephemeral():
+            raise ZeroDivisionError("the caller's own bug")
+
+    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+        caller_raises()
+
+
+def test_exec_result_equality_ignores_the_raw_payload() -> None:
+    """An ExecResult is a value: callers assert on one and put them in sets.
+
+    `raw` carries whatever else the server sent, so comparing it made a result
+    unequal to the result a caller built by hand, and comparing a dict at all
+    made the frozen dataclass unhashable.
+    """
+    got = mc.ExecResult.from_api(
+        {"exit_code": 0, "stdout": "hi", "stderr": "", "timed_out": False, "unknown": 1}
+    )
+    assert got == mc.ExecResult(0, "hi", "", False)
+    assert len({got, mc.ExecResult(0, "hi", "", False)}) == 1
+    assert got.raw["unknown"] == 1

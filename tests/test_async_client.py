@@ -350,6 +350,7 @@ async def test_a_failing_ephemeral_cleanup_keeps_the_original_error(
     respx.delete(f"{BASE}/computers/vm-1").mock(
         httpx.Response(409, json={"error": "a snapshot is being taken"})
     )
+
     async def caller_raises() -> None:
         async with client.computers.ephemeral():
             raise ZeroDivisionError("the caller's own bug")
@@ -366,4 +367,21 @@ async def test_ephemeral_still_deletes_on_the_ordinary_path(client: mc.AsyncClie
     async with client.computers.ephemeral() as c:
         assert c.id == "vm-1"
     assert route.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half of the same rule: a transport error is a failed cleanup too."""
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(side_effect=httpx.ConnectError("reset"))
+
+    async def caller_raises() -> None:
+        async with client.computers.ephemeral():
+            raise ZeroDivisionError("the caller's own bug")
+
+    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+        await caller_raises()
     await client.aclose()

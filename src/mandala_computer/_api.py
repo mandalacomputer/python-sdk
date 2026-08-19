@@ -28,11 +28,21 @@ def seg(value: str) -> str:
     ids are minted by the platform in a known alphabet, so in the ordinary case
     this changes nothing; but ``get()`` takes whatever string it is given, and
     an id is the one part of these URLs that does not come from this file. An
-    unescaped ``/`` or ``..`` would not merely 404 — it would re-point the
-    request at a route nobody meant, with the account's bearer token on it, and
-    a ``?`` would put query keys on a request whose own parameters are what
-    interlocks like the snapshot-purge fingerprint are carried in.
+    unescaped ``/`` would not merely 404 — it would re-point the request at a
+    route nobody meant, with the account's bearer token on it, and a ``?``
+    would put query keys on a request whose own parameters are what interlocks
+    like the snapshot-purge fingerprint are carried in.
+
+    Encoding cannot answer ``.`` and ``..``: ``quote`` leaves a dot alone
+    whatever ``safe`` says, and the dot-segment removal in RFC 3986 is applied
+    by the client to the assembled URL, so ``get("..")`` would climb a level
+    and address ``/api/v1`` itself — and an id of ``..`` would turn one
+    computer's ``/snapshots`` into the account's whole snapshot list, which is
+    a bad thing to hand a purge loop. An empty id does the same to the
+    collection route. Neither is a real id, so both are refused here.
     """
+    if not value.strip("."):
+        raise ValueError(f"id must not be empty or all dots: {value!r}")
     return quote(value, safe="")
 
 
@@ -105,6 +115,25 @@ def is_absolute_guest_path(path: str) -> bool:
         and path[1] == ":"
         and path[2] in "\\/"
     )
+
+
+def looks_windows_guest_path(path: str) -> bool:
+    r"""Whether the path is spelled the way only a Windows guest spells it.
+
+    Weaker than :func:`is_absolute_guest_path` on purpose: this asks which
+    *family* a path belongs to, not whether it is absolute, so the
+    drive-relative ``C:notes.txt`` counts here and does not there.
+
+    What it is for is the rules that must not be applied to the other family. A
+    ``\`` separates nothing on Linux and a ``:`` is an ordinary character in a
+    Linux filename, so treating every path as possibly-Windows quietly renames
+    ``/tmp/a:b.txt`` to ``b.txt``. A leading ``/`` says Linux; a drive or a UNC
+    prefix says Windows; a bare relative name says neither, and is left to the
+    permissive reading, where the two families agree anyway.
+    """
+    if path.startswith("\\\\"):  # UNC share
+        return True
+    return len(path) >= 2 and path[0].isascii() and path[0].isalpha() and path[1] == ":"
 
 
 def files_params(path: str) -> dict[str, str]:

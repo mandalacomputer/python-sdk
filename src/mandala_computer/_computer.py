@@ -557,7 +557,7 @@ class Computer(ComputerFields):
         runs in session 0 and replies well before anyone has logged in. When you
         need the desktop rather than the machine, poll :meth:`screenshot`.
 
-    What it does not wait through is a refusal that will never clear: a revoked
+        What it does not wait through is a refusal that will never clear: a revoked
         key, a computer that is not there, an account that is not allowed, a
         plan that does not cover this. Those are raised at once. Waiting on one
         of them costs the full timeout and then reports "the guest did not

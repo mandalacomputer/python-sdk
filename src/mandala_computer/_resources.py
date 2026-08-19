@@ -11,7 +11,6 @@ from typing import Any
 from . import _api
 from ._client import Transport
 from ._computer import Computer
-from ._exceptions import MandalaError
 from ._models import Listing, Size, Snapshot, Template
 
 __all__ = ["Computers", "Sizes", "Snapshots", "Templates"]
@@ -130,7 +129,14 @@ class Computers:
             # raised, which says it without taking the exception's place.
             try:
                 computer.delete()
-            except MandalaError as cleanup_failed:
+            except Exception as cleanup_failed:  # noqa: BLE001
+                # Every failure, not just MandalaError: the transport does not
+                # wrap httpx, so a connection reset or a read timeout on this
+                # one request arrives as itself, and a cleanup that raised
+                # `ConnectError` past this handler would replace the caller's
+                # exception exactly the way a raised `ConflictError` would.
+                # Nothing here is worth more than the exception already going
+                # out, so nothing here is allowed to displace it.
                 warn_cleanup_failed(computer.id, cleanup_failed)
             raise
         else:
@@ -139,7 +145,7 @@ class Computers:
     ephemeral.__doc__ = EPHEMERAL_DOC
 
 
-def warn_cleanup_failed(computer_id: str, error: MandalaError) -> None:
+def warn_cleanup_failed(computer_id: str, error: Exception) -> None:
     """Report an ``ephemeral`` cleanup that did not happen, without raising.
 
     Shared by both halves. This runs only while another exception is already on
