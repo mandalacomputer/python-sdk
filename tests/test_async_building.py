@@ -74,7 +74,7 @@ async def test_wait_until_built_clamps_its_last_sleep(
     client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
-    now = iter((0.0, 0.75))
+    now = iter((0.0, 0.75, 0.75))
     sleeps: list[float] = []
 
     async def capture_sleep(seconds: float) -> None:
@@ -84,6 +84,16 @@ async def test_wait_until_built_clamps_its_last_sleep(
     monkeypatch.setattr(mc._async_computer, "asyncio", SimpleNamespace(sleep=capture_sleep))
     await mc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=1, poll=5)
     assert sleeps == [0.25]
+    await client.aclose()
+
+
+@respx.mock
+async def test_wait_until_built_caps_refresh_to_its_remaining_budget(
+    client: mc.AsyncClient,
+) -> None:
+    route = respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
+    await mc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=2, poll=0)
+    assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
     await client.aclose()
 
 

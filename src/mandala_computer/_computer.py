@@ -474,7 +474,13 @@ class Computer(ComputerFields):
         Also how a computer from :meth:`Computers.list` acquires a :attr:`vnc`
         connect surface, which the list deliberately omits.
         """
-        self._data = _api.computer_payload(self._t.json_object("GET", _api.computer(self.id)))
+        return self._refresh()
+
+    def _refresh(self, *, timeout_cap: float | None = None) -> Computer:
+        """Refresh with an optional cap used by deadline-bound wait helpers."""
+        self._data = _api.computer_payload(
+            self._t.json_object("GET", _api.computer(self.id), timeout_cap=timeout_cap)
+        )
         return self
 
     def start(self) -> Computer:
@@ -677,7 +683,13 @@ class Computer(ComputerFields):
                     "(it has not stopped; only this wait has)"
                 )
             time.sleep(min(poll, remaining))
-            self.refresh()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self.id} was still building after {timeout:g}s "
+                    "(it has not stopped; only this wait has)"
+                )
+            self._refresh(timeout_cap=remaining)
 
     def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> Computer:
         """Block until the machine is running.
@@ -692,7 +704,10 @@ class Computer(ComputerFields):
         """
         deadline = time.monotonic() + timeout
         while True:
-            self.refresh()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
+            self._refresh(timeout_cap=remaining)
             if self.status == "running":
                 return self
             # A computer with no disk will never start on its own, and waiting
@@ -761,16 +776,23 @@ class Computer(ComputerFields):
             except _FATAL_WHILE_WAITING:
                 raise
             except MandalaError:
-                # A clone is the one handle that can become permanently unusable
-                # while this wait is in flight. Refresh only that state; doing it
-                # for an ordinary boot would double every readiness poll.
-                if self.is_building:
-                    self.refresh()
-                    if self.build_failed:
-                        raise MandalaError(
-                            f"{self.id} could not be built: "
-                            f"{self.build_error or 'the disk copy failed'}"
-                        )
+                # A failed probe may mean that the cached lifecycle state is
+                # stale. Re-read it before deciding the failure is transient.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
+                try:
+                    self._refresh(timeout_cap=remaining)
+                except _FATAL_WHILE_WAITING:
+                    raise
+                except MandalaError:
+                    # A transient failure on the state read is no more final
+                    # than one on the probe; retry while the budget remains.
+                    pass
+                else:
+                    failure = self._guest_wait_failure()
+                    if failure is not None:
+                        raise failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
@@ -1355,13 +1377,20 @@ class Computer(ComputerFields):
         """
         result: AgentResult | None = None
         failure: AgentFailed | None = None
-        for event in self.agent_stream(
-            prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
-        ):
-            if isinstance(event, AgentDone):
-                result = event.result
-            elif isinstance(event, AgentFailed):
-                failure = event
+        try:
+            for event in self.agent_stream(
+                prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
+            ):
+                if isinstance(event, AgentDone):
+                    result = event.result
+                elif isinstance(event, AgentFailed):
+                    failure = event
+        except TimeoutError:
+            # The stream deliberately remains open after done so a trailing
+            # failure can override it. Silence after done is not itself a
+            # failure, however, and must not discard the result already sent.
+            if result is None:
+                raise
         return _agent_outcome(result, failure)
 
     def agent_once(
