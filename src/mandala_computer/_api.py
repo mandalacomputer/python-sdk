@@ -697,7 +697,7 @@ def agent_body(
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if max_steps is not None:
-        if not isinstance(max_steps, int):
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
             raise ValueError("max_steps must be a whole number")
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
