@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shutil
 import signal
 import sys
@@ -42,6 +43,10 @@ if TYPE_CHECKING:
 # frame is not the terminal protocol.
 _MAX_FRAME = 1 << 22
 
+# Captured once so path parsing and platform guards can be tested without
+# mutating the process-wide ``os`` module.
+LOCAL_WINDOWS = os.name == "nt"
+
 
 def _die(message: str) -> NoReturn:
     raise SystemExit(f"mandala: {message}")
@@ -58,7 +63,10 @@ def _write_all(fd: int, data: bytes) -> None:
     """
     view = memoryview(data)
     while view:
-        view = view[os.write(fd, view) :]
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError("write made no progress")
+        view = view[written:]
 
 
 def _client() -> Client:
@@ -91,6 +99,8 @@ def _resolve(client: Client, target: str) -> Computer:
 
 
 def _cmd_ssh(args: argparse.Namespace) -> int:
+    if LOCAL_WINDOWS:
+        _die("interactive ssh requires a Unix-like local terminal")
     c = _resolve(_client(), args.target).refresh()
     vnc = c.vnc
     if vnc is None or not vnc.terminal_url:
@@ -108,7 +118,7 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
 
 
 def _connect(url: str) -> ClientConnection:
-    from websockets.exceptions import InvalidStatus
+    from websockets.exceptions import InvalidStatus, WebSocketException
     from websockets.sync.client import connect
 
     try:
@@ -126,6 +136,8 @@ def _connect(url: str) -> ClientConnection:
         _die(f"terminal refused: HTTP {status}")
     except OSError as e:
         _die(f"could not reach the terminal: {e}")
+    except WebSocketException as e:
+        _die(f"could not open the terminal: {e}")
 
 
 def _exit_code(message: str) -> int | None:
@@ -162,27 +174,42 @@ def _interact(url: str) -> int:
     control — resize out, exit in. The local TTY goes raw so every keystroke
     (including Ctrl-C) belongs to the remote shell.
     """
-    from websockets.exceptions import ConnectionClosed
+    from websockets.exceptions import ConnectionClosed, WebSocketException
 
     ws = _connect(url)
     stdin = sys.stdin.fileno()
     stdout = sys.stdout.fileno()
     closed = threading.Event()
+    resize = object()
+    stop_sender = object()
+    outbound: queue.SimpleQueue[bytes | str | object] = queue.SimpleQueue()
 
     def send_size(*_sig: object) -> None:
-        cols, rows = shutil.get_terminal_size()
-        # Racing a close is fine; the close is the news, not this.
-        with suppress(ConnectionClosed, OSError):
-            ws.send(json.dumps({"type": "resize", "cols": cols, "rows": rows}))
+        # A Python signal handler must not touch the socket, and websockets
+        # forbids overlapping sends. The sender owns both the terminal query
+        # and every outbound frame; this handler does nothing but enqueue.
+        outbound.put(resize)
 
     def pump_stdin() -> None:
-        # The socket closing under us is fine; the main loop reports it.
-        with suppress(ConnectionClosed, OSError):
+        with suppress(OSError):
             while not closed.is_set():
                 data = os.read(stdin, 4096)
                 if not data:
                     return  # piped stdin ran dry; the shell decides what's next
-                ws.send(data)
+                outbound.put(data)
+
+    def pump_outbound() -> None:
+        # The socket closing under us is fine; the main loop reports it.
+        with suppress(ConnectionClosed, OSError, WebSocketException):
+            while not closed.is_set():
+                message = outbound.get()
+                if message is stop_sender:
+                    return
+                if message is resize:
+                    cols, rows = shutil.get_terminal_size()
+                    message = json.dumps({"type": "resize", "cols": cols, "rows": rows})
+                assert isinstance(message, (bytes, str))
+                ws.send(message)
 
     saved_tty = None
     if sys.stdin.isatty():
@@ -197,6 +224,7 @@ def _interact(url: str) -> int:
 
     exit_code: int | None = None
     try:
+        threading.Thread(target=pump_outbound, daemon=True).start()
         threading.Thread(target=pump_stdin, daemon=True).start()
         while True:
             message = ws.recv()
@@ -206,18 +234,23 @@ def _interact(url: str) -> int:
             code = _exit_code(message)
             if code is not None:
                 exit_code = code
+                break
     except ConnectionClosed:
         pass
+    except WebSocketException as e:
+        _die(f"terminal connection failed: {e}")
     except KeyboardInterrupt:
         # Only reachable with a non-tty stdin; raw mode sends ^C to the guest.
         exit_code = 130
     finally:
         closed.set()
+        outbound.put(stop_sender)
         if saved_tty is not None:
             import termios
 
             termios.tcsetattr(stdin, termios.TCSADRAIN, saved_tty)
-        ws.close()
+        with suppress(ConnectionClosed, OSError, WebSocketException):
+            ws.close()
     if exit_code is None:
         # The link dropped without the shell ending: the session is still
         # alive server-side, and saying so is what makes that a feature.
@@ -237,6 +270,8 @@ def _remote_side(arg: str) -> tuple[str, str] | None:
     """
     head, sep, tail = arg.partition(":")
     if not sep or not head or "/" in head:
+        return None
+    if LOCAL_WINDOWS and len(head) == 1 and head.isascii() and head.isalpha():
         return None
     return head, tail
 
