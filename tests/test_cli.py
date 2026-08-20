@@ -100,9 +100,20 @@ def test_resolve_does_not_call_an_empty_partial_listing_an_empty_account() -> No
 
 
 @respx.mock
-def test_scp_upload_puts_bytes(tmp_path) -> None:
+def test_scp_upload_puts_bytes(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
     put = respx.put(f"{BASE}/computers/vm-1/files").mock(return_value=httpx.Response(200))
+    client = _cli._client()
+    closed = False
+    original_close = client.close
+
+    def close() -> None:
+        nonlocal closed
+        closed = True
+        original_close()
+
+    monkeypatch.setattr(client, "close", close)
+    monkeypatch.setattr(_cli, "_client", lambda: client)
     src = tmp_path / "secret.env"
     src.write_bytes(b"TOKEN=hunter2\n")
 
@@ -110,6 +121,7 @@ def test_scp_upload_puts_bytes(tmp_path) -> None:
     request = put.calls.last.request
     assert request.url.params["path"] == "/home/user/.env"
     assert request.content == b"TOKEN=hunter2\n"
+    assert closed
 
 
 @respx.mock
@@ -211,6 +223,45 @@ def test_ssh_stopped_computer_says_start_it() -> None:
     _computer({"status": "stopped", "os": "linux"})
     with pytest.raises(SystemExit, match="start it"):
         _cli.main(["ssh", "dev"])
+
+
+@respx.mock
+def test_ssh_closes_the_api_client_before_interacting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _computer(
+        {
+            "status": "running",
+            "os": "linux",
+            "vnc": {
+                "url": "wss://control.test",
+                "view_url": "wss://view.test",
+                "token": "control",
+                "view_token": "view",
+                "embed_url": "https://embed.test",
+                "terminal_url": "wss://terminal.test",
+            },
+        }
+    )
+    client = _cli._client()
+    closed = False
+    original_close = client.close
+
+    def close() -> None:
+        nonlocal closed
+        closed = True
+        original_close()
+
+    monkeypatch.setattr(client, "close", close)
+    monkeypatch.setattr(_cli, "_client", lambda: client)
+
+    def interact(url: str) -> int:
+        assert closed
+        assert url == "wss://terminal.test"
+        return 7
+
+    monkeypatch.setattr(_cli, "_interact", interact)
+    assert _cli.main(["ssh", "dev"]) == 7
 
 
 def test_ssh_on_a_local_windows_terminal_dies_before_connecting(

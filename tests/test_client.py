@@ -97,6 +97,11 @@ def test_clone_refuses_an_empty_optional_name_before_the_request(client: mc.Clie
         client.snapshots.clone("snap-1", name=" \t")
 
 
+def test_snapshot_refuses_an_empty_optional_name_before_the_request(client: mc.Client) -> None:
+    with pytest.raises(ValueError, match="name must not be empty"):
+        mc.Computer(client._t, COMPUTER).snapshot(name=" \t")
+
+
 @respx.mock
 def test_sizes_list(client: mc.Client) -> None:
     respx.get(f"{BASE}/sizes").mock(
@@ -242,6 +247,12 @@ def test_screenshot_width_becomes_query_param(client: mc.Client) -> None:
     assert route.calls.last.request.url.params["w"] == "320"
 
 
+@pytest.mark.parametrize("width", [0, -1])
+def test_screenshot_refuses_a_non_positive_width(client: mc.Client, width: int) -> None:
+    with pytest.raises(ValueError, match="width must be positive"):
+        mc.Computer(client._t, COMPUTER).screenshot(width=width)
+
+
 @respx.mock
 def test_screenshot_fresh_becomes_query_param(client: mc.Client) -> None:
     route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"png"))
@@ -338,6 +349,15 @@ def test_wait_until_running_times_out(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_wait_until_running_caps_refresh_to_its_remaining_budget(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "running"})
+    )
+    mc.Computer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
+    assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
+
+
+@respx.mock
 def test_wait_for_guest_ignores_errors_while_booting(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
@@ -347,7 +367,21 @@ def test_wait_for_guest_ignores_errors_while_booting(client: mc.Client) -> None:
             ),
         ]
     )
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     mc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
+
+
+@respx.mock
+def test_wait_for_guest_refreshes_a_stale_running_handle(client: mc.Client) -> None:
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(400, json={"error": "not running"})
+    )
+    refresh = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+    )
+    with pytest.raises(mc.MandalaError, match="stopped.+call start"):
+        mc.Computer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)
+    assert probe.call_count == 1 and refresh.call_count == 1
 
 
 @respx.mock
@@ -967,6 +1001,22 @@ def test_listing_transformations_preserve_partial_state() -> None:
         assert isinstance(transformed, mc.Listing)
         assert not transformed.is_complete
     assert (partial * 2).incomplete == 8
+
+
+def test_listing_in_place_growth_merges_partial_state() -> None:
+    partial = mc.Listing.of([1, 2], incomplete=3)
+
+    extended = mc.Listing.of([0])
+    extended.extend(partial)
+    assert extended == [0, 1, 2] and extended.incomplete == 3
+
+    combined = mc.Listing.of([0])
+    original = combined
+    combined += partial
+    assert combined is original and combined.incomplete == 3
+
+    partial.extend(partial)
+    assert partial == [1, 2, 1, 2] and partial.incomplete == 6
 
 
 @respx.mock

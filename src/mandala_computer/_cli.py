@@ -119,7 +119,8 @@ def _resolve(client: Client, target: str) -> Computer:
 def _cmd_ssh(args: argparse.Namespace) -> int:
     if LOCAL_WINDOWS:
         _die("interactive ssh requires a Unix-like local terminal")
-    c = _resolve(_client(), args.target).refresh()
+    with _client() as client:
+        c = _resolve(client, args.target).refresh()
     vnc = c.vnc
     if vnc is None or not vnc.terminal_url:
         if c.os == "windows":
@@ -420,7 +421,8 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         target, remote_path = src
         if not remote_path:
             _die(f"say which file: {target}:/absolute/path")
-        data = _resolve(_client(), target).read_file(remote_path)
+        with _client() as client:
+            data = _resolve(client, target).read_file(remote_path)
         local = args.dst
         if os.path.isdir(local):
             local = os.path.join(local, _guest_basename(remote_path))
@@ -446,7 +448,8 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         data = f.read(FILE_SIZE_LIMIT + 1)
     if len(data) > FILE_SIZE_LIMIT:
         _die(f"{args.src} exceeds the 64 MiB file-transfer limit")
-    _resolve(_client(), target).write_file(remote_path, data)
+    with _client() as client:
+        _resolve(client, target).write_file(remote_path, data)
     print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0
 
