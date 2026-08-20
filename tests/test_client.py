@@ -207,10 +207,20 @@ def test_scroll_rejects_a_non_positive_amount(client: mc.Client) -> None:
 
 @respx.mock
 def test_screenshot_returns_bytes(client: mc.Client) -> None:
-    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
         httpx.Response(200, content=b"\x89PNG\r\n", headers={"Content-Type": "image/png"})
     )
     assert mc.Computer(client._t, COMPUTER).screenshot().startswith(b"\x89PNG")
+    assert "image/png" in route.calls.last.request.headers["Accept"]
+
+
+@respx.mock
+def test_screenshot_refuses_a_json_success_body(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(200, json={"error": "sign in again"})
+    )
+    with pytest.raises(mc.MandalaError, match="not binary content"):
+        mc.Computer(client._t, COMPUTER).screenshot()
 
 
 @respx.mock
@@ -911,6 +921,11 @@ def test_listing_transformations_preserve_partial_state() -> None:
     assert combined.incomplete == 4
     assert not combined.is_complete
 
+    for transformed in ([0] + partial, partial * 2, 2 * partial, partial * 0):
+        assert isinstance(transformed, mc.Listing)
+        assert not transformed.is_complete
+    assert (partial * 2).incomplete == 8
+
 
 @respx.mock
 def test_a_short_listing_that_cannot_say_by_how_much_is_still_short(
@@ -1059,6 +1074,14 @@ def test_a_computer_with_neither_says_so_rather_than_inventing_one(client: mc.Cl
 
 
 @respx.mock
+def test_a_null_workspace_is_the_documented_empty_string(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "workspace_id": None})
+    )
+    assert client.computers.get("vm-1").workspace_id == ""
+
+
+@respx.mock
 def test_a_computers_snapshots_keep_the_rows_nobody_could_read(client: mc.Client) -> None:
     """Filtering by computer must not delete the markers saying it is short.
 
@@ -1143,6 +1166,13 @@ def test_a_quiet_server_is_not_reported_as_nothing_destroyed(client: mc.Client) 
     """None, not 0. This is the one irreversible call on the object."""
     respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
     assert _computer(client).delete(purge_snapshots=True, expect="fp-abc") is None
+
+
+@respx.mock
+def test_a_malformed_delete_count_is_an_sdk_error(client: mc.Client) -> None:
+    respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"snapshots_deleted": []}))
+    with pytest.raises(mc.MandalaError, match="invalid snapshots_deleted"):
+        _computer(client).delete()
 
 
 # --- background exec --------------------------------------------------------
@@ -1312,6 +1342,14 @@ def test_the_desktops_own_furniture_is_left_out_unless_asked_for(client: mc.Clie
     assert "include" not in route.calls.last.request.url.params
     c.windows(include_all=True)
     assert route.calls.last.request.url.params["include"] == "all"
+
+
+@respx.mock
+@pytest.mark.parametrize("rows", [{}, ["not a window"]])
+def test_windows_refuses_non_object_rows(client: mc.Client, rows: object) -> None:
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(httpx.Response(200, json={"windows": rows}))
+    with pytest.raises(mc.MandalaError, match="array of objects"):
+        _computer(client).windows()
 
 
 @respx.mock
@@ -1792,6 +1830,14 @@ def test_the_file_routes_get_a_budget_of_their_own(client: mc.Client) -> None:
     c.write_file("/tmp/a", b"hi")
     assert _budget(get)["read"] == mc._client.FILE_TIMEOUT
     assert _budget(put)["write"] == mc._client.FILE_TIMEOUT
+    assert get.calls.last.request.headers["Accept"] == "application/octet-stream"
+
+
+@respx.mock
+def test_read_file_refuses_an_html_success_body(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, html="<html>sign in</html>"))
+    with pytest.raises(mc.MandalaError, match="not binary content"):
+        _computer(client).read_file("/tmp/a")
 
 
 @respx.mock

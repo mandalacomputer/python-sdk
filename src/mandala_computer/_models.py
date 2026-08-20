@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from operator import index as integer_index
 from typing import Any, SupportsIndex, TypeVar, overload
 
 __all__ = [
@@ -87,6 +88,28 @@ class Listing(list[T]):
         if isinstance(other, Listing) and other.incomplete is not None:
             incomplete = other.incomplete if incomplete is None else incomplete + other.incomplete
         return Listing.of(super().__add__(other), incomplete)
+
+    def __radd__(self, other: list[Any], /) -> Listing[Any]:
+        """Preserve partial state when an ordinary list is on the left."""
+        incomplete = self.incomplete
+        if isinstance(other, Listing) and other.incomplete is not None:
+            incomplete = other.incomplete if incomplete is None else incomplete + other.incomplete
+        return Listing.of(list.__add__(other, self), incomplete)
+
+    def __mul__(self, value: SupportsIndex, /) -> Listing[T]:
+        """Repeat rows without losing (or understating) missing rows."""
+        count = integer_index(value)
+        incomplete = self.incomplete
+        if incomplete is not None:
+            # Like an empty slice, multiplying by zero must not turn a partial
+            # source into a confidently complete answer. Positive repetition,
+            # on the other hand, repeats both the present and missing rows.
+            incomplete *= max(count, 1)
+        return Listing.of(super().__mul__(count), incomplete)
+
+    def __rmul__(self, value: SupportsIndex, /) -> Listing[T]:
+        """The reflected spelling of :meth:`__mul__`."""
+        return self * value
 
     @classmethod
     def of(cls, items: list[T], incomplete: int | None = None) -> Listing[T]:
