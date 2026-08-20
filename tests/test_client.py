@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import json
 import shlex
+import time
 
 import httpx
 import pytest
@@ -1272,7 +1273,7 @@ def test_a_malformed_delete_count_is_an_sdk_error(client: mc.Client) -> None:
 
 @respx.mock
 def test_a_background_exec_returns_a_handle_and_no_deadline(client: mc.Client) -> None:
-    """timeout_s is omitted rather than sent and ignored.
+    """The wire field timeout_s is omitted rather than sent and ignored.
 
     The server does ignore it — not waiting is the whole request — but a payload
     carrying a deadline that means nothing is one somebody later reads as a
@@ -1299,14 +1300,14 @@ def test_a_foreground_exec_still_carries_its_deadline(client: mc.Client) -> None
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
     )
-    _computer(client).exec("true", timeout_s=5, env={"CI": "1"})
+    _computer(client).exec("true", timeout=5, env={"CI": "1"})
     body = json.loads(route.calls.last.request.content)
     assert body == {"command": "true", "timeout_s": 5, "env": {"CI": "1"}}
 
 
 def test_a_foreground_exec_needs_a_positive_deadline(client: mc.Client) -> None:
-    with pytest.raises(ValueError, match="timeout_s must be positive"):
-        mc.Computer(client._t, COMPUTER).exec("true", timeout_s=0)
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        mc.Computer(client._t, COMPUTER).exec("true", timeout=0)
 
 
 def test_a_relative_cwd_is_refused_before_the_request() -> None:
@@ -1893,21 +1894,24 @@ def test_widening_a_mixed_timeout_keeps_infinite_halves_and_widens_finite_ones()
 def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.Client) -> None:
     """The deadline the caller names is the one the transport honours.
 
-    The platform puts no ceiling on timeout_s and stretches its own deadline to
-    match, so a fixed 60-second client abandoned a 300-second command at 60 —
-    while the command carried on running in the guest with its output and its
-    exit code going nowhere.
+    The platform stretches its own deadline to match, so a fixed 60-second
+    client abandoned a 300-second command at 60 — while the command carried on
+    running in the guest with its output and its exit code going nowhere.
+
+    What this does NOT establish is that the command survives that long. A proxy
+    in front of the platform gives up at about two minutes whatever was asked
+    for; see test_a_proxy_giving_up_is_not_reported_as_a_bare_status.
     """
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
     )
     c = _computer(client)
 
-    c.exec("make", timeout_s=300)
+    c.exec("make", timeout=300)
     assert _budget(route)["read"] == 300 + mc._client.DEADLINE_SLACK
 
     # Under the client's own default it changes nothing. This only ever widens.
-    c.exec("true", timeout_s=5)
+    c.exec("true", timeout=5)
     assert _budget(route)["read"] == mc._client.DEFAULT_TIMEOUT
 
 
@@ -1956,7 +1960,7 @@ def test_a_client_of_your_own_is_never_shortened() -> None:
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
     )
     patient = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=600.0))
-    mc.Computer(patient._t, COMPUTER).exec("true", timeout_s=30)
+    mc.Computer(patient._t, COMPUTER).exec("true", timeout=30)
     assert _budget(route)["read"] == 600.0
 
 
@@ -1969,7 +1973,7 @@ def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.Client) -> No
     """
     respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=httpx.ReadTimeout("too slow"))
     with pytest.raises(mc.TimeoutError, match="did not answer") as caught:
-        mc.Computer(client._t, COMPUTER).exec("sleep 999", timeout_s=100)
+        mc.Computer(client._t, COMPUTER).exec("sleep 999", timeout=100)
     assert isinstance(caught.value, mc.MandalaError)
 
 
@@ -2012,3 +2016,296 @@ def test_set_schedule_reads_its_own_answer(client: mc.Client) -> None:
     assert c.set_schedule(enabled=True) == stored
     assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
+
+
+@respx.mock
+def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(client: mc.Client) -> None:
+    """524 is a hop in front of the platform, and says so.
+
+    Measured against app.mandala.computer on 2026-08-20: `sleep 110` with
+    timeout=230 returned normally at 110.6s, while `sleep 130` died at 125.2s
+    with timeout=300 and at 125.3s with timeout=3600 — a 12x difference in what
+    was asked for, and 0.1s in where it ended. Cloudflare content-negotiates that
+    error page, so a client asking for JSON (which every request here does) gets
+    an EMPTY body, which left `str(e)` reading "HTTP 524" and named nothing a
+    caller could act on.
+    """
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(524, content=b""))
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        _computer(client).exec("sleep 130", timeout=300)
+    assert e.value.status == 524
+    assert isinstance(e.value, mc.APIError)
+    # The three things the bare status did not say: whose ceiling it is, that
+    # the command outlived the request, and what to use instead.
+    assert "proxy" in str(e.value)
+    assert "outlived the request" in str(e.value)
+    assert "start_exec()" in str(e.value)
+
+
+@respx.mock
+def test_the_proxys_own_error_page_is_never_shown(client: mc.Client) -> None:
+    """An HTML body is discarded rather than truncated into the message.
+
+    Without the override this read as 500 characters of Cloudflare boilerplate —
+    the failure mode the empty-body case only looks better than. The override is
+    conditional on the platform not having named the failure itself, and an HTML
+    page never does, so this is the branch that still substitutes.
+    """
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(
+            524,
+            headers={"content-type": "text/html; charset=UTF-8"},
+            text="<!DOCTYPE html><html><body>error code: 524</body></html>",
+        )
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        _computer(client).exec("sleep 130", timeout=300)
+    assert "DOCTYPE" not in str(e.value)
+
+
+@respx.mock
+def test_an_ordinary_gateway_timeout_lands_in_the_same_place(client: mc.Client) -> None:
+    """504 and 524 differ only in which hop gave up first."""
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(504, content=b""))
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.get("vm-1")
+    assert e.value.status == 504
+
+
+@respx.mock
+def test_a_platform_that_named_the_failure_keeps_its_own_words(client: mc.Client) -> None:
+    """The substitution is for a body that said nothing, not for every 504.
+
+    A gateway status can also come from a hop that speaks this surface's JSON,
+    and "upstream unavailable before dispatch" is a more specific true thing
+    than the generic message. Overwriting it would be the client replacing the
+    platform with a guess.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(504, json={"error": "upstream unavailable before dispatch"})
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.get("vm-1")
+    assert str(e.value) == "upstream unavailable before dispatch"
+    # Still the class that says what a gateway timeout is; only the words differ.
+    assert e.value.status == 504
+
+
+@respx.mock
+def test_the_generic_message_does_not_promise_a_command_to_a_read(client: mc.Client) -> None:
+    """A GET started no command, so the message must not claim one is running.
+
+    The wording is shared by every route, and the exec advice is hedged
+    precisely so that a listing or a read is not told a confident falsehood
+    about work it never began.
+    """
+    respx.get(f"{BASE}/computers").mock(httpx.Response(524, content=b""))
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.list()
+    said = str(e.value)
+    assert "Nothing was cancelled" in said
+    assert "Most often" in said
+    # The sentence that would be false here is not stated unconditionally.
+    assert "whatever this request started is still running" not in said
+
+
+def test_an_in_band_failure_is_not_an_edge_that_gave_up() -> None:
+    """A status delivered ON a stream is proof no proxy abandoned it.
+
+    The agent loop reports its own failures as events inside a 200. A 504 from
+    there is the platform relaying a downstream timeout, not an edge that
+    stopped waiting — and a caller branching on the class to decide whether its
+    work survived would be answered wrongly.
+    """
+    err = mc._client.error_for_status(504, "the agent run failed: model provider timed out")
+    assert isinstance(err, mc.APIError)
+    assert not isinstance(err, mc.GatewayTimeoutError)
+    assert err.status == 504
+    # The statuses that do travel this way are unaffected.
+    assert isinstance(mc._client.error_for_status(401, "revoked"), mc.AuthenticationError)
+    assert isinstance(mc._client.error_for_status(409, "busy"), mc.ConflictError)
+
+
+@respx.mock
+def test_an_origin_never_reached_is_not_one_that_stopped_answering(client: mc.Client) -> None:
+    """Opposite implications, which is why they are two classes.
+
+    A 524 means the request arrived and its work carries on; a 522 means it
+    never arrived, so nothing was started and nothing outlives anything.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(522, content=b""))
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert e.value.status == 522
+    assert not isinstance(e.value, mc.GatewayTimeoutError)
+    assert "never sent" in str(e.value)
+    assert "clears on its own" in str(e.value)
+
+
+@respx.mock
+def test_a_certificate_that_will_not_agree_is_not_told_to_wait(client: mc.Client) -> None:
+    """525 and 526 fail identically on every retry, and get their own class.
+
+    Sharing one with the unreachable statuses is what let a ``wait_*`` helper
+    retry a certificate failure: the fatal tuple names classes, so there was no
+    way to say "this one, but not its neighbours".
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(526, content=b""))
+    with pytest.raises(mc.OriginTLSError) as e:
+        client.computers.get("vm-1")
+    assert not isinstance(e.value, mc.OriginUnreachableError)
+    assert "TLS handshake" in str(e.value)
+    assert "report it rather than waiting it out" in str(e.value)
+
+
+@respx.mock
+def test_a_bad_certificate_ends_a_wait_instead_of_running_it_out(client: mc.Client) -> None:
+    """The bug the split exists to fix, and it contradicted its own message.
+
+    ``_FATAL_WHILE_WAITING`` names classes. While the TLS statuses shared a
+    class with an origin that is merely down, wait_for_guest could not tell them
+    apart: it caught every 526 from the probe and from the refresh behind it,
+    discarded both, and spent its full 180 seconds before reporting "the guest
+    did not respond" — the wrong cause and the wrong class, about a certificate
+    whose own error said to report it rather than wait it out.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(526, content=b""))
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(526, content=b""))
+    started = time.monotonic()
+    with pytest.raises(mc.OriginTLSError):
+        _computer(client).wait_for_guest(timeout=30)
+    # Raised on the first probe, not waited out.
+    assert time.monotonic() - started < 5
+
+
+@respx.mock
+def test_an_unreachable_origin_says_so_even_when_something_sent_a_body(
+    client: mc.Client,
+) -> None:
+    """No "did the platform name it" guard here, unlike the gateway pair.
+
+    The status itself says the platform was never reached, so a body cannot be
+    its account of what happened — there is nothing to defer to.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(521, json={"error": "web server is down"})
+    )
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert "never sent" in str(e.value)
+
+
+def test_an_unreachable_origin_cannot_arrive_on_a_stream() -> None:
+    """The in-band split, one step past the gateway case.
+
+    A status delivered on a response that was a 200 contradicts the claim that
+    the request never reached the platform, rather than merely failing to
+    support it.
+    """
+    err = mc._client.error_for_status(522, "the agent run failed: upstream gone")
+    assert isinstance(err, mc.APIError)
+    assert not isinstance(err, mc.OriginUnreachableError)
+    assert err.status == 522
+
+
+@respx.mock
+def test_a_520_does_not_claim_the_work_never_happened(client: mc.Client) -> None:
+    """520 is the trap in the 52x range, and the costly one to get backwards.
+
+    Cloudflare returns it when the origin DID receive the request and answered
+    with something empty, unknown or oversized. Filed with the unreachable
+    statuses it inherited their message — "the request never arrived, so nothing
+    was started" — about a create that may well have created something.
+    """
+    respx.post(f"{BASE}/computers").mock(httpx.Response(520, content=b""))
+    with pytest.raises(mc.OriginResponseError) as e:
+        client.computers.create(template="base")
+    assert e.value.status == 520
+    # Neither of its neighbours: the answers they give about surviving work are
+    # both wrong here, in opposite directions.
+    assert not isinstance(e.value, mc.OriginUnreachableError)
+    assert not isinstance(e.value, mc.GatewayTimeoutError)
+    said = str(e.value)
+    assert "never arrived" not in said
+    assert "did arrive" in said
+    assert "creates something" in said
+
+
+@respx.mock
+def test_a_520_keeps_a_message_the_platform_may_have_written(client: mc.Client) -> None:
+    """Guarded where 521-526 are not, and the difference is who could have spoken.
+
+    A 520 is the platform's own answer arriving mangled, so a body that parsed
+    as this surface's JSON plausibly is its account. On the unreachable statuses
+    it provably cannot be.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(520, json={"error": "the hypervisor closed the connection"})
+    )
+    with pytest.raises(mc.OriginResponseError) as e:
+        client.computers.get("vm-1")
+    assert str(e.value) == "the hypervisor closed the connection"
+
+
+def test_a_520_cannot_arrive_on_a_stream_either() -> None:
+    err = mc._client.error_for_status(520, "the agent run failed: upstream gone")
+    assert isinstance(err, mc.APIError)
+    assert not isinstance(err, mc.OriginResponseError)
+
+
+@respx.mock
+def test_a_substituted_message_still_says_which_status_it_stands_in_for(
+    client: mc.Client,
+) -> None:
+    """Four classes, eight statuses, and three of them share one sentence.
+
+    Explaining a failure in prose took the number out of ``str(e)``, which the
+    bare ``HTTP 522`` at least had: an operator reading a log that captured only
+    the message could no longer tell 521 from 523, and support asks for the
+    status before anything else.
+    """
+    for status, cls in (
+        (504, mc.GatewayTimeoutError),
+        (520, mc.OriginResponseError),
+        (522, mc.OriginUnreachableError),
+        (526, mc.OriginTLSError),
+    ):
+        respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(status, content=b""))
+        with pytest.raises(cls) as e:
+            client.computers.get("vm-1")
+        assert str(e.value).endswith(f"(HTTP {status})")
+
+
+@respx.mock
+def test_an_edge_error_page_survives_on_the_exception(client: mc.Client) -> None:
+    """Not shown, not discarded.
+
+    A proxy's HTML is the wrong thing to put in front of a caller and the right
+    thing to still have when one asks support about it — the Cloudflare Ray ID
+    is in that page and nowhere else, and substituting the message dropped it.
+    """
+    page = "<html><body>error code: 522 Ray ID: 8f2a1c</body></html>"
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(522, headers={"content-type": "text/html"}, text=page)
+    )
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert "Ray ID" not in str(e.value)
+    assert "8f2a1c" in str(e.value.body)
+
+
+@respx.mock
+def test_a_message_the_platform_wrote_is_not_stamped_with_a_status(
+    client: mc.Client,
+) -> None:
+    """The stamp is for our wording, not the platform's.
+
+    Its message is its own sentence and ``e.status`` already carries the number;
+    appending one would be this client editing the platform's words.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(504, json={"error": "upstream unavailable before dispatch"})
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.get("vm-1")
+    assert str(e.value) == "upstream unavailable before dispatch"

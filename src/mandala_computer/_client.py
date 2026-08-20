@@ -19,8 +19,12 @@ from ._exceptions import (
     APIError,
     AuthenticationError,
     ConflictError,
+    GatewayTimeoutError,
     MandalaError,
     NotFoundError,
+    OriginResponseError,
+    OriginTLSError,
+    OriginUnreachableError,
     PermissionDeniedError,
     PlanLimitError,
     RateLimitError,
@@ -101,7 +105,103 @@ _STATUS_ERRORS = {
     # surface that is not a fault: nothing is broken from the caller's side, the
     # platform is declining to hand over a list it knows is incomplete.
     503: UnavailableError,
+    # Neither of these is the platform's answer. Both are a hop in front of it
+    # saying it waited long enough — 504 from an ordinary proxy, 524 from
+    # Cloudflare, which is what serves app.mandala.computer. Same class because
+    # they are the same event to a caller, and because which one arrives depends
+    # on which hop gave up first rather than on anything they did.
+    504: GatewayTimeoutError,
+    524: GatewayTimeoutError,
+    # The rest of what an edge answers on its own, and the opposite event to the
+    # pair above despite the neighbouring numbers: those mean the platform was
+    # reached and did not answer in time, these mean it was never reached.
+    #
+    # 520 is NOT one of them, which is the trap in this range. It means the
+    # platform WAS reached and answered unreadably, so it belongs with neither
+    # group and gets a class of its own — see OriginResponseError for what a
+    # wrong answer here costs.
+    520: OriginResponseError,
+    521: OriginUnreachableError,
+    522: OriginUnreachableError,
+    523: OriginUnreachableError,
+    # Their own class, not more entries on the one above: an unreachable origin
+    # is a passing outage and these are a deployment somebody has to fix, so a
+    # caller asking "should I try again" needs opposite answers.
+    525: OriginTLSError,
+    526: OriginTLSError,
 }
+
+#: What a caller is told when a proxy abandoned their request and named nothing.
+#:
+#: Used only where the response carried no message of the platform's own — an
+#: empty body, or an intermediary's HTML error page. Where the platform *did*
+#: name the failure, its own words are better than these and are kept; see
+#: :meth:`_error`.
+#:
+#: Measured against ``app.mandala.computer`` on 2026-08-20: Cloudflare
+#: content-negotiates its error page, and every request from this client asks
+#: for JSON, so the body arrived **empty** and ``str(e)`` read ``HTTP 524`` — a
+#: caller with nowhere to go, which is where the ceiling below cost real
+#: debugging time. Stated as a measurement rather than a rule, because it is a
+#: property of an edge this SDK does not own: a proxy that answers 5xx with a
+#: structured body instead (RFC 9457 names its fields ``title`` and ``detail``,
+#: not ``error``) still lands here, which is safe — a proxy's account of the
+#: platform is not the platform's, and ``e.body`` keeps it either way.
+#:
+#: Worded for any route, because any of them can meet the ceiling. The exec
+#: sentence is hedged for the same reason — most callers arrive here from one,
+#: but a listing or a screenshot can too, and telling the caller of a GET that
+#: their command is still running would be a confident falsehood.
+GATEWAY_TIMEOUT_MESSAGE = (
+    "a proxy in front of the platform gave up waiting for it to answer. Nothing "
+    "was cancelled: the platform never saw this deadline, so any work the "
+    "request had already started carries on. Most often that is a foreground "
+    "exec(), which ends this way after about two minutes however long a timeout "
+    "it was given — the ceiling belongs to the proxy, not to the platform or to "
+    "this client, so raising the timeout cannot buy time from it and start_exec() "
+    "is the way to run something slower. After one of those, the next call on "
+    "that computer may report the guest agent as busy with the command that "
+    "outlived the request"
+)
+
+#: What a caller is told when a proxy could not reach the platform at all.
+#:
+#: No "did the platform name it" guard on any of the three below, unlike the
+#: gateway pair, and the asymmetry is the point: on these the edge never got an
+#: answer out of the platform, so a body cannot carry its account of what
+#: happened. There is nothing to defer to.
+ORIGIN_UNREACHABLE_MESSAGE = (
+    "a proxy in front of the platform could not reach it. Almost always that "
+    "means the request was never sent, so nothing was started and there is no "
+    "work on the other side of this to account for — unlike a gateway timeout. "
+    "Almost, rather than never, because a connection can also time out after it "
+    "was established, and bytes already on the wire are not unsent because the "
+    "answer never came back: retry a read freely, and look before retrying "
+    "something that creates. Usually this is the platform restarting or a short "
+    "outage, which clears on its own; if it persists the platform is down, and "
+    "waiting is the only thing that helps"
+)
+
+#: What a caller is told when the platform was reached and the exchange broke.
+ORIGIN_RESPONSE_MESSAGE = (
+    "the platform received the request and the exchange then broke on the way "
+    "back — an empty or unreadable response, a connection dropped before the "
+    "headers, an origin that stopped part-way. Unlike an unreachable origin, the "
+    "request did arrive, so it may have been carried out in full, in part, or "
+    "not at all. Retrying a read costs nothing; before retrying anything that "
+    "creates something, look at whether the first attempt took effect"
+)
+
+#: What a caller is told when the edge and the platform cannot agree on TLS.
+#:
+#: The one edge failure with no "wait and see" in it, which is why it is raised
+#: rather than waited out — see ``_FATAL_WHILE_WAITING``.
+ORIGIN_TLS_MESSAGE = (
+    "a proxy in front of the platform could not complete a TLS handshake with "
+    "it, so the request was never sent. This is a misconfigured deployment "
+    "rather than a passing outage — an expired or mismatched certificate fails "
+    "the same way on every retry, so report it rather than waiting it out"
+)
 
 #: How many rows a listing is short by. Present means short; the number can be
 #: 0, which means "short, by an amount the placement cache cannot state" rather
@@ -294,15 +394,60 @@ class _BaseTransport:
     def _error(resp: httpx.Response) -> APIError:
         body: Any = None
         message = f"HTTP {resp.status_code}"
+        # Whether the PLATFORM named this failure, as opposed to the message
+        # being our fallback or some intermediary's error page. Only the
+        # structured form counts: a JSON body with an ``error`` in it is this
+        # surface answering, and nothing else on this path is.
+        named = False
         try:
             body = resp.json()
             if isinstance(body, dict) and body.get("error"):
                 message = str(body["error"])
+                named = True
         except ValueError:
             text = resp.text.strip()
             if text:
                 message = text[:500]
+                # Kept on the exception even where the wording below replaces
+                # it. An edge's error page is the wrong thing to show a caller
+                # and the right thing to still have when one asks support about
+                # it — a Cloudflare Ray ID lives in that HTML and nowhere else,
+                # and substituting the message used to drop it on the floor.
+                body = message
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
+
+        def substituted(said: str) -> str:
+            """Our wording, carrying the status it stands in for.
+
+            The number matters on a message we wrote in a way it does not on one
+            the platform wrote. Four classes cover eight statuses between them
+            and three of those share a sentence, so a log line holding only
+            ``str(e)`` could no longer tell 521 from 523 — which it could before
+            this SDK started explaining them.
+            """
+            return f"{said} (HTTP {resp.status_code})"
+
+        # All four set `message` rather than returning, so the status above is
+        # appended in one place and a fifth class cannot forget it.
+        if cls is OriginResponseError and not named:
+            # Guarded, where the two below are not, and the difference is which
+            # of them the platform could have spoken through. A 520 is its own
+            # answer arriving mangled, so a body that parsed as this surface's
+            # JSON plausibly IS its account. On 521-526 it provably cannot be.
+            message = substituted(ORIGIN_RESPONSE_MESSAGE)
+        elif cls is OriginTLSError:
+            message = substituted(ORIGIN_TLS_MESSAGE)
+        elif cls is OriginUnreachableError:
+            message = substituted(ORIGIN_UNREACHABLE_MESSAGE)
+        elif cls is GatewayTimeoutError and not named:
+            # The substitution is worth making twice over and worth NOT making a
+            # third time. An empty body leaves "HTTP 524", which says nothing; an
+            # HTML body leaves 500 characters of a proxy's boilerplate, which is
+            # worse. But a 504 can also come from a hop that speaks this
+            # surface's JSON — "upstream unavailable before dispatch" is a more
+            # specific true thing than anything written here, and replacing it
+            # would be this client overwriting the platform with a guess.
+            message = substituted(GATEWAY_TIMEOUT_MESSAGE)
         if cls is RateLimitError:
             return RateLimitError(
                 message,
@@ -328,7 +473,23 @@ def error_for_status(status: int, message: str) -> APIError:
     :attr:`~mandala_computer.RateLimitError.retry_after` is ``None`` — see it
     there, rather than inventing a delay the platform did not name.
     """
-    return _STATUS_ERRORS.get(status, APIError)(message, status=status)
+    cls = _STATUS_ERRORS.get(status, APIError)
+    if cls in (OriginUnreachableError, OriginResponseError, OriginTLSError):
+        # For the reason below, one step further: this status arrived ON a
+        # response, so the claim that the request never reached the platform is
+        # not merely unproven here, it is contradicted.
+        cls = APIError
+    if cls is GatewayTimeoutError:
+        # Not here, and the reason is the arrival itself. This status did not
+        # come off a response — it came out of an event on a stream the platform
+        # opened, answered 200, and successfully delivered. That is proof no
+        # proxy abandoned anything, which is the one thing
+        # :class:`~mandala_computer.GatewayTimeoutError` asserts. A downstream
+        # 504 the platform is REPORTING and an edge that stopped waiting are
+        # different events, and a caller branching on the class to decide
+        # whether its work survived would be answered wrongly here.
+        cls = APIError
+    return cls(message, status=status)
 
 
 def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutError:
