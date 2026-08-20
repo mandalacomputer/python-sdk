@@ -408,25 +408,38 @@ class _BaseTransport:
             text = resp.text.strip()
             if text:
                 message = text[:500]
+                # Kept on the exception even where the wording below replaces
+                # it. An edge's error page is the wrong thing to show a caller
+                # and the right thing to still have when one asks support about
+                # it — a Cloudflare Ray ID lives in that HTML and nowhere else,
+                # and substituting the message used to drop it on the floor.
+                body = message
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
+
+        def substituted(said: str) -> str:
+            """Our wording, carrying the status it stands in for.
+
+            The number matters on a message we wrote in a way it does not on one
+            the platform wrote. Four classes cover eight statuses between them
+            and three of those share a sentence, so a log line holding only
+            ``str(e)`` could no longer tell 521 from 523 — which it could before
+            this SDK started explaining them.
+            """
+            return f"{said} (HTTP {resp.status_code})"
+
+        # All four set `message` rather than returning, so the status above is
+        # appended in one place and a fifth class cannot forget it.
         if cls is OriginResponseError and not named:
-            # Guarded, where the unreachable statuses below are not, and the
-            # difference is which of them the platform could have spoken through.
-            # A 520 is the platform's own answer arriving mangled, so a body that
-            # parsed as this surface's JSON plausibly IS its account of what
-            # happened. On 521-526 it provably cannot be.
-            message = ORIGIN_RESPONSE_MESSAGE
-        if cls is OriginTLSError:
-            return OriginTLSError(ORIGIN_TLS_MESSAGE, status=resp.status_code, body=body)
-        if cls is OriginUnreachableError:
-            # Unconditionally, where the gateway pair below is guarded. These
-            # statuses mean the edge never got an answer out of the platform, so
-            # a body cannot be the platform's account of what happened and there
-            # is nothing to defer to.
-            return OriginUnreachableError(
-                ORIGIN_UNREACHABLE_MESSAGE, status=resp.status_code, body=body
-            )
-        if cls is GatewayTimeoutError and not named:
+            # Guarded, where the two below are not, and the difference is which
+            # of them the platform could have spoken through. A 520 is its own
+            # answer arriving mangled, so a body that parsed as this surface's
+            # JSON plausibly IS its account. On 521-526 it provably cannot be.
+            message = substituted(ORIGIN_RESPONSE_MESSAGE)
+        elif cls is OriginTLSError:
+            message = substituted(ORIGIN_TLS_MESSAGE)
+        elif cls is OriginUnreachableError:
+            message = substituted(ORIGIN_UNREACHABLE_MESSAGE)
+        elif cls is GatewayTimeoutError and not named:
             # The substitution is worth making twice over and worth NOT making a
             # third time. An empty body leaves "HTTP 524", which says nothing; an
             # HTML body leaves 500 characters of a proxy's boilerplate, which is
@@ -434,7 +447,7 @@ class _BaseTransport:
             # surface's JSON — "upstream unavailable before dispatch" is a more
             # specific true thing than anything written here, and replacing it
             # would be this client overwriting the platform with a guess.
-            message = GATEWAY_TIMEOUT_MESSAGE
+            message = substituted(GATEWAY_TIMEOUT_MESSAGE)
         if cls is RateLimitError:
             return RateLimitError(
                 message,
