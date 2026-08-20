@@ -297,23 +297,16 @@ already decided. The result describes the launch, not the page — a zero exit
 means the shell started the browser, not that the URL resolved. Screenshot it to
 see what loaded.
 
-**Why it names a browser.** `xdg-open` is the portable way to want this and is
-installed on the `base` template, along with `exo-open`, `sensible-browser` and
-`x-www-browser` — and none of them work. Every one exits 0 and launches nothing,
-because the image's default-browser association points at a desktop entry it does
-not ship. Exit 0 and an unchanged screen is the worst shape a failure can take,
-so `open()` asks for Firefox, which is the only browser on the image anyway;
-there is no Chromium. When the platform fixes the association, `open()` changes
-in one place and your code does not change at all — which is most of the reason
-to call it rather than write the `exec()` yourself.
+**Why it names a browser.** `open()` asks for Firefox by name rather than going
+through `xdg-open` or one of the other portable wrappers. Naming it puts the
+choice in one place: this method is the only thing that decides which browser the
+guest opens, so if that ever needs to be a different one, it changes here and
+your code does not change at all. Which is most of the reason to call it rather
+than write the `exec()` yourself.
 
 The URL is shell-quoted, so one containing `&` or `;` stays a URL. One starting
 with `-` is refused rather than escaped: quoting stops the *shell* reading it as
 a flag, nothing stops the *browser* doing so, and no real URL starts with a dash.
-
-There is no `xdotool` or `wmctrl` on the image, which you should not need —
-`click()`, `type()` and `key()` are that, and they work without anything
-installed in the guest.
 
 **Windows does not support this yet**, and neither does `open()`, which is a
 `desktop=True` exec underneath. `exec()` there runs as `NT AUTHORITY\SYSTEM`
