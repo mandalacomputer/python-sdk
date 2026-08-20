@@ -12,3 +12,5 @@ dist/
 htmlcov/
 .env
 .DS_Store
+
+.claude/
