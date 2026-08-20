@@ -44,15 +44,20 @@ AGENT = Path("web/lib/agent.ts")
 CONSTANTS = [("MAX_STEPS", AGENT, "MAX_MAX_STEPS")]
 
 
+#: Directory names the platform repo answers to when checked out beside this one.
+#:
+#: ``app`` is the repository's own name, so a plain clone is called that, and it is
+#: still what most working copies are called. Kept as a fallback so a machine
+#: that already has one kept working through the rename; ``MANDALA_PLATFORM_REPO``
+#: is the way to point at a checkout that is called neither, or lives elsewhere.
+SIBLINGS = ("mandala-computer", "app")
+
+
 def platform_repo() -> Path | None:
     """Where the platform is checked out, if it is."""
     candidates = [
         Path(p)
-        for p in (
-            os.environ.get("MANDALA_PLATFORM_REPO"),
-            REPO.parent / "app",
-            REPO.parent / "mandala-computer",
-        )
+        for p in (os.environ.get("MANDALA_PLATFORM_REPO"), *(REPO.parent / s for s in SIBLINGS))
         if p
     ]
     return next((d for d in candidates if (d / SURFACE).is_file()), None)
@@ -135,8 +140,7 @@ def main() -> int:
     if platform is None:
         print(
             "check-surface — platform repo not found, skipping.\n"
-            f"  Looked in: $MANDALA_PLATFORM_REPO, {REPO.parent / 'app'}, "
-            f"{REPO.parent / 'mandala-computer'}\n"
+            f"  Looked in $MANDALA_PLATFORM_REPO and next to {REPO.name}.\n"
             f"  Set MANDALA_PLATFORM_REPO to compare against {SURFACE}."
         )
         return 0
