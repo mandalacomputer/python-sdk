@@ -321,7 +321,9 @@ Until that lands, drive the Windows desktop through `click()`, `type()` and
 
 `exec()` waits, and `timeout_s` passing means *you* stopped waiting — the
 command keeps running inside the guest, and its output and exit code are lost
-with the request. For anything slower than a few seconds, start it instead:
+with the request. There is no ceiling on `timeout_s`: the HTTP budget is
+derived from it, so a long command is not cut short by the client's own
+default. For anything slower than a few seconds, start it instead:
 
 ```python
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
@@ -570,7 +572,7 @@ Everything derives from `MandalaError`.
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
 | `APIError` | any other unsuccessful response |
-| `TimeoutError` | a `wait_*` helper gave up |
+| `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 `PlanLimitError`'s message names the limit that was hit.
 

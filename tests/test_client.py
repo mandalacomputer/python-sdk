@@ -1499,7 +1499,7 @@ def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
 ) -> None:
     """Not every failed delete is a MandalaError.
 
-    The transport does not wrap httpx, so a connection reset on the cleanup
+    The transport wraps only timeouts, so a connection reset on the cleanup
     request arrives as itself — and a handler that caught only MandalaError let
     it past, displacing the caller's exception exactly the way the 409 used to.
     A network blip during teardown is at least as likely as the 409.
@@ -1528,3 +1528,109 @@ def test_exec_result_equality_ignores_the_raw_payload() -> None:
     assert got == mc.ExecResult(0, "hi", "", False)
     assert len({got, mc.ExecResult(0, "hi", "", False)}) == 1
     assert got.raw["unknown"] == 1
+
+
+# --- request deadlines ------------------------------------------------------
+
+
+def _budget(route: respx.Route) -> dict[str, float | None]:
+    """The timeout httpx was actually handed for the last call on this route."""
+    return dict(route.calls.last.request.extensions["timeout"])
+
+
+@respx.mock
+def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.Client) -> None:
+    """The deadline the caller names is the one the transport honours.
+
+    The platform puts no ceiling on timeout_s and stretches its own deadline to
+    match, so a fixed 60-second client abandoned a 300-second command at 60 —
+    while the command carried on running in the guest with its output and its
+    exit code going nowhere.
+    """
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    c = _computer(client)
+
+    c.exec("make", timeout_s=300)
+    assert _budget(route)["read"] == 300 + mc._client.DEADLINE_SLACK
+
+    # Under the client's own default it changes nothing. This only ever widens.
+    c.exec("true", timeout_s=5)
+    assert _budget(route)["read"] == mc._client.DEFAULT_TIMEOUT
+
+
+@respx.mock
+def test_the_file_routes_get_a_budget_of_their_own(client: mc.Client) -> None:
+    """A transfer of up to 64 MiB is not an ordinary control-plane request."""
+    get = respx.get(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, content=b"hi"))
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, json={}))
+    c = _computer(client)
+
+    c.read_file("/tmp/a")
+    c.write_file("/tmp/a", b"hi")
+    assert _budget(get)["read"] == mc._client.FILE_TIMEOUT
+    assert _budget(put)["write"] == mc._client.FILE_TIMEOUT
+
+
+@respx.mock
+def test_a_client_of_your_own_is_never_shortened() -> None:
+    """Widening is the only thing this does, so a patient client stays patient."""
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    patient = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=600.0))
+    mc.Computer(patient._t, COMPUTER).exec("true", timeout_s=30)
+    assert _budget(route)["read"] == 600.0
+
+
+@respx.mock
+def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.Client) -> None:
+    """``except MandalaError`` is the one handler the README tells callers to write.
+
+    A raw httpx.ReadTimeout walked straight through it, so a call that ran long
+    failed in a way nothing in the SDK's own error table described.
+    """
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=httpx.ReadTimeout("too slow"))
+    with pytest.raises(mc.TimeoutError, match="did not answer") as caught:
+        mc.Computer(client._t, COMPUTER).exec("sleep 999", timeout_s=100)
+    assert isinstance(caught.value, mc.MandalaError)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [("inf", None), ("-inf", None), ("nan", None), ("-5", 0.0), ("2.5", 2.5)],
+)
+def test_retry_after_survives_only_as_a_usable_delay(
+    client: mc.Client, header: str, expected: float | None
+) -> None:
+    """The value is handed to time.sleep, where inf blocks forever and nan raises.
+
+    Both parse as floats, so guarding on ValueError alone let them through. A
+    negative delay is one that has already passed, which is zero.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(429, headers={"Retry-After": header}, json={"error": "slow down"})
+    )
+    with pytest.raises(mc.RateLimitError) as caught:
+        client.computers.list()
+    assert caught.value.retry_after == expected
+
+
+@respx.mock
+def test_set_schedule_reads_its_own_answer(client: mc.Client) -> None:
+    """The PUT already returns the schedule as stored.
+
+    Re-reading it with a GET cost a second metered round trip to report a value
+    a concurrent change could have altered in between — which would then come
+    back looking like what this call stored.
+    """
+    stored = {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=stored))
+    get = respx.get(f"{BASE}/computers/vm-1/schedule").mock(
+        httpx.Response(200, json={"enabled": False})
+    )
+
+    assert mc.Computer(client._t, COMPUTER).set_schedule(enabled=True) == stored
+    assert (put.call_count, get.call_count) == (1, 0)
