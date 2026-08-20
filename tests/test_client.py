@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import shlex
 
@@ -83,6 +84,17 @@ def test_create_refuses_size_beside_explicit_sizing(client: mc.Client) -> None:
     # round trip — no request is mocked, so reaching the wire would fail loud.
     with pytest.raises(ValueError, match="size"):
         client.computers.create(size="large", cpu=4)
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+def test_create_refuses_an_empty_name_before_the_request(client: mc.Client, name: str) -> None:
+    with pytest.raises(ValueError, match="name must not be empty"):
+        client.computers.create(name=name)
+
+
+def test_clone_refuses_an_empty_optional_name_before_the_request(client: mc.Client) -> None:
+    with pytest.raises(ValueError, match="name must not be empty"):
+        client.snapshots.clone("snap-1", name=" \t")
 
 
 @respx.mock
@@ -336,6 +348,36 @@ def test_wait_for_guest_ignores_errors_while_booting(client: mc.Client) -> None:
         ]
     )
     mc.Computer(client._t, COMPUTER).wait_for_guest(timeout=5, poll=0)
+
+
+@respx.mock
+def test_wait_for_guest_reports_a_failed_start_without_probing(client: mc.Client) -> None:
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
+    computer = mc.Computer(
+        client._t,
+        {**COMPUTER, "status": "stopped", "start_error": "no host had room"},
+    )
+    with pytest.raises(mc.MandalaError, match="did not start: no host had room"):
+        computer.wait_for_guest(timeout=30, poll=0)
+    assert not probe.called
+
+
+@respx.mock
+def test_wait_for_guest_reports_an_already_stopped_computer(client: mc.Client) -> None:
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
+    with pytest.raises(mc.MandalaError, match=r"stopped.+call start\(\) first"):
+        mc.Computer(client._t, {**COMPUTER, "status": "stopped"}).wait_for_guest()
+    assert not probe.called
+
+
+@respx.mock
+def test_wait_for_guest_still_resumes_a_suspended_computer(client: mc.Client) -> None:
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    computer = mc.Computer(client._t, {**COMPUTER, "status": "suspended"})
+    assert computer.wait_for_guest(timeout=5, poll=0) is computer
+    assert probe.call_count == 1
 
 
 # --- rename ---------------------------------------------------------------
@@ -1831,6 +1873,23 @@ def test_the_file_routes_get_a_budget_of_their_own(client: mc.Client) -> None:
     assert _budget(get)["read"] == mc._client.FILE_TIMEOUT
     assert _budget(put)["write"] == mc._client.FILE_TIMEOUT
     assert get.calls.last.request.headers["Accept"] == "application/octet-stream"
+
+
+@respx.mock
+def test_write_file_refuses_an_oversized_body_before_the_request(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200))
+    monkeypatch.setattr(mc._computer, "FILE_SIZE_LIMIT", 2)
+    with pytest.raises(ValueError, match="may not exceed"):
+        _computer(client).write_file("/tmp/a", "€")
+    assert not put.called
+
+
+def test_the_sdk_timeout_is_also_the_builtin_timeout() -> None:
+    error = mc.TimeoutError("gave up")
+    assert isinstance(error, mc.MandalaError)
+    assert isinstance(error, builtins.TimeoutError)
 
 
 @respx.mock

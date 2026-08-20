@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -174,11 +175,15 @@ class UnavailableError(APIError):
     """
 
 
-class TimeoutError(MandalaError):
+class TimeoutError(MandalaError, builtins.TimeoutError):
     """The SDK stopped waiting.
 
     Two things raise it: a wait helper that gave up before the computer reached
     the expected state, and a request that outran the transport's budget for it.
+
+    It is both a :class:`MandalaError` and Python's built-in
+    :class:`TimeoutError`, so either the SDK-wide handler or an ordinary timeout
+    handler catches it.
 
     Either way nothing has been cancelled — a command goes on running in the
     guest after the request carrying it is abandoned. What was lost is this
