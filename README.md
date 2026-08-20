@@ -720,9 +720,13 @@ only to the two listings, which are the one case where a partial answer exists
 (see [Partial listings](#partial-listings)).
 
 `GatewayTimeoutError` is not the platform refusing anything — the request
-reached it and is very likely still running. What ended was one hop's
-willingness to hold a connection open with nothing crossing it, which is why
-retrying the same call unchanged reproduces it exactly. See
+reached it, and any work it had already started carries on. What ended was one
+hop's willingness to hold a connection open with nothing crossing it, which is
+why retrying the same call unchanged reproduces it exactly. After one on an
+`exec()` the next call may report the guest agent busy; after one on a read
+there is nothing left behind. `str(e)` carries the platform's own message where
+it sent one, and the SDK's own explanation where the hop sent an empty or HTML
+body — which is the usual case, since a 524 is generated at the edge. See
 [Long-running commands](#long-running-commands) for the ceiling and for
 `start_exec()`, which is the shape that does not meet it.
 
