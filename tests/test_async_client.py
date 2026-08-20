@@ -635,7 +635,7 @@ async def test_an_origin_never_reached_is_not_one_that_stopped_answering(
         await client.computers.get("vm-1")
     assert e.value.status == 522
     assert not isinstance(e.value, mc.GatewayTimeoutError)
-    assert "never arrived" in str(e.value)
+    assert "never sent" in str(e.value)
 
 
 @respx.mock

@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import json
 import shlex
+import time
 
 import httpx
 import pytest
@@ -2135,18 +2136,44 @@ def test_an_origin_never_reached_is_not_one_that_stopped_answering(client: mc.Cl
         client.computers.get("vm-1")
     assert e.value.status == 522
     assert not isinstance(e.value, mc.GatewayTimeoutError)
-    assert "never arrived" in str(e.value)
+    assert "never sent" in str(e.value)
     assert "clears on its own" in str(e.value)
 
 
 @respx.mock
 def test_a_certificate_that_will_not_agree_is_not_told_to_wait(client: mc.Client) -> None:
-    """525 and 526 fail identically on every retry, and the message says so."""
+    """525 and 526 fail identically on every retry, and get their own class.
+
+    Sharing one with the unreachable statuses is what let a ``wait_*`` helper
+    retry a certificate failure: the fatal tuple names classes, so there was no
+    way to say "this one, but not its neighbours".
+    """
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(526, content=b""))
-    with pytest.raises(mc.OriginUnreachableError) as e:
+    with pytest.raises(mc.OriginTLSError) as e:
         client.computers.get("vm-1")
+    assert not isinstance(e.value, mc.OriginUnreachableError)
     assert "TLS handshake" in str(e.value)
     assert "report it rather than waiting it out" in str(e.value)
+
+
+@respx.mock
+def test_a_bad_certificate_ends_a_wait_instead_of_running_it_out(client: mc.Client) -> None:
+    """The bug the split exists to fix, and it contradicted its own message.
+
+    ``_FATAL_WHILE_WAITING`` names classes. While the TLS statuses shared a
+    class with an origin that is merely down, wait_for_guest could not tell them
+    apart: it caught every 526 from the probe and from the refresh behind it,
+    discarded both, and spent its full 180 seconds before reporting "the guest
+    did not respond" — the wrong cause and the wrong class, about a certificate
+    whose own error said to report it rather than wait it out.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(526, content=b""))
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(526, content=b""))
+    started = time.monotonic()
+    with pytest.raises(mc.OriginTLSError):
+        _computer(client).wait_for_guest(timeout=30)
+    # Raised on the first probe, not waited out.
+    assert time.monotonic() - started < 5
 
 
 @respx.mock
@@ -2163,7 +2190,7 @@ def test_an_unreachable_origin_says_so_even_when_something_sent_a_body(
     )
     with pytest.raises(mc.OriginUnreachableError) as e:
         client.computers.get("vm-1")
-    assert "never arrived" in str(e.value)
+    assert "never sent" in str(e.value)
 
 
 def test_an_unreachable_origin_cannot_arrive_on_a_stream() -> None:

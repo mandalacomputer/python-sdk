@@ -30,6 +30,7 @@ from ._exceptions import (
     AuthenticationError,
     MandalaError,
     NotFoundError,
+    OriginTLSError,
     PermissionDeniedError,
     PlanLimitError,
     RateLimitError,
@@ -194,6 +195,12 @@ _FATAL_WHILE_WAITING = (
     NotFoundError,
     PlanLimitError,
     RateLimitError,
+    # A certificate the edge and the platform cannot agree on fails identically
+    # on every retry, so waiting one out spends the whole timeout to report "the
+    # guest did not respond" — the wrong cause, the wrong class, and three
+    # minutes, about a deployment somebody has to go and fix. Its own message
+    # says to report it rather than wait it out; this is what makes that true.
+    OriginTLSError,
 )
 
 
