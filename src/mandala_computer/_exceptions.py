@@ -78,9 +78,10 @@ class PlanLimitError(APIError):
 class GatewayTimeoutError(APIError):
     """A proxy in front of the platform gave up before the platform answered (504, 524).
 
-    Not the platform refusing anything. The request reached it, is very likely
-    still running, and nothing was cancelled — what ended was one hop's
-    willingness to hold the connection open with no response crossing it.
+    Not the platform refusing anything. The request reached it and nothing was
+    cancelled — what ended was one hop's willingness to hold the connection open
+    with no response crossing it, so any work the request had already started
+    carries on without it.
 
     The ceiling this reports is not the SDK's and not ``timeout``\'s: it belongs
     to whatever sits between the caller and the platform, and it is reached at
@@ -91,9 +92,17 @@ class GatewayTimeoutError(APIError):
     it answers as soon as the command has started and is polled afterwards, so
     no request is ever held open for the length of the work.
 
-    The command it abandoned keeps running, which is why the next call on the
-    same computer often raises :class:`ConflictError` — the guest agent is
-    still busy with it. That is the earlier command, not a second failure.
+    Where the abandoned request was an ``exec``, the command keeps running, which
+    is why the next call on that computer often raises :class:`ConflictError` —
+    the guest agent is still busy with it. That is the earlier command, not a
+    second failure. A read that met the ceiling started nothing and leaves
+    nothing behind.
+
+    ``str(e)`` is the platform's own message whenever it sent one. A gateway
+    status usually arrives from an intermediary with an empty or HTML body, and
+    that is what the SDK's own wording is for; a hop that answers in this
+    surface's JSON has said something more specific than the SDK could, and it
+    is kept.
     """
 
 

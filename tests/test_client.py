@@ -2037,7 +2037,7 @@ def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(client: mc.Client) -
     # The three things the bare status did not say: whose ceiling it is, that
     # the command outlived the request, and what to use instead.
     assert "proxy" in str(e.value)
-    assert "still running" in str(e.value)
+    assert "outlived the request" in str(e.value)
     assert "start_exec()" in str(e.value)
 
 
@@ -2067,3 +2067,57 @@ def test_an_ordinary_gateway_timeout_lands_in_the_same_place(client: mc.Client) 
     with pytest.raises(mc.GatewayTimeoutError) as e:
         client.computers.get("vm-1")
     assert e.value.status == 504
+
+
+@respx.mock
+def test_a_platform_that_named_the_failure_keeps_its_own_words(client: mc.Client) -> None:
+    """The substitution is for a body that said nothing, not for every 504.
+
+    A gateway status can also come from a hop that speaks this surface's JSON,
+    and "upstream unavailable before dispatch" is a more specific true thing
+    than the generic message. Overwriting it would be the client replacing the
+    platform with a guess.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(504, json={"error": "upstream unavailable before dispatch"})
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.get("vm-1")
+    assert str(e.value) == "upstream unavailable before dispatch"
+    # Still the class that says what a gateway timeout is; only the words differ.
+    assert e.value.status == 504
+
+
+@respx.mock
+def test_the_generic_message_does_not_promise_a_command_to_a_read(client: mc.Client) -> None:
+    """A GET started no command, so the message must not claim one is running.
+
+    The wording is shared by every route, and the exec advice is hedged
+    precisely so that a listing or a read is not told a confident falsehood
+    about work it never began.
+    """
+    respx.get(f"{BASE}/computers").mock(httpx.Response(524, content=b""))
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.list()
+    said = str(e.value)
+    assert "Nothing was cancelled" in said
+    assert "Most often" in said
+    # The sentence that would be false here is not stated unconditionally.
+    assert "whatever this request started is still running" not in said
+
+
+def test_an_in_band_failure_is_not_an_edge_that_gave_up() -> None:
+    """A status delivered ON a stream is proof no proxy abandoned it.
+
+    The agent loop reports its own failures as events inside a 200. A 504 from
+    there is the platform relaying a downstream timeout, not an edge that
+    stopped waiting — and a caller branching on the class to decide whether its
+    work survived would be answered wrongly.
+    """
+    err = mc._client.error_for_status(504, "the agent run failed: model provider timed out")
+    assert isinstance(err, mc.APIError)
+    assert not isinstance(err, mc.GatewayTimeoutError)
+    assert err.status == 504
+    # The statuses that do travel this way are unaffected.
+    assert isinstance(mc._client.error_for_status(401, "revoked"), mc.AuthenticationError)
+    assert isinstance(mc._client.error_for_status(409, "busy"), mc.ConflictError)
