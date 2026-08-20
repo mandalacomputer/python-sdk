@@ -144,30 +144,30 @@ class OriginResponseError(APIError):
 
 
 class OriginUnreachableError(APIError):
-    """521-523, 525, 526 — a proxy in front of the platform could not reach it.
+    """521-523 — a proxy in front of the platform could not reach it.
 
-    The rest of what an edge generates on its own, and the opposite event to
-    :class:`GatewayTimeoutError` despite sitting beside it in the numbering. A
-    524 means the request arrived and its work carries on; these mean it never
-    arrived, so nothing was started and there is nothing left running to account
-    for. A caller branching on the class to decide whether to expect a busy
-    guest agent gets opposite answers, correctly — which is why they are two
-    types rather than more statuses on one.
+    One of four classes for an edge failing rather than the platform refusing,
+    and they are four because a caller asking *did my work happen* needs four
+    answers. :class:`GatewayTimeoutError` is a hop that stopped waiting, usually
+    on a request the platform has. :class:`OriginResponseError` is 520, where the
+    platform was reached and the exchange broke coming back. :class:`OriginTLSError`
+    is a certificate that will never agree. This one is an origin that is down or
+    unreachable — what a platform restart looks like from outside, and it clears.
 
-    An origin that is down or unreachable, which is what a platform restart looks
-    like from outside and does clear. :meth:`~mandala_computer.Computer.wait_for_guest`
-    waits one out, as it waits out every error not named in
-    ``_FATAL_WHILE_WAITING``. :meth:`~mandala_computer.Computer.wait_until_built`
-    and :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they
-    read the computer's state with no retry around it, so one of these mid-poll
-    ends the wait.
+    Almost always the request was never sent, so nothing was started and there is
+    nothing left running to account for. *Almost*, rather than never: a 522 is a
+    connection that timed out, and the edge can give up after one was
+    established, so bytes already on the wire are not unsent because no
+    acknowledgement came back. Retry a read freely; look before retrying
+    something that creates.
 
-    "Never arrived" is the overwhelmingly likely reading and not a proof. A 522
-    is a connection that timed out, which is usually a request that was never
-    sent — but the edge can also give up after the connection was established,
-    and bytes already on the wire are not unsent because the acknowledgement was
-    lost. So it is safe to retry a read on one of these, and worth a look before
-    retrying something that creates.
+    :meth:`~mandala_computer.Computer.wait_for_guest` waits one of these out, as
+    it waits out every error not named in ``_FATAL_WHILE_WAITING``.
+    :meth:`~mandala_computer.Computer.wait_until_built` and
+    :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they read
+    the computer's state with no retry around it, so one of these mid-poll ends
+    the wait. :class:`OriginTLSError` is the sibling that is never waited out,
+    which is the whole reason it stopped sharing this class.
     """
 
 

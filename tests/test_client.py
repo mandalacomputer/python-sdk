@@ -2046,8 +2046,10 @@ def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(client: mc.Client) -
 def test_the_proxys_own_error_page_is_never_shown(client: mc.Client) -> None:
     """An HTML body is discarded rather than truncated into the message.
 
-    Without the unconditional override this read as 500 characters of Cloudflare
-    boilerplate — the failure mode the empty-body case only looks better than.
+    Without the override this read as 500 characters of Cloudflare boilerplate —
+    the failure mode the empty-body case only looks better than. The override is
+    conditional on the platform not having named the failure itself, and an HTML
+    page never does, so this is the branch that still substitutes.
     """
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
@@ -2249,3 +2251,61 @@ def test_a_520_cannot_arrive_on_a_stream_either() -> None:
     err = mc._client.error_for_status(520, "the agent run failed: upstream gone")
     assert isinstance(err, mc.APIError)
     assert not isinstance(err, mc.OriginResponseError)
+
+
+@respx.mock
+def test_a_substituted_message_still_says_which_status_it_stands_in_for(
+    client: mc.Client,
+) -> None:
+    """Four classes, eight statuses, and three of them share one sentence.
+
+    Explaining a failure in prose took the number out of ``str(e)``, which the
+    bare ``HTTP 522`` at least had: an operator reading a log that captured only
+    the message could no longer tell 521 from 523, and support asks for the
+    status before anything else.
+    """
+    for status, cls in (
+        (504, mc.GatewayTimeoutError),
+        (520, mc.OriginResponseError),
+        (522, mc.OriginUnreachableError),
+        (526, mc.OriginTLSError),
+    ):
+        respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(status, content=b""))
+        with pytest.raises(cls) as e:
+            client.computers.get("vm-1")
+        assert str(e.value).endswith(f"(HTTP {status})")
+
+
+@respx.mock
+def test_an_edge_error_page_survives_on_the_exception(client: mc.Client) -> None:
+    """Not shown, not discarded.
+
+    A proxy's HTML is the wrong thing to put in front of a caller and the right
+    thing to still have when one asks support about it — the Cloudflare Ray ID
+    is in that page and nowhere else, and substituting the message dropped it.
+    """
+    page = "<html><body>error code: 522 Ray ID: 8f2a1c</body></html>"
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(522, headers={"content-type": "text/html"}, text=page)
+    )
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert "Ray ID" not in str(e.value)
+    assert "8f2a1c" in str(e.value.body)
+
+
+@respx.mock
+def test_a_message_the_platform_wrote_is_not_stamped_with_a_status(
+    client: mc.Client,
+) -> None:
+    """The stamp is for our wording, not the platform's.
+
+    Its message is its own sentence and ``e.status`` already carries the number;
+    appending one would be this client editing the platform's words.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(504, json={"error": "upstream unavailable before dispatch"})
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        client.computers.get("vm-1")
+    assert str(e.value) == "upstream unavailable before dispatch"
