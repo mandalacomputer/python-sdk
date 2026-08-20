@@ -244,6 +244,7 @@ def _interact(url: str) -> int:
     saved_exit_handlers: dict[
         int, Callable[[int, FrameType | None], Any] | int | signal.Handlers
     ] = {}
+    sender_thread: threading.Thread | None = None
     stdin_thread: threading.Thread | None = None
     exit_code: int | None = None
     tty_raw = False
@@ -313,7 +314,8 @@ def _interact(url: str) -> int:
                 winch_installed = True
 
         stdin_wakeup_read, stdin_wakeup_write = os.pipe()
-        threading.Thread(target=pump_outbound, daemon=True).start()
+        sender_thread = threading.Thread(target=pump_outbound, daemon=True)
+        sender_thread.start()
         stdin_thread = threading.Thread(target=pump_stdin, daemon=True)
         stdin_thread.start()
         while True:
@@ -334,12 +336,17 @@ def _interact(url: str) -> int:
         exit_code = 130
     finally:
         closed.set()
-        outbound.put(stop_sender)
         if stdin_wakeup_write is not None:
             with suppress(OSError):
                 os.write(stdin_wakeup_write, b"\0")
         if stdin_thread is not None:
             stdin_thread.join()
+        # No producer can enqueue after the sentinel. Joining makes the sender
+        # the sole websocket writer all the way through its final frame; close()
+        # writes a close frame and must not overlap send().
+        outbound.put(stop_sender)
+        if sender_thread is not None:
+            sender_thread.join()
         for fd in (stdin_wakeup_read, stdin_wakeup_write):
             if fd is not None:
                 with suppress(OSError):

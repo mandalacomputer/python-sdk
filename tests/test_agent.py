@@ -327,6 +327,25 @@ def test_agent_once_refuses_a_body_that_is_not_an_object(computer: mc.Computer) 
         computer.agent_once("do the thing", model_key=KEY)
 
 
+@respx.mock
+def test_agent_once_maps_an_in_band_error_like_the_stream(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(
+        httpx.Response(
+            200,
+            json={
+                "error": "bad model key",
+                "status": 401,
+                "usage": {"input_tokens": 90},
+                "steps": [{"n": 1}],
+            },
+        )
+    )
+    with pytest.raises(mc.AuthenticationError, match="after 1 step: bad model key") as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is not None
+    assert error.value.agent.usage.input_tokens == 90
+
+
 # --- forward compatibility -------------------------------------------------
 
 
@@ -690,6 +709,17 @@ async def test_the_async_non_streaming_form_refuses_the_same_non_result() -> Non
         c = mc.AsyncComputer(client._t, COMPUTER)
         with pytest.raises(mc.MandalaError, match="not a JSON object"):
             await c.agent_once("do the thing", model_key=KEY)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_non_streaming_form_maps_an_in_band_error() -> None:
+    respx.post(AGENT).mock(httpx.Response(200, json={"error": "slow down", "status": 429}))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.RateLimitError, match="slow down") as error:
+            await c.agent_once("do the thing", model_key=KEY)
+    assert error.value.status == 429 and error.value.retry_after is None
 
 
 @respx.mock
