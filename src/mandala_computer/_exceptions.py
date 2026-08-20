@@ -15,6 +15,7 @@ __all__ = [
     "GatewayTimeoutError",
     "MandalaError",
     "NotFoundError",
+    "OriginResponseError",
     "OriginUnreachableError",
     "PermissionDeniedError",
     "PlanLimitError",
@@ -107,8 +108,34 @@ class GatewayTimeoutError(APIError):
     """
 
 
+class OriginResponseError(APIError):
+    """520 — the platform answered a proxy with something it could not read.
+
+    Sits between the other two edge failures and must not be filed with either,
+    because the question a caller is really asking is whether their work
+    happened, and this is the one status whose honest answer is "unknown".
+
+    A 524 means the request arrived and is still being worked on. 521-523 mean it
+    never arrived, so nothing was started. A 520 means it **did** arrive — the
+    platform received it and then returned an empty, unknown or oversized
+    response, so it may have been carried out in full, in part, or not at all,
+    and the answer was lost rather than never produced.
+
+    Which makes a blind retry the thing to be careful about. Re-sending a read
+    costs nothing; re-sending a create can leave two computers where one was
+    meant, both of them billable, on the strength of a failure that said the
+    first one never happened. Look before retrying anything that makes something.
+
+    This one was filed with :class:`OriginUnreachableError` at first, on the
+    reading that the whole 52x range is the edge failing to reach the platform.
+    It is not, and the message that came with it — "the request never arrived, so
+    nothing was started" — was exactly the kind of confident falsehood the rest
+    of this work exists to remove, pointed the other way.
+    """
+
+
 class OriginUnreachableError(APIError):
-    """520-523, 525, 526 — a proxy in front of the platform could not reach it.
+    """521-523, 525, 526 — a proxy in front of the platform could not reach it.
 
     The rest of what an edge generates on its own, and the opposite event to
     :class:`GatewayTimeoutError` despite sitting beside it in the numbering. A
@@ -118,18 +145,21 @@ class OriginUnreachableError(APIError):
     guest agent gets opposite answers, correctly — which is why they are two
     types rather than more statuses on one.
 
-    520-523 are an origin that is down or unreachable, which is what a platform
+    521-523 are an origin that is down or unreachable, which is what a platform
     restart looks like from outside and does clear. 525 and 526 are a TLS
     handshake the edge and the platform cannot agree on — an expired
     certificate, a mismatched name — which fails identically on every retry.
     ``str(e)`` says which of the two this is, because the right response differs:
     wait, or report it.
 
-    Retried by the ``wait_*`` helpers, as every error not named in
-    ``_FATAL_WHILE_WAITING`` is. That is unchanged by this class existing and is
-    right for 520-523; whether it is right for the TLS pair is part of a wider
-    question about how the three clients decide transience, which is being
-    settled separately rather than here.
+    :meth:`~mandala_computer.Computer.wait_for_guest` waits one of these out, as
+    it waits out every error not named in ``_FATAL_WHILE_WAITING``.
+    :meth:`~mandala_computer.Computer.wait_until_built` and
+    :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they read
+    the computer's state without a retry around it, so one 522 mid-poll ends the
+    wait. That is unchanged by this class existing, and whether the three of them
+    should agree is part of a wider question about how the clients decide
+    transience, being settled separately rather than here.
     """
 
 
