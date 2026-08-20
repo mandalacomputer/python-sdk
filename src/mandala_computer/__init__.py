@@ -29,7 +29,7 @@ import httpx
 
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import AsyncComputers, AsyncSizes, AsyncSnapshots, AsyncTemplates
-from ._client import DEFAULT_BASE_URL, AsyncTransport, Transport
+from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
 from ._exceptions import (
     APIError,
@@ -105,7 +105,7 @@ class Client:
         api_key: str | None = None,
         *,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._t = Transport(api_key, base_url=base_url, timeout=timeout, client=http_client)
@@ -144,7 +144,7 @@ class AsyncClient:
         api_key: str | None = None,
         *,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._t = AsyncTransport(api_key, base_url=base_url, timeout=timeout, client=http_client)
