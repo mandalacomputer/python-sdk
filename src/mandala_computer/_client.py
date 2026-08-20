@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncGenerator, Generator, Mapping
 from typing import Any
 
 import httpx
@@ -52,6 +52,9 @@ DEADLINE_SLACK = 15.0
 #: deadline than an ordinary call, so :data:`DEFAULT_TIMEOUT` would abandon a
 #: large one the platform is still willing to finish.
 FILE_TIMEOUT = 300.0
+
+#: Maximum body accepted by the platform's single-file transfer route.
+FILE_SIZE_LIMIT = 64 * 1024 * 1024
 
 #: A request with no deadline at all, for the non-streaming agent loop.
 #:
@@ -263,6 +266,31 @@ class _BaseTransport:
         )
 
     @staticmethod
+    def _binary_body(
+        method: str,
+        path: str,
+        resp: httpx.Response,
+        content_types: tuple[str, ...],
+    ) -> bytes:
+        """Read bytes only from a response of the promised wire type.
+
+        Older platform versions omitted ``Content-Type``, so absence remains
+        compatible. An explicit JSON or HTML type is not a file or screenshot,
+        however, and returning its bytes would disguise a proxy/login response
+        as successful binary data.
+        """
+        content_type = resp.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type and not any(
+            content_type == expected or expected.endswith("/") and content_type.startswith(expected)
+            for expected in content_types
+        ):
+            expected = " or ".join(content_types)
+            raise MandalaError(
+                f"{method} {path} answered {content_type}, not binary content ({expected})"
+            )
+        return resp.content
+
+    @staticmethod
     def _error(resp: httpx.Response) -> APIError:
         body: Any = None
         message = f"HTTP {resp.status_code}"
@@ -404,7 +432,7 @@ class Transport(_BaseTransport):
         *,
         json: Any = None,
         headers: Mapping[str, str] | None = None,
-    ) -> Iterator[SSEEvent]:
+    ) -> Generator[SSEEvent, None, None]:
         """A route that answers with a stream of events rather than a result.
 
         Yielded rather than collected, so a caller can report progress while the
@@ -445,6 +473,19 @@ class Transport(_BaseTransport):
 
     def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(self.request(method, path, **kw))
+
+    def binary(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept: str,
+        content_types: tuple[str, ...],
+        **kw: Any,
+    ) -> bytes:
+        """A successful raw body with an explicit binary ``Accept`` type."""
+        resp = self.request(method, path, headers={"Accept": accept}, **kw)
+        return self._binary_body(method, path, resp, content_types)
 
     def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
         """:meth:`json`, for a route whose answer is only useful as an object.
@@ -541,7 +582,7 @@ class AsyncTransport(_BaseTransport):
         *,
         json: Any = None,
         headers: Mapping[str, str] | None = None,
-    ) -> AsyncIterator[SSEEvent]:
+    ) -> AsyncGenerator[SSEEvent, None]:
         """A route that answers with a stream of events rather than a result.
 
         Yielded rather than collected, so a caller can report progress while the
@@ -581,6 +622,19 @@ class AsyncTransport(_BaseTransport):
 
     async def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(await self.request(method, path, **kw))
+
+    async def binary(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept: str,
+        content_types: tuple[str, ...],
+        **kw: Any,
+    ) -> bytes:
+        """A successful raw body with an explicit binary ``Accept`` type."""
+        resp = await self.request(method, path, headers={"Accept": accept}, **kw)
+        return self._binary_body(method, path, resp, content_types)
 
     async def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
         """:meth:`json`, for a route whose answer is only useful as an object.

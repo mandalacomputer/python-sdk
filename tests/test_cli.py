@@ -86,6 +86,16 @@ def test_resolve_unknown_name_lists_what_exists() -> None:
         _cli._resolve(_cli._client(), "nope")
 
 
+@respx.mock
+def test_resolve_does_not_call_an_empty_partial_listing_an_empty_account() -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(200, json=[], headers={"X-GC-Incomplete": "0"})
+    )
+    with pytest.raises(SystemExit, match="incomplete fleet listing") as caught:
+        _cli._resolve(_cli._client(), "missing")
+    assert "account has no computers" not in str(caught.value)
+
+
 # --- scp -------------------------------------------------------------------
 
 
@@ -147,6 +157,14 @@ def test_scp_both_remote_dies() -> None:
 def test_scp_remote_needs_a_path() -> None:
     with pytest.raises(SystemExit, match="say where"):
         _cli.main(["scp", __file__, "dev:"])
+
+
+def test_scp_refuses_an_oversized_local_file_before_reading_it(tmp_path) -> None:
+    src = tmp_path / "large.bin"
+    with src.open("wb") as f:
+        f.truncate(_cli.FILE_SIZE_LIMIT + 1)
+    with pytest.raises(SystemExit, match="64 MiB"):
+        _cli.main(["scp", str(src), "dev:/tmp/large.bin"])
 
 
 @respx.mock
@@ -408,9 +426,12 @@ def test_raw_mode_is_restored_when_resize_setup_fails(
     monkeypatch.setattr(tty, "setraw", lambda fd: None)
     monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, state: restored.append(state))
     monkeypatch.setattr(_cli.signal, "getsignal", lambda signum: object())
-    monkeypatch.setattr(
-        _cli.signal, "signal", lambda signum, handler: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
+
+    def install(signum: object, handler: object) -> None:
+        if signum == _cli.signal.SIGWINCH:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(_cli.signal, "signal", install)
 
     with pytest.raises(RuntimeError, match="boom"):
         _cli._interact("wss://terminal.test")
@@ -500,6 +521,9 @@ def test_resize_and_stdin_frames_use_the_sender_thread(
     reads = iter((b"guest input", b""))
     monkeypatch.setattr(_cli.os, "read", lambda fd, size: next(reads))
     monkeypatch.setattr(
+        _cli.select, "select", lambda readers, writers, errors: ([readers[0]], [], [])
+    )
+    monkeypatch.setattr(
         _cli.signal, "signal", lambda signum, handler: handlers.setdefault("resize", handler)
     )
     monkeypatch.setattr(_cli.shutil, "get_terminal_size", lambda: (80, 24))
@@ -507,6 +531,102 @@ def test_resize_and_stdin_frames_use_the_sender_thread(
     assert _cli._interact("wss://terminal.test") == 0
     assert ws.sent == 3
     assert all(thread is not threading.main_thread() for thread in ws.send_threads)
+
+
+def test_stdin_reader_is_woken_and_joined_before_return(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeFile:
+        def __init__(self, fd: int) -> None:
+            self.fd = fd
+
+        def fileno(self) -> int:
+            return self.fd
+
+        def isatty(self) -> bool:
+            return False
+
+    entered_select = threading.Event()
+    real_select = _cli.select.select
+
+    def watched_select(readers: object, writers: object, errors: object):
+        entered_select.set()
+        return real_select(readers, writers, errors)
+
+    class FakeConnection:
+        def recv(self) -> str:
+            assert entered_select.wait(1)
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    stdin_read, stdin_write = _cli.os.pipe()
+    try:
+        monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+        monkeypatch.setattr(_cli.sys, "stdin", FakeFile(stdin_read))
+        monkeypatch.setattr(_cli.sys, "stdout", FakeFile(-1))
+        monkeypatch.setattr(_cli.select, "select", watched_select)
+        reads: list[int] = []
+        monkeypatch.setattr(_cli.os, "read", lambda fd, size: reads.append(fd) or b"")
+
+        assert _cli._interact("wss://terminal.test") == 0
+        assert not reads
+    finally:
+        _cli.os.close(stdin_read)
+        _cli.os.close(stdin_write)
+
+
+def test_terminating_signal_restores_raw_tty_before_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import termios
+    import tty
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return self is _cli.sys.stdin
+
+    installed: dict[int, object] = {}
+    restored: list[object] = []
+    saved = object()
+
+    class FakeConnection:
+        def recv(self) -> str:
+            handler = installed[int(_cli.signal.SIGTERM)]
+            assert callable(handler)
+            handler(int(_cli.signal.SIGTERM), None)
+            raise AssertionError("terminating signal returned")
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: saved)
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, state: restored.append(state))
+    monkeypatch.setattr(tty, "setraw", lambda fd: None)
+    monkeypatch.setattr(_cli.signal, "getsignal", lambda signum: _cli.signal.SIG_DFL)
+    monkeypatch.setattr(
+        _cli.signal, "signal", lambda signum, handler: installed.__setitem__(int(signum), handler)
+    )
+
+    def terminate(pid: int, signum: int) -> None:
+        assert restored == [saved]
+        raise SystemExit(128 + signum)
+
+    monkeypatch.setattr(_cli.os, "kill", terminate)
+    with pytest.raises(SystemExit):
+        _cli._interact("wss://terminal.test")
+    assert restored
 
 
 def test_non_status_websocket_failures_are_cli_errors(monkeypatch: pytest.MonkeyPatch) -> None:

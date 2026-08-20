@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Iterator, Mapping
+from contextlib import closing
 from typing import Any
 
 from . import _api
@@ -113,6 +114,31 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
     if not res.get("known"):
         return None
     return int(res.get("x", 0)), int(res.get("y", 0))
+
+
+def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
+    """Validate the embedded windows collection before building its rows."""
+    rows = data.get("windows")
+    if rows is None:
+        return []
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+        raise MandalaError(
+            "GET windows answered with a windows field that is not an array of objects"
+        )
+    return [Window.from_api(row) for row in rows]
+
+
+def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
+    """The delete count, with malformed success payloads kept inside the SDK error family."""
+    deleted = data.get("snapshots_deleted")
+    if deleted is None:
+        return None
+    try:
+        return int(deleted)
+    except (TypeError, ValueError) as exc:
+        raise MandalaError(
+            "DELETE computer answered with an invalid snapshots_deleted count"
+        ) from exc
 
 
 # What wait_for_guest() runs to decide the guest is answering. A builtin of both
@@ -337,7 +363,7 @@ class ComputerFields:
         and a key scoped to one creates in it. This is how to tell which, for a
         key that is not.
         """
-        return str(self._data.get("workspace_id", ""))
+        return str(self._data.get("workspace_id") or "")
 
     @property
     def snapshot_schedule(self) -> Mapping[str, Any] | None:
@@ -586,8 +612,7 @@ class Computer(ComputerFields):
         )
         if not isinstance(data, Mapping):
             return None
-        deleted = data.get("snapshots_deleted")
-        return None if deleted is None else int(deleted)
+        return _snapshots_deleted(data)
 
     # --- readiness ------------------------------------------------------
 
@@ -736,12 +761,13 @@ class Computer(ComputerFields):
         desktop — :meth:`click`, :meth:`type`, :meth:`exec` — both counts as use
         and resumes it.
         """
-        resp = self._t.request(
+        return self._t.binary(
             "GET",
             _api.computer_action(self.id, "screenshot"),
             params=_api.screenshot_params(width, fresh),
+            accept="image/png, image/jpeg",
+            content_types=("image/", "application/octet-stream"),
         )
-        return resp.content
 
     # --- controlling ----------------------------------------------------
 
@@ -1014,10 +1040,14 @@ class Computer(ComputerFields):
         request is made. Works while the computer is running or suspended
         (a transfer resumes a suspended computer, like any other use).
         """
-        resp = self._t.request(
-            "GET", _api.files(self.id), params=_api.files_params(path), timeout=FILE_TIMEOUT
+        return self._t.binary(
+            "GET",
+            _api.files(self.id),
+            params=_api.files_params(path),
+            timeout=FILE_TIMEOUT,
+            accept="application/octet-stream",
+            content_types=("application/octet-stream",),
         )
-        return resp.content
 
     def write_file(self, path: str, data: bytes | str) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
@@ -1055,8 +1085,7 @@ class Computer(ComputerFields):
             _api.computer_action(self.id, "windows"),
             params=_api.windows_params(include_all),
         )
-        rows = data.get("windows")
-        return [Window.from_api(w) for w in rows or []]
+        return _windows_from_response(data)
 
     def window_action(
         self,
@@ -1232,26 +1261,30 @@ class Computer(ComputerFields):
         what a click plus a screenshot costs anywhere. A run that exhausts it
         stops where it is and ends ``rate_limited`` rather than failing.
 
-        Events this SDK does not model are skipped rather than raised on. Ending
-        the loop early — ``break``, or an exception — closes the stream, which is
-        what stops the run.
+        Events this SDK does not model are skipped rather than raised on. To
+        stop a run early, close the iterator explicitly; a bare ``break`` does
+        not guarantee generator cleanup on every Python implementation. The
+        standard :func:`contextlib.closing` helper makes that concise.
         """
         _require_model_key(model_key)
         steps = 0
-        for frame in self._t.sse(
-            "POST",
-            _api.computer_action(self.id, "agent"),
-            json=_api.agent_body(
-                prompt, stream=True, system=system, max_steps=max_steps, model=model
-            ),
-            headers={MODEL_KEY_HEADER: model_key},
-        ):
-            event = to_agent_event(frame.event, frame.data, steps)
-            if event is None:
-                continue
-            if isinstance(event, AgentStepEvent):
-                steps += 1
-            yield event
+        with closing(
+            self._t.sse(
+                "POST",
+                _api.computer_action(self.id, "agent"),
+                json=_api.agent_body(
+                    prompt, stream=True, system=system, max_steps=max_steps, model=model
+                ),
+                headers={MODEL_KEY_HEADER: model_key},
+            )
+        ) as frames:
+            for frame in frames:
+                event = to_agent_event(frame.event, frame.data, steps)
+                if event is None:
+                    continue
+                if isinstance(event, AgentStepEvent):
+                    steps += 1
+                yield event
 
     def agent(
         self,
