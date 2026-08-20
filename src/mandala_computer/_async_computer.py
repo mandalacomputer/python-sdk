@@ -67,12 +67,19 @@ class AsyncComputer(ComputerFields):
         await self._t.request("POST", _api.computer_action(self.id, "start"))
         return await self.refresh()
 
-    async def stop(self) -> AsyncComputer:
+    async def stop(self, *, force: bool = False) -> AsyncComputer:
         """Stop this computer, discarding a suspended session if it has one.
 
         Use :meth:`suspend` to keep it.
+
+        The guest is asked to shut down and given time to do it. ``force=True``
+        skips the asking and pulls the power — what to reach for when a guest
+        will not come down on its own, at the cost of whatever it had not
+        written to disk.
         """
-        await self._t.request("POST", _api.computer_action(self.id, "stop"))
+        await self._t.request(
+            "POST", _api.computer_action(self.id, "stop"), params=_api.stop_params(force)
+        )
         return await self.refresh()
 
     async def suspend(self) -> AsyncComputer:
@@ -324,12 +331,18 @@ class AsyncComputer(ComputerFields):
 
     # --- observing ------------------------------------------------------
 
-    async def screenshot(self, width: int | None = None) -> bytes:
+    async def screenshot(self, width: int | None = None, *, fresh: bool = False) -> bytes:
         """Capture the screen.
 
         Full-resolution PNG by default. Passing ``width`` returns a downscaled
         JPEG instead — much cheaper, and enough for a thumbnail or a quick
         "has anything changed" check.
+
+        PASS ``fresh=True`` WHENEVER THE IMAGE IS FEEDING A DECISION. Without it
+        the platform may answer from a frame up to 1.5 seconds old, which is
+        fine for a thumbnail and wrong for a drive loop: a model shown the
+        screen from before its own click concludes the click missed and clicks
+        again, and the second one lands on whatever the first one opened.
 
         A screenshot is not *use* as far as the platform's idle sweep is
         concerned, and does not resume a suspended computer. A loop that only
@@ -341,7 +354,7 @@ class AsyncComputer(ComputerFields):
         resp = await self._t.request(
             "GET",
             _api.computer_action(self.id, "screenshot"),
-            params=_api.screenshot_params(width),
+            params=_api.screenshot_params(width, fresh),
         )
         return resp.content
 

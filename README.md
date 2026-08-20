@@ -98,6 +98,11 @@ c.start()  # resumes it; ~1s, not a boot
 c.stop()  # discards the session instead
 ```
 
+`stop()` asks the guest to shut down and gives it time to. `stop(force=True)`
+skips the asking and pulls the power — the equivalent of holding the button in.
+It is what to reach for when a guest will not come down on its own, and it loses
+whatever had not been written to disk.
+
 `restart()` is refused with `ConflictError` while a session is saved, since it
 would have to guess which of those two you meant. Start it or stop it first.
 
@@ -227,10 +232,17 @@ c.key("ctrl", "c")
 
 png = c.screenshot()  # full-resolution PNG
 jpg = c.screenshot(width=320)  # downscaled JPEG — cheap enough to poll
+now = c.screenshot(fresh=True)  # skip the cache; what a drive loop wants
 
 res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
 res.ok, res.exit_code, res.stdout, res.stderr
 ```
+
+**Pass `fresh=True` whenever the image is feeding a decision.** A bare
+`screenshot()` may be answered from a frame up to 1.5 seconds old. That is the
+right trade for a thumbnail and the wrong one for a loop: a model shown the
+screen from before its own click concludes the click missed and clicks again,
+and the second one lands on whatever the first one opened.
 
 A non-zero exit is returned, not raised — check `res.ok`.
 
@@ -449,6 +461,17 @@ c.set_schedule(enabled=True, hour=4, tz="America/Chicago")
 c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the time
 c.clear_schedule()  # removed entirely
 ```
+
+A snapshot carries the shape it was captured at — `snap.os`, `snap.template`,
+`snap.cpu`, `snap.ram_mb`, `snap.disk_gb`, `snap.resolution` — which is what a
+`clone()` of it comes up as. That is the capture's shape and not the source
+computer's current one, so a computer resized after the snapshot was taken
+clones back to what it was. Read it before cloning if the size matters.
+
+`c.snapshot_schedule` is the same window carried on the computer itself, for a
+caller that already holds one and would rather not spend a second call on
+`c.schedule()`. It is `None` on a computer that has no schedule, which is not
+the same as one whose schedule is switched off.
 
 Disabling and clearing differ. `set_schedule(enabled=False)` is deliberately
 non-destructive — it keeps the chosen time so toggling back on restores it.

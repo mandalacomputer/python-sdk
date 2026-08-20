@@ -253,6 +253,29 @@ class ComputerFields:
         return None if value is None else int(value)
 
     @property
+    def workspace_id(self) -> str:
+        """The workspace this computer is in, or ``""`` when it is in none.
+
+        Not something a create can choose: the workspace comes from the API key,
+        and a key scoped to one creates in it. This is how to tell which, for a
+        key that is not.
+        """
+        return str(self._data.get("workspace_id", ""))
+
+    @property
+    def snapshot_schedule(self) -> Mapping[str, Any] | None:
+        """This computer's automatic snapshot window, if it has one.
+
+        The same shape :meth:`Computer.schedule` returns and ``None`` where that
+        would answer an empty mapping — carried on the computer itself, so a
+        caller that already holds one does not spend a second metered call to
+        find out whether it snapshots itself. Read it here; change it with
+        :meth:`Computer.set_schedule`.
+        """
+        value = self._data.get("snapshot_schedule")
+        return dict(value) if isinstance(value, Mapping) else None
+
+    @property
     def unreachable(self) -> bool:
         """True on a row served from the placement cache, with nothing else on it.
 
@@ -327,12 +350,19 @@ class Computer(ComputerFields):
         self._t.request("POST", _api.computer_action(self.id, "start"))
         return self.refresh()
 
-    def stop(self) -> Computer:
+    def stop(self, *, force: bool = False) -> Computer:
         """Stop this computer, discarding a suspended session if it has one.
 
         Use :meth:`suspend` to keep it.
+
+        The guest is asked to shut down and given time to do it. ``force=True``
+        skips the asking and pulls the power — what to reach for when a guest
+        will not come down on its own, at the cost of whatever it had not
+        written to disk.
         """
-        self._t.request("POST", _api.computer_action(self.id, "stop"))
+        self._t.request(
+            "POST", _api.computer_action(self.id, "stop"), params=_api.stop_params(force)
+        )
         return self.refresh()
 
     def suspend(self) -> Computer:
@@ -579,12 +609,18 @@ class Computer(ComputerFields):
 
     # --- observing ------------------------------------------------------
 
-    def screenshot(self, width: int | None = None) -> bytes:
+    def screenshot(self, width: int | None = None, *, fresh: bool = False) -> bytes:
         """Capture the screen.
 
         Full-resolution PNG by default. Passing ``width`` returns a downscaled
         JPEG instead — much cheaper, and enough for a thumbnail or a quick
         "has anything changed" check.
+
+        PASS ``fresh=True`` WHENEVER THE IMAGE IS FEEDING A DECISION. Without it
+        the platform may answer from a frame up to 1.5 seconds old, which is
+        fine for a thumbnail and wrong for a drive loop: a model shown the
+        screen from before its own click concludes the click missed and clicks
+        again, and the second one lands on whatever the first one opened.
 
         A screenshot is not *use* as far as the platform's idle sweep is
         concerned, and does not resume a suspended computer. A loop that only
@@ -596,7 +632,7 @@ class Computer(ComputerFields):
         resp = self._t.request(
             "GET",
             _api.computer_action(self.id, "screenshot"),
-            params=_api.screenshot_params(width),
+            params=_api.screenshot_params(width, fresh),
         )
         return resp.content
 
