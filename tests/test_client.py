@@ -2177,3 +2177,48 @@ def test_an_unreachable_origin_cannot_arrive_on_a_stream() -> None:
     assert isinstance(err, mc.APIError)
     assert not isinstance(err, mc.OriginUnreachableError)
     assert err.status == 522
+
+
+@respx.mock
+def test_a_520_does_not_claim_the_work_never_happened(client: mc.Client) -> None:
+    """520 is the trap in the 52x range, and the costly one to get backwards.
+
+    Cloudflare returns it when the origin DID receive the request and answered
+    with something empty, unknown or oversized. Filed with the unreachable
+    statuses it inherited their message — "the request never arrived, so nothing
+    was started" — about a create that may well have created something.
+    """
+    respx.post(f"{BASE}/computers").mock(httpx.Response(520, content=b""))
+    with pytest.raises(mc.OriginResponseError) as e:
+        client.computers.create(template="base")
+    assert e.value.status == 520
+    # Neither of its neighbours: the answers they give about surviving work are
+    # both wrong here, in opposite directions.
+    assert not isinstance(e.value, mc.OriginUnreachableError)
+    assert not isinstance(e.value, mc.GatewayTimeoutError)
+    said = str(e.value)
+    assert "never arrived" not in said
+    assert "did arrive" in said
+    assert "creates something" in said
+
+
+@respx.mock
+def test_a_520_keeps_a_message_the_platform_may_have_written(client: mc.Client) -> None:
+    """Guarded where 521-526 are not, and the difference is who could have spoken.
+
+    A 520 is the platform's own answer arriving mangled, so a body that parsed
+    as this surface's JSON plausibly is its account. On the unreachable statuses
+    it provably cannot be.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(520, json={"error": "the hypervisor closed the connection"})
+    )
+    with pytest.raises(mc.OriginResponseError) as e:
+        client.computers.get("vm-1")
+    assert str(e.value) == "the hypervisor closed the connection"
+
+
+def test_a_520_cannot_arrive_on_a_stream_either() -> None:
+    err = mc._client.error_for_status(520, "the agent run failed: upstream gone")
+    assert isinstance(err, mc.APIError)
+    assert not isinstance(err, mc.OriginResponseError)

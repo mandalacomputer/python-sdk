@@ -636,3 +636,16 @@ async def test_an_origin_never_reached_is_not_one_that_stopped_answering(
     assert e.value.status == 522
     assert not isinstance(e.value, mc.GatewayTimeoutError)
     assert "never arrived" in str(e.value)
+
+
+@respx.mock
+async def test_a_520_does_not_claim_the_work_never_happened(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half tells 520 apart from its neighbours the same way."""
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(520, content=b""))
+    with pytest.raises(mc.OriginResponseError) as e:
+        await client.computers.get("vm-1")
+    assert e.value.status == 520
+    assert not isinstance(e.value, mc.OriginUnreachableError)
+    assert "never arrived" not in str(e.value)
