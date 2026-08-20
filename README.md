@@ -279,7 +279,7 @@ c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 ```
 
 The `nohup … &` is still yours to write. A GUI program does not exit on its own,
-so a foreground launch blocks until `timeout_s` kills it and comes back as a
+so a foreground launch blocks until `timeout` kills it and comes back as a
 failure — having opened the window anyway, which is a confusing pair of outcomes.
 Detach it and the call returns in well under a second.
 
@@ -324,11 +324,35 @@ Until that lands, drive the Windows desktop through `click()`, `type()` and
 
 ### Long-running commands
 
-`exec()` waits, and `timeout_s` passing means *you* stopped waiting — the
+`exec()` waits, and `timeout` passing means *you* stopped waiting — the
 command keeps running inside the guest, and its output and exit code are lost
-with the request. There is no ceiling on `timeout_s`: the HTTP budget is
-derived from it, so a long command is not cut short by the client's own
-default. For anything slower than a few seconds, start it instead:
+with the request.
+
+**`exec()` has a ceiling of about two minutes, and it is not `timeout`'s.** The
+HTTP budget is derived from `timeout` and the platform stretches its own
+deadline to match, so neither this client nor the platform is what stops a long
+command. A proxy in front of the platform is: it abandons a request that has
+produced no response for about two minutes and answers 524, which arrives as
+`GatewayTimeoutError`. Measured against `app.mandala.computer`:
+
+| command | `timeout` | result | wall clock |
+|---|---|---|---|
+| `sleep 110` | 230 | ok | 110.6s |
+| `sleep 130` | 300 | `GatewayTimeoutError` | 125.2s |
+| `sleep 130` | 3600 | `GatewayTimeoutError` | 125.3s |
+
+The last two rows are the whole point: `timeout` differs by an order of
+magnitude and the failure lands in the same place, because the ceiling belongs
+to a hop that never saw it. Raising `timeout` cannot buy time from it.
+
+The command also survives the request that abandoned it, so the call *after* a
+`GatewayTimeoutError` commonly raises `ConflictError` — the guest agent is still
+busy with the command that timed out. That is the first failure still happening,
+not a second one.
+
+So `exec()` is for commands that finish in well under two minutes. For anything
+slower — and for anything slower than a few seconds, which is a lower bar —
+start it instead:
 
 ```python
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
@@ -672,6 +696,10 @@ Everything derives from `MandalaError`.
 | `ConflictError` | 409 — right request, wrong moment; retry |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
+| `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on |
+| `OriginResponseError` | 520 — it was reached; the exchange broke on the way back |
+| `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
+| `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
@@ -693,6 +721,50 @@ the fan-out that checks your plan comes back short, and so does a host with no
 room left for another guest. Retrying is the fix; `allow_partial=True` applies
 only to the two listings, which are the one case where a partial answer exists
 (see [Partial listings](#partial-listings)).
+
+These four are the edge failing rather than the platform refusing, and they are
+four classes rather than one because a caller asking *did my work happen* needs
+four different answers.
+
+`GatewayTimeoutError` is a hop that stopped waiting. Usually the platform has
+the request and is still working on it — that is what a 524 is — so retrying the
+same call unchanged reproduces it exactly, and after one on an `exec()` the next
+call may report the guest agent busy. A strong default rather than a guarantee,
+though: a 504 can come from a hop that never reached the platform, and a 524 can
+end an upload whose body had not finished arriving. `str(e)` carries the
+platform's own message where it sent one, and the SDK's explanation otherwise.
+See [Long-running commands](#long-running-commands) for the ceiling and for
+`start_exec()`, which is the shape that does not meet it.
+
+`OriginUnreachableError` is its near-opposite: 521-523, a proxy that could not
+reach the platform at all. Almost always the request was never sent, so nothing
+was started — *almost*, because a connection can also time out after it was
+established, and bytes already on the wire are not unsent because no answer came
+back. Usually the platform restarting, and it clears on its own.
+
+`OriginTLSError` is 525 and 526, and it is the one edge failure with no waiting
+in it. An expired or mismatched certificate fails identically on every retry, so
+the `wait_*` helpers raise it immediately instead of spending their timeout on
+it. It is a deployment somebody has to fix.
+
+`OriginResponseError` is 520 alone, and it is the trap in that range. Despite
+the neighbouring number it does **not** mean the platform was never reached: it
+means the platform *was* reached and the exchange broke on the way back. So the
+work may have happened in full, in part, or not at all. Retrying a read costs
+nothing; before retrying anything that *creates* something, check whether the
+first attempt took effect — the alternative is two computers where you meant
+one, both billable, on the strength of an error that looked like nothing
+happened.
+
+The rule of thumb across all four: reads are always safe to retry, and anything
+that creates deserves a look first.
+
+One caveat the table cannot show: these classes are for failures that arrive as
+an HTTP status. The agent loop reports its own failures as events inside a
+successful response, and a gateway or origin status relayed that way comes back
+as a plain `APIError` — the stream having been delivered is proof no proxy
+abandoned anything. So `except GatewayTimeoutError` around `agent()` will not
+catch a 504 the platform is *reporting*; catch `APIError` and read `.status`.
 
 `ConflictError` is the one worth catching separately, because it is the only one
 that clears itself: something is in flight that the operation cannot run
