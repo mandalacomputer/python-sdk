@@ -11,6 +11,7 @@ import asyncio
 import math
 import time
 from collections.abc import AsyncIterator, Mapping
+from contextlib import aclosing
 from typing import Any
 
 from . import _api
@@ -38,6 +39,8 @@ from ._computer import (
     _cursor,
     _require_background_pid,
     _require_model_key,
+    _snapshots_deleted,
+    _windows_from_response,
 )
 from ._exceptions import MandalaError, TimeoutError
 from ._models import (
@@ -246,8 +249,7 @@ class AsyncComputer(ComputerFields):
         )
         if not isinstance(data, Mapping):
             return None
-        deleted = data.get("snapshots_deleted")
-        return None if deleted is None else int(deleted)
+        return _snapshots_deleted(data)
 
     # --- readiness ------------------------------------------------------
 
@@ -394,12 +396,13 @@ class AsyncComputer(ComputerFields):
         desktop — :meth:`click`, :meth:`type`, :meth:`exec` — both counts as use
         and resumes it.
         """
-        resp = await self._t.request(
+        return await self._t.binary(
             "GET",
             _api.computer_action(self.id, "screenshot"),
             params=_api.screenshot_params(width, fresh),
+            accept="image/png, image/jpeg",
+            content_types=("image/", "application/octet-stream"),
         )
-        return resp.content
 
     # --- controlling ----------------------------------------------------
 
@@ -674,10 +677,14 @@ class AsyncComputer(ComputerFields):
 
         See :meth:`mandala_computer.Computer.read_file`.
         """
-        resp = await self._t.request(
-            "GET", _api.files(self.id), params=_api.files_params(path), timeout=FILE_TIMEOUT
+        return await self._t.binary(
+            "GET",
+            _api.files(self.id),
+            params=_api.files_params(path),
+            timeout=FILE_TIMEOUT,
+            accept="application/octet-stream",
+            content_types=("application/octet-stream",),
         )
-        return resp.content
 
     async def write_file(self, path: str, data: bytes | str) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
@@ -713,8 +720,7 @@ class AsyncComputer(ComputerFields):
             _api.computer_action(self.id, "windows"),
             params=_api.windows_params(include_all),
         )
-        rows = data.get("windows")
-        return [Window.from_api(w) for w in rows or []]
+        return _windows_from_response(data)
 
     async def window_action(
         self,
@@ -888,26 +894,30 @@ class AsyncComputer(ComputerFields):
         what a click plus a screenshot costs anywhere. A run that exhausts it
         stops where it is and ends ``rate_limited`` rather than failing.
 
-        Events this SDK does not model are skipped rather than raised on. Ending
-        the loop early — ``break``, or an exception — closes the stream, which is
-        what stops the run.
+        Events this SDK does not model are skipped rather than raised on. A bare
+        ``break`` does not close an async iterator. To stop a run early, wrap
+        this iterator in :func:`contextlib.aclosing`; leaving that context awaits
+        cleanup of the HTTP stream before continuing.
         """
         _require_model_key(model_key)
         steps = 0
-        async for frame in self._t.sse(
-            "POST",
-            _api.computer_action(self.id, "agent"),
-            json=_api.agent_body(
-                prompt, stream=True, system=system, max_steps=max_steps, model=model
-            ),
-            headers={MODEL_KEY_HEADER: model_key},
-        ):
-            event = to_agent_event(frame.event, frame.data, steps)
-            if event is None:
-                continue
-            if isinstance(event, AgentStepEvent):
-                steps += 1
-            yield event
+        async with aclosing(
+            self._t.sse(
+                "POST",
+                _api.computer_action(self.id, "agent"),
+                json=_api.agent_body(
+                    prompt, stream=True, system=system, max_steps=max_steps, model=model
+                ),
+                headers={MODEL_KEY_HEADER: model_key},
+            )
+        ) as frames:
+            async for frame in frames:
+                event = to_agent_event(frame.event, frame.data, steps)
+                if event is None:
+                    continue
+                if isinstance(event, AgentStepEvent):
+                    steps += 1
+                yield event
 
     async def agent(
         self,
