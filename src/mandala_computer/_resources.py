@@ -56,7 +56,7 @@ class Computers:
         return Listing.of([Computer(self._t, c) for c in data or []], incomplete)
 
     def get(self, computer_id: str) -> Computer:
-        data = self._t.json("GET", _api.computer(computer_id))
+        data = self._t.json_object("GET", _api.computer(computer_id))
         return Computer(self._t, _api.computer_payload(data))
 
     def create(
@@ -112,7 +112,7 @@ class Computers:
             resolution=resolution,
             size=size,
         )
-        data = self._t.json("POST", _api.COMPUTERS, json=body)
+        data = self._t.json_object("POST", _api.COMPUTERS, json=body)
         return Computer(self._t, _api.computer_payload(data))
 
     @contextmanager
@@ -130,13 +130,10 @@ class Computers:
             try:
                 computer.delete()
             except Exception as cleanup_failed:  # noqa: BLE001
-                # Every failure, not just MandalaError: the transport does not
-                # wrap httpx, so a connection reset or a read timeout on this
-                # one request arrives as itself, and a cleanup that raised
-                # `ConnectError` past this handler would replace the caller's
-                # exception exactly the way a raised `ConflictError` would.
-                # Nothing here is worth more than the exception already going
-                # out, so nothing here is allowed to displace it.
+                # Every failure, not just MandalaError: a caller-supplied
+                # transport or an unexpected local failure can still raise its
+                # own exception. Nothing here is worth more than the exception
+                # already going out, so nothing here may displace it.
                 warn_cleanup_failed(computer.id, cleanup_failed)
             raise
         else:
@@ -156,7 +153,8 @@ def warn_cleanup_failed(computer_id: str, error: Exception) -> None:
     warnings.warn(
         f"ephemeral: could not delete {computer_id}: {error}. "
         "It is still running and still billable.",
-        stacklevel=2,
+        # warn_cleanup_failed -> generator context manager -> contextlib -> user.
+        stacklevel=4,
     )
 
 
@@ -207,7 +205,7 @@ class Snapshots:
         boot and starting it raises :class:`~mandala_computer.ConflictError`; wait
         with :meth:`Computer.wait_until_built`.
         """
-        data = self._t.json(
+        data = self._t.json_object(
             "POST", _api.snapshot_action(snapshot_id, "clone"), json=_api.name_body(name)
         )
         return Computer(self._t, _api.computer_payload(data))
@@ -221,7 +219,7 @@ class Templates:
         self._t = transport
 
     def list(self) -> builtins.list[Template]:
-        data = self._t.json("GET", _api.TEMPLATES) or []
+        data = self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
 
 
@@ -230,5 +228,5 @@ class Sizes:
         self._t = transport
 
     def list(self) -> builtins.list[Size]:
-        data = self._t.json("GET", _api.SIZES) or []
+        data = self._t.json_array("GET", _api.SIZES)
         return [Size.from_api(s) for s in data]

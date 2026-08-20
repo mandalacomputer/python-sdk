@@ -735,6 +735,9 @@ same command reattaches with recent output replayed. `--session <name>` keeps
 several; the shell's exit code becomes the command's own. Inside, plain
 `nano`/`vim`/`echo` work as they would over real ssh.
 
+The interactive `ssh` command currently requires a Unix-like local terminal.
+`scp` remains available on Windows, including with drive-letter paths.
+
 `scp` copies one file per invocation, the side spelled `<computer>:/path` being
 the guest. It rides the files API rather than the terminal, so it works
 without any shell in the guest at all.

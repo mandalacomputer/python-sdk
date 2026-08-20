@@ -146,6 +146,29 @@ def test_non_json_error_still_raises(client: mc.Client) -> None:
         client.computers.list()
 
 
+@respx.mock
+def test_a_network_failure_is_still_a_mandala_error(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers").mock(side_effect=httpx.ConnectError("reset"))
+    with pytest.raises(mc.MandalaError, match="ConnectError") as caught:
+        client.computers.list()
+    assert isinstance(caught.value.__cause__, httpx.ConnectError)
+
+
+@respx.mock
+@pytest.mark.parametrize("content", [b"", b"<html>captive portal</html>", b"{}"])
+def test_a_listing_must_be_a_json_array_of_objects(client: mc.Client, content: bytes) -> None:
+    respx.get(f"{BASE}/computers").mock(httpx.Response(200, content=content))
+    with pytest.raises(mc.MandalaError, match="not a JSON array of objects"):
+        client.computers.list()
+
+
+@respx.mock
+def test_exec_does_not_turn_an_empty_200_into_success(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200))
+    with pytest.raises(mc.MandalaError, match="not a JSON object"):
+        _computer(client).exec("true")
+
+
 # --- control --------------------------------------------------------------
 
 
@@ -175,6 +198,11 @@ def test_key_requires_at_least_one(client: mc.Client) -> None:
 def test_scroll_rejects_bad_direction(client: mc.Client) -> None:
     with pytest.raises(ValueError, match="up.*down"):
         mc.Computer(client._t, COMPUTER).scroll(direction="sideways")
+
+
+def test_scroll_rejects_a_non_positive_amount(client: mc.Client) -> None:
+    with pytest.raises(ValueError, match="amount must be positive"):
+        mc.Computer(client._t, COMPUTER).scroll(amount=0)
 
 
 @respx.mock
@@ -399,7 +427,9 @@ def test_clear_schedule_is_a_delete_not_a_disable(client: mc.Client) -> None:
     route = respx.delete(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=cleared))
     put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
 
-    assert mc.Computer(client._t, COMPUTER).clear_schedule() == cleared
+    c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
+    assert c.clear_schedule() == cleared
+    assert c.snapshot_schedule is None
     assert route.called
     assert not put.called, "clearing must not go through the set path"
 
@@ -595,6 +625,16 @@ def test_hold_key_and_wait_refuse_a_non_positive_duration(client: mc.Client) -> 
         c.wait(-1)
     with pytest.raises(ValueError):
         c.hold_key(seconds=1)
+
+
+@respx.mock
+def test_long_input_actions_widen_the_request_budget(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.wait(120)
+    assert _budget(route)["read"] == 120 + mc._client.DEADLINE_SLACK
+    c.hold_key("shift", seconds=90)
+    assert _budget(route)["read"] == 90 + mc._client.DEADLINE_SLACK
 
 
 # --- resolution (OPL-3567) -------------------------------------------------
@@ -1122,6 +1162,11 @@ def test_a_foreground_exec_still_carries_its_deadline(client: mc.Client) -> None
     assert body == {"command": "true", "timeout_s": 5, "env": {"CI": "1"}}
 
 
+def test_a_foreground_exec_needs_a_positive_deadline(client: mc.Client) -> None:
+    with pytest.raises(ValueError, match="timeout_s must be positive"):
+        mc.Computer(client._t, COMPUTER).exec("true", timeout_s=0)
+
+
 def test_a_relative_cwd_is_refused_before_the_request() -> None:
     with pytest.raises(ValueError, match="cwd must be absolute"):
         mc._api.exec_body("make", 30, cwd="src")
@@ -1296,6 +1341,17 @@ def test_half_a_window_geometry_is_refused_rather_than_zeroed() -> None:
         mc._api.window_body("move", x=300)
     with pytest.raises(ValueError, match="both width and height"):
         mc._api.window_body("resize", width=800)
+
+
+def test_window_actions_require_only_the_geometry_they_use() -> None:
+    with pytest.raises(ValueError, match="move needs"):
+        mc._api.window_body("move")
+    with pytest.raises(ValueError, match="resize needs"):
+        mc._api.window_body("resize")
+    with pytest.raises(ValueError, match="only valid for move"):
+        mc._api.window_body("focus", x=1, y=2)
+    with pytest.raises(ValueError, match="only valid for resize"):
+        mc._api.window_body("close", width=10, height=10)
 
 
 # --- resize and the idle window ---------------------------------------------
@@ -1498,6 +1554,14 @@ def test_exec_result_keeps_the_raw_payload() -> None:
     assert result.stdout == "hi"
 
 
+def test_exec_result_preserves_a_null_exit_code() -> None:
+    result = mc.ExecResult.from_api(
+        {"exit_code": None, "stdout": "partial", "stderr": "", "timed_out": True}
+    )
+    assert result.exit_code is None
+    assert not result.ok
+
+
 # --- 429 is its own answer -------------------------------------------------
 
 
@@ -1559,6 +1623,27 @@ def test_wait_for_guest_still_waits_through_a_booting_agent(client: mc.Client) -
     assert len(route.calls) == 2
 
 
+@respx.mock
+def test_wait_for_guest_preserves_a_rate_limit(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(429, headers={"Retry-After": "12"}, json={"error": "slow down"})
+    )
+    with pytest.raises(mc.RateLimitError) as caught:
+        _computer(client).wait_for_guest(timeout=30, poll=0)
+    assert caught.value.retry_after == 12
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_wait_for_guest_caps_the_probe_to_its_remaining_budget(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    _computer(client).wait_for_guest(timeout=2, poll=0)
+    assert json.loads(route.calls.last.request.content)["timeout_s"] == 2
+    assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
+
+
 # --- ephemeral cleanup does not displace the caller's exception ------------
 
 
@@ -1579,8 +1664,12 @@ def test_a_failing_ephemeral_cleanup_keeps_the_original_error(client: mc.Client)
         with client.computers.ephemeral():
             raise ZeroDivisionError("the caller's own bug")
 
-    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+    with (
+        pytest.warns(UserWarning, match="still billable") as warning,
+        pytest.raises(ZeroDivisionError),
+    ):
         caller_raises()
+    assert warning[0].filename == __file__
 
 
 @respx.mock
@@ -1605,13 +1694,7 @@ def test_a_failing_ephemeral_cleanup_still_raises_on_a_clean_exit(client: mc.Cli
 def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
     client: mc.Client,
 ) -> None:
-    """Not every failed delete is a MandalaError.
-
-    The transport wraps only timeouts, so a connection reset on the cleanup
-    request arrives as itself — and a handler that caught only MandalaError let
-    it past, displacing the caller's exception exactly the way the 409 used to.
-    A network blip during teardown is at least as likely as the 409.
-    """
+    """A network blip during teardown must not displace the caller's exception."""
     respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     respx.delete(f"{BASE}/computers/vm-1").mock(side_effect=httpx.ConnectError("reset"))
 
@@ -1740,5 +1823,7 @@ def test_set_schedule_reads_its_own_answer(client: mc.Client) -> None:
         httpx.Response(200, json={"enabled": False})
     )
 
-    assert mc.Computer(client._t, COMPUTER).set_schedule(enabled=True) == stored
+    c = mc.Computer(client._t, COMPUTER)
+    assert c.set_schedule(enabled=True) == stored
+    assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)

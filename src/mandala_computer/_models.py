@@ -492,7 +492,9 @@ class ExecStatus:
 class ExecResult:
     """The outcome of a shell command run inside the guest."""
 
-    exit_code: int
+    #: ``None`` when the platform could not report an exit code, such as a
+    #: timed-out command. It must not be coerced to zero and mistaken for success.
+    exit_code: int | None
     stdout: str
     stderr: str
     timed_out: bool
@@ -536,8 +538,9 @@ class ExecResult:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ExecResult:
+        code = d.get("exit_code")
         return cls(
-            exit_code=int(d.get("exit_code", 0)),
+            exit_code=None if code is None else int(code),
             stdout=d.get("stdout", "") or "",
             stderr=d.get("stderr", "") or "",
             timed_out=bool(d.get("timed_out", False)),
