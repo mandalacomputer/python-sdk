@@ -646,6 +646,37 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
     return params or None
 
 
+def agent_body(
+    prompt: str,
+    *,
+    stream: bool,
+    system: str | None = None,
+    max_steps: int | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """One agent run's request.
+
+    An empty prompt is refused here rather than sent. The platform would answer
+    400, but a run is the one call on this surface where a round trip is not the
+    whole cost of getting it wrong: the request that comes back is billed
+    against the caller's own model key, and nothing else in this file lets a
+    caller spend money to be told they typed nothing.
+
+    ``max_steps`` is checked for the same reason — it is the spending bound, and
+    a zero or a negative is a request to do no work, which is not what anybody
+    means by it.
+    """
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    if max_steps is not None and max_steps < 1:
+        raise ValueError("max_steps must be at least 1")
+    body: dict[str, Any] = {"prompt": prompt, "stream": stream}
+    for key, value in (("system", system), ("max_steps", max_steps), ("model", model)):
+        if value is not None:
+            body[key] = value
+    return body
+
+
 def stop_params(force: bool) -> dict[str, Any] | None:
     """``force=true`` pulls the power instead of asking the guest to shut down.
 

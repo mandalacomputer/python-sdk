@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from . import _api
-from ._client import DEADLINE_SLACK, FILE_TIMEOUT, Transport
+from ._agent import (
+    AgentDone,
+    AgentEvent,
+    AgentFailed,
+    AgentResult,
+    AgentStepEvent,
+    to_agent_event,
+)
+from ._client import (
+    DEADLINE_SLACK,
+    FILE_TIMEOUT,
+    MODEL_KEY_HEADER,
+    NO_DEADLINE,
+    Transport,
+    error_for_status,
+)
 from ._exceptions import (
     AuthenticationError,
     MandalaError,
@@ -40,6 +55,39 @@ __all__ = ["BackgroundCommand", "Computer"]
 SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 800
 DEFAULT_RESOLUTION = f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24"
+
+
+def _require_model_key(model_key: str) -> None:
+    """The agent routes need the caller's own Anthropic key, and only theirs.
+
+    Refused here rather than sent empty because the failure is otherwise a 401
+    on a route where a 401 reads as "your Mandala key is wrong" — which is the
+    one thing it does not mean. The platform stores no model key and will not
+    fall back to one.
+    """
+    if not model_key or not model_key.strip():
+        raise MandalaError(
+            "the agent needs your own Anthropic API key as model_key — "
+            "the platform does not store one, and never bills you for it."
+        )
+
+
+def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> AgentResult:
+    """What a finished stream comes to, once its events are in.
+
+    The failure is checked first. A run can report one after a result — a
+    connection lost while the tail of the stream was in flight — and the last
+    word about a run that went wrong should not be a result that arrived before
+    it did.
+    """
+    if failure is not None:
+        message = f"the agent run failed: {failure.error}"
+        raise (
+            error_for_status(failure.status, message) if failure.status else MandalaError(message)
+        )
+    if result is None:
+        raise MandalaError("the agent stream ended without a result")
+    return result
 
 
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -1059,6 +1107,135 @@ class Computer(ComputerFields):
         returns the computer to never having had a schedule.
         """
         return self._t.json("DELETE", _api.computer_action(self.id, "schedule")) or {}
+
+    # --- the agent loop -------------------------------------------------
+
+    def agent_stream(
+        self,
+        prompt: str,
+        *,
+        model_key: str,
+        system: str | None = None,
+        max_steps: int | None = None,
+        model: str | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Have the platform drive this computer, reporting as it goes.
+
+        Screenshot, decide, click, type, repeat — inside the platform, on your
+        own Anthropic key, which it never stores and never bills you for. What
+        it buys you is that ten clicks stop being ten images in your context.
+
+        The computer must already be RUNNING. This route will not start one:
+        starting is billable, and it is not a decision to make on somebody's
+        behalf because they sent a prompt. A stopped or suspended computer is a
+        :class:`~mandala_computer.ConflictError`, and so is a computer another
+        run is already driving.
+
+        Yielded rather than returned because a run is minutes of clicking, and
+        something that says nothing until it is over cannot be told from a
+        hang::
+
+            for event in c.agent_stream("Turn on dark mode", model_key=key):
+                match event:
+                    case mc.AgentStepEvent(step):
+                        print(f"{step.n}. {step.detail}")
+                    case mc.AgentDone(result):
+                        print(result.text)
+
+        Every step spends your rate budget as well — the same budget your own
+        calls draw on, at the same price, because a click through here costs
+        what a click plus a screenshot costs anywhere. A run that exhausts it
+        stops where it is and ends ``rate_limited`` rather than failing.
+
+        Events this SDK does not model are skipped rather than raised on. Ending
+        the loop early — ``break``, or an exception — closes the stream, which is
+        what stops the run.
+        """
+        _require_model_key(model_key)
+        steps = 0
+        for frame in self._t.sse(
+            "POST",
+            _api.computer_action(self.id, "agent"),
+            json=_api.agent_body(
+                prompt, stream=True, system=system, max_steps=max_steps, model=model
+            ),
+            headers={MODEL_KEY_HEADER: model_key},
+        ):
+            event = to_agent_event(frame.event, frame.data, steps)
+            if event is None:
+                continue
+            if isinstance(event, AgentStepEvent):
+                steps += 1
+            yield event
+
+    def agent(
+        self,
+        prompt: str,
+        *,
+        model_key: str,
+        system: str | None = None,
+        max_steps: int | None = None,
+        model: str | None = None,
+    ) -> AgentResult:
+        """:meth:`agent_stream`, waited out — one call, one result.
+
+        ::
+
+            result = c.agent("Open the settings and turn on dark mode.", model_key=key)
+            if not result.finished:
+                print(f"did not finish: {result.stop}")
+
+        It does **not** raise when a run ends unfinished. ``max_steps``,
+        ``rate_limited`` and ``refusal`` leave real work on the desktop, and
+        raising would discard the only account of what was done to the machine —
+        check :attr:`~mandala_computer.AgentResult.finished`. What it does raise
+        is a failure the platform reported mid-run, as the class that status
+        deserves, and a :class:`~mandala_computer.MandalaError` for a stream
+        that ended without saying how the run came out.
+
+        This still streams underneath, and that is deliberate: it is the same
+        request either way, and the streaming one is the request a proxy between
+        you and the platform will not close for being quiet.
+        """
+        result: AgentResult | None = None
+        failure: AgentFailed | None = None
+        for event in self.agent_stream(
+            prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
+        ):
+            if isinstance(event, AgentDone):
+                result = event.result
+            elif isinstance(event, AgentFailed):
+                failure = event
+        return _agent_outcome(result, failure)
+
+    def agent_once(
+        self,
+        prompt: str,
+        *,
+        model_key: str,
+        system: str | None = None,
+        max_steps: int | None = None,
+        model: str | None = None,
+    ) -> AgentResult:
+        """The agent loop as a single non-streaming request.
+
+        Worse than :meth:`agent` for anything long, and here for the callers
+        who cannot use a stream at all: nothing is reported until the whole run
+        is over, and a reverse proxy between you and the platform is entitled to
+        close a request held open for minutes with nothing crossing it. Prefer
+        :meth:`agent`.
+        """
+        _require_model_key(model_key)
+        data = self._t.json(
+            "POST",
+            _api.computer_action(self.id, "agent"),
+            json=_api.agent_body(
+                prompt, stream=False, system=system, max_steps=max_steps, model=model
+            ),
+            headers={MODEL_KEY_HEADER: model_key},
+            timeout=NO_DEADLINE,
+        )
+        return AgentResult.from_api(data)
 
 
 class BackgroundCommandFields:
