@@ -996,7 +996,7 @@ class Computer(ComputerFields):
         produced no response for about two minutes and answers 524, which
         arrives here as :class:`~mandala_computer.GatewayTimeoutError`; measured
         against ``app.mandala.computer``, an ``exec`` slower than that dies at
-        ~125s whether ``timeout`` said 270 or 3600. The command survives the
+        ~125s whether ``timeout`` said 300 or 3600. The command survives the
         request that abandoned it, so the next call on this computer may well
         report the guest agent as busy with it. Past a couple of minutes,
         :meth:`start_exec` is the only thing that works.
@@ -1419,6 +1419,14 @@ class Computer(ComputerFields):
         A proxy that answers instead of the platform raises here rather than
         coming back as a run of no steps that ended for no reason — the same
         check :meth:`agent` makes on the content type, made on the body.
+
+        The proxy in front of ``app.mandala.computer`` gives up at about two
+        minutes, measured — so on that deployment this is not a risk but a
+        certainty for any run longer than that, and it arrives as
+        :class:`~mandala_computer.GatewayTimeoutError`. The remedy is
+        :meth:`agent`, not ``start_exec``: a stream sends its headers at once
+        and heartbeats every ten seconds, so nothing about it looks idle to the
+        hop that would otherwise stop waiting.
         """
         _require_model_key(model_key)
         data = self._t.json_object(

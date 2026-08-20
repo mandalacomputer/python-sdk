@@ -22,6 +22,7 @@ from ._exceptions import (
     GatewayTimeoutError,
     MandalaError,
     NotFoundError,
+    OriginResponseError,
     OriginUnreachableError,
     PermissionDeniedError,
     PlanLimitError,
@@ -113,7 +114,12 @@ _STATUS_ERRORS = {
     # The rest of what an edge answers on its own, and the opposite event to the
     # pair above despite the neighbouring numbers: those mean the platform was
     # reached and did not answer in time, these mean it was never reached.
-    520: OriginUnreachableError,
+    #
+    # 520 is NOT one of them, which is the trap in this range. It means the
+    # platform WAS reached and answered unreadably, so it belongs with neither
+    # group and gets a class of its own — see OriginResponseError for what a
+    # wrong answer here costs.
+    520: OriginResponseError,
     521: OriginUnreachableError,
     522: OriginUnreachableError,
     523: OriginUnreachableError,
@@ -167,6 +173,16 @@ ORIGIN_UNREACHABLE_MESSAGE = (
     "Usually the platform restarting or a short outage, which clears on its "
     "own; if it persists the platform is down, and waiting is the only thing "
     "that helps"
+)
+
+#: The same, for the two of those that waiting will not fix.
+ORIGIN_RESPONSE_MESSAGE = (
+    "the platform answered a proxy in front of it with something the proxy could "
+    "not read — an empty, unknown or oversized response. Unlike an unreachable "
+    "origin, the request did arrive: it may have been carried out in full, in "
+    "part, or not at all, and it is the answer that was lost rather than never "
+    "produced. Retrying a read costs nothing; before retrying anything that "
+    "creates something, look at whether the first attempt took effect"
 )
 
 #: The same, for the two of those that waiting will not fix.
@@ -384,6 +400,13 @@ class _BaseTransport:
             if text:
                 message = text[:500]
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
+        if cls is OriginResponseError and not named:
+            # Guarded, where the unreachable statuses below are not, and the
+            # difference is which of them the platform could have spoken through.
+            # A 520 is the platform's own answer arriving mangled, so a body that
+            # parsed as this surface's JSON plausibly IS its account of what
+            # happened. On 521-526 it provably cannot be.
+            message = ORIGIN_RESPONSE_MESSAGE
         if cls is OriginUnreachableError:
             # Unconditionally, where the gateway pair below is guarded. Every one
             # of these statuses means the request never reached the platform, so
@@ -430,7 +453,7 @@ def error_for_status(status: int, message: str) -> APIError:
     there, rather than inventing a delay the platform did not name.
     """
     cls = _STATUS_ERRORS.get(status, APIError)
-    if cls is OriginUnreachableError:
+    if cls in (OriginUnreachableError, OriginResponseError):
         # For the reason below, one step further: this status arrived ON a
         # response, so the claim that the request never reached the platform is
         # not merely unproven here, it is contradicted.

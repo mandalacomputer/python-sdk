@@ -332,10 +332,12 @@ def exec_body(
     The wire field is ``timeout_s`` and the argument is ``timeout``: seconds is
     the only unit this SDK measures a wait in, so the suffix says nothing here
     that the surrounding code does not, while on the wire it is the platform's
-    name for the field and not ours to shorten. It is omitted alongside
-    ``background`` rather than sent and ignored. The server does ignore it — not waiting is the whole request — but
-    a payload carrying a deadline that means nothing is a payload somebody will
-    later read as a promise the platform never made.
+    name for the field and not ours to shorten.
+
+    The field is omitted alongside ``background`` rather than sent and ignored.
+    The server does ignore it — not waiting is the whole request — but a payload
+    carrying a deadline that means nothing is a payload somebody will later read
+    as a promise the platform never made.
 
     ``cwd`` must be absolute for the reason a file transfer's path must be: the
     guest agent inherits whatever directory it was started in, so a relative one
