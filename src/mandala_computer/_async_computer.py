@@ -77,7 +77,13 @@ class AsyncComputer(ComputerFields):
         Also how a computer from :meth:`AsyncComputers.list` acquires a
         :attr:`vnc` connect surface, which the list deliberately omits.
         """
-        self._data = _api.computer_payload(await self._t.json_object("GET", _api.computer(self.id)))
+        return await self._refresh()
+
+    async def _refresh(self, *, timeout_cap: float | None = None) -> AsyncComputer:
+        """Refresh with an optional cap used by deadline-bound wait helpers."""
+        self._data = _api.computer_payload(
+            await self._t.json_object("GET", _api.computer(self.id), timeout_cap=timeout_cap)
+        )
         return self
 
     async def start(self) -> AsyncComputer:
@@ -282,7 +288,13 @@ class AsyncComputer(ComputerFields):
                     "(it has not stopped; only this wait has)"
                 )
             await asyncio.sleep(min(poll, remaining))
-            await self.refresh()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self.id} was still building after {timeout:g}s "
+                    "(it has not stopped; only this wait has)"
+                )
+            await self._refresh(timeout_cap=remaining)
 
     async def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> AsyncComputer:
         """Await until the machine is running.
@@ -297,7 +309,10 @@ class AsyncComputer(ComputerFields):
         """
         deadline = time.monotonic() + timeout
         while True:
-            await self.refresh()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
+            await self._refresh(timeout_cap=remaining)
             if self.status == "running":
                 return self
             # A computer with no disk will never start on its own, and waiting
@@ -367,13 +382,19 @@ class AsyncComputer(ComputerFields):
             except _FATAL_WHILE_WAITING:
                 raise
             except MandalaError:
-                if self.is_building:
-                    await self.refresh()
-                    if self.build_failed:
-                        raise MandalaError(
-                            f"{self.id} could not be built: "
-                            f"{self.build_error or 'the disk copy failed'}"
-                        )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
+                try:
+                    await self._refresh(timeout_cap=remaining)
+                except _FATAL_WHILE_WAITING:
+                    raise
+                except MandalaError:
+                    pass
+                else:
+                    failure = self._guest_wait_failure()
+                    if failure is not None:
+                        raise failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
@@ -955,13 +976,17 @@ class AsyncComputer(ComputerFields):
         """
         result: AgentResult | None = None
         failure: AgentFailed | None = None
-        async for event in self.agent_stream(
-            prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
-        ):
-            if isinstance(event, AgentDone):
-                result = event.result
-            elif isinstance(event, AgentFailed):
-                failure = event
+        try:
+            async for event in self.agent_stream(
+                prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
+            ):
+                if isinstance(event, AgentDone):
+                    result = event.result
+                elif isinstance(event, AgentFailed):
+                    failure = event
+        except TimeoutError:
+            if result is None:
+                raise
         return _agent_outcome(result, failure)
 
     async def agent_once(

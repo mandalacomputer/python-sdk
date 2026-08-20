@@ -388,6 +388,7 @@ def open_url_command(url: str) -> str:
 
 def snapshot_body(memory: bool, name: str | None = None) -> dict[str, Any]:
     """A capture request. An omitted name asks the platform to generate one."""
+    _require_optional_name(name)
     body: dict[str, Any] = {"memory": memory}
     if name is not None:
         body["name"] = name
@@ -662,7 +663,9 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
     that single value and matches on it.
     """
     params: dict[str, Any] = {}
-    if width:
+    if width is not None:
+        if width <= 0:
+            raise ValueError("width must be positive")
         params["w"] = width
     if fresh:
         params["fresh"] = 1
