@@ -27,6 +27,16 @@ from __future__ import annotations
 
 import httpx
 
+from ._agent import (
+    AgentDone,
+    AgentEvent,
+    AgentFailed,
+    AgentResult,
+    AgentStep,
+    AgentStepEvent,
+    AgentText,
+    AgentUsage,
+)
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import AsyncComputers, AsyncSizes, AsyncSnapshots, AsyncTemplates
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
@@ -64,6 +74,14 @@ __all__ = [
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
     "APIError",
+    "AgentDone",
+    "AgentEvent",
+    "AgentFailed",
+    "AgentResult",
+    "AgentStep",
+    "AgentStepEvent",
+    "AgentText",
+    "AgentUsage",
     "AsyncBackgroundCommand",
     "AsyncClient",
     "AsyncComputer",
