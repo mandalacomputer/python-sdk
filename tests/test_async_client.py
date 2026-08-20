@@ -431,6 +431,33 @@ async def test_wait_for_guest_caps_the_probe_to_its_remaining_budget(
 
 
 @respx.mock
+async def test_wait_for_guest_reports_an_async_failed_start_without_probing(
+    client: mc.AsyncClient,
+) -> None:
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
+    computer = mc.AsyncComputer(
+        client._t,
+        {**COMPUTER, "status": "stopped", "start_error": "boot allocation failed"},
+    )
+    with pytest.raises(mc.MandalaError, match="boot allocation failed"):
+        await computer.wait_for_guest(timeout=30, poll=0)
+    assert not probe.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_write_file_refuses_an_oversized_body_before_the_request(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200))
+    monkeypatch.setattr(mc._computer, "FILE_SIZE_LIMIT", 2)
+    with pytest.raises(ValueError, match="may not exceed"):
+        await mc.AsyncComputer(client._t, COMPUTER).write_file("/tmp/a", "€")
+    assert not put.called
+    await client.aclose()
+
+
+@respx.mock
 async def test_a_failing_ephemeral_cleanup_keeps_the_original_error(
     client: mc.AsyncClient,
 ) -> None:
