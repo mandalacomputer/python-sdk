@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import queue
+import select
 import shutil
 import signal
 import sys
@@ -33,6 +34,7 @@ from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from ._api import looks_windows_guest_path
+from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
 from ._exceptions import MandalaError
 
@@ -94,6 +96,17 @@ def _resolve(client: Client, target: str) -> Computer:
     if named:
         ids = ", ".join(c.id for c in named)
         _die(f"{target!r} names {len(named)} computers — use an id: {ids}")
+    if not computers.is_complete:
+        if computers:
+            have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
+            _die(
+                f"no computer named {target!r} in an incomplete fleet listing. "
+                f"Known computers:\n{have}\nretry when every host is reachable"
+            )
+        _die(
+            f"no computer named {target!r} in an incomplete fleet listing; "
+            "retry when every host is reachable"
+        )
     if not computers:
         _die(f"no computer named {target!r}; the account has no computers")
     have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
@@ -188,6 +201,8 @@ def _interact(url: str) -> int:
     resize = object()
     stop_sender = object()
     outbound: queue.SimpleQueue[bytes | str | object] = queue.SimpleQueue()
+    stdin_wakeup_read: int | None = None
+    stdin_wakeup_write: int | None = None
 
     def send_size(*_sig: object) -> None:
         # A Python signal handler must not touch the socket, and websockets
@@ -196,8 +211,12 @@ def _interact(url: str) -> int:
         outbound.put(resize)
 
     def pump_stdin() -> None:
-        with suppress(OSError):
+        assert stdin_wakeup_read is not None
+        with suppress(OSError, ValueError):
             while not closed.is_set():
+                ready, _, _ = select.select((stdin, stdin_wakeup_read), (), ())
+                if stdin_wakeup_read in ready:
+                    return
                 data = os.read(stdin, 4096)
                 if not data:
                     return  # piped stdin ran dry; the shell decides what's next
@@ -222,7 +241,45 @@ def _interact(url: str) -> int:
     )
     winch_installed = False
     sigwinch: int | signal.Signals | None = getattr(signal, "SIGWINCH", None)
+    saved_exit_handlers: dict[
+        int, Callable[[int, FrameType | None], Any] | int | signal.Handlers
+    ] = {}
+    stdin_thread: threading.Thread | None = None
     exit_code: int | None = None
+    tty_raw = False
+
+    def restore_tty() -> None:
+        nonlocal tty_raw
+        if saved_tty is None or not tty_raw:
+            return
+        import termios
+
+        termios.tcsetattr(stdin, termios.TCSADRAIN, saved_tty)
+        tty_raw = False
+
+    def forward_exit_signal(signum: int, frame: FrameType | None) -> None:
+        """Put the TTY back before preserving the process's prior signal behavior."""
+        nonlocal tty_raw
+        previous = saved_exit_handlers[signum]
+        if previous == signal.SIG_IGN:
+            return
+        restore_tty()
+        signal.signal(signum, previous)
+        if callable(previous):
+            previous(signum, frame)
+            # A custom handler is allowed to return. If it does, the session is
+            # still alive, so resume raw mode and keep protecting the terminal.
+            import tty
+
+            signal.signal(signum, forward_exit_signal)
+            tty.setraw(stdin)
+            tty_raw = True
+            return
+        os.kill(os.getpid(), signum)
+        # A default terminating signal never returns. This is only a fallback
+        # for an unusual runtime (or a test double) that did not deliver it.
+        raise SystemExit(128 + signum)
+
     try:
         # Setup belongs under the same finally as restoration. In particular,
         # installing the resize handler can fail after raw mode has been set.
@@ -231,7 +288,23 @@ def _interact(url: str) -> int:
             import tty
 
             saved_tty = termios.tcgetattr(stdin)
+            # Install before raw mode, so there is no interval in which a
+            # terminating signal can leave the terminal changed.
+            for name in ("SIGTERM", "SIGHUP", "SIGQUIT"):
+                signum = getattr(signal, name, None)
+                if signum is None or int(signum) in saved_exit_handlers:
+                    continue
+                previous = signal.getsignal(signum)
+                if previous is None:
+                    previous = signal.SIG_DFL
+                saved_exit_handlers[int(signum)] = previous
+                try:
+                    signal.signal(signum, forward_exit_signal)
+                except Exception:
+                    del saved_exit_handlers[int(signum)]
+                    raise
             tty.setraw(stdin)
+            tty_raw = True
         if sys.stdout.isatty():
             send_size()
             if sigwinch is not None:
@@ -239,8 +312,10 @@ def _interact(url: str) -> int:
                 signal.signal(sigwinch, send_size)
                 winch_installed = True
 
+        stdin_wakeup_read, stdin_wakeup_write = os.pipe()
         threading.Thread(target=pump_outbound, daemon=True).start()
-        threading.Thread(target=pump_stdin, daemon=True).start()
+        stdin_thread = threading.Thread(target=pump_stdin, daemon=True)
+        stdin_thread.start()
         while True:
             message = ws.recv()
             if isinstance(message, bytes):
@@ -260,12 +335,22 @@ def _interact(url: str) -> int:
     finally:
         closed.set()
         outbound.put(stop_sender)
+        if stdin_wakeup_write is not None:
+            with suppress(OSError):
+                os.write(stdin_wakeup_write, b"\0")
+        if stdin_thread is not None:
+            stdin_thread.join()
+        for fd in (stdin_wakeup_read, stdin_wakeup_write):
+            if fd is not None:
+                with suppress(OSError):
+                    os.close(fd)
+        # The reader is gone before cooked mode returns, so it cannot consume a
+        # keystroke intended for the parent shell after this function exits.
+        restore_tty()
+        for signum, previous in saved_exit_handlers.items():
+            signal.signal(signum, previous)
         if winch_installed and sigwinch is not None:
             signal.signal(sigwinch, saved_winch)
-        if saved_tty is not None:
-            import termios
-
-            termios.tcsetattr(stdin, termios.TCSADRAIN, saved_tty)
         with suppress(ConnectionClosed, OSError, WebSocketException):
             ws.close()
     if exit_code is None:
@@ -347,7 +432,13 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     if remote_path.endswith(("/", "\\")):
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
-        data = f.read()
+        if os.fstat(f.fileno()).st_size > FILE_SIZE_LIMIT:
+            _die(f"{args.src} exceeds the 64 MiB file-transfer limit")
+        # The bounded read also covers files that grow after fstat and special
+        # files whose reported size is zero.
+        data = f.read(FILE_SIZE_LIMIT + 1)
+    if len(data) > FILE_SIZE_LIMIT:
+        _die(f"{args.src} exceeds the 64 MiB file-transfer limit")
     _resolve(_client(), target).write_file(remote_path, data)
     print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0

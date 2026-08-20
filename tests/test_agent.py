@@ -10,6 +10,8 @@ well" come apart.
 from __future__ import annotations
 
 import json
+from contextlib import aclosing
+from typing import Any
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ import respx
 
 import mandala_computer as mc
 from mandala_computer._client import MODEL_KEY_HEADER
+from mandala_computer._sse import SSEEvent
 
 BASE = "https://api.test/api/v1"
 AGENT = f"{BASE}/computers/vm-1/agent"
@@ -445,6 +448,12 @@ def test_a_step_cap_that_is_not_a_whole_number_is_refused(computer: mc.Computer)
 
 
 @respx.mock
+def test_a_boolean_is_not_a_step_cap(computer: mc.Computer) -> None:
+    with pytest.raises(ValueError, match="whole number"):
+        computer.agent("do the thing", model_key=KEY, max_steps=True)
+
+
+@respx.mock
 def test_a_step_cap_above_the_platform_ceiling_is_refused(computer: mc.Computer) -> None:
     """Capped rather than obeyed, and for the platform's own reason: each step
     is a model call plus a screenshot on the caller's key."""
@@ -619,6 +628,39 @@ async def test_the_async_client_streams_the_same_events() -> None:
         c = mc.AsyncComputer(client._t, COMPUTER)
         events = [e async for e in c.agent_stream("do the thing", model_key=KEY)]
     assert [type(e).__name__ for e in events] == ["AgentStepEvent", "AgentDone"]
+
+
+async def test_explicitly_closing_an_async_agent_stream_awaits_transport_cleanup() -> None:
+    class Frames:
+        def __init__(self) -> None:
+            self.sent = False
+            self.closed = False
+
+        def __aiter__(self) -> Frames:
+            return self
+
+        async def __anext__(self) -> SSEEvent:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return SSEEvent("step", {"n": 1})
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.frames = Frames()
+
+        def sse(self, *args: Any, **kwargs: Any) -> Frames:
+            return self.frames
+
+    transport = FakeTransport()
+    c = mc.AsyncComputer(transport, COMPUTER)  # type: ignore[arg-type]
+    async with aclosing(c.agent_stream("do the thing", model_key=KEY)) as events:
+        async for _ in events:
+            break
+    assert transport.frames.closed
 
 
 @respx.mock
