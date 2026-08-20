@@ -279,7 +279,7 @@ c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 ```
 
 The `nohup … &` is still yours to write. A GUI program does not exit on its own,
-so a foreground launch blocks until `timeout_s` kills it and comes back as a
+so a foreground launch blocks until `timeout` kills it and comes back as a
 failure — having opened the window anyway, which is a confusing pair of outcomes.
 Detach it and the call returns in well under a second.
 
@@ -324,11 +324,35 @@ Until that lands, drive the Windows desktop through `click()`, `type()` and
 
 ### Long-running commands
 
-`exec()` waits, and `timeout_s` passing means *you* stopped waiting — the
+`exec()` waits, and `timeout` passing means *you* stopped waiting — the
 command keeps running inside the guest, and its output and exit code are lost
-with the request. There is no ceiling on `timeout_s`: the HTTP budget is
-derived from it, so a long command is not cut short by the client's own
-default. For anything slower than a few seconds, start it instead:
+with the request.
+
+**`exec()` has a ceiling of about two minutes, and it is not `timeout`'s.** The
+HTTP budget is derived from `timeout` and the platform stretches its own
+deadline to match, so neither this client nor the platform is what stops a long
+command. A proxy in front of the platform is: it abandons a request that has
+produced no response for about two minutes and answers 524, which arrives as
+`GatewayTimeoutError`. Measured against `app.mandala.computer`:
+
+| command | `timeout` | result | wall clock |
+|---|---|---|---|
+| `sleep 110` | 230 | ok | 110.6s |
+| `sleep 130` | 300 | `GatewayTimeoutError` | 125.2s |
+| `sleep 130` | 3600 | `GatewayTimeoutError` | 125.3s |
+
+The last two rows are the whole point: `timeout` differs by an order of
+magnitude and the failure lands in the same place, because the ceiling belongs
+to a hop that never saw it. Raising `timeout` cannot buy time from it.
+
+The command also survives the request that abandoned it, so the call *after* a
+`GatewayTimeoutError` commonly raises `ConflictError` — the guest agent is still
+busy with the command that timed out. That is the first failure still happening,
+not a second one.
+
+So `exec()` is for commands that finish in well under two minutes. For anything
+slower — and for anything slower than a few seconds, which is a lower bar —
+start it instead:
 
 ```python
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
@@ -672,6 +696,7 @@ Everything derives from `MandalaError`.
 | `ConflictError` | 409 — right request, wrong moment; retry |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
+| `GatewayTimeoutError` | 504/524 — a proxy gave up; the work carries on |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
@@ -693,6 +718,13 @@ the fan-out that checks your plan comes back short, and so does a host with no
 room left for another guest. Retrying is the fix; `allow_partial=True` applies
 only to the two listings, which are the one case where a partial answer exists
 (see [Partial listings](#partial-listings)).
+
+`GatewayTimeoutError` is not the platform refusing anything — the request
+reached it and is very likely still running. What ended was one hop's
+willingness to hold a connection open with nothing crossing it, which is why
+retrying the same call unchanged reproduces it exactly. See
+[Long-running commands](#long-running-commands) for the ceiling and for
+`start_exec()`, which is the shape that does not meet it.
 
 `ConflictError` is the one worth catching separately, because it is the only one
 that clears itself: something is in flight that the operation cannot run
