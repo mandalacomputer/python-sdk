@@ -19,6 +19,7 @@ from ._agent import (
 )
 from ._client import (
     DEADLINE_SLACK,
+    FILE_SIZE_LIMIT,
     FILE_TIMEOUT,
     MODEL_KEY_HEADER,
     NO_DEADLINE,
@@ -101,6 +102,23 @@ def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> A
     if result is None:
         raise MandalaError("the agent stream ended without a result")
     return result
+
+
+def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
+    """Map a non-streaming body through the streaming failure contract."""
+    if "error" not in data:
+        return AgentResult.from_api(data)
+    failure = to_agent_event("error", data, 0)
+    if not isinstance(failure, AgentFailed):  # defensive: the converter owns this shape
+        raise MandalaError("the agent run failed")
+    return _agent_outcome(None, failure)
+
+
+def _file_body(data: bytes | str) -> bytes:
+    body = data.encode() if isinstance(data, str) else data
+    if len(body) > FILE_SIZE_LIMIT:
+        raise ValueError(f"file data may not exceed {FILE_SIZE_LIMIT // (1024 * 1024)} MiB")
+    return body
 
 
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -275,6 +293,22 @@ class ComputerFields:
         delete it and clone again. :attr:`build_error` says what went wrong.
         """
         return self.status == "build-failed"
+
+    def _guest_wait_failure(self) -> MandalaError | None:
+        """A cached lifecycle state from which a guest probe cannot recover."""
+        if self.build_failed:
+            return MandalaError(
+                f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+            )
+        if self.start_error:
+            return MandalaError(f"{self.id} did not start: {self.start_error}")
+        if self.status == "stopped":
+            return MandalaError(
+                f"{self.id} is stopped and its guest cannot answer: call start() first"
+            )
+        # A suspended computer is deliberately allowed through. Exec is use,
+        # and use resumes a suspended session, so the probe wakes it itself.
+        return None
 
     @property
     def build_error(self) -> str:
@@ -703,13 +737,16 @@ class Computer(ComputerFields):
         of them costs the full timeout and then reports "the guest did not
         respond", which is both wrong and the least useful thing this method
         could say about a 401.
+
+        A stopped computer is also refused immediately, including one carrying
+        :attr:`start_error` from a failed boot. A suspended computer is not:
+        running the probe counts as use and resumes its saved session.
         """
         deadline = time.monotonic() + timeout
         while True:
-            if self.build_failed:
-                raise MandalaError(
-                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
-                )
+            failure = self._guest_wait_failure()
+            if failure is not None:
+                raise failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
@@ -1055,8 +1092,9 @@ class Computer(ComputerFields):
         A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
         The bytes land exactly as given — this is how a credential reaches a
         guest ``.env`` without echoing it through a shell command line.
+        Bodies over 64 MiB are refused before any request is made.
         """
-        body = data.encode() if isinstance(data, str) else data
+        body = _file_body(data)
         self._t.request(
             "PUT",
             _api.files(self.id),
@@ -1357,7 +1395,7 @@ class Computer(ComputerFields):
             headers={MODEL_KEY_HEADER: model_key},
             timeout=NO_DEADLINE,
         )
-        return AgentResult.from_api(data)
+        return _agent_once_outcome(data)
 
 
 class BackgroundCommandFields:
