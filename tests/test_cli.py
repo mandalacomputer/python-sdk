@@ -281,3 +281,41 @@ def test_write_all_handles_an_empty_frame(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(_cli.os, "write", lambda fd, data: calls.append(data) or len(data))
     _cli._write_all(1, b"")
     assert not calls
+
+
+# --- control frames --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("frame", "want"),
+    [
+        ('{"type": "exit", "code": 3}', 3),
+        ('{"type": "exit", "code": 0}', 0),
+        ('{"type": "exit"}', 0),
+        ('{"type": "resize", "cols": 80}', None),
+        ('{"type": "error", "message": "nope"}', None),
+        ("not json at all", None),
+        ("", None),
+        # Valid JSON that is not an object. Each of these parses, and then has
+        # no `.get` — an AttributeError main() does not catch, so one stray
+        # frame ended an interactive session in a traceback.
+        ("null", None),
+        ("5", None),
+        ('"hi"', None),
+        ("[1, 2]", None),
+        ("true", None),
+        # An exit frame whose code is unreadable is still an exit.
+        ('{"type": "exit", "code": [1]}', 0),
+        ('{"type": "exit", "code": "abc"}', 0),
+        ('{"type": "exit", "code": null}', 0),
+        ('{"type": "exit", "code": "7"}', 7),
+    ],
+)
+def test_exit_code_reads_only_an_exit_frame(frame: str, want: int | None) -> None:
+    """Junk on this socket is tolerated, whatever shape it arrives in.
+
+    The pump already skipped unparseable bytes; valid JSON that was not an
+    object crashed instead. Tolerating one and dying on the other is not a
+    distinction worth making about a peer we do not control.
+    """
+    assert _cli._exit_code(frame) == want
