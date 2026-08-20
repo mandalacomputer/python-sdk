@@ -755,10 +755,12 @@ class Computer(ComputerFields):
 
         What it does not wait through is a refusal that will never clear: a revoked
         key, a computer that is not there, an account that is not allowed, a
-        plan that does not cover this. Those are raised at once. Waiting on one
-        of them costs the full timeout and then reports "the guest did not
+        plan that does not cover this, a rate limit, or a TLS handshake the edge
+        and the platform cannot agree on. Those are raised at once. Waiting on
+        one of them costs the full timeout and then reports "the guest did not
         respond", which is both wrong and the least useful thing this method
-        could say about a 401.
+        could say about a 401 — or, as measured, about an expired certificate
+        that had already told the caller to report it rather than wait it out.
 
         A stopped computer is also refused immediately, including one carrying
         :attr:`start_error` from a failed boot. A suspended computer is not:
