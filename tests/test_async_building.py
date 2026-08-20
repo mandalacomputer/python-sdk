@@ -6,6 +6,8 @@ anyone noticing until a clone hung.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 import respx
@@ -64,6 +66,34 @@ async def test_wait_until_built_raises_with_the_reason(client: mc.AsyncClient) -
     with pytest.raises(mc.MandalaError, match="no space left on device"):
         await mc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=5, poll=0)
     assert route.call_count == 2
+    await client.aclose()
+
+
+@respx.mock
+async def test_wait_until_built_clamps_its_last_sleep(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
+    now = iter((0.0, 0.75))
+    sleeps: list[float] = []
+
+    async def capture_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(mc._async_computer, "time", SimpleNamespace(monotonic=lambda: next(now)))
+    monkeypatch.setattr(mc._async_computer, "asyncio", SimpleNamespace(sleep=capture_sleep))
+    await mc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=1, poll=5)
+    assert sleeps == [0.25]
+    await client.aclose()
+
+
+@respx.mock
+async def test_wait_until_running_points_building_computers_at_the_build_wait(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILDING))
+    with pytest.raises(mc.MandalaError, match=r"wait_until_built\(\).+start\(\)"):
+        await mc.AsyncComputer(client._t, BUILDING).wait_until_running(timeout=30, poll=0)
     await client.aclose()
 
 

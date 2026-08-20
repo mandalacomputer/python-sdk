@@ -899,6 +899,19 @@ def test_a_short_listing_says_so_rather_than_reading_as_a_smaller_fleet(
     assert computers.incomplete == 3
 
 
+def test_listing_transformations_preserve_partial_state() -> None:
+    partial = mc.Listing.of([1, 2, 3], incomplete=4)
+
+    for transformed in (partial.copy(), partial[1:], partial + [4]):
+        assert isinstance(transformed, mc.Listing)
+        assert transformed.incomplete == 4
+        assert not transformed.is_complete
+
+    combined = mc.Listing.of([0]) + partial
+    assert combined.incomplete == 4
+    assert not combined.is_complete
+
+
 @respx.mock
 def test_a_short_listing_that_cannot_say_by_how_much_is_still_short(
     client: mc.Client,
@@ -1150,6 +1163,13 @@ def test_a_background_exec_returns_a_handle_and_no_deadline(client: mc.Client) -
     body = json.loads(route.calls.last.request.content)
     assert body == {"command": "make", "background": True, "cwd": "/src"}
     assert (job.pid, job.command) == (4242, "make")
+
+
+@respx.mock
+def test_a_background_exec_requires_a_positive_pid(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
+    with pytest.raises(mc.MandalaError, match="positive pid"):
+        _computer(client).start_exec("make")
 
 
 @respx.mock
@@ -1727,6 +1747,16 @@ def test_exec_result_equality_ignores_the_raw_payload() -> None:
 def _budget(route: respx.Route) -> dict[str, float | None]:
     """The timeout httpx was actually handed for the last call on this route."""
     return dict(route.calls.last.request.extensions["timeout"])
+
+
+def test_widening_a_mixed_timeout_keeps_infinite_halves_and_widens_finite_ones() -> None:
+    read_unbounded = httpx.Timeout(connect=1, read=None, write=2, pool=1)
+    widened = mc._client._BaseTransport._budget(read_unbounded, 10)
+    assert widened.read is None and widened.write == 10
+
+    write_unbounded = httpx.Timeout(connect=1, read=2, write=None, pool=1)
+    widened = mc._client._BaseTransport._budget(write_unbounded, 10)
+    assert widened.read == 10 and widened.write is None
 
 
 @respx.mock

@@ -27,8 +27,10 @@ import shutil
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from contextlib import suppress
-from typing import TYPE_CHECKING, NoReturn
+from types import FrameType
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from ._api import looks_windows_guest_path
 from ._computer import Computer
@@ -79,7 +81,10 @@ def _client() -> Client:
 
 def _resolve(client: Client, target: str) -> Computer:
     """The computer ``target`` names — an exact id, or a unique name."""
-    computers = client.computers.list()
+    # Resolution is not a fleet-wide consistency decision. One unreachable
+    # hypervisor must not block ssh/scp to a computer on a healthy one, and the
+    # partial response still carries cached id-only rows for unavailable hosts.
+    computers = client.computers.list(allow_partial=True)
     for c in computers:
         if c.id == target:
             return c
@@ -212,18 +217,28 @@ def _interact(url: str) -> int:
                 ws.send(message)
 
     saved_tty = None
-    if sys.stdin.isatty():
-        import termios
-        import tty
-
-        saved_tty = termios.tcgetattr(stdin)
-        tty.setraw(stdin)
-    if sys.stdout.isatty():
-        send_size()
-        signal.signal(signal.SIGWINCH, send_size)
-
+    saved_winch: Callable[[int, FrameType | None], Any] | int | signal.Handlers | None = (
+        signal.SIG_DFL
+    )
+    winch_installed = False
+    sigwinch: int | signal.Signals | None = getattr(signal, "SIGWINCH", None)
     exit_code: int | None = None
     try:
+        # Setup belongs under the same finally as restoration. In particular,
+        # installing the resize handler can fail after raw mode has been set.
+        if sys.stdin.isatty():
+            import termios
+            import tty
+
+            saved_tty = termios.tcgetattr(stdin)
+            tty.setraw(stdin)
+        if sys.stdout.isatty():
+            send_size()
+            if sigwinch is not None:
+                saved_winch = signal.getsignal(sigwinch)
+                signal.signal(sigwinch, send_size)
+                winch_installed = True
+
         threading.Thread(target=pump_outbound, daemon=True).start()
         threading.Thread(target=pump_stdin, daemon=True).start()
         while True:
@@ -245,6 +260,8 @@ def _interact(url: str) -> int:
     finally:
         closed.set()
         outbound.put(stop_sender)
+        if winch_installed and sigwinch is not None:
+            signal.signal(sigwinch, saved_winch)
         if saved_tty is not None:
             import termios
 
