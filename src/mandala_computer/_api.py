@@ -625,5 +625,34 @@ def cursor_body() -> dict[str, Any]:
     return {"action": "cursor_position"}
 
 
-def screenshot_params(width: int | None) -> dict[str, Any] | None:
-    return {"w": width} if width else None
+def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] | None:
+    """``w`` downscales, ``fresh`` skips the cache.
+
+    A bare screenshot may be served from a frame up to 1.5 seconds old, which is
+    right for a thumbnail and wrong for a loop: a model shown the frame from
+    before its own click concludes the click missed and clicks again, and the
+    second one lands on whatever the first one opened. ``fresh`` is therefore
+    not an optimisation to reach for when a screenshot looks stale — it is what
+    every screenshot feeding a decision wants, and the cost of it is one capture.
+
+    Sent as ``1`` rather than ``true``: the platform documents the parameter as
+    that single value and matches on it.
+    """
+    params: dict[str, Any] = {}
+    if width:
+        params["w"] = width
+    if fresh:
+        params["fresh"] = 1
+    return params or None
+
+
+def stop_params(force: bool) -> dict[str, Any] | None:
+    """``force=true`` pulls the power instead of asking the guest to shut down.
+
+    Absent, the guest is asked and given time to do it. Present, it is not —
+    the equivalent of holding the button in, and anything the guest had not
+    written to disk is lost with it. Kept off by default for that reason: this
+    is what to reach for when a guest will not come down on its own, not the
+    ordinary way to stop one.
+    """
+    return {"force": "true"} if force else None

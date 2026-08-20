@@ -259,6 +259,17 @@ class Snapshot:
     #: dropping them removes precisely the markers saying the answer is
     #: incomplete, and then reports a confident count.
     unreachable: bool = False
+    #: The shape the capture was taken at, which is the shape a
+    #: :meth:`~mandala_computer.Snapshots.clone` of it comes up as. Worth
+    #: reading before cloning: a snapshot carries its own sizing rather than
+    #: the source computer's current one, so a computer resized after the
+    #: capture clones back to what it was, not to what it is.
+    os: str = ""
+    template: str = ""
+    cpu: int = 0
+    ram_mb: int = 0
+    disk_gb: int = 0
+    resolution: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -295,6 +306,12 @@ class Snapshot:
             computer_name=str(d.get("computer_name", "")),
             orphaned=bool(d.get("orphaned", False)),
             unreachable=bool(d.get("unreachable", False)),
+            os=str(d.get("os", "")),
+            template=str(d.get("template", "")),
+            cpu=int(d.get("cpu", 0)),
+            ram_mb=int(d.get("ram_mb", 0)),
+            disk_gb=int(d.get("disk_gb", 0)),
+            resolution=str(d.get("resolution", "")),
             raw=dict(d),
         )
 

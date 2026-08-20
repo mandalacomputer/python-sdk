@@ -193,6 +193,45 @@ def test_screenshot_width_becomes_query_param(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_screenshot_fresh_becomes_query_param(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"png"))
+    mc.Computer(client._t, COMPUTER).screenshot(fresh=True)
+    # `1`, not `true`: the platform documents the parameter as that one value.
+    assert route.calls.last.request.url.params["fresh"] == "1"
+
+
+@respx.mock
+def test_screenshot_is_cached_unless_asked_otherwise(client: mc.Client) -> None:
+    """The default sends neither parameter, and that is the cheap answer.
+
+    Worth pinning rather than leaving implied: making `fresh` the default would
+    turn every thumbnail into a capture, and dropping it would put a drive loop
+    back on frames that predate its own clicks.
+    """
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"png"))
+    mc.Computer(client._t, COMPUTER).screenshot()
+    assert "fresh" not in route.calls.last.request.url.params
+    assert "w" not in route.calls.last.request.url.params
+
+
+@respx.mock
+def test_stop_force_becomes_query_param(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/stop").mock(httpx.Response(200, json={"ok": True}))
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    mc.Computer(client._t, COMPUTER).stop(force=True)
+    assert route.calls.last.request.url.params["force"] == "true"
+
+
+@respx.mock
+def test_stop_asks_the_guest_by_default(client: mc.Client) -> None:
+    """No `force` unless it was asked for — this one can lose unwritten data."""
+    route = respx.post(f"{BASE}/computers/vm-1/stop").mock(httpx.Response(200, json={"ok": True}))
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    mc.Computer(client._t, COMPUTER).stop()
+    assert "force" not in route.calls.last.request.url.params
+
+
+@respx.mock
 def test_exec_nonzero_exit_is_returned_not_raised(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
@@ -895,6 +934,75 @@ def test_an_orphaned_snapshot_says_which_operation_still_works(client: mc.Client
     (s,) = client.snapshots.list()
     assert s.orphaned
     assert s.computer_name == "was-dev"
+
+
+@respx.mock
+def test_a_snapshot_carries_the_shape_it_would_clone_back_as(client: mc.Client) -> None:
+    """The sizing on a snapshot is the capture's, not the source computer's now.
+
+    Which is the whole reason to read it before cloning: a computer resized
+    after the capture clones back to what it was.
+    """
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "snap-1",
+                    "computer_id": "vm-1",
+                    "os": "linux",
+                    "template": "base",
+                    "cpu": 2,
+                    "ram_mb": 4096,
+                    "disk_gb": 40,
+                    "resolution": "1920x1080x24",
+                },
+            ],
+        )
+    )
+    (snap,) = client.snapshots.list()
+    assert (snap.os, snap.template) == ("linux", "base")
+    assert (snap.cpu, snap.ram_mb, snap.disk_gb) == (2, 4096, 40)
+    assert snap.resolution == "1920x1080x24"
+
+
+@respx.mock
+def test_a_snapshot_without_a_shape_reads_empty_rather_than_raising(client: mc.Client) -> None:
+    """An unreachable stub carries an id and nothing else, this included."""
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(200, json=[{"id": "snap-1", "unreachable": True}])
+    )
+    (snap,) = client.snapshots.list()
+    assert snap.unreachable
+    assert (snap.os, snap.cpu, snap.resolution) == ("", 0, "")
+
+
+@respx.mock
+def test_a_computer_carries_its_workspace_and_its_schedule(client: mc.Client) -> None:
+    """Both readable off a computer already in hand, without a second call."""
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(
+            200,
+            json={
+                **COMPUTER,
+                "workspace_id": "ws-7",
+                "snapshot_schedule": {"enabled": True, "hour": 3, "minute": 30, "tz": "UTC"},
+            },
+        )
+    )
+    c = client.computers.get("vm-1")
+    assert c.workspace_id == "ws-7"
+    assert c.snapshot_schedule == {"enabled": True, "hour": 3, "minute": 30, "tz": "UTC"}
+
+
+@respx.mock
+def test_a_computer_with_neither_says_so_rather_than_inventing_one(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    c = client.computers.get("vm-1")
+    assert c.workspace_id == ""
+    # None, not an empty mapping: "no schedule" and "a schedule that is off"
+    # are different answers, and set_schedule(enabled=False) is the second.
+    assert c.snapshot_schedule is None
 
 
 @respx.mock
