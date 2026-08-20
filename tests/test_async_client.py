@@ -623,3 +623,16 @@ async def test_a_platform_that_named_the_failure_keeps_its_own_words(
     with pytest.raises(mc.GatewayTimeoutError) as e:
         await client.computers.get("vm-1")
     assert str(e.value) == "upstream unavailable before dispatch"
+
+
+@respx.mock
+async def test_an_origin_never_reached_is_not_one_that_stopped_answering(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half classifies the 52x range exactly as the sync half does."""
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(522, content=b""))
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        await client.computers.get("vm-1")
+    assert e.value.status == 522
+    assert not isinstance(e.value, mc.GatewayTimeoutError)
+    assert "never arrived" in str(e.value)

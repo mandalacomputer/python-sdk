@@ -697,6 +697,7 @@ Everything derives from `MandalaError`.
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
 | `GatewayTimeoutError` | 504/524 — a proxy gave up; the work carries on |
+| `OriginUnreachableError` | 520-523/525/526 — a proxy never reached it at all |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
@@ -729,6 +730,15 @@ it sent one, and the SDK's own explanation where the hop sent an empty or HTML
 body — which is the usual case, since a 524 is generated at the edge. See
 [Long-running commands](#long-running-commands) for the ceiling and for
 `start_exec()`, which is the shape that does not meet it.
+
+`OriginUnreachableError` is its opposite, and that is why they are two classes
+sitting in neighbouring numbers. A gateway timeout means the request arrived and
+its work carries on; these mean it never arrived, so nothing was started and
+there is nothing to account for. 520-523 are usually the platform restarting and
+clear on their own. 525 and 526 are a TLS handshake the edge and the platform
+cannot agree on, which fails identically on every retry — `str(e)` says which of
+the two you have, because one is worth waiting out and the other is worth
+reporting.
 
 `ConflictError` is the one worth catching separately, because it is the only one
 that clears itself: something is in flight that the operation cannot run
