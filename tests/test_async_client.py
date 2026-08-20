@@ -610,3 +610,16 @@ async def test_an_ordinary_gateway_timeout_lands_in_the_same_place(
     with pytest.raises(mc.GatewayTimeoutError) as e:
         await client.computers.get("vm-1")
     assert e.value.status == 504
+
+
+@respx.mock
+async def test_a_platform_that_named_the_failure_keeps_its_own_words(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half substitutes on the same condition the sync half does."""
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(504, json={"error": "upstream unavailable before dispatch"})
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        await client.computers.get("vm-1")
+    assert str(e.value) == "upstream unavailable before dispatch"
