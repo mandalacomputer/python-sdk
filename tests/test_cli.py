@@ -578,6 +578,53 @@ def test_stdin_reader_is_woken_and_joined_before_return(monkeypatch: pytest.Monk
         _cli.os.close(stdin_write)
 
 
+def test_sender_is_joined_before_the_websocket_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    real_thread = threading.Thread
+    tracked: dict[str, TrackedThread] = {}
+
+    class TrackedThread:
+        def __init__(self, *, target: object, daemon: bool) -> None:
+            assert callable(target)
+            self.target_name = target.__name__
+            self.thread = real_thread(target=target, daemon=daemon)
+            self.joined = False
+            tracked[self.target_name] = self
+
+        def start(self) -> None:
+            self.thread.start()
+
+        def join(self) -> None:
+            self.joined = True
+            self.thread.join()
+
+    class FakeConnection:
+        def recv(self) -> str:
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            assert tracked["pump_outbound"].joined
+
+    monkeypatch.setattr(_cli.threading, "Thread", TrackedThread)
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+
+    assert _cli._interact("wss://terminal.test") == 0
+    assert tracked["pump_stdin"].joined
+
+
 def test_terminating_signal_restores_raw_tty_before_forwarding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

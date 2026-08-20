@@ -271,6 +271,7 @@ def create_body(
             "size already names a template and a shape; send size alone, "
             "or template/cpu/ram_mb/disk_gb without it"
         )
+    _require_optional_name(name)
     body: dict[str, Any] = {"start": start}
     for key, value in (
         ("name", name),
@@ -287,7 +288,18 @@ def create_body(
 
 
 def name_body(name: str | None) -> dict[str, Any]:
+    """An optional name for a clone.
+
+    Omission asks the platform to generate one. Empty text cannot express that
+    omission and is refused consistently with create and rename.
+    """
+    _require_optional_name(name)
     return {} if name is None else {"name": name}
+
+
+def _require_optional_name(name: str | None) -> None:
+    if name is not None and not name.strip():
+        raise ValueError("name must not be empty")
 
 
 def rename_body(name: str) -> dict[str, Any]:
@@ -298,8 +310,7 @@ def rename_body(name: str) -> dict[str, Any]:
     caller cleared the field, and a round trip to be told so is a round trip
     that never had to happen.
     """
-    if not name.strip():
-        raise ValueError("name must not be empty")
+    _require_optional_name(name)
     return {"name": name}
 
 
