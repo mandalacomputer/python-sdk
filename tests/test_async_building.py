@@ -49,9 +49,21 @@ async def test_wait_until_built_polls_until_the_disk_lands(
 
 @respx.mock
 async def test_wait_until_built_raises_with_the_reason(client: mc.AsyncClient) -> None:
-    respx.get(f"{BASE}/computers/vm-new").mock(return_value=httpx.Response(200, json=FAILED))
+    """The failure has to be discovered by polling, not read off the handle.
+
+    Seeded with FAILED this passed without making a single request — the cached
+    check at the top of the loop raised, and the poll this file exists to cover
+    never ran. So it starts building, like the sync analogue.
+    """
+    route = respx.get(f"{BASE}/computers/vm-new").mock(
+        side_effect=[
+            httpx.Response(200, json=BUILDING),
+            httpx.Response(200, json=FAILED),
+        ]
+    )
     with pytest.raises(mc.MandalaError, match="no space left on device"):
-        await mc.AsyncComputer(client._t, FAILED).wait_until_built(timeout=5, poll=0)
+        await mc.AsyncComputer(client._t, BUILDING).wait_until_built(timeout=5, poll=0)
+    assert route.call_count == 2
     await client.aclose()
 
 
