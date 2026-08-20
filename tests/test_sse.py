@@ -137,3 +137,40 @@ def test_a_stream_cut_mid_character_leaves_a_visible_mark() -> None:
 def test_a_stream_of_nothing_yields_nothing() -> None:
     assert drain(b"") == []
     assert drain() == []
+
+
+def test_a_leading_byte_order_mark_is_not_part_of_the_first_field() -> None:
+    """An intermediary that re-encodes the stream is entitled to add one.
+
+    Left on, it is glued to the front of the first line, which then matches
+    neither `event:` nor `data:` — so the first frame carries no data, is
+    dropped as a comment-only frame, and the run loses its opening step with
+    nothing anywhere saying why.
+    """
+    assert drain("﻿".encode() + b'event: step\ndata: {"n": 1}\n\n') == [("step", {"n": 1})]
+
+
+def test_a_byte_order_mark_split_across_chunks_is_still_consumed() -> None:
+    """It is three bytes, and the network may put a boundary inside them."""
+    bom = "﻿".encode()
+    assert drain(bom[:2], bom[2:] + b"data: hi\n\n") == [("message", "hi")]
+
+
+def test_a_mark_that_is_not_leading_is_left_alone() -> None:
+    """Only the one at the start of the stream is framing. Inside a payload it
+    is a character the model wrote, and eating it would edit the text."""
+    assert drain("data: caf﻿é\n\n".encode()) == [("message", "caf﻿é")]
+
+
+def test_flushing_twice_does_not_hand_over_the_same_event_twice() -> None:
+    """A decoder is a thing you feed until it is empty, and `flush` empties it.
+
+    Both transports call it once, so nothing is wrong today — but a second call
+    that re-parsed the same tail would report one step of somebody's run twice,
+    which is the kind of trap that is cheaper to close than to find later.
+    """
+    decoder = SSEDecoder()
+    decoder.feed(b'event: done\ndata: {"stop": "end_turn"}\n')
+    first = decoder.flush()
+    assert first is not None and first.event == "done"
+    assert decoder.flush() is None

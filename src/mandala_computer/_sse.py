@@ -91,7 +91,13 @@ class SSEDecoder:
         # `flush` — where strict RAISES on a stream cut mid-character. That
         # would turn a run whose result had already arrived into an exception
         # thrown by the tidying-up afterwards.
-        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        #
+        # "utf-8-sig", not "utf-8", so a leading BOM is consumed rather than
+        # left on the front of the first line. The platform does not send one,
+        # but an intermediary that re-encodes the stream may, and a BOM glued to
+        # `event:` matches neither field name — so the whole first frame, which
+        # is the one carrying the first step, is silently dropped.
+        self._decoder = codecs.getincrementaldecoder("utf-8-sig")("replace")
         self._buffer = ""
         self._swallow_lf = False
 
@@ -127,6 +133,12 @@ class SSEDecoder:
         above holds those bytes back waiting for the rest — so without this the
         final event silently loses them and looks complete. Flushed, they decode
         to U+FFFD, which is a visible mark that something was cut off.
+
+        Takes the tail rather than reading it. Both transports call this once,
+        but a decoder that answered a second call with the same event would hand
+        a caller one step of their run twice — a decoder is a thing you feed
+        until it is empty, and this is what empties it.
         """
         self._buffer += self._decoder.decode(b"", final=True)
-        return parse_event(self._buffer)
+        tail, self._buffer = self._buffer, ""
+        return parse_event(tail)

@@ -373,6 +373,92 @@ def test_a_done_frame_with_nothing_in_it_is_survivable(computer: mc.Computer) ->
     assert not result.finished and result.stop == "unknown" and result.text == ""
 
 
+# --- what a malformed frame must not cost ---------------------------------
+
+
+@respx.mock
+def test_a_number_too_big_to_be_one_does_not_take_the_result_with_it(
+    computer: mc.Computer,
+) -> None:
+    """JSON has no integer ceiling and neither does Python's `int`.
+
+    A 400-digit literal parses fine and only fails on the way to a `float`, as
+    an OverflowError rather than the ValueError a malformed number usually
+    raises — so it escaped the one function whose whole job is that no bad field
+    loses the run's answer along with it.
+    """
+    huge = "1" + "0" * 400
+    respx.post(AGENT).mock(
+        stream(frame("done", f'{{"steps": {huge}, "stop": "end_turn", "text": "all set"}}'))
+    )
+    result = computer.agent("do the thing", model_key=KEY)
+    assert result.finished and result.text == "all set" and result.steps == 0
+
+
+@respx.mock
+@pytest.mark.parametrize("n", ["null", '"two"', "0", "-3", "1e999"])
+def test_a_step_number_that_is_not_usable_falls_back_to_the_count(
+    computer: mc.Computer, n: str
+) -> None:
+    """Steps count from 1, so anything that is not a positive whole number is
+    the same as no number at all — and reading one as 0 puts the "0." in a
+    caller's progress line that the fallback exists to prevent."""
+    respx.post(AGENT).mock(stream(frame("step", f'{{"n": {n}}}'), DONE_FRAME))
+    (step, _) = computer.agent_stream("do the thing", model_key=KEY)
+    assert step.step.n == 1
+
+
+@respx.mock
+def test_a_text_frame_that_said_nothing_is_not_an_event(computer: mc.Computer) -> None:
+    """Skipped like any other frame this SDK cannot read.
+
+    The README's loop prints what it is handed, so an empty AgentText is a blank
+    line in somebody's output standing for a payload whose shape we did not
+    recognise — which is the opposite of what skipping the unmodelled is for.
+    """
+    respx.post(AGENT).mock(
+        stream(
+            frame("text", '{"delta": "hi"}'),
+            frame("text", '{"text": ""}'),
+            frame("text", '{"text": "really said something"}'),
+            DONE_FRAME,
+        )
+    )
+    said = [
+        e.text
+        for e in computer.agent_stream("do the thing", model_key=KEY)
+        if isinstance(e, mc.AgentText)
+    ]
+    assert said == ["really said something"]
+
+
+# --- the step cap, checked the way the platform checks it -----------------
+
+
+@respx.mock
+def test_a_step_cap_that_is_not_a_whole_number_is_refused(computer: mc.Computer) -> None:
+    """The platform's `stepCap` requires `Number.isInteger`. Sending 2.5 buys a
+    400 on a route where the round trip is the thing this check exists to
+    save."""
+    with pytest.raises(ValueError, match="whole number"):
+        computer.agent("do the thing", model_key=KEY, max_steps=2.5)  # type: ignore[arg-type]
+
+
+@respx.mock
+def test_a_step_cap_above_the_platform_ceiling_is_refused(computer: mc.Computer) -> None:
+    """Capped rather than obeyed, and for the platform's own reason: each step
+    is a model call plus a screenshot on the caller's key."""
+    with pytest.raises(ValueError, match="may not exceed 100"):
+        computer.agent("do the thing", model_key=KEY, max_steps=101)
+
+
+@respx.mock
+def test_the_ceiling_itself_is_still_allowed(computer: mc.Computer) -> None:
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    computer.agent("do the thing", model_key=KEY, max_steps=mc._api.MAX_STEPS)
+    assert json_body(route)["max_steps"] == 100
+
+
 # --- what a failure carries -----------------------------------------------
 
 
@@ -488,6 +574,38 @@ def test_a_client_of_your_own_still_sets_the_stream_budget() -> None:
     patient = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=600.0))
     mc.Computer(patient._t, COMPUTER).agent("do the thing", model_key=KEY)
     assert _budget(route)["read"] == 600.0
+
+
+def test_a_mid_stream_rate_limit_says_it_has_no_delay_to_offer(
+    computer: mc.Computer,
+) -> None:
+    """The one place `retry_after` is None on purpose.
+
+    A 429 reported inside a stream arrived on a response that was a 200, so
+    there is no `Retry-After` header anywhere to read — and inventing a delay
+    the platform did not name would be worse than saying nothing. Pinned because
+    the docstring makes a promise about when this is None.
+    """
+    with respx.mock:
+        respx.post(AGENT).mock(stream(frame("error", '{"error": "slow down", "status": 429}')))
+        with pytest.raises(mc.RateLimitError) as e:
+            computer.agent("do the thing", model_key=KEY)
+    assert e.value.retry_after is None and e.value.status == 429
+
+
+def test_the_module_declares_everything_the_package_re_exports() -> None:
+    """`__all__` is the module's account of its own surface.
+
+    Nothing star-imports it today, so a name missing from it is invisible —
+    which is exactly why it drifts, and why the package's own export list is the
+    thing to check it against.
+    """
+    from mandala_computer import _agent
+
+    exported = {n for n in mc.__all__ if n.startswith("Agent")}
+    assert exported == set(_agent.__all__)
+    for name in _agent.__all__:
+        assert hasattr(_agent, name), name
 
 
 # --- the async half --------------------------------------------------------

@@ -418,7 +418,8 @@ one request as `X-Model-Key`. The platform never stores one, never bills you for
 it, and will not fall back to anything — so the key is a per-call argument
 rather than something the client holds. Every step is a model call plus a
 screenshot on that key, which is why `max_steps` bounds spending as much as it
-bounds the loop.
+bounds the loop. It is a whole number from 1 to 100 — the platform's ceiling,
+which the SDK refuses past rather than spending a round trip to be told.
 
 **The computer must already be running.** This route will not start one for you:
 starting is billable, and it is not a decision to make on your behalf because

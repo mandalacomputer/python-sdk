@@ -98,8 +98,14 @@ class RateLimitError(APIError):
         retry_after: float | None = None,
     ) -> None:
         super().__init__(message, status=status, body=body)
-        #: Seconds to wait before retrying, from ``Retry-After``. ``None`` only
-        #: if the header was missing or unparseable, which should not happen.
+        #: Seconds to wait before retrying, from ``Retry-After``.
+        #:
+        #: ``None`` where there was no usable header, which on an ordinary
+        #: response should not happen — every 429 on this surface carries one.
+        #: The exception is a 429 the agent loop reported from inside a stream:
+        #: the response there was a 200 and the refusal is an event in its body,
+        #: so there is no header to read and nothing to guess from. That is the
+        #: one place to expect this to be ``None`` and back off on your own.
         self.retry_after = retry_after
 
 

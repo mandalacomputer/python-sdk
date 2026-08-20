@@ -261,6 +261,12 @@ def error_for_status(status: int, message: str) -> APIError:
     every other route gets for free has to be reached for by hand here. Without
     it the one failure that reaches a caller from inside a stream is the one
     their ``except AuthenticationError`` cannot catch.
+
+    A 429 arriving this way has no ``Retry-After`` to carry, because the header
+    belonged to a response that was a success. So this is the one path that
+    builds a :class:`~mandala_computer.RateLimitError` whose
+    :attr:`~mandala_computer.RateLimitError.retry_after` is ``None`` — see it
+    there, rather than inventing a delay the platform did not name.
     """
     return _STATUS_ERRORS.get(status, APIError)(message, status=status)
 

@@ -29,6 +29,7 @@ __all__ = [
     "AgentFailed",
     "AgentResult",
     "AgentStep",
+    "AgentStepEvent",
     "AgentText",
     "AgentUsage",
 ]
@@ -37,13 +38,19 @@ __all__ = [
 def _num(value: Any) -> int:
     """A count off the wire, or ``0``.
 
-    Never raises. A malformed number in one field must not lose the run's result
-    along with it — a step count that arrived as ``null`` is worth reporting as
-    zero, and is not worth discarding the model's answer over.
+    Never raises, and the word is load-bearing: a malformed number in one field
+    must not lose the run's result along with it — a step count that arrived as
+    ``null`` is worth reporting as zero, and is not worth discarding the model's
+    answer over.
+
+    ``OverflowError`` is caught alongside the two obvious ones because JSON has
+    no integer ceiling and Python's ``int`` has none either, so a 400-digit
+    literal parses fine and only fails on the way to a ``float``. It is a
+    malformed number like any other here.
     """
     try:
         n = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return 0
     # NaN and the infinities parse as floats and are not counts. int(nan) raises
     # and int(inf) raises too, so this is the guard as much as the filter.
@@ -73,9 +80,18 @@ class AgentStep:
 
     @classmethod
     def from_api(cls, d: Any, fallback_n: int) -> AgentStep:
+        """This step, with ``fallback_n`` standing in for a number it did not give.
+
+        "Did not give" is any unusable number, not only a missing key: steps
+        count from 1, so a ``null``, a string, or a zero all mean the same thing
+        — nothing to number this step by — and reading one as ``0`` would put
+        the "0." in a caller's progress line that the fallback exists to
+        prevent.
+        """
         r = d if isinstance(d, Mapping) else {}
+        n = _num(r.get("n"))
         return cls(
-            n=fallback_n if r.get("n") is None else _num(r.get("n")),
+            n=n if n > 0 else fallback_n,
             tool=_text(r.get("tool")),
             action=_text(r.get("action")),
             detail=_text(r.get("detail")),
@@ -209,8 +225,12 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
     if event == "step":
         return AgentStepEvent(AgentStep.from_api(data, step_count + 1))
     if event == "text":
-        text = data.get("text") if isinstance(data, Mapping) else data
-        return AgentText(_text(text))
+        text = _text(data.get("text") if isinstance(data, Mapping) else data)
+        # A frame that said nothing is skipped like any other frame this SDK
+        # cannot read. The README's loop prints what it is handed, and an empty
+        # AgentText is a blank line in a caller's output standing for a payload
+        # whose shape we did not recognise.
+        return AgentText(text) if text else None
     if event == "done":
         return AgentDone(AgentResult.from_api(data))
     if event == "error":
