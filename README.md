@@ -400,6 +400,88 @@ what separates that from an action the guest simply could not report on.
 wallpaper window. Off by default because a stock guest showing one terminal has
 five windows, four of which are not applications. Linux only.
 
+### Letting the platform drive
+
+`agent()` hands the whole loop to the platform: it screenshots, asks a model
+what to do, does it, and repeats, until the task is done or it runs out of
+steps. The point is that ten clicks stop being ten images in your context.
+
+```python
+result = c.agent("Open the settings and turn on dark mode.", model_key=key)
+print(result.text)
+if not result.finished:
+    print(f"did not finish: {result.stop}")
+```
+
+**It runs on your own Anthropic key**, passed as `model_key` and sent on that
+one request as `X-Model-Key`. The platform never stores one, never bills you for
+it, and will not fall back to anything — so the key is a per-call argument
+rather than something the client holds. Every step is a model call plus a
+screenshot on that key, which is why `max_steps` bounds spending as much as it
+bounds the loop. It is a whole number from 1 to 100 — the platform's ceiling,
+which the SDK refuses past rather than spending a round trip to be told.
+
+**The computer must already be running.** This route will not start one for you:
+starting is billable, and it is not a decision to make on your behalf because
+you sent a prompt. A stopped or suspended computer is a `ConflictError`, and so
+is one another run is already driving.
+
+A run is minutes of clicking, so `agent_stream()` reports as it goes — something
+that says nothing until it is over cannot be told from a hang:
+
+```python
+for event in c.agent_stream("Find the cheapest flight to Lisbon", model_key=key):
+    match event:
+        case mc.AgentStepEvent(step):
+            print(f"{step.n}. {step.detail}")
+        case mc.AgentText(text):
+            print(text)
+        case mc.AgentDone(result):
+            print(f"{result.stop} after {result.steps} steps")
+```
+
+`agent()` is that loop waited out, and it streams underneath for the same
+reason: it is the same request either way, and the streaming one is the request
+a proxy between you and the platform will not close for being quiet. Use
+`agent_once()` — one non-streaming request — only if you cannot use a stream at
+all.
+
+**A run that ends unfinished does not raise.** `max_steps`, `rate_limited` and
+`refusal` all leave real work on the desktop, and raising would throw away the
+only account of what was done to the machine. Check `result.finished`, which is
+`stop == "end_turn"` and nothing else — including for a stop reason added after
+this SDK was written. What *does* raise is a failure the platform reports
+mid-run, as whatever class its status deserves: a bad model key comes back as an
+`AuthenticationError`, not as something your handler cannot classify.
+
+That raise carries the run with it. `e.agent` holds what the loop had already
+spent on your model key and the steps it had already taken, so a failure at step
+eight stays an account of eight steps rather than only a message — the spend is
+on a key the platform never meters, and the clicks are still on the desktop.
+`agent_stream()` hands the same record over as an `AgentFailed` event.
+
+```python
+try:
+    c.agent("Book the flight", model_key=key)
+except mandala_computer.MandalaError as e:
+    if e.agent:
+        print(f"{len(e.agent.steps)} steps, {e.agent.usage.input_tokens} tokens in")
+```
+
+Every step spends your Mandala rate budget too — the same budget your own calls
+draw on, at the same price, because a click through here costs what a click plus
+a screenshot costs anywhere. A run that exhausts it stops where it is and ends
+`rate_limited` rather than failing.
+
+Events this SDK does not model are skipped rather than raised on, so the
+platform adding an event type does not break your loop. Breaking out of the loop
+closes the stream, which is what stops the run.
+
+The platform also exposes the same engine behind an OpenAI-shaped door at
+`POST /chat/completions`. This SDK deliberately does not wrap it: if you want
+that, you already have an OpenAI client — point its `base_url` here, which is
+the whole reason the door is there.
+
 ### Readiness
 
 `create()` returns as soon as the API does; the machine is starting, not ready.
@@ -683,11 +765,12 @@ lands on an allowlisted route, so drift fails here rather than in a user's hands
 
 Drift has two directions, and that test pins both. `ALLOWED` mirrors the
 platform's `V1_ROUTES` table in full, and `UNIMPLEMENTED` names the part of it
-this SDK cannot yet reach — currently `POST computers/:id/agent` and `POST
-chat/completions`, both of which need SSE. Without the second set the first
-proves nothing over time: "every call lands on an allowlisted route" stays true
-no matter how far behind the client falls, so closing a gap means deleting a
-line from `UNIMPLEMENTED` rather than nobody noticing.
+this SDK does not reach — currently just `POST chat/completions`, and that one
+by choice rather than by lag: a caller who wants an OpenAI-shaped door already
+has an OpenAI client to point at it. Without the second set the first proves
+nothing over time: "every call lands on an allowlisted route" stays true no
+matter how far behind the client falls, so closing a gap means deleting a line
+from `UNIMPLEMENTED` rather than nobody noticing.
 
 A mirror nobody compares is a comment, though, and that is not hypothetical:
 background exec and the snapshot holdings landed upstream and stayed invisible

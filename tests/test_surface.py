@@ -6,7 +6,7 @@ runtime in a user's hands rather than here. This asserts every request the SDK
 can issue lands on an allowlisted route.
 
 Keep ALLOWED in step with V1_ROUTES in `web/lib/surface.ts` in the platform repo.
-It mirrors that table in full, including the routes this SDK cannot yet call —
+It mirrors that table in full, including the routes this SDK does not call —
 those are named in UNIMPLEMENTED, which is what keeps the distance between the
 two visible rather than letting it grow quietly.
 
@@ -22,6 +22,7 @@ remember is the same hole one step further back.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -65,8 +66,8 @@ ALLOWED = {
     ("DELETE", "computers/:id/schedule"),
     ("PUT", "computers/:id/files"),
     ("GET", "computers/:id/files"),
-    # Reachable, and not yet reached from here — see UNIMPLEMENTED.
     ("POST", "computers/:id/agent"),
+    # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
 
@@ -79,9 +80,15 @@ ALLOWED = {
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # OPL-3567. One call that drives the computer until the task is done, and
-    # the same engine behind an OpenAI-shaped door. Both need SSE.
-    ("POST", "computers/:id/agent"),
+    # The OpenAI-shaped door onto the agent loop, which `POST
+    # computers/:id/agent` is the front of and this SDK does drive.
+    #
+    # Deliberately not wrapped, and not a gap waiting to be closed: a caller who
+    # wants this route already has an OpenAI client and points its base_url
+    # here, which is the entire reason the platform put the door there. A
+    # second, worse OpenAI client inside this SDK would be a maintenance
+    # obligation with no user. The TypeScript SDK leaves it out for the same
+    # reason, in the same set.
     ("POST", "chat/completions"),
 }
 
@@ -90,6 +97,11 @@ SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", 
 HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
 WINDOW = {"id": "0x2600003", "title": "T", "class": "Firefox"}
 EXEC_STATUS = {"pid": 4242, "running": False, "exited": True, "exit_code": 0}
+# One agent run, over in a frame. The route answers a stream whether or not
+# `stream` was set — a non-streaming run is the same body without the framing —
+# so the handler below serves this to both, and `agent_once` reads it as JSON.
+AGENT_DONE = b'event: done\ndata: {"steps": 1, "stop": "end_turn", "text": "done"}\n\n'
+AGENT_RESULT = {"steps": 1, "stop": "end_turn", "text": "done"}
 
 
 def pattern_for(path: str) -> str:
@@ -134,6 +146,15 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"png")
     if path.endswith("/files"):
         return httpx.Response(200, content=b"bytes")
+    if path.endswith("/agent"):
+        # The streaming and non-streaming forms are one route and one handler
+        # here, told apart by what the caller asked for — which is the same
+        # thing the platform does with `stream`.
+        if json.loads(request.content or b"{}").get("stream"):
+            return httpx.Response(
+                200, content=AGENT_DONE, headers={"Content-Type": "text/event-stream"}
+            )
+        return httpx.Response(200, json=AGENT_RESULT)
     if path.endswith("/exec"):
         return httpx.Response(
             200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False, "pid": 4242}
@@ -226,6 +247,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.schedule()
     c.set_schedule(enabled=True, hour=4, tz="UTC")
     c.clear_schedule()
+    c.agent("do the thing", model_key="sk-ant-test")
+    c.agent_once("do the thing", model_key="sk-ant-test")
     client.computers.list(allow_partial=True)
     client.snapshots.list()
     client.snapshots.list(include_unfinished=True, allow_partial=True)
@@ -295,6 +318,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.schedule()
     await c.set_schedule(enabled=True, hour=4, tz="UTC")
     await c.clear_schedule()
+    await c.agent("do the thing", model_key="sk-ant-test")
+    await c.agent_once("do the thing", model_key="sk-ant-test")
     await client.computers.list(allow_partial=True)
     await client.snapshots.list()
     await client.snapshots.list(include_unfinished=True, allow_partial=True)

@@ -79,8 +79,14 @@ def test_same_call_signatures() -> None:
             )
 
 
-def test_async_io_methods_are_coroutines() -> None:
-    """Anything that talks to the API must be awaitable, or it silently blocks."""
+def test_async_io_methods_are_awaitable_or_iterable() -> None:
+    """Anything that talks to the API must be awaited or iterated, not called.
+
+    A coroutine function for the ordinary case, and an async generator for the
+    one route that answers with a stream. Both are checked, because the failure
+    this guards against is the same either way: a plain method doing IO on the
+    async client blocks the event loop, and nothing about calling it says so.
+    """
     non_io = {
         "ephemeral",  # an async context manager, not a coroutine function
         # Builds a handle around a pid the caller already has. It makes no
@@ -96,9 +102,23 @@ def test_async_io_methods_are_coroutines() -> None:
                 inspect.getattr_static(async_cls, name, None), property
             ):
                 continue
-            assert inspect.iscoroutinefunction(getattr(async_cls, name)), (
-                f"{async_cls.__name__}.{name} is not a coroutine function"
+            fn = getattr(async_cls, name)
+            assert inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn), (
+                f"{async_cls.__name__}.{name} is neither a coroutine function "
+                "nor an async generator"
             )
+
+
+def test_a_sync_generator_is_mirrored_by_an_async_one() -> None:
+    """The stream route specifically, since the check above accepts either.
+
+    Without this, an `agent_stream` that lost its `yield` on the async side and
+    became an ordinary coroutine returning a list would pass every other test
+    here — same name, same parameters, still awaitable — while quietly turning
+    a stream a caller reports progress from into a minutes-long silence.
+    """
+    assert inspect.isgeneratorfunction(mc.Computer.agent_stream)
+    assert inspect.isasyncgenfunction(mc.AsyncComputer.agent_stream)
 
 
 def test_field_accessors_are_shared_not_copied() -> None:

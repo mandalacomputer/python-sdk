@@ -646,6 +646,58 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
     return params or None
 
 
+#: The platform's ceiling on ``max_steps``, mirrored.
+#:
+#: ``MAX_MAX_STEPS`` in the platform's ``web/lib/agent.ts``, and kept in step by
+#: ``scripts/check_surface.py`` — a mirror nobody compares is a comment, and one
+#: that drifts refuses a run the platform would have taken.
+#:
+#: Capped rather than obeyed for the reason the platform gives: each step is a
+#: model call plus a screenshot on the caller's own key, so a ``max_steps`` of
+#: ten thousand is a request to spend their money for an hour on a task that has
+#: plainly gone wrong.
+MAX_STEPS = 100
+
+
+def agent_body(
+    prompt: str,
+    *,
+    stream: bool,
+    system: str | None = None,
+    max_steps: int | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """One agent run's request.
+
+    An empty prompt is refused here rather than sent. The platform would answer
+    400, but a run is the one call on this surface where a round trip is not the
+    whole cost of getting it wrong: the request that comes back is billed
+    against the caller's own model key, and nothing else in this file lets a
+    caller spend money to be told they typed nothing.
+
+    ``max_steps`` is checked for the same reason — it is the spending bound, and
+    a zero or a negative is a request to do no work, which is not what anybody
+    means by it. It is checked the way the platform checks it, rather than only
+    at the near end of the range: a whole number, at least 1, and no more than
+    :data:`MAX_STEPS`. A ``2.5`` or a ``10000`` that got through here would come
+    back as the 400 this function exists to save the caller.
+    """
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    if max_steps is not None:
+        if not isinstance(max_steps, int):
+            raise ValueError("max_steps must be a whole number")
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1")
+        if max_steps > MAX_STEPS:
+            raise ValueError(f"max_steps may not exceed {MAX_STEPS}")
+    body: dict[str, Any] = {"prompt": prompt, "stream": stream}
+    for key, value in (("system", system), ("max_steps", max_steps), ("model", model)):
+        if value is not None:
+            body[key] = value
+    return body
+
+
 def stop_params(force: bool) -> dict[str, Any] | None:
     """``force=true`` pulls the power instead of asking the guest to shut down.
 

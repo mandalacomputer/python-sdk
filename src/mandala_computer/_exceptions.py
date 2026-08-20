@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._agent import AgentFailed
+
 __all__ = [
     "APIError",
     "AuthenticationError",
@@ -18,6 +23,20 @@ __all__ = [
 
 class MandalaError(Exception):
     """Base class for every error this SDK raises."""
+
+    #: The failed agent run behind this error, or ``None`` — which is every
+    #: error that did not come out of one.
+    #:
+    #: Set by :meth:`~mandala_computer.Computer.agent`, which has to raise: the
+    #: platform reports a mid-run failure as an event rather than a status, and
+    #: the class that status deserves is not one that can carry a run. Without
+    #: it, collecting the stream would be the one way of running the agent that
+    #: throws away what the run had already spent and already done — the
+    #: :attr:`~mandala_computer.AgentFailed.usage` billed to your own model key,
+    #: and the :attr:`~mandala_computer.AgentFailed.steps` that are still on the
+    #: desktop. :meth:`~mandala_computer.Computer.agent_stream` hands the same
+    #: record over as an event and never needs this.
+    agent: AgentFailed | None = None
 
 
 class APIError(MandalaError):
@@ -79,8 +98,14 @@ class RateLimitError(APIError):
         retry_after: float | None = None,
     ) -> None:
         super().__init__(message, status=status, body=body)
-        #: Seconds to wait before retrying, from ``Retry-After``. ``None`` only
-        #: if the header was missing or unparseable, which should not happen.
+        #: Seconds to wait before retrying, from ``Retry-After``.
+        #:
+        #: ``None`` where there was no usable header, which on an ordinary
+        #: response should not happen — every 429 on this surface carries one.
+        #: The exception is a 429 the agent loop reported from inside a stream:
+        #: the response there was a 200 and the refusal is an event in its body,
+        #: so there is no header to read and nothing to guess from. That is the
+        #: one place to expect this to be ``None`` and back off on your own.
         self.retry_after = retry_after
 
 
