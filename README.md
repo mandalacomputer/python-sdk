@@ -696,9 +696,10 @@ Everything derives from `MandalaError`.
 | `ConflictError` | 409 — right request, wrong moment; retry |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
-| `GatewayTimeoutError` | 504/524 — a proxy gave up; the work carries on |
-| `OriginResponseError` | 520 — it answered, unreadably; the work may have happened |
-| `OriginUnreachableError` | 521-523/525/526 — a proxy never reached it at all |
+| `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on |
+| `OriginResponseError` | 520 — it was reached; the exchange broke on the way back |
+| `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
+| `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
@@ -721,33 +722,42 @@ room left for another guest. Retrying is the fix; `allow_partial=True` applies
 only to the two listings, which are the one case where a partial answer exists
 (see [Partial listings](#partial-listings)).
 
-`GatewayTimeoutError` is not the platform refusing anything — the request
-reached it, and any work it had already started carries on. What ended was one
-hop's willingness to hold a connection open with nothing crossing it, which is
-why retrying the same call unchanged reproduces it exactly. After one on an
-`exec()` the next call may report the guest agent busy; after one on a read
-there is nothing left behind. `str(e)` carries the platform's own message where
-it sent one, and the SDK's own explanation where the hop sent an empty or HTML
-body — which is the usual case, since a 524 is generated at the edge. See
-[Long-running commands](#long-running-commands) for the ceiling and for
+These four are the edge failing rather than the platform refusing, and they are
+four classes rather than one because a caller asking *did my work happen* needs
+four different answers.
+
+`GatewayTimeoutError` is a hop that stopped waiting. Usually the platform has
+the request and is still working on it — that is what a 524 is — so retrying the
+same call unchanged reproduces it exactly, and after one on an `exec()` the next
+call may report the guest agent busy. A strong default rather than a guarantee,
+though: a 504 can come from a hop that never reached the platform, and a 524 can
+end an upload whose body had not finished arriving. `str(e)` carries the
+platform's own message where it sent one, and the SDK's explanation otherwise.
+See [Long-running commands](#long-running-commands) for the ceiling and for
 `start_exec()`, which is the shape that does not meet it.
 
-`OriginUnreachableError` is its opposite, and that is why they are separate
-classes sitting in neighbouring numbers. A gateway timeout means the request
-arrived and its work carries on; these mean it never arrived, so nothing was
-started and there is nothing to account for. 521-523 are usually the platform
-restarting and clear on their own. 525 and 526 are a TLS handshake the edge and
-the platform cannot agree on, which fails identically on every retry — `str(e)`
-says which of the two you have, because one is worth waiting out and the other
-is worth reporting.
+`OriginUnreachableError` is its near-opposite: 521-523, a proxy that could not
+reach the platform at all. Almost always the request was never sent, so nothing
+was started — *almost*, because a connection can also time out after it was
+established, and bytes already on the wire are not unsent because no answer came
+back. Usually the platform restarting, and it clears on its own.
 
-`OriginResponseError` is 520 alone, and it is the trap in that range. Despite the
-neighbouring number it does **not** mean the platform was never reached: it means
-the platform answered and the proxy could not read the answer. So the work may
-have happened in full, in part, or not at all. Retrying a read costs nothing;
-before retrying anything that *creates* something, check whether the first
-attempt took effect — the alternative is two computers where you meant one, both
-billable, on the strength of an error that looked like nothing happened.
+`OriginTLSError` is 525 and 526, and it is the one edge failure with no waiting
+in it. An expired or mismatched certificate fails identically on every retry, so
+the `wait_*` helpers raise it immediately instead of spending their timeout on
+it. It is a deployment somebody has to fix.
+
+`OriginResponseError` is 520 alone, and it is the trap in that range. Despite
+the neighbouring number it does **not** mean the platform was never reached: it
+means the platform *was* reached and the exchange broke on the way back. So the
+work may have happened in full, in part, or not at all. Retrying a read costs
+nothing; before retrying anything that *creates* something, check whether the
+first attempt took effect — the alternative is two computers where you meant
+one, both billable, on the strength of an error that looked like nothing
+happened.
+
+The rule of thumb across all four: reads are always safe to retry, and anything
+that creates deserves a look first.
 
 One caveat the table cannot show: these classes are for failures that arrive as
 an HTTP status. The agent loop reports its own failures as events inside a

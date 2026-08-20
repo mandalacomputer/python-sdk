@@ -16,6 +16,7 @@ __all__ = [
     "MandalaError",
     "NotFoundError",
     "OriginResponseError",
+    "OriginTLSError",
     "OriginUnreachableError",
     "PermissionDeniedError",
     "PlanLimitError",
@@ -80,10 +81,17 @@ class PlanLimitError(APIError):
 class GatewayTimeoutError(APIError):
     """A proxy in front of the platform gave up before the platform answered (504, 524).
 
-    Not the platform refusing anything. The request reached it and nothing was
-    cancelled — what ended was one hop's willingness to hold the connection open
-    with no response crossing it, so any work the request had already started
-    carries on without it.
+    Not the platform refusing anything. What ended was one hop's willingness to
+    hold the connection open with no response crossing it, so anything the
+    request had already set going carries on without it.
+
+    Usually that means the platform received the request and is still working on
+    it, which is what a 524 is: the edge connected, sent it, and gave up waiting
+    for the answer. It is a strong default rather than a guarantee. A 504 can be
+    raised by a hop that never reached the platform at all, and a 524 can end an
+    upload whose body had not finished arriving — so before retrying something
+    that *creates* rather than reads, check whether the first attempt took
+    effect.
 
     The ceiling this reports is not the SDK's and not ``timeout``\'s: it belongs
     to whatever sits between the caller and the platform, and it is reached at
@@ -116,10 +124,11 @@ class OriginResponseError(APIError):
     happened, and this is the one status whose honest answer is "unknown".
 
     A 524 means the request arrived and is still being worked on. 521-523 mean it
-    never arrived, so nothing was started. A 520 means it **did** arrive — the
-    platform received it and then returned an empty, unknown or oversized
-    response, so it may have been carried out in full, in part, or not at all,
-    and the answer was lost rather than never produced.
+    almost certainly never arrived. A 520 means it **did** arrive and the
+    exchange then broke on the way back: an empty or unreadable response, a
+    connection dropped before headers, an origin that crashed part-way. So the
+    work may have been carried out in full, in part, or not at all, and no
+    answer may ever have been produced to lose.
 
     Which makes a blind retry the thing to be careful about. Re-sending a read
     costs nothing; re-sending a create can leave two computers where one was
@@ -145,21 +154,37 @@ class OriginUnreachableError(APIError):
     guest agent gets opposite answers, correctly — which is why they are two
     types rather than more statuses on one.
 
-    521-523 are an origin that is down or unreachable, which is what a platform
-    restart looks like from outside and does clear. 525 and 526 are a TLS
-    handshake the edge and the platform cannot agree on — an expired
-    certificate, a mismatched name — which fails identically on every retry.
-    ``str(e)`` says which of the two this is, because the right response differs:
-    wait, or report it.
+    An origin that is down or unreachable, which is what a platform restart looks
+    like from outside and does clear. :meth:`~mandala_computer.Computer.wait_for_guest`
+    waits one out, as it waits out every error not named in
+    ``_FATAL_WHILE_WAITING``. :meth:`~mandala_computer.Computer.wait_until_built`
+    and :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they
+    read the computer's state with no retry around it, so one of these mid-poll
+    ends the wait.
 
-    :meth:`~mandala_computer.Computer.wait_for_guest` waits one of these out, as
-    it waits out every error not named in ``_FATAL_WHILE_WAITING``.
-    :meth:`~mandala_computer.Computer.wait_until_built` and
-    :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they read
-    the computer's state without a retry around it, so one 522 mid-poll ends the
-    wait. That is unchanged by this class existing, and whether the three of them
-    should agree is part of a wider question about how the clients decide
-    transience, being settled separately rather than here.
+    "Never arrived" is the overwhelmingly likely reading and not a proof. A 522
+    is a connection that timed out, which is usually a request that was never
+    sent — but the edge can also give up after the connection was established,
+    and bytes already on the wire are not unsent because the acknowledgement was
+    lost. So it is safe to retry a read on one of these, and worth a look before
+    retrying something that creates.
+    """
+
+
+class OriginTLSError(APIError):
+    """525, 526 — a proxy and the platform could not agree on TLS.
+
+    Split from :class:`OriginUnreachableError`, which it used to share, because
+    the two need opposite answers to "should I try again". An unreachable origin
+    is a passing outage; an expired or mismatched certificate fails identically
+    on every retry, and is a deployment somebody has to go and fix.
+
+    Being its own class is what lets the ``wait_*`` helpers act on that. Sharing
+    one meant ``_FATAL_WHILE_WAITING`` could not name it, so
+    :meth:`~mandala_computer.Computer.wait_for_guest` retried a certificate
+    failure for its full 180 seconds and then reported "the guest did not
+    respond" — losing the cause, the class and the three minutes, while this
+    error's own message said to report it rather than wait it out.
     """
 
 

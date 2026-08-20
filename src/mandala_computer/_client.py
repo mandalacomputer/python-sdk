@@ -23,6 +23,7 @@ from ._exceptions import (
     MandalaError,
     NotFoundError,
     OriginResponseError,
+    OriginTLSError,
     OriginUnreachableError,
     PermissionDeniedError,
     PlanLimitError,
@@ -123,26 +124,29 @@ _STATUS_ERRORS = {
     521: OriginUnreachableError,
     522: OriginUnreachableError,
     523: OriginUnreachableError,
-    525: OriginUnreachableError,
-    526: OriginUnreachableError,
+    # Their own class, not more entries on the one above: an unreachable origin
+    # is a passing outage and these are a deployment somebody has to fix, so a
+    # caller asking "should I try again" needs opposite answers.
+    525: OriginTLSError,
+    526: OriginTLSError,
 }
-
-#: The two of those that waiting cannot fix.
-#:
-#: 525 and 526 are a handshake the edge and the platform cannot agree on, which
-#: fails the same way on every retry. The other four are an origin that is down,
-#: which is what a restart looks like from outside and does come back.
-TLS_STATUSES = frozenset({525, 526})
 
 #: What a caller is told when a proxy abandoned their request and named nothing.
 #:
 #: Used only where the response carried no message of the platform's own — an
-#: empty body, or an intermediary's HTML error page. A 524 is generated at the
-#: edge, so that is the usual case: Cloudflare content-negotiates its page, and
-#: every request from this client asks for JSON, so the body arrives empty and
-#: ``str(e)`` read ``HTTP 524`` — a caller with nowhere to go, which is where
-#: the ceiling below cost real debugging time. Where the platform *did* name the
-#: failure, its own words are better than these and are kept; see :meth:`_error`.
+#: empty body, or an intermediary's HTML error page. Where the platform *did*
+#: name the failure, its own words are better than these and are kept; see
+#: :meth:`_error`.
+#:
+#: Measured against ``app.mandala.computer`` on 2026-08-20: Cloudflare
+#: content-negotiates its error page, and every request from this client asks
+#: for JSON, so the body arrived **empty** and ``str(e)`` read ``HTTP 524`` — a
+#: caller with nowhere to go, which is where the ceiling below cost real
+#: debugging time. Stated as a measurement rather than a rule, because it is a
+#: property of an edge this SDK does not own: a proxy that answers 5xx with a
+#: structured body instead (RFC 9457 names its fields ``title`` and ``detail``,
+#: not ``error``) still lands here, which is safe — a proxy's account of the
+#: platform is not the platform's, and ``e.body`` keeps it either way.
 #:
 #: Worded for any route, because any of them can meet the ceiling. The exec
 #: sentence is hedged for the same reason — most callers arrive here from one,
@@ -162,36 +166,41 @@ GATEWAY_TIMEOUT_MESSAGE = (
 
 #: What a caller is told when a proxy could not reach the platform at all.
 #:
-#: No "did the platform name it" guard on this one, unlike the gateway pair, and
-#: the asymmetry is the point: every one of these statuses means the request
-#: never reached the platform, so there is no reading on which the body carries
-#: its account of what happened. There is nothing to defer to.
+#: No "did the platform name it" guard on any of the three below, unlike the
+#: gateway pair, and the asymmetry is the point: on these the edge never got an
+#: answer out of the platform, so a body cannot carry its account of what
+#: happened. There is nothing to defer to.
 ORIGIN_UNREACHABLE_MESSAGE = (
-    "a proxy in front of the platform could not reach it. The request never "
-    "arrived, so nothing was started and nothing is running — unlike a gateway "
-    "timeout, there is no work on the other side of this to account for. "
-    "Usually the platform restarting or a short outage, which clears on its "
-    "own; if it persists the platform is down, and waiting is the only thing "
-    "that helps"
+    "a proxy in front of the platform could not reach it. Almost always that "
+    "means the request was never sent, so nothing was started and there is no "
+    "work on the other side of this to account for — unlike a gateway timeout. "
+    "Almost, rather than never, because a connection can also time out after it "
+    "was established, and bytes already on the wire are not unsent because the "
+    "answer never came back: retry a read freely, and look before retrying "
+    "something that creates. Usually this is the platform restarting or a short "
+    "outage, which clears on its own; if it persists the platform is down, and "
+    "waiting is the only thing that helps"
 )
 
-#: The same, for the two of those that waiting will not fix.
+#: What a caller is told when the platform was reached and the exchange broke.
 ORIGIN_RESPONSE_MESSAGE = (
-    "the platform answered a proxy in front of it with something the proxy could "
-    "not read — an empty, unknown or oversized response. Unlike an unreachable "
-    "origin, the request did arrive: it may have been carried out in full, in "
-    "part, or not at all, and it is the answer that was lost rather than never "
-    "produced. Retrying a read costs nothing; before retrying anything that "
+    "the platform received the request and the exchange then broke on the way "
+    "back — an empty or unreadable response, a connection dropped before the "
+    "headers, an origin that stopped part-way. Unlike an unreachable origin, the "
+    "request did arrive, so it may have been carried out in full, in part, or "
+    "not at all. Retrying a read costs nothing; before retrying anything that "
     "creates something, look at whether the first attempt took effect"
 )
 
-#: The same, for the two of those that waiting will not fix.
+#: What a caller is told when the edge and the platform cannot agree on TLS.
+#:
+#: The one edge failure with no "wait and see" in it, which is why it is raised
+#: rather than waited out — see ``_FATAL_WHILE_WAITING``.
 ORIGIN_TLS_MESSAGE = (
     "a proxy in front of the platform could not complete a TLS handshake with "
-    "it. The request never arrived, so nothing was started and nothing is "
-    "running. This is a misconfigured deployment rather than a passing outage — "
-    "an expired or mismatched certificate fails the same way on every retry, so "
-    "report it rather than waiting it out"
+    "it, so the request was never sent. This is a misconfigured deployment "
+    "rather than a passing outage — an expired or mismatched certificate fails "
+    "the same way on every retry, so report it rather than waiting it out"
 )
 
 #: How many rows a listing is short by. Present means short; the number can be
@@ -407,17 +416,16 @@ class _BaseTransport:
             # parsed as this surface's JSON plausibly IS its account of what
             # happened. On 521-526 it provably cannot be.
             message = ORIGIN_RESPONSE_MESSAGE
+        if cls is OriginTLSError:
+            return OriginTLSError(ORIGIN_TLS_MESSAGE, status=resp.status_code, body=body)
         if cls is OriginUnreachableError:
-            # Unconditionally, where the gateway pair below is guarded. Every one
-            # of these statuses means the request never reached the platform, so
+            # Unconditionally, where the gateway pair below is guarded. These
+            # statuses mean the edge never got an answer out of the platform, so
             # a body cannot be the platform's account of what happened and there
             # is nothing to defer to.
-            said = (
-                ORIGIN_TLS_MESSAGE
-                if resp.status_code in TLS_STATUSES
-                else (ORIGIN_UNREACHABLE_MESSAGE)
+            return OriginUnreachableError(
+                ORIGIN_UNREACHABLE_MESSAGE, status=resp.status_code, body=body
             )
-            return OriginUnreachableError(said, status=resp.status_code, body=body)
         if cls is GatewayTimeoutError and not named:
             # The substitution is worth making twice over and worth NOT making a
             # third time. An empty body leaves "HTTP 524", which says nothing; an
@@ -453,7 +461,7 @@ def error_for_status(status: int, message: str) -> APIError:
     there, rather than inventing a delay the platform did not name.
     """
     cls = _STATUS_ERRORS.get(status, APIError)
-    if cls in (OriginUnreachableError, OriginResponseError):
+    if cls in (OriginUnreachableError, OriginResponseError, OriginTLSError):
         # For the reason below, one step further: this status arrived ON a
         # response, so the claim that the request never reached the platform is
         # not merely unproven here, it is contradicted.
