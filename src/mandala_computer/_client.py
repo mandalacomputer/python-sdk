@@ -53,16 +53,33 @@ DEADLINE_SLACK = 15.0
 #: large one the platform is still willing to finish.
 FILE_TIMEOUT = 300.0
 
-#: A request with no deadline at all, for the agent loop.
+#: A request with no deadline at all, for the non-streaming agent loop.
 #:
 #: Not a very large number: a run is minutes of clicking with no upper bound
 #: anybody can name, and any finite guess would end every run longer than the
-#: guess at exactly the same place. The two routes it is used on both hold one
-#: request open for the whole run — the streaming form because that is what a
-#: stream is, and the non-streaming form because it answers only at the end —
-#: so the ordinary deadline is not a safety net here, it is a cut-off. Closing
-#: the generator, or abandoning the call, is what stops one early.
+#: guess at exactly the same place. ``agent_once`` holds one request open for
+#: the whole run and answers only at the end, so nothing crosses the connection
+#: to time a shorter budget against — the ordinary deadline is not a safety net
+#: there, it is a cut-off. Abandoning the call is what stops one early.
+#:
+#: The streaming form does have something to time against, which is why it uses
+#: :data:`STREAM_IDLE_TIMEOUT` instead.
 NO_DEADLINE = math.inf
+
+#: How long a stream may say nothing before the transport gives up on it.
+#:
+#: An httpx ``read`` budget is per-chunk idle time, not total run duration, so
+#: this bounds the silence rather than the run: a stream that keeps arriving
+#: runs as long as it likes. That distinction is what makes a finite number
+#: right here and wrong for :data:`NO_DEADLINE` — the platform sends
+#: ``: keepalive`` every 10s precisely so a quiet run still ticks, and six
+#: missed heartbeats is a connection that is gone rather than one that is busy.
+#:
+#: Without it, a connection dropped without a FIN — a NAT rebind, a load
+#: balancer reaping an idle socket, a laptop suspended mid-run — leaves the
+#: caller blocked forever on a stream nothing will ever arrive on, which the
+#: generator cannot be closed out of from inside the call that is waiting.
+STREAM_IDLE_TIMEOUT = 60.0
 
 #: The header carrying the caller's own model key. Never stored by the platform,
 #: never metered, and never held on this client either — see
@@ -206,6 +223,14 @@ class _BaseTransport:
         )
 
     @staticmethod
+    def _not_an_object(method: str, path: str, resp: httpx.Response) -> MandalaError:
+        """The complaint for a 200 that carried no object to read a result out of."""
+        content_type = resp.headers.get("content-type") or "no content type"
+        return MandalaError(
+            f"{method} {path} answered {content_type}, not a JSON object: {resp.text.strip()[:200]}"
+        )
+
+    @staticmethod
     def _error(resp: httpx.Response) -> APIError:
         body: Any = None
         message = f"HTTP {resp.status_code}"
@@ -340,8 +365,9 @@ class Transport(_BaseTransport):
         run is going: an agent run is minutes of clicking, and something that
         says nothing until it is over cannot be told from a hang.
 
-        No deadline — see :data:`NO_DEADLINE`. Closing the generator is what
-        stops one early, and it closes the response with it.
+        No deadline on the run, but a bound on its silence — see
+        :data:`STREAM_IDLE_TIMEOUT`. Closing the generator is what stops one
+        early, and it closes the response with it.
         """
         sent = {**(headers or {}), "Accept": "text/event-stream"}
         try:
@@ -350,7 +376,7 @@ class Transport(_BaseTransport):
                 self._url(path),
                 json=json,
                 headers=self._sent(sent),
-                timeout=self._budget(self._http.timeout, NO_DEADLINE),
+                timeout=self._budget(self._http.timeout, STREAM_IDLE_TIMEOUT),
             ) as resp:
                 if not resp.is_success:
                     # Read first: the body of a streamed response is not there
@@ -371,6 +397,23 @@ class Transport(_BaseTransport):
 
     def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(self.request(method, path, **kw))
+
+    def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
+        """:meth:`json`, for a route whose answer is only useful as an object.
+
+        The captive-portal case that :meth:`_is_event_stream` catches on the
+        streaming half of a route, for the half that has no frames to notice it
+        by: a proxy that answered instead of the platform sends an HTML page,
+        which parses to ``None``, and the tolerant ``from_api`` constructors
+        turn ``None`` into a well-formed record of nothing having happened. That
+        is a sentence about the platform, describing something that never
+        reached it — the same failure, and the same complaint, either way.
+        """
+        resp = self.request(method, path, **kw)
+        data = self._parse(resp)
+        if not isinstance(data, Mapping):
+            raise self._not_an_object(method, path, resp)
+        return data
 
     def listing(self, path: str, **kw: Any) -> tuple[Any, int | None]:
         """A collection read, and whether the platform had to answer it short.
@@ -443,8 +486,9 @@ class AsyncTransport(_BaseTransport):
         run is going: an agent run is minutes of clicking, and something that
         says nothing until it is over cannot be told from a hang.
 
-        No deadline — see :data:`NO_DEADLINE`. Closing the generator is what
-        stops one early, and it closes the response with it.
+        No deadline on the run, but a bound on its silence — see
+        :data:`STREAM_IDLE_TIMEOUT`. Closing the generator is what stops one
+        early, and it closes the response with it.
         """
         sent = {**(headers or {}), "Accept": "text/event-stream"}
         try:
@@ -453,7 +497,7 @@ class AsyncTransport(_BaseTransport):
                 self._url(path),
                 json=json,
                 headers=self._sent(sent),
-                timeout=self._budget(self._http.timeout, NO_DEADLINE),
+                timeout=self._budget(self._http.timeout, STREAM_IDLE_TIMEOUT),
             ) as resp:
                 if not resp.is_success:
                     await resp.aread()
@@ -473,6 +517,17 @@ class AsyncTransport(_BaseTransport):
 
     async def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(await self.request(method, path, **kw))
+
+    async def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
+        """:meth:`json`, for a route whose answer is only useful as an object.
+
+        See :meth:`Transport.json_object`.
+        """
+        resp = await self.request(method, path, **kw)
+        data = self._parse(resp)
+        if not isinstance(data, Mapping):
+            raise self._not_an_object(method, path, resp)
+        return data
 
     async def listing(self, path: str, **kw: Any) -> tuple[Any, int | None]:
         """A collection read, and whether the platform had to answer it short.

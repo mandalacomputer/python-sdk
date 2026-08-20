@@ -453,6 +453,20 @@ this SDK was written. What *does* raise is a failure the platform reports
 mid-run, as whatever class its status deserves: a bad model key comes back as an
 `AuthenticationError`, not as something your handler cannot classify.
 
+That raise carries the run with it. `e.agent` holds what the loop had already
+spent on your model key and the steps it had already taken, so a failure at step
+eight stays an account of eight steps rather than only a message — the spend is
+on a key the platform never meters, and the clicks are still on the desktop.
+`agent_stream()` hands the same record over as an `AgentFailed` event.
+
+```python
+try:
+    c.agent("Book the flight", model_key=key)
+except mandala_computer.MandalaError as e:
+    if e.agent:
+        print(f"{len(e.agent.steps)} steps, {e.agent.usage.input_tokens} tokens in")
+```
+
 Every step spends your Mandala rate budget too — the same budget your own calls
 draw on, at the same price, because a click through here costs what a click plus
 a screenshot costs anywhere. A run that exhausts it stops where it is and ends

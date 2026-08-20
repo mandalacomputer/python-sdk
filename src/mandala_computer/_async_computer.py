@@ -908,9 +908,13 @@ class AsyncComputer(ComputerFields):
         is over, and a reverse proxy between you and the platform is entitled to
         close a request held open for minutes with nothing crossing it. Prefer
         :meth:`agent`.
+
+        A proxy that answers instead of the platform raises here rather than
+        coming back as a run of no steps that ended for no reason — the same
+        check :meth:`agent` makes on the content type, made on the body.
         """
         _require_model_key(model_key)
-        data = await self._t.json(
+        data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "agent"),
             json=_api.agent_body(

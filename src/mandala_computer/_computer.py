@@ -79,12 +79,22 @@ def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> A
     connection lost while the tail of the stream was in flight — and the last
     word about a run that went wrong should not be a result that arrived before
     it did.
+
+    The failure itself rides on the exception as
+    :attr:`~mandala_computer.MandalaError.agent`. Raising is what a caller who
+    is not reading the stream asked for, but the steps it had already taken are
+    still on the desktop and their cost is already on the caller's model key, so
+    the raise says how far it got rather than only that it stopped.
     """
     if failure is not None:
-        message = f"the agent run failed: {failure.error}"
-        raise (
+        n = len(failure.steps)
+        taken = f" after {n} step{'' if n == 1 else 's'}" if n else ""
+        message = f"the agent run failed{taken}: {failure.error}"
+        error = (
             error_for_status(failure.status, message) if failure.status else MandalaError(message)
         )
+        error.agent = failure
+        raise error
     if result is None:
         raise MandalaError("the agent stream ended without a result")
     return result
@@ -1224,9 +1234,13 @@ class Computer(ComputerFields):
         is over, and a reverse proxy between you and the platform is entitled to
         close a request held open for minutes with nothing crossing it. Prefer
         :meth:`agent`.
+
+        A proxy that answers instead of the platform raises here rather than
+        coming back as a run of no steps that ended for no reason — the same
+        check :meth:`agent` makes on the content type, made on the body.
         """
         _require_model_key(model_key)
-        data = self._t.json(
+        data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "agent"),
             json=_api.agent_body(

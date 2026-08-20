@@ -300,6 +300,30 @@ def test_agent_once_still_needs_the_model_key(computer: mc.Computer) -> None:
         computer.agent_once("do the thing", model_key="")
 
 
+@respx.mock
+def test_agent_once_refuses_an_answer_that_is_not_a_result(computer: mc.Computer) -> None:
+    """The captive-portal case again, on the half of the route with no frames.
+
+    `AgentResult.from_api` is deliberately tolerant of a missing field, so an
+    HTML page parses to nothing and comes back as a well-formed run of no steps
+    that ended for no reason — the same sentence about the platform describing
+    something that never reached it, and the one the streaming form already
+    refuses to say.
+    """
+    respx.post(AGENT).mock(httpx.Response(200, html="<html>Sign in to the wifi</html>"))
+    with pytest.raises(mc.MandalaError, match="not a JSON object"):
+        computer.agent_once("do the thing", model_key=KEY)
+
+
+@respx.mock
+def test_agent_once_refuses_a_body_that_is_not_an_object(computer: mc.Computer) -> None:
+    """Valid JSON is not enough — a result has to be something to read fields
+    off, and `from_api` treats everything else as an empty run."""
+    respx.post(AGENT).mock(httpx.Response(200, json=["nope"]))
+    with pytest.raises(mc.MandalaError, match="not a JSON object"):
+        computer.agent_once("do the thing", model_key=KEY)
+
+
 # --- forward compatibility -------------------------------------------------
 
 
@@ -349,6 +373,123 @@ def test_a_done_frame_with_nothing_in_it_is_survivable(computer: mc.Computer) ->
     assert not result.finished and result.stop == "unknown" and result.text == ""
 
 
+# --- what a failure carries -----------------------------------------------
+
+
+@respx.mock
+def test_a_failure_carries_what_the_run_had_already_spent_and_done(
+    computer: mc.Computer,
+) -> None:
+    """A run that dies at step three was still billed for three steps.
+
+    The spend is on the caller's own model key, which the platform never meters,
+    so an error event that reported only its message would be the one place that
+    number could have come from — and the steps behind it are still on the
+    desktop whether or not anything says so.
+    """
+    respx.post(AGENT).mock(
+        stream(
+            frame(
+                "error",
+                '{"error": "the model went away", "status": 502, '
+                '"usage": {"input_tokens": 4000, "output_tokens": 120}, '
+                '"steps": [{"n": 1, "tool": "computer", "action": "left_click"}, '
+                '{"n": 2, "tool": "bash"}]}',
+            )
+        )
+    )
+    (failure,) = list(computer.agent_stream("do the thing", model_key=KEY))
+    assert isinstance(failure, mc.AgentFailed)
+    assert failure.usage.input_tokens == 4000 and failure.usage.output_tokens == 120
+    assert [s.action for s in failure.steps] == ["left_click", ""]
+
+
+@respx.mock
+def test_the_raise_carries_the_failed_run_and_says_how_far_it_got(
+    computer: mc.Computer,
+) -> None:
+    """`agent()` has to raise, and raising must not be where the record stops.
+
+    The exception classes the status maps to cannot carry a run, so it rides on
+    `MandalaError.agent` — otherwise collecting the stream would be the one way
+    of running the agent that throws away what it had already spent and done.
+    """
+    respx.post(AGENT).mock(
+        stream(
+            frame(
+                "error",
+                '{"error": "bad model key", "status": 401, '
+                '"usage": {"input_tokens": 90}, "steps": [{"n": 1}, {"n": 2}, {"n": 3}]}',
+            )
+        )
+    )
+    with pytest.raises(mc.AuthenticationError, match="after 3 steps") as e:
+        computer.agent("do the thing", model_key=KEY)
+    assert e.value.agent is not None
+    assert e.value.agent.usage.input_tokens == 90
+    assert len(e.value.agent.steps) == 3
+
+
+@respx.mock
+def test_a_failure_the_platform_could_not_detail_carries_nothing_rather_than_lying(
+    computer: mc.Computer,
+) -> None:
+    """The platform's own last-resort handler sends the error and status alone.
+
+    Empty here means "not reported" rather than "nothing happened", which is why
+    the message says nothing about steps when there are none to speak of.
+    """
+    respx.post(AGENT).mock(stream(frame("error", '{"error": "lost the host"}')))
+    with pytest.raises(mc.MandalaError, match=r"^the agent run failed: lost the host$") as e:
+        computer.agent("do the thing", model_key=KEY)
+    assert e.value.agent is not None
+    assert e.value.agent.steps == () and e.value.agent.usage.input_tokens == 0
+
+
+def test_an_error_that_did_not_come_out_of_a_run_carries_no_run() -> None:
+    """The attribute is on every error the SDK raises, and is None on all the
+    rest of them — reading it must not need a hasattr first."""
+    assert mc.MandalaError("nothing to do with the agent").agent is None
+    assert mc.NotFoundError("no such computer", status=404).agent is None
+
+
+# --- how long a stream may say nothing ------------------------------------
+
+
+def _budget(route: respx.Route) -> dict[str, float | None]:
+    """The timeout httpx was actually handed for the last call on this route."""
+    return dict(route.calls.last.request.extensions["timeout"])
+
+
+@respx.mock
+def test_a_stream_is_given_up_on_when_it_goes_quiet_not_when_it_runs_long(
+    computer: mc.Computer,
+) -> None:
+    """The budget bounds the silence, not the run.
+
+    httpx reads `read` as per-chunk idle time, so a finite one cannot cut a long
+    run short — the platform beats every 10s precisely so a quiet run still
+    ticks. `None` was the thing that could hang: a connection dropped without a
+    FIN leaves the caller waiting forever on a stream nothing will arrive on,
+    and the generator cannot be closed from inside the call that is waiting.
+    """
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    computer.agent("do the thing", model_key=KEY)
+    assert _budget(route)["read"] == mc._client.STREAM_IDLE_TIMEOUT
+    # Several heartbeats, so an ordinarily slow step is never mistaken for a
+    # dead connection.
+    assert mc._client.STREAM_IDLE_TIMEOUT >= 30.0
+
+
+@respx.mock
+def test_a_client_of_your_own_still_sets_the_stream_budget() -> None:
+    """The budget only ever widens, here as everywhere else."""
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    patient = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=600.0))
+    mc.Computer(patient._t, COMPUTER).agent("do the thing", model_key=KEY)
+    assert _budget(route)["read"] == 600.0
+
+
 # --- the async half --------------------------------------------------------
 
 
@@ -379,3 +520,32 @@ async def test_the_async_non_streaming_form_reads_one_body() -> None:
     async with mc.AsyncClient("gck_test", base_url=BASE) as client:
         c = mc.AsyncComputer(client._t, COMPUTER)
         assert (await c.agent_once("do the thing", model_key=KEY)).text == "all set"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_non_streaming_form_refuses_the_same_non_result() -> None:
+    respx.post(AGENT).mock(httpx.Response(200, html="<html>Sign in to the wifi</html>"))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.MandalaError, match="not a JSON object"):
+            await c.agent_once("do the thing", model_key=KEY)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_raise_carries_the_failed_run_too() -> None:
+    respx.post(AGENT).mock(
+        stream(
+            frame(
+                "error",
+                '{"error": "bad model key", "status": 401, '
+                '"usage": {"input_tokens": 90}, "steps": [{"n": 1}]}',
+            )
+        )
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.AuthenticationError, match="after 1 step:") as e:
+            await c.agent("do the thing", model_key=KEY)
+    assert e.value.agent is not None and e.value.agent.usage.input_tokens == 90

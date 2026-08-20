@@ -184,6 +184,18 @@ class AgentFailed:
     #: same :class:`~mandala_computer.AuthenticationError` a 401 anywhere else
     #: raises, rather than as something a caller's handler cannot classify.
     status: int = 0
+    #: What the run had already spent on your key when it went wrong. A failure
+    #: at step eight has been billed for eight steps whether or not anything is
+    #: told about it, and this is the only place that number is ever reported —
+    #: the platform meters nothing on your model key, so there is no invoice to
+    #: reconcile it against later.
+    usage: AgentUsage = field(default_factory=AgentUsage)
+    #: What the run had already done to the desktop. Those actions stand: the
+    #: failure stopped the loop, it did not undo the clicks. Left empty where
+    #: the platform could not say — its own last-resort handler reports the
+    #: error and the status alone — so this being empty means "not reported"
+    #: rather than "nothing happened".
+    steps: tuple[AgentStep, ...] = ()
 
 
 #: One event out of :meth:`~mandala_computer.Computer.agent_stream`. Match on it
@@ -203,5 +215,14 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
         return AgentDone(AgentResult.from_api(data))
     if event == "error":
         r = data if isinstance(data, Mapping) else {}
-        return AgentFailed(_text(r.get("error")) or "the run failed", _num(r.get("status")))
+        taken = r.get("steps")
+        return AgentFailed(
+            _text(r.get("error")) or "the run failed",
+            _num(r.get("status")),
+            AgentUsage.from_api(r.get("usage")),
+            tuple(
+                AgentStep.from_api(step, i + 1)
+                for i, step in enumerate(taken if isinstance(taken, list) else ())
+            ),
+        )
     return None
