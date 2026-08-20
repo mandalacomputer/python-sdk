@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, SupportsIndex, TypeVar, overload
 
 __all__ = [
     "ExecResult",
@@ -24,6 +24,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+S = TypeVar("S")
 
 
 class Listing(list[T]):
@@ -58,6 +59,34 @@ class Listing(list[T]):
     def is_complete(self) -> bool:
         """False when the platform said this listing is short."""
         return self.incomplete is None
+
+    def copy(self) -> Listing[T]:
+        """Copy the rows without discarding whether the server answered short."""
+        return Listing.of(list(self), self.incomplete)
+
+    @overload
+    def __getitem__(self, index: SupportsIndex, /) -> T: ...
+
+    @overload
+    def __getitem__(self, index: slice, /) -> Listing[T]: ...
+
+    def __getitem__(self, index: SupportsIndex | slice, /) -> T | Listing[T]:
+        if isinstance(index, slice):
+            return Listing.of(super().__getitem__(index), self.incomplete)
+        return super().__getitem__(index)
+
+    @overload
+    def __add__(self, other: list[T], /) -> Listing[T]: ...
+
+    @overload
+    def __add__(self, other: list[S], /) -> Listing[T | S]: ...
+
+    def __add__(self, other: list[Any], /) -> Listing[Any]:
+        """Concatenate without promoting a partial answer to a complete one."""
+        incomplete = self.incomplete
+        if isinstance(other, Listing) and other.incomplete is not None:
+            incomplete = other.incomplete if incomplete is None else incomplete + other.incomplete
+        return Listing.of(super().__add__(other), incomplete)
 
     @classmethod
     def of(cls, items: list[T], incomplete: int | None = None) -> Listing[T]:

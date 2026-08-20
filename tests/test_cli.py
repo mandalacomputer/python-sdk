@@ -61,8 +61,9 @@ def test_a_local_windows_drive_is_not_a_computer(monkeypatch: pytest.MonkeyPatch
 
 @respx.mock
 def test_resolve_prefers_exact_id() -> None:
-    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    route = respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
     assert _cli._resolve(_cli._client(), "vm-2").id == "vm-2"
+    assert route.calls.last.request.url.params["allow_partial"] == "1"
 
 
 @respx.mock
@@ -379,6 +380,76 @@ def test_an_exit_frame_ends_the_interaction_without_waiting_for_close(
     assert _cli._interact("wss://terminal.test") == 7
     assert ws.receives == 1
     assert ws.closed
+
+
+def test_raw_mode_is_restored_when_resize_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import termios
+    import tty
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return True
+
+    class FakeConnection:
+        def close(self) -> None:
+            pass
+
+    restored: list[object] = []
+    saved = object()
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: saved)
+    monkeypatch.setattr(tty, "setraw", lambda fd: None)
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, state: restored.append(state))
+    monkeypatch.setattr(_cli.signal, "getsignal", lambda signum: object())
+    monkeypatch.setattr(
+        _cli.signal, "signal", lambda signum, handler: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _cli._interact("wss://terminal.test")
+    assert restored == [saved]
+
+
+def test_interaction_restores_the_previous_resize_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFile:
+        def __init__(self, tty: bool) -> None:
+            self.tty = tty
+
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return self.tty
+
+    class FakeConnection:
+        def recv(self) -> str:
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    previous = _cli.signal.SIG_IGN
+    installed: list[object] = []
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile(False))
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile(True))
+    monkeypatch.setattr(_cli.signal, "getsignal", lambda signum: previous)
+    monkeypatch.setattr(_cli.signal, "signal", lambda signum, handler: installed.append(handler))
+
+    assert _cli._interact("wss://terminal.test") == 0
+    assert installed[-1] is previous
 
 
 def test_resize_and_stdin_frames_use_the_sender_thread(

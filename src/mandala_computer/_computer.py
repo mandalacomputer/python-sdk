@@ -122,6 +122,18 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
 # on Windows it could only spin until it timed out.
 GUEST_PROBE = "exit 0"
 
+
+def _require_background_pid(data: Mapping[str, Any]) -> None:
+    """Reject a successful start response that cannot identify its command."""
+    raw = data.get("pid")
+    try:
+        pid = 0 if raw is None else int(raw)
+    except (TypeError, ValueError):
+        pid = 0
+    if isinstance(raw, bool) or pid <= 0:
+        raise MandalaError("exec start answered without a positive pid")
+
+
 #: Errors that :meth:`Computer.wait_for_guest` must not hide. Most cannot be
 #: resolved by waiting; a rate limit can, but only on the server's retry cadence,
 #: which this helper must preserve for its caller rather than replacing with its
@@ -599,12 +611,13 @@ class Computer(ComputerFields):
                 )
             if not self.is_building:
                 return self
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(
                     f"{self.id} was still building after {timeout:g}s "
                     "(it has not stopped; only this wait has)"
                 )
-            time.sleep(poll)
+            time.sleep(min(poll, remaining))
             self.refresh()
 
     def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> Computer:
@@ -638,9 +651,14 @@ class Computer(ComputerFields):
                     f"{self.id} is suspended and will not start on its own: "
                     "call start() to resume it"
                 )
-            if time.monotonic() >= deadline:
+            if self.is_building:
+                raise MandalaError(
+                    f"{self.id} is still building: call wait_until_built(), then start()"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
-            time.sleep(poll)
+            time.sleep(min(poll, remaining))
 
     def wait_for_guest(self, timeout: float = 180.0, poll: float = 3.0) -> Computer:
         """Block until the guest OS answers, by running a trivial command in it.
@@ -953,6 +971,7 @@ class Computer(ComputerFields):
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, 0, desktop, background=True, cwd=cwd, env=env),
         )
+        _require_background_pid(data)
         return BackgroundCommand(self._t, self.id, data)
 
     def background_command(self, pid: int) -> BackgroundCommand:

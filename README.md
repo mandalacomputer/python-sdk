@@ -26,7 +26,7 @@ from mandala_computer import Client
 client = Client()
 
 with client.computers.ephemeral(template="base") as c:
-    c.wait_for_guest()  # desktop is up and answering
+    c.wait_for_guest()  # guest agent is up and answering
     c.open("https://example.com")  # on the screen, not as root
     c.click(640, 400)
     c.type("hello")
