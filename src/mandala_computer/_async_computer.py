@@ -35,8 +35,10 @@ from ._computer import (
     GUEST_PROBE,
     BackgroundCommandFields,
     ComputerFields,
+    _agent_once_outcome,
     _agent_outcome,
     _cursor,
+    _file_body,
     _require_background_pid,
     _require_model_key,
     _snapshots_deleted,
@@ -340,13 +342,16 @@ class AsyncComputer(ComputerFields):
         of them costs the full timeout and then reports "the guest did not
         respond", which is both wrong and the least useful thing this method
         could say about a 401.
+
+        A stopped computer is also refused immediately, including one carrying
+        :attr:`start_error` from a failed boot. A suspended computer is not:
+        running the probe counts as use and resumes its saved session.
         """
         deadline = time.monotonic() + timeout
         while True:
-            if self.build_failed:
-                raise MandalaError(
-                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
-                )
+            failure = self._guest_wait_failure()
+            if failure is not None:
+                raise failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
@@ -691,7 +696,7 @@ class AsyncComputer(ComputerFields):
 
         See :meth:`mandala_computer.Computer.write_file`.
         """
-        body = data.encode() if isinstance(data, str) else data
+        body = _file_body(data)
         await self._t.request(
             "PUT",
             _api.files(self.id),
@@ -990,7 +995,7 @@ class AsyncComputer(ComputerFields):
             headers={MODEL_KEY_HEADER: model_key},
             timeout=NO_DEADLINE,
         )
-        return AgentResult.from_api(data)
+        return _agent_once_outcome(data)
 
 
 class AsyncBackgroundCommand(BackgroundCommandFields):

@@ -492,7 +492,9 @@ the whole reason the door is there.
   rather than waiting out the timeout on a failed build or a suspended session,
   neither of which becomes "running" on its own.
 - `wait_for_guest()` — the guest agent answers. Linux and Windows both; the probe
-  is `exit 0`, which bash and cmd.exe both have as a builtin.
+  is `exit 0`, which bash and cmd.exe both have as a builtin. A failed start or
+  stopped computer is reported immediately. A suspended computer is different:
+  the probe is an `exec()`, so it resumes the session as use normally does.
 
 The last of those is about the agent, not the desktop, and the agent answers
 first — on Windows by a wide margin, since it runs in session 0 and replies
@@ -661,7 +663,8 @@ report = c.read_file("/home/user/report.csv")
 
 Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
-directory. A transfer resumes a suspended computer, like any other use.
+directory. A transfer resumes a suspended computer, like any other use. File
+bodies are limited to 64 MiB and oversized writes are refused locally.
 
 ### Errors
 
