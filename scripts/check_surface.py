@@ -33,6 +33,15 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SURFACE = Path("web/lib/surface.ts")
+AGENT = Path("web/lib/agent.ts")
+
+#: Platform constants this SDK mirrors, as ``(our name, their file, their name)``.
+#:
+#: A number copied out of the platform is a route by another name: the SDK
+#: refuses a value early to save the caller a round trip, and a ceiling that has
+#: drifted turns that favour into a refusal of a run the platform would have
+#: taken — with nothing failing here to say so.
+CONSTANTS = [("MAX_STEPS", AGENT, "MAX_MAX_STEPS")]
 
 
 def platform_repo() -> Path | None:
@@ -82,6 +91,33 @@ def table(source: str, name: str) -> set[tuple[str, str]]:
     return routes
 
 
+def constant(source: str, name: str) -> int:
+    """One ``export const NAME = <int>`` out of a platform module."""
+    m = re.search(rf"export const {re.escape(name)}\s*=\s*(\d+)", source)
+    if m is None:
+        raise SystemExit(f"{name} not found — has it moved or changed shape?")
+    return int(m.group(1))
+
+
+def constant_drift(platform: Path) -> list[str]:
+    """Every mirrored constant that no longer matches the platform's.
+
+    Imported rather than scraped, for the reason :func:`mirrored` is: the module
+    is the mirror, and a second parser over it would be one more thing that can
+    disagree with what the SDK actually sends.
+    """
+    sys.path.insert(0, str(REPO / "src"))
+    from mandala_computer import _api
+
+    drifted = []
+    for ours, module, theirs in CONSTANTS:
+        mine = getattr(_api, ours)
+        upstream = constant((platform / module).read_text(), theirs)
+        if mine != upstream:
+            drifted.append(f"  ! {ours} is {mine}, but {module}'s {theirs} is {upstream}")
+    return drifted
+
+
 def mirrored() -> set[tuple[str, str]]:
     """This repo's mirror, read from the test rather than re-parsed.
 
@@ -109,19 +145,27 @@ def main() -> int:
     mirror = mirrored()
     added = sorted(upstream - mirror)
     removed = sorted(mirror - upstream)
+    drifted = constant_drift(platform)
 
-    if not added and not removed:
-        print(f"check-surface — {len(mirror)} routes, in step with {platform / SURFACE}.")
+    if not added and not removed and not drifted:
+        n = len(CONSTANTS)
+        print(
+            f"check-surface — {len(mirror)} routes and {n} constant"
+            f"{'' if n == 1 else 's'}, in step with {platform / SURFACE.parent}."
+        )
         return 0
 
     for method, pattern in added:
         print(f"  + {method} {pattern}  (upstream, missing from ALLOWED)")
     for method, pattern in removed:
         print(f"  - {method} {pattern}  (in ALLOWED, gone from upstream)")
+    for line in drifted:
+        print(line)
     print(
         "\ncheck-surface — the mirror has drifted from the platform.\n"
         "  Update ALLOWED in tests/test_surface.py, and add anything new to\n"
-        "  UNIMPLEMENTED until this SDK can call it."
+        "  UNIMPLEMENTED until this SDK can call it. A constant that has moved\n"
+        "  belongs in src/mandala_computer/_api.py."
     )
     return 1
 
