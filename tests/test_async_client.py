@@ -126,8 +126,11 @@ async def test_long_input_actions_widen_the_request_budget(client: mc.AsyncClien
 
 @respx.mock
 async def test_screenshot_returns_bytes(client: mc.AsyncClient) -> None:
-    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"\x89PNG\r\n"))
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(200, content=b"\x89PNG\r\n", headers={"Content-Type": "image/png"})
+    )
     assert (await mc.AsyncComputer(client._t, COMPUTER).screenshot()).startswith(b"\x89PNG")
+    assert "image/png" in route.calls.last.request.headers["Accept"]
 
 
 @respx.mock
@@ -310,6 +313,17 @@ async def test_a_purge_without_a_fingerprint_deletes_nothing(client: mc.AsyncCli
 
 
 @respx.mock
+async def test_a_malformed_delete_count_is_an_sdk_error(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"snapshots_deleted": "many"})
+    )
+    c = await client.computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="invalid snapshots_deleted"):
+        await c.delete()
+
+
+@respx.mock
 async def test_a_background_command_polls_and_is_killed(client: mc.AsyncClient) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
@@ -356,6 +370,13 @@ async def test_windows_and_one_window_acted_on(client: mc.AsyncClient) -> None:
     res = await c.window_action(w.id, "focus")
     assert res.window is not None and res.window.focused
     assert not res.gone
+
+
+@respx.mock
+async def test_windows_refuses_non_object_rows(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(httpx.Response(200, json={"windows": [None]}))
+    with pytest.raises(mc.MandalaError, match="array of objects"):
+        await mc.AsyncComputer(client._t, COMPUTER).windows()
 
 
 @respx.mock
@@ -484,6 +505,7 @@ async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) 
     files = respx.get(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, content=b"hi"))
     await c.read_file("/tmp/a")
     assert files.calls.last.request.extensions["timeout"]["read"] == mc._client.FILE_TIMEOUT
+    assert files.calls.last.request.headers["Accept"] == "application/octet-stream"
     await client.aclose()
 
 
