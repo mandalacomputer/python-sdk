@@ -573,7 +573,7 @@ class AsyncComputer(ComputerFields):
     async def exec(
         self,
         command: str,
-        timeout_s: int = 30,
+        timeout: int = 30,
         *,
         desktop: bool = False,
         cwd: str | None = None,
@@ -590,7 +590,7 @@ class AsyncComputer(ComputerFields):
         and ``XAUTHORITY`` set — which is what anything with a window needs.
 
         A GUI program does not exit on its own, so launch it detached or the call
-        blocks until ``timeout_s`` kills it::
+        blocks until ``timeout`` kills it::
 
             await c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 
@@ -598,13 +598,24 @@ class AsyncComputer(ComputerFields):
 
         ``cwd`` is an absolute path inside the guest and ``env`` is extra
         environment for this command alone. A command slower than a few seconds
-        wants :meth:`start_exec` instead: hitting ``timeout_s`` means this call
+        wants :meth:`start_exec` instead: hitting ``timeout`` means this call
         stopped waiting, not that the work was destroyed, and the output and the
         exit code are lost with the request.
+
+        The transport waits out whatever ``timeout`` asks for, and the platform
+        extends its own deadline to match — but neither is what ends a long
+        command. A proxy in front of the platform abandons a request that has
+        produced no response for about two minutes and answers 524, which
+        arrives here as :class:`~mandala_computer.GatewayTimeoutError`; measured
+        against ``app.mandala.computer``, an ``exec`` slower than that dies at
+        ~125s whether ``timeout`` said 270 or 3600. The command survives the
+        request that abandoned it, so the next call on this computer may well
+        report the guest agent as busy with it. Past a couple of minutes,
+        :meth:`start_exec` is the only thing that works.
         """
         return await self._exec(
             command,
-            timeout_s,
+            timeout,
             desktop=desktop,
             cwd=cwd,
             env=env,
@@ -613,7 +624,7 @@ class AsyncComputer(ComputerFields):
     async def _exec(
         self,
         command: str,
-        timeout_s: int,
+        timeout: int,
         *,
         desktop: bool = False,
         cwd: str | None = None,
@@ -624,8 +635,8 @@ class AsyncComputer(ComputerFields):
         data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
-            json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
-            timeout=timeout_s + DEADLINE_SLACK,
+            json=_api.exec_body(command, timeout, desktop, cwd=cwd, env=env),
+            timeout=timeout + DEADLINE_SLACK,
             timeout_cap=timeout_cap,
         )
         return ExecResult.from_api(data)
@@ -677,14 +688,14 @@ class AsyncComputer(ComputerFields):
         """
         return AsyncBackgroundCommand(self._t, self.id, {"pid": pid})
 
-    async def open(self, url: str, *, timeout_s: int = 30) -> ExecResult:
+    async def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::
 
             await c.open("https://example.com")
 
         Sugar over :meth:`exec` with ``desktop=True``: it names a browser that
         works on the image, quotes the URL, and detaches the launch so the call
-        returns in well under a second instead of blocking until ``timeout_s``.
+        returns in well under a second instead of blocking until ``timeout``.
 
         The result describes the *launch*, not the page — a zero exit means the
         shell started the browser, not that the URL resolved. Take a
@@ -694,7 +705,7 @@ class AsyncComputer(ComputerFields):
         a browser would read as a flag rather than an address. On Windows the
         API rejects it, the same as any ``desktop=True`` exec.
         """
-        return await self.exec(_api.open_url_command(url), timeout_s, desktop=True)
+        return await self.exec(_api.open_url_command(url), timeout, desktop=True)
 
     # --- files ----------------------------------------------------------
 

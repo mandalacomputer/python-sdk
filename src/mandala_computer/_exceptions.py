@@ -12,6 +12,7 @@ __all__ = [
     "APIError",
     "AuthenticationError",
     "ConflictError",
+    "GatewayTimeoutError",
     "MandalaError",
     "NotFoundError",
     "PermissionDeniedError",
@@ -71,6 +72,28 @@ class PlanLimitError(APIError):
     Raised for computer-count caps, per-computer size ceilings, account-wide RAM
     and storage pools, and OS entitlements. ``str(e)`` carries the API's
     explanation of which limit was hit.
+    """
+
+
+class GatewayTimeoutError(APIError):
+    """A proxy in front of the platform gave up before the platform answered (504, 524).
+
+    Not the platform refusing anything. The request reached it, is very likely
+    still running, and nothing was cancelled — what ended was one hop's
+    willingness to hold the connection open with no response crossing it.
+
+    The ceiling this reports is not the SDK's and not ``timeout``\'s: it belongs
+    to whatever sits between the caller and the platform, and it is reached at
+    the same place however long the call asked to wait. Against
+    ``app.mandala.computer`` that is about two minutes, so a foreground
+    :meth:`~mandala_computer.Computer.exec` of a slower command always ends
+    here. :meth:`~mandala_computer.Computer.start_exec` is the way to run one:
+    it answers as soon as the command has started and is polled afterwards, so
+    no request is ever held open for the length of the work.
+
+    The command it abandoned keeps running, which is why the next call on the
+    same computer often raises :class:`ConflictError` — the guest agent is
+    still busy with it. That is the earlier command, not a second failure.
     """
 
 
