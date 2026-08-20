@@ -359,17 +359,11 @@ def exec_body(
 def open_url_command(url: str) -> str:
     """Build the shell command that puts ``url`` on the guest's screen.
 
-    The browser is named rather than asked for. ``xdg-open`` is the portable way
-    to want this and is installed on the base template, along with ``exo-open``,
-    ``sensible-browser`` and ``x-www-browser`` — and every one of them exits 0
-    and launches nothing, because the image's default-browser association points
-    at a desktop entry it does not ship. Exit 0 and an unchanged screen is the
-    worst shape a failure can take, so this asks for Firefox, which is the only
-    browser on the image anyway.
-
-    This function is the one place that decision lives. When the platform fixes
-    the association (OPL-3376), this is the line that changes, rather than every
-    caller's prompt.
+    The browser is named rather than asked for: Firefox, not ``xdg-open`` or one
+    of the other portable wrappers. Naming it keeps the choice in one place —
+    this function is the only thing that decides which browser the guest opens,
+    so a change of image, or of which browser we want, is a change here rather
+    than in every caller's prompt.
 
     Detached, because a browser does not exit on its own: in the foreground the
     call would block until the timeout killed it and come back as a failure,

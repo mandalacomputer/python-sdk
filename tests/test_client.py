@@ -590,8 +590,8 @@ def test_open_detaches_the_launch(client: mc.Client) -> None:
 
 @respx.mock
 def test_open_does_not_ask_for_the_default_handler(client: mc.Client) -> None:
-    """xdg-open and friends are installed and all exit 0 without launching
-    anything, so naming the browser is the whole point of this method."""
+    """Naming the browser is the whole point of this method: the choice lives
+    here rather than in whatever the guest's default handler resolves to."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
     )
