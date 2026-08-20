@@ -22,6 +22,7 @@ from ._exceptions import (
     GatewayTimeoutError,
     MandalaError,
     NotFoundError,
+    OriginUnreachableError,
     PermissionDeniedError,
     PlanLimitError,
     RateLimitError,
@@ -109,7 +110,23 @@ _STATUS_ERRORS = {
     # on which hop gave up first rather than on anything they did.
     504: GatewayTimeoutError,
     524: GatewayTimeoutError,
+    # The rest of what an edge answers on its own, and the opposite event to the
+    # pair above despite the neighbouring numbers: those mean the platform was
+    # reached and did not answer in time, these mean it was never reached.
+    520: OriginUnreachableError,
+    521: OriginUnreachableError,
+    522: OriginUnreachableError,
+    523: OriginUnreachableError,
+    525: OriginUnreachableError,
+    526: OriginUnreachableError,
 }
+
+#: The two of those that waiting cannot fix.
+#:
+#: 525 and 526 are a handshake the edge and the platform cannot agree on, which
+#: fails the same way on every retry. The other four are an origin that is down,
+#: which is what a restart looks like from outside and does come back.
+TLS_STATUSES = frozenset({525, 526})
 
 #: What a caller is told when a proxy abandoned their request and named nothing.
 #:
@@ -135,6 +152,30 @@ GATEWAY_TIMEOUT_MESSAGE = (
     "is the way to run something slower. After one of those, the next call on "
     "that computer may report the guest agent as busy with the command that "
     "outlived the request"
+)
+
+#: What a caller is told when a proxy could not reach the platform at all.
+#:
+#: No "did the platform name it" guard on this one, unlike the gateway pair, and
+#: the asymmetry is the point: every one of these statuses means the request
+#: never reached the platform, so there is no reading on which the body carries
+#: its account of what happened. There is nothing to defer to.
+ORIGIN_UNREACHABLE_MESSAGE = (
+    "a proxy in front of the platform could not reach it. The request never "
+    "arrived, so nothing was started and nothing is running — unlike a gateway "
+    "timeout, there is no work on the other side of this to account for. "
+    "Usually the platform restarting or a short outage, which clears on its "
+    "own; if it persists the platform is down, and waiting is the only thing "
+    "that helps"
+)
+
+#: The same, for the two of those that waiting will not fix.
+ORIGIN_TLS_MESSAGE = (
+    "a proxy in front of the platform could not complete a TLS handshake with "
+    "it. The request never arrived, so nothing was started and nothing is "
+    "running. This is a misconfigured deployment rather than a passing outage — "
+    "an expired or mismatched certificate fails the same way on every retry, so "
+    "report it rather than waiting it out"
 )
 
 #: How many rows a listing is short by. Present means short; the number can be
@@ -343,6 +384,17 @@ class _BaseTransport:
             if text:
                 message = text[:500]
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
+        if cls is OriginUnreachableError:
+            # Unconditionally, where the gateway pair below is guarded. Every one
+            # of these statuses means the request never reached the platform, so
+            # a body cannot be the platform's account of what happened and there
+            # is nothing to defer to.
+            said = (
+                ORIGIN_TLS_MESSAGE
+                if resp.status_code in TLS_STATUSES
+                else (ORIGIN_UNREACHABLE_MESSAGE)
+            )
+            return OriginUnreachableError(said, status=resp.status_code, body=body)
         if cls is GatewayTimeoutError and not named:
             # The substitution is worth making twice over and worth NOT making a
             # third time. An empty body leaves "HTTP 524", which says nothing; an
@@ -378,6 +430,11 @@ def error_for_status(status: int, message: str) -> APIError:
     there, rather than inventing a delay the platform did not name.
     """
     cls = _STATUS_ERRORS.get(status, APIError)
+    if cls is OriginUnreachableError:
+        # For the reason below, one step further: this status arrived ON a
+        # response, so the claim that the request never reached the platform is
+        # not merely unproven here, it is contradicted.
+        cls = APIError
     if cls is GatewayTimeoutError:
         # Not here, and the reason is the arrival itself. This status did not
         # come off a response — it came out of an event on a stream the platform
