@@ -169,14 +169,20 @@ class _BaseTransport:
             # httpx spells "wait indefinitely" as None rather than as infinity,
             # which it would reject.
             return httpx.Timeout(connect=current.connect, read=None, write=None, pool=current.pool)
-        if seconds is None or current.read is None or current.write is None:
+        if seconds is None:
             return current
-        if current.read >= seconds and current.write >= seconds:
+
+        def widened(value: float | None) -> float | None:
+            return None if value is None else max(value, seconds)
+
+        read = widened(current.read)
+        write = widened(current.write)
+        if read == current.read and write == current.write:
             return current
         return httpx.Timeout(
             connect=current.connect,
-            read=max(current.read, seconds),
-            write=max(current.write, seconds),
+            read=read,
+            write=write,
             pool=current.pool,
         )
 

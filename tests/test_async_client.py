@@ -333,6 +333,14 @@ async def test_a_background_command_polls_and_is_killed(client: mc.AsyncClient) 
 
 
 @respx.mock
+async def test_a_background_exec_requires_a_positive_pid(client: mc.AsyncClient) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
+    with pytest.raises(mc.MandalaError, match="positive pid"):
+        await mc.AsyncComputer(client._t, COMPUTER).start_exec("make")
+    await client.aclose()
+
+
+@respx.mock
 async def test_windows_and_one_window_acted_on(client: mc.AsyncClient) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     respx.get(f"{BASE}/computers/vm-1/windows").mock(
