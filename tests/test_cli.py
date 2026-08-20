@@ -8,6 +8,8 @@ right routes. The HTTP layer is respx, same as the client tests.
 
 from __future__ import annotations
 
+import threading
+
 import httpx
 import pytest
 import respx
@@ -46,6 +48,12 @@ def env(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_remote_side(arg: str, want: tuple[str, str] | None) -> None:
     assert _cli._remote_side(arg) == want
+
+
+def test_a_local_windows_drive_is_not_a_computer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_cli, "LOCAL_WINDOWS", True)
+    assert _cli._remote_side(r"C:\work\notes.txt") is None
+    assert _cli._remote_side("D:/work/notes.txt") is None
 
 
 # --- resolution ------------------------------------------------------------
@@ -186,6 +194,15 @@ def test_ssh_stopped_computer_says_start_it() -> None:
         _cli.main(["ssh", "dev"])
 
 
+def test_ssh_on_a_local_windows_terminal_dies_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_cli, "LOCAL_WINDOWS", True)
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    with pytest.raises(SystemExit, match="Unix-like local terminal"):
+        _cli.main(["ssh", "dev"])
+
+
 # --- guest paths are not local paths ---------------------------------------
 
 
@@ -283,6 +300,12 @@ def test_write_all_handles_an_empty_frame(monkeypatch: pytest.MonkeyPatch) -> No
     assert not calls
 
 
+def test_write_all_refuses_a_zero_length_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_cli.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError, match="no progress"):
+        _cli._write_all(1, b"guest output")
+
+
 # --- control frames --------------------------------------------------------
 
 
@@ -319,3 +342,109 @@ def test_exit_code_reads_only_an_exit_frame(frame: str, want: int | None) -> Non
     distinction worth making about a peer we do not control.
     """
     assert _cli._exit_code(frame) == want
+
+
+def test_an_exit_frame_ends_the_interaction_without_waiting_for_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.receives = 0
+            self.closed = False
+
+        def recv(self) -> str:
+            self.receives += 1
+            if self.receives > 1:
+                raise AssertionError("waited for the websocket to close after exit")
+            return '{"type": "exit", "code": 7}'
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    ws = FakeConnection()
+    monkeypatch.setattr(_cli, "_connect", lambda url: ws)
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+
+    assert _cli._interact("wss://terminal.test") == 7
+    assert ws.receives == 1
+    assert ws.closed
+
+
+def test_resize_and_stdin_frames_use_the_sender_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFile:
+        def __init__(self, tty: bool) -> None:
+            self.tty = tty
+
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return self.tty
+
+    handlers: dict[str, object] = {}
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent = 0
+            self.sent_twice = threading.Event()
+            self.sent_thrice = threading.Event()
+            self.send_threads: list[threading.Thread] = []
+
+        def recv(self) -> str:
+            assert self.sent_twice.wait(1)
+            handler = handlers["resize"]
+            assert callable(handler)
+            handler()
+            assert self.sent_thrice.wait(1)
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            self.send_threads.append(threading.current_thread())
+            self.sent += 1
+            if self.sent == 2:
+                self.sent_twice.set()
+            if self.sent == 3:
+                self.sent_thrice.set()
+
+        def close(self) -> None:
+            pass
+
+    ws = FakeConnection()
+    monkeypatch.setattr(_cli, "_connect", lambda url: ws)
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile(False))
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile(True))
+    reads = iter((b"guest input", b""))
+    monkeypatch.setattr(_cli.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(
+        _cli.signal, "signal", lambda signum, handler: handlers.setdefault("resize", handler)
+    )
+    monkeypatch.setattr(_cli.shutil, "get_terminal_size", lambda: (80, 24))
+
+    assert _cli._interact("wss://terminal.test") == 0
+    assert ws.sent == 3
+    assert all(thread is not threading.main_thread() for thread in ws.send_threads)
+
+
+def test_non_status_websocket_failures_are_cli_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    from websockets.exceptions import InvalidURI
+    from websockets.sync import client as ws_client
+
+    def invalid_uri(*args: object, **kwargs: object) -> None:
+        raise InvalidURI("not-a-websocket", "scheme isn't ws or wss")
+
+    monkeypatch.setattr(ws_client, "connect", invalid_uri)
+    with pytest.raises(SystemExit, match="could not open the terminal"):
+        _cli._connect("not-a-websocket")
