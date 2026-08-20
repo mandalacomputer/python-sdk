@@ -2121,3 +2121,59 @@ def test_an_in_band_failure_is_not_an_edge_that_gave_up() -> None:
     # The statuses that do travel this way are unaffected.
     assert isinstance(mc._client.error_for_status(401, "revoked"), mc.AuthenticationError)
     assert isinstance(mc._client.error_for_status(409, "busy"), mc.ConflictError)
+
+
+@respx.mock
+def test_an_origin_never_reached_is_not_one_that_stopped_answering(client: mc.Client) -> None:
+    """Opposite implications, which is why they are two classes.
+
+    A 524 means the request arrived and its work carries on; a 522 means it
+    never arrived, so nothing was started and nothing outlives anything.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(522, content=b""))
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert e.value.status == 522
+    assert not isinstance(e.value, mc.GatewayTimeoutError)
+    assert "never arrived" in str(e.value)
+    assert "clears on its own" in str(e.value)
+
+
+@respx.mock
+def test_a_certificate_that_will_not_agree_is_not_told_to_wait(client: mc.Client) -> None:
+    """525 and 526 fail identically on every retry, and the message says so."""
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(526, content=b""))
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert "TLS handshake" in str(e.value)
+    assert "report it rather than waiting it out" in str(e.value)
+
+
+@respx.mock
+def test_an_unreachable_origin_says_so_even_when_something_sent_a_body(
+    client: mc.Client,
+) -> None:
+    """No "did the platform name it" guard here, unlike the gateway pair.
+
+    The status itself says the platform was never reached, so a body cannot be
+    its account of what happened — there is nothing to defer to.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(521, json={"error": "web server is down"})
+    )
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        client.computers.get("vm-1")
+    assert "never arrived" in str(e.value)
+
+
+def test_an_unreachable_origin_cannot_arrive_on_a_stream() -> None:
+    """The in-band split, one step past the gateway case.
+
+    A status delivered on a response that was a 200 contradicts the claim that
+    the request never reached the platform, rather than merely failing to
+    support it.
+    """
+    err = mc._client.error_for_status(522, "the agent run failed: upstream gone")
+    assert isinstance(err, mc.APIError)
+    assert not isinstance(err, mc.OriginUnreachableError)
+    assert err.status == 522
