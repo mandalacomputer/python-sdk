@@ -71,6 +71,18 @@ def test_a_run_that_finishes_comes_back_as_a_result(computer: mc.Computer) -> No
     assert result.finished and result.stop == "end_turn" and result.steps == 2
 
 
+def test_a_post_done_idle_timeout_does_not_discard_the_result(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def events() -> Any:
+        yield mc.AgentDone(mc.AgentResult(stop="end_turn", text="all set"))
+        raise mc.TimeoutError("stream went quiet")
+
+    monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
+    result = computer.agent("do the thing", model_key=KEY)
+    assert result.finished and result.text == "all set"
+
+
 @respx.mock
 def test_the_stream_reports_each_step_as_it_happens(computer: mc.Computer) -> None:
     respx.post(AGENT).mock(
@@ -647,6 +659,21 @@ async def test_the_async_client_streams_the_same_events() -> None:
         c = mc.AsyncComputer(client._t, COMPUTER)
         events = [e async for e in c.agent_stream("do the thing", model_key=KEY)]
     assert [type(e).__name__ for e in events] == ["AgentStepEvent", "AgentDone"]
+
+
+@pytest.mark.asyncio
+async def test_an_async_post_done_idle_timeout_does_not_discard_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def events() -> Any:
+        yield mc.AgentDone(mc.AgentResult(stop="end_turn", text="all set"))
+        raise mc.TimeoutError("stream went quiet")
+
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        computer = mc.AsyncComputer(client._t, COMPUTER)
+        monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
+        result = await computer.agent("do the thing", model_key=KEY)
+    assert result.finished and result.text == "all set"
 
 
 async def test_explicitly_closing_an_async_agent_stream_awaits_transport_cleanup() -> None:

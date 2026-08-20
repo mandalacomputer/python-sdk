@@ -186,6 +186,18 @@ async def test_wait_until_running_times_out(client: mc.AsyncClient) -> None:
 
 
 @respx.mock
+async def test_wait_until_running_caps_refresh_to_its_remaining_budget(
+    client: mc.AsyncClient,
+) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "running"})
+    )
+    await mc.AsyncComputer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
+    assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
+    await client.aclose()
+
+
+@respx.mock
 async def test_ephemeral_deletes_on_exit(client: mc.AsyncClient) -> None:
     respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     delete = respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"ok": True}))
@@ -442,6 +454,22 @@ async def test_wait_for_guest_reports_an_async_failed_start_without_probing(
     with pytest.raises(mc.MandalaError, match="boot allocation failed"):
         await computer.wait_for_guest(timeout=30, poll=0)
     assert not probe.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_wait_for_guest_refreshes_an_async_stale_running_handle(
+    client: mc.AsyncClient,
+) -> None:
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(400, json={"error": "not running"})
+    )
+    refresh = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+    )
+    with pytest.raises(mc.MandalaError, match="stopped.+call start"):
+        await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)
+    assert probe.call_count == 1 and refresh.call_count == 1
     await client.aclose()
 
 

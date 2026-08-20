@@ -140,13 +140,20 @@ def test_wait_until_built_clamps_its_last_sleep(
     client: mc.Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
-    now = iter((0.0, 0.75))
+    now = iter((0.0, 0.75, 0.75))
     sleeps: list[float] = []
     monkeypatch.setattr(mc._computer.time, "monotonic", lambda: next(now))
     monkeypatch.setattr(mc._computer.time, "sleep", sleeps.append)
 
     mc.Computer(client._t, BUILDING).wait_until_built(timeout=1, poll=5)
     assert sleeps == [0.25]
+
+
+@respx.mock
+def test_wait_until_built_caps_refresh_to_its_remaining_budget(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
+    mc.Computer(client._t, BUILDING).wait_until_built(timeout=2, poll=0)
+    assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
 
 
 @respx.mock

@@ -6,7 +6,7 @@ rejected, so a server that starts returning more does not break older clients.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from operator import index as integer_index
 from typing import Any, SupportsIndex, TypeVar, overload
@@ -95,6 +95,25 @@ class Listing(list[T]):
         if isinstance(other, Listing) and other.incomplete is not None:
             incomplete = other.incomplete if incomplete is None else incomplete + other.incomplete
         return Listing.of(list.__add__(other, self), incomplete)
+
+    def extend(self, values: Iterable[T], /) -> None:
+        """Append rows without promoting a partial answer to a complete one."""
+        other_incomplete = values.incomplete if isinstance(values, Listing) else None
+        super().extend(values)
+        if other_incomplete is not None:
+            self.incomplete = (
+                other_incomplete if self.incomplete is None else self.incomplete + other_incomplete
+            )
+
+    # This is list.__iadd__'s own signature. Mypy additionally compares it to
+    # the cross-type __add__ overloads above, although in-place mutation cannot
+    # change the generic type of the object it returns.
+    def __iadd__(  # type: ignore[override, misc]
+        self, other: Iterable[T], /
+    ) -> Listing[T]:
+        """The in-place spelling of :meth:`extend`, including partial state."""
+        self.extend(other)
+        return self
 
     def __mul__(self, value: SupportsIndex, /) -> Listing[T]:
         """Repeat rows without losing (or understating) missing rows."""
