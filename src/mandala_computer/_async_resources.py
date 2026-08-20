@@ -42,7 +42,7 @@ class AsyncComputers:
         return Listing.of([AsyncComputer(self._t, c) for c in data or []], incomplete)
 
     async def get(self, computer_id: str) -> AsyncComputer:
-        data = await self._t.json("GET", _api.computer(computer_id))
+        data = await self._t.json_object("GET", _api.computer(computer_id))
         return AsyncComputer(self._t, _api.computer_payload(data))
 
     async def create(
@@ -98,7 +98,7 @@ class AsyncComputers:
             resolution=resolution,
             size=size,
         )
-        data = await self._t.json("POST", _api.COMPUTERS, json=body)
+        data = await self._t.json_object("POST", _api.COMPUTERS, json=body)
         return AsyncComputer(self._t, _api.computer_payload(data))
 
     @asynccontextmanager
@@ -168,7 +168,7 @@ class AsyncSnapshots:
         boot and starting it raises :class:`~mandala_computer.ConflictError`; wait
         with :meth:`AsyncComputer.wait_until_built`.
         """
-        data = await self._t.json(
+        data = await self._t.json_object(
             "POST", _api.snapshot_action(snapshot_id, "clone"), json=_api.name_body(name)
         )
         return AsyncComputer(self._t, _api.computer_payload(data))
@@ -182,7 +182,7 @@ class AsyncTemplates:
         self._t = transport
 
     async def list(self) -> builtins.list[Template]:
-        data = await self._t.json("GET", _api.TEMPLATES) or []
+        data = await self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
 
 
@@ -191,5 +191,5 @@ class AsyncSizes:
         self._t = transport
 
     async def list(self) -> builtins.list[Size]:
-        data = await self._t.json("GET", _api.SIZES) or []
+        data = await self._t.json_array("GET", _api.SIZES)
         return [Size.from_api(s) for s in data]

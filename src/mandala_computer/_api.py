@@ -329,6 +329,8 @@ def exec_body(
     """
     body: dict[str, Any] = {"command": command}
     if not background:
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive for a foreground exec")
         body["timeout_s"] = timeout_s
     if desktop:
         body["session"] = "desktop"
@@ -418,6 +420,14 @@ def window_body(
         raise ValueError("give both x and y, or neither")
     if (width is None) != (height is None):
         raise ValueError("give both width and height, or neither")
+    if action == "move" and x is None:
+        raise ValueError("move needs both x and y")
+    if action == "resize" and width is None:
+        raise ValueError("resize needs both width and height")
+    if action != "move" and x is not None:
+        raise ValueError("x and y are only valid for move")
+    if action != "resize" and width is not None:
+        raise ValueError("width and height are only valid for resize")
     body: dict[str, Any] = {"action": action}
     if x is not None and y is not None:
         body["x"], body["y"] = x, y
@@ -578,6 +588,8 @@ def scroll_body(
     """
     if direction not in _SCROLL_DIRECTIONS:
         raise ValueError(f"direction must be one of {_SCROLL_DIRECTIONS}")
+    if amount <= 0:
+        raise ValueError("amount must be positive")
     _whole_point(x, y)
     body: dict[str, Any] = {
         "action": "scroll",

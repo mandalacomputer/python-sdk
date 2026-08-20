@@ -181,6 +181,23 @@ class _BaseTransport:
         )
 
     @staticmethod
+    def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
+        """Cap every phase of one request to the time its caller has left."""
+        if seconds is None:
+            return current
+        cap = max(seconds, 0.001)
+
+        def capped(value: float | None) -> float:
+            return cap if value is None else min(value, cap)
+
+        return httpx.Timeout(
+            connect=capped(current.connect),
+            read=capped(current.read),
+            write=capped(current.write),
+            pool=capped(current.pool),
+        )
+
+    @staticmethod
     def _parse(resp: httpx.Response) -> Any:
         if not resp.content:
             return None
@@ -228,6 +245,15 @@ class _BaseTransport:
         content_type = resp.headers.get("content-type") or "no content type"
         return MandalaError(
             f"{method} {path} answered {content_type}, not a JSON object: {resp.text.strip()[:200]}"
+        )
+
+    @staticmethod
+    def _not_an_array(method: str, path: str, resp: httpx.Response) -> MandalaError:
+        """The complaint for a collection route that didn't return object rows."""
+        content_type = resp.headers.get("content-type") or "no content type"
+        return MandalaError(
+            f"{method} {path} answered {content_type}, not a JSON array of objects: "
+            f"{resp.text.strip()[:200]}"
         )
 
     @staticmethod
@@ -289,6 +315,11 @@ def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutEr
     )
 
 
+def _request_failed(method: str, path: str, exc: httpx.RequestError) -> MandalaError:
+    """The SDK's error for a request that failed before an HTTP response arrived."""
+    return MandalaError(f"{method} {path} could not complete ({type(exc).__name__}): {exc}")
+
+
 def _retry_after(resp: httpx.Response) -> float | None:
     """``Retry-After`` in seconds, or ``None`` if it was not usable.
 
@@ -338,9 +369,10 @@ class Transport(_BaseTransport):
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout: float | None = None,
+        timeout_cap: float | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
-        """One request. ``timeout`` widens this call's budget; see :meth:`_budget`."""
+        """One request, with optional widening and a final per-phase cap."""
         try:
             resp = self._http.request(
                 method,
@@ -349,10 +381,12 @@ class Transport(_BaseTransport):
                 params=params,
                 content=content,
                 headers=self._sent(headers),
-                timeout=self._budget(self._http.timeout, timeout),
+                timeout=self._cap_budget(self._budget(self._http.timeout, timeout), timeout_cap),
             )
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
+        except httpx.RequestError as exc:
+            raise _request_failed(method, path, exc) from exc
         if resp.is_success:
             return resp
         raise self._error(resp)
@@ -400,6 +434,8 @@ class Transport(_BaseTransport):
                     yield tail
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
+        except httpx.RequestError as exc:
+            raise _request_failed(method, path, exc) from exc
 
     def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(self.request(method, path, **kw))
@@ -421,14 +457,25 @@ class Transport(_BaseTransport):
             raise self._not_an_object(method, path, resp)
         return data
 
-    def listing(self, path: str, **kw: Any) -> tuple[Any, int | None]:
+    def json_array(self, method: str, path: str, **kw: Any) -> list[Mapping[str, Any]]:
+        """A JSON route whose successful answer must be an array of objects."""
+        resp = self.request(method, path, **kw)
+        data = self._parse(resp)
+        if not isinstance(data, list) or not all(isinstance(row, Mapping) for row in data):
+            raise self._not_an_array(method, path, resp)
+        return data
+
+    def listing(self, path: str, **kw: Any) -> tuple[list[Mapping[str, Any]], int | None]:
         """A collection read, and whether the platform had to answer it short.
 
         Separate from :meth:`json` because the news is in a header, and a header
         nothing reads is not a warning. See :data:`INCOMPLETE_HEADER`.
         """
         resp = self.request("GET", path, **kw)
-        return self._parse(resp), _incomplete(resp)
+        data = self._parse(resp)
+        if not isinstance(data, list) or not all(isinstance(row, Mapping) for row in data):
+            raise self._not_an_array("GET", path, resp)
+        return data, _incomplete(resp)
 
     def close(self) -> None:
         if self._owns_client:
@@ -459,9 +506,10 @@ class AsyncTransport(_BaseTransport):
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout: float | None = None,
+        timeout_cap: float | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
-        """One request. ``timeout`` widens this call's budget; see :meth:`_budget`."""
+        """One request, with optional widening and a final per-phase cap."""
         try:
             resp = await self._http.request(
                 method,
@@ -470,10 +518,12 @@ class AsyncTransport(_BaseTransport):
                 params=params,
                 content=content,
                 headers=self._sent(headers),
-                timeout=self._budget(self._http.timeout, timeout),
+                timeout=self._cap_budget(self._budget(self._http.timeout, timeout), timeout_cap),
             )
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
+        except httpx.RequestError as exc:
+            raise _request_failed(method, path, exc) from exc
         if resp.is_success:
             return resp
         raise self._error(resp)
@@ -520,6 +570,8 @@ class AsyncTransport(_BaseTransport):
                     yield tail
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
+        except httpx.RequestError as exc:
+            raise _request_failed(method, path, exc) from exc
 
     async def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(await self.request(method, path, **kw))
@@ -535,14 +587,25 @@ class AsyncTransport(_BaseTransport):
             raise self._not_an_object(method, path, resp)
         return data
 
-    async def listing(self, path: str, **kw: Any) -> tuple[Any, int | None]:
+    async def json_array(self, method: str, path: str, **kw: Any) -> list[Mapping[str, Any]]:
+        """A JSON route whose successful answer must be an array of objects."""
+        resp = await self.request(method, path, **kw)
+        data = self._parse(resp)
+        if not isinstance(data, list) or not all(isinstance(row, Mapping) for row in data):
+            raise self._not_an_array(method, path, resp)
+        return data
+
+    async def listing(self, path: str, **kw: Any) -> tuple[list[Mapping[str, Any]], int | None]:
         """A collection read, and whether the platform had to answer it short.
 
         Separate from :meth:`json` because the news is in a header, and a header
         nothing reads is not a warning. See :data:`INCOMPLETE_HEADER`.
         """
         resp = await self.request("GET", path, **kw)
-        return self._parse(resp), _incomplete(resp)
+        data = self._parse(resp)
+        if not isinstance(data, list) or not all(isinstance(row, Mapping) for row in data):
+            raise self._not_an_array("GET", path, resp)
+        return data, _incomplete(resp)
 
     async def aclose(self) -> None:
         if self._owns_client:

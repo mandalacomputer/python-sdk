@@ -8,10 +8,16 @@ user. These tests make the sync client the spec and hold the async one to it.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any
 
 import mandala_computer as mc
 from mandala_computer import _async_resources, _resources
+
+
+def test_the_installed_package_declares_its_inline_types() -> None:
+    package = Path(mc.__file__).resolve().parent
+    assert (package / "py.typed").is_file()
 
 
 def public_names(cls: type) -> set[str]:

@@ -68,6 +68,22 @@ async def test_status_maps_to_exception(client: mc.AsyncClient, status: int, exc
 
 
 @respx.mock
+async def test_a_network_failure_is_still_a_mandala_error(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers").mock(side_effect=httpx.ConnectError("reset"))
+    with pytest.raises(mc.MandalaError, match="ConnectError"):
+        await client.computers.list()
+    await client.aclose()
+
+
+@respx.mock
+async def test_exec_does_not_turn_an_empty_200_into_success(client: mc.AsyncClient) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200))
+    with pytest.raises(mc.MandalaError, match="not a JSON object"):
+        await mc.AsyncComputer(client._t, COMPUTER).exec("true")
+    await client.aclose()
+
+
+@respx.mock
 async def test_click_payload(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     await mc.AsyncComputer(client._t, COMPUTER).click(10, 20)
@@ -85,8 +101,27 @@ async def test_validation_happens_before_any_request(client: mc.AsyncClient) -> 
         await c.key()
     with pytest.raises(ValueError, match="up.*down"):
         await c.scroll(direction="sideways")
+    with pytest.raises(ValueError, match="amount must be positive"):
+        await c.scroll(amount=0)
+    with pytest.raises(ValueError, match="timeout_s must be positive"):
+        await c.exec("true", timeout_s=0)
     with pytest.raises(ValueError, match="hour"):
         await c.set_schedule(enabled=True, hour=99)
+
+
+@respx.mock
+async def test_long_input_actions_widen_the_request_budget(client: mc.AsyncClient) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    await c.wait(120)
+    assert route.calls.last.request.extensions["timeout"]["read"] == (
+        120 + mc._client.DEADLINE_SLACK
+    )
+    await c.hold_key("shift", seconds=90)
+    assert route.calls.last.request.extensions["timeout"]["read"] == (
+        90 + mc._client.DEADLINE_SLACK
+    )
+    await client.aclose()
 
 
 @respx.mock
@@ -342,6 +377,31 @@ async def test_wait_for_guest_does_not_wait_out_a_revoked_key(client: mc.AsyncCl
 
 
 @respx.mock
+async def test_wait_for_guest_preserves_a_rate_limit(client: mc.AsyncClient) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(429, headers={"Retry-After": "8"}, json={"error": "slow down"})
+    )
+    with pytest.raises(mc.RateLimitError) as caught:
+        await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)
+    assert caught.value.retry_after == 8
+    assert route.call_count == 1
+    await client.aclose()
+
+
+@respx.mock
+async def test_wait_for_guest_caps_the_probe_to_its_remaining_budget(
+    client: mc.AsyncClient,
+) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=2, poll=0)
+    assert json.loads(route.calls.last.request.content)["timeout_s"] == 2
+    assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
+    await client.aclose()
+
+
+@respx.mock
 async def test_a_failing_ephemeral_cleanup_keeps_the_original_error(
     client: mc.AsyncClient,
 ) -> None:
@@ -355,8 +415,12 @@ async def test_a_failing_ephemeral_cleanup_keeps_the_original_error(
         async with client.computers.ephemeral():
             raise ZeroDivisionError("the caller's own bug")
 
-    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+    with (
+        pytest.warns(UserWarning, match="still billable") as warning,
+        pytest.raises(ZeroDivisionError),
+    ):
         await caller_raises()
+    assert warning[0].filename == __file__
     await client.aclose()
 
 
@@ -434,6 +498,8 @@ async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None
         httpx.Response(200, json={"enabled": False})
     )
 
-    assert await mc.AsyncComputer(client._t, COMPUTER).set_schedule(enabled=True) == stored
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.set_schedule(enabled=True) == stored
+    assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
     await client.aclose()

@@ -8,6 +8,7 @@ from the shared ``ComputerFields``; paths, payloads, and validation come from
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -70,7 +71,7 @@ class AsyncComputer(ComputerFields):
         Also how a computer from :meth:`AsyncComputers.list` acquires a
         :attr:`vnc` connect surface, which the list deliberately omits.
         """
-        self._data = _api.computer_payload(await self._t.json("GET", _api.computer(self.id)))
+        self._data = _api.computer_payload(await self._t.json_object("GET", _api.computer(self.id)))
         return self
 
     async def start(self) -> AsyncComputer:
@@ -134,7 +135,7 @@ class AsyncComputer(ComputerFields):
         ``"building"`` and fills in behind you. Follow with
         :meth:`wait_until_built` before starting it.
         """
-        data = await self._t.json(
+        data = await self._t.json_object(
             "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
         )
         return AsyncComputer(self._t, _api.computer_payload(data))
@@ -156,7 +157,7 @@ class AsyncComputer(ComputerFields):
         all that is left of it.
         """
         self._data = _api.computer_payload(
-            await self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name))
+            await self._t.json_object("PATCH", _api.computer(self.id), json=_api.rename_body(name))
         )
         return self
 
@@ -179,7 +180,7 @@ class AsyncComputer(ComputerFields):
         not part of this — see :attr:`resolution`, which is fixed at create.
         """
         self._data = _api.computer_payload(
-            await self._t.json(
+            await self._t.json_object(
                 "PATCH",
                 _api.computer(self.id),
                 json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
@@ -200,7 +201,7 @@ class AsyncComputer(ComputerFields):
         polls the screen is the one thing this setting can surprise.
         """
         self._data = _api.computer_payload(
-            await self._t.json(
+            await self._t.json_object(
                 "PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes)
             )
         )
@@ -333,17 +334,36 @@ class AsyncComputer(ComputerFields):
         """
         deadline = time.monotonic() + timeout
         while True:
+            if self.build_failed:
+                raise MandalaError(
+                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             try:
-                res = await self.exec(GUEST_PROBE, timeout_s=5)
+                probe_timeout = max(1, min(5, math.ceil(remaining)))
+                res = await self._exec(
+                    GUEST_PROBE,
+                    probe_timeout,
+                    timeout_cap=remaining,
+                )
                 if res.ok:
                     return self
             except _FATAL_WHILE_WAITING:
                 raise
             except MandalaError:
-                pass  # agent not up yet
-            if time.monotonic() >= deadline:
+                if self.is_building:
+                    await self.refresh()
+                    if self.build_failed:
+                        raise MandalaError(
+                            f"{self.id} could not be built: "
+                            f"{self.build_error or 'the disk copy failed'}"
+                        )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
-            await asyncio.sleep(poll)
+            await asyncio.sleep(min(poll, remaining))
 
     # --- observing ------------------------------------------------------
 
@@ -376,8 +396,12 @@ class AsyncComputer(ComputerFields):
 
     # --- controlling ----------------------------------------------------
 
-    async def _input(self, body: dict[str, Any]) -> Mapping[str, Any]:
-        return await self._t.json("POST", _api.computer_action(self.id, "input"), json=body) or {}
+    async def _input(
+        self, body: dict[str, Any], *, timeout: float | None = None
+    ) -> Mapping[str, Any]:
+        return await self._t.json_object(
+            "POST", _api.computer_action(self.id, "input"), json=body, timeout=timeout
+        )
 
     async def move(self, x: int, y: int) -> None:
         """Move the pointer to ``(x, y)`` in this computer's screen space.
@@ -488,7 +512,7 @@ class AsyncComputer(ComputerFields):
         For the keys that mean something while held rather than when tapped — an
         arrow key that repeats, a modifier that changes what a UI shows.
         """
-        await self._input(_api.hold_key_body(keys, seconds))
+        await self._input(_api.hold_key_body(keys, seconds), timeout=seconds + DEADLINE_SLACK)
 
     async def wait(self, seconds: float) -> None:
         """Pause, inside the platform, without holding this computer's monitor.
@@ -497,7 +521,7 @@ class AsyncComputer(ComputerFields):
         computer-use model emits ``wait`` as an action, and because it does not
         block the screenshot polls of anything else watching the desktop.
         """
-        await self._input(_api.wait_body(seconds))
+        await self._input(_api.wait_body(seconds), timeout=seconds + DEADLINE_SLACK)
 
     async def cursor_position(self) -> tuple[int, int] | None:
         """Where the pointer is, or ``None`` if nothing has placed it yet.
@@ -542,13 +566,33 @@ class AsyncComputer(ComputerFields):
         stopped waiting, not that the work was destroyed, and the output and the
         exit code are lost with the request.
         """
-        data = await self._t.json(
+        return await self._exec(
+            command,
+            timeout_s,
+            desktop=desktop,
+            cwd=cwd,
+            env=env,
+        )
+
+    async def _exec(
+        self,
+        command: str,
+        timeout_s: int,
+        *,
+        desktop: bool = False,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_cap: float | None = None,
+    ) -> ExecResult:
+        """The exec request, with an optional wall-clock cap for readiness probes."""
+        data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
             timeout=timeout_s + DEADLINE_SLACK,
+            timeout_cap=timeout_cap,
         )
-        return ExecResult.from_api(data or {})
+        return ExecResult.from_api(data)
 
     async def start_exec(
         self,
@@ -578,12 +622,12 @@ class AsyncComputer(ComputerFields):
         can rebuild one with :meth:`background_command` — but not a restart of
         the computer, and only commands this API started can be read back.
         """
-        data = await self._t.json(
+        data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, 0, desktop, background=True, cwd=cwd, env=env),
         )
-        return AsyncBackgroundCommand(self._t, self.id, data or {})
+        return AsyncBackgroundCommand(self._t, self.id, data)
 
     def background_command(self, pid: int) -> AsyncBackgroundCommand:
         """A handle onto a command :meth:`start_exec` started earlier.
@@ -656,12 +700,12 @@ class AsyncComputer(ComputerFields):
 
         Linux only.
         """
-        data = await self._t.json(
+        data = await self._t.json_object(
             "GET",
             _api.computer_action(self.id, "windows"),
             params=_api.windows_params(include_all),
         )
-        rows = data.get("windows") if isinstance(data, Mapping) else None
+        rows = data.get("windows")
         return [Window.from_api(w) for w in rows or []]
 
     async def window_action(
@@ -689,12 +733,12 @@ class AsyncComputer(ComputerFields):
         see :class:`~mandala_computer.WindowResult`, and believe it rather than
         the request.
         """
-        data = await self._t.json(
+        data = await self._t.json_object(
             "POST",
             _api.window(self.id, window_id),
             json=_api.window_body(action, x=x, y=y, width=width, height=height),
         )
-        return WindowResult.from_api(data if isinstance(data, Mapping) else {})
+        return WindowResult.from_api(data)
 
     # --- snapshots ------------------------------------------------------
 
@@ -706,12 +750,12 @@ class AsyncComputer(ComputerFields):
         of booting — the computer must be running for that. An omitted ``name``
         asks the platform to generate one.
         """
-        data = await self._t.json(
+        data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "snapshots"),
             json=_api.snapshot_body(memory, name),
         )
-        return Snapshot.from_api(data or {})
+        return Snapshot.from_api(data)
 
     async def snapshots(
         self, *, include_unfinished: bool = False, allow_partial: bool = False
@@ -755,12 +799,12 @@ class AsyncComputer(ComputerFields):
         the fingerprint is the only interlock on a purge, and it is not
         something a caller can compute from a listing. See :meth:`delete`.
         """
-        data = await self._t.json("GET", _api.computer_action(self.id, "snapshots"))
-        return SnapshotHoldings.from_api(data if isinstance(data, Mapping) else {})
+        data = await self._t.json_object("GET", _api.computer_action(self.id, "snapshots"))
+        return SnapshotHoldings.from_api(data)
 
     async def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
-        return await self._t.json("GET", _api.computer_action(self.id, "schedule")) or {}
+        return await self._t.json_object("GET", _api.computer_action(self.id, "schedule"))
 
     async def set_schedule(
         self,
@@ -774,14 +818,15 @@ class AsyncComputer(ComputerFields):
 
         See :meth:`mandala_computer.Computer.set_schedule`.
         """
-        return (
-            await self._t.json(
+        stored = dict(
+            await self._t.json_object(
                 "PUT",
                 _api.computer_action(self.id, "schedule"),
                 json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
             )
-            or {}
         )
+        self._data["snapshot_schedule"] = stored
+        return stored
 
     async def clear_schedule(self) -> Mapping[str, Any]:
         """Remove the schedule, as distinct from disabling it.
@@ -790,7 +835,11 @@ class AsyncComputer(ComputerFields):
         restores it, and keeps the scheduler's bookkeeping with it. Clearing
         returns the computer to never having had a schedule.
         """
-        return await self._t.json("DELETE", _api.computer_action(self.id, "schedule")) or {}
+        cleared = dict(
+            await self._t.json_object("DELETE", _api.computer_action(self.id, "schedule"))
+        )
+        self._data["snapshot_schedule"] = None
+        return cleared
 
     # --- the agent loop -------------------------------------------------
 
@@ -952,8 +1001,8 @@ class AsyncBackgroundCommand(BackgroundCommandFields):
         while :attr:`~mandala_computer.ExecStatus.more` is set; there is output
         waiting, and sleeping on it only makes the next read bigger.
         """
-        data = await self._t.json("GET", _api.exec_handle(self._computer_id, self.pid))
-        return ExecStatus.from_api(data if isinstance(data, Mapping) else {})
+        data = await self._t.json_object("GET", _api.exec_handle(self._computer_id, self.pid))
+        return ExecStatus.from_api(data)
 
     async def kill(self) -> ExecStatus:
         """Stop it, and everything it started.
@@ -962,5 +1011,5 @@ class AsyncBackgroundCommand(BackgroundCommandFields):
         been read — so this is a way to end a command and collect its tail in
         one call, not only a way to abandon one.
         """
-        data = await self._t.json("DELETE", _api.exec_handle(self._computer_id, self.pid))
-        return ExecStatus.from_api(data if isinstance(data, Mapping) else {})
+        data = await self._t.json_object("DELETE", _api.exec_handle(self._computer_id, self.pid))
+        return ExecStatus.from_api(data)

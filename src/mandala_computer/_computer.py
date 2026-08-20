@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterator, Mapping
 from typing import Any
@@ -29,6 +30,7 @@ from ._exceptions import (
     NotFoundError,
     PermissionDeniedError,
     PlanLimitError,
+    RateLimitError,
     TimeoutError,
 )
 from ._models import (
@@ -120,8 +122,12 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
 # on Windows it could only spin until it timed out.
 GUEST_PROBE = "exit 0"
 
-#: Errors that no amount of waiting resolves, so :meth:`Computer.wait_for_guest`
-#: re-raises them rather than polling through them. Everything else in the
+#: Errors that :meth:`Computer.wait_for_guest` must not hide. Most cannot be
+#: resolved by waiting; a rate limit can, but only on the server's retry cadence,
+#: which this helper must preserve for its caller rather than replacing with its
+#: own shorter poll.
+#:
+#: Everything else in the
 #: hierarchy is either transient by definition (:class:`ConflictError`, which
 #: the guest agent answers with in the first seconds of a start, and
 #: :class:`UnavailableError`) or a 502 from an agent that has not spoken yet —
@@ -131,6 +137,7 @@ _FATAL_WHILE_WAITING = (
     PermissionDeniedError,
     NotFoundError,
     PlanLimitError,
+    RateLimitError,
 )
 
 
@@ -395,7 +402,7 @@ class Computer(ComputerFields):
         Also how a computer from :meth:`Computers.list` acquires a :attr:`vnc`
         connect surface, which the list deliberately omits.
         """
-        self._data = _api.computer_payload(self._t.json("GET", _api.computer(self.id)))
+        self._data = _api.computer_payload(self._t.json_object("GET", _api.computer(self.id)))
         return self
 
     def start(self) -> Computer:
@@ -459,7 +466,7 @@ class Computer(ComputerFields):
         ``"building"`` and fills in behind you. Follow with
         :meth:`wait_until_built` before starting it.
         """
-        data = self._t.json(
+        data = self._t.json_object(
             "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
         )
         return Computer(self._t, _api.computer_payload(data))
@@ -481,7 +488,7 @@ class Computer(ComputerFields):
         all that is left of it.
         """
         self._data = _api.computer_payload(
-            self._t.json("PATCH", _api.computer(self.id), json=_api.rename_body(name))
+            self._t.json_object("PATCH", _api.computer(self.id), json=_api.rename_body(name))
         )
         return self
 
@@ -504,7 +511,7 @@ class Computer(ComputerFields):
         not part of this — see :attr:`resolution`, which is fixed at create.
         """
         self._data = _api.computer_payload(
-            self._t.json(
+            self._t.json_object(
                 "PATCH",
                 _api.computer(self.id),
                 json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
@@ -525,7 +532,9 @@ class Computer(ComputerFields):
         polls the screen is the one thing this setting can surprise.
         """
         self._data = _api.computer_payload(
-            self._t.json("PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes))
+            self._t.json_object(
+                "PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes)
+            )
         )
         return self
 
@@ -654,16 +663,38 @@ class Computer(ComputerFields):
         """
         deadline = time.monotonic() + timeout
         while True:
+            if self.build_failed:
+                raise MandalaError(
+                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             try:
-                if self.exec(GUEST_PROBE, timeout_s=5).ok:
+                probe_timeout = max(1, min(5, math.ceil(remaining)))
+                if self._exec(
+                    GUEST_PROBE,
+                    probe_timeout,
+                    timeout_cap=remaining,
+                ).ok:
                     return self
             except _FATAL_WHILE_WAITING:
                 raise
             except MandalaError:
-                pass  # agent not up yet
-            if time.monotonic() >= deadline:
+                # A clone is the one handle that can become permanently unusable
+                # while this wait is in flight. Refresh only that state; doing it
+                # for an ordinary boot would double every readiness poll.
+                if self.is_building:
+                    self.refresh()
+                    if self.build_failed:
+                        raise MandalaError(
+                            f"{self.id} could not be built: "
+                            f"{self.build_error or 'the disk copy failed'}"
+                        )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
-            time.sleep(poll)
+            time.sleep(min(poll, remaining))
 
     # --- observing ------------------------------------------------------
 
@@ -696,8 +727,10 @@ class Computer(ComputerFields):
 
     # --- controlling ----------------------------------------------------
 
-    def _input(self, body: dict[str, Any]) -> Mapping[str, Any]:
-        return self._t.json("POST", _api.computer_action(self.id, "input"), json=body) or {}
+    def _input(self, body: dict[str, Any], *, timeout: float | None = None) -> Mapping[str, Any]:
+        return self._t.json_object(
+            "POST", _api.computer_action(self.id, "input"), json=body, timeout=timeout
+        )
 
     def move(self, x: int, y: int) -> None:
         """Move the pointer to ``(x, y)`` in this computer's screen space.
@@ -800,7 +833,7 @@ class Computer(ComputerFields):
         For the keys that mean something while held rather than when tapped — an
         arrow key that repeats, a modifier that changes what a UI shows.
         """
-        self._input(_api.hold_key_body(keys, seconds))
+        self._input(_api.hold_key_body(keys, seconds), timeout=seconds + DEADLINE_SLACK)
 
     def wait(self, seconds: float) -> None:
         """Pause, inside the platform, without holding this computer's monitor.
@@ -809,7 +842,7 @@ class Computer(ComputerFields):
         computer-use model emits ``wait`` as an action, and because it does not
         block the screenshot polls of anything else watching the desktop.
         """
-        self._input(_api.wait_body(seconds))
+        self._input(_api.wait_body(seconds), timeout=seconds + DEADLINE_SLACK)
 
     def cursor_position(self) -> tuple[int, int] | None:
         """Where the pointer is, or ``None`` if nothing has placed it yet.
@@ -859,13 +892,33 @@ class Computer(ComputerFields):
         match, so the HTTP budget is derived from it rather than left at the
         client default that would otherwise cut a long command short.
         """
-        data = self._t.json(
+        return self._exec(
+            command,
+            timeout_s,
+            desktop=desktop,
+            cwd=cwd,
+            env=env,
+        )
+
+    def _exec(
+        self,
+        command: str,
+        timeout_s: int,
+        *,
+        desktop: bool = False,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_cap: float | None = None,
+    ) -> ExecResult:
+        """The exec request, with an optional wall-clock cap for readiness probes."""
+        data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
             timeout=timeout_s + DEADLINE_SLACK,
+            timeout_cap=timeout_cap,
         )
-        return ExecResult.from_api(data or {})
+        return ExecResult.from_api(data)
 
     def start_exec(
         self,
@@ -895,12 +948,12 @@ class Computer(ComputerFields):
         can rebuild one with :meth:`background_command` — but not a restart of
         the computer, and only commands this API started can be read back.
         """
-        data = self._t.json(
+        data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, 0, desktop, background=True, cwd=cwd, env=env),
         )
-        return BackgroundCommand(self._t, self.id, data or {})
+        return BackgroundCommand(self._t, self.id, data)
 
     def background_command(self, pid: int) -> BackgroundCommand:
         """A handle onto a command :meth:`start_exec` started earlier.
@@ -978,12 +1031,12 @@ class Computer(ComputerFields):
 
         Linux only.
         """
-        data = self._t.json(
+        data = self._t.json_object(
             "GET",
             _api.computer_action(self.id, "windows"),
             params=_api.windows_params(include_all),
         )
-        rows = data.get("windows") if isinstance(data, Mapping) else None
+        rows = data.get("windows")
         return [Window.from_api(w) for w in rows or []]
 
     def window_action(
@@ -1011,12 +1064,12 @@ class Computer(ComputerFields):
         see :class:`~mandala_computer.WindowResult`, and believe it rather than
         the request.
         """
-        data = self._t.json(
+        data = self._t.json_object(
             "POST",
             _api.window(self.id, window_id),
             json=_api.window_body(action, x=x, y=y, width=width, height=height),
         )
-        return WindowResult.from_api(data if isinstance(data, Mapping) else {})
+        return WindowResult.from_api(data)
 
     # --- snapshots ------------------------------------------------------
 
@@ -1028,12 +1081,12 @@ class Computer(ComputerFields):
         of booting — the computer must be running for that. An omitted ``name``
         asks the platform to generate one.
         """
-        data = self._t.json(
+        data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "snapshots"),
             json=_api.snapshot_body(memory, name),
         )
-        return Snapshot.from_api(data or {})
+        return Snapshot.from_api(data)
 
     def snapshots(
         self, *, include_unfinished: bool = False, allow_partial: bool = False
@@ -1077,12 +1130,12 @@ class Computer(ComputerFields):
         the fingerprint is the only interlock on a purge, and it is not
         something a caller can compute from a listing. See :meth:`delete`.
         """
-        data = self._t.json("GET", _api.computer_action(self.id, "snapshots"))
-        return SnapshotHoldings.from_api(data if isinstance(data, Mapping) else {})
+        data = self._t.json_object("GET", _api.computer_action(self.id, "snapshots"))
+        return SnapshotHoldings.from_api(data)
 
     def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
-        return self._t.json("GET", _api.computer_action(self.id, "schedule")) or {}
+        return self._t.json_object("GET", _api.computer_action(self.id, "schedule"))
 
     def set_schedule(
         self,
@@ -1100,14 +1153,15 @@ class Computer(ComputerFields):
         come back looking like yours. :meth:`clear_schedule` reads its own
         answer for the same reason, as do :meth:`rename` and :meth:`resize`.
         """
-        return (
-            self._t.json(
+        stored = dict(
+            self._t.json_object(
                 "PUT",
                 _api.computer_action(self.id, "schedule"),
                 json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
             )
-            or {}
         )
+        self._data["snapshot_schedule"] = stored
+        return stored
 
     def clear_schedule(self) -> Mapping[str, Any]:
         """Remove the schedule, as distinct from disabling it.
@@ -1116,7 +1170,9 @@ class Computer(ComputerFields):
         restores it, and keeps the scheduler's bookkeeping with it. Clearing
         returns the computer to never having had a schedule.
         """
-        return self._t.json("DELETE", _api.computer_action(self.id, "schedule")) or {}
+        cleared = dict(self._t.json_object("DELETE", _api.computer_action(self.id, "schedule")))
+        self._data["snapshot_schedule"] = None
+        return cleared
 
     # --- the agent loop -------------------------------------------------
 
@@ -1309,8 +1365,8 @@ class BackgroundCommand(BackgroundCommandFields):
         while :attr:`~mandala_computer.ExecStatus.more` is set; there is output
         waiting, and sleeping on it only makes the next read bigger.
         """
-        data = self._t.json("GET", _api.exec_handle(self._computer_id, self.pid))
-        return ExecStatus.from_api(data if isinstance(data, Mapping) else {})
+        data = self._t.json_object("GET", _api.exec_handle(self._computer_id, self.pid))
+        return ExecStatus.from_api(data)
 
     def kill(self) -> ExecStatus:
         """Stop it, and everything it started.
@@ -1319,5 +1375,5 @@ class BackgroundCommand(BackgroundCommandFields):
         been read — so this is a way to end a command and collect its tail in
         one call, not only a way to abandon one.
         """
-        data = self._t.json("DELETE", _api.exec_handle(self._computer_id, self.pid))
-        return ExecStatus.from_api(data if isinstance(data, Mapping) else {})
+        data = self._t.json_object("DELETE", _api.exec_handle(self._computer_id, self.pid))
+        return ExecStatus.from_api(data)
