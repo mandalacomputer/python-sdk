@@ -14,7 +14,20 @@ import mandala_computer as mc
 from mandala_computer import _async_resources, _resources
 
 
+def public_names(cls: type) -> set[str]:
+    """Every attribute a caller can reach — methods and field accessors alike.
+
+    ``inspect.getmembers(cls, callable)`` silently drops properties, because a
+    ``property`` object is not callable. Enumerating only those left the whole
+    field surface — ``base_url``, ``vnc``, ``resolution``, ``screen``,
+    ``is_building`` and the rest — out of the comparison, so one could be added
+    to or renamed on a single half and this suite would still pass.
+    """
+    return {name for name in dir(cls) if not name.startswith("_")}
+
+
 def public_methods(cls: type) -> dict[str, inspect.Signature]:
+    """The callables alone. A property has no call signature to compare."""
     return {
         name: inspect.signature(fn)
         for name, fn in inspect.getmembers(cls, callable)
@@ -38,10 +51,10 @@ PAIRS = [
 ]
 
 
-def test_same_method_names() -> None:
+def test_same_public_names() -> None:
     for sync_cls, async_cls in PAIRS:
-        sync_names = set(public_methods(sync_cls))
-        async_names = set(public_methods(async_cls))
+        sync_names = public_names(sync_cls)
+        async_names = public_names(async_cls)
         # close/aclose is the one intentional difference — the async variant
         # cannot be spelled the same because it must be awaited.
         sync_names.discard("close")
@@ -76,7 +89,9 @@ def test_async_io_methods_are_coroutines() -> None:
         "background_command",
     }
     for _, async_cls in PAIRS:
-        for name, fn in public_methods(async_cls).items():
+        for name in public_names(async_cls):
+            # Reading a field makes no request, so it is not a coroutine. The
+            # guard is live now that properties are enumerated at all.
             if name in non_io or isinstance(
                 inspect.getattr_static(async_cls, name, None), property
             ):
@@ -84,7 +99,6 @@ def test_async_io_methods_are_coroutines() -> None:
             assert inspect.iscoroutinefunction(getattr(async_cls, name)), (
                 f"{async_cls.__name__}.{name} is not a coroutine function"
             )
-            assert fn is not None
 
 
 def test_field_accessors_are_shared_not_copied() -> None:
