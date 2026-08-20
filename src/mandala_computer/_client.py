@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from typing import Any
 
 import httpx
@@ -27,6 +27,7 @@ from ._exceptions import (
     TimeoutError,
     UnavailableError,
 )
+from ._sse import SSEDecoder, SSEEvent
 
 DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
 
@@ -51,6 +52,22 @@ DEADLINE_SLACK = 15.0
 #: deadline than an ordinary call, so :data:`DEFAULT_TIMEOUT` would abandon a
 #: large one the platform is still willing to finish.
 FILE_TIMEOUT = 300.0
+
+#: A request with no deadline at all, for the agent loop.
+#:
+#: Not a very large number: a run is minutes of clicking with no upper bound
+#: anybody can name, and any finite guess would end every run longer than the
+#: guess at exactly the same place. The two routes it is used on both hold one
+#: request open for the whole run — the streaming form because that is what a
+#: stream is, and the non-streaming form because it answers only at the end —
+#: so the ordinary deadline is not a safety net here, it is a cut-off. Closing
+#: the generator, or abandoning the call, is what stops one early.
+NO_DEADLINE = math.inf
+
+#: The header carrying the caller's own model key. Never stored by the platform,
+#: never metered, and never held on this client either — see
+#: :meth:`Computer.agent`.
+MODEL_KEY_HEADER = "X-Model-Key"
 
 _STATUS_ERRORS = {
     401: AuthenticationError,
@@ -130,6 +147,11 @@ class _BaseTransport:
         the budget already means "wait indefinitely", which is longer than
         anything we would ask for.
         """
+        if seconds == NO_DEADLINE:
+            # The maximal widening, and the one this cannot express as a number:
+            # httpx spells "wait indefinitely" as None rather than as infinity,
+            # which it would reject.
+            return httpx.Timeout(connect=current.connect, read=None, write=None, pool=current.pool)
         if seconds is None or current.read is None or current.write is None:
             return current
         if current.read >= seconds and current.write >= seconds:
@@ -149,6 +171,39 @@ class _BaseTransport:
             return resp.json()
         except ValueError:
             return None
+
+    def _sent(self, headers: Mapping[str, str] | None) -> dict[str, str]:
+        """This request's headers — the client's, plus whatever the call adds.
+
+        The call's win on a clash, which is what makes the stream able to ask
+        for ``text/event-stream`` over the client-wide ``application/json``.
+        """
+        return {**self._headers, **(headers or {})}
+
+    @staticmethod
+    def _is_event_stream(resp: httpx.Response) -> bool:
+        """Whether this is a stream to frame, read off the content type alone.
+
+        The captive-portal case, on the one route with no JSON parse to catch
+        it: a proxy that answered instead of the platform sends an HTML page,
+        which contains no ``data:`` lines, so it frames to a stream of no events
+        and surfaces as "the run ended without a result" — a sentence about the
+        platform, describing something that never reached it.
+
+        Deliberately does not touch the body. A streaming response has not read
+        one yet, and reading it is the caller's to do — and to await, on the
+        half of this file where that is a different verb.
+        """
+        return "text/event-stream" in resp.headers.get("content-type", "").lower()
+
+    @staticmethod
+    def _not_a_stream(method: str, path: str, resp: httpx.Response) -> MandalaError:
+        """The complaint, once the body behind it has been read."""
+        content_type = resp.headers.get("content-type") or "no content type"
+        return MandalaError(
+            f"{method} {path} answered {content_type}, not an event stream: "
+            f"{resp.text.strip()[:200]}"
+        )
 
     @staticmethod
     def _error(resp: httpx.Response) -> APIError:
@@ -171,6 +226,18 @@ class _BaseTransport:
                 retry_after=_retry_after(resp),
             )
         return cls(message, status=resp.status_code, body=body)
+
+
+def error_for_status(status: int, message: str) -> APIError:
+    """The exception a status deserves, for a failure that arrived in a stream.
+
+    The agent loop reports its own failures as events rather than as a status —
+    the response was a 200 and the run went wrong afterwards — so the mapping
+    every other route gets for free has to be reached for by hand here. Without
+    it the one failure that reaches a caller from inside a stream is the one
+    their ``except AuthenticationError`` cannot catch.
+    """
+    return _STATUS_ERRORS.get(status, APIError)(message, status=status)
 
 
 def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutError:
@@ -240,6 +307,7 @@ class Transport(_BaseTransport):
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         """One request. ``timeout`` widens this call's budget; see :meth:`_budget`."""
         try:
@@ -249,7 +317,7 @@ class Transport(_BaseTransport):
                 json=json,
                 params=params,
                 content=content,
-                headers=self._headers,
+                headers=self._sent(headers),
                 timeout=self._budget(self._http.timeout, timeout),
             )
         except httpx.TimeoutException as exc:
@@ -257,6 +325,49 @@ class Transport(_BaseTransport):
         if resp.is_success:
             return resp
         raise self._error(resp)
+
+    def sse(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Iterator[SSEEvent]:
+        """A route that answers with a stream of events rather than a result.
+
+        Yielded rather than collected, so a caller can report progress while the
+        run is going: an agent run is minutes of clicking, and something that
+        says nothing until it is over cannot be told from a hang.
+
+        No deadline — see :data:`NO_DEADLINE`. Closing the generator is what
+        stops one early, and it closes the response with it.
+        """
+        sent = {**(headers or {}), "Accept": "text/event-stream"}
+        try:
+            with self._http.stream(
+                method,
+                self._url(path),
+                json=json,
+                headers=self._sent(sent),
+                timeout=self._budget(self._http.timeout, NO_DEADLINE),
+            ) as resp:
+                if not resp.is_success:
+                    # Read first: the body of a streamed response is not there
+                    # until it is asked for, and the error message is in it.
+                    resp.read()
+                    raise self._error(resp)
+                if not self._is_event_stream(resp):
+                    resp.read()
+                    raise self._not_a_stream(method, path, resp)
+                decoder = SSEDecoder()
+                for chunk in resp.iter_bytes():
+                    yield from decoder.feed(chunk)
+                tail = decoder.flush()
+                if tail is not None:
+                    yield tail
+        except httpx.TimeoutException as exc:
+            raise _timed_out(method, path, exc) from exc
 
     def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(self.request(method, path, **kw))
@@ -299,6 +410,7 @@ class AsyncTransport(_BaseTransport):
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
         timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         """One request. ``timeout`` widens this call's budget; see :meth:`_budget`."""
         try:
@@ -308,7 +420,7 @@ class AsyncTransport(_BaseTransport):
                 json=json,
                 params=params,
                 content=content,
-                headers=self._headers,
+                headers=self._sent(headers),
                 timeout=self._budget(self._http.timeout, timeout),
             )
         except httpx.TimeoutException as exc:
@@ -316,6 +428,48 @@ class AsyncTransport(_BaseTransport):
         if resp.is_success:
             return resp
         raise self._error(resp)
+
+    async def sse(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> AsyncIterator[SSEEvent]:
+        """A route that answers with a stream of events rather than a result.
+
+        Yielded rather than collected, so a caller can report progress while the
+        run is going: an agent run is minutes of clicking, and something that
+        says nothing until it is over cannot be told from a hang.
+
+        No deadline — see :data:`NO_DEADLINE`. Closing the generator is what
+        stops one early, and it closes the response with it.
+        """
+        sent = {**(headers or {}), "Accept": "text/event-stream"}
+        try:
+            async with self._http.stream(
+                method,
+                self._url(path),
+                json=json,
+                headers=self._sent(sent),
+                timeout=self._budget(self._http.timeout, NO_DEADLINE),
+            ) as resp:
+                if not resp.is_success:
+                    await resp.aread()
+                    raise self._error(resp)
+                if not self._is_event_stream(resp):
+                    await resp.aread()
+                    raise self._not_a_stream(method, path, resp)
+                decoder = SSEDecoder()
+                async for chunk in resp.aiter_bytes():
+                    for event in decoder.feed(chunk):
+                        yield event
+                tail = decoder.flush()
+                if tail is not None:
+                    yield tail
+        except httpx.TimeoutException as exc:
+            raise _timed_out(method, path, exc) from exc
 
     async def json(self, method: str, path: str, **kw: Any) -> Any:
         return self._parse(await self.request(method, path, **kw))
