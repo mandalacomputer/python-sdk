@@ -150,4 +150,14 @@ class UnavailableError(APIError):
 
 
 class TimeoutError(MandalaError):
-    """A wait helper gave up before the computer reached the expected state."""
+    """The SDK stopped waiting.
+
+    Two things raise it: a wait helper that gave up before the computer reached
+    the expected state, and a request that outran the transport's budget for it.
+
+    Either way nothing has been cancelled — a command goes on running in the
+    guest after the request carrying it is abandoned. What was lost is this
+    call's view of the outcome, which is why a command slower than its request
+    wants :meth:`~mandala_computer.Computer.start_exec` rather than a longer
+    deadline.
+    """

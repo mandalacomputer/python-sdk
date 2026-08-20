@@ -385,3 +385,55 @@ async def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
     with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
         await caller_raises()
     await client.aclose()
+
+
+# --- request deadlines ------------------------------------------------------
+
+
+@respx.mock
+async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) -> None:
+    """The async half derives its deadline from timeout_s too.
+
+    The budget is threaded through the transport, so this is exactly where the
+    two halves could drift: an await that kept the fixed 60-second default would
+    abandon a long command while the sync half waited it out.
+    """
+    route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    c = await client.computers.get("vm-1")
+
+    await c.exec("make", timeout_s=300)
+    assert route.calls.last.request.extensions["timeout"]["read"] == (
+        300 + mc._client.DEADLINE_SLACK
+    )
+
+    files = respx.get(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, content=b"hi"))
+    await c.read_file("/tmp/a")
+    assert files.calls.last.request.extensions["timeout"]["read"] == mc._client.FILE_TIMEOUT
+    await client.aclose()
+
+
+@respx.mock
+async def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.AsyncClient) -> None:
+    """A timeout is the SDK's own error on both halves."""
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=httpx.ReadTimeout("too slow"))
+    with pytest.raises(mc.TimeoutError, match="did not answer") as caught:
+        await mc.AsyncComputer(client._t, COMPUTER).exec("sleep 999", timeout_s=100)
+    assert isinstance(caught.value, mc.MandalaError)
+    await client.aclose()
+
+
+@respx.mock
+async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None:
+    """No follow-up GET on this half either."""
+    stored = {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=stored))
+    get = respx.get(f"{BASE}/computers/vm-1/schedule").mock(
+        httpx.Response(200, json={"enabled": False})
+    )
+
+    assert await mc.AsyncComputer(client._t, COMPUTER).set_schedule(enabled=True) == stored
+    assert (put.call_count, get.call_count) == (1, 0)
+    await client.aclose()

@@ -8,6 +8,7 @@ what a 402 is or where a request goes.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -23,10 +24,33 @@ from ._exceptions import (
     PermissionDeniedError,
     PlanLimitError,
     RateLimitError,
+    TimeoutError,
     UnavailableError,
 )
 
 DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
+
+#: How long the transport waits, when nothing asks for longer.
+#:
+#: Enough for every route that answers at the speed of the control plane. The
+#: two that do not — a foreground ``exec`` and the file transfers — say so per
+#: request; see :meth:`_BaseTransport._budget`.
+DEFAULT_TIMEOUT = 60.0
+
+#: Added to a guest-side deadline to get the client's.
+#:
+#: The platform holds an ``exec`` open for ``timeout_s + 5s`` before giving up
+#: on the hypervisor, so a client waiting exactly ``timeout_s`` would abandon
+#: the request in the window where the answer is still coming. This is that 5s
+#: plus room for the round trip.
+DEADLINE_SLACK = 15.0
+
+#: Read and write budget for the file routes.
+#:
+#: A transfer is capped at 64 MiB and runs against a much longer platform-side
+#: deadline than an ordinary call, so :data:`DEFAULT_TIMEOUT` would abandon a
+#: large one the platform is still willing to finish.
+FILE_TIMEOUT = 300.0
 
 _STATUS_ERRORS = {
     401: AuthenticationError,
@@ -91,6 +115,33 @@ class _BaseTransport:
         return f"{self.base_url}/{path.lstrip('/')}"
 
     @staticmethod
+    def _budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
+        """This request's timeout, when the call needs longer than the default.
+
+        Only ever widens, and returns ``current`` unchanged when it does not.
+        A caller who handed us a patient client of their own keeps it, and a
+        call asking for less than the client already allows changes nothing —
+        the point is to stop the transport giving up on a deadline the platform
+        is still honouring, not to impose a new one.
+
+        ``connect`` and ``pool`` are left alone: neither has anything to do with
+        how long the *guest* takes, and shortening the wait for a connection is
+        not what a long-running command asked for. A ``None`` on either half of
+        the budget already means "wait indefinitely", which is longer than
+        anything we would ask for.
+        """
+        if seconds is None or current.read is None or current.write is None:
+            return current
+        if current.read >= seconds and current.write >= seconds:
+            return current
+        return httpx.Timeout(
+            connect=current.connect,
+            read=max(current.read, seconds),
+            write=max(current.write, seconds),
+            pool=current.pool,
+        )
+
+    @staticmethod
     def _parse(resp: httpx.Response) -> Any:
         if not resp.content:
             return None
@@ -122,20 +173,47 @@ class _BaseTransport:
         return cls(message, status=resp.status_code, body=body)
 
 
+def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutError:
+    """The SDK's own error for a request the transport stopped waiting on.
+
+    ``httpx.TimeoutException`` is not a :class:`MandalaError`, so letting it out
+    raw means ``except MandalaError`` — the one handler the README tells callers
+    to write — misses the failure entirely.
+
+    The distinction in the message matters: nothing has been cancelled. The
+    command is still running in the guest and the file is still being written;
+    what was lost is this request's view of the outcome.
+    """
+    return TimeoutError(
+        f"{method} {path} did not answer within the client's timeout "
+        f"({type(exc).__name__}). This is the SDK giving up, not the platform "
+        "refusing — the work may still be running."
+    )
+
+
 def _retry_after(resp: httpx.Response) -> float | None:
     """``Retry-After`` in seconds, or ``None`` if it was not usable.
 
     Only the delta-seconds form is read. The HTTP-date form is legal and this
     surface does not send it, and guessing at a date against a clock that may
     disagree with the server's is worse than saying nothing.
+
+    ``nan`` and ``inf`` parse as floats but are not delays: this value is handed
+    to ``time.sleep``, where an infinity blocks forever and a ``nan`` raises. A
+    negative is a delay that has already passed, which is ``0``. So anything
+    that is not a finite number becomes ``None`` — the header was there, and it
+    was not usable, which is exactly what this returns ``None`` to say.
     """
     raw = resp.headers.get("retry-after")
     if raw is None:
         return None
     try:
-        return float(raw.strip())
+        seconds = float(raw.strip())
     except ValueError:
         return None
+    if not math.isfinite(seconds):
+        return None
+    return max(seconds, 0.0)
 
 
 class Transport(_BaseTransport):
@@ -146,7 +224,7 @@ class Transport(_BaseTransport):
         api_key: str | None = None,
         *,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
         client: httpx.Client | None = None,
     ) -> None:
         super().__init__(api_key, base_url)
@@ -161,15 +239,21 @@ class Transport(_BaseTransport):
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
-        resp = self._http.request(
-            method,
-            self._url(path),
-            json=json,
-            params=params,
-            content=content,
-            headers=self._headers,
-        )
+        """One request. ``timeout`` widens this call's budget; see :meth:`_budget`."""
+        try:
+            resp = self._http.request(
+                method,
+                self._url(path),
+                json=json,
+                params=params,
+                content=content,
+                headers=self._headers,
+                timeout=self._budget(self._http.timeout, timeout),
+            )
+        except httpx.TimeoutException as exc:
+            raise _timed_out(method, path, exc) from exc
         if resp.is_success:
             return resp
         raise self._error(resp)
@@ -199,7 +283,7 @@ class AsyncTransport(_BaseTransport):
         api_key: str | None = None,
         *,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         super().__init__(api_key, base_url)
@@ -214,15 +298,21 @@ class AsyncTransport(_BaseTransport):
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         content: bytes | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
-        resp = await self._http.request(
-            method,
-            self._url(path),
-            json=json,
-            params=params,
-            content=content,
-            headers=self._headers,
-        )
+        """One request. ``timeout`` widens this call's budget; see :meth:`_budget`."""
+        try:
+            resp = await self._http.request(
+                method,
+                self._url(path),
+                json=json,
+                params=params,
+                content=content,
+                headers=self._headers,
+                timeout=self._budget(self._http.timeout, timeout),
+            )
+        except httpx.TimeoutException as exc:
+            raise _timed_out(method, path, exc) from exc
         if resp.is_success:
             return resp
         raise self._error(resp)
