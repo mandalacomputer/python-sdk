@@ -128,6 +128,33 @@ def _connect(url: str) -> ClientConnection:
         _die(f"could not reach the terminal: {e}")
 
 
+def _exit_code(message: str) -> int | None:
+    """The status carried by a text frame, or ``None`` if it carries none.
+
+    Text frames are control, and the only one that ends a session is
+    ``{"type": "exit", "code": N}``. Everything else — a resize echo, an error
+    notice, a frame from a peer that is not the daemon — is not news here.
+
+    Everything that is not that shape is junk, *including* valid JSON that is
+    not an object: ``null``, a number and a list all parse cleanly and then
+    have no ``.get``. That reached the pump as an ``AttributeError``, which
+    ``main()`` does not catch, so a single stray frame ended an interactive
+    session in a traceback. An unreadable ``code`` is the same story one line
+    down, and is answered the same way — the frame's arrival is the news that
+    the shell ended, and no code to read is not a reason to invent a failure.
+    """
+    try:
+        control = json.loads(message)
+    except ValueError:
+        return None
+    if not isinstance(control, dict) or control.get("type") != "exit":
+        return None
+    try:
+        return int(control.get("code") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _interact(url: str) -> int:
     """Pump the local terminal into the websocket and back, until the shell ends.
 
@@ -176,12 +203,9 @@ def _interact(url: str) -> int:
             if isinstance(message, bytes):
                 _write_all(stdout, message)
                 continue
-            try:
-                control = json.loads(message)
-            except ValueError:
-                continue
-            if control.get("type") == "exit":
-                exit_code = int(control.get("code") or 0)
+            code = _exit_code(message)
+            if code is not None:
+                exit_code = code
     except ConnectionClosed:
         pass
     except KeyboardInterrupt:
