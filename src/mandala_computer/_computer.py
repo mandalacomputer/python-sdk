@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from . import _api
-from ._client import Transport
+from ._client import DEADLINE_SLACK, FILE_TIMEOUT, Transport
 from ._exceptions import (
     AuthenticationError,
     MandalaError,
@@ -759,11 +759,17 @@ class Computer(ComputerFields):
         wants :meth:`start_exec` instead: hitting ``timeout_s`` means this call
         stopped waiting, not that the work was destroyed, and the output and the
         exit code are lost with the request.
+
+        The transport waits out whatever ``timeout_s`` asks for. There is no
+        ceiling on it here or on the platform, which extends its own deadline to
+        match, so the HTTP budget is derived from it rather than left at the
+        client default that would otherwise cut a long command short.
         """
         data = self._t.json(
             "POST",
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
+            timeout=timeout_s + DEADLINE_SLACK,
         )
         return ExecResult.from_api(data or {})
 
@@ -842,7 +848,9 @@ class Computer(ComputerFields):
         request is made. Works while the computer is running or suspended
         (a transfer resumes a suspended computer, like any other use).
         """
-        resp = self._t.request("GET", _api.files(self.id), params=_api.files_params(path))
+        resp = self._t.request(
+            "GET", _api.files(self.id), params=_api.files_params(path), timeout=FILE_TIMEOUT
+        )
         return resp.content
 
     def write_file(self, path: str, data: bytes | str) -> None:
@@ -853,7 +861,13 @@ class Computer(ComputerFields):
         guest ``.env`` without echoing it through a shell command line.
         """
         body = data.encode() if isinstance(data, str) else data
-        self._t.request("PUT", _api.files(self.id), params=_api.files_params(path), content=body)
+        self._t.request(
+            "PUT",
+            _api.files(self.id),
+            params=_api.files_params(path),
+            content=body,
+            timeout=FILE_TIMEOUT,
+        )
 
     # --- windows --------------------------------------------------------
 
@@ -984,13 +998,22 @@ class Computer(ComputerFields):
         minute: int = 0,
         tz: str = "UTC",
     ) -> Mapping[str, Any]:
-        """Set the automatic daily snapshot window, in the given IANA timezone."""
-        self._t.request(
-            "PUT",
-            _api.computer_action(self.id, "schedule"),
-            json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
+        """Set the automatic daily snapshot window, in the given IANA timezone.
+
+        Returns the schedule as stored, out of the PUT's own answer. A follow-up
+        GET would cost a second metered round trip to report a *re-read* rather
+        than what this call stored — so a change that landed in between would
+        come back looking like yours. :meth:`clear_schedule` reads its own
+        answer for the same reason, as do :meth:`rename` and :meth:`resize`.
+        """
+        return (
+            self._t.json(
+                "PUT",
+                _api.computer_action(self.id, "schedule"),
+                json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
+            )
+            or {}
         )
-        return self.schedule()
 
     def clear_schedule(self) -> Mapping[str, Any]:
         """Remove the schedule, as distinct from disabling it.

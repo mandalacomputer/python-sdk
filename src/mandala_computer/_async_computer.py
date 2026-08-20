@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from . import _api
-from ._client import AsyncTransport
+from ._client import DEADLINE_SLACK, FILE_TIMEOUT, AsyncTransport
 from ._computer import (
     _FATAL_WHILE_WAITING,
     GUEST_PROBE,
@@ -517,6 +517,7 @@ class AsyncComputer(ComputerFields):
             "POST",
             _api.computer_action(self.id, "exec"),
             json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
+            timeout=timeout_s + DEADLINE_SLACK,
         )
         return ExecResult.from_api(data or {})
 
@@ -592,7 +593,9 @@ class AsyncComputer(ComputerFields):
 
         See :meth:`mandala_computer.Computer.read_file`.
         """
-        resp = await self._t.request("GET", _api.files(self.id), params=_api.files_params(path))
+        resp = await self._t.request(
+            "GET", _api.files(self.id), params=_api.files_params(path), timeout=FILE_TIMEOUT
+        )
         return resp.content
 
     async def write_file(self, path: str, data: bytes | str) -> None:
@@ -602,7 +605,11 @@ class AsyncComputer(ComputerFields):
         """
         body = data.encode() if isinstance(data, str) else data
         await self._t.request(
-            "PUT", _api.files(self.id), params=_api.files_params(path), content=body
+            "PUT",
+            _api.files(self.id),
+            params=_api.files_params(path),
+            content=body,
+            timeout=FILE_TIMEOUT,
         )
 
     # --- windows --------------------------------------------------------
@@ -734,13 +741,18 @@ class AsyncComputer(ComputerFields):
         minute: int = 0,
         tz: str = "UTC",
     ) -> Mapping[str, Any]:
-        """Set the automatic daily snapshot window, in the given IANA timezone."""
-        await self._t.request(
-            "PUT",
-            _api.computer_action(self.id, "schedule"),
-            json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
+        """Set the automatic daily snapshot window, in the given IANA timezone.
+
+        See :meth:`mandala_computer.Computer.set_schedule`.
+        """
+        return (
+            await self._t.json(
+                "PUT",
+                _api.computer_action(self.id, "schedule"),
+                json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
+            )
+            or {}
         )
-        return await self.schedule()
 
     async def clear_schedule(self) -> Mapping[str, Any]:
         """Remove the schedule, as distinct from disabling it.
