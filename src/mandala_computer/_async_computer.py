@@ -353,10 +353,12 @@ class AsyncComputer(ComputerFields):
 
         What it does not wait through is a refusal that will never clear: a revoked
         key, a computer that is not there, an account that is not allowed, a
-        plan that does not cover this. Those are raised at once. Waiting on one
-        of them costs the full timeout and then reports "the guest did not
+        plan that does not cover this, a rate limit, or a TLS handshake the edge
+        and the platform cannot agree on. Those are raised at once. Waiting on
+        one of them costs the full timeout and then reports "the guest did not
         respond", which is both wrong and the least useful thing this method
-        could say about a 401.
+        could say about a 401 — or, as measured, about an expired certificate
+        that had already told the caller to report it rather than wait it out.
 
         A stopped computer is also refused immediately, including one carrying
         :attr:`start_error` from a failed boot. A suspended computer is not:
@@ -573,7 +575,7 @@ class AsyncComputer(ComputerFields):
     async def exec(
         self,
         command: str,
-        timeout_s: int = 30,
+        timeout: int = 30,
         *,
         desktop: bool = False,
         cwd: str | None = None,
@@ -590,7 +592,7 @@ class AsyncComputer(ComputerFields):
         and ``XAUTHORITY`` set — which is what anything with a window needs.
 
         A GUI program does not exit on its own, so launch it detached or the call
-        blocks until ``timeout_s`` kills it::
+        blocks until ``timeout`` kills it::
 
             await c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 
@@ -598,13 +600,24 @@ class AsyncComputer(ComputerFields):
 
         ``cwd`` is an absolute path inside the guest and ``env`` is extra
         environment for this command alone. A command slower than a few seconds
-        wants :meth:`start_exec` instead: hitting ``timeout_s`` means this call
+        wants :meth:`start_exec` instead: hitting ``timeout`` means this call
         stopped waiting, not that the work was destroyed, and the output and the
         exit code are lost with the request.
+
+        The transport waits out whatever ``timeout`` asks for, and the platform
+        extends its own deadline to match — but neither is what ends a long
+        command. A proxy in front of the platform abandons a request that has
+        produced no response for about two minutes and answers 524, which
+        arrives here as :class:`~mandala_computer.GatewayTimeoutError`; measured
+        against ``app.mandala.computer``, an ``exec`` slower than that dies at
+        ~125s whether ``timeout`` said 300 or 3600. The command survives the
+        request that abandoned it, so the next call on this computer may well
+        report the guest agent as busy with it. Past a couple of minutes,
+        :meth:`start_exec` is the only thing that works.
         """
         return await self._exec(
             command,
-            timeout_s,
+            timeout,
             desktop=desktop,
             cwd=cwd,
             env=env,
@@ -613,7 +626,7 @@ class AsyncComputer(ComputerFields):
     async def _exec(
         self,
         command: str,
-        timeout_s: int,
+        timeout: int,
         *,
         desktop: bool = False,
         cwd: str | None = None,
@@ -624,8 +637,8 @@ class AsyncComputer(ComputerFields):
         data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
-            json=_api.exec_body(command, timeout_s, desktop, cwd=cwd, env=env),
-            timeout=timeout_s + DEADLINE_SLACK,
+            json=_api.exec_body(command, timeout, desktop, cwd=cwd, env=env),
+            timeout=timeout + DEADLINE_SLACK,
             timeout_cap=timeout_cap,
         )
         return ExecResult.from_api(data)
@@ -677,14 +690,14 @@ class AsyncComputer(ComputerFields):
         """
         return AsyncBackgroundCommand(self._t, self.id, {"pid": pid})
 
-    async def open(self, url: str, *, timeout_s: int = 30) -> ExecResult:
+    async def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::
 
             await c.open("https://example.com")
 
         Sugar over :meth:`exec` with ``desktop=True``: it names a browser that
         works on the image, quotes the URL, and detaches the launch so the call
-        returns in well under a second instead of blocking until ``timeout_s``.
+        returns in well under a second instead of blocking until ``timeout``.
 
         The result describes the *launch*, not the page — a zero exit means the
         shell started the browser, not that the URL resolved. Take a
@@ -694,7 +707,7 @@ class AsyncComputer(ComputerFields):
         a browser would read as a flag rather than an address. On Windows the
         API rejects it, the same as any ``desktop=True`` exec.
         """
-        return await self.exec(_api.open_url_command(url), timeout_s, desktop=True)
+        return await self.exec(_api.open_url_command(url), timeout, desktop=True)
 
     # --- files ----------------------------------------------------------
 
@@ -1009,6 +1022,14 @@ class AsyncComputer(ComputerFields):
         A proxy that answers instead of the platform raises here rather than
         coming back as a run of no steps that ended for no reason — the same
         check :meth:`agent` makes on the content type, made on the body.
+
+        The proxy in front of ``app.mandala.computer`` gives up at about two
+        minutes, measured — so on that deployment this is not a risk but a
+        certainty for any run longer than that, and it arrives as
+        :class:`~mandala_computer.GatewayTimeoutError`. The remedy is
+        :meth:`agent`, not ``start_exec``: a stream sends its headers at once
+        and heartbeats every ten seconds, so nothing about it looks idle to the
+        hop that would otherwise stop waiting.
         """
         _require_model_key(model_key)
         data = await self._t.json_object(

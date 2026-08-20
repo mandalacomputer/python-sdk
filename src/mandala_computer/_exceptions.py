@@ -12,8 +12,12 @@ __all__ = [
     "APIError",
     "AuthenticationError",
     "ConflictError",
+    "GatewayTimeoutError",
     "MandalaError",
     "NotFoundError",
+    "OriginResponseError",
+    "OriginTLSError",
+    "OriginUnreachableError",
     "PermissionDeniedError",
     "PlanLimitError",
     "RateLimitError",
@@ -71,6 +75,116 @@ class PlanLimitError(APIError):
     Raised for computer-count caps, per-computer size ceilings, account-wide RAM
     and storage pools, and OS entitlements. ``str(e)`` carries the API's
     explanation of which limit was hit.
+    """
+
+
+class GatewayTimeoutError(APIError):
+    """A proxy in front of the platform gave up before the platform answered (504, 524).
+
+    Not the platform refusing anything. What ended was one hop's willingness to
+    hold the connection open with no response crossing it, so anything the
+    request had already set going carries on without it.
+
+    Usually that means the platform received the request and is still working on
+    it, which is what a 524 is: the edge connected, sent it, and gave up waiting
+    for the answer. It is a strong default rather than a guarantee. A 504 can be
+    raised by a hop that never reached the platform at all, and a 524 can end an
+    upload whose body had not finished arriving — so before retrying something
+    that *creates* rather than reads, check whether the first attempt took
+    effect.
+
+    The ceiling this reports is not the SDK's and not ``timeout``\'s: it belongs
+    to whatever sits between the caller and the platform, and it is reached at
+    the same place however long the call asked to wait. Against
+    ``app.mandala.computer`` that is about two minutes, so a foreground
+    :meth:`~mandala_computer.Computer.exec` of a slower command always ends
+    here. :meth:`~mandala_computer.Computer.start_exec` is the way to run one:
+    it answers as soon as the command has started and is polled afterwards, so
+    no request is ever held open for the length of the work.
+
+    Where the abandoned request was an ``exec``, the command keeps running, which
+    is why the next call on that computer often raises :class:`ConflictError` —
+    the guest agent is still busy with it. That is the earlier command, not a
+    second failure. A read that met the ceiling started nothing and leaves
+    nothing behind.
+
+    ``str(e)`` is the platform's own message whenever it sent one. A gateway
+    status usually arrives from an intermediary with an empty or HTML body, and
+    that is what the SDK's own wording is for; a hop that answers in this
+    surface's JSON has said something more specific than the SDK could, and it
+    is kept.
+    """
+
+
+class OriginResponseError(APIError):
+    """520 — the platform answered a proxy with something it could not read.
+
+    Sits between the other two edge failures and must not be filed with either,
+    because the question a caller is really asking is whether their work
+    happened, and this is the one status whose honest answer is "unknown".
+
+    A 524 means the request arrived and is still being worked on. 521-523 mean it
+    almost certainly never arrived. A 520 means it **did** arrive and the
+    exchange then broke on the way back: an empty or unreadable response, a
+    connection dropped before headers, an origin that crashed part-way. So the
+    work may have been carried out in full, in part, or not at all, and no
+    answer may ever have been produced to lose.
+
+    Which makes a blind retry the thing to be careful about. Re-sending a read
+    costs nothing; re-sending a create can leave two computers where one was
+    meant, both of them billable, on the strength of a failure that said the
+    first one never happened. Look before retrying anything that makes something.
+
+    This one was filed with :class:`OriginUnreachableError` at first, on the
+    reading that the whole 52x range is the edge failing to reach the platform.
+    It is not, and the message that came with it — "the request never arrived, so
+    nothing was started" — was exactly the kind of confident falsehood the rest
+    of this work exists to remove, pointed the other way.
+    """
+
+
+class OriginUnreachableError(APIError):
+    """521-523 — a proxy in front of the platform could not reach it.
+
+    One of four classes for an edge failing rather than the platform refusing,
+    and they are four because a caller asking *did my work happen* needs four
+    answers. :class:`GatewayTimeoutError` is a hop that stopped waiting, usually
+    on a request the platform has. :class:`OriginResponseError` is 520, where the
+    platform was reached and the exchange broke coming back. :class:`OriginTLSError`
+    is a certificate that will never agree. This one is an origin that is down or
+    unreachable — what a platform restart looks like from outside, and it clears.
+
+    Almost always the request was never sent, so nothing was started and there is
+    nothing left running to account for. *Almost*, rather than never: a 522 is a
+    connection that timed out, and the edge can give up after one was
+    established, so bytes already on the wire are not unsent because no
+    acknowledgement came back. Retry a read freely; look before retrying
+    something that creates.
+
+    :meth:`~mandala_computer.Computer.wait_for_guest` waits one of these out, as
+    it waits out every error not named in ``_FATAL_WHILE_WAITING``.
+    :meth:`~mandala_computer.Computer.wait_until_built` and
+    :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they read
+    the computer's state with no retry around it, so one of these mid-poll ends
+    the wait. :class:`OriginTLSError` is the sibling that is never waited out,
+    which is the whole reason it stopped sharing this class.
+    """
+
+
+class OriginTLSError(APIError):
+    """525, 526 — a proxy and the platform could not agree on TLS.
+
+    Split from :class:`OriginUnreachableError`, which it used to share, because
+    the two need opposite answers to "should I try again". An unreachable origin
+    is a passing outage; an expired or mismatched certificate fails identically
+    on every retry, and is a deployment somebody has to go and fix.
+
+    Being its own class is what lets the ``wait_*`` helpers act on that. Sharing
+    one meant ``_FATAL_WHILE_WAITING`` could not name it, so
+    :meth:`~mandala_computer.Computer.wait_for_guest` retried a certificate
+    failure for its full 180 seconds and then reported "the guest did not
+    respond" — losing the cause, the class and the three minutes, while this
+    error's own message said to report it rather than wait it out.
     """
 
 

@@ -103,8 +103,8 @@ async def test_validation_happens_before_any_request(client: mc.AsyncClient) -> 
         await c.scroll(direction="sideways")
     with pytest.raises(ValueError, match="amount must be positive"):
         await c.scroll(amount=0)
-    with pytest.raises(ValueError, match="timeout_s must be positive"):
-        await c.exec("true", timeout_s=0)
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        await c.exec("true", timeout=0)
     with pytest.raises(ValueError, match="hour"):
         await c.set_schedule(enabled=True, hour=99)
 
@@ -540,7 +540,7 @@ async def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
 
 @respx.mock
 async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) -> None:
-    """The async half derives its deadline from timeout_s too.
+    """The async half derives its deadline from timeout too.
 
     The budget is threaded through the transport, so this is exactly where the
     two halves could drift: an await that kept the fixed 60-second default would
@@ -552,7 +552,7 @@ async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) 
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     c = await client.computers.get("vm-1")
 
-    await c.exec("make", timeout_s=300)
+    await c.exec("make", timeout=300)
     assert route.calls.last.request.extensions["timeout"]["read"] == (
         300 + mc._client.DEADLINE_SLACK
     )
@@ -569,7 +569,7 @@ async def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.AsyncCl
     """A timeout is the SDK's own error on both halves."""
     respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=httpx.ReadTimeout("too slow"))
     with pytest.raises(mc.TimeoutError, match="did not answer") as caught:
-        await mc.AsyncComputer(client._t, COMPUTER).exec("sleep 999", timeout_s=100)
+        await mc.AsyncComputer(client._t, COMPUTER).exec("sleep 999", timeout=100)
     assert isinstance(caught.value, mc.MandalaError)
     await client.aclose()
 
@@ -588,3 +588,64 @@ async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None
     assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
     await client.aclose()
+
+
+@respx.mock
+async def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half maps 524 exactly as the sync half does."""
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(524, content=b""))
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        await mc.AsyncComputer(client._t, COMPUTER).exec("sleep 130", timeout=300)
+    assert e.value.status == 524
+    assert "start_exec()" in str(e.value)
+
+
+@respx.mock
+async def test_an_ordinary_gateway_timeout_lands_in_the_same_place(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(504, content=b""))
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        await client.computers.get("vm-1")
+    assert e.value.status == 504
+
+
+@respx.mock
+async def test_a_platform_that_named_the_failure_keeps_its_own_words(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half substitutes on the same condition the sync half does."""
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(504, json={"error": "upstream unavailable before dispatch"})
+    )
+    with pytest.raises(mc.GatewayTimeoutError) as e:
+        await client.computers.get("vm-1")
+    assert str(e.value) == "upstream unavailable before dispatch"
+
+
+@respx.mock
+async def test_an_origin_never_reached_is_not_one_that_stopped_answering(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half classifies the 52x range exactly as the sync half does."""
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(522, content=b""))
+    with pytest.raises(mc.OriginUnreachableError) as e:
+        await client.computers.get("vm-1")
+    assert e.value.status == 522
+    assert not isinstance(e.value, mc.GatewayTimeoutError)
+    assert "never sent" in str(e.value)
+
+
+@respx.mock
+async def test_a_520_does_not_claim_the_work_never_happened(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half tells 520 apart from its neighbours the same way."""
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(520, content=b""))
+    with pytest.raises(mc.OriginResponseError) as e:
+        await client.computers.get("vm-1")
+    assert e.value.status == 520
+    assert not isinstance(e.value, mc.OriginUnreachableError)
+    assert "never arrived" not in str(e.value)
