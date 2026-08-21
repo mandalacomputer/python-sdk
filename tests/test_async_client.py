@@ -576,6 +576,26 @@ async def test_async_read_file_part_reads_the_answer_not_the_ask(
 
 
 @respx.mock
+async def test_async_a_partial_answer_wider_than_requested_is_refused(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"x" * 40,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 0-39/100",
+            },
+        )
+    )
+
+    with pytest.raises(mc.MandalaError, match="outside the requested Range bytes=0-9"):
+        await mc.AsyncComputer(client._t, COMPUTER).read_file_part("/x", offset=0, length=10)
+    await client.aclose()
+
+
+@respx.mock
 async def test_async_an_empty_file_downloads_as_nothing(client: mc.AsyncClient, tmp_path) -> None:
     respx.get(f"{BASE}/computers/vm-1/files").mock(
         httpx.Response(416, json={"error": "no"}, headers={"Content-Range": "bytes */0"})

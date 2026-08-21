@@ -261,6 +261,12 @@ def _incomplete(resp: httpx.Response) -> int | None:
 #: how many the file has. Only on a 206.
 _CONTENT_RANGE = re.compile(r"\s*bytes\s+(\d+)\s*-\s*(\d+)\s*/\s*(\d+)\s*", re.IGNORECASE)
 
+#: The three single-range requests :func:`~mandala_computer._api.files_range`
+#: emits: a bounded window, everything from one position, or a suffix.
+_REQUESTED_RANGE = re.compile(
+    r"\s*bytes\s*=\s*(?:(\d+)\s*-\s*(\d*)|-\s*(\d+))\s*", re.IGNORECASE
+)
+
 #: ``Content-Range: bytes */2147483648`` — the same header on a 416, where there
 #: is no window to name and the length is the entire point of the answer.
 _UNSATISFIED_RANGE = re.compile(r"\s*bytes\s+\*\s*/\s*(\d+)\s*", re.IGNORECASE)
@@ -443,6 +449,7 @@ class _BaseTransport:
         path: str,
         resp: httpx.Response,
         data: bytes,
+        requested_range: str,
     ) -> tuple[int, int | None, bool]:
         """Where in the file these bytes are — ``(offset, total, partial)``.
 
@@ -496,6 +503,24 @@ class _BaseTransport:
                 f"{method} {path} sent {len(data)} bytes for the window "
                 f"{first}-{last} its Content-Range names. Something between here and "
                 "the platform altered the body, and the two cannot both be true."
+            )
+        asked = _REQUESTED_RANGE.fullmatch(requested_range)
+        if asked is None:
+            raise MandalaError(
+                f"{method} {path} answered a partial request whose Range "
+                f"{requested_range!r} cannot be checked"
+            )
+        if asked.group(3) is not None:
+            lower = max(total - int(asked.group(3)), 0)
+            upper: int | None = total - 1
+        else:
+            lower = int(asked.group(1))
+            upper = int(asked.group(2)) if asked.group(2) else None
+        if first < lower or upper is not None and last > upper:
+            raise MandalaError(
+                f"{method} {path} served the wrong bytes at the wrong place: "
+                f"Content-Range {raw.strip()} falls outside the requested "
+                f"Range {requested_range}."
             )
         return first, total, True
 
@@ -786,7 +811,7 @@ class Transport(_BaseTransport):
         """
         resp = self.request(method, path, headers={**headers, "Accept": accept}, **kw)
         data = self._binary_body(method, path, resp, content_types)
-        offset, total, partial = self._served_range(method, path, resp, data)
+        offset, total, partial = self._served_range(method, path, resp, data, headers["Range"])
         return data, offset, total, partial
 
     def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
@@ -957,7 +982,7 @@ class AsyncTransport(_BaseTransport):
         """
         resp = await self.request(method, path, headers={**headers, "Accept": accept}, **kw)
         data = self._binary_body(method, path, resp, content_types)
-        offset, total, partial = self._served_range(method, path, resp, data)
+        offset, total, partial = self._served_range(method, path, resp, data, headers["Range"])
         return data, offset, total, partial
 
     async def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:

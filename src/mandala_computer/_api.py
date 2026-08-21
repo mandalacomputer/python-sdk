@@ -169,6 +169,10 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
     anchored at both ends, and the header has no way to spell that; naming the
     two forms apart is better than picking one silently.
     """
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise TypeError(f"offset must be an integer byte position, not {offset!r}")
+    if length is not None and (isinstance(length, bool) or not isinstance(length, int)):
+        raise TypeError(f"length must be an integer byte count or None, not {length!r}")
     if offset < 0:
         if length is not None:
             raise ValueError(

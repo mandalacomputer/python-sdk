@@ -2113,6 +2113,22 @@ def test_a_zero_length_window_is_refused_before_the_request() -> None:
         mc._api.files_range(0, 0)
 
 
+@pytest.mark.parametrize(
+    ("offset", "length", "message"),
+    [
+        (0.5, None, "offset must be an integer"),
+        (0, 1.5, "length must be an integer"),
+        (False, None, "offset must be an integer"),
+        (0, True, "length must be an integer"),
+    ],
+)
+def test_fractional_and_boolean_file_ranges_are_refused(
+    offset: int, length: int | None, message: str
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        mc._api.files_range(offset, length)
+
+
 @respx.mock
 def test_a_window_larger_than_one_request_moves_is_sent_anyway(client: mc.Client) -> None:
     """Asking for more than the ceiling is not an error, and must not become one.
@@ -2182,6 +2198,14 @@ def test_a_window_whose_body_contradicts_its_content_range_is_refused(client: mc
         )
     )
     with pytest.raises(mc.MandalaError, match="cannot both be true"):
+        _computer(client).read_file_part("/tmp/a", offset=0, length=10)
+
+
+@respx.mock
+def test_a_partial_answer_wider_than_the_requested_range_is_refused(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"x" * 40, 0, 100))
+
+    with pytest.raises(mc.MandalaError, match="outside the requested Range bytes=0-9"):
         _computer(client).read_file_part("/tmp/a", offset=0, length=10)
 
 
@@ -2256,7 +2280,7 @@ def _paging(*parts: bytes) -> object:
 @respx.mock
 def test_download_file_pages_until_the_file_ends(client: mc.Client, tmp_path) -> None:
     route = respx.get(f"{BASE}/computers/vm-1/files").mock(
-        side_effect=_paging(b"one", b"two", b"three")
+        side_effect=_paging(b"one", b"two", b"thr", b"ee")
     )
     dst = tmp_path / "out.bin"
 
@@ -2268,6 +2292,7 @@ def test_download_file_pages_until_the_file_ends(client: mc.Client, tmp_path) ->
         "bytes=0-2",
         "bytes=3-5",
         "bytes=6-8",
+        "bytes=9-11",
     ]
 
 
@@ -2445,7 +2470,7 @@ def test_a_file_that_grows_while_it_is_read_is_followed(client: mc.Client) -> No
         first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
         if first == 0:
             return _window(b"aa", 0, 4)
-        return _window(b"bbbb", 2, 6)  # two more bytes arrived in between
+        return _window(b"bb", first, 6)  # two more bytes arrived in between
 
     respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
     sink = io.BytesIO()
@@ -2502,6 +2527,15 @@ def test_a_window_from_the_wrong_offset_stops_the_download(client: mc.Client) ->
 def test_download_file_refuses_a_part_size_of_nothing(client: mc.Client) -> None:
     with pytest.raises(ValueError, match="at least 1 byte"):
         mc.Computer(client._t, {"id": "vm-1"}).download_file("/x", io.BytesIO(), part_size=0)
+
+
+@respx.mock
+def test_download_file_refuses_a_fractional_part_size_before_request(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"ab", 0, 2))
+
+    with pytest.raises(TypeError, match="length must be an integer"):
+        _computer(client).download_file("/x", io.BytesIO(), part_size=1.5)
+    assert not route.called
 
 
 @respx.mock
