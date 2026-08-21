@@ -7,6 +7,7 @@ lifecycle.
 
 from __future__ import annotations
 
+import io
 import json
 
 import httpx
@@ -482,6 +483,148 @@ async def test_async_write_file_refuses_an_oversized_body_before_the_request(
     with pytest.raises(ValueError, match="may not exceed"):
         await mc.AsyncComputer(client._t, COMPUTER).write_file("/tmp/a", "€")
     assert not put.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_download_file_pages_until_the_file_ends(
+    client: mc.AsyncClient, tmp_path
+) -> None:
+    """The paging loop is written out on both halves, so it is checked on both.
+
+    The shape is what test_parity.py pins; this is the behaviour underneath it,
+    which two hand-written loops can differ on while both keep the signature.
+    """
+    body = b"onetwothree"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        window = body[first : first + 3]
+        return httpx.Response(
+            206,
+            content=window,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + len(window) - 1}/{len(body)}",
+            },
+        )
+
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    dst = tmp_path / "out.bin"
+
+    written = await mc.AsyncComputer(client._t, COMPUTER).download_file(
+        "/home/user/out.bin", dst, part_size=3
+    )
+
+    assert written == len(body)
+    assert dst.read_bytes() == body
+    assert [call.request.headers["Range"] for call in route.calls] == [
+        "bytes=0-2",
+        "bytes=3-5",
+        "bytes=6-8",
+        "bytes=9-11",
+    ]
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_download_file_drains_short_writes(client: mc.AsyncClient) -> None:
+    class ShortSink(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            return super().write(data[:2])
+
+    body = b"abcdefgh"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        return httpx.Response(
+            206,
+            content=body[first : first + 4],
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + 3}/{len(body)}",
+            },
+        )
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    sink = ShortSink()
+
+    assert await mc.AsyncComputer(client._t, COMPUTER).download_file(
+        "/x", sink, part_size=4
+    ) == len(body)
+    assert sink.getvalue() == body
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_read_file_part_reads_the_answer_not_the_ask(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"ab",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 4-5/64",
+            },
+        )
+    )
+    part = await mc.AsyncComputer(client._t, COMPUTER).read_file_part("/tmp/a", offset=4, length=16)
+    assert (part.offset, part.total, part.end, part.at_end) == (4, 64, 6, False)
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_a_partial_answer_wider_than_requested_is_refused(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"x" * 40,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 0-39/100",
+            },
+        )
+    )
+
+    with pytest.raises(mc.MandalaError, match="outside the requested Range bytes=0-9"):
+        await mc.AsyncComputer(client._t, COMPUTER).read_file_part("/x", offset=0, length=10)
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_an_empty_file_downloads_as_nothing(client: mc.AsyncClient, tmp_path) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(416, json={"error": "no"}, headers={"Content-Range": "bytes */0"})
+    )
+    dst = tmp_path / "empty"
+    assert await mc.AsyncComputer(client._t, COMPUTER).download_file("/tmp/empty", dst) == 0
+    assert dst.read_bytes() == b""
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_a_file_that_shrinks_mid_download_raises(client: mc.AsyncClient) -> None:
+    """The loop is written out twice, so the thing that stops it is checked twice."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        data, total = (b"OLDOLD", 100) if first == 0 else (b"new", 9)
+        return httpx.Response(
+            206,
+            content=data,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + len(data) - 1}/{total}",
+            },
+        )
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    with pytest.raises(mc.MandalaError, match="was 100 bytes and is 9"):
+        await mc.AsyncComputer(client._t, COMPUTER).download_file("/x", io.BytesIO(), part_size=6)
     await client.aclose()
 
 

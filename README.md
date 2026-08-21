@@ -683,8 +683,70 @@ report = c.read_file("/home/user/report.csv")
 
 Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
-directory. A transfer resumes a suspended computer, like any other use. File
-bodies are limited to 64 MiB and oversized writes are refused locally.
+directory. A transfer resumes a suspended computer, like any other use.
+
+**One request moves at most 64 MiB**, and that is a limit on the request rather
+than on the file. An oversized write is refused locally, before anything is
+sent; an oversized `read_file()` raises `FileTooLargeError`, which is a signpost
+rather than a dead end.
+
+#### A window of a file
+
+`download_file()` is how a file of any size comes off a computer, and
+`read_file_part()` is the single window underneath it:
+
+```python
+c.download_file("/home/user/out.tar", "out.tar")  # 2 GB, a part at a time
+c.download_file("/home/user/out.tar", open_handle)  # or into anything writable
+
+tail = c.read_file_part("/var/log/build.log", offset=-4096)  # the last 4 KiB
+head = c.read_file_part("/home/user/out.tar", length=512)  # the first 512 B
+```
+
+`offset` counts from the start of the file, or from its end when it is
+negative — the reading Python gives an index, and the one `Range: bytes=-N`
+has. A tail takes no `length`: it is already anchored at both ends.
+
+**Asking for more than one request moves is not an error, and you can get fewer
+bytes than you asked for on a success.** The platform trims the window rather
+than refusing it, precisely because a caller cannot know the ceiling before
+asking — so the `FilePart` that comes back is the authority on what arrived and
+where to ask from next, never the numbers passed in:
+
+```python
+part = c.read_file_part(path, offset=0, length=1 << 20)
+part.data  # the bytes
+part.offset  # where they start in the file
+part.total  # the file's length
+part.end  # the offset to ask from next
+part.at_end  # whether there is anything left to ask for
+```
+
+Which end gets trimmed follows the end you anchored: a window counted from the
+start keeps its start, a tail keeps its end. An over-long tail is still the tail
+of the file, never the middle of it.
+
+Two answers worth recognizing. A window naming no byte the file has raises
+`RangeNotSatisfiableError`, whose `size` is the file's real length so the retry
+does not have to guess — and it is how an *empty* file answers every window,
+which is why `download_file()` reads a zero there as an empty file rather than a
+failure. A file whose length the guest cannot report — a `/proc` entry, where
+the seek says 0 and the bytes are there anyway — has no positions to name, so
+the platform sends the whole thing and ignores the range; `partial` is `False`,
+`total` is `None`, and `at_end` is `True`, because everything there was arrived.
+
+`download_file()` does not open a local path until the first window has landed
+*and been checked*, so a download that is refused leaves whatever was there
+alone — opening for write is destructive on its own, and "nothing was written"
+is no comfort to a file that was truncated on the way to an exception.
+
+A file that **grows** while it is read is followed to its new end: appending
+leaves the windows already read where they were, so that is still one file. A
+file that **shrinks** raises, because it is not. Either the next window falls
+off the new end — a `RangeNotSatisfiableError` — or it lands inside it and the
+length it reports has dropped, which is a `MandalaError` naming both. The
+alternative is two files spliced at whatever offset the change landed on, under
+a byte count that looks perfectly reasonable.
 
 ### Errors
 
@@ -697,6 +759,8 @@ Everything derives from `MandalaError`.
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
 | `ConflictError` | 409 — right request, wrong moment; retry |
+| `FileTooLargeError` | 413 — past the 64 MiB one request moves; ask for a window |
+| `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
 | `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on |
@@ -707,6 +771,14 @@ Everything derives from `MandalaError`.
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 `PlanLimitError`'s message names the limit that was hit.
+
+`FileTooLargeError` and `RangeNotSatisfiableError` are the two file statuses,
+and each has a next move attached, which is why neither is a bare `APIError`.
+A 413 means the ceiling applies to what one request moves, so ask for part of it
+— `download_file()` is that loop already written. A 416 carries the file's real
+length in `size`, which is the whole point of the status: you asked about a file
+whose length you did not know, and the number comes back with the refusal
+instead of behind another request. See [Files](#files).
 
 `RateLimitError` is the only refusal that says how long to wait:
 `retry_after` carries the `Retry-After` header in seconds. Every route on this
@@ -811,7 +883,10 @@ The interactive `ssh` command currently requires a Unix-like local terminal.
 
 `scp` copies one file per invocation, the side spelled `<computer>:/path` being
 the guest. It rides the files API rather than the terminal, so it works
-without any shell in the guest at all.
+without any shell in the guest at all. A download is paged, so a file larger
+than the 64 MiB one request moves copies like any other, and a copy that is
+refused leaves the local file alone. An upload is one request, and one larger
+than the limit is refused before it is read.
 
 Two answers worth recognizing: a computer that predates the terminal feature
 answers 409 until it is stopped and started again (a restart is not enough,

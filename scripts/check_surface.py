@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diff the mirrored allowlist in tests/test_surface.py against the real one.
+"""Diff the mirrors in tests/test_surface.py against the real tables upstream.
 
 ``ALLOWED`` in the surface test mirrors ``V1_ROUTES`` in the platform's
 ``web/lib/surface.ts``, and it is what keeps this SDK honest about which routes
@@ -21,6 +21,14 @@ people learn to ignore. Where it earns its keep is on a machine that has both,
 and in any job that checks out both — which is where a route added upstream
 stops being invisible.
 
+The parameter half exists because the route half was not enough. `Range` on
+`GET computers/:id/files` (OPL-3727) is a whole feature — the only way a file
+larger than one request moves comes off a computer at all — and it is not a
+route. It arrived on a route the mirror already knew about, so nothing here had
+anything to compare and this script went on reporting the SDK in step. A route
+table cannot see a parameter: the call lands in the right place either way, and
+what is missing is the argument that made it worth making.
+
     python scripts/check_surface.py
 """
 
@@ -31,9 +39,12 @@ import re
 import sys
 from pathlib import Path
 
+from surface_text import balanced, strip_comments, top_level_keys
+
 REPO = Path(__file__).resolve().parent.parent
 SURFACE = Path("web/lib/surface.ts")
 AGENT = Path("web/lib/agent.ts")
+APIDOC = Path("web/lib/apidoc.ts")
 
 #: Platform constants this SDK mirrors, as ``(our name, their file, their name)``.
 #:
@@ -60,7 +71,10 @@ def platform_repo() -> Path | None:
         for p in (os.environ.get("MANDALA_PLATFORM_REPO"), *(REPO.parent / s for s in SIBLINGS))
         if p
     ]
-    return next((d for d in candidates if (d / SURFACE).is_file()), None)
+    return next(
+        (d for d in candidates if (d / SURFACE).is_file() and (d / APIDOC).is_file()),
+        None,
+    )
 
 
 def table(source: str, name: str) -> set[tuple[str, str]]:
@@ -94,6 +108,77 @@ def table(source: str, name: str) -> set[tuple[str, str]]:
     if not routes:
         raise SystemExit(f"parsed {name} but found no routes — has its shape changed?")
     return routes
+
+
+def shared_query(source: str) -> dict[str, str]:
+    """Module-level ``const NAME: Query = {...}`` entries, by identifier.
+
+    A route's ``query`` list can name one of these instead of spelling it out —
+    ``ALLOW_PARTIAL`` is shared by two routes — so the identifier has to resolve
+    to a parameter name or those routes read as taking none.
+    """
+    found = {}
+    for m in re.finditer(r"^const ([A-Z_]+): Query = \{", source, re.MULTILINE):
+        body = balanced(source, m.end() - 1, "{", "}")
+        named = re.search(r"name:\s*'([^']+)'", strip_comments(body))
+        if named:
+            found[m.group(1)] = named.group(1)
+    return found
+
+
+def parameters(platform: Path) -> dict[str, set[str]]:
+    """Every query, header and body field the platform documents, by route.
+
+    Read out of ``apidoc.ts``'s ``DOCS`` rather than ``surface.ts``, because the
+    route table has no parameters in it — which is the whole reason a route
+    comparison could not see the one that prompted this.
+    """
+    source = (platform / APIDOC).read_text()
+    shared = shared_query(source)
+    start = source.find("export const DOCS: Record<string, Doc> = {")
+    if start == -1:
+        raise SystemExit(f"DOCS not found in {APIDOC} — has its shape changed?")
+    # Comments blanked once, over the whole table: `strip_comments` replaces
+    # them with spaces rather than deleting them, so every offset still names the
+    # same character and one pass serves both the scan and the bracket matching.
+    docs = strip_comments(balanced(source, source.index("{", start + 40), "{", "}"))
+
+    table: dict[str, set[str]] = {}
+    entry = re.compile(r"'([A-Z]+) ([^']+)':\s*\{")
+    at = 0
+    while (m := entry.search(docs, at)) is not None:
+        clean = balanced(docs, m.end() - 1, "{", "}")
+        # Past this entry rather than into it. A description is prose in quotes,
+        # and prose about this API quotes routes — `'GET computers/:id/files'`
+        # inside one would otherwise open a route of its own, nested inside the
+        # entry that is still being read.
+        at = m.end() + len(clean)
+        found: set[str] = set()
+        for key, kind in (("query", "query"), ("headers", "header")):
+            listed = clean.find(f"{key}: [")
+            if listed == -1:
+                continue
+            listing = balanced(clean, clean.index("[", listed), "[", "]")
+            for name in re.finditer(r"name:\s*'([^']+)'", listing):
+                found.add(f"{kind}:{name.group(1)}")
+            # An identifier standing in for a whole entry. Bounded by a
+            # separator on each side rather than by a trailing comma: `query:
+            # [ALLOW_PARTIAL]` on one line has nothing after the identifier at
+            # all, and demanding one read GET computers as taking no parameters.
+            for ident in re.finditer(r"(?:^|[\[,\s])([A-Z_]{2,})(?=[,\s\]]|$)", listing):
+                if ident.group(1) in shared:
+                    found.add(f"query:{shared[ident.group(1)]}")
+        # Only an `object(...)` body has named fields. A raw one — the file
+        # upload's own bytes — has none to name.
+        body_at = clean.find("body: object(")
+        if body_at != -1:
+            args = balanced(clean, clean.index("(", body_at), "(", ")")
+            fields = balanced(args, args.index("{"), "{", "}")
+            found.update(f"body:{k}" for k in top_level_keys(fields))
+        table[f"{m.group(1)} {m.group(2)}"] = found
+    if not table:
+        raise SystemExit(f"parsed DOCS but found no routes in {APIDOC} — has its shape changed?")
+    return table
 
 
 def constant(source: str, name: str) -> int:
@@ -135,6 +220,34 @@ def mirrored() -> set[tuple[str, str]]:
     return set(ALLOWED)
 
 
+def mirrored_parameters() -> dict[str, set[str]]:
+    """The parameter mirror, imported for the same reason :func:`mirrored` is."""
+    sys.path.insert(0, str(REPO / "tests"))
+    from test_surface import PARAMETERS
+
+    return {route: set(names) for route, names in PARAMETERS.items()}
+
+
+def parameter_drift(upstream: dict[str, set[str]], mirror: dict[str, set[str]]) -> list[str]:
+    """Every documented parameter the mirror does not list, and the reverse.
+
+    Routes are diffed too, but quietly: a route in one table and not the other
+    is already the route check's news, and saying it twice buries the parameters
+    this exists to find.
+    """
+    lines = []
+    for route in sorted(set(upstream) & set(mirror)):
+        for name in sorted(upstream[route] - mirror[route]):
+            lines.append(f"  + {route}  {name}  (upstream, missing from PARAMETERS)")
+        for name in sorted(mirror[route] - upstream[route]):
+            lines.append(f"  - {route}  {name}  (in PARAMETERS, gone from upstream)")
+    for route in sorted(set(upstream) - set(mirror)):
+        lines.append(f"  + {route}  (documented upstream, absent from PARAMETERS)")
+    for route in sorted(set(mirror) - set(upstream)):
+        lines.append(f"  - {route}  (in PARAMETERS, no longer documented upstream)")
+    return lines
+
+
 def main() -> int:
     platform = platform_repo()
     if platform is None:
@@ -150,11 +263,13 @@ def main() -> int:
     added = sorted(upstream - mirror)
     removed = sorted(mirror - upstream)
     drifted = constant_drift(platform)
+    params = parameter_drift(parameters(platform), mirrored_parameters())
 
-    if not added and not removed and not drifted:
+    if not added and not removed and not drifted and not params:
         n = len(CONSTANTS)
+        counted = sum(len(names) for names in mirrored_parameters().values())
         print(
-            f"check-surface — {len(mirror)} routes and {n} constant"
+            f"check-surface — {len(mirror)} routes, {counted} parameters and {n} constant"
             f"{'' if n == 1 else 's'}, in step with {platform / SURFACE.parent}."
         )
         return 0
@@ -163,13 +278,17 @@ def main() -> int:
         print(f"  + {method} {pattern}  (upstream, missing from ALLOWED)")
     for method, pattern in removed:
         print(f"  - {method} {pattern}  (in ALLOWED, gone from upstream)")
+    for line in params:
+        print(line)
     for line in drifted:
         print(line)
     print(
         "\ncheck-surface — the mirror has drifted from the platform.\n"
-        "  Update ALLOWED in tests/test_surface.py, and add anything new to\n"
-        "  UNIMPLEMENTED until this SDK can call it. A constant that has moved\n"
-        "  belongs in src/mandala_computer/_api.py."
+        "  Update ALLOWED and PARAMETERS in tests/test_surface.py, and add anything\n"
+        "  new to UNIMPLEMENTED or UNIMPLEMENTED_PARAMETERS until this SDK can send\n"
+        "  it — which is the line that makes a gap somebody's to close rather than\n"
+        "  nobody's to notice. A constant that has moved belongs in\n"
+        "  src/mandala_computer/_api.py."
     )
     return 1
 

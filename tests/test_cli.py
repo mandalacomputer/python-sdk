@@ -156,6 +156,75 @@ def test_scp_download_into_directory_keeps_basename(tmp_path) -> None:
     assert (tmp_path / "report.csv").read_bytes() == b"x"
 
 
+@respx.mock
+def test_scp_download_pages_a_file_larger_than_one_request(tmp_path) -> None:
+    """The reason scp reads in windows at all.
+
+    A whole-file read is refused past 64 MiB, and a file that size is exactly
+    what somebody reaches for scp to move. Paging is what makes the copy
+    possible.
+
+    The guest here trims every window to four bytes whatever was asked for,
+    which is what the platform does to anything past its ceiling — so this also
+    pins the copy following the answers rather than its own arithmetic, without
+    needing a 64 MiB fixture to reach the trim.
+    """
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    body = b"0123456789"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        window = body[first : first + 4]
+        return httpx.Response(
+            206,
+            content=window,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + len(window) - 1}/{len(body)}",
+            },
+        )
+
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    dst = tmp_path / "big.bin"
+    assert _cli.main(["scp", "dev:/home/user/big.bin", str(dst)]) == 0
+
+    assert dst.read_bytes() == body
+    assert route.call_count == 3
+    assert [call.request.headers["Range"].split("-")[0] for call in route.calls] == [
+        "bytes=0",
+        "bytes=4",
+        "bytes=8",
+    ]
+
+
+@respx.mock
+def test_scp_download_reports_what_it_wrote(tmp_path, capsys) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(200, content=b"report,1\n")
+    )
+    assert _cli.main(["scp", "dev:/home/user/report.csv", str(tmp_path / "r.csv")]) == 0
+    assert "(9 bytes)" in capsys.readouterr().err
+
+
+@respx.mock
+def test_scp_download_that_is_refused_leaves_no_local_file(tmp_path) -> None:
+    """It did not create one before, and paging must not start creating one.
+
+    The whole-file read opened the destination only once it had the bytes. A
+    download that truncated a file on its way to a 404 would be a regression
+    dressed as an improvement.
+    """
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(404, json={"error": "no such file"})
+    )
+    dst = tmp_path / "out"
+
+    assert _cli.main(["scp", "dev:/gone.txt", str(dst)]) == 1
+    assert not dst.exists()
+
+
 @pytest.mark.parametrize("remote_path", ["/tmp/.", "/tmp/..", "/"])
 def test_scp_download_into_directory_rejects_a_non_file_basename(
     tmp_path, remote_path: str

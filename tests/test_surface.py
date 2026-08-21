@@ -18,10 +18,19 @@ because "every call lands on an allowlisted route" is trivially true of a
 mirror that never learned the route exists. That script is run from this file,
 rather than left as a command in the README, because a check somebody has to
 remember is the same hole one step further back.
+
+PARAMETERS mirrors `web/lib/apidoc.ts` the same way, and exists because the
+route table was not enough. `Range` on `GET computers/:id/files` is what lets a
+file larger than one request moves come off a computer at all, and it arrived on
+a route ALLOWED already listed — so every check here stayed green through a
+whole feature going missing. A parameter is not a smaller kind of surface: the
+call lands in the right place either way, and what is absent is the argument
+that made it worth making.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -90,6 +99,150 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+}
+
+# Every query, header and body field the platform documents, by route —
+# mirroring the `DOCS` table in `web/lib/apidoc.ts` as ALLOWED mirrors
+# V1_ROUTES.
+#
+# Its own table because the route table could not see the thing that made it
+# necessary. `Range` on `GET computers/:id/files` is what lets a file larger
+# than one request moves come off a computer at all, and it arrived on a route
+# this mirror already listed — so every check here stayed green while the whole
+# feature was missing. A parameter is not a smaller kind of surface: `force` on
+# a stop, `fresh` on a screenshot and `env` on an exec are each the difference
+# between a call that works and a call that works wrongly and says nothing.
+PARAMETERS: dict[str, set[str]] = {
+    "GET templates": set(),
+    "GET sizes": set(),
+    "GET computers": {"query:allow_partial"},
+    "POST computers": {
+        "body:name",
+        "body:size",
+        "body:template",
+        "body:cpu",
+        "body:ram_mb",
+        "body:disk_gb",
+        "body:resolution",
+        "body:start",
+    },
+    "GET computers/:id": set(),
+    "PATCH computers/:id": {
+        "body:name",
+        "body:cpu",
+        "body:ram_mb",
+        "body:disk_gb",
+        "body:idle_suspend_min",
+    },
+    "DELETE computers/:id": {"query:snapshots", "query:expect"},
+    "POST computers/:id/start": set(),
+    "POST computers/:id/stop": {"query:force"},
+    "POST computers/:id/suspend": set(),
+    "POST computers/:id/restart": set(),
+    "POST computers/:id/clone": {"body:name"},
+    # Computer use.
+    "GET computers/:id/screenshot": {"query:w", "query:fresh"},
+    "POST computers/:id/input": {
+        "body:action",
+        "body:x",
+        "body:y",
+        "body:coordinate",
+        "body:start_coordinate",
+        "body:text",
+        "body:key",
+        "body:keys",
+        "body:button",
+        "body:scroll_direction",
+        "body:amount",
+        "body:scroll_amount",
+        "body:duration",
+    },
+    "POST computers/:id/exec": {
+        "body:command",
+        "body:session",
+        "body:timeout_s",
+        "body:background",
+        "body:cwd",
+        "body:env",
+    },
+    "GET computers/:id/exec/:pid": set(),
+    "DELETE computers/:id/exec/:pid": set(),
+    "GET computers/:id/windows": {"query:include"},
+    "POST computers/:id/windows/:window": {
+        "body:action",
+        "body:x",
+        "body:y",
+        "body:width",
+        "body:height",
+    },
+    "POST computers/:id/agent": {
+        "header:X-Model-Key",
+        "body:prompt",
+        "body:system",
+        "body:max_steps",
+        "body:model",
+        "body:stream",
+    },
+    "POST chat/completions": {
+        "header:X-Model-Key",
+        "body:computer_id",
+        "body:messages",
+        "body:model",
+        "body:max_steps",
+        "body:stream",
+    },
+    # An upload's body is the file itself, raw — there are no named fields to
+    # mirror. A download's `Range` is the one header a *caller* sets that
+    # reaches the daemon; see `Computer.read_file_part`.
+    "PUT computers/:id/files": {"query:path"},
+    "GET computers/:id/files": {"query:path", "header:Range"},
+    "GET snapshots": {"query:allow_partial", "query:include"},
+    "GET computers/:id/snapshots": set(),
+    "POST computers/:id/snapshots": {"body:name", "body:memory"},
+    "POST snapshots/:id/restore": set(),
+    "POST snapshots/:id/clone": {"body:name"},
+    "DELETE snapshots/:id": set(),
+    "GET computers/:id/schedule": set(),
+    "PUT computers/:id/schedule": {"body:enabled", "body:hour", "body:minute", "body:tz"},
+    "DELETE computers/:id/schedule": set(),
+}
+
+# Parameters the platform documents that this SDK deliberately does not send.
+#
+# UNIMPLEMENTED's counterpart, and the same argument: PARAMETERS mirrors the
+# platform, so without this the difference between "documented" and "sent" would
+# have nowhere to be written down and no test could tell a parameter nobody got
+# round to from one nobody wants.
+#
+# Three of these are the flat vocabulary's second name for something already
+# sent, and one is a whole route.
+UNIMPLEMENTED_PARAMETERS = {
+    # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
+    # express a key whose own name contains the separator.
+    "POST computers/:id/input  body:key",
+    # `scroll_direction` is sent instead — `button` is the flat vocabulary's
+    # name for it, and on a route that also takes a real mouse button that is a
+    # word worth not overloading.
+    "POST computers/:id/input  body:button",
+    # `amount` is sent instead. Same value, two names.
+    "POST computers/:id/input  body:scroll_amount",
+    # The OpenAI-shaped door, whole. See UNIMPLEMENTED for why it stays shut.
+    "POST chat/completions  header:X-Model-Key",
+    "POST chat/completions  body:computer_id",
+    "POST chat/completions  body:messages",
+    "POST chat/completions  body:model",
+    "POST chat/completions  body:max_steps",
+    "POST chat/completions  body:stream",
+}
+
+#: Header names the platform documents anywhere — the ones worth looking for on
+#: a recorded request. Every call also carries an Authorization and an Accept
+#: this SDK wrote itself, and neither is a parameter a caller chose.
+DOCUMENTED_HEADERS = {
+    name.removeprefix("header:")
+    for names in PARAMETERS.values()
+    for name in names
+    if name.startswith("header:")
 }
 
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
@@ -181,6 +334,29 @@ def api_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=COMPUTER)
 
 
+def sent_parameters(calls: object) -> dict[str, set[str]]:
+    """Every documented parameter the recorded calls actually carried, by route.
+
+    Read off the requests rather than off the source, because what the SDK sends
+    is the only thing a user experiences. Headers are matched against
+    DOCUMENTED_HEADERS alone: every request also carries an ``Authorization`` and
+    an ``Accept`` this SDK wrote for itself, and neither is a parameter anyone
+    chose.
+    """
+    found: dict[str, set[str]] = {}
+    for call in calls:  # type: ignore[attr-defined]
+        request = call.request
+        route = f"{request.method} {pattern_for(request.url.path.replace('/api/v1', '', 1))}"
+        names = found.setdefault(route, set())
+        names.update(f"query:{key}" for key, _ in request.url.params.multi_items())
+        names.update(f"header:{h}" for h in DOCUMENTED_HEADERS if h in request.headers)
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = json.loads(request.content or b"null")
+            if isinstance(body, dict):
+                names.update(f"body:{key}" for key in body)
+    return found
+
+
 def called_routes(calls: object) -> set[tuple[str, str]]:
     return {
         (call.request.method, pattern_for(call.request.url.path.replace("/api/v1", "", 1)))
@@ -195,6 +371,19 @@ def exercise_everything(client: mc.Client) -> None:
     client.computers.list()
     client.computers.get("vm-1")
     c = client.computers.create(template="base")
+    # Everything a create can name, in the two shapes that are allowed: a size
+    # stands in for a template and a shape together, so it cannot be combined
+    # with the four it replaces.
+    client.computers.create(
+        name="dev",
+        template="base",
+        cpu=2,
+        ram_mb=4096,
+        disk_gb=40,
+        resolution="1920x1080",
+        start=False,
+    )
+    client.computers.create(size="small")
     c.refresh()
     c.start()
     c.stop()
@@ -226,6 +415,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.cursor_position()
     c.exec("true")
     c.exec("true", cwd="/tmp", env={"CI": "1"})
+    # `desktop` is the wire's `session`, and the only value it takes.
+    c.exec("true", desktop=True)
     job = c.start_exec("sleep 60")
     job.poll()
     job.kill()
@@ -234,10 +425,15 @@ def exercise_everything(client: mc.Client) -> None:
     c.windows(include_all=True)
     c.window_action("0x2600003", "focus")
     c.window_action("0x2600003", "move", x=10, y=20)
+    c.window_action("0x2600003", "resize", width=800, height=600)
     c.resize(cpu=4, ram_mb=8192)
+    c.resize(disk_gb=64)
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
     c.read_file("/home/user/out.txt")
+    c.read_file_part("/home/user/out.txt", offset=0, length=1024)
+    c.read_file_part("/var/log/build.log", offset=-4096)
+    c.download_file("/home/user/out.txt", io.BytesIO())
     c.write_file("/home/user/in.txt", b"hello")
     c.snapshot()
     c.snapshot(memory=True, name="before-upgrade")
@@ -248,12 +444,13 @@ def exercise_everything(client: mc.Client) -> None:
     c.set_schedule(enabled=True, hour=4, tz="UTC")
     c.clear_schedule()
     c.agent("do the thing", model_key="sk-ant-test")
+    c.agent("do the thing", model_key="sk-ant-test", system="be brief", max_steps=5, model="m")
     c.agent_once("do the thing", model_key="sk-ant-test")
     client.computers.list(allow_partial=True)
     client.snapshots.list()
     client.snapshots.list(include_unfinished=True, allow_partial=True)
     client.snapshots.restore("snap-1")
-    client.snapshots.clone("snap-1")
+    client.snapshots.clone("snap-1", name="from-snap")
     client.snapshots.delete("snap-1")
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
@@ -266,6 +463,16 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.computers.list()
     await client.computers.get("vm-1")
     c = await client.computers.create(template="base")
+    await client.computers.create(
+        name="dev",
+        template="base",
+        cpu=2,
+        ram_mb=4096,
+        disk_gb=40,
+        resolution="1920x1080",
+        start=False,
+    )
+    await client.computers.create(size="small")
     await c.refresh()
     await c.start()
     await c.stop()
@@ -297,6 +504,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.cursor_position()
     await c.exec("true")
     await c.exec("true", cwd="/tmp", env={"CI": "1"})
+    await c.exec("true", desktop=True)
     job = await c.start_exec("sleep 60")
     await job.poll()
     await job.kill()
@@ -305,10 +513,15 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.windows(include_all=True)
     await c.window_action("0x2600003", "focus")
     await c.window_action("0x2600003", "move", x=10, y=20)
+    await c.window_action("0x2600003", "resize", width=800, height=600)
     await c.resize(cpu=4, ram_mb=8192)
+    await c.resize(disk_gb=64)
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
     await c.read_file("/home/user/out.txt")
+    await c.read_file_part("/home/user/out.txt", offset=0, length=1024)
+    await c.read_file_part("/var/log/build.log", offset=-4096)
+    await c.download_file("/home/user/out.txt", io.BytesIO())
     await c.write_file("/home/user/in.txt", b"hello")
     await c.snapshot()
     await c.snapshot(memory=True, name="before-upgrade")
@@ -319,12 +532,15 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.set_schedule(enabled=True, hour=4, tz="UTC")
     await c.clear_schedule()
     await c.agent("do the thing", model_key="sk-ant-test")
+    await c.agent(
+        "do the thing", model_key="sk-ant-test", system="be brief", max_steps=5, model="m"
+    )
     await c.agent_once("do the thing", model_key="sk-ant-test")
     await client.computers.list(allow_partial=True)
     await client.snapshots.list()
     await client.snapshots.list(include_unfinished=True, allow_partial=True)
     await client.snapshots.restore("snap-1")
-    await client.snapshots.clone("snap-1")
+    await client.snapshots.clone("snap-1", name="from-snap")
     await client.snapshots.delete("snap-1")
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
@@ -378,6 +594,77 @@ async def test_both_clients_hit_exactly_the_same_routes(
 
 
 @respx.mock
+def test_every_documented_parameter_is_sent_or_pinned_as_unsent(client: mc.Client) -> None:
+    """The SDK sends every parameter the platform documents, or says why not.
+
+    The route half of this file cannot see any of this: a call lands on the right
+    route whether or not it carried the argument that made it worth making. The
+    four the TypeScript SDK found missing this way — a forced stop, a fresh
+    screenshot, an exec's environment and a snapshot's name — were each a call
+    that worked and worked wrongly, which is the failure that does not announce
+    itself.
+    """
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    exercise_everything(client)
+    sent = sent_parameters(route.calls)
+
+    unsent = {
+        f"{name} on {where}"
+        for where, names in PARAMETERS.items()
+        for name in names - sent.get(where, set())
+        if f"{where}  {name}" not in UNIMPLEMENTED_PARAMETERS
+    }
+    assert not unsent, (
+        f"documented parameters this SDK never sends: {sorted(unsent)}. "
+        "Send them, or pin them in UNIMPLEMENTED_PARAMETERS with the reason."
+    )
+
+
+@respx.mock
+def test_no_call_sends_a_parameter_the_platform_does_not_document(client: mc.Client) -> None:
+    """The other direction, which is the one that fails silently in a user's hands.
+
+    A query key or body field the platform has never heard of is ignored, and a
+    request that is ignored in part looks exactly like one that worked. So a
+    rename upstream shows up here as a parameter with no documentation rather
+    than as a feature that quietly stopped happening.
+    """
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    exercise_everything(client)
+
+    undocumented = {
+        f"{name} on {where}"
+        for where, names in sent_parameters(route.calls).items()
+        for name in names - PARAMETERS.get(where, set())
+    }
+    assert not undocumented, (
+        f"SDK sends parameters the platform does not take: {sorted(undocumented)}"
+    )
+
+
+@respx.mock
+async def test_both_clients_send_exactly_the_same_parameters(
+    client: mc.Client, async_client: mc.AsyncClient
+) -> None:
+    """Parity down to the arguments, not just the routes.
+
+    The route comparison next door is satisfied by an async half that reaches the
+    same endpoints having dropped a keyword on the way — which is the drift that
+    actually happens, because a parameter is added to one half by the person who
+    needed it.
+    """
+    sync_route = respx.route(host="api.test").mock(side_effect=api_handler)
+    exercise_everything(client)
+    sync_sent = sent_parameters(sync_route.calls)
+
+    respx.reset()
+    async_route = respx.route(host="api.test").mock(side_effect=api_handler)
+    await exercise_everything_async(async_client)
+
+    assert sync_sent == sent_parameters(async_route.calls)
+
+
+@respx.mock
 def test_the_unreached_part_of_the_surface_is_exactly_what_we_think(
     client: mc.Client,
 ) -> None:
@@ -425,6 +712,10 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
     # routes that differ instead of as a non-zero exit code.
     upstream = check_surface.table((platform / check_surface.SURFACE).read_text(), "V1_ROUTES")
     assert upstream == ALLOWED
+    # And the same for what each of them takes. `Range` on the download is the
+    # reason this half exists: a whole feature, on a route the line above was
+    # already satisfied by.
+    assert check_surface.parameter_drift(check_surface.parameters(platform), PARAMETERS) == []
 
 
 def test_allowlist_excludes_the_daemons_internal_routes() -> None:
