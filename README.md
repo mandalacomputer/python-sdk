@@ -696,11 +696,11 @@ rather than a dead end.
 `read_file_part()` is the single window underneath it:
 
 ```python
-c.download_file("/home/user/out.tar", "out.tar")      # 2 GB, a part at a time
-c.download_file("/home/user/out.tar", open_handle)    # or into anything writable
+c.download_file("/home/user/out.tar", "out.tar")  # 2 GB, a part at a time
+c.download_file("/home/user/out.tar", open_handle)  # or into anything writable
 
-tail = c.read_file_part("/var/log/build.log", offset=-4096)   # the last 4 KiB
-head = c.read_file_part("/home/user/out.tar", length=512)     # the first 512 B
+tail = c.read_file_part("/var/log/build.log", offset=-4096)  # the last 4 KiB
+head = c.read_file_part("/home/user/out.tar", length=512)  # the first 512 B
 ```
 
 `offset` counts from the start of the file, or from its end when it is
@@ -715,11 +715,11 @@ where to ask from next, never the numbers passed in:
 
 ```python
 part = c.read_file_part(path, offset=0, length=1 << 20)
-part.data       # the bytes
-part.offset     # where they start in the file
-part.total      # the file's length
-part.end        # the offset to ask from next
-part.at_end     # whether there is anything left to ask for
+part.data  # the bytes
+part.offset  # where they start in the file
+part.total  # the file's length
+part.end  # the offset to ask from next
+part.at_end  # whether there is anything left to ask for
 ```
 
 Which end gets trimmed follows the end you anchored: a window counted from the
