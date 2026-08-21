@@ -2496,9 +2496,7 @@ def test_download_file_drains_short_writes_before_advancing(client: mc.Client) -
         def write(self, data: bytes) -> int:
             return super().write(data[:2])
 
-    route = respx.get(f"{BASE}/computers/vm-1/files").mock(
-        side_effect=_paging(b"abcd", b"efgh")
-    )
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=_paging(b"abcd", b"efgh"))
     sink = ShortSink()
 
     assert _computer(client).download_file("/x", sink, part_size=4) == 8

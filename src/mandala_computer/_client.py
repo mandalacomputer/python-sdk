@@ -263,9 +263,7 @@ _CONTENT_RANGE = re.compile(r"\s*bytes\s+(\d+)\s*-\s*(\d+)\s*/\s*(\d+)\s*", re.I
 
 #: The three single-range requests :func:`~mandala_computer._api.files_range`
 #: emits: a bounded window, everything from one position, or a suffix.
-_REQUESTED_RANGE = re.compile(
-    r"\s*bytes\s*=\s*(?:(\d+)\s*-\s*(\d*)|-\s*(\d+))\s*", re.IGNORECASE
-)
+_REQUESTED_RANGE = re.compile(r"\s*bytes\s*=\s*(?:(\d+)\s*-\s*(\d*)|-\s*(\d+))\s*", re.IGNORECASE)
 
 #: ``Content-Range: bytes */2147483648`` — the same header on a 416, where there
 #: is no window to name and the length is the entire point of the answer.
