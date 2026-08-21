@@ -6,6 +6,7 @@ rejected, so a server that starts returning more does not break older clients.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from operator import index as integer_index
@@ -26,6 +27,29 @@ __all__ = [
 
 T = TypeVar("T")
 S = TypeVar("S")
+
+
+def _num(value: Any) -> int:
+    """An integer field off the wire, or zero when it is unusable."""
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return 0
+    return int(number) if math.isfinite(number) else 0
+
+
+def _text(value: Any) -> str:
+    """A string field off the wire, with JSON null represented as empty."""
+    return "" if value is None else str(value)
+
+
+def _exit_code(value: Any) -> int | None:
+    """An exit code off the wire, preserving null and rejecting JSON booleans."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError("exit_code must be an integer or null, not a boolean")
+    return int(value)
 
 
 class Listing(list[T]):
@@ -248,12 +272,12 @@ class Template:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Template:
         return cls(
-            name=d.get("name", ""),
-            label=d.get("label", ""),
-            os=d.get("os", ""),
-            cpu=int(d.get("cpu", 0)),
-            ram_mb=int(d.get("ram_mb", 0)),
-            disk_gb=int(d.get("disk_gb", 0)),
+            name=_text(d.get("name")),
+            label=_text(d.get("label")),
+            os=_text(d.get("os")),
+            cpu=_num(d.get("cpu")),
+            ram_mb=_num(d.get("ram_mb")),
+            disk_gb=_num(d.get("disk_gb")),
             raw=dict(d),
         )
 
@@ -284,15 +308,16 @@ class Size:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Size:
+        cheapest_plan = d.get("cheapest_plan")
         return cls(
-            id=d.get("id", ""),
-            label=d.get("label", ""),
-            template=d.get("template", ""),
-            cpu=int(d.get("cpu", 0)),
-            ram_mb=int(d.get("ram_mb", 0)),
-            disk_gb=int(d.get("disk_gb", 0)),
+            id=_text(d.get("id")),
+            label=_text(d.get("label")),
+            template=_text(d.get("template")),
+            cpu=_num(d.get("cpu")),
+            ram_mb=_num(d.get("ram_mb")),
+            disk_gb=_num(d.get("disk_gb")),
             allowed=bool(d.get("allowed", False)),
-            cheapest_plan=d.get("cheapest_plan"),
+            cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
 
@@ -365,24 +390,24 @@ class Snapshot:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Snapshot:
         return cls(
-            id=d.get("id", ""),
-            computer_id=d.get("computer_id", ""),
-            name=d.get("name", ""),
-            kind=d.get("kind", "disk"),
-            state=d.get("state", ""),
-            size_bytes=int(d.get("size_bytes", 0)),
-            created_at=d.get("created_at", ""),
+            id=_text(d.get("id")),
+            computer_id=_text(d.get("computer_id")),
+            name=_text(d.get("name")),
+            kind=_text(d.get("kind", "disk")),
+            state=_text(d.get("state")),
+            size_bytes=_num(d.get("size_bytes")),
+            created_at=_text(d.get("created_at")),
             incremental=bool(d.get("incremental", False)),
             auto=bool(d.get("auto", False)),
-            computer_name=str(d.get("computer_name", "")),
+            computer_name=_text(d.get("computer_name")),
             orphaned=bool(d.get("orphaned", False)),
             unreachable=bool(d.get("unreachable", False)),
-            os=str(d.get("os", "")),
-            template=str(d.get("template", "")),
-            cpu=int(d.get("cpu", 0)),
-            ram_mb=int(d.get("ram_mb", 0)),
-            disk_gb=int(d.get("disk_gb", 0)),
-            resolution=str(d.get("resolution", "")),
+            os=_text(d.get("os")),
+            template=_text(d.get("template")),
+            cpu=_num(d.get("cpu")),
+            ram_mb=_num(d.get("ram_mb")),
+            disk_gb=_num(d.get("disk_gb")),
+            resolution=_text(d.get("resolution")),
             raw=dict(d),
         )
 
@@ -412,9 +437,9 @@ class SnapshotHoldings:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SnapshotHoldings:
         return cls(
-            count=int(d.get("count", 0)),
-            size_bytes=int(d.get("size_bytes", 0)),
-            fingerprint=str(d.get("fingerprint", "")),
+            count=_num(d.get("count")),
+            size_bytes=_num(d.get("size_bytes")),
+            fingerprint=_text(d.get("fingerprint")),
             raw=dict(d),
         )
 
@@ -449,14 +474,14 @@ class Window:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Window:
         return cls(
-            id=str(d.get("id", "")),
-            title=str(d.get("title", "")),
-            wm_class=str(d.get("class", "")),
-            type=str(d.get("type", "")),
-            x=int(d.get("x", 0)),
-            y=int(d.get("y", 0)),
-            width=int(d.get("width", 0)),
-            height=int(d.get("height", 0)),
+            id=_text(d.get("id")),
+            title=_text(d.get("title")),
+            wm_class=_text(d.get("class")),
+            type=_text(d.get("type")),
+            x=_num(d.get("x")),
+            y=_num(d.get("y")),
+            width=_num(d.get("width")),
+            height=_num(d.get("height")),
             focused=bool(d.get("focused", False)),
             raw=dict(d),
         )
@@ -543,18 +568,18 @@ class ExecStatus:
     def from_api(cls, d: Mapping[str, Any]) -> ExecStatus:
         code = d.get("exit_code")
         return cls(
-            pid=int(d.get("pid", 0)),
-            command=str(d.get("command", "")),
+            pid=_num(d.get("pid")),
+            command=_text(d.get("command")),
             running=bool(d.get("running", False)),
             exited=bool(d.get("exited", False)),
-            exit_code=None if code is None else int(code),
-            stdout=str(d.get("stdout") or ""),
-            stderr=str(d.get("stderr") or ""),
-            stdout_offset=int(d.get("stdout_offset", 0)),
-            stderr_offset=int(d.get("stderr_offset", 0)),
+            exit_code=_exit_code(code),
+            stdout=_text(d.get("stdout")),
+            stderr=_text(d.get("stderr")),
+            stdout_offset=_num(d.get("stdout_offset")),
+            stderr_offset=_num(d.get("stderr_offset")),
             more=bool(d.get("more", False)),
             killed=bool(d.get("killed", False)),
-            started_at=str(d.get("started_at", "")),
+            started_at=_text(d.get("started_at")),
             raw=dict(d),
         )
 
@@ -611,9 +636,9 @@ class ExecResult:
     def from_api(cls, d: Mapping[str, Any]) -> ExecResult:
         code = d.get("exit_code")
         return cls(
-            exit_code=None if code is None else int(code),
-            stdout=d.get("stdout", "") or "",
-            stderr=d.get("stderr", "") or "",
+            exit_code=_exit_code(code),
+            stdout=_text(d.get("stdout")),
+            stderr=_text(d.get("stderr")),
             timed_out=bool(d.get("timed_out", False)),
             out_truncated=bool(d.get("out_truncated", False)),
             err_truncated=bool(d.get("err_truncated", False)),

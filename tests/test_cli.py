@@ -156,6 +156,15 @@ def test_scp_download_into_directory_keeps_basename(tmp_path) -> None:
     assert (tmp_path / "report.csv").read_bytes() == b"x"
 
 
+@pytest.mark.parametrize("remote_path", ["/tmp/.", "/tmp/..", "/"])
+def test_scp_download_into_directory_rejects_a_non_file_basename(
+    tmp_path, remote_path: str
+) -> None:
+    with pytest.raises(SystemExit, match="does not name a downloadable file"):
+        _cli.main(["scp", f"dev:{remote_path}", str(tmp_path)])
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_scp_both_local_dies(tmp_path) -> None:
     with pytest.raises(SystemExit, match="exactly one side"):
         _cli.main(["scp", str(tmp_path / "a"), str(tmp_path / "b")])

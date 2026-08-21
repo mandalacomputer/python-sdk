@@ -515,7 +515,15 @@ def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str
 # writing the same seven stubs.
 
 
+def _coordinate(value: Any, name: str) -> None:
+    """Reject values JSON can carry but the guest cannot use as coordinates."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer coordinate")
+
+
 def pointer_body(action: str, x: int, y: int) -> dict[str, Any]:
+    _coordinate(x, "x")
+    _coordinate(y, "y")
     return {"action": action, "x": x, "y": y}
 
 
@@ -531,6 +539,9 @@ def _whole_point(x: int | None, y: int | None) -> None:
     """
     if (x is None) != (y is None):
         raise ValueError("give both x and y, or neither")
+    if x is not None and y is not None:
+        _coordinate(x, "x")
+        _coordinate(y, "y")
 
 
 def click_body(
@@ -567,6 +578,11 @@ def drag_body(from_x: int | None, from_y: int | None, to_x: int, to_y: int) -> d
     """
     if (from_x is None) != (from_y is None):
         raise ValueError("give both from_x and from_y, or neither")
+    _coordinate(to_x, "to_x")
+    _coordinate(to_y, "to_y")
+    if from_x is not None and from_y is not None:
+        _coordinate(from_x, "from_x")
+        _coordinate(from_y, "from_y")
     body: dict[str, Any] = {"action": "left_click_drag", "coordinate": [to_x, to_y]}
     if from_x is not None and from_y is not None:
         body["start_coordinate"] = [from_x, from_y]
