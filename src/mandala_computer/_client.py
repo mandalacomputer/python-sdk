@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from collections.abc import AsyncGenerator, Generator, Mapping
 from typing import Any
 
@@ -19,6 +20,7 @@ from ._exceptions import (
     APIError,
     AuthenticationError,
     ConflictError,
+    FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
     NotFoundError,
@@ -27,6 +29,7 @@ from ._exceptions import (
     OriginUnreachableError,
     PermissionDeniedError,
     PlanLimitError,
+    RangeNotSatisfiableError,
     RateLimitError,
     TimeoutError,
     UnavailableError,
@@ -57,8 +60,26 @@ DEADLINE_SLACK = 15.0
 #: large one the platform is still willing to finish.
 FILE_TIMEOUT = 300.0
 
-#: Maximum body accepted by the platform's single-file transfer route.
+#: The most one file request moves, mirroring the platform's ``guestFileMax``.
+#:
+#: A limit on the *request*, not on the file. The bytes cross the guest agent's
+#: one connection in chunks and a transfer holds it for as long as it takes, so
+#: the ceiling falls on what a single exchange carries. An upload meets it as a
+#: limit on the file, because ``PUT`` takes no range; a download meets it as a
+#: limit on the window, which is what makes a file of any size reachable — see
+#: :meth:`~mandala_computer.Computer.read_file_part`.
 FILE_SIZE_LIMIT = 64 * 1024 * 1024
+
+#: How much of a file :meth:`~mandala_computer.Computer.download_file` asks for
+#: at a time.
+#:
+#: Well under :data:`FILE_SIZE_LIMIT`, which is the most it *could* ask for. The
+#: ceiling is the point at which one request stops being served, not the point
+#: at which it stops being a good idea: a part is held whole in memory on both
+#: sides, and it is also the unit a failure costs you, since a part that dies
+#: mid-transfer is re-fetched from its start. Eight of these is one ceiling's
+#: worth of round trips, which is a cheap price for both.
+FILE_PART_SIZE = 8 * 1024 * 1024
 
 #: A request with no deadline at all, for the non-streaming agent loop.
 #:
@@ -99,6 +120,12 @@ _STATUS_ERRORS = {
     403: PermissionDeniedError,
     404: NotFoundError,
     409: ConflictError,
+    # Both file statuses, and both of them about the same ceiling seen from
+    # different sides — see FILE_SIZE_LIMIT. Their own classes rather than a
+    # bare APIError because each one has a specific next move attached: a 413
+    # says ask for part of it, and a 416 hands over the length to ask against.
+    413: FileTooLargeError,
+    416: RangeNotSatisfiableError,
     429: RateLimitError,
     # A fan-out listing that would have been short, without allow_partial. Its
     # own class rather than a bare APIError because it is the one 5xx on this
@@ -228,6 +255,30 @@ def _incomplete(resp: httpx.Response) -> int | None:
     except ValueError:
         return 0
     return max(n, 0)
+
+
+#: ``Content-Range: bytes 0-1048575/2147483648`` — which bytes came back, and
+#: how many the file has. Only on a 206.
+_CONTENT_RANGE = re.compile(r"\s*bytes\s+(\d+)\s*-\s*(\d+)\s*/\s*(\d+)\s*", re.IGNORECASE)
+
+#: The three single-range requests :func:`~mandala_computer._api.files_range`
+#: emits: a bounded window, everything from one position, or a suffix.
+_REQUESTED_RANGE = re.compile(r"\s*bytes\s*=\s*(?:(\d+)\s*-\s*(\d*)|-\s*(\d+))\s*", re.IGNORECASE)
+
+#: ``Content-Range: bytes */2147483648`` — the same header on a 416, where there
+#: is no window to name and the length is the entire point of the answer.
+_UNSATISFIED_RANGE = re.compile(r"\s*bytes\s+\*\s*/\s*(\d+)\s*", re.IGNORECASE)
+
+
+def _refused_size(resp: httpx.Response) -> int | None:
+    """The file's length off a 416, or ``None`` if the refusal did not say.
+
+    ``None`` rather than a guess, and a guess is what any default would be: the
+    caller is about to ask again, and a zero standing in for "the header was
+    dropped" would tell them the file is empty.
+    """
+    m = _UNSATISFIED_RANGE.fullmatch(resp.headers.get("content-range", ""))
+    return int(m.group(1)) if m else None
 
 
 class _BaseTransport:
@@ -391,6 +442,87 @@ class _BaseTransport:
         return resp.content
 
     @staticmethod
+    def _served_range(
+        method: str,
+        path: str,
+        resp: httpx.Response,
+        data: bytes,
+        requested_range: str,
+    ) -> tuple[int, int | None, bool]:
+        """Where in the file these bytes are — ``(offset, total, partial)``.
+
+        The status is what says whether a window came back, not the presence of
+        the header: a 200 to a request that carried a ``Range`` is the platform
+        *ignoring* it, which it does for a file whose length the guest cannot
+        report. There are no positions to name in one of those and no total to
+        promise, so the answer is the whole file at offset zero.
+
+        A 206 whose ``Content-Range`` is missing or unreadable is refused rather
+        than assumed. The header is the only thing that says which bytes these
+        are, and every mistake available without it is silent: a window taken for
+        the start of the file writes the middle of a download over its beginning
+        and reports success. A proxy that drops the header on the way back is the
+        way this happens — see ``passThrough`` in the platform's ``lib/hvproxy``,
+        where it is forwarded by name.
+
+        An empty window is refused with it, and that one is not fussiness. The
+        length check below passes an ``A-B`` whose ``B`` is before its ``A`` when
+        the body is empty, and a window of no bytes ends exactly where it began —
+        so :meth:`~mandala_computer.Computer.download_file` would ask for it
+        again, receive it again, and never stop. Requiring at least one byte here
+        is what makes the paging loop's advance a property of the parse rather
+        than something every caller has to check for itself.
+        """
+        if resp.status_code != 206:
+            return 0, None, False
+        raw = resp.headers.get("content-range", "")
+        m = _CONTENT_RANGE.fullmatch(raw)
+        if m is None:
+            raise MandalaError(
+                f"{method} {path} answered 206 Partial Content with no readable "
+                f"Content-Range ({raw or 'header absent'}). Which bytes those are is "
+                "not knowable without it, so they are refused rather than guessed at."
+            )
+        first, last, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if last < first:
+            raise MandalaError(
+                f"{method} {path} answered 206 with Content-Range {raw.strip()}, whose "
+                "window ends before it starts. A window holds at least one byte — a "
+                "range naming none is a 416 — so there is nothing here to believe."
+            )
+        if last >= total:
+            raise MandalaError(
+                f"{method} {path} answered 206 with Content-Range {raw.strip()}, whose "
+                f"{first}-{last} window does not fit inside a {total}-byte file. The "
+                "window and total cannot both be true."
+            )
+        if last - first + 1 != len(data):
+            raise MandalaError(
+                f"{method} {path} sent {len(data)} bytes for the window "
+                f"{first}-{last} its Content-Range names. Something between here and "
+                "the platform altered the body, and the two cannot both be true."
+            )
+        asked = _REQUESTED_RANGE.fullmatch(requested_range)
+        if asked is None:
+            raise MandalaError(
+                f"{method} {path} answered a partial request whose Range "
+                f"{requested_range!r} cannot be checked"
+            )
+        if asked.group(3) is not None:
+            lower = max(total - int(asked.group(3)), 0)
+            upper: int | None = total - 1
+        else:
+            lower = int(asked.group(1))
+            upper = int(asked.group(2)) if asked.group(2) else None
+        if first < lower or upper is not None and last > upper:
+            raise MandalaError(
+                f"{method} {path} served the wrong bytes at the wrong place: "
+                f"Content-Range {raw.strip()} falls outside the requested "
+                f"Range {requested_range}."
+            )
+        return first, total, True
+
+    @staticmethod
     def _error(resp: httpx.Response) -> APIError:
         body: Any = None
         message = f"HTTP {resp.status_code}"
@@ -454,6 +586,16 @@ class _BaseTransport:
                 status=resp.status_code,
                 body=body,
                 retry_after=_retry_after(resp),
+            )
+        if cls is RangeNotSatisfiableError:
+            # The one refusal on this surface that answers the question it is
+            # refusing. Parsed here rather than left on the response, because the
+            # response is gone by the time a caller has the exception.
+            return RangeNotSatisfiableError(
+                message,
+                status=resp.status_code,
+                body=body,
+                size=_refused_size(resp),
             )
         return cls(message, status=resp.status_code, body=body)
 
@@ -648,6 +790,28 @@ class Transport(_BaseTransport):
         resp = self.request(method, path, headers={"Accept": accept}, **kw)
         return self._binary_body(method, path, resp, content_types)
 
+    def binary_part(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept: str,
+        content_types: tuple[str, ...],
+        headers: Mapping[str, str],
+        **kw: Any,
+    ) -> tuple[bytes, int, int | None, bool]:
+        """:meth:`binary`, for a request that asked for a window of the body.
+
+        Returns the bytes and where they sit — ``(data, offset, total, partial)``,
+        which is :class:`~mandala_computer.FilePart`'s four fields in its own
+        order. Kept as a tuple so this layer stays about the wire; what the
+        numbers *mean* is written down once, on the record the caller gets.
+        """
+        resp = self.request(method, path, headers={**headers, "Accept": accept}, **kw)
+        data = self._binary_body(method, path, resp, content_types)
+        offset, total, partial = self._served_range(method, path, resp, data, headers["Range"])
+        return data, offset, total, partial
+
     def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
         """:meth:`json`, for a route whose answer is only useful as an object.
 
@@ -796,6 +960,28 @@ class AsyncTransport(_BaseTransport):
         """A successful raw body with an explicit binary ``Accept`` type."""
         resp = await self.request(method, path, headers={"Accept": accept}, **kw)
         return self._binary_body(method, path, resp, content_types)
+
+    async def binary_part(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept: str,
+        content_types: tuple[str, ...],
+        headers: Mapping[str, str],
+        **kw: Any,
+    ) -> tuple[bytes, int, int | None, bool]:
+        """:meth:`binary`, for a request that asked for a window of the body.
+
+        Returns the bytes and where they sit — ``(data, offset, total, partial)``,
+        which is :class:`~mandala_computer.FilePart`'s four fields in its own
+        order. Kept as a tuple so this layer stays about the wire; what the
+        numbers *mean* is written down once, on the record the caller gets.
+        """
+        resp = await self.request(method, path, headers={**headers, "Accept": accept}, **kw)
+        data = self._binary_body(method, path, resp, content_types)
+        offset, total, partial = self._served_range(method, path, resp, data, headers["Range"])
+        return data, offset, total, partial
 
     async def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
         """:meth:`json`, for a route whose answer is only useful as an object.
