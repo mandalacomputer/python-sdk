@@ -459,6 +459,14 @@ class _BaseTransport:
         and reports success. A proxy that drops the header on the way back is the
         way this happens — see ``passThrough`` in the platform's ``lib/hvproxy``,
         where it is forwarded by name.
+
+        An empty window is refused with it, and that one is not fussiness. The
+        length check below passes an ``A-B`` whose ``B`` is before its ``A`` when
+        the body is empty, and a window of no bytes ends exactly where it began —
+        so :meth:`~mandala_computer.Computer.download_file` would ask for it
+        again, receive it again, and never stop. Requiring at least one byte here
+        is what makes the paging loop's advance a property of the parse rather
+        than something every caller has to check for itself.
         """
         if resp.status_code != 206:
             return 0, None, False
@@ -471,6 +479,12 @@ class _BaseTransport:
                 "not knowable without it, so they are refused rather than guessed at."
             )
         first, last, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if last < first:
+            raise MandalaError(
+                f"{method} {path} answered 206 with Content-Range {raw.strip()}, whose "
+                "window ends before it starts. A window holds at least one byte — a "
+                "range naming none is a 416 — so there is nothing here to believe."
+            )
         if last - first + 1 != len(data):
             raise MandalaError(
                 f"{method} {path} sent {len(data)} bytes for the window "

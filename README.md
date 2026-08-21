@@ -735,10 +735,18 @@ the seek says 0 and the bytes are there anyway — has no positions to name, so
 the platform sends the whole thing and ignores the range; `partial` is `False`,
 `total` is `None`, and `at_end` is `True`, because everything there was arrived.
 
-`download_file()` does not open a local path until the first window has landed,
-so a download that is refused outright leaves nothing behind. A file that grows
-while it is read is followed to its new end; one that *shrinks* raises rather
-than handing back a short file with nothing said about it.
+`download_file()` does not open a local path until the first window has landed
+*and been checked*, so a download that is refused leaves whatever was there
+alone — opening for write is destructive on its own, and "nothing was written"
+is no comfort to a file that was truncated on the way to an exception.
+
+A file that **grows** while it is read is followed to its new end: appending
+leaves the windows already read where they were, so that is still one file. A
+file that **shrinks** raises, because it is not. Either the next window falls
+off the new end — a `RangeNotSatisfiableError` — or it lands inside it and the
+length it reports has dropped, which is a `MandalaError` naming both. The
+alternative is two files spliced at whatever offset the change landed on, under
+a byte count that looks perfectly reasonable.
 
 ### Errors
 

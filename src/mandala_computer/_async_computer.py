@@ -774,18 +774,19 @@ class AsyncComputer(ComputerFields):
             if not _empty_guest_file(exc):
                 raise
             first = None
+        if first is not None:
+            _continues(path, 0, first, None)
         written = 0
-        asked = 0
         with _download_sink(dest) as sink:
             part = first
             while part is not None:
-                _continues(path, asked, part)
                 sink.write(part.data)
                 written += len(part.data)
                 if part.at_end:
                     break
-                asked = part.end
+                asked, was = part.end, part.total
                 part = await self.read_file_part(path, offset=asked, length=part_size)
+                _continues(path, asked, part, was)
         return written
 
     async def write_file(self, path: str, data: bytes | str) -> None:

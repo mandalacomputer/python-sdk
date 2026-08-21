@@ -7,6 +7,7 @@ lifecycle.
 
 from __future__ import annotations
 
+import io
 import json
 
 import httpx
@@ -553,6 +554,28 @@ async def test_async_an_empty_file_downloads_as_nothing(client: mc.AsyncClient, 
     dst = tmp_path / "empty"
     assert await mc.AsyncComputer(client._t, COMPUTER).download_file("/tmp/empty", dst) == 0
     assert dst.read_bytes() == b""
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_a_file_that_shrinks_mid_download_raises(client: mc.AsyncClient) -> None:
+    """The loop is written out twice, so the thing that stops it is checked twice."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        data, total = (b"OLDOLD", 100) if first == 0 else (b"new", 9)
+        return httpx.Response(
+            206,
+            content=data,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + len(data) - 1}/{total}",
+            },
+        )
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    with pytest.raises(mc.MandalaError, match="was 100 bytes and is 9"):
+        await mc.AsyncComputer(client._t, COMPUTER).download_file("/x", io.BytesIO(), part_size=6)
     await client.aclose()
 
 

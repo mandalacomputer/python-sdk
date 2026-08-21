@@ -159,28 +159,43 @@ def _empty_guest_file(exc: RangeNotSatisfiableError) -> bool:
     return exc.size == 0
 
 
-def _continues(path: str, asked_from: int, part: FilePart) -> None:
-    """Refuse a window that does not start where the download asked it to.
+def _continues(path: str, asked_from: int, part: FilePart, total_was: int | None) -> None:
+    """Refuse a window that does not continue the download it arrived for.
 
-    A range anchored at the start keeps its start — only its far end is ever
-    trimmed — so a window beginning anywhere else is not the one that was asked
-    for. Appending it would splice foreign bytes into the file at a position
-    nothing downstream would ever check, and where the same window comes back
-    every time (a cache in front of the platform, a hop that drops the header on
-    the way through) the loop would also never end.
+    The loop's own invariant, and it has to be the loop's: neither of these is
+    visible inside one response. A window is only wrong relative to the one that
+    should have come, and a length is only wrong relative to the one before it.
 
-    The loop's own invariant, checked against what was asked rather than against
-    the answer alone. Nothing in one response can say it on its own: a window is
-    only wrong relative to the one that should have arrived. Asked of the first
-    window too, where the offset is zero — a download whose opening window
-    starts somewhere else would write the middle of the file over its beginning
-    and be no more obviously wrong for having gone first.
+    **It has to start where it was asked to.** A range anchored at the start
+    keeps its start — only its far end is ever trimmed — so a window beginning
+    anywhere else is not the one that was asked for. Appending it would put
+    foreign bytes at a position nothing downstream would ever check, and where
+    the same window comes back every time (a cache in front of the platform, a
+    hop that drops the header) the loop would never end either. Asked of the
+    first window too, where the offset is zero: an opening window that starts
+    elsewhere writes the middle of the file over its beginning, and is no more
+    obviously wrong for having gone first.
+
+    **The file must not have got shorter.** Growing is followed and shrinking is
+    not, and the asymmetry is the point rather than an inconsistency. Bytes
+    appended to a file leave the ones already read exactly where they were, so a
+    download that follows the new end is still one file. A file that got shorter
+    was rewritten or truncated, which means the earlier windows came from
+    something that no longer exists — and finishing would hand back two files
+    spliced at whatever offset the change happened to land on, with a byte count
+    that looks entirely reasonable.
     """
     if part.offset != asked_from:
         raise MandalaError(
             f"{path}: asked for the window at offset {asked_from} and got the one at "
             f"{part.offset}. Appending that would put the wrong bytes at the wrong "
             "place, and asking again would ask the same question."
+        )
+    if total_was is not None and part.total is not None and part.total < total_was:
+        raise MandalaError(
+            f"{path}: was {total_was} bytes and is {part.total} part-way through being "
+            "read. What has already been written came from a file that no longer "
+            "exists, so going on would splice two of them together."
         )
 
 
@@ -1270,20 +1285,30 @@ class Computer(ComputerFields):
         than the platform moves in one request is allowed and simply gets
         trimmed, so the ceiling is not something this has to know.
 
-        Two endings that are not the file's, both raised rather than smoothed
-        over. A file that **shrinks** while it is being read raises
-        :class:`~mandala_computer.RangeNotSatisfiableError` from the window that
-        fell off the end — the alternative is a short file on disk and an exit
-        code saying it went fine. A file that **grows** is followed: each answer
-        carries the length as it is now, and the loop ends where the last one
-        does. An empty file is not an error and writes nothing.
+        A file that **grows** while it is being read is followed: each
+        answer carries the length as it is now, and the loop ends where the last
+        one does. Appending leaves the windows already read where they were, so
+        that is still one file.
+
+        A file that **shrinks** is not, and raises. Getting shorter means it was
+        rewritten or truncated, so the bytes already written came from something
+        that is gone — and going on would hand back two files spliced at whatever
+        offset the change landed on, under a byte count that looks perfectly
+        reasonable. Either the next window falls off the new end, which is
+        :class:`~mandala_computer.RangeNotSatisfiableError`, or it lands inside
+        it and the length it reports has dropped, which is a
+        :class:`~mandala_computer.MandalaError` naming both lengths.
+
+        An empty file is not an error and writes nothing.
         """
         if part_size < 1:
             raise ValueError(f"part_size must be at least 1 byte, not {part_size}")
-        # The first window is asked for before anything local is opened, so a
-        # download that was never going to happen — no such file, no guest agent,
-        # a computer that is gone — does not leave an empty one behind in its
-        # place. Everything after it has already written bytes somebody wants.
+        # The whole of the first window — the request AND the check on what came
+        # back — happens before anything local is opened, so a download that was
+        # never going to happen leaves nothing in the place of the file it was
+        # meant to become. Opening for write is destructive on its own: a
+        # refusal that had already truncated somebody's file would be keeping the
+        # letter of "nothing was written" and none of the point.
         first: FilePart | None
         try:
             first = self.read_file_part(path, offset=0, length=part_size)
@@ -1291,12 +1316,12 @@ class Computer(ComputerFields):
             if not _empty_guest_file(exc):
                 raise
             first = None
+        if first is not None:
+            _continues(path, 0, first, None)
         written = 0
-        asked = 0
         with _download_sink(dest) as sink:
             part = first
             while part is not None:
-                _continues(path, asked, part)
                 sink.write(part.data)
                 written += len(part.data)
                 if part.at_end:
@@ -1305,8 +1330,9 @@ class Computer(ComputerFields):
                 # have: a window past what one request moves comes back trimmed,
                 # and advancing by part_size would leave holes in the file with
                 # nothing raised.
-                asked = part.end
+                asked, was = part.end, part.total
                 part = self.read_file_part(path, offset=asked, length=part_size)
+                _continues(path, asked, part, was)
         return written
 
     def write_file(self, path: str, data: bytes | str) -> None:

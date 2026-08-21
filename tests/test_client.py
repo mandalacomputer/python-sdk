@@ -2347,14 +2347,95 @@ def test_a_refused_download_leaves_the_local_file_alone(client: mc.Client, tmp_p
 
 
 @respx.mock
-def test_a_first_window_from_the_wrong_offset_is_caught_too(client: mc.Client) -> None:
-    """Going first does not make a misplaced window any less misplaced."""
+def test_a_first_window_from_the_wrong_offset_is_caught_before_the_file_is_opened(
+    client: mc.Client, tmp_path
+) -> None:
+    """Going first does not make a misplaced window any less misplaced.
+
+    And the check has to happen before the destination is opened, not inside it.
+    Opening for write is destructive on its own, so a refusal that had already
+    truncated somebody's file would be keeping the letter of "nothing was
+    written" and none of the point — which a BytesIO destination cannot see.
+    """
     respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"ab", 40, 100))
-    sink = io.BytesIO()
+    dst = tmp_path / "out.bin"
+    dst.write_bytes(b"do not touch")
 
     with pytest.raises(mc.MandalaError, match="wrong bytes at the wrong place"):
-        _computer(client).download_file("/x", sink, part_size=2)
-    assert sink.getvalue() == b""
+        _computer(client).download_file("/x", dst, part_size=2)
+    assert dst.read_bytes() == b"do not touch"
+
+
+@respx.mock
+def test_a_window_that_ends_before_it_starts_is_refused(client: mc.Client) -> None:
+    """`bytes 5-4/100` with an empty body, which the length check alone lets by.
+
+    A window of no bytes ends exactly where it began, so the paging loop asks for
+    it again, receives it again, and never stops — and every check it passes on
+    the way is satisfied: the offset is the one that was asked for, and zero
+    bytes is what a zero-length window should carry. Refusing it in the parse is
+    what makes the loop's advance a property of the parse.
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 5-4/100",
+            },
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="ends before it starts"):
+        _computer(client).read_file_part("/x", offset=5, length=8)
+
+
+@respx.mock
+def test_a_file_that_shrinks_inside_the_window_is_caught_by_its_length(
+    client: mc.Client,
+) -> None:
+    """The shrink a 416 cannot catch, because the next window still lands inside.
+
+    The refusal at the end of the file is the loud version. This is the quiet
+    one: a file rewritten shorter, whose next window is perfectly satisfiable, so
+    every request succeeds and `at_end` arrives on schedule. What comes back is
+    two files spliced at whatever offset the change landed on, under a byte count
+    that looks entirely reasonable.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        if first == 0:
+            return _window(b"OLDOLD", 0, 100)
+        return _window(b"new", 6, 9)  # rewritten to nine bytes in between
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    sink = io.BytesIO()
+
+    with pytest.raises(mc.MandalaError, match="was 100 bytes and is 9"):
+        _computer(client).download_file("/x", sink, part_size=6)
+
+
+@respx.mock
+def test_a_file_that_grows_while_it_is_read_is_followed(client: mc.Client) -> None:
+    """The other direction, and not an error.
+
+    Appending leaves every window already read exactly where it was, so following
+    the new end is still one file. Only shrinking invalidates what has been
+    written, which is why the two are not treated alike.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        if first == 0:
+            return _window(b"aa", 0, 4)
+        return _window(b"bbbb", 2, 6)  # two more bytes arrived in between
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    sink = io.BytesIO()
+
+    assert _computer(client).download_file("/x", sink, part_size=2) == 6
+    assert sink.getvalue() == b"aabbbb"
 
 
 @respx.mock
