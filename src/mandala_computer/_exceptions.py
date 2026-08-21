@@ -12,6 +12,7 @@ __all__ = [
     "APIError",
     "AuthenticationError",
     "ConflictError",
+    "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
     "NotFoundError",
@@ -20,6 +21,7 @@ __all__ = [
     "OriginUnreachableError",
     "PermissionDeniedError",
     "PlanLimitError",
+    "RangeNotSatisfiableError",
     "RateLimitError",
     "TimeoutError",
     "UnavailableError",
@@ -76,6 +78,59 @@ class PlanLimitError(APIError):
     and storage pools, and OS entitlements. ``str(e)`` carries the API's
     explanation of which limit was hit.
     """
+
+
+class FileTooLargeError(APIError):
+    """A guest transfer larger than the 64 MiB one request moves (413).
+
+    The ceiling is on what a single *request* moves, not on the file. The bytes
+    cross the guest agent's one connection in chunks and a transfer holds it for
+    as long as it takes, so the limit has to fall somewhere — and asking for a
+    whole file bigger than that is what earns this.
+
+    Which makes it a signpost rather than a dead end, on the read side.
+    :meth:`~mandala_computer.Computer.read_file_part` applies the same ceiling to
+    the *window* you asked for, so the file behind it may be any size, and
+    :meth:`~mandala_computer.Computer.download_file` is that loop already
+    written. The platform's own refusal says so too — it carries
+    ``Accept-Ranges: bytes`` and names the header, because this is the one answer
+    a caller gets precisely when they have a file too big to fetch and no reason
+    yet to think there is another way to ask.
+
+    An upload raises it too, and there it really is a limit on the file: ``PUT``
+    takes no range. :meth:`~mandala_computer.Computer.write_file` refuses an
+    oversized body before the request is made, so from that direction this
+    arrives only if the platform's ceiling is lower than the one mirrored here.
+    """
+
+
+class RangeNotSatisfiableError(APIError):
+    """The window asked for named no byte the file has (416).
+
+    :attr:`size` is the file's real length, taken from the ``Content-Range`` the
+    refusal carries. That header is the point of this status: the caller asked
+    about a file whose length they did not know, and the number is what lets
+    them ask again instead of guessing.
+
+    ``size`` is legitimately ``0``. An empty file has no byte at any position, so
+    *every* range against one is refused — which is why
+    :meth:`~mandala_computer.Computer.download_file` reads a zero at offset zero
+    as an empty file rather than as a failure. It is ``None`` only when the
+    header was absent or unreadable, which is a hop in front of the platform
+    having dropped it rather than the platform declining to say.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        body: object = None,
+        size: int | None = None,
+    ) -> None:
+        super().__init__(message, status=status, body=body)
+        #: The file's length in bytes, or ``None`` if the refusal did not carry it.
+        self.size = size
 
 
 class GatewayTimeoutError(APIError):
