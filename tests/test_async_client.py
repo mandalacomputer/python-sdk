@@ -528,6 +528,35 @@ async def test_async_download_file_pages_until_the_file_ends(
 
 
 @respx.mock
+async def test_async_download_file_drains_short_writes(client: mc.AsyncClient) -> None:
+    class ShortSink(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            return super().write(data[:2])
+
+    body = b"abcdefgh"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        return httpx.Response(
+            206,
+            content=body[first : first + 4],
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + 3}/{len(body)}",
+            },
+        )
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    sink = ShortSink()
+
+    assert await mc.AsyncComputer(client._t, COMPUTER).download_file(
+        "/x", sink, part_size=4
+    ) == len(body)
+    assert sink.getvalue() == body
+    await client.aclose()
+
+
+@respx.mock
 async def test_async_read_file_part_reads_the_answer_not_the_ask(
     client: mc.AsyncClient,
 ) -> None:

@@ -48,6 +48,7 @@ from ._computer import (
     _require_model_key,
     _snapshots_deleted,
     _windows_from_response,
+    _write_all,
 )
 from ._exceptions import MandalaError, RangeNotSatisfiableError, TimeoutError
 from ._models import (
@@ -780,7 +781,7 @@ class AsyncComputer(ComputerFields):
         with _download_sink(dest) as sink:
             part = first
             while part is not None:
-                sink.write(part.data)
+                _write_all(sink, part.data)
                 written += len(part.data)
                 if part.at_end:
                     break

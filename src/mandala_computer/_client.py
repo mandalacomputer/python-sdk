@@ -485,6 +485,12 @@ class _BaseTransport:
                 "window ends before it starts. A window holds at least one byte — a "
                 "range naming none is a 416 — so there is nothing here to believe."
             )
+        if last >= total:
+            raise MandalaError(
+                f"{method} {path} answered 206 with Content-Range {raw.strip()}, whose "
+                f"{first}-{last} window does not fit inside a {total}-byte file. The "
+                "window and total cannot both be true."
+            )
         if last - first + 1 != len(data):
             raise MandalaError(
                 f"{method} {path} sent {len(data)} bytes for the window "

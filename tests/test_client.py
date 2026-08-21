@@ -2391,6 +2391,22 @@ def test_a_window_that_ends_before_it_starts_is_refused(client: mc.Client) -> No
 
 
 @respx.mock
+def test_a_window_that_extends_past_its_total_is_refused(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"abcdefgh",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 0-7/4",
+            },
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="does not fit inside a 4-byte file"):
+        _computer(client).read_file_part("/x", offset=0, length=8)
+
+
+@respx.mock
 def test_a_file_that_shrinks_inside_the_window_is_caught_by_its_length(
     client: mc.Client,
 ) -> None:
@@ -2447,6 +2463,22 @@ def test_download_file_writes_into_a_handle_and_leaves_it_open(client: mc.Client
     assert _computer(client).download_file("/x", sink, part_size=2) == 4
     assert not sink.closed
     assert sink.getvalue() == b"abcd"
+
+
+@respx.mock
+def test_download_file_drains_short_writes_before_advancing(client: mc.Client) -> None:
+    class ShortSink(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            return super().write(data[:2])
+
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(
+        side_effect=_paging(b"abcd", b"efgh")
+    )
+    sink = ShortSink()
+
+    assert _computer(client).download_file("/x", sink, part_size=4) == 8
+    assert sink.getvalue() == b"abcdefgh"
+    assert [call.request.headers["Range"] for call in route.calls] == ["bytes=0-3", "bytes=4-7"]
 
 
 @respx.mock

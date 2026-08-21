@@ -142,6 +142,28 @@ def _download_sink(dest: str | os.PathLike[str] | IO[bytes]) -> Iterator[IO[byte
     yield dest
 
 
+def _write_all(sink: IO[bytes], data: bytes) -> None:
+    """Write one downloaded part completely before fetching the next one.
+
+    Binary streams may accept fewer bytes than they were handed. Advancing the
+    remote range after such a write would silently leave a hole in the local
+    file, while counting the whole part as written. A write that accepts
+    nothing cannot be retried safely here — a nonblocking sink needs its caller
+    to arrange readiness — so it is reported rather than spun on forever.
+    """
+    view = memoryview(data)
+    while view:
+        written = sink.write(view)
+        if written is None or written <= 0:
+            raise OSError("download destination write made no progress")
+        if written > len(view):
+            raise OSError(
+                f"download destination reported writing {written} bytes from "
+                f"a {len(view)}-byte buffer"
+            )
+        view = view[written:]
+
+
 def _empty_guest_file(exc: RangeNotSatisfiableError) -> bool:
     """Whether a refused range is really a file with nothing in it.
 
@@ -1322,7 +1344,7 @@ class Computer(ComputerFields):
         with _download_sink(dest) as sink:
             part = first
             while part is not None:
-                sink.write(part.data)
+                _write_all(sink, part.data)
                 written += len(part.data)
                 if part.at_end:
                     break
