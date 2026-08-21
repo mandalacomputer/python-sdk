@@ -491,8 +491,11 @@ a screenshot costs anywhere. A run that exhausts it stops where it is and ends
 `rate_limited` rather than failing.
 
 Events this SDK does not model are skipped rather than raised on, so the
-platform adding an event type does not break your loop. Breaking out of the loop
-closes the stream, which is what stops the run.
+platform adding an event type does not break your loop. A bare `break` does not
+close an async iterator, and immediate cleanup of a sync generator is not
+portable across Python implementations. To stop a run early, wrap the iterator
+in `contextlib.closing()` (sync) or `contextlib.aclosing()` (async); leaving that
+context closes the HTTP stream and stops the run.
 
 The platform also exposes the same engine behind an OpenAI-shaped door at
 `POST /chat/completions`. This SDK deliberately does not wrap it: if you want

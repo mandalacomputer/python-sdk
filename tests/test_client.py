@@ -748,6 +748,17 @@ def test_a_computer_that_reports_no_resolution_reads_as_the_default(client: mc.C
     assert c.screen == (1280, 800)
 
 
+def test_screen_accepts_uppercase_resolution_separators() -> None:
+    c = mc.Computer(None, {**COMPUTER, "resolution": "1920X1080x24"})  # type: ignore[arg-type]
+    assert c.screen == (1920, 1080)
+
+
+def test_screen_rejects_a_reported_malformed_resolution() -> None:
+    c = mc.Computer(None, {**COMPUTER, "resolution": "1920xwide"})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid computer resolution"):
+        _ = c.screen
+
+
 @respx.mock
 def test_a_defaulted_scroll_does_not_move_the_pointer_to_the_corner(client: mc.Client) -> None:
     # scroll() used to send x=0,y=0 always, and the server reads a flat
@@ -1652,6 +1663,21 @@ def test_a_half_coordinate_click_never_reaches_the_wire(client: mc.Client) -> No
     assert not route.calls
 
 
+@respx.mock
+def test_strings_and_booleans_are_not_pointer_coordinates(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    computer = _computer(client)
+    with pytest.raises(TypeError, match="y must be an integer coordinate"):
+        computer.click(100, "shift")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="y must be an integer coordinate"):
+        computer.scroll(1, "down")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="x must be an integer coordinate"):
+        computer.move(True, 20)
+    with pytest.raises(TypeError, match="to_x must be an integer coordinate"):
+        computer.drag(False, 20)
+    assert not route.calls
+
+
 # --- credentials stay out of the repr --------------------------------------
 
 
@@ -1711,6 +1737,64 @@ def test_exec_result_preserves_a_null_exit_code() -> None:
     )
     assert result.exit_code is None
     assert not result.ok
+
+
+def test_null_model_fields_are_normalized_without_losing_the_row() -> None:
+    template = mc.Template.from_api(
+        {"name": None, "label": None, "os": None, "cpu": None, "ram_mb": None, "disk_gb": None}
+    )
+    size = mc.Size.from_api(
+        {"id": None, "label": None, "template": None, "cpu": None, "ram_mb": None, "disk_gb": None}
+    )
+    snapshot = mc.Snapshot.from_api(
+        {
+            "id": None,
+            "computer_id": None,
+            "name": None,
+            "state": None,
+            "size_bytes": None,
+            "created_at": None,
+            "cpu": None,
+            "ram_mb": None,
+            "disk_gb": None,
+        }
+    )
+    holdings = mc.SnapshotHoldings.from_api(
+        {"count": None, "size_bytes": None, "fingerprint": None}
+    )
+    window = mc.Window.from_api(
+        {"id": None, "title": None, "class": None, "type": None, "x": None, "y": None}
+    )
+    status = mc.ExecStatus.from_api(
+        {"pid": None, "command": None, "stdout_offset": None, "stderr_offset": None}
+    )
+
+    assert (template.name, template.cpu, template.ram_mb, template.disk_gb) == ("", 0, 0, 0)
+    assert (size.id, size.label, size.cpu, size.ram_mb, size.disk_gb) == ("", "", 0, 0, 0)
+    assert (snapshot.id, snapshot.state, snapshot.size_bytes, snapshot.cpu) == ("", "", 0, 0)
+    assert (holdings.count, holdings.size_bytes, holdings.fingerprint) == (0, 0, "")
+    assert (window.id, window.title, window.x, window.y) == ("", "", 0, 0)
+    assert (status.pid, status.command, status.stdout_offset, status.stderr_offset) == (0, "", 0, 0)
+
+
+def test_null_computer_string_fields_are_empty() -> None:
+    computer = mc.Computer(
+        None,
+        {"id": None, "name": None, "status": None, "os": None, "template": None},
+    )  # type: ignore[arg-type]
+    assert (computer.id, computer.name, computer.status, computer.os, computer.template) == (
+        "",
+        "",
+        "",
+        "",
+        "",
+    )
+
+
+@pytest.mark.parametrize("model", [mc.ExecResult, mc.ExecStatus])
+def test_a_boolean_exit_code_is_rejected(model: type[mc.ExecResult | mc.ExecStatus]) -> None:
+    with pytest.raises(TypeError, match="exit_code.+boolean"):
+        model.from_api({"exit_code": False})
 
 
 # --- 429 is its own answer -------------------------------------------------

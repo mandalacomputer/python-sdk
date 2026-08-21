@@ -83,6 +83,21 @@ def test_a_post_done_idle_timeout_does_not_discard_the_result(
     assert result.finished and result.text == "all set"
 
 
+def test_a_post_failure_idle_timeout_preserves_the_agent_error(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = mc.AgentFailed("bad model key", status=401)
+
+    def events() -> Any:
+        yield failure
+        raise mc.TimeoutError("stream went quiet")
+
+    monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
+    with pytest.raises(mc.AuthenticationError, match="bad model key") as caught:
+        computer.agent("do the thing", model_key=KEY)
+    assert caught.value.agent is failure
+
+
 @respx.mock
 def test_the_stream_reports_each_step_as_it_happens(computer: mc.Computer) -> None:
     respx.post(AGENT).mock(
@@ -674,6 +689,24 @@ async def test_an_async_post_done_idle_timeout_does_not_discard_the_result(
         monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
         result = await computer.agent("do the thing", model_key=KEY)
     assert result.finished and result.text == "all set"
+
+
+@pytest.mark.asyncio
+async def test_an_async_post_failure_idle_timeout_preserves_the_agent_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = mc.AgentFailed("bad model key", status=401)
+
+    async def events() -> Any:
+        yield failure
+        raise mc.TimeoutError("stream went quiet")
+
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        computer = mc.AsyncComputer(client._t, COMPUTER)
+        monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
+        with pytest.raises(mc.AuthenticationError, match="bad model key") as caught:
+            await computer.agent("do the thing", model_key=KEY)
+    assert caught.value.agent is failure
 
 
 async def test_explicitly_closing_an_async_agent_stream_awaits_transport_cleanup() -> None:
