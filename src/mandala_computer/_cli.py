@@ -11,7 +11,9 @@ Two subcommands, both addressing a computer by name or id:
 ``mandala scp <src> <dst>``
     Copy one file in or out, ``scp``-style: the side spelled
     ``<computer>:/path`` is the guest. Rides the files API, so it needs no
-    shell in the guest at all.
+    shell in the guest at all. A download is paged, so a file larger than the
+    64 MiB one request moves copies like any other; an upload is one request,
+    and one over the limit is refused before it is read.
 
 Authentication is the SDK's: ``MANDALA_API_KEY`` (and optionally
 ``MANDALA_BASE_URL``) in the environment.
@@ -427,11 +429,15 @@ def _cmd_scp(args: argparse.Namespace) -> int:
             if not basename or basename in (".", "..") or os.path.basename(basename) != basename:
                 _die(f"{target}:{remote_path} does not name a downloadable file")
             local = os.path.join(local, basename)
+        # Paged rather than read whole: the ceiling is on what one request
+        # moves, so a whole-file read makes anything past 64 MiB uncopyable, and
+        # a file that big is exactly what somebody reaches for scp to move.
+        # download_file writes as each window lands and does not open the local
+        # file until the first one has, so a refused copy still leaves whatever
+        # was there alone.
         with _client() as client:
-            data = _resolve(client, target).read_file(remote_path)
-        with open(local, "wb") as f:
-            f.write(data)
-        print(f"{target}:{remote_path} -> {local} ({len(data)} bytes)", file=sys.stderr)
+            written = _resolve(client, target).download_file(remote_path, local)
+        print(f"{target}:{remote_path} -> {local} ({written} bytes)", file=sys.stderr)
         return 0
 
     assert dst is not None

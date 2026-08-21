@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import aclosing
-from typing import Any
+from typing import IO, Any
 
 from . import _api
 from ._agent import (
@@ -25,6 +26,7 @@ from ._agent import (
 )
 from ._client import (
     DEADLINE_SLACK,
+    FILE_PART_SIZE,
     FILE_TIMEOUT,
     MODEL_KEY_HEADER,
     NO_DEADLINE,
@@ -37,17 +39,21 @@ from ._computer import (
     ComputerFields,
     _agent_once_outcome,
     _agent_outcome,
+    _continues,
     _cursor,
+    _download_sink,
+    _empty_guest_file,
     _file_body,
     _require_background_pid,
     _require_model_key,
     _snapshots_deleted,
     _windows_from_response,
 )
-from ._exceptions import MandalaError, TimeoutError
+from ._exceptions import MandalaError, RangeNotSatisfiableError, TimeoutError
 from ._models import (
     ExecResult,
     ExecStatus,
+    FilePart,
     Listing,
     Snapshot,
     SnapshotHoldings,
@@ -719,6 +725,68 @@ class AsyncComputer(ComputerFields):
             accept="application/octet-stream",
             content_types=("application/octet-stream",),
         )
+
+    async def read_file_part(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> FilePart:
+        """Read one window of a guest file, and where that window sits in it.
+
+        See :meth:`mandala_computer.Computer.read_file_part`.
+        """
+        data, at, total, partial = await self._t.binary_part(
+            "GET",
+            _api.files(self.id),
+            params=_api.files_params(path),
+            headers=_api.files_range(offset, length),
+            timeout=FILE_TIMEOUT,
+            accept="application/octet-stream",
+            content_types=("application/octet-stream",),
+        )
+        return FilePart(data=data, offset=at, total=total, partial=partial)
+
+    async def download_file(
+        self,
+        path: str,
+        dest: str | os.PathLike[str] | IO[bytes],
+        *,
+        part_size: int = FILE_PART_SIZE,
+    ) -> int:
+        """Fetch a whole guest file of any size, a window at a time.
+
+        See :meth:`mandala_computer.Computer.download_file`.
+
+        The writes are ordinary blocking writes, on this half as on the other.
+        A part is in memory by the time one happens, so what it costs the event
+        loop is a memcpy to the page cache rather than the transfer — and taking
+        a filesystem dependency to move that off the loop would be a large
+        answer to a small thing.
+        """
+        if part_size < 1:
+            raise ValueError(f"part_size must be at least 1 byte, not {part_size}")
+        first: FilePart | None
+        try:
+            first = await self.read_file_part(path, offset=0, length=part_size)
+        except RangeNotSatisfiableError as exc:
+            if not _empty_guest_file(exc):
+                raise
+            first = None
+        written = 0
+        asked = 0
+        with _download_sink(dest) as sink:
+            part = first
+            while part is not None:
+                _continues(path, asked, part)
+                sink.write(part.data)
+                written += len(part.data)
+                if part.at_end:
+                    break
+                asked = part.end
+                part = await self.read_file_part(path, offset=asked, length=part_size)
+        return written
 
     async def write_file(self, path: str, data: bytes | str) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.

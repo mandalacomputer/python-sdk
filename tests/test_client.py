@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import shlex
 import time
@@ -2035,6 +2036,367 @@ def test_read_file_refuses_an_html_success_body(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, html="<html>sign in</html>"))
     with pytest.raises(mc.MandalaError, match="not binary content"):
         _computer(client).read_file("/tmp/a")
+
+
+# --- ranged reads ----------------------------------------------------------
+#
+# The platform serves a window of a guest file (OPL-3727), and that is the only
+# way anything larger than the 64 MiB one request moves comes off a computer at
+# all. What these pin is the half of that a client owns: asking for the right
+# window, and believing the answer about which one arrived rather than the
+# question that was asked.
+
+
+def _window(data: bytes, first: int, total: int) -> httpx.Response:
+    """A 206, spelled the way the daemon spells one."""
+    return httpx.Response(
+        206,
+        content=data,
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Range": f"bytes {first}-{first + len(data) - 1}/{total}",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+@respx.mock
+def test_read_file_part_asks_for_a_window_and_says_where_it_landed(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"abcd", 8, 100))
+
+    part = _computer(client).read_file_part("/tmp/a", offset=8, length=4)
+
+    assert route.calls.last.request.headers["Range"] == "bytes=8-11"
+    assert (part.data, part.offset, part.total, part.partial) == (b"abcd", 8, 100, True)
+    assert (part.end, part.remaining, part.at_end) == (12, 88, False)
+
+
+@respx.mock
+def test_a_window_with_no_length_asks_for_the_rest_of_the_file(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"xyz", 7, 10))
+
+    part = _computer(client).read_file_part("/tmp/a", offset=7)
+
+    assert route.calls.last.request.headers["Range"] == "bytes=7-"
+    assert part.at_end and part.remaining == 0
+
+
+@respx.mock
+def test_a_tail_is_asked_for_by_counting_back_from_the_end(client: mc.Client) -> None:
+    """`bytes=-N`, which is the form the platform keeps anchored at the END.
+
+    Worth having its own spelling rather than making a caller work out
+    ``size - n``: they would need the size first, and the whole point of the tail
+    form is that it reads the last of something without knowing how long it is.
+    """
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"tail", 96, 100))
+
+    part = _computer(client).read_file_part("/var/log/x.log", offset=-4)
+
+    assert route.calls.last.request.headers["Range"] == "bytes=-4"
+    assert (part.offset, part.at_end) == (96, True)
+
+
+def test_a_tail_takes_no_length() -> None:
+    """Refused here rather than sent, because the header cannot spell it.
+
+    ``bytes=-N`` is anchored at both ends already. Silently dropping one of the
+    two numbers would answer a question nobody asked, and the trim rule makes
+    which one you dropped matter.
+    """
+    with pytest.raises(ValueError, match="tail is spelled by its offset alone"):
+        mc._api.files_range(-4096, 512)
+
+
+def test_a_zero_length_window_is_refused_before_the_request() -> None:
+    with pytest.raises(ValueError, match="at least 1 byte"):
+        mc._api.files_range(0, 0)
+
+
+@respx.mock
+def test_a_window_larger_than_one_request_moves_is_sent_anyway(client: mc.Client) -> None:
+    """Asking for more than the ceiling is not an error, and must not become one.
+
+    The caller cannot know the ceiling before they ask — that is the premise of
+    the whole feature — so the platform trims and says so. A client that refused
+    the ask locally would put the unknowable number back in the caller's hands.
+    """
+    over = mc._client.FILE_SIZE_LIMIT * 4
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"a" * 64, 0, over))
+
+    part = _computer(client).read_file_part("/tmp/big", offset=0, length=over)
+
+    assert route.calls.last.request.headers["Range"] == f"bytes=0-{over - 1}"
+    # Fewer bytes than asked for, on a success. The answer is what to believe.
+    assert len(part.data) == 64 and not part.at_end and part.end == 64
+
+
+@respx.mock
+def test_a_file_the_guest_cannot_measure_ignores_the_range(client: mc.Client) -> None:
+    """A ``/proc`` entry: no length to report, so no positions and no total.
+
+    The platform answers 200 with the whole thing and ``Accept-Ranges: none``,
+    and the status is how a client tells. Reading that as a window at offset zero
+    would invent a total the platform declined to promise.
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            200,
+            content=b"cpu0",
+            headers={"Content-Type": "application/octet-stream", "Accept-Ranges": "none"},
+        )
+    )
+
+    part = _computer(client).read_file_part("/proc/stat", offset=0, length=1024)
+
+    assert (part.data, part.offset, part.total, part.partial) == (b"cpu0", 0, None, False)
+    # Everything there was, arrived. There is nothing to page through.
+    assert part.at_end and part.remaining is None
+
+
+@respx.mock
+def test_a_partial_answer_with_no_content_range_is_refused(client: mc.Client) -> None:
+    """The header is the only thing that says which bytes these are.
+
+    A proxy that drops it leaves a 206 that cannot be read, and every mistake
+    available without it is silent: taken for the start of the file, a window
+    writes the middle of a download over its beginning and reports success.
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(206, content=b"abc", headers={"Content-Type": "application/octet-stream"})
+    )
+    with pytest.raises(mc.MandalaError, match="no readable Content-Range"):
+        _computer(client).read_file_part("/tmp/a", offset=0, length=3)
+
+
+@respx.mock
+def test_a_window_whose_body_contradicts_its_content_range_is_refused(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"ab",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 0-9/100",
+            },
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="cannot both be true"):
+        _computer(client).read_file_part("/tmp/a", offset=0, length=10)
+
+
+@respx.mock
+def test_a_refused_window_carries_the_files_real_length(client: mc.Client) -> None:
+    """416, and the number that makes the next ask possible without guessing."""
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            416,
+            json={"error": "range not satisfiable"},
+            headers={"Content-Range": "bytes */4096"},
+        )
+    )
+    with pytest.raises(mc.RangeNotSatisfiableError) as caught:
+        _computer(client).read_file_part("/tmp/a", offset=9999)
+
+    assert caught.value.size == 4096
+    assert caught.value.status == 416
+    assert isinstance(caught.value, mc.APIError)
+
+
+@respx.mock
+def test_a_refusal_that_names_no_length_says_so_rather_than_zero(client: mc.Client) -> None:
+    """``None``, not ``0`` — a zero here would read as "the file is empty"."""
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(416, json={"error": "range not satisfiable"})
+    )
+    with pytest.raises(mc.RangeNotSatisfiableError) as caught:
+        _computer(client).read_file_part("/tmp/a", offset=9999)
+    assert caught.value.size is None
+
+
+@respx.mock
+def test_a_whole_file_past_the_ceiling_is_its_own_error(client: mc.Client) -> None:
+    """413 has a next move attached, which a bare APIError could not carry."""
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(413, json={"error": "that file is 2000000000 bytes"})
+    )
+    with pytest.raises(mc.FileTooLargeError) as caught:
+        _computer(client).read_file("/tmp/big")
+    assert caught.value.status == 413
+    assert isinstance(caught.value, mc.APIError)
+
+
+# --- paging ----------------------------------------------------------------
+
+
+def _paging(*parts: bytes) -> object:
+    """A file served one window at a time, answering from the Range it is sent.
+
+    Written to serve the *requested* offset rather than a fixed script, so a
+    download that asks for the wrong window fails these tests instead of walking
+    off the end of a list.
+    """
+    body = b"".join(parts)
+    sizes = [len(p) for p in parts]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        at = 0
+        for n in sizes:
+            if at == first:
+                return _window(body[first : first + n], first, len(body))
+            at += n
+        return httpx.Response(
+            416, json={"error": "no"}, headers={"Content-Range": f"bytes */{len(body)}"}
+        )
+
+    return handler
+
+
+@respx.mock
+def test_download_file_pages_until_the_file_ends(client: mc.Client, tmp_path) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(
+        side_effect=_paging(b"one", b"two", b"three")
+    )
+    dst = tmp_path / "out.bin"
+
+    written = _computer(client).download_file("/home/user/out.bin", dst, part_size=3)
+
+    assert written == 11
+    assert dst.read_bytes() == b"onetwothree"
+    assert [call.request.headers["Range"] for call in route.calls] == [
+        "bytes=0-2",
+        "bytes=3-5",
+        "bytes=6-8",
+    ]
+
+
+@respx.mock
+def test_download_file_resumes_from_where_the_answer_ended(client: mc.Client, tmp_path) -> None:
+    """Not from where the ask would have ended, which is the trimmed case.
+
+    A window past the ceiling comes back short on a 200-shaped success, so a
+    loop that advanced by ``part_size`` would skip everything it did not
+    receive — a file with holes in it and nothing raised.
+    """
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=_paging(b"aa", b"bbbb"))
+    dst = tmp_path / "out.bin"
+
+    assert _computer(client).download_file("/x", dst, part_size=4) == 6
+    assert dst.read_bytes() == b"aabbbb"
+    # Asked for four, given two, and asked again from two rather than four.
+    assert [call.request.headers["Range"] for call in route.calls] == ["bytes=0-3", "bytes=2-5"]
+
+
+@respx.mock
+def test_an_empty_file_downloads_as_nothing_rather_than_as_a_failure(
+    client: mc.Client, tmp_path
+) -> None:
+    """An empty file has no byte at any position, so it refuses every window."""
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(416, json={"error": "no"}, headers={"Content-Range": "bytes */0"})
+    )
+    dst = tmp_path / "empty"
+
+    assert _computer(client).download_file("/tmp/empty", dst) == 0
+    assert dst.read_bytes() == b""
+
+
+@respx.mock
+def test_a_file_that_shrinks_mid_download_is_not_reported_as_finished(
+    client: mc.Client, tmp_path
+) -> None:
+    """The alternative is a short file on disk and an exit code saying it is fine.
+
+    Only the FIRST window reads a refusal as an empty file. One anywhere else is
+    the file having changed underneath, which is news.
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        side_effect=[
+            # Ten bytes, says the first answer, so the loop asks for more.
+            _window(b"aa", 0, 10),
+            # Two, says the file, by the time it is asked again.
+            httpx.Response(416, json={"error": "no"}, headers={"Content-Range": "bytes */2"}),
+        ]
+    )
+    dst = tmp_path / "out.bin"
+
+    with pytest.raises(mc.RangeNotSatisfiableError):
+        _computer(client).download_file("/x", dst, part_size=2)
+    # What did arrive is still there; what is refused is calling it the file.
+    assert dst.read_bytes() == b"aa"
+
+
+@respx.mock
+def test_a_refused_download_leaves_the_local_file_alone(client: mc.Client, tmp_path) -> None:
+    """The first window is asked for before anything local is opened.
+
+    ``read_file`` never touched the destination when it failed, and a paging
+    download that truncated one on the way to a 404 would be a regression worn
+    as an improvement.
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(404, json={"error": "no such file"})
+    )
+    dst = tmp_path / "out.bin"
+    dst.write_bytes(b"do not touch")
+
+    with pytest.raises(mc.NotFoundError):
+        _computer(client).download_file("/gone", dst)
+    assert dst.read_bytes() == b"do not touch"
+
+
+@respx.mock
+def test_a_first_window_from_the_wrong_offset_is_caught_too(client: mc.Client) -> None:
+    """Going first does not make a misplaced window any less misplaced."""
+    respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"ab", 40, 100))
+    sink = io.BytesIO()
+
+    with pytest.raises(mc.MandalaError, match="wrong bytes at the wrong place"):
+        _computer(client).download_file("/x", sink, part_size=2)
+    assert sink.getvalue() == b""
+
+
+@respx.mock
+def test_download_file_writes_into_a_handle_and_leaves_it_open(client: mc.Client) -> None:
+    """A handle is the caller's; closing it would end a transfer they own."""
+    respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=_paging(b"ab", b"cd"))
+    sink = io.BytesIO()
+
+    assert _computer(client).download_file("/x", sink, part_size=2) == 4
+    assert not sink.closed
+    assert sink.getvalue() == b"abcd"
+
+
+@respx.mock
+def test_a_window_from_the_wrong_offset_stops_the_download(client: mc.Client) -> None:
+    """A hop that ignores the Range serves the same window forever.
+
+    Two failures in one: the bytes would be appended at a position they do not
+    belong to, and the loop would never reach an end to stop at. The offset asked
+    for is what the answer is held against — nothing inside a single response
+    could tell.
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"ab", 0, 100))
+    sink = io.BytesIO()
+
+    with pytest.raises(mc.MandalaError, match="wrong bytes at the wrong place"):
+        _computer(client).download_file("/x", sink, part_size=2)
+    # The first window was legitimate and is kept; the repeat is what stopped it.
+    assert sink.getvalue() == b"ab"
+
+
+def test_download_file_refuses_a_part_size_of_nothing(client: mc.Client) -> None:
+    with pytest.raises(ValueError, match="at least 1 byte"):
+        mc.Computer(client._t, {"id": "vm-1"}).download_file("/x", io.BytesIO(), part_size=0)
+
+
+@respx.mock
+def test_a_ranged_read_gets_the_file_routes_budget(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(_window(b"ab", 0, 2))
+    _computer(client).read_file_part("/tmp/a", offset=0, length=2)
+    assert _budget(route)["read"] == mc._client.FILE_TIMEOUT
+    assert route.calls.last.request.headers["Accept"] == "application/octet-stream"
 
 
 @respx.mock

@@ -15,6 +15,7 @@ from typing import Any, SupportsIndex, TypeVar, overload
 __all__ = [
     "ExecResult",
     "ExecStatus",
+    "FilePart",
     "Listing",
     "Size",
     "Snapshot",
@@ -485,6 +486,66 @@ class Window:
             focused=bool(d.get("focused", False)),
             raw=dict(d),
         )
+
+
+@dataclass(frozen=True)
+class FilePart:
+    """One window of a guest file, and where it sits in the whole.
+
+    What :meth:`~mandala_computer.Computer.read_file_part` answers with. The
+    bytes alone would not be enough to ask for the next window: the platform
+    trims a request longer than one transfer moves rather than refusing it, so
+    **you can get fewer bytes than you asked for on a success**, and where the
+    window actually ended is a fact only the response carries::
+
+        part = c.read_file_part("/home/user/out.tar", offset=0, length=1 << 20)
+        while True:
+            sink.write(part.data)
+            if part.at_end:
+                break
+            part = c.read_file_part("/home/user/out.tar", offset=part.end, length=1 << 20)
+
+    That loop is :meth:`~mandala_computer.Computer.download_file`, which is
+    usually the thing to reach for. This record is for the reads that are not a
+    download: the last 4 KiB of a log, a header off the front of an archive,
+    a resumable transfer that has to remember where it stopped.
+
+    :attr:`partial` is ``False`` in exactly one situation, and it is not "the
+    file was small". A range is always sent, so the platform answering with the
+    whole thing means it *ignored* the range — which it does for a file whose
+    length the guest cannot report, a ``/proc`` entry being the usual one. There
+    are no byte positions to name in such a file and no total to promise, so
+    :attr:`total` is ``None`` and :attr:`at_end` is ``True``: everything there
+    was arrived, and there is nothing to page through.
+    """
+
+    #: The bytes of this window.
+    data: bytes
+    #: Position in the file of this window's first byte.
+    offset: int
+    #: The file's total length, or ``None`` when the guest could not report one.
+    total: int | None
+    #: Whether this is a window of the file (a 206) rather than all of it.
+    partial: bool
+
+    @property
+    def end(self) -> int:
+        """One past this window's last byte — the offset to ask from next."""
+        return self.offset + len(self.data)
+
+    @property
+    def at_end(self) -> bool:
+        """Whether the file ends here, so there is nothing left to ask for."""
+        if not self.partial:
+            return True
+        return self.total is not None and self.end >= self.total
+
+    @property
+    def remaining(self) -> int | None:
+        """Bytes after this window, or ``None`` when the total is not known."""
+        if self.total is None:
+            return None
+        return max(self.total - self.end, 0)
 
 
 @dataclass(frozen=True)

@@ -486,6 +486,77 @@ async def test_async_write_file_refuses_an_oversized_body_before_the_request(
 
 
 @respx.mock
+async def test_async_download_file_pages_until_the_file_ends(
+    client: mc.AsyncClient, tmp_path
+) -> None:
+    """The paging loop is written out on both halves, so it is checked on both.
+
+    The shape is what test_parity.py pins; this is the behaviour underneath it,
+    which two hand-written loops can differ on while both keep the signature.
+    """
+    body = b"onetwothree"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        first = int(request.headers["Range"].removeprefix("bytes=").split("-")[0])
+        window = body[first : first + 3]
+        return httpx.Response(
+            206,
+            content=window,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {first}-{first + len(window) - 1}/{len(body)}",
+            },
+        )
+
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(side_effect=handler)
+    dst = tmp_path / "out.bin"
+
+    written = await mc.AsyncComputer(client._t, COMPUTER).download_file(
+        "/home/user/out.bin", dst, part_size=3
+    )
+
+    assert written == len(body)
+    assert dst.read_bytes() == body
+    assert [call.request.headers["Range"] for call in route.calls] == [
+        "bytes=0-2",
+        "bytes=3-5",
+        "bytes=6-8",
+        "bytes=9-11",
+    ]
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_read_file_part_reads_the_answer_not_the_ask(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(
+            206,
+            content=b"ab",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": "bytes 4-5/64",
+            },
+        )
+    )
+    part = await mc.AsyncComputer(client._t, COMPUTER).read_file_part("/tmp/a", offset=4, length=16)
+    assert (part.offset, part.total, part.end, part.at_end) == (4, 64, 6, False)
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_an_empty_file_downloads_as_nothing(client: mc.AsyncClient, tmp_path) -> None:
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(416, json={"error": "no"}, headers={"Content-Range": "bytes */0"})
+    )
+    dst = tmp_path / "empty"
+    assert await mc.AsyncComputer(client._t, COMPUTER).download_file("/tmp/empty", dst) == 0
+    assert dst.read_bytes() == b""
+    await client.aclose()
+
+
+@respx.mock
 async def test_a_failing_ephemeral_cleanup_keeps_the_original_error(
     client: mc.AsyncClient,
 ) -> None:

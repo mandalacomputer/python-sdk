@@ -148,6 +148,42 @@ def files_params(path: str) -> dict[str, str]:
     return {"path": path}
 
 
+def files_range(offset: int, length: int | None) -> dict[str, str]:
+    """The ``Range`` header for one window of a guest file.
+
+    ``offset`` counts from the start of the file, or **from its end when it is
+    negative** — the same reading Python gives an index, and the same thing the
+    ``bytes=-N`` form of the header means. ``length`` is how many bytes to ask
+    for, or ``None`` for "to the end".
+
+    Deliberately does **not** refuse a window larger than
+    :data:`~mandala_computer._client.FILE_SIZE_LIMIT`. Asking for more than one
+    request moves is not a mistake: the platform trims the window to what it can
+    carry and the ``Content-Range`` on the answer says exactly what came back and
+    what is left, which is the whole paging loop and needs no advance knowledge
+    of the ceiling to run. Refusing it here would put that knowledge back.
+
+    Which *end* gets trimmed follows the end the caller anchored — a window
+    counted from the start keeps its start, a tail keeps its end — so a negative
+    ``offset`` takes no ``length``. Combining them would ask for a window
+    anchored at both ends, and the header has no way to spell that; naming the
+    two forms apart is better than picking one silently.
+    """
+    if offset < 0:
+        if length is not None:
+            raise ValueError(
+                "a tail is spelled by its offset alone: bytes=-N asks for the file's "
+                f"last N bytes and has no length to give. Pass offset={offset} on its "
+                "own, or count offset and length from the start of the file."
+            )
+        return {"Range": f"bytes={offset}"}
+    if length is None:
+        return {"Range": f"bytes={offset}-"}
+    if length < 1:
+        raise ValueError(f"length must be at least 1 byte, not {length}")
+    return {"Range": f"bytes={offset}-{offset + length - 1}"}
+
+
 def partial_params(allow_partial: bool) -> dict[str, str] | None:
     """The opt-in to a knowingly short fan-out listing.
 

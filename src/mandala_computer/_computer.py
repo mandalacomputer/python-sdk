@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import closing
-from typing import Any
+from contextlib import closing, contextmanager
+from typing import IO, Any
 
 from . import _api
 from ._agent import (
@@ -19,6 +20,7 @@ from ._agent import (
 )
 from ._client import (
     DEADLINE_SLACK,
+    FILE_PART_SIZE,
     FILE_SIZE_LIMIT,
     FILE_TIMEOUT,
     MODEL_KEY_HEADER,
@@ -33,12 +35,14 @@ from ._exceptions import (
     OriginTLSError,
     PermissionDeniedError,
     PlanLimitError,
+    RangeNotSatisfiableError,
     RateLimitError,
     TimeoutError,
 )
 from ._models import (
     ExecResult,
     ExecStatus,
+    FilePart,
     Listing,
     Snapshot,
     SnapshotHoldings,
@@ -120,6 +124,64 @@ def _file_body(data: bytes | str) -> bytes:
     if len(body) > FILE_SIZE_LIMIT:
         raise ValueError(f"file data may not exceed {FILE_SIZE_LIMIT // (1024 * 1024)} MiB")
     return body
+
+
+@contextmanager
+def _download_sink(dest: str | os.PathLike[str] | IO[bytes]) -> Iterator[IO[bytes]]:
+    """Where a download's bytes go, whether it was named a path or handed a file.
+
+    A file this opened is one nothing else can close, so it is closed here. One
+    the caller opened is left alone — closing it would end a transfer they may
+    have meant to go on writing to, and a download is not the owner of somebody
+    else's handle.
+    """
+    if isinstance(dest, (str, os.PathLike)):
+        with open(dest, "wb") as f:
+            yield f
+        return
+    yield dest
+
+
+def _empty_guest_file(exc: RangeNotSatisfiableError) -> bool:
+    """Whether a refused range is really a file with nothing in it.
+
+    An empty file has no byte at any position, so it refuses *every* window —
+    including the first one a download asks for. That is the platform being
+    consistent rather than a failure, and the zero length it puts on the refusal
+    is what says so.
+
+    Only ever asked of the FIRST window, which is why the offset is not a
+    parameter. A range refused later in a download is a file that shrank while
+    it was being read, and reading that as an ending would hand back a truncated
+    file with nothing raised — the silent truncation every ``Content-Range`` on
+    this path exists to prevent.
+    """
+    return exc.size == 0
+
+
+def _continues(path: str, asked_from: int, part: FilePart) -> None:
+    """Refuse a window that does not start where the download asked it to.
+
+    A range anchored at the start keeps its start — only its far end is ever
+    trimmed — so a window beginning anywhere else is not the one that was asked
+    for. Appending it would splice foreign bytes into the file at a position
+    nothing downstream would ever check, and where the same window comes back
+    every time (a cache in front of the platform, a hop that drops the header on
+    the way through) the loop would also never end.
+
+    The loop's own invariant, checked against what was asked rather than against
+    the answer alone. Nothing in one response can say it on its own: a window is
+    only wrong relative to the one that should have arrived. Asked of the first
+    window too, where the offset is zero — a download whose opening window
+    starts somewhere else would write the middle of the file over its beginning
+    and be no more obviously wrong for having gone first.
+    """
+    if part.offset != asked_from:
+        raise MandalaError(
+            f"{path}: asked for the window at offset {asked_from} and got the one at "
+            f"{part.offset}. Appending that would put the wrong bytes at the wrong "
+            "place, and asking again would ask the same question."
+        )
 
 
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -1116,6 +1178,12 @@ class Computer(ComputerFields):
         working directory behind this, so a relative path is refused before the
         request is made. Works while the computer is running or suspended
         (a transfer resumes a suspended computer, like any other use).
+
+        The whole file crosses in one request, so a file past the 64 MiB that
+        one request moves raises :class:`~mandala_computer.FileTooLargeError`.
+        That is a limit on the request rather than on the file:
+        :meth:`download_file` fetches one of any size by asking for it a window
+        at a time, and :meth:`read_file_part` is the single window underneath.
         """
         return self._t.binary(
             "GET",
@@ -1125,6 +1193,121 @@ class Computer(ComputerFields):
             accept="application/octet-stream",
             content_types=("application/octet-stream",),
         )
+
+    def read_file_part(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> FilePart:
+        """Read one window of a guest file, and where that window sits in it.
+
+        The way anything larger than 64 MiB comes off a computer at all. The
+        ceiling is on what one request moves, so applying it to a *window*
+        leaves the file behind it any size you like::
+
+            head = c.read_file_part("/home/user/out.tar", length=512)
+            tail = c.read_file_part("/var/log/build.log", offset=-4096)
+
+        ``offset`` counts from the start of the file, or from its end when it is
+        negative — the reading Python gives an index, and the one the ``Range``
+        header's own tail form has. ``length`` is how many bytes to ask for, and
+        ``None`` means to the end of the file. A tail takes no ``length``: it is
+        already anchored at both the end it starts from and the end it stops at.
+
+        **Asking for more than one request moves is not an error, and you may
+        get fewer bytes than you asked for.** The platform trims the window
+        instead of refusing it, precisely because a caller cannot know the
+        ceiling before asking — so the returned
+        :class:`~mandala_computer.FilePart` is the authority on what came back
+        and where to ask from next, never the numbers passed in. Which end gets
+        trimmed follows the end you anchored: a window counted from the start
+        keeps its start, and a tail keeps its end, so an over-long tail is still
+        the tail of the file rather than the middle of it.
+
+        Raises :class:`~mandala_computer.RangeNotSatisfiableError` for a window
+        naming no byte the file has — past the end, or any window at all of an
+        empty file — carrying the file's real length so the next ask does not
+        have to guess.
+
+        :meth:`download_file` is this in a loop, and is what a whole large file
+        wants.
+        """
+        data, at, total, partial = self._t.binary_part(
+            "GET",
+            _api.files(self.id),
+            params=_api.files_params(path),
+            headers=_api.files_range(offset, length),
+            timeout=FILE_TIMEOUT,
+            accept="application/octet-stream",
+            content_types=("application/octet-stream",),
+        )
+        return FilePart(data=data, offset=at, total=total, partial=partial)
+
+    def download_file(
+        self,
+        path: str,
+        dest: str | os.PathLike[str] | IO[bytes],
+        *,
+        part_size: int = FILE_PART_SIZE,
+    ) -> int:
+        """Fetch a whole guest file of any size, a window at a time::
+
+            c.download_file("/home/user/out.tar", "out.tar")
+
+        Returns how many bytes were written. ``dest`` is a path to write, or an
+        already-open binary file — a path is opened and closed here, a handle is
+        written to and left as it was found. A path is not opened until the
+        first window has arrived, so a download that is refused outright leaves
+        nothing behind on this side.
+
+        This is :meth:`read_file_part` in the loop its ``Content-Range`` is
+        designed for, which is what makes it, and not :meth:`read_file`, the way
+        to move a large file. Nothing is held in memory but one part, so
+        ``part_size`` is the memory cost and also what a mid-transfer failure
+        costs: a part that dies is re-fetched from its start. Asking for more
+        than the platform moves in one request is allowed and simply gets
+        trimmed, so the ceiling is not something this has to know.
+
+        Two endings that are not the file's, both raised rather than smoothed
+        over. A file that **shrinks** while it is being read raises
+        :class:`~mandala_computer.RangeNotSatisfiableError` from the window that
+        fell off the end — the alternative is a short file on disk and an exit
+        code saying it went fine. A file that **grows** is followed: each answer
+        carries the length as it is now, and the loop ends where the last one
+        does. An empty file is not an error and writes nothing.
+        """
+        if part_size < 1:
+            raise ValueError(f"part_size must be at least 1 byte, not {part_size}")
+        # The first window is asked for before anything local is opened, so a
+        # download that was never going to happen — no such file, no guest agent,
+        # a computer that is gone — does not leave an empty one behind in its
+        # place. Everything after it has already written bytes somebody wants.
+        first: FilePart | None
+        try:
+            first = self.read_file_part(path, offset=0, length=part_size)
+        except RangeNotSatisfiableError as exc:
+            if not _empty_guest_file(exc):
+                raise
+            first = None
+        written = 0
+        asked = 0
+        with _download_sink(dest) as sink:
+            part = first
+            while part is not None:
+                _continues(path, asked, part)
+                sink.write(part.data)
+                written += len(part.data)
+                if part.at_end:
+                    break
+                # From where the answer ended, never from where the ask would
+                # have: a window past what one request moves comes back trimmed,
+                # and advancing by part_size would leave holes in the file with
+                # nothing raised.
+                asked = part.end
+                part = self.read_file_part(path, offset=asked, length=part_size)
+        return written
 
     def write_file(self, path: str, data: bytes | str) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
