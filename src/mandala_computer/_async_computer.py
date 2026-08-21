@@ -289,11 +289,6 @@ class AsyncComputer(ComputerFields):
                 )
             await asyncio.sleep(min(poll, remaining))
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"{self.id} was still building after {timeout:g}s "
-                    "(it has not stopped; only this wait has)"
-                )
             await self._refresh(timeout_cap=remaining)
 
     async def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> AsyncComputer:
@@ -998,7 +993,7 @@ class AsyncComputer(ComputerFields):
                 elif isinstance(event, AgentFailed):
                     failure = event
         except TimeoutError:
-            if result is None:
+            if result is None and failure is None:
                 raise
         return _agent_outcome(result, failure)
 

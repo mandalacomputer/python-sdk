@@ -215,11 +215,11 @@ class ComputerFields:
 
     @property
     def id(self) -> str:
-        return str(self._data.get("id", ""))
+        return str(self._data.get("id") or "")
 
     @property
     def name(self) -> str:
-        return str(self._data.get("name", ""))
+        return str(self._data.get("name") or "")
 
     @property
     def status(self) -> str:
@@ -232,7 +232,7 @@ class ComputerFields:
         copied, and becomes ``"build-failed"`` if that copy never finished. See
         :attr:`is_building`.
         """
-        return str(self._data.get("status", ""))
+        return str(self._data.get("status") or "")
 
     @property
     def is_suspended(self) -> bool:
@@ -331,11 +331,11 @@ class ComputerFields:
 
     @property
     def os(self) -> str:
-        return str(self._data.get("os", ""))
+        return str(self._data.get("os") or "")
 
     @property
     def template(self) -> str:
-        return str(self._data.get("template", ""))
+        return str(self._data.get("template") or "")
 
     @property
     def cpu(self) -> int:
@@ -370,17 +370,25 @@ class ComputerFields:
         Handy for the computer-use tool definition, which wants the two numbers
         separately — ``display_width_px``/``display_height_px`` have to equal
         what screenshots actually are or the model's coordinates are wrong.
+
+        Raises :class:`ValueError` if a server reports a malformed resolution;
+        only an absent resolution means the legacy default.
         """
-        parts = self.resolution.split("x")
+        resolution = self.resolution
+        parts = resolution.lower().split("x")
         try:
-            w, h = int(parts[0]), int(parts[1])
-        except (IndexError, ValueError):
-            return SCREEN_WIDTH, SCREEN_HEIGHT
-        return (w, h) if w > 0 and h > 0 else (SCREEN_WIDTH, SCREEN_HEIGHT)
+            if len(parts) not in (2, 3) or any(not part for part in parts):
+                raise ValueError
+            values = [int(part) for part in parts]
+            if any(value <= 0 for value in values):
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"invalid computer resolution {resolution!r}") from None
+        return values[0], values[1]
 
     @property
     def created_at(self) -> str:
-        return str(self._data.get("created_at", ""))
+        return str(self._data.get("created_at") or "")
 
     @property
     def idle_suspend_min(self) -> int | None:
@@ -691,11 +699,6 @@ class Computer(ComputerFields):
                 )
             time.sleep(min(poll, remaining))
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"{self.id} was still building after {timeout:g}s "
-                    "(it has not stopped; only this wait has)"
-                )
             self._refresh(timeout_cap=remaining)
 
     def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> Computer:
@@ -1404,7 +1407,7 @@ class Computer(ComputerFields):
             # The stream deliberately remains open after done so a trailing
             # failure can override it. Silence after done is not itself a
             # failure, however, and must not discard the result already sent.
-            if result is None:
+            if result is None and failure is None:
                 raise
         return _agent_outcome(result, failure)
 
@@ -1468,11 +1471,11 @@ class BackgroundCommandFields:
     @property
     def command(self) -> str:
         """The command line, echoed back by the platform."""
-        return str(self._data.get("command", ""))
+        return str(self._data.get("command") or "")
 
     @property
     def started_at(self) -> str:
-        return str(self._data.get("started_at", ""))
+        return str(self._data.get("started_at") or "")
 
     @property
     def raw(self) -> Mapping[str, Any]:

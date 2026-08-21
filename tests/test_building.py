@@ -150,6 +150,20 @@ def test_wait_until_built_clamps_its_last_sleep(
 
 
 @respx.mock
+def test_wait_until_built_refreshes_after_the_timeout_boundary(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build that lands during the final sleep must not be reported timed out."""
+    route = respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
+    now = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(mc._computer.time, "monotonic", lambda: next(now))
+    monkeypatch.setattr(mc._computer.time, "sleep", lambda seconds: None)
+
+    computer = mc.Computer(client._t, BUILDING).wait_until_built(timeout=1, poll=5)
+    assert computer.status == "stopped" and route.call_count == 1
+
+
+@respx.mock
 def test_wait_until_built_caps_refresh_to_its_remaining_budget(client: mc.Client) -> None:
     route = respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=BUILT))
     mc.Computer(client._t, BUILDING).wait_until_built(timeout=2, poll=0)
