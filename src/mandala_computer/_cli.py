@@ -421,11 +421,14 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         target, remote_path = src
         if not remote_path:
             _die(f"say which file: {target}:/absolute/path")
-        with _client() as client:
-            data = _resolve(client, target).read_file(remote_path)
         local = args.dst
         if os.path.isdir(local):
-            local = os.path.join(local, _guest_basename(remote_path))
+            basename = _guest_basename(remote_path)
+            if not basename or basename in (".", "..") or os.path.basename(basename) != basename:
+                _die(f"{target}:{remote_path} does not name a downloadable file")
+            local = os.path.join(local, basename)
+        with _client() as client:
+            data = _resolve(client, target).read_file(remote_path)
         with open(local, "wb") as f:
             f.write(data)
         print(f"{target}:{remote_path} -> {local} ({len(data)} bytes)", file=sys.stderr)
