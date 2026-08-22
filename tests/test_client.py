@@ -1369,6 +1369,18 @@ def test_a_foreground_exec_needs_a_positive_deadline(client: mc.Client) -> None:
         mc.Computer(client._t, COMPUTER).exec("true", timeout=0)
 
 
+def test_a_foreground_exec_deadline_must_be_finite() -> None:
+    """Infinity survives `timeout <= 0` and then means "no deadline" twice over.
+
+    It leaves the body as a bare `Infinity` no JSON parser owes us, and it goes
+    on to be the HTTP read timeout, so a guest that never answers hangs the
+    caller for good. NaN takes the same route by failing every comparison.
+    """
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            mc._api.exec_body("true", timeout=bad)
+
+
 def test_a_relative_cwd_is_refused_before_the_request() -> None:
     with pytest.raises(ValueError, match="cwd must be absolute"):
         mc._api.exec_body("make", 30, cwd="src")
@@ -1622,6 +1634,14 @@ def test_a_boolean_is_not_an_idle_window() -> None:
     """True is an int subclass and would JSON-encode as true, not 1."""
     with pytest.raises(TypeError, match="integer minute count"):
         mc._api.idle_suspend_body(True)  # type: ignore[arg-type]
+
+
+def test_a_nan_is_not_an_idle_window() -> None:
+    """`nan < 0` is False, so the negative check alone would pass it through."""
+    with pytest.raises(TypeError, match="integer minute count"):
+        mc._api.idle_suspend_body(math.nan)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="integer minute count"):
+        mc._api.idle_suspend_body(2.5)  # type: ignore[arg-type]
 
 
 # --- ids are not trusted to be shaped like ids -----------------------------
