@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import io
 import json
+import math
 import shlex
 import time
 
@@ -448,9 +449,9 @@ def test_rename_reports_the_name_the_server_settled_on(client: mc.Client) -> Non
 def test_rename_refuses_an_empty_name_without_asking(client: mc.Client) -> None:
     """The server refuses it too; there is no reason to spend a round trip."""
     c = mc.Computer(client._t, COMPUTER)
-    for name in ("", "   ", "\t\n"):
+    for name in ("", "   ", "\t\n", None):
         with pytest.raises(ValueError, match="must not be empty"):
-            c.rename(name)
+            c.rename(name)  # type: ignore[arg-type]
     assert c.name == "dev", "a refused rename must not touch the handle"
 
 
@@ -469,11 +470,29 @@ def test_schedule_is_the_window_only(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1/schedule").mock(
         httpx.Response(200, json={"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"})
     )
-    sched = mc.Computer(client._t, COMPUTER).schedule()
+    c = mc.Computer(client._t, COMPUTER)
+    sched = c.schedule()
     assert "last_run" not in sched
     # Empty string would mean "UTC" to the daemon but is rejected by every
     # timezone library, so the surface must name the zone.
     assert sched["tz"] == "UTC"
+    # The GET must write through: snapshot_schedule used to stay stale after
+    # a fetch that set_schedule would have cached.
+    assert c.snapshot_schedule == {
+        "enabled": False,
+        "hour": 0,
+        "minute": 0,
+        "tz": "UTC",
+    }
+
+
+@respx.mock
+def test_an_empty_schedule_does_not_cache_as_a_window(client: mc.Client) -> None:
+    """GET {} is "no schedule"; snapshot_schedule is None, not {}."""
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
+    c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
+    assert c.schedule() == {}
+    assert c.snapshot_schedule is None
 
 
 @respx.mock
@@ -695,6 +714,15 @@ def test_the_cursor_position_is_returned_once_it_is_known(client: mc.Client) -> 
 
 
 @respx.mock
+def test_a_known_cursor_with_no_coordinates_is_unknown(client: mc.Client) -> None:
+    """known=true and null x/y is contradictory; zero would be the corner."""
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        httpx.Response(200, json={"ok": True, "x": None, "y": None, "known": True})
+    )
+    assert _computer(client).cursor_position() is None
+
+
+@respx.mock
 def test_scroll_takes_all_four_directions_and_refuses_the_rest(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = _computer(client)
@@ -713,6 +741,14 @@ def test_hold_key_and_wait_refuse_a_non_positive_duration(client: mc.Client) -> 
         c.wait(-1)
     with pytest.raises(ValueError):
         c.hold_key(seconds=1)
+
+
+def test_hold_key_and_wait_refuse_nan() -> None:
+    """NaN is not positive and not non-positive; it used to become the timeout."""
+    with pytest.raises(ValueError, match="seconds must be positive"):
+        mc._api.hold_key_body(("shift",), math.nan)
+    with pytest.raises(ValueError, match="seconds must be positive"):
+        mc._api.wait_body(math.nan)
 
 
 @respx.mock
@@ -1176,6 +1212,7 @@ def test_a_computer_with_neither_says_so_rather_than_inventing_one(client: mc.Cl
     # None, not an empty mapping: "no schedule" and "a schedule that is off"
     # are different answers, and set_schedule(enabled=False) is the second.
     assert c.snapshot_schedule is None
+    assert mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {}}).snapshot_schedule is None
 
 
 @respx.mock
@@ -1276,6 +1313,16 @@ def test_a_quiet_server_is_not_reported_as_nothing_destroyed(client: mc.Client) 
 @respx.mock
 def test_a_malformed_delete_count_is_an_sdk_error(client: mc.Client) -> None:
     respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"snapshots_deleted": []}))
+    with pytest.raises(mc.MandalaError, match="invalid snapshots_deleted"):
+        _computer(client).delete()
+
+
+@respx.mock
+def test_a_boolean_delete_count_is_not_one_snapshot(client: mc.Client) -> None:
+    """int(True) is 1; a boolean payload is not a count."""
+    respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"snapshots_deleted": True})
+    )
     with pytest.raises(mc.MandalaError, match="invalid snapshots_deleted"):
         _computer(client).delete()
 
@@ -1571,6 +1618,12 @@ def test_zero_pins_a_computer_against_the_idle_sweep() -> None:
         mc._api.idle_suspend_body(-1)
 
 
+def test_a_boolean_is_not_an_idle_window() -> None:
+    """True is an int subclass and would JSON-encode as true, not 1."""
+    with pytest.raises(TypeError, match="integer minute count"):
+        mc._api.idle_suspend_body(True)  # type: ignore[arg-type]
+
+
 # --- ids are not trusted to be shaped like ids -----------------------------
 
 
@@ -1792,10 +1845,34 @@ def test_null_computer_string_fields_are_empty() -> None:
     )
 
 
+def test_null_computer_numeric_fields_are_zero() -> None:
+    """Present JSON null used to crash int() on cpu/ram/disk."""
+    computer = mc.Computer(
+        None,
+        {"id": "vm-1", "cpu": None, "ram_mb": None, "disk_gb": None},
+    )  # type: ignore[arg-type]
+    assert (computer.cpu, computer.ram_mb, computer.disk_gb) == (0, 0, 0)
+
+
+def test_a_malformed_idle_window_is_an_sdk_error() -> None:
+    """0 is 'never suspend'; garbage must not become 0 or a TypeError."""
+    computer = mc.Computer(None, {"idle_suspend_min": "soon"})  # type: ignore[arg-type]
+    with pytest.raises(mc.MandalaError, match="idle_suspend_min"):
+        _ = computer.idle_suspend_min
+
+
 @pytest.mark.parametrize("model", [mc.ExecResult, mc.ExecStatus])
 def test_a_boolean_exit_code_is_rejected(model: type[mc.ExecResult | mc.ExecStatus]) -> None:
     with pytest.raises(TypeError, match="exit_code.+boolean"):
         model.from_api({"exit_code": False})
+
+
+@pytest.mark.parametrize("model", [mc.ExecResult, mc.ExecStatus])
+def test_a_malformed_exit_code_is_an_sdk_error(
+    model: type[mc.ExecResult | mc.ExecStatus],
+) -> None:
+    with pytest.raises(mc.MandalaError, match="invalid exit_code"):
+        model.from_api({"exit_code": "oops"})
 
 
 # --- 429 is its own answer -------------------------------------------------

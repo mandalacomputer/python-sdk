@@ -188,6 +188,17 @@ def _exit_code(message: str) -> int | None:
         return 0
 
 
+# Cap on unread local keystrokes / piped stdin waiting to go out. A stalled
+# websocket plus a firehose on stdin used to grow without bound; blocking the
+# stdin pump here is the backpressure. Resize uses put_nowait so a signal
+# handler never blocks.
+_OUTBOUND_QUEUE_MAX = 256
+
+
+def _outbound_queue() -> queue.Queue[bytes | str | object]:
+    return queue.Queue(maxsize=_OUTBOUND_QUEUE_MAX)
+
+
 def _interact(url: str) -> int:
     """Pump the local terminal into the websocket and back, until the shell ends.
 
@@ -203,7 +214,7 @@ def _interact(url: str) -> int:
     closed = threading.Event()
     resize = object()
     stop_sender = object()
-    outbound: queue.SimpleQueue[bytes | str | object] = queue.SimpleQueue()
+    outbound = _outbound_queue()
     stdin_wakeup_read: int | None = None
     stdin_wakeup_write: int | None = None
 
@@ -211,7 +222,8 @@ def _interact(url: str) -> int:
         # A Python signal handler must not touch the socket, and websockets
         # forbids overlapping sends. The sender owns both the terminal query
         # and every outbound frame; this handler does nothing but enqueue.
-        outbound.put(resize)
+        with suppress(queue.Full):
+            outbound.put_nowait(resize)
 
     def pump_stdin() -> None:
         assert stdin_wakeup_read is not None
@@ -223,19 +235,31 @@ def _interact(url: str) -> int:
                 data = os.read(stdin, 4096)
                 if not data:
                     return  # piped stdin ran dry; the shell decides what's next
-                outbound.put(data)
+                # Bounded queue: a stall+firehose must not pin join() on put().
+                while True:
+                    try:
+                        outbound.put(data, timeout=0.1)
+                        break
+                    except queue.Full:
+                        if closed.is_set():
+                            return
 
     def pump_outbound() -> None:
-        # The socket closing under us is fine; the main loop reports it.
-        with suppress(ConnectionClosed, OSError, WebSocketException):
-            while not closed.is_set():
-                message = outbound.get()
-                if message is stop_sender:
-                    return
-                if message is resize:
-                    cols, rows = shutil.get_terminal_size()
-                    message = json.dumps({"type": "resize", "cols": cols, "rows": rows})
-                assert isinstance(message, (bytes, str))
+        # Keep draining until the stop sentinel even after the socket dies, or a
+        # full queue cannot accept that sentinel and shutdown deadlocks. Do not
+        # send once closed: a peer that already exited may have stopped reading,
+        # and flushing the backlog would delay or hang join().
+        while True:
+            message = outbound.get()
+            if message is stop_sender:
+                return
+            if closed.is_set():
+                continue
+            if message is resize:
+                cols, rows = shutil.get_terminal_size()
+                message = json.dumps({"type": "resize", "cols": cols, "rows": rows})
+            assert isinstance(message, (bytes, str))
+            with suppress(ConnectionClosed, OSError, WebSocketException):
                 ws.send(message)
 
     saved_tty = None
@@ -344,9 +368,14 @@ def _interact(url: str) -> int:
                 os.write(stdin_wakeup_write, b"\0")
         if stdin_thread is not None:
             stdin_thread.join()
-        # No producer can enqueue after the sentinel. Joining makes the sender
-        # the sole websocket writer all the way through its final frame; close()
-        # writes a close frame and must not overlap send().
+        # No producer can enqueue after the sentinel. Uninstall SIGWINCH first
+        # so a resize cannot land after it. Joining makes the sender the sole
+        # websocket writer all the way through its final frame; close() writes
+        # a close frame and must not overlap send(). Blocking put is safe now:
+        # stdin has stopped and the sender is still draining.
+        if winch_installed and sigwinch is not None:
+            signal.signal(sigwinch, saved_winch)
+            winch_installed = False
         outbound.put(stop_sender)
         if sender_thread is not None:
             sender_thread.join()
@@ -359,8 +388,6 @@ def _interact(url: str) -> int:
         restore_tty()
         for signum, previous in saved_exit_handlers.items():
             signal.signal(signum, previous)
-        if winch_installed and sigwinch is not None:
-            signal.signal(sigwinch, saved_winch)
         with suppress(ConnectionClosed, OSError, WebSocketException):
             ws.close()
     if exit_code is None:
