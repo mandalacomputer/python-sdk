@@ -124,7 +124,7 @@ its live desktop, so putting a screen on your own page costs no extra call:
 ```python
 c = client.computers.get(computer_id)
 c.vnc.embed_url  # watch-only, drop straight into an <iframe>
-c.vnc.url  # full control: keyboard, pointer, clipboard
+c.vnc.url  # full control: keyboard and pointer — not the clipboard
 c.vnc.view_url  # watch only — the platform drops input on this socket
 ```
 
@@ -132,6 +132,19 @@ Two credentials, because they are not the same permission. `view_token` cannot
 type even from a patched client; `token` is root-equivalent on that machine.
 Neither is your API key — which is every computer on the account, forever, and
 must never reach a browser. Both end when the computer restarts.
+
+The clipboard does not cross that socket, whatever a noVNC client offers on it:
+QEMU carries cut text only through a vdagent channel these guests are not started
+with, so a paste arrives and is dropped without an error. Move text with `exec`
+and `desktop=True` — and give the write a process that outlives the command,
+because an X selection belongs to a live one:
+
+```python
+import shlex
+
+got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
+c.exec(f"printf %s {shlex.quote(text)} | setsid xclip -selection clipboard &", desktop=True)
+```
 
 `vnc` is `None` on a computer that came from `list()`. That is deliberate on the
 platform's side: a desktop credential in every list response is a credential in
