@@ -487,6 +487,15 @@ def test_schedule_is_the_window_only(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_an_empty_schedule_does_not_cache_as_a_window(client: mc.Client) -> None:
+    """GET {} is "no schedule"; snapshot_schedule is None, not {}."""
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
+    c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
+    assert c.schedule() == {}
+    assert c.snapshot_schedule is None
+
+
+@respx.mock
 def test_scheduled_snapshots_are_distinguishable(client: mc.Client) -> None:
     """`auto` is what makes snapshot times usable as backup history.
 
@@ -1203,6 +1212,7 @@ def test_a_computer_with_neither_says_so_rather_than_inventing_one(client: mc.Cl
     # None, not an empty mapping: "no schedule" and "a schedule that is off"
     # are different answers, and set_schedule(enabled=False) is the second.
     assert c.snapshot_schedule is None
+    assert mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {}}).snapshot_schedule is None
 
 
 @respx.mock
