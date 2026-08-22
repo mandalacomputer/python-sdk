@@ -388,8 +388,7 @@ def exec_body(
     """
     body: dict[str, Any] = {"command": command}
     if not background:
-        if timeout <= 0:
-            raise ValueError("timeout must be positive for a foreground exec")
+        _require_positive_seconds(timeout, "timeout must be positive for a foreground exec")
         body["timeout_s"] = timeout
     if desktop:
         body["session"] = "desktop"
@@ -533,7 +532,10 @@ def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
     The platform requires this to be the only field in the PATCH, which is why
     it has a method of its own rather than a keyword on ``rename``.
     """
-    if isinstance(minutes, bool):
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, type(None))):
+        # Floats are refused rather than rounded, and that also shuts the NaN
+        # door: `nan < 0` is False, so a NaN would otherwise sail past the
+        # negative check and onto the wire as an idle window.
         raise TypeError(
             f"idle_suspend_min must be an integer minute count or None, not {minutes!r}"
         )
@@ -693,16 +695,20 @@ def key_body(keys: tuple[str, ...]) -> dict[str, Any]:
     return {"action": "key", "keys": list(keys)}
 
 
-def _require_positive_seconds(seconds: float) -> None:
+def _require_positive_seconds(seconds: float, message: str = "seconds must be positive") -> None:
     # NaN fails every ordered comparison, so `seconds <= 0` alone would let it
-    # through and become an HTTP timeout of nan + slack.
+    # through and become an HTTP timeout of nan + slack. Infinity passes that
+    # comparison honestly and is worse: it serialises as a bare `Infinity` that
+    # is not JSON, and as an httpx timeout it means a hung guest hangs the
+    # caller with no deadline at all. Finiteness, not just sign, is what makes
+    # a duration sendable.
     if (
         isinstance(seconds, bool)
         or not isinstance(seconds, (int, float))
         or not math.isfinite(seconds)
         or seconds <= 0
     ):
-        raise ValueError("seconds must be positive")
+        raise ValueError(message)
 
 
 def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
