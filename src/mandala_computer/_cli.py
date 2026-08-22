@@ -215,6 +215,7 @@ def _interact(url: str) -> int:
     resize = object()
     stop_sender = object()
     outbound = _outbound_queue()
+    pending_resize = threading.Event()
     stdin_wakeup_read: int | None = None
     stdin_wakeup_write: int | None = None
 
@@ -222,8 +223,16 @@ def _interact(url: str) -> int:
         # A Python signal handler must not touch the socket, and websockets
         # forbids overlapping sends. The sender owns both the terminal query
         # and every outbound frame; this handler does nothing but enqueue.
-        with suppress(queue.Full):
+        try:
             outbound.put_nowait(resize)
+        except queue.Full:
+            # SIGWINCH is edge-triggered and nothing re-arms it, so a resize
+            # dropped here is wrong for the rest of the session rather than
+            # merely late: a window resized while a paste is draining would
+            # leave the remote pty at the old geometry for good. The sender
+            # reads the geometry itself, so one flag stands in for however many
+            # resizes the queue could not take.
+            pending_resize.set()
 
     def pump_stdin() -> None:
         assert stdin_wakeup_read is not None
@@ -245,6 +254,17 @@ def _interact(url: str) -> int:
                             return
 
     def pump_outbound() -> None:
+        def send(message: bytes | str) -> None:
+            with suppress(ConnectionClosed, OSError, WebSocketException):
+                ws.send(message)
+
+        def resize_frame() -> str:
+            # Cleared before the size is read, so a resize arriving during the
+            # read is flagged again rather than swallowed by the clear.
+            pending_resize.clear()
+            cols, rows = shutil.get_terminal_size()
+            return json.dumps({"type": "resize", "cols": cols, "rows": rows})
+
         # Keep draining until the stop sentinel even after the socket dies, or a
         # full queue cannot accept that sentinel and shutdown deadlocks. Do not
         # send once closed: a peer that already exited may have stopped reading,
@@ -256,11 +276,13 @@ def _interact(url: str) -> int:
             if closed.is_set():
                 continue
             if message is resize:
-                cols, rows = shutil.get_terminal_size()
-                message = json.dumps({"type": "resize", "cols": cols, "rows": rows})
+                message = resize_frame()
             assert isinstance(message, (bytes, str))
-            with suppress(ConnectionClosed, OSError, WebSocketException):
-                ws.send(message)
+            send(message)
+            # The flag is only ever set while the queue is full, so there is
+            # always a later iteration to pick it up here.
+            if pending_resize.is_set() and not closed.is_set():
+                send(resize_frame())
 
     saved_tty = None
     saved_winch: Callable[[int, FrameType | None], Any] | int | signal.Handlers | None = (
@@ -374,7 +396,12 @@ def _interact(url: str) -> int:
         # a close frame and must not overlap send(). Blocking put is safe now:
         # stdin has stopped and the sender is still draining.
         if winch_installed and sigwinch is not None:
-            signal.signal(sigwinch, saved_winch)
+            # getsignal() answers None for a handler that was installed from C
+            # rather than from Python — readline and ncurses both do that —
+            # and signal() refuses None. Raising here would strand the terminal
+            # in raw mode with every line below this one unrun.
+            with suppress(TypeError, ValueError, OSError):
+                signal.signal(sigwinch, saved_winch)
             winch_installed = False
         outbound.put(stop_sender)
         if sender_thread is not None:
