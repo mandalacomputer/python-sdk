@@ -8,6 +8,7 @@ platform's allowlist would only be checking one of them.
 
 from __future__ import annotations
 
+import math
 import shlex
 from collections.abc import Mapping
 from typing import Any
@@ -350,6 +351,8 @@ def rename_body(name: str) -> dict[str, Any]:
     caller cleared the field, and a round trip to be told so is a round trip
     that never had to happen.
     """
+    if name is None:
+        raise ValueError("name must not be empty")
     _require_optional_name(name)
     return {"name": name}
 
@@ -530,6 +533,10 @@ def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
     The platform requires this to be the only field in the PATCH, which is why
     it has a method of its own rather than a keyword on ``rename``.
     """
+    if isinstance(minutes, bool):
+        raise TypeError(
+            f"idle_suspend_min must be an integer minute count or None, not {minutes!r}"
+        )
     if minutes is not None and minutes < 0:
         raise ValueError(
             f"idle_suspend_min cannot be negative: {minutes!r}. Send 0 to stop this computer "
@@ -686,17 +693,27 @@ def key_body(keys: tuple[str, ...]) -> dict[str, Any]:
     return {"action": "key", "keys": list(keys)}
 
 
+def _require_positive_seconds(seconds: float) -> None:
+    # NaN fails every ordered comparison, so `seconds <= 0` alone would let it
+    # through and become an HTTP timeout of nan + slack.
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds)
+        or seconds <= 0
+    ):
+        raise ValueError("seconds must be positive")
+
+
 def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
     if not keys:
         raise ValueError("hold_key() needs at least one key")
-    if seconds <= 0:
-        raise ValueError("seconds must be positive")
+    _require_positive_seconds(seconds)
     return {"action": "hold_key", "keys": list(keys), "duration": seconds}
 
 
 def wait_body(seconds: float) -> dict[str, Any]:
-    if seconds <= 0:
-        raise ValueError("seconds must be positive")
+    _require_positive_seconds(seconds)
     return {"action": "wait", "duration": seconds}
 
 

@@ -734,6 +734,17 @@ async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None
 
 
 @respx.mock
+async def test_schedule_writes_through_to_the_cached_property(client: mc.AsyncClient) -> None:
+    """A GET used to leave snapshot_schedule stale against the just-fetched value."""
+    stored = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"}
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=stored))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.schedule() == stored
+    assert c.snapshot_schedule == stored
+    await client.aclose()
+
+
+@respx.mock
 async def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(
     client: mc.AsyncClient,
 ) -> None:

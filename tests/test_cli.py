@@ -815,3 +815,10 @@ def test_non_status_websocket_failures_are_cli_errors(monkeypatch: pytest.Monkey
     monkeypatch.setattr(ws_client, "connect", invalid_uri)
     with pytest.raises(SystemExit, match="could not open the terminal"):
         _cli._connect("not-a-websocket")
+
+
+def test_outbound_queue_is_bounded() -> None:
+    """A stalled websocket must not grow without bound on piped stdin."""
+    q = _cli._outbound_queue()
+    assert q.maxsize == _cli._OUTBOUND_QUEUE_MAX
+    assert q.maxsize > 0
