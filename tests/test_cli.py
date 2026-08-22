@@ -822,3 +822,64 @@ def test_outbound_queue_is_bounded() -> None:
     q = _cli._outbound_queue()
     assert q.maxsize == _cli._OUTBOUND_QUEUE_MAX
     assert q.maxsize > 0
+
+
+def test_queued_input_is_discarded_once_the_terminal_has_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drain to the sentinel after close, but do not send the leftover frames.
+
+    A peer that sent exit and then stopped reading would stall send() for the
+    whole backlog; skipping those writes is what makes join() return.
+    """
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    first_send = threading.Event()
+    release_send = threading.Event()
+    queued = threading.Event()
+    sent: list[object] = []
+    outbound = _cli._outbound_queue()
+    original_put = outbound.put
+
+    def put(item: object, block: bool = True, timeout: float | None = None) -> None:
+        if not isinstance(item, (bytes, str)):
+            release_send.set()
+        original_put(item, block=block, timeout=timeout)
+        if outbound.qsize() >= 2:
+            queued.set()
+
+    outbound.put = put  # type: ignore[method-assign]
+
+    class FakeConnection:
+        def recv(self) -> str:
+            assert first_send.wait(1)
+            assert queued.wait(1)
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            if not release_send.is_set():
+                first_send.set()
+                assert release_send.wait(1)
+            sent.append(message)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_outbound_queue", lambda: outbound)
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    reads = iter((b"one", b"two", b"three", b""))
+    monkeypatch.setattr(_cli.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(
+        _cli.select, "select", lambda readers, writers, errors: ([readers[0]], [], [])
+    )
+
+    assert _cli._interact("wss://terminal.test") == 0
+    assert sent == [b"one"]
