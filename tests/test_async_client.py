@@ -745,6 +745,16 @@ async def test_schedule_writes_through_to_the_cached_property(client: mc.AsyncCl
 
 
 @respx.mock
+async def test_an_empty_schedule_does_not_cache_as_a_window(client: mc.AsyncClient) -> None:
+    """GET {} is "no schedule"; snapshot_schedule is None, not {}."""
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
+    c = mc.AsyncComputer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
+    assert await c.schedule() == {}
+    assert c.snapshot_schedule is None
+    await client.aclose()
+
+
+@respx.mock
 async def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(
     client: mc.AsyncClient,
 ) -> None:

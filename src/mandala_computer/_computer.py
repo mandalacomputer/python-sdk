@@ -544,7 +544,9 @@ class ComputerFields:
         :meth:`Computer.set_schedule`.
         """
         value = self._data.get("snapshot_schedule")
-        return dict(value) if isinstance(value, Mapping) else None
+        if not isinstance(value, Mapping) or not value:
+            return None
+        return dict(value)
 
     @property
     def unreachable(self) -> bool:
@@ -1513,7 +1515,7 @@ class Computer(ComputerFields):
     def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
         stored = dict(self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
-        self._data["snapshot_schedule"] = stored
+        self._data["snapshot_schedule"] = stored or None
         return stored
 
     def set_schedule(

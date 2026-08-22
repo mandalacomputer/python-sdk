@@ -246,11 +246,15 @@ def _interact(url: str) -> int:
 
     def pump_outbound() -> None:
         # Keep draining until the stop sentinel even after the socket dies, or a
-        # full queue cannot accept that sentinel and shutdown deadlocks.
+        # full queue cannot accept that sentinel and shutdown deadlocks. Do not
+        # send once closed: a peer that already exited may have stopped reading,
+        # and flushing the backlog would delay or hang join().
         while True:
             message = outbound.get()
             if message is stop_sender:
                 return
+            if closed.is_set():
+                continue
             if message is resize:
                 cols, rows = shutil.get_terminal_size()
                 message = json.dumps({"type": "resize", "cols": cols, "rows": rows})
