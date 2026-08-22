@@ -49,6 +49,7 @@ from ._models import (
     VncConnect,
     Window,
     WindowResult,
+    _num,
 )
 
 __all__ = ["BackgroundCommand", "Computer"]
@@ -231,7 +232,15 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
     """
     if not res.get("known"):
         return None
-    return int(res.get("x", 0)), int(res.get("y", 0))
+    x, y = res.get("x"), res.get("y")
+    # known=true with a missing or unusable coordinate is the same as unknown:
+    # coercing null to zero would report the corner of the screen.
+    if x is None or y is None:
+        return None
+    try:
+        return int(x), int(y)
+    except (TypeError, ValueError):
+        return None
 
 
 def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
@@ -251,6 +260,9 @@ def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
     deleted = data.get("snapshots_deleted")
     if deleted is None:
         return None
+    # bool is an int subclass, so int(True) == 1 would report one snapshot gone.
+    if isinstance(deleted, bool):
+        raise MandalaError("DELETE computer answered with an invalid snapshots_deleted count")
     try:
         return int(deleted)
     except (TypeError, ValueError) as exc:
@@ -438,15 +450,15 @@ class ComputerFields:
 
     @property
     def cpu(self) -> int:
-        return int(self._data.get("cpu", 0))
+        return _num(self._data.get("cpu"))
 
     @property
     def ram_mb(self) -> int:
-        return int(self._data.get("ram_mb", 0))
+        return _num(self._data.get("ram_mb"))
 
     @property
     def disk_gb(self) -> int:
-        return int(self._data.get("disk_gb", 0))
+        return _num(self._data.get("disk_gb"))
 
     @property
     def resolution(self) -> str:
@@ -501,7 +513,15 @@ class ComputerFields:
         it does not own. Set it with :meth:`Computer.set_idle_suspend`.
         """
         value = self._data.get("idle_suspend_min")
-        return None if value is None else int(value)
+        if value is None:
+            return None
+        # 0 is a real setting ("never suspend"); unusable wire must not become 0.
+        if isinstance(value, bool):
+            raise MandalaError("computer answered with an invalid idle_suspend_min")
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise MandalaError("computer answered with an invalid idle_suspend_min") from exc
 
     @property
     def workspace_id(self) -> str:
@@ -1492,7 +1512,9 @@ class Computer(ComputerFields):
 
     def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
-        return self._t.json_object("GET", _api.computer_action(self.id, "schedule"))
+        stored = dict(self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
+        self._data["snapshot_schedule"] = stored
+        return stored
 
     def set_schedule(
         self,

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from operator import index as integer_index
 from typing import Any, SupportsIndex, TypeVar, overload
 
+from ._exceptions import MandalaError
+
 __all__ = [
     "ExecResult",
     "ExecStatus",
@@ -50,7 +52,10 @@ def _exit_code(value: Any) -> int | None:
         return None
     if isinstance(value, bool):
         raise TypeError("exit_code must be an integer or null, not a boolean")
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise MandalaError("exec answered with an invalid exit_code") from exc
 
 
 class Listing(list[T]):

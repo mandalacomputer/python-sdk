@@ -922,7 +922,9 @@ class AsyncComputer(ComputerFields):
 
     async def schedule(self) -> Mapping[str, Any]:
         """The automatic daily snapshot schedule."""
-        return await self._t.json_object("GET", _api.computer_action(self.id, "schedule"))
+        stored = dict(await self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
+        self._data["snapshot_schedule"] = stored
+        return stored
 
     async def set_schedule(
         self,
