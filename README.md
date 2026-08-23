@@ -754,6 +754,13 @@ client.usage.read(
 )
 ```
 
+One window at a time, and at most 62 days of it: every hypervisor replays its
+ledger a day at a time to answer, so a longer span is refused rather than quietly
+shortened. Records reach back 399 days, so an older period is read by naming both
+bounds rather than by widening one. And send `since` **with** `until` when the
+period has closed — `until` on its own is measured from the current period's
+start, which is after it.
+
 `since` and `until` are sent as `from` and `to`; the other spelling exists
 because `from` is a Python keyword. Both take an **aware** `datetime` or an RFC
 3339 string carrying a zone — `"2026-08-01T00:00:00Z"`, not
