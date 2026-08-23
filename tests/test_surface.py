@@ -33,6 +33,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -82,6 +83,10 @@ ALLOWED = {
     ("PUT", "computers/:id/files"),
     ("GET", "computers/:id/files"),
     ("POST", "computers/:id/agent"),
+    # What the account has used. Account-scoped like `moves`, and for a related
+    # reason: the figures include computers that have since been deleted, which
+    # is precisely the line an unexplained invoice is about.
+    ("GET", "usage"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -216,6 +221,10 @@ PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/schedule": set(),
     "PUT computers/:id/schedule": {"body:enabled", "body:hour", "body:minute", "body:tz"},
     "DELETE computers/:id/schedule": set(),
+    # Both bounds, and both optional: with neither, the platform answers over the
+    # account's current billing period. Sent as `from`/`to` — the SDK spells them
+    # `since`/`until` because `from` is a keyword.
+    "GET usage": {"query:from", "query:to"},
 }
 
 # Parameters the platform documents that this SDK deliberately does not send.
@@ -261,6 +270,19 @@ SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", 
 HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
 WINDOW = {"id": "0x2600003", "title": "T", "class": "Firefox"}
 EXEC_STATUS = {"pid": 4242, "running": False, "exited": True, "exit_code": 0}
+USAGE = {
+    "period": {
+        "start": "2026-08-04T00:00:00Z",
+        "end": "2026-09-04T00:00:00Z",
+        "source": "subscription",
+    },
+    "from": "2026-08-04T00:00:00Z",
+    "to": "2026-08-22T12:00:00Z",
+    "usage": {"run_hours": 1.5, "vcpu_hours": 3, "computers": []},
+    "degraded": False,
+    "unmetered": False,
+    "reported_through": None,
+}
 # One agent run, over in a frame. The route answers a stream whether or not
 # `stream` was set — a non-streaming run is the same body without the framing —
 # so the handler below serves this to both, and `agent_once` reads it as JSON.
@@ -340,6 +362,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         if not get:
             return httpx.Response(200, json=SNAPSHOT)
         return httpx.Response(200, json=HOLDINGS if "/computers/" in path else [SNAPSHOT])
+    if path.endswith("/usage"):
+        return httpx.Response(200, json=USAGE)
     if path.endswith("/computers"):
         return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
     return httpx.Response(200, json=COMPUTER)
@@ -444,6 +468,10 @@ def exercise_everything(client: mc.Client) -> None:
     # `move` on the handle is the mouse pointer — see Computer.relocate.
     c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
     client.moves.list()
+    # Both bounds, because a call that names neither cannot show the parameter
+    # sweep that this SDK can send either.
+    client.usage.read()
+    client.usage.read(since=datetime(2026, 8, 1, tzinfo=timezone.utc), until="2026-08-22T00:00:00Z")
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
     c.read_file("/home/user/out.txt")
@@ -534,6 +562,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.resize(disk_gb=64)
     await c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
     await client.moves.list()
+    await client.usage.read()
+    await client.usage.read(
+        since=datetime(2026, 8, 1, tzinfo=timezone.utc), until="2026-08-22T00:00:00Z"
+    )
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
     await c.read_file("/home/user/out.txt")

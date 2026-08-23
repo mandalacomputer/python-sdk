@@ -15,6 +15,7 @@ from typing import Any, SupportsIndex, TypeVar, overload
 from ._exceptions import MandalaError
 
 __all__ = [
+    "ComputerUsage",
     "ExecResult",
     "ExecStatus",
     "FilePart",
@@ -23,6 +24,9 @@ __all__ = [
     "Snapshot",
     "SnapshotHoldings",
     "Template",
+    "UsagePeriod",
+    "UsageReport",
+    "UsageTotals",
     "VncConnect",
     "Window",
     "WindowResult",
@@ -39,6 +43,21 @@ def _num(value: Any) -> int:
     except (OverflowError, TypeError, ValueError):
         return 0
     return int(number) if math.isfinite(number) else 0
+
+
+def _real(value: Any) -> float:
+    """A fractional field off the wire, or zero when it is unusable.
+
+    Its own helper rather than :func:`_num`, which truncates to ``int``. Every
+    usage figure is fractional — 0.75 hours is a real session, and 0.13
+    GB-months is a real charge — so truncating them would round most small
+    accounts' usage to nothing.
+    """
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
 
 
 def _text(value: Any) -> str:
@@ -476,6 +495,170 @@ class SnapshotHoldings:
             count=_num(d.get("count")),
             size_bytes=_num(d.get("size_bytes")),
             fingerprint=_text(d.get("fingerprint")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class UsagePeriod:
+    """The period an account is billed on."""
+
+    start: str
+    end: str
+    #: ``"subscription"`` when the boundary came from the plan's renewal date,
+    #: which is what an invoice is anchored to. ``"calendar-month"`` when there
+    #: is no live subscription to take it from, in which case the period is the
+    #: current UTC month. Worth reading before quoting a figure at anybody: the
+    #: two answer different questions about "this period".
+    source: str
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> UsagePeriod:
+        return cls(
+            start=_text(d.get("start")),
+            end=_text(d.get("end")),
+            source=_text(d.get("source")),
+        )
+
+
+@dataclass(frozen=True)
+class ComputerUsage:
+    """One computer's share of a window."""
+
+    id: str
+    name: str
+    run_hours: float
+    vcpu_hours: float
+    ram_gb_hours: float
+    #: This computer is no longer on the fleet. It ran during the window and was
+    #: deleted, which is why it is billed for and absent from
+    #: :meth:`~mandala_computer.Computers.list` — the line is not stale, the
+    #: machine is gone.
+    gone: bool
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> ComputerUsage:
+        return cls(
+            id=_text(d.get("id")),
+            name=_text(d.get("name")),
+            run_hours=_real(d.get("run_hours")),
+            vcpu_hours=_real(d.get("vcpu_hours")),
+            ram_gb_hours=_real(d.get("ram_gb_hours")),
+            gone=bool(d.get("gone", False)),
+        )
+
+
+@dataclass(frozen=True)
+class UsageTotals:
+    """What an account used, with the per-computer breakdown behind it.
+
+    The two storage figures stay separate because the remedies are: a computer's
+    disk is provisioned at create and released at delete, and snapshots come and
+    go under the retention policy the account sets. One summed number would be a
+    figure nobody could act on.
+    """
+
+    run_hours: float
+    vcpu_hours: float
+    ram_gb_hours: float
+    snapshot_gb_hours: float
+    snapshot_gb_months: float
+    disk_gb_hours: float
+    disk_gb_months: float
+    #: The breakdown, which is what makes a total checkable.
+    #:
+    #: EMPTY on a workspace-scoped API key, and empty rather than ``None`` so
+    #: that iterating it never needs a check first. Usage is metered and billed
+    #: per ACCOUNT, so these lines cover the whole account and would name
+    #: computers outside such a key's scope; the platform withholds them and
+    #: sends the account-wide totals either way.
+    #: :attr:`UsageReport.breakdown` is how to tell "no computers ran" from
+    #: "this key may not see which did".
+    computers: tuple[ComputerUsage, ...]
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> UsageTotals:
+        rows = d.get("computers")
+        return cls(
+            run_hours=_real(d.get("run_hours")),
+            vcpu_hours=_real(d.get("vcpu_hours")),
+            ram_gb_hours=_real(d.get("ram_gb_hours")),
+            snapshot_gb_hours=_real(d.get("snapshot_gb_hours")),
+            snapshot_gb_months=_real(d.get("snapshot_gb_months")),
+            disk_gb_hours=_real(d.get("disk_gb_hours")),
+            disk_gb_months=_real(d.get("disk_gb_months")),
+            computers=tuple(
+                ComputerUsage.from_api(c)
+                for c in (rows if isinstance(rows, list) else [])
+                if isinstance(c, Mapping)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class UsageReport:
+    """What :meth:`~mandala_computer.Usage.read` answers.
+
+    READ :attr:`degraded` AND :attr:`unmetered` BEFORE USING THE NUMBERS. Every
+    figure is a sum across the hypervisors this account's computers are on, so a
+    host that did not contribute does not leave a hole anybody could notice — it
+    leaves a total that is quietly too small. The platform answers 200 with these
+    two flags rather than refusing, because a caveat in the same object cannot be
+    missed the way a missing row can, and because one of the two never clears by
+    retrying.
+    """
+
+    #: The period this ACCOUNT is billed on — not necessarily the window that was
+    #: measured. :attr:`from_` and :attr:`to` are that, and they differ whenever
+    #: a window was named.
+    period: UsagePeriod
+    #: The start of the measured window. ``from_`` because ``from`` is a keyword.
+    from_: str
+    #: The end of it, and worth reading rather than assuming: a ``until`` in the
+    #: future is answered as now, because the future holds no usage.
+    to: str
+    usage: UsageTotals
+    #: A hypervisor could not be reached, so every figure may be too small. This
+    #: one clears on its own — retry when the host is back.
+    degraded: bool
+    #: The same shortfall from the other cause: a hypervisor is up and running a
+    #: daemon older than the meter, so it has no hours to report. Waiting does
+    #: not fix this one, which is why it is a separate flag rather than the same.
+    unmetered: bool
+    #: Whether :attr:`UsageTotals.computers` is the real breakdown rather than a
+    #: withheld one — False on a workspace-scoped key. Read off the payload's
+    #: shape (the platform omits the field rather than sending an empty list), so
+    #: an empty breakdown can be told from an invisible one.
+    breakdown: bool
+    #: The last UTC day (``YYYY-MM-DD``) whose usage has settled for billing — a
+    #: contiguous prefix, so a day still being held back stops the count where it
+    #: is. ``None`` when none of the window has settled yet.
+    #:
+    #: NOT a caveat on the totals, which are live from the ledger and true
+    #: through :attr:`to`. It answers the other question, and it is the one to
+    #: check before comparing these numbers against an invoice.
+    reported_through: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> UsageReport:
+        period = d.get("period")
+        totals = d.get("usage")
+        totals = totals if isinstance(totals, Mapping) else {}
+        reported = d.get("reported_through")
+        return cls(
+            period=UsagePeriod.from_api(period if isinstance(period, Mapping) else {}),
+            from_=_text(d.get("from")),
+            to=_text(d.get("to")),
+            usage=UsageTotals.from_api(totals),
+            degraded=bool(d.get("degraded", False)),
+            unmetered=bool(d.get("unmetered", False)),
+            # Presence, not emptiness. The platform drops the key for a scoped
+            # credential and sends ``[]`` for an account that ran nothing, and
+            # those are different answers: one is "you may not see this", the
+            # other is "there was nothing to see".
+            breakdown=isinstance(totals.get("computers"), list),
+            reported_through=None if reported is None else _text(reported),
             raw=dict(d),
         )
 
