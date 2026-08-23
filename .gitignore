@@ -13,4 +13,13 @@ htmlcov/
 .env
 .DS_Store
 
-.claude/
+# Everything under .claude/ is local — settings.local.json is per-machine — with
+# one exception. linear-sync.json is repo configuration, not preference: it is
+# what says this repo belongs to the OPL team and the Mandala Computer project,
+# and both sibling SDKs carry theirs.
+#
+# `.claude/*` rather than `.claude/`, and the difference matters: git will not
+# re-include a file whose parent DIRECTORY is excluded, so a negation under a
+# bare `.claude/` does nothing at all and the file below stays invisible.
+.claude/*
+!.claude/linear-sync.json
