@@ -56,6 +56,7 @@ from ._models import (
     ExecStatus,
     FilePart,
     Listing,
+    Move,
     Snapshot,
     SnapshotHoldings,
     Window,
@@ -206,6 +207,101 @@ class AsyncComputer(ComputerFields):
             )
         )
         return self
+
+    async def relocate(
+        self, *, ram_mb: int, cpu: int | None = None, disk_gb: int | None = None
+    ) -> Move:
+        """Move this computer to another host in its region, so a resize its
+        current host cannot run becomes possible.
+
+        THE SECOND HALF OF A REFUSED RESIZE, and only ever that. :meth:`resize`
+        raises :class:`~mandala_computer.MoveRequiredError` when the size asked
+        for is more RAM than the host this computer is on can run;
+        ``move_possible`` on that exception says whether anywhere in the region
+        can run it, and this is how you agree to go there. Calling it without
+        having been refused first is an operation nobody needed: a size that fits
+        where the computer already is is answered with a
+        :class:`~mandala_computer.ConflictError` rather than a pointless
+        multi-gigabyte copy.
+
+        A separate method rather than a keyword on :meth:`resize`, and the
+        platform draws the same line: this copies the computer's disk to
+        different hardware, and a resize that relocated a machine without being
+        asked is exactly what neither side will do.
+
+        THE COMPUTER MUST BE STOPPED. Suspended is not stopped here, unlike a
+        resize — a saved desktop only loads on the host that wrote it, so it
+        cannot travel. Resume and stop it, or discard the session, first.
+
+        ANSWERS BEFORE IT FINISHES. The returned :class:`~mandala_computer.Move`
+        is the operation as it stood the moment it was accepted, with ``live``
+        True and the disk copy running behind it; :meth:`wait_for_move` is the
+        other half. One move runs per account at a time.
+
+        Everything is decided again at the moment this runs — the plan, the state
+        of the computer, and which host it goes to — so it can still refuse even
+        though the resize offered it.
+
+        Not called ``move``, which on this class is the mouse pointer and has
+        been since before there was anything else to move. The platform calls the
+        operation a move and the record it returns is a
+        :class:`~mandala_computer.Move`; the verb here is ``relocate`` because a
+        ``move(x, y)`` that sometimes migrated a virtual machine between hosts
+        would be the worst overload in this file. The TypeScript SDK made the
+        same choice for the same reason.
+        """
+        return Move.from_api(
+            await self._t.json_object(
+                "POST",
+                _api.computer_action(self.id, "move"),
+                json=_api.move_body(ram_mb=ram_mb, cpu=cpu, disk_gb=disk_gb),
+            )
+        )
+
+    async def wait_for_move(self, timeout: float = 900.0, poll: float = 3.0) -> Move:
+        """Block until this computer's move stops running, and answer what happened.
+
+        Polls the account's moves and picks out this computer's. It does NOT
+        raise for a move that ended badly, and that is the decision worth
+        knowing: the three failures are three different situations with three
+        different remedies — see :attr:`~mandala_computer.Move.state` — and
+        collapsing them into one exception is exactly how ``moved``, where the
+        computer HAS changed hardware, gets read as "nothing happened". Read
+        ``state``.
+
+        Raises :class:`~mandala_computer.TimeoutError` if the move is still going
+        when ``timeout`` runs out. The move is not stopped by that; only the
+        waiting is, and there is no calling back a disk crossing between two
+        hosts in any case.
+
+        Raises :class:`~mandala_computer.MandalaError` if the move stops being
+        listed, which happens when the computer is deleted — the platform reaps
+        the row along with it.
+
+        The default timeout is generous because the work is: a small overlay
+        crosses in seconds and a full Windows disk takes minutes, plus minutes
+        more when the target has to be sent the image this computer was built
+        from first.
+        """
+        deadline = time.monotonic() + timeout
+        last: Move | None = None
+        while True:
+            mine = self._my_move(await self._t.json_object("GET", _api.MOVES))
+            if mine is None:
+                raise MandalaError(
+                    f"{self.id} has no move any more; the platform reaps one "
+                    "when its computer is deleted"
+                )
+            last = mine
+            if not mine.live:
+                return mine
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self.id} was still moving after {timeout:g}s (state {last.state}; "
+                    "the move has not stopped, only this wait has)"
+                )
+            await asyncio.sleep(min(poll, remaining))
 
     async def set_idle_suspend(self, minutes: int | None) -> AsyncComputer:
         """Set how long this computer may go untouched before it is suspended.

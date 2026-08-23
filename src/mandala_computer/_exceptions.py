@@ -282,9 +282,9 @@ class RateLimitError(APIError):
 class ConflictError(APIError):
     """The request was fine; the moment was not (409).
 
-    Every one of these clears itself without anybody doing anything, so the
-    answer is to wait and try again rather than to change the request. It means
-    something is in flight that this operation cannot run alongside:
+    Nearly every one of these clears itself without anybody doing anything, so
+    the answer is to wait and try again rather than to change the request. It
+    means something is in flight that this operation cannot run alongside:
 
     - the computer's disk is still being copied from a snapshot or another
       computer (see :meth:`Computer.wait_until_built`)
@@ -307,7 +307,58 @@ class ConflictError(APIError):
     that stays silent past its boot window stops being a conflict and becomes a
     502 :class:`APIError`, so a retry loop on this exception terminates rather
     than being told "still booting" forever.
+
+    NEARLY every one, and the exception is :class:`MoveRequiredError`. Whether a
+    409 clears is a property of the body rather than of the status: a refusal
+    that clears describes a passing state, and one that does not describes a
+    decision about the request. This docstring said "every one" of them, which
+    made a resize past what a host can run something to retry forever.
     """
+
+
+class MoveRequiredError(ConflictError):
+    """This resize needs the computer moved to another host first (409).
+
+    Growing ``ram_mb`` past what the computer's current host can run is refused
+    with an OFFER rather than an ending: the platform puts a ``move`` object on
+    the body, because another host in the same region may be able to run that
+    size and :meth:`~mandala_computer.Computer.relocate` is how you agree to go
+    there.
+
+    :attr:`move_possible` is the whole branch, read off the body here so that no
+    caller has to: ``move.required`` is true either way, and it is the second
+    field that says whether there is anything to do.
+
+    - ``True`` — somewhere in the region can run it.
+      :meth:`~mandala_computer.Computer.relocate` with the same sizing arguments
+      moves the computer and applies the size on arrival. It copies the disk to
+      different hardware, which is why it is a separate call rather than
+      something a resize does to you quietly, and the computer has to be
+      stopped.
+    - ``False`` — nothing in the region can run that size at all. There is
+      nowhere to move to; ask for less.
+
+    NOT worth retrying either way, which is what earns it a class: it is a
+    :class:`ConflictError` by status and the opposite of one by nature. The host
+    cannot run that size and will not grow, so the same request answers the same
+    way for as long as the computer is where it is.
+
+    A subclass rather than a sibling, so that ``except ConflictError`` written
+    before this existed still catches it. What changes is only what a caller
+    should do about it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        body: object = None,
+        move_possible: bool,
+    ) -> None:
+        super().__init__(message, status=status, body=body)
+        #: Whether a host in this region could run the size that was asked for.
+        self.move_possible = move_possible
 
 
 class UnavailableError(APIError):
