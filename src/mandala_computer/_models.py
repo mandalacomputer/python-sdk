@@ -500,6 +500,48 @@ class SnapshotHoldings:
 
 
 @dataclass(frozen=True)
+class Retention:
+    """How long automatic snapshots are kept, as the plan grants it.
+
+    From ``GET /retention``, and the other half of
+    :meth:`~mandala_computer.Computer.set_schedule` — which decides when
+    snapshots are TAKEN and deliberately has no field for how long they survive.
+
+    A grandfather-father-son window rather than an age. What survives is the
+    newest automatic snapshot in each of the last :attr:`daily` days *that have
+    one*, the last :attr:`weekly` such ISO weeks and the last :attr:`monthly`
+    such calendar months. Counting periods that contain a capture rather than
+    periods on the calendar is what stops a computer switched off for a month
+    losing the history it had: nothing ages out for the passage of time alone.
+
+    Boundaries are cut in UTC, whatever timezone the schedule runs in. A capture
+    at 23:30 on a Sunday in ``America/Chicago`` is Monday in UTC and counts
+    toward the following ISO week.
+
+    A zero turns that tier off. All three zero is what an account with no active
+    subscription reads.
+
+    Only snapshots with :attr:`Snapshot.auto` are ever touched. One you took by
+    hand is yours until you delete it, whatever this says — which is also how
+    you keep something past the window.
+    """
+
+    daily: int
+    weekly: int
+    monthly: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> Retention:
+        return cls(
+            daily=_num(d.get("daily")),
+            weekly=_num(d.get("weekly")),
+            monthly=_num(d.get("monthly")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
 class UsagePeriod:
     """The period an account is billed on."""
 
