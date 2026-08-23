@@ -44,6 +44,7 @@ from ._async_resources import (
     AsyncSizes,
     AsyncSnapshots,
     AsyncTemplates,
+    AsyncUsage,
 )
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
@@ -67,6 +68,7 @@ from ._exceptions import (
     UnavailableError,
 )
 from ._models import (
+    ComputerUsage,
     ExecResult,
     ExecStatus,
     FilePart,
@@ -76,11 +78,14 @@ from ._models import (
     Snapshot,
     SnapshotHoldings,
     Template,
+    UsagePeriod,
+    UsageReport,
+    UsageTotals,
     VncConnect,
     Window,
     WindowResult,
 )
-from ._resources import Computers, Moves, Sizes, Snapshots, Templates
+from ._resources import Computers, Moves, Sizes, Snapshots, Templates, Usage
 
 __version__ = "0.1.0"
 
@@ -104,6 +109,7 @@ __all__ = [
     "BackgroundCommand",
     "Client",
     "Computer",
+    "ComputerUsage",
     "ConflictError",
     "ExecResult",
     "ExecStatus",
@@ -128,6 +134,9 @@ __all__ = [
     "Template",
     "TimeoutError",
     "UnavailableError",
+    "UsagePeriod",
+    "UsageReport",
+    "UsageTotals",
     "VncConnect",
     "Window",
     "WindowResult",
@@ -156,6 +165,7 @@ class Client:
         self.snapshots = Snapshots(self._t)
         self.templates = Templates(self._t)
         self.sizes = Sizes(self._t)
+        self.usage = Usage(self._t)
 
     @property
     def base_url(self) -> str:
@@ -196,6 +206,7 @@ class AsyncClient:
         self.snapshots = AsyncSnapshots(self._t)
         self.templates = AsyncTemplates(self._t)
         self.sizes = AsyncSizes(self._t)
+        self.usage = AsyncUsage(self._t)
 
     @property
     def base_url(self) -> str:

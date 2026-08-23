@@ -55,6 +55,7 @@ PAIRS = [
     (_resources.Snapshots, _async_resources.AsyncSnapshots),
     (_resources.Templates, _async_resources.AsyncTemplates),
     (_resources.Sizes, _async_resources.AsyncSizes),
+    (_resources.Usage, _async_resources.AsyncUsage),
 ]
 
 
