@@ -38,7 +38,13 @@ from ._agent import (
     AgentUsage,
 )
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
-from ._async_resources import AsyncComputers, AsyncSizes, AsyncSnapshots, AsyncTemplates
+from ._async_resources import (
+    AsyncComputers,
+    AsyncMoves,
+    AsyncSizes,
+    AsyncSnapshots,
+    AsyncTemplates,
+)
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
 from ._exceptions import (
@@ -48,6 +54,7 @@ from ._exceptions import (
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
+    MoveRequiredError,
     NotFoundError,
     OriginResponseError,
     OriginTLSError,
@@ -64,6 +71,7 @@ from ._models import (
     ExecStatus,
     FilePart,
     Listing,
+    Move,
     Size,
     Snapshot,
     SnapshotHoldings,
@@ -72,7 +80,7 @@ from ._models import (
     Window,
     WindowResult,
 )
-from ._resources import Computers, Sizes, Snapshots, Templates
+from ._resources import Computers, Moves, Sizes, Snapshots, Templates
 
 __version__ = "0.1.0"
 
@@ -104,6 +112,8 @@ __all__ = [
     "GatewayTimeoutError",
     "Listing",
     "MandalaError",
+    "Move",
+    "MoveRequiredError",
     "NotFoundError",
     "OriginResponseError",
     "OriginTLSError",
@@ -142,6 +152,7 @@ class Client:
     ) -> None:
         self._t = Transport(api_key, base_url=base_url, timeout=timeout, client=http_client)
         self.computers = Computers(self._t)
+        self.moves = Moves(self._t)
         self.snapshots = Snapshots(self._t)
         self.templates = Templates(self._t)
         self.sizes = Sizes(self._t)
@@ -181,6 +192,7 @@ class AsyncClient:
     ) -> None:
         self._t = AsyncTransport(api_key, base_url=base_url, timeout=timeout, client=http_client)
         self.computers = AsyncComputers(self._t)
+        self.moves = AsyncMoves(self._t)
         self.snapshots = AsyncSnapshots(self._t)
         self.templates = AsyncTemplates(self._t)
         self.sizes = AsyncSizes(self._t)

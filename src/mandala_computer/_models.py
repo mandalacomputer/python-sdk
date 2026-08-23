@@ -481,6 +481,71 @@ class SnapshotHoldings:
 
 
 @dataclass(frozen=True)
+class Move:
+    """A move in flight, or the outcome of one that has finished.
+
+    A resize past what a computer's host can run is refused with an offer (see
+    :class:`~mandala_computer.MoveRequiredError`);
+    :meth:`~mandala_computer.Computer.relocate` takes it up, and the platform
+    answers 202 with one of these while the disk copy runs behind it.
+    :meth:`~mandala_computer.Moves.list` is where it is read afterwards.
+
+    Two fields are absent because the platform does not send them: which host the
+    computer is leaving and which it is going to. Both are recorded on its side
+    for an operator; a tenant is told "another host in this region" and never
+    which machine.
+    """
+
+    computer_id: str
+    #: Where it has got to.
+    #:
+    #: ``staging``, ``moving`` and ``resizing`` are live. The four terminal
+    #: states are four different situations, which is why they are four words:
+    #:
+    #: - ``done`` — on the new host at the new size.
+    #: - ``moved`` — on the new host at its OLD size. The move landed and the
+    #:   resize did not, so the computer HAS changed hardware and an ordinary
+    #:   :meth:`~mandala_computer.Computer.resize` finishes the job where it now
+    #:   is. Reading this as "the move failed" sends you looking for a machine
+    #:   that has moved.
+    #: - ``failed`` — nothing happened. The computer is where it was, untouched.
+    #: - ``lost`` — we stopped watching. It may well have completed; read the
+    #:   computer.
+    state: str
+    #: A sentence about the state, for a person. Empty while nothing has gone wrong.
+    detail: str
+    #: Still running. The flag to poll on, rather than comparing :attr:`state`
+    #: against a list that will grow.
+    live: bool
+    #: Present only where the move is applying a new value for that dimension.
+    #: ``None`` means "not being changed" and never "changed to nothing" — which
+    #: is why these are optional rather than defaulting to 0 on the field this
+    #: whole operation exists to grow.
+    cpu: int | None = None
+    ram_mb: int | None = None
+    disk_gb: int | None = None
+    started_at: str = ""
+    #: ``None`` while :attr:`live`.
+    finished_at: str | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> Move:
+        return cls(
+            computer_id=_text(d.get("computer_id")),
+            state=_text(d.get("state")),
+            detail=_text(d.get("detail")),
+            live=bool(d.get("live")),
+            cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
+            ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
+            disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
+            started_at=_text(d.get("started_at")),
+            finished_at=_text(d["finished_at"]) if d.get("finished_at") is not None else None,
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
 class Window:
     """One window on the guest's desktop.
 
