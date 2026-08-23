@@ -124,7 +124,7 @@ its live desktop, so putting a screen on your own page costs no extra call:
 ```python
 c = client.computers.get(computer_id)
 c.vnc.embed_url  # watch-only, drop straight into an <iframe>
-c.vnc.url  # full control: keyboard, pointer, clipboard
+c.vnc.url  # full control: keyboard and pointer — not the clipboard
 c.vnc.view_url  # watch only — the platform drops input on this socket
 ```
 
@@ -132,6 +132,33 @@ Two credentials, because they are not the same permission. `view_token` cannot
 type even from a patched client; `token` is root-equivalent on that machine.
 Neither is your API key — which is every computer on the account, forever, and
 must never reach a browser. Both end when the computer restarts.
+
+The clipboard does not cross that socket, whatever a noVNC client offers on it:
+QEMU carries cut text only through a vdagent channel these guests are not started
+with, so a paste arrives and is dropped without an error. Move text with `exec`
+and `desktop=True`. Three things about the write are quiet when you get them
+wrong: the holder must outlive the command, because an X selection belongs to a
+live process; its output must be redirected, or the resident `xclip` holds the
+pipe the guest agent reads and the exec runs to its full timeout before
+answering; and the text goes over base64, whose alphabet has no quote in it, so
+an apostrophe in what you are pasting cannot end the shell word.
+
+Being granted the selection is also asynchronous, so a read straight after the
+write returns the *previous* clipboard — poll until it matches, and give up
+after a few seconds. Every poll is another billable exec, and the redirection
+above swallows xclip's own errors, so a guest without it never changes the
+selection at all.
+
+```python
+import base64
+
+got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
+b64 = base64.b64encode(text.encode()).decode()
+c.exec(
+    f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
+    desktop=True,
+)
+```
 
 `vnc` is `None` on a computer that came from `list()`. That is deliberate on the
 platform's side: a desktop credential in every list response is a credential in
