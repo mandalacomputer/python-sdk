@@ -87,6 +87,10 @@ ALLOWED = {
     # reason: the figures include computers that have since been deleted, which
     # is precisely the line an unexplained invoice is about.
     ("GET", "usage"),
+    # How long the automatic snapshots a schedule takes are kept. Account-scoped
+    # like `usage` and `moves`, and read-only on every surface: the plan owns
+    # retention.
+    ("GET", "retention"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -225,6 +229,7 @@ PARAMETERS: dict[str, set[str]] = {
     # account's current billing period. Sent as `from`/`to` — the SDK spells them
     # `since`/`until` because `from` is a keyword.
     "GET usage": {"query:from", "query:to"},
+    "GET retention": set(),
 }
 
 # Parameters the platform documents that this SDK deliberately does not send.
@@ -268,6 +273,7 @@ DOCUMENTED_HEADERS = {
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
 SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", "state": "durable"}
 HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
+RETENTION = {"daily": 7, "weekly": 4, "monthly": 12}
 WINDOW = {"id": "0x2600003", "title": "T", "class": "Firefox"}
 EXEC_STATUS = {"pid": 4242, "running": False, "exited": True, "exit_code": 0}
 USAGE = {
@@ -364,6 +370,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=HOLDINGS if "/computers/" in path else [SNAPSHOT])
     if path.endswith("/usage"):
         return httpx.Response(200, json=USAGE)
+    if path.endswith("/retention"):
+        return httpx.Response(200, json=RETENTION)
     if path.endswith("/computers"):
         return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
     return httpx.Response(200, json=COMPUTER)
@@ -496,6 +504,9 @@ def exercise_everything(client: mc.Client) -> None:
     client.snapshots.restore("snap-1")
     client.snapshots.clone("snap-1", name="from-snap")
     client.snapshots.delete("snap-1")
+    # The other half of the schedule: when they are taken is a computer's, how
+    # long they are kept is the account's.
+    client.snapshots.retention()
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -592,6 +603,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.snapshots.restore("snap-1")
     await client.snapshots.clone("snap-1", name="from-snap")
     await client.snapshots.delete("snap-1")
+    await client.snapshots.retention()
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 
@@ -769,12 +781,35 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
 
 
 def test_allowlist_excludes_the_daemons_internal_routes() -> None:
-    """The ops and plan-owned endpoints are not tenant API and never should be.
+    """The ops endpoints are not tenant API and never should be.
 
     The previous test proves the SDK stays inside ALLOWED; this proves ALLOWED
     itself stays honest, so widening it later is a deliberate act rather than a
-    quiet one. These routes are not owner-scoped in the daemon.
+    quiet one.
+
+    ``retention`` WAS in this set and came out of it deliberately (OPL-3767,
+    OPL-3783), which is the act this test exists to force. Two things had to be
+    true first. The platform put ``GET retention`` on its public allowlist — so
+    the READ is tenant API now, answered from the plan catalogue by the control
+    plane rather than forwarded to a daemon at all. And the reason recorded here
+    for withholding it was wrong besides: ``PUT /retention`` *is* owner-scoped,
+    it sets the calling tenant's own policy. What keeps the WRITE off every
+    surface is that the plan owns retention, so a tenant setting its own would
+    be granting itself history it has not paid for — a different argument, and
+    one a head-segment check cannot enforce, since it cannot tell a GET from a
+    PUT. The test below is what holds that line.
     """
-    internal = {"audit", "host", "fleet", "retention"}
+    internal = {"audit", "host", "fleet"}
     reachable = {pattern.split("/")[0] for _, pattern in ALLOWED}
     assert not (reachable & internal)
+
+
+def test_retention_is_reachable_only_to_read() -> None:
+    """What the head-segment check above can no longer say.
+
+    The plan owns the window, so a write to it is a tenant granting itself a
+    longer history than it pays for. The platform refuses one on both its
+    surfaces; this is the mirror of that refusal, so a PUT could not be added to
+    ALLOWED without deleting a test.
+    """
+    assert {method for method, pattern in ALLOWED if pattern == "retention"} == {"GET"}

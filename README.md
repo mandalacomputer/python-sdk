@@ -680,6 +680,26 @@ if last is None:
 `auto` also marks the only snapshots retention will age out — ones you take
 yourself are never removed automatically.
 
+#### How long they are kept
+
+A schedule says when snapshots are taken and not how long they survive. That is
+your plan's, account-wide, and read-only:
+
+```python
+r = client.snapshots.retention()
+print(f"keeps {r.daily} daily, {r.weekly} weekly, {r.monthly} monthly")
+```
+
+What survives is the newest automatic snapshot in each of the last `daily` days
+**that have one**, and likewise for ISO weeks and calendar months — periods that
+contain a capture, not periods on the calendar, so a computer switched off for a
+month still has the history it had. Boundaries are cut in UTC whatever timezone
+the schedule runs in. A zero turns that tier off.
+
+The window belongs to the account and is applied per computer: two computers on
+`7/4/12` keep up to twenty-three snapshots each, not twenty-three between them.
+Taking one by hand is how you keep something past it.
+
 #### Orphans
 
 Snapshots outlive the computers they came from, so an ordinary account's listing
