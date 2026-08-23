@@ -136,18 +136,23 @@ must never reach a browser. Both end when the computer restarts.
 The clipboard does not cross that socket, whatever a noVNC client offers on it:
 QEMU carries cut text only through a vdagent channel these guests are not started
 with, so a paste arrives and is dropped without an error. Move text with `exec`
-and `desktop=True`. A write needs two things, and both are quiet when missing:
-the holder must outlive the command, because an X selection belongs to a live
-process, and its output must be redirected, because an `xclip` left holding the
-pipe the guest agent reads keeps that pipe open and the exec then runs to its
-full timeout before answering.
+and `desktop=True`. Three things about the write are quiet when you get them
+wrong: the holder must outlive the command, because an X selection belongs to a
+live process; its output must be redirected, or the resident `xclip` holds the
+pipe the guest agent reads and the exec runs to its full timeout before
+answering; and the text goes over base64, whose alphabet has no quote in it, so
+an apostrophe in what you are pasting cannot end the shell word.
+
+Being granted the selection is also asynchronous, so a read straight after the
+write returns the *previous* clipboard — poll until it matches.
 
 ```python
-import shlex
+import base64
 
 got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
+b64 = base64.b64encode(text.encode()).decode()
 c.exec(
-    f"printf %s {shlex.quote(text)} | setsid xclip -selection clipboard >/dev/null 2>&1 &",
+    f"printf %s {b64} | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
     desktop=True,
 )
 ```

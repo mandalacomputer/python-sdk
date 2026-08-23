@@ -184,7 +184,10 @@ class VncConnect:
         the holder outlives the command — an X selection belongs to a live
         process — AND ``>/dev/null 2>&1``, without which the resident xclip
         holds the pipe the guest agent is reading and the exec runs to its full
-        timeout before answering.
+        timeout before answering. Send the text base64 rather than quoted, since
+        an apostrophe would otherwise end the shell word, and poll rather than
+        reading straight back: being granted a selection is asynchronous, so the
+        next read can still be the old one.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
         browser holding this one cannot type even from a patched client.
