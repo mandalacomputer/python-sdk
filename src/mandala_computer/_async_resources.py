@@ -10,10 +10,10 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Listing, Size, Snapshot, Template
+from ._models import Listing, Move, Size, Snapshot, Template
 from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
 
-__all__ = ["AsyncComputers", "AsyncSizes", "AsyncSnapshots", "AsyncTemplates"]
+__all__ = ["AsyncComputers", "AsyncMoves", "AsyncSizes", "AsyncSnapshots", "AsyncTemplates"]
 
 
 class AsyncComputers:
@@ -184,6 +184,42 @@ class AsyncTemplates:
     async def list(self) -> builtins.list[Template]:
         data = await self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
+
+
+class AsyncMoves:
+    """The moves on this account, live and recently finished.
+
+    Its own collection because ``GET /moves`` is its own route, account-scoped
+    rather than hanging off a computer — which is the platform's decision and the
+    right one: a move is a fact about a computer that is currently on one host
+    and about to be on another, and during the window that matters that is
+    exactly what nobody can say.
+    """
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self) -> builtins.list[Move]:
+        """Every move worth reading: the ones still running, and the ones that
+        finished within the last day and have not been dismissed.
+
+        Two things to get from a listing rather than a per-computer read. A move
+        you started is found by its ``computer_id`` —
+        :meth:`~mandala_computer.Computer.wait_for_move` does exactly that. And a
+        move you did NOT start is what the "another computer on this account is
+        being moved right now" refusal is about: one runs per account at a time,
+        and this is where you find out which and how far along.
+
+        A finished move stays here for a day so that an outcome is still readable
+        by somebody who went away while it ran. Read ``live``, not the row's
+        absence.
+
+        An API key issued against a workspace sees the moves of computers in that
+        workspace only.
+        """
+        data = await self._t.json_object("GET", _api.MOVES)
+        rows = data.get("moves")
+        return [Move.from_api(m) for m in rows] if isinstance(rows, list) else []
 
 
 class AsyncSizes:

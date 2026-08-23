@@ -57,6 +57,12 @@ ALLOWED = {
     ("POST", "computers/:id/suspend"),
     ("POST", "computers/:id/restart"),
     ("POST", "computers/:id/clone"),
+    # Taking up the offer a refused resize makes, and reading how it went.
+    # `moves` is a collection rather than `computers/:id/move`, which is the
+    # platform's decision: a per-computer read could not tell a computer with no
+    # move from an id that does not exist.
+    ("POST", "computers/:id/move"),
+    ("GET", "moves"),
     ("GET", "computers/:id/screenshot"),
     ("POST", "computers/:id/input"),
     ("POST", "computers/:id/exec"),
@@ -140,6 +146,11 @@ PARAMETERS: dict[str, set[str]] = {
     "POST computers/:id/suspend": set(),
     "POST computers/:id/restart": set(),
     "POST computers/:id/clone": {"body:name"},
+    # The sizing group and nothing else. The platform reads only these three off
+    # a move body and ignores the rest, so a name sent here would be dropped in
+    # silence — which is why relocate() has no room for one.
+    "POST computers/:id/move": {"body:cpu", "body:ram_mb", "body:disk_gb"},
+    "GET moves": set(),
     # Computer use.
     "GET computers/:id/screenshot": {"query:w", "query:fresh"},
     "POST computers/:id/input": {
@@ -428,6 +439,11 @@ def exercise_everything(client: mc.Client) -> None:
     c.window_action("0x2600003", "resize", width=800, height=600)
     c.resize(cpu=4, ram_mb=8192)
     c.resize(disk_gb=64)
+    # All three sizing fields in one call: the platform reads exactly these off a
+    # move body, and the parameter sweep is what proves the SDK sends them.
+    # `move` on the handle is the mouse pointer — see Computer.relocate.
+    c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
+    client.moves.list()
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
     c.read_file("/home/user/out.txt")
@@ -516,6 +532,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.window_action("0x2600003", "resize", width=800, height=600)
     await c.resize(cpu=4, ram_mb=8192)
     await c.resize(disk_gb=64)
+    await c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
+    await client.moves.list()
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
     await c.read_file("/home/user/out.txt")

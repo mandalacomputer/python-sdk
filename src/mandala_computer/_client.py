@@ -23,6 +23,7 @@ from ._exceptions import (
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
+    MoveRequiredError,
     NotFoundError,
     OriginResponseError,
     OriginTLSError,
@@ -580,6 +581,19 @@ class _BaseTransport:
             # specific true thing than anything written here, and replacing it
             # would be this client overwriting the platform with a guess.
             message = substituted(GATEWAY_TIMEOUT_MESSAGE)
+        if cls is ConflictError:
+            # The 409 that is an offer, told apart by its body — see
+            # MoveRequiredError. Never given a substituted message: the
+            # platform's sentence here is the whole account of what will not fit
+            # and what moving costs, written for whoever has to agree to it.
+            offer = _move_offer(body)
+            if offer is not None:
+                return MoveRequiredError(
+                    message,
+                    status=resp.status_code,
+                    body=body,
+                    move_possible=offer,
+                )
         if cls is RateLimitError:
             return RateLimitError(
                 message,
@@ -598,6 +612,27 @@ class _BaseTransport:
                 size=_refused_size(resp),
             )
         return cls(message, status=resp.status_code, body=body)
+
+
+def _move_offer(body: object) -> bool | None:
+    """``move.possible`` off a refusal that carries one, or ``None``.
+
+    Shape-checked rather than trusted, because it decides both what a caller is
+    told to do next and whether retrying is worth anything: a body whose ``move``
+    is a string, or a dict with no boolean ``possible``, has to read as "not that
+    refusal" rather than as a move that is impossible. Absent and malformed get
+    the same answer, and it is the conservative one — an ordinary
+    :class:`~mandala_computer.ConflictError`, which is what this was before.
+    """
+    if not isinstance(body, dict):
+        return None
+    move = body.get("move")
+    if not isinstance(move, dict):
+        return None
+    possible = move.get("possible")
+    if move.get("required") is not True or not isinstance(possible, bool):
+        return None
+    return possible
 
 
 def error_for_status(status: int, message: str) -> APIError:

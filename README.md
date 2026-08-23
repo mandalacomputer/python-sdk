@@ -240,6 +240,64 @@ operator changes it.
 The screen is not part of this. `resolution` is fixed for the life of a
 computer — see [Sizes](#sizes).
 
+### Growing past the host
+
+A resize is refused when the size asks for more RAM than the host the computer
+happens to be on can run. That refusal is an offer rather than an ending: another
+host in the same region may be able to run it, and the computer can be moved
+there.
+
+```python
+try:
+    c.resize(ram_mb=32768)
+except mc.MoveRequiredError as e:
+    if not e.move_possible:
+        raise  # nowhere in the region can run it
+    c.relocate(ram_mb=32768)  # 202 — the copy runs behind it
+    move = c.wait_for_move()
+    if move.state != "done":
+        print(move.state, move.detail)
+```
+
+**It is a separate method on purpose.** `relocate()` copies the computer's disk
+to different hardware. A resize that did that without being asked is exactly what
+neither this SDK nor the platform will do, so there is no keyword on `resize()`
+that quietly relocates a machine.
+
+**The computer must be stopped**, and suspended is not stopped here — unlike a
+resize, which accepts it. A saved desktop only loads on the host that wrote it,
+so it cannot travel: resume and stop the computer, or discard the session, first.
+
+**`wait_for_move()` does not raise for a move that ended badly**, because the
+ways it can end are not one thing:
+
+| `state` | what happened |
+|---|---|
+| `done` | on the new host, at the new size |
+| `moved` | on the new host, at its **old** size — the move landed and the resize did not. An ordinary `resize()` finishes it where it now is |
+| `failed` | nothing happened; the computer is where it was, untouched |
+| `lost` | we stopped watching. It may well have completed — read the computer |
+
+`moved` is the one to read carefully: the computer really has changed hardware,
+so treating it as "the move failed" sends you looking for a machine that is no
+longer where it was.
+
+One move runs per account at a time. `client.moves.list()` is the account-wide
+view — where a move you did not start is found, and how an "another computer on
+this account is being moved right now" refusal gets a name.
+
+```python
+for m in client.moves.list():
+    print(m.computer_id, m.state, "running" if m.live else m.finished_at)
+```
+
+The target is ours to choose and is never in the request: you are told a host in
+this region, not which one.
+
+Not called `move()`, which on a computer is the mouse pointer and has been since
+before there was anything else to move. The TypeScript SDK made the same choice
+for the same reason.
+
 ### Driving the desktop
 
 Coordinates are in the computer's own screen space. That is a create-time choice
@@ -786,6 +844,7 @@ Everything derives from `MandalaError`.
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
 | `ConflictError` | 409 — right request, wrong moment; retry |
+| `MoveRequiredError` | 409 — …except this one: the size needs a host that can run it |
 | `FileTooLargeError` | 413 — past the 64 MiB one request moves; ask for a window |
 | `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
@@ -798,6 +857,15 @@ Everything derives from `MandalaError`.
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 `PlanLimitError`'s message names the limit that was hit.
+
+`MoveRequiredError` is the one 409 that does **not** clear, and it is a subclass
+of `ConflictError` so that an `except ConflictError` written before it existed
+still catches it. It means the size asked for is more RAM than the host this
+computer is on can run — and the host will not grow, so the same request answers
+the same way for as long as the computer is where it is. `move_possible` is the
+branch: `True` means somewhere else in the region can run that size and
+`relocate()` takes the offer up, `False` means nowhere can and the size is the
+thing to change. See [Growing past the host](#growing-past-the-host).
 
 `FileTooLargeError` and `RangeNotSatisfiableError` are the two file statuses,
 and each has a next move attached, which is why neither is a bare `APIError`.
