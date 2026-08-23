@@ -47,6 +47,10 @@ BASE = "https://api.test/api/v1"
 # (method, pattern) with ids replaced by ":id" — mirrors surface.ts V1_ROUTES.
 ALLOWED = {
     ("GET", "templates"),
+    # The template document format (platform OPL-3568): the published JSON
+    # Schema, and a check of a document against it that stores nothing.
+    ("GET", "templates/schema"),
+    ("POST", "templates/validate"),
     ("GET", "sizes"),
     ("GET", "computers"),
     ("POST", "computers"),
@@ -114,6 +118,14 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # The template document routes (platform OPL-3568). Listed rather than
+    # wrapped because there is nothing yet to wrap them FOR: no route publishes
+    # a document, so an SDK method that validated one would be a checker for a
+    # file this SDK gives its caller no way to use. They become worth a method
+    # with publish and launch-by-ref, and until then the gap stays a line
+    # somebody has to delete. The TypeScript SDK holds them in the same set.
+    ("GET", "templates/schema"),
+    ("POST", "templates/validate"),
 }
 
 # Every query, header and body field the platform documents, by route —
@@ -129,6 +141,11 @@ UNIMPLEMENTED = {
 # between a call that works and a call that works wrongly and says nothing.
 PARAMETERS: dict[str, set[str]] = {
     "GET templates": set(),
+    # Neither takes a query parameter or a header. The validate route's body is
+    # the document itself, raw rather than a JSON envelope with named fields —
+    # so it contributes nothing here, the same way the file upload's does not.
+    "GET templates/schema": set(),
+    "POST templates/validate": set(),
     "GET sizes": set(),
     "GET computers": {"query:allow_partial"},
     "POST computers": {
