@@ -252,8 +252,8 @@ try:
     c.resize(ram_mb=32768)
 except mc.MoveRequiredError as e:
     if not e.move_possible:
-        raise                                  # nowhere in the region can run it
-    c.relocate(ram_mb=32768)                   # 202 — the copy runs behind it
+        raise  # nowhere in the region can run it
+    c.relocate(ram_mb=32768)  # 202 — the copy runs behind it
     move = c.wait_for_move()
     if move.state != "done":
         print(move.state, move.detail)
