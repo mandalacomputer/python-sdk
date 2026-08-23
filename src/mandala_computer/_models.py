@@ -175,8 +175,19 @@ class VncConnect:
     platform rather than by the client asking politely:
 
     ``token``
-        Full control — keyboard, pointer, clipboard. Root-equivalent on that one
-        machine, so it belongs on a server or in a page you trust.
+        Full control — keyboard and pointer. Root-equivalent on that one
+        machine, so it belongs on a server or in a page you trust. NOT the
+        clipboard, whatever a noVNC client offers on it: QEMU carries cut text
+        only through a vdagent channel these guests are not started with, so a
+        paste arrives and is dropped with no error. Move text with
+        :meth:`Computer.exec` and ``desktop=True``. A write needs ``setsid``, so
+        the holder outlives the command — an X selection belongs to a live
+        process — AND ``>/dev/null 2>&1``, without which the resident xclip
+        holds the pipe the guest agent is reading and the exec runs to its full
+        timeout before answering. Send the text base64 rather than quoted, since
+        an apostrophe would otherwise end the shell word, and poll rather than
+        reading straight back: being granted a selection is asynchronous, so the
+        next read can still be the old one.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
         browser holding this one cannot type even from a patched client.
@@ -201,8 +212,14 @@ class VncConnect:
     embed_url: str
     #: Websocket URL opening an interactive terminal — a PTY in the guest,
     #: carried on the same controlling credential as :attr:`url`, so treat it
-    #: as that credential. ``""`` on a Windows guest, which has no terminal
-    #: yet, and on a server from before the terminal existed.
+    #: as that credential. ``""`` on a Windows guest, which has no terminal yet.
+    #:
+    #: Present and refused is the case to plan for, and it is about the COMPUTER
+    #: rather than the server: the serial channel a terminal runs over is added
+    #: to a guest's hardware at COLD boot, so a computer last started before
+    #: terminals shipped has a URL here that answers 409 until it is stopped and
+    #: started. A restart will not do it — that resets the same QEMU, and the
+    #: command line only changes on a cold boot.
     terminal_url: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
@@ -334,6 +351,19 @@ class Snapshot:
     computer_id: str
     name: str
     kind: str
+    #: Where these bytes have got to, and what may be done with them.
+    #:
+    #: ``"capturing"``
+    #:     Still being taken, and NOT a snapshot yet. A listing puts these
+    #:     first, their ids begin ``cap-``, and restore, clone and delete all
+    #:     answer 404 on one. Acting on the newest row of a fresh listing is
+    #:     exactly how this is met.
+    #: ``"pending"``
+    #:     On its host and usable. This is the point to act from.
+    #: ``"durable"``
+    #:     In backup storage as well. See :attr:`is_durable`.
+    #: ``"deleting"``
+    #:     A deletion that began and did not finish; only listed when asked for.
     state: str
     size_bytes: int
     created_at: str
