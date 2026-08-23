@@ -5,15 +5,23 @@ from __future__ import annotations
 import builtins
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Listing, Move, Size, Snapshot, Template
+from ._models import Listing, Move, Size, Snapshot, Template, UsageReport
 from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
 
-__all__ = ["AsyncComputers", "AsyncMoves", "AsyncSizes", "AsyncSnapshots", "AsyncTemplates"]
+__all__ = [
+    "AsyncComputers",
+    "AsyncMoves",
+    "AsyncSizes",
+    "AsyncSnapshots",
+    "AsyncTemplates",
+    "AsyncUsage",
+]
 
 
 class AsyncComputers:
@@ -229,3 +237,48 @@ class AsyncSizes:
     async def list(self) -> builtins.list[Size]:
         data = await self._t.json_array("GET", _api.SIZES)
         return [Size.from_api(s) for s in data]
+
+
+class AsyncUsage:
+    """What this account has used.
+
+    Its own collection because ``GET /usage`` is its own route, account-scoped
+    like ``GET /moves`` rather than hanging off a computer — which it could not
+    be: the figures include computers that have since been deleted, and those are
+    exactly the ones an unexplained line on an invoice belongs to.
+    """
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def read(
+        self,
+        *,
+        since: datetime | str | None = None,
+        until: datetime | str | None = None,
+    ) -> UsageReport:
+        """Running hours weighted by cores and memory, the storage held, and
+        the per-computer breakdown behind the totals.
+
+        The read to build a spend check around: a loop that launches computers is
+        the caller that can run up a bill without noticing, and this is the same
+        figure the dashboard shows the person who will ask about it.
+
+        With no arguments the window is the account's current billing period,
+        which is what makes the numbers comparable with an invoice. Name
+        ``since``/``until`` for a window that has CLOSED — the billing period is
+        always the current one, and by the time an invoice arrives the period it
+        covers is not. Both take an aware ``datetime`` or an RFC 3339 string with
+        a zone; a naive datetime is refused rather than guessed at, because the
+        zone that would have to be assumed is not necessarily yours. They are
+        sent as ``from``/``to``, which ``from`` being a keyword is the whole
+        reason for the other spelling.
+
+        Check :attr:`~mandala_computer.UsageReport.degraded` and
+        :attr:`~mandala_computer.UsageReport.unmetered` on the way out. Each
+        figure is a sum across the fleet, so a hypervisor that did not answer
+        leaves a total that is quietly short rather than an obviously missing
+        row, and those two flags are the only thing that says so.
+        """
+        data = await self._t.json_object("GET", _api.USAGE, params=_api.usage_params(since, until))
+        return UsageReport.from_api(data)

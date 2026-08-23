@@ -726,6 +726,83 @@ platform did not say. `None` rather than `0`: reporting "nothing was destroyed"
 because the server was quiet is the one wrong answer worth going out of the way
 to avoid.
 
+### Usage
+
+What the account has spent, in the same figures the dashboard shows and the
+invoice bills on. This is the read to build a spend check around: a loop that
+launches computers is the caller that can run up a bill without noticing.
+
+```python
+u = client.usage.read()
+
+print(f"{u.usage.vcpu_hours} vCPU-hours since {u.from_}")
+for c in u.usage.computers:
+    print(f"  {c.name or c.id}{' (deleted)' if c.gone else ''}  {c.run_hours}h")
+```
+
+With no arguments the window is the account's **current billing period**, which
+is what makes the numbers comparable with an invoice. Name a window for one that
+has closed — the billing period is always the current one, and by the time an
+invoice arrives the period it covers is not:
+
+```python
+from datetime import datetime, timezone
+
+client.usage.read(
+    since=datetime(2026, 7, 1, tzinfo=timezone.utc),
+    until=datetime(2026, 8, 1, tzinfo=timezone.utc),
+)
+```
+
+One window at a time, and at most 62 days of it: every hypervisor replays its
+ledger a day at a time to answer, so a longer span is refused rather than quietly
+shortened. Records reach back 399 days, so an older period is read by naming both
+bounds rather than by widening one. And send `since` **with** `until` when the
+period has closed — `until` on its own is measured from the current period's
+start, which is after it.
+
+`since` and `until` are sent as `from` and `to`; the other spelling exists
+because `from` is a Python keyword. Both take an **aware** `datetime` or an RFC
+3339 string carrying a zone — `"2026-08-01T00:00:00Z"`, not
+`"2026-08-01T00:00:00"`. A naive datetime is refused rather than rendered,
+because the zone that would have to be assumed is not necessarily yours, and a
+window silently shifted by a few hours is the worst possible failure on the one
+call whose output somebody checks against a bill.
+
+**Read `degraded` and `unmetered` before you use the numbers.** Every figure is a
+sum across the hypervisors your computers are on, so a host that did not
+contribute does not leave a hole you could notice — it leaves a total that is
+quietly too small.
+
+```python
+if u.degraded or u.unmetered:
+    # Short, and saying so. `degraded` clears when the host comes back;
+    # `unmetered` is a host running a daemon older than the meter and never does.
+    print("these totals may be low — do not reconcile them against an invoice")
+```
+
+This is why the call returns rather than raising, unlike a partial listing below:
+the caveat travels on the same object, so it cannot be missed the way a missing
+row can — and one of the two shortfalls would never clear by retrying.
+
+Two more fields worth knowing:
+
+- `reported_through` — the last UTC day whose usage has settled for billing, as a
+  contiguous prefix. Not a caveat on the totals, which are live and true through
+  `to`; it is the boundary to check before comparing anything with an invoice.
+  `None` while none of the window has settled.
+- `breakdown` — `False` when the API key is scoped to a workspace. Usage is
+  metered and billed per **account**, so `usage.computers` would name computers
+  outside such a key's scope and the platform withholds it; the account-wide
+  totals still arrive. The tuple is empty either way, and this flag is what tells
+  "no computers ran" from "this key may not see which did".
+
+The async client reads it the same way:
+
+```python
+u = await client.usage.read()
+```
+
 ### Partial listings
 
 `client.computers.list()` and `client.snapshots.list()` fan out across every
