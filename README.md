@@ -144,7 +144,10 @@ answering; and the text goes over base64, whose alphabet has no quote in it, so
 an apostrophe in what you are pasting cannot end the shell word.
 
 Being granted the selection is also asynchronous, so a read straight after the
-write returns the *previous* clipboard — poll until it matches.
+write returns the *previous* clipboard — poll until it matches, and give up
+after a few seconds. Every poll is another billable exec, and the redirection
+above swallows xclip's own errors, so a guest without it never changes the
+selection at all.
 
 ```python
 import base64
@@ -152,7 +155,7 @@ import base64
 got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
 b64 = base64.b64encode(text.encode()).decode()
 c.exec(
-    f"printf %s {b64} | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
+    f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
     desktop=True,
 )
 ```
