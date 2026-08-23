@@ -9,8 +9,10 @@ platform's allowlist would only be checking one of them.
 from __future__ import annotations
 
 import math
+import re
 import shlex
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -28,6 +30,8 @@ SNAPSHOTS = "snapshots"
 #: such route. :meth:`~mandala_computer.Computer.wait_for_move` filters this by
 #: ``computer_id``.
 MOVES = "moves"
+#: What the account has used, over a window. Account-scoped, like :data:`MOVES`.
+USAGE = "usage"
 
 
 def seg(value: str) -> str:
@@ -195,6 +199,68 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
     if length < 1:
         raise ValueError(f"length must be at least 1 byte, not {length}")
     return {"Range": f"bytes={offset}-{offset + length - 1}"}
+
+
+#: An RFC 3339 timestamp carrying a time zone, which is the only kind the
+#: platform takes on ``GET /usage``.
+_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$")
+
+
+def _usage_stamp(value: datetime | str, what: str) -> str:
+    """One bound of a usage window, in the spelling the platform reads.
+
+    A ``datetime`` is the shape to prefer, and an AWARE one is the only kind
+    accepted: a naive datetime has no zone, so rendering it would mean this SDK
+    choosing between "the machine that called" and "UTC" — and being wrong about
+    that shifts the window by hours on the one call whose output somebody checks
+    against an invoice. ``datetime.now(timezone.utc)`` and
+    ``datetime(2026, 8, 1, tzinfo=timezone.utc)`` are both fine; a bare
+    ``datetime(2026, 8, 1)`` is refused, with the remedy in the message.
+
+    A string is taken for the caller who already has one — out of a config file,
+    or off a previous response — and is checked here rather than sent, for the
+    same reason. The platform refuses a zoneless stamp too; being told locally
+    means the complaint arrives with the argument that caused it.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                f"{what} must be an aware datetime — a naive one has no time zone, and "
+                "guessing one would move the window. Try "
+                f"{what}=your_datetime.replace(tzinfo=timezone.utc)."
+            )
+        # isoformat() renders the offset it carries; UTC comes out as +00:00,
+        # which is RFC 3339 and what the platform parses. Not forced to "Z":
+        # the offset IS the instant, and normalising it would be this SDK
+        # deciding what the caller meant.
+        return value.isoformat()
+    if not isinstance(value, str) or not _RFC3339.match(value):
+        raise ValueError(
+            f"{what} must be an RFC 3339 timestamp with a time zone, e.g. "
+            f"2026-08-01T00:00:00Z (or pass an aware datetime): {value!r}"
+        )
+    return value
+
+
+def usage_params(
+    since: datetime | str | None, until: datetime | str | None
+) -> dict[str, str] | None:
+    """The window to read usage over, or ``None`` for the billing period.
+
+    ``since``/``until`` because ``from`` is a Python keyword and cannot be a
+    parameter name; they are sent as ``from``/``to``, which is what the platform
+    and the other two clients call them.
+
+    ``None`` rather than an empty dict when neither bound is given, so the
+    default call builds a bare URL — and so that "I did not name a window" and
+    "I named an empty one" cannot look the same on the wire.
+    """
+    params: dict[str, str] = {}
+    if since is not None:
+        params["from"] = _usage_stamp(since, "since")
+    if until is not None:
+        params["to"] = _usage_stamp(until, "until")
+    return params or None
 
 
 def partial_params(allow_partial: bool) -> dict[str, str] | None:
