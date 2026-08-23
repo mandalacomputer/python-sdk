@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/b-open-io/linear-sync/main/schema/linear-sync.json",
+  "_warning": "AUTO-MANAGED by linear-sync. Manual edits may break issue sync, commit hooks, and branch naming.",
+  "workspace": "openprotocollabs",
+  "project": "Mandala Computer",
+  "team": "OPL",
+  "label": "repo:mandala-computer-python",
+  "github_org": "mandalacomputer"
+}
