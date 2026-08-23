@@ -11,7 +11,7 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Listing, Move, Size, Snapshot, Template, UsageReport
+from ._models import Listing, Move, Retention, Size, Snapshot, Template, UsageReport
 from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
 
 __all__ = [
@@ -183,6 +183,28 @@ class AsyncSnapshots:
 
     async def delete(self, snapshot_id: str) -> None:
         await self._t.request("DELETE", _api.snapshot(snapshot_id))
+
+    async def retention(self) -> Retention:
+        """How long the automatic ones are kept — your plan's retention window.
+
+        The other half of :meth:`~mandala_computer.Computer.set_schedule`, which
+        decides when snapshots are TAKEN and deliberately has no field for how
+        long they survive. Without this a caller setting a daily schedule had to
+        hardcode a number per plan tier or infer one by watching ``auto``
+        snapshots disappear.
+
+        On this collection rather than on a :class:`~mandala_computer.Computer`
+        because the window belongs to the ACCOUNT — every computer you own is
+        aged out on the same one, though each keeps its own set, so two
+        computers on ``7/4/12`` keep up to twenty-three snapshots each rather
+        than twenty-three between them.
+
+        Read-only, and there is no write anywhere: the plan owns retention, so
+        setting it would be granting yourself history you have not paid for. It
+        changes when the subscription does. See :class:`Retention` for what the
+        three numbers select.
+        """
+        return Retention.from_api(await self._t.json_object("GET", _api.RETENTION))
 
 
 class AsyncTemplates:
