@@ -11,9 +11,9 @@ from typing import Any
 from . import _api
 from ._client import Transport
 from ._computer import Computer
-from ._models import Listing, Size, Snapshot, Template
+from ._models import Listing, Move, Size, Snapshot, Template
 
-__all__ = ["Computers", "Sizes", "Snapshots", "Templates"]
+__all__ = ["Computers", "Moves", "Sizes", "Snapshots", "Templates"]
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
 
@@ -221,6 +221,46 @@ class Templates:
     def list(self) -> builtins.list[Template]:
         data = self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
+
+
+class Moves:
+    """The moves on this account, live and recently finished.
+
+    Its own collection because ``GET /moves`` is its own route, account-scoped
+    rather than hanging off a computer — which is the platform's decision and the
+    right one: a move is a fact about a computer that is currently on one host
+    and about to be on another, and during the window that matters that is
+    exactly what nobody can say.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self) -> builtins.list[Move]:
+        """Every move worth reading: the ones still running, and the ones that
+        finished within the last day and have not been dismissed.
+
+        Two things to get from a listing rather than a per-computer read. A move
+        you started is found by its ``computer_id`` —
+        :meth:`~mandala_computer.Computer.wait_for_move` does exactly that. And a
+        move you did NOT start is what the "another computer on this account is
+        being moved right now" refusal is about: one runs per account at a time,
+        and this is where you find out which and how far along.
+
+        A finished move stays here for a day so that an outcome is still readable
+        by somebody who went away while it ran. Read ``live``, not the row's
+        absence.
+
+        An API key issued against a workspace sees the moves of computers in that
+        workspace only.
+        """
+        data = self._t.json_object("GET", _api.MOVES)
+        rows = data.get("moves")
+        # The platform answers ``{"moves": [...]}``; a caller gets the list. The
+        # envelope exists because the route is account-scoped and could grow a
+        # sibling field, and unwrapping it here is what keeps that from being
+        # every caller's problem.
+        return [Move.from_api(m) for m in rows] if isinstance(rows, list) else []
 
 
 class Sizes:

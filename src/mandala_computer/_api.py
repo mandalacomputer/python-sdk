@@ -20,6 +20,14 @@ TEMPLATES = "templates"
 SIZES = "sizes"
 COMPUTERS = "computers"
 SNAPSHOTS = "snapshots"
+#: Every move on the account, live and recently finished.
+#:
+#: A collection, and not ``computers/:id/move`` — which is the platform's own
+#: decision and worth knowing when binding to it: a per-computer read could not
+#: tell a computer with no move from an id that does not exist, so there is no
+#: such route. :meth:`~mandala_computer.Computer.wait_for_move` filters this by
+#: ``computer_id``.
+MOVES = "moves"
 
 
 def seg(value: str) -> str:
@@ -510,6 +518,29 @@ def resize_body(*, cpu: int | None, ram_mb: int | None, disk_gb: int | None) -> 
     }
     if not body:
         raise ValueError("resize() needs at least one of cpu, ram_mb or disk_gb")
+    return body
+
+
+def move_body(*, ram_mb: int, cpu: int | None, disk_gb: int | None) -> dict[str, Any]:
+    """The sizing group for a move, which is a resize the current host cannot run.
+
+    ``ram_mb`` is REQUIRED here and optional on :func:`resize_body`, and that is
+    the one difference worth explaining. A move exists to escape a RAM ceiling:
+    the platform fills an omitted ``ram_mb`` from the computer's current size and
+    then refuses the move for not needing one, so a call without it can only ever
+    be refused. Required in the signature turns a guaranteed 409 into a
+    ``TypeError`` at the call site.
+
+    There is no ``name`` and no ``idle_suspend_min``. The platform reads only
+    these three fields off a move body and ignores the rest, so accepting either
+    would be a rename that copies a multi-gigabyte disk between hosts and then
+    does not happen.
+    """
+    body: dict[str, Any] = {"ram_mb": ram_mb}
+    if cpu is not None:
+        body["cpu"] = cpu
+    if disk_gb is not None:
+        body["disk_gb"] = disk_gb
     return body
 
 

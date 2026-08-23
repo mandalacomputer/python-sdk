@@ -51,6 +51,7 @@ PAIRS = [
     (mc.Computer, mc.AsyncComputer),
     (mc.BackgroundCommand, mc.AsyncBackgroundCommand),
     (_resources.Computers, _async_resources.AsyncComputers),
+    (_resources.Moves, _async_resources.AsyncMoves),
     (_resources.Snapshots, _async_resources.AsyncSnapshots),
     (_resources.Templates, _async_resources.AsyncTemplates),
     (_resources.Sizes, _async_resources.AsyncSizes),
