@@ -19,6 +19,16 @@ from urllib.parse import quote
 # --- paths ----------------------------------------------------------------
 
 TEMPLATES = "templates"
+#: The JSON Schema for a ``mandala/v1`` document (platform OPL-3568).
+TEMPLATE_SCHEMA = "templates/schema"
+#: Check a document without publishing it. Side-effect free, and claims no ref.
+TEMPLATE_VALIDATE = "templates/validate"
+#: Every build this account has started (platform OPL-3791).
+#:
+#: A collection, like :data:`MOVES` and for the same reason: a build is a job
+#: rather than a property of a computer, and it outlives the request that
+#: started it.
+BUILDS = "builds"
 SIZES = "sizes"
 COMPUTERS = "computers"
 SNAPSHOTS = "snapshots"
@@ -96,6 +106,100 @@ def window(computer_id: str, window_id: str) -> str:
     on who chose the string.
     """
     return f"computers/{seg(computer_id)}/windows/{seg(window_id)}"
+
+
+def template_ref(namespace: str, name: str) -> str:
+    """One published template, by the two halves of its ref.
+
+    Two segments and not one, because that is the shape of the route: the
+    platform reduces ``templates/<a>/<b>`` to ``templates/:namespace/:name``, so
+    a ref handed over whole — ``acc-1/devbox@1.0.0`` — would be percent-encoded
+    into a single segment and reach a route that does not exist. The version is
+    a *query* parameter on this path, not part of it; see
+    :func:`template_version_params`.
+    """
+    return f"{TEMPLATES}/{seg(namespace)}/{seg(name)}"
+
+
+#: ``MAJOR.MINOR.PATCH``, no leading zeros — the platform's own version grammar.
+_VERSION = re.compile(r"^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$")
+
+
+def template_version_params(version: str | None) -> dict[str, str]:
+    """The ``version`` query parameter, refused when it is not a version.
+
+    Absence and emptiness have to be different things here. The platform answers
+    400 for one that is empty or malformed rather than defaulting, and that
+    refusal exists because of a real defect: ``?version=`` — which is what most
+    clients serialise for an unset optional string — read as "no version was
+    named" and retired an entire template, irreversibly.
+
+    This SDK cannot send that at all. ``None`` omits the parameter, and anything
+    else has to be a version. Checked here rather than left to the platform
+    because the two answers are not interchangeable on a retire: omitting the
+    parameter means EVERY version, so a caller who meant one version and passed
+    an empty string would, without the platform's refusal, have retired the lot.
+    """
+    if version is None:
+        return {}
+    if not _VERSION.match(version):
+        raise ValueError(
+            f"version must be MAJOR.MINOR.PATCH with no leading zeros (got {version!r}); "
+            "omit it entirely to name the whole template"
+        )
+    return {"version": version}
+
+
+def template_document(document: str) -> bytes:
+    """The document a publish, a validate or a build sends.
+
+    Raw bytes, not a JSON envelope: the platform reads JSON or YAML off the body
+    itself, so a wrapper would be a document the validator never sees — and one
+    that parses, so the failure would be a complaint about the wrapper's fields.
+
+    Refused when empty for the reason :func:`seg` refuses an empty id — the
+    platform answers 400 for it, and that is a round trip that never had to
+    happen.
+    """
+    if not isinstance(document, str) or not document.strip():
+        raise ValueError("document must be a non-empty template document, as JSON or YAML")
+    return document.encode("utf-8")
+
+
+def build(build_id: str) -> str:
+    return f"{BUILDS}/{seg(build_id)}"
+
+
+def build_action(build_id: str, action: str) -> str:
+    """progress | events."""
+    return f"{BUILDS}/{seg(build_id)}/{action}"
+
+
+def build_params(no_reuse: bool) -> dict[str, str]:
+    """``no_reuse``, sent only when it is asked for.
+
+    The platform reads the PRESENCE of the key rather than its value, so
+    ``no_reuse=false`` would ask for the opposite of what it says.
+    """
+    return {"no_reuse": "true"} if no_reuse else {}
+
+
+def build_stream_failed(build_id: str, data: Any) -> str:
+    """What to say when a build's event stream ends with an ``error`` event.
+
+    The stream's own failure, not the build's — named as such because a caller
+    told "the build failed" would go and read a document that is fine. One
+    function so the sync and async halves cannot word it differently.
+    """
+    detail = ""
+    if isinstance(data, Mapping):
+        detail = str(data.get("error") or "")
+    elif data is not None:
+        detail = str(data)
+    return (
+        f"the build event stream for {build_id} ended: {detail or 'no reason given'} "
+        f"(this says nothing about the build itself — read builds.progress({build_id!r}))"
+    )
 
 
 def snapshot(snapshot_id: str) -> str:

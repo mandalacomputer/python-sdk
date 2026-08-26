@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -11,10 +13,25 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Listing, Move, Retention, Size, Snapshot, Template, UsageReport
-from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
+from ._exceptions import MandalaError, TimeoutError
+from ._models import (
+    BuildProgress,
+    Listing,
+    Move,
+    PublishedTemplate,
+    Retention,
+    RetiredTemplates,
+    Size,
+    Snapshot,
+    Template,
+    TemplateBuild,
+    TemplateCheck,
+    UsageReport,
+)
+from ._resources import EPHEMERAL_DOC, PERMANENT, Builds, Templates, warn_cleanup_failed
 
 __all__ = [
+    "AsyncBuilds",
     "AsyncComputers",
     "AsyncMoves",
     "AsyncSizes",
@@ -214,6 +231,129 @@ class AsyncTemplates:
     async def list(self) -> builtins.list[Template]:
         data = await self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
+
+    async def schema(self) -> Mapping[str, Any]:
+        return await self._t.json_object("GET", _api.TEMPLATE_SCHEMA)
+
+    async def validate(self, document: str) -> TemplateCheck:
+        data = await self._t.json_object(
+            "POST", _api.TEMPLATE_VALIDATE, content=_api.template_document(document)
+        )
+        return TemplateCheck.from_api(data)
+
+    async def publish(self, document: str) -> PublishedTemplate:
+        data = await self._t.json_object(
+            "POST", _api.TEMPLATES, content=_api.template_document(document)
+        )
+        return PublishedTemplate.from_api(data)
+
+    async def get(
+        self, namespace: str, name: str, *, version: str | None = None
+    ) -> PublishedTemplate:
+        data = await self._t.json_object(
+            "GET",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return PublishedTemplate.from_api(data)
+
+    async def retire(
+        self, namespace: str, name: str, *, version: str | None = None
+    ) -> RetiredTemplates:
+        data = await self._t.json_object(
+            "DELETE",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return RetiredTemplates.from_api(data)
+
+    # Taken from the sync twin rather than written again. These are long — the
+    # retire's alone is three paragraphs about what a retire does and does not
+    # cost — and two copies of a paragraph is two paragraphs to keep true. The
+    # parity test compares signatures; nothing compares prose, which is exactly
+    # why prose is the half that drifts.
+    schema.__doc__ = Templates.schema.__doc__
+    validate.__doc__ = Templates.validate.__doc__
+    publish.__doc__ = Templates.publish.__doc__
+    get.__doc__ = Templates.get.__doc__
+    retire.__doc__ = Templates.retire.__doc__
+
+
+class AsyncBuilds:
+    __doc__ = Builds.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def start(self, document: str, *, no_reuse: bool = False) -> TemplateBuild:
+        data = await self._t.json_object(
+            "POST",
+            _api.BUILDS,
+            content=_api.template_document(document),
+            params=_api.build_params(no_reuse),
+        )
+        return TemplateBuild.from_api(data)
+
+    async def list(self) -> builtins.list[TemplateBuild]:
+        data = await self._t.json_array("GET", _api.BUILDS)
+        return [TemplateBuild.from_api(b) for b in data]
+
+    async def get(self, build_id: str) -> TemplateBuild:
+        return TemplateBuild.from_api(await self._t.json_object("GET", _api.build(build_id)))
+
+    async def progress(self, build_id: str) -> BuildProgress:
+        data = await self._t.json_object("GET", _api.build_action(build_id, "progress"))
+        return BuildProgress.from_api(data)
+
+    async def events(self, build_id: str) -> AsyncIterator[BuildProgress]:
+        async for event in self._t.sse("GET", _api.build_action(build_id, "events")):
+            if event.event == "error":
+                raise MandalaError(_api.build_stream_failed(build_id, event.data))
+            if event.event not in ("progress", "done"):
+                continue
+            if not isinstance(event.data, Mapping):
+                continue
+            yield BuildProgress.from_api(event.data)
+            if event.event == "done":
+                return
+
+    async def wait(
+        self, build_id: str, timeout: float = 1800.0, poll: float = 5.0
+    ) -> BuildProgress:
+        deadline = time.monotonic() + timeout
+        last: BuildProgress | None = None
+        while True:
+            try:
+                last = await self.progress(build_id)
+                if last.done:
+                    return last
+            except PERMANENT:
+                raise
+            except MandalaError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"build {build_id} was still running after {timeout:g}s"
+                    + (
+                        f" (phase {last.phase}, step {last.step} of {last.of}; "
+                        "the build has not stopped, only this wait has)"
+                        if last is not None
+                        else ": every poll failed"
+                    )
+                )
+            # asyncio.sleep, not time.sleep: this is the one line where the two
+            # halves genuinely differ, and blocking the event loop for five
+            # seconds a poll across a fifteen-minute build is what the async
+            # client exists not to do.
+            await asyncio.sleep(min(poll, remaining))
+
+    start.__doc__ = Builds.start.__doc__
+    list.__doc__ = Builds.list.__doc__
+    get.__doc__ = Builds.get.__doc__
+    progress.__doc__ = Builds.progress.__doc__
+    events.__doc__ = Builds.events.__doc__
+    wait.__doc__ = Builds.wait.__doc__
 
 
 class AsyncMoves:

@@ -84,6 +84,109 @@ if c.start_error:
     c.start()  # often works on a second attempt
 ```
 
+### Your own templates
+
+A template is a `mandala/v1` document — the image family it resolves to, what it
+is layered onto, and the shape a computer gets when the create names no numbers.
+Publishing one gives it a ref you can launch by name.
+
+```python
+doc = Path("devbox.yaml").read_text()
+
+# Worth doing while you iterate: this reports EVERY problem at once, and claims
+# no ref. It does not raise for an invalid document — that is the answer.
+check = client.templates.validate(doc)
+if not check.valid:
+    raise SystemExit("\n".join(check.problems))
+
+t = client.templates.publish(doc)
+c = client.computers.create(template=t.ref)
+```
+
+**The namespace is your account.** `metadata.namespace` has to be your account
+id — anything else is a `PermissionDeniedError`, `system` included — and this SDK
+does not rewrite it, because publishing a ref that is not the one in your file
+would be worse than refusing.
+
+**A ref is immutable.** Publishing the identical document again succeeds and
+changes nothing, so a pipeline that republishes on every commit is safe.
+Publishing a *different* document under the same ref is a `ConflictError`; bump
+`metadata.version`. What counts as different is the digest, so a changed label is
+a change.
+
+Read one back — yours or `system`, so you can see what you are layering onto:
+
+```python
+base = client.templates.get("system", "base")
+pinned = client.templates.get(namespace, "devbox", version="1.0.0")
+```
+
+Without `version` you get the newest, which is also what a create naming the
+unpinned `namespace/name` resolves to.
+
+#### Retiring one
+
+```python
+client.templates.retire(namespace, "devbox", version="1.0.4")  # one version
+client.templates.retire(namespace, "devbox")                   # every version
+```
+
+Omitting `version` retires the **whole name** — deliberately not `get()`'s "the
+newest", which on a delete would let a loop walk backwards through a history it
+never asked about. An empty string is refused before it is sent, for the same
+reason.
+
+**Computers are not affected.** A computer is built from the image the ref
+resolved to and holds no reference to the document, so anything already running,
+stopped or suspended is untouched. What a retire breaks is resolution: a *new*
+create naming the ref is refused.
+
+**The ref stays spoken for, and still counts once.** Publishing it again is a
+`ConflictError`, identical bytes included, and `refs_claimed` on the result does
+not go down — it is the count against a much larger, separate ceiling than
+`templates`. A ref you retired is a `NotFoundError` whose message names the date
+it went, rather than claiming the template never existed; read the message before
+concluding you mistyped something.
+
+### Building one
+
+A document that declares `spec.build` steps has to be compiled into an image
+before anything can launch it. That is minutes of work — an agent image is
+roughly fifteen — so it never blocks:
+
+```python
+build = client.builds.start(doc)
+out = client.builds.wait(build.id)
+
+if out.status != "succeeded":
+    failed = next((s for s in out.steps if s.status == "failed"), None)
+    print(f"step {failed.n} ({failed.kind} {failed.label}) failed: {out.error}")
+```
+
+`wait()` does **not** raise for a build that failed. `succeeded` and `failed` are
+two situations with two remedies — one has an image, the other has a step to fix
+— and an exception flattens them into "something went wrong". Read `status`.
+
+For a terminal, stream it instead of polling:
+
+```python
+for p in client.builds.events(build.id):
+    print(f"{p.phase} {p.step}/{p.of} {p.note}")
+```
+
+Each event is news — the platform sends one only when something moved — and the
+last one is the `done`, **including for a build that failed**. An `error` event
+means the *stream* could not go on and says nothing about the build; it raises,
+and says so. An account may hold eight streams open at once.
+
+**A build that declares its own family is not launchable yet.** The fleet does
+not advertise a family it built rather than shipped, so a create naming such a
+ref is still refused with a `503`. Publishing the document is worth doing anyway
+— it claims the ref, and it is what `builds.start()` takes.
+
+Everything here has an async twin: `await client.templates.publish(doc)`,
+`await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
+
 ### Suspending
 
 A suspend writes the guest's RAM to disk and gives the host its memory back.

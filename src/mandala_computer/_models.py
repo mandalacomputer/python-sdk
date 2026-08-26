@@ -6,6 +6,7 @@ rejected, so a server that starts returning more does not break older clients.
 
 from __future__ import annotations
 
+import builtins
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -15,15 +16,21 @@ from typing import Any, SupportsIndex, TypeVar, overload
 from ._exceptions import MandalaError
 
 __all__ = [
+    "BuildProgress",
+    "BuildStep",
     "ComputerUsage",
     "ExecResult",
     "ExecStatus",
     "FilePart",
     "Listing",
+    "PublishedTemplate",
+    "RetiredTemplates",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
     "Template",
+    "TemplateBuild",
+    "TemplateCheck",
     "UsagePeriod",
     "UsageReport",
     "UsageTotals",
@@ -320,6 +327,280 @@ class Template:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class PublishedTemplate:
+    """A document this account published, from ``publish()`` or ``get()``.
+
+    :class:`Template` is what a LISTING answers — a name, a size, enough to
+    launch it. This is what a template IS, and the two are different shapes on
+    purpose: the listing has to stay small enough to render a picker from, and
+    the document carries build steps that can run to pages.
+    """
+
+    #: ``namespace/name@version``. What you pass as ``template`` to create.
+    ref: str
+    #: ``sha256:…`` of the document. Two publishes of the same digest are the
+    #: same template, which is what makes republishing an unchanged document a
+    #: no-op rather than a conflict.
+    doc_digest: str
+    #: The document itself, in canonical form — the bytes :attr:`doc_digest` is
+    #: over. Key order and whitespace may differ from what was sent; nothing
+    #: else does.
+    document: Mapping[str, Any]
+    #: The catalogue row this document describes.
+    template: Template
+    #: Every version of this name, newest first.
+    versions: builtins.list[str]
+    #: ``None`` on a template the platform publishes — nobody published it.
+    published_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> PublishedTemplate:
+        document = d.get("document")
+        template = d.get("template")
+        published = d.get("published_at")
+        return cls(
+            ref=_text(d.get("ref")),
+            doc_digest=_text(d.get("doc_digest")),
+            document=dict(document) if isinstance(document, Mapping) else {},
+            template=Template.from_api(template if isinstance(template, Mapping) else {}),
+            versions=[_text(v) for v in d.get("versions") or []],
+            # None stays None rather than becoming "": a shipped template was
+            # not published by anybody, and an empty timestamp reads as one that
+            # is known and blank rather than one that does not apply.
+            published_at=None if published is None else _text(published),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class TemplateCheck:
+    """What ``validate()`` said about a document.
+
+    Both outcomes are a 200 — an invalid document is an answer to the question,
+    not a failed request — so nothing here raises for :attr:`valid` being False.
+    That is the point of validating: :attr:`problems` lists EVERY problem at
+    once, where publishing reports the first thing that stops it.
+    """
+
+    valid: bool
+    #: Every problem with the document, not just the first. Empty when valid.
+    problems: builtins.list[str]
+    #: The ref the document claims, once it parsed far enough to have one.
+    ref: str | None
+    #: ``sha256:…`` of the whole document. Changes with any edit, a label included.
+    doc_digest: str | None
+    #: ``sha256:…`` of only what decides the IMAGE.
+    #:
+    #: A new label or a version bump leaves it alone, so comparing it against a
+    #: previous run is how you tell whether an edit means a rebuild. ``None``
+    #: for a document naming a parent in ``spec.from``, which cannot be computed
+    #: without the parent's.
+    build_digest: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> TemplateCheck:
+        def maybe(key: str) -> str | None:
+            value = d.get(key)
+            return None if value is None else _text(value)
+
+        return cls(
+            valid=bool(d.get("valid", False)),
+            problems=[_text(p) for p in d.get("problems") or []],
+            ref=maybe("ref"),
+            doc_digest=maybe("doc_digest"),
+            build_digest=maybe("build_digest"),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class RetiredTemplates:
+    """What a retire took away, from ``retire()``.
+
+    Not a :class:`PublishedTemplate` with a flag on it: the document is gone, so
+    there is nothing of that shape left to answer with.
+
+    WHAT A RETIRE COSTS is worth knowing before calling it. It breaks
+    RESOLUTION and nothing else — a computer is built from the image the ref
+    resolved to and holds no reference to the document, so anything already
+    running, stopped or suspended is untouched. What it does not give back is
+    the NAME: a retired ref is refused for ever, identical bytes included, and
+    :attr:`refs_claimed` does not go down.
+    """
+
+    #: The refs that went, newest version first. Never empty — an empty retire
+    #: is a 404.
+    retired: builtins.list[str]
+    #: One value: everything in :attr:`retired` went in the same write.
+    retired_at: str
+    #: The versions of this name still published, newest first. Empty means the
+    #: name is gone.
+    versions: builtins.list[str]
+    #: How many templates the account holds now — the number the per-account
+    #: ceiling is against.
+    templates: int
+    #: How many refs this account has ever claimed, live and retired together.
+    #:
+    #: It does NOT go down when you retire, and there is a much larger ceiling
+    #: on it than on :attr:`templates`. The two move differently, and somebody
+    #: watching only the first would conclude that retiring is free.
+    refs_claimed: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> RetiredTemplates:
+        return cls(
+            retired=[_text(r) for r in d.get("retired") or []],
+            retired_at=_text(d.get("retired_at")),
+            versions=[_text(v) for v in d.get("versions") or []],
+            templates=_num(d.get("templates")),
+            refs_claimed=_num(d.get("refs_claimed")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class TemplateBuild:
+    """Compiling a document into an image (platform OPL-3791).
+
+    Not to be confused with a computer's disk copy, which the platform also
+    calls a build. This one is minutes long: ``start()`` answers immediately
+    with a job, and ``wait()`` is what watches it.
+    """
+
+    #: ``bld-a1b2c3d4e5f6``-shaped.
+    id: str
+    #: The document this was built from, as ``namespace/name@version``.
+    ref: str
+    #: ``running``, ``succeeded`` or ``failed``.
+    status: str
+    #: Why it failed, when it did. For a failing ``run:`` step, the end of that
+    #: step's own output.
+    error: str
+    started_at: str
+    #: ``None`` while it is still running.
+    finished_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> TemplateBuild:
+        finished = d.get("finished_at")
+        return cls(
+            id=_text(d.get("id")),
+            ref=_text(d.get("ref")),
+            status=_text(d.get("status")),
+            error=_text(d.get("error")),
+            started_at=_text(d.get("started_at")),
+            finished_at=None if finished is None else _text(finished),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class BuildStep:
+    """One step of a build, in the order the document declares them."""
+
+    #: Its position, 1-based.
+    n: int
+    #: ``apt``, ``run``, ``file``, ``mkdir``, ``env``, or ``finish`` for the
+    #: cleanup every build ends with.
+    kind: str
+    #: What the step does, from the document — the packages, the path, or the
+    #: first real line of the script.
+    label: str
+    #: ``pending``, ``running``, ``done``, ``failed``, or ``skipped`` for one an
+    #: earlier failure meant we never reached.
+    status: str
+    started_at: str | None
+    finished_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> BuildStep:
+        started, finished = d.get("started_at"), d.get("finished_at")
+        return cls(
+            n=_num(d.get("n")),
+            kind=_text(d.get("kind")),
+            label=_text(d.get("label")),
+            status=_text(d.get("status")),
+            started_at=None if started is None else _text(started),
+            finished_at=None if finished is None else _text(finished),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class BuildProgress:
+    """What a build is DOING, as against what became of it (platform OPL-3794).
+
+    A build is minutes long — most of it spent copying a multi-gigabyte base
+    image and then running the document's steps — so this says which step of how
+    many is running, and which one failed. It stays readable after the build has
+    finished, so a program that was not attached at the time can still see where
+    it stopped.
+    """
+
+    id: str
+    #: The job's own status, restated so one poll answers both questions.
+    status: str
+    #: Whether to stop polling.
+    #:
+    #: Derived from :attr:`status` and not from :attr:`phase`: a phase is read
+    #: out of the build's log, which the document's own ``run:`` steps write
+    #: into, and only the job decides whether a build worked.
+    done: bool
+    #: ``planning``, ``staging``, ``copying``, ``building``, ``publishing``, and
+    #: then ``published``, ``reused`` or ``failed``.
+    #:
+    #: ``unknown`` means the build finished without keeping a step-by-step
+    #: record — every build from before the endpoint existed is one. It is not
+    #: reported as ``published`` because a build that REUSED an existing image
+    #: succeeds too, and that distinction lived in the record that is missing.
+    #: :attr:`status` is still the answer.
+    phase: str
+    #: Which step is running, 1-based, or the one that failed. ``0`` before the
+    #: first.
+    step: int
+    #: How many steps there are.
+    of: int
+    #: Every step, in order, whatever its status — so the whole list renders
+    #: from the first read.
+    steps: builtins.list[BuildStep]
+    #: One line about the phase, or why a failed build failed.
+    note: str
+    #: Why it failed, when it did. The same value ``get()`` gives.
+    error: str
+    #: When the build last MOVED, and not when this was last read — a build
+    #: whose steps have stopped advancing is one whose ``updated_at`` stops.
+    updated_at: str
+    #: True only where the fleet could not recognise its own build tool's
+    #: output, so the per-step position is unavailable. The build itself is
+    #: unaffected and :attr:`status` is still the answer.
+    unmatched: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> BuildProgress:
+        rows = d.get("steps") or []
+        return cls(
+            id=_text(d.get("id")),
+            status=_text(d.get("status")),
+            done=bool(d.get("done", False)),
+            phase=_text(d.get("phase")),
+            step=_num(d.get("step")),
+            of=_num(d.get("of")),
+            steps=[BuildStep.from_api(r) for r in rows if isinstance(r, Mapping)],
+            note=_text(d.get("note")),
+            error=_text(d.get("error")),
+            updated_at=_text(d.get("updated_at")),
+            unmatched=bool(d.get("unmatched", False)),
             raw=dict(d),
         )
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import builtins
+import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
@@ -12,9 +13,38 @@ from typing import Any
 from . import _api
 from ._client import Transport
 from ._computer import Computer
-from ._models import Listing, Move, Retention, Size, Snapshot, Template, UsageReport
+from ._exceptions import (
+    AuthenticationError,
+    MandalaError,
+    NotFoundError,
+    PermissionDeniedError,
+    PlanLimitError,
+    TimeoutError,
+)
+from ._models import (
+    BuildProgress,
+    Listing,
+    Move,
+    PublishedTemplate,
+    Retention,
+    RetiredTemplates,
+    Size,
+    Snapshot,
+    Template,
+    TemplateBuild,
+    TemplateCheck,
+    UsageReport,
+)
 
-__all__ = ["Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
+__all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
+
+#: A failure that polling again cannot fix.
+#:
+#: A wait swallows the transient ones — a hypervisor briefly away is exactly
+#: what a poll loop is for — and must not swallow these, or a wait against a
+#: deleted id, an expired key or a plan that does not permit the operation
+#: spends its whole timeout discovering it.
+PERMANENT = (AuthenticationError, PermissionDeniedError, NotFoundError, PlanLimitError)
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
 
@@ -244,6 +274,261 @@ class Templates:
     def list(self) -> builtins.list[Template]:
         data = self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
+
+    def schema(self) -> Mapping[str, Any]:
+        """The JSON Schema for a ``mandala/v1`` document.
+
+        Returned as it arrives rather than wrapped in a type, because it is a
+        schema: what a caller does with it is point an editor or a validator at
+        it, and a shape of our own over the top would be a second, worse
+        description of the same thing. Its ``$id`` is the URL it came from, so a
+        ``$ref`` to it resolves.
+        """
+        return self._t.json_object("GET", _api.TEMPLATE_SCHEMA)
+
+    def validate(self, document: str) -> TemplateCheck:
+        """Check a document without publishing it.
+
+        Side-effect free and claims no ref, so it is safe on a draft and safe to
+        call repeatedly. Worth doing while iterating: a document that is wrong
+        comes back with EVERY problem at once, where :meth:`publish` reports the
+        first thing that stops it.
+
+        Does not raise for an invalid document. That is not leniency — an
+        invalid document is the answer to the question this method asks, and the
+        platform says so with a 200. Read
+        :attr:`~mandala_computer.TemplateCheck.valid`.
+
+        The document goes as raw bytes, JSON or YAML, exactly as written. There
+        is no envelope to build and none to get wrong.
+        """
+        data = self._t.json_object(
+            "POST", _api.TEMPLATE_VALIDATE, content=_api.template_document(document)
+        )
+        return TemplateCheck.from_api(data)
+
+    def publish(self, document: str) -> PublishedTemplate:
+        """Store a document under a ref of your own, so a create can launch it.
+
+        THE NAMESPACE IS YOUR ACCOUNT. ``metadata.namespace`` has to be your
+        account id — anything else is a
+        :class:`~mandala_computer.PermissionDeniedError`, ``system`` included —
+        and this SDK does not rewrite it, because silently relocating somebody's
+        document would publish a ref that is not the one in the file they
+        submitted.
+
+        A REF IS IMMUTABLE. Publishing the identical document again succeeds and
+        changes nothing, so a pipeline that republishes on every commit is safe.
+        Publishing a DIFFERENT document under the same ref is a
+        :class:`~mandala_computer.ConflictError`, and the fix is to bump
+        ``metadata.version``. What counts as different is the digest, so a
+        changed label is a change.
+
+        A ref you have RETIRED stays spoken for and cannot be republished,
+        identical bytes included. See :meth:`retire`.
+        """
+        data = self._t.json_object("POST", _api.TEMPLATES, content=_api.template_document(document))
+        return PublishedTemplate.from_api(data)
+
+    def get(self, namespace: str, name: str, *, version: str | None = None) -> PublishedTemplate:
+        """Read one template back, as the document it was written as.
+
+        Works for your own namespace and for ``system``, so you can see what you
+        are layering onto. Another account's namespace is a
+        :class:`~mandala_computer.NotFoundError`, the same answer a name that
+        does not exist gets.
+
+        Without ``version`` this is the newest published version of that name —
+        which is also what a create naming the unpinned ``namespace/name``
+        resolves to. :attr:`~mandala_computer.PublishedTemplate.versions` lists
+        the rest.
+
+        A ref you retired is a :class:`~mandala_computer.NotFoundError` whose
+        message names the date it went, rather than claiming the template never
+        existed. Read the message before concluding you mistyped something.
+        """
+        data = self._t.json_object(
+            "GET",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return PublishedTemplate.from_api(data)
+
+    def retire(self, namespace: str, name: str, *, version: str | None = None) -> RetiredTemplates:
+        """Retire a template you published, so it stops resolving and stops
+        counting against your ceiling.
+
+        WITH ``version`` this retires that one version. WITHOUT it, this retires
+        EVERY version of the name — which is what "retire this template" means,
+        and is deliberately not :meth:`get`'s "the newest": a delete that
+        quietly took the latest one would let a loop walk backwards through a
+        history it never asked about. An empty string is refused here rather
+        than sent, for the same reason.
+
+        COMPUTERS ARE NOT AFFECTED. A computer is built from the IMAGE the ref
+        resolved to and holds no reference to the document, so anything already
+        running, stopped or suspended is untouched. What a retire breaks is
+        resolution: a NEW create naming the ref is refused.
+
+        THE REF IS STILL SPOKEN FOR, AND STILL COUNTS ONCE. Publishing it again
+        afterwards is a :class:`~mandala_computer.ConflictError`, identical
+        bytes included, and
+        :attr:`~mandala_computer.RetiredTemplates.refs_claimed` does not go
+        down. Publish the next version instead.
+        """
+        data = self._t.json_object(
+            "DELETE",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return RetiredTemplates.from_api(data)
+
+
+class Builds:
+    """Compiling template documents into images.
+
+    Its own collection rather than methods on :class:`Templates`, because a
+    build is not a property of a published template: ``POST /builds`` takes a
+    DOCUMENT, not a ref, and the job it answers with outlives the request and is
+    read back by its own id. Publishing and building are separate acts with very
+    different costs, and the platform keeps them apart for that reason.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def start(self, document: str, *, no_reuse: bool = False) -> TemplateBuild:
+        """Compile a document into a golden image, and return with a job.
+
+        A build takes minutes — an agent image is roughly fifteen — so this
+        never blocks. :meth:`wait` is what watches one, :meth:`progress` is the
+        poll and :meth:`events` is the stream.
+
+        THE NAMESPACE AND THE FAMILY BOTH HAVE TO BE YOURS, and either one is a
+        :class:`~mandala_computer.PermissionDeniedError`. ``spec.family`` is what
+        the built image is CALLED on a hypervisor, in a directory shared with
+        every computer on that machine, so a build may only write into
+        ``golden-<your account id>`` or that and a ``-`` and a name of your
+        choosing.
+
+        A :class:`~mandala_computer.ConflictError` means a hypervisor is busy —
+        one build runs per host at a time — rather than that anything is wrong
+        with the document, and is worth retrying.
+
+        ``no_reuse`` builds again even when an image already carries this
+        document's build digest. Identical documents normally share an image,
+        which is what makes a repeated build cheap.
+        """
+        data = self._t.json_object(
+            "POST",
+            _api.BUILDS,
+            content=_api.template_document(document),
+            params=_api.build_params(no_reuse),
+        )
+        return TemplateBuild.from_api(data)
+
+    def list(self) -> builtins.list[TemplateBuild]:
+        """Every build the fleet still holds a record of, newest first."""
+        data = self._t.json_array("GET", _api.BUILDS)
+        return [TemplateBuild.from_api(b) for b in data]
+
+    def get(self, build_id: str) -> TemplateBuild:
+        """What became of one build. ``error`` says why a failed one failed."""
+        return TemplateBuild.from_api(self._t.json_object("GET", _api.build(build_id)))
+
+    def progress(self, build_id: str) -> BuildProgress:
+        """What a build is DOING, as against what became of it.
+
+        The polling half; :meth:`events` is the same record as a stream. Use
+        this for anything that reconnects, restarts, or cannot hold a socket
+        open. It stays readable after the build has finished, so a program that
+        was not attached at the time can still see which step failed.
+        """
+        data = self._t.json_object("GET", _api.build_action(build_id, "progress"))
+        return BuildProgress.from_api(data)
+
+    def events(self, build_id: str) -> Iterator[BuildProgress]:
+        """The same record as :meth:`progress`, as an event stream.
+
+        Yields every ``progress`` and the final ``done``. A ``progress`` is sent
+        only when something actually moved, so every one of them is news; the
+        ``done`` is the last event of a build that finished, INCLUDING one that
+        failed — a failed build is a ``done`` whose ``status`` says ``failed``,
+        not an ``error`` event.
+
+        An ``error`` event means the STREAM could not go on and says nothing
+        about the build; it is raised, because a caller who kept reading would be
+        told nothing more and a build they still care about needs
+        :meth:`progress`. Attaching to a build that has already finished is not
+        an error — one ``progress`` and one ``done`` arrive immediately.
+
+        An account may hold eight of these open at once; the ninth is a
+        :class:`~mandala_computer.RateLimitError`.
+        """
+        for event in self._t.sse("GET", _api.build_action(build_id, "events")):
+            if event.event == "error":
+                raise MandalaError(_api.build_stream_failed(build_id, event.data))
+            if event.event not in ("progress", "done"):
+                continue
+            if not isinstance(event.data, Mapping):
+                continue
+            yield BuildProgress.from_api(event.data)
+            if event.event == "done":
+                return
+
+    def wait(self, build_id: str, timeout: float = 1800.0, poll: float = 5.0) -> BuildProgress:
+        """Block until a build stops running, and answer where it got to.
+
+        Polls :meth:`progress` rather than holding the stream open, because a
+        wait is the case the stream is worst at: it reconnects badly, it is
+        bounded to eight per account, and a caller who only wants the outcome
+        has no use for the events in between.
+
+        It does NOT raise for a build that failed. ``succeeded`` and ``failed``
+        are two situations with two remedies — one has an image and the other
+        has a step to fix — and an exception flattens them into "something went
+        wrong", which is the mistake the move work established the rule about.
+        Read ``status``, ``error``, and ``steps`` to see which step stopped it.
+
+        Raises :class:`~mandala_computer.TimeoutError` if the build is still
+        going when ``timeout`` runs out. The build is not stopped by that; only
+        the waiting is.
+
+        The default timeout is generous because the work is: most of a build is
+        copying a multi-gigabyte base image before a single step of the document
+        runs, and an agent image is roughly fifteen minutes in total.
+        """
+        deadline = time.monotonic() + timeout
+        last: BuildProgress | None = None
+        while True:
+            try:
+                last = self.progress(build_id)
+                # ``done`` and not a comparison against a list of statuses: the
+                # platform derives it from the JOB rather than from the phase,
+                # and the phase is read out of a log the document's own steps
+                # write into.
+                if last.done:
+                    return last
+            except PERMANENT:
+                # A build that does not exist, a key that does not work and a
+                # plan that does not permit this are not going to start working.
+                raise
+            except MandalaError:
+                # Everything else is what a poll loop is for — a hypervisor
+                # briefly away during a fifteen-minute build is ordinary.
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"build {build_id} was still running after {timeout:g}s"
+                    + (
+                        f" (phase {last.phase}, step {last.step} of {last.of}; "
+                        "the build has not stopped, only this wait has)"
+                        if last is not None
+                        else ": every poll failed"
+                    )
+                )
+            time.sleep(min(poll, remaining))
 
 
 class Moves:
