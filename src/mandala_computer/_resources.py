@@ -14,12 +14,13 @@ from . import _api
 from ._client import Transport
 from ._computer import Computer
 from ._exceptions import (
+    APIError,
     ConflictError,
     MandalaError,
     MoveRequiredError,
+    OriginTLSError,
     RateLimitError,
     TimeoutError,
-    UnavailableError,
 )
 from ._models import (
     BuildProgress,
@@ -42,31 +43,67 @@ __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "U
 def is_transient(err: BaseException) -> bool:
     """Whether a poll loop may swallow this and ask again.
 
-    Written as what may be RETRIED rather than what must be re-raised, which is
-    the way round that fails safe (adversarial review, OPL-3835). The first
-    version of :meth:`Builds.wait` re-raised a short list of permanent classes
-    and swallowed everything else — so a 400, a malformed body and a TLS failure
-    all burned the full half-hour default before surfacing as a misleading
-    timeout. A list of what to retry can only ever be too small; a list of what
-    to re-raise can be silently incomplete, and was.
+    STATUS-BASED for the caller-error range, class-based for the one deployment
+    fault, retry everything else. That shape took two reviews to arrive at, and
+    both corrections are worth keeping:
 
-    The TypeScript SDK's ``isTransient``, class for class, because the two
-    clients disagreeing about what is worth retrying is its own open ticket
-    (OPL-3724) and this is not the place to open a second front. A move offer is
-    excluded for its reason: it is a ``ConflictError`` subclass and is a DECISION
-    about the size asked for, so the same request answers the same way for ever.
+    * It began as a deny-list of four permanent classes with ``except
+      MandalaError: pass`` under it, which swallowed a 400 and a malformed body
+      for the full half-hour default before surfacing as a misleading timeout.
+    * It was then an allow-list of three transient classes, which was worse in
+      the other direction: it dropped every failure the original rode out.
+      :class:`~mandala_computer.GatewayTimeoutError` (504/524),
+      :class:`~mandala_computer.OriginUnreachableError` (521-523) and
+      :class:`~mandala_computer.OriginResponseError` (520) all became fatal —
+      and ``OriginUnreachableError``'s own docstring in this package calls itself
+      "a passing outage" and says to retry a read freely. So did this SDK's own
+      :class:`~mandala_computer.TimeoutError`, which is what a poll capped by
+      ``timeout_cap`` raises when one fan-out runs long: a single slow poll
+      fourteen minutes into a build ended the wait.
 
-    ONE DIFFERENCE FROM TYPESCRIPT, stated rather than hidden. That SDK also
-    retries a ``ConnectionError``; this one has no such class — a request that
-    fails before a response arrives becomes a bare :class:`MandalaError` (see
-    ``_request_failed``), which is indistinguishable here from a malformed body.
-    So a dropped connection propagates from a Python wait where it would be
-    retried in TypeScript. Naming a new public exception class is a wider change
-    than this ticket, and propagating is the safe direction to be wrong in.
+    A 4xx is a request the platform refused on its merits, and repeating it
+    unchanged cannot change the answer — except a 429, which is a request that
+    was fine and arrived too often. Everything at 5xx, every transport failure
+    and every timeout is the passing kind, which is what a poll loop is for.
+
+    An ``OriginTLSError`` is a 525/526 and the 5xx rule would retry it, so it is
+    named: the edge and the platform disagreeing about a certificate fails
+    identically on every retry and is a deployment somebody has to fix. The same
+    call ``_FATAL_WHILE_WAITING`` in _computer.py makes about it.
+
+    A move offer is excluded for its own reason — it is a
+    :class:`~mandala_computer.ConflictError` subclass and is a DECISION about the
+    size asked for, so the same request answers the same way for ever. It cannot
+    arise from a build poll; it is named so the predicate stays true wherever it
+    is reused.
     """
-    if isinstance(err, MoveRequiredError):
+    if isinstance(err, MoveRequiredError | OriginTLSError):
         return False
-    return isinstance(err, (ConflictError, RateLimitError, UnavailableError))
+    # The two 4xx that are not decisions, named ahead of the range rule. A 409 is
+    # a hypervisor already building — one build runs per host — and a 429 is a
+    # request that was fine and arrived too often. Whether a 409 clears is in the
+    # BODY and not the status, which is why MoveRequiredError is excluded above
+    # rather than here.
+    if isinstance(err, ConflictError | RateLimitError):
+        return True
+    if isinstance(err, APIError):
+        return not (400 <= err.status < 500)
+    # A transport failure, a body that did not parse, a poll that ran past its
+    # cap: none of them says the request was wrong.
+    return True
+
+
+def retry_delay(poll: float, err: BaseException) -> float:
+    """The ordinary polling delay, raised when the platform asked us to wait.
+
+    A 429 retried on a fixed five-second poll is the loop that caused it. The
+    TypeScript SDK has had ``retryDelay`` since the move work; this is the same
+    thing, and the reason it did not exist here is that no Python wait retried a
+    429 until this one.
+    """
+    if isinstance(err, RateLimitError) and err.retry_after:
+        return max(poll, err.retry_after)
+    return poll
 
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
@@ -609,6 +646,7 @@ class Builds:
                 if not is_transient(err):
                     raise
                 observed = False
+                poll = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))

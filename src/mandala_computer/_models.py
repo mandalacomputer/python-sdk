@@ -330,6 +330,16 @@ class VncConnect:
 @dataclass(frozen=True)
 class Template:
     name: str
+    #: The pinned ``namespace/name@version``, when the platform sent one.
+    #:
+    #: ``None`` only from a host too old to advertise refs. It matters more than
+    #: it looks: since OPL-3789 a template an account PUBLISHED is named by its
+    #: ref and by nothing else — the short ``name`` still resolves to the
+    #: platform's own catalogue — so a listing without this cannot tell a caller
+    #: how to launch their own template. ``publicTemplate`` in the platform's
+    #: lib/projection publishes it for exactly that reason, and this model was
+    #: dropping it on the floor.
+    ref: str | None
     label: str
     os: str
     cpu: int
@@ -339,8 +349,10 @@ class Template:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Template:
+        ref = d.get("ref")
         return cls(
             name=_text(d.get("name")),
+            ref=None if ref is None else _text(ref),
             label=_text(d.get("label")),
             os=_text(d.get("os")),
             cpu=_num(d.get("cpu")),

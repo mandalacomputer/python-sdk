@@ -34,6 +34,7 @@ from ._resources import (
     Templates,
     _wait_timed_out,
     is_transient,
+    retry_delay,
     warn_cleanup_failed,
 )
 
@@ -348,6 +349,7 @@ class AsyncBuilds:
                 if not is_transient(err):
                     raise
                 observed = False
+                poll = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))

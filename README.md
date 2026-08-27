@@ -159,8 +159,11 @@ build = client.builds.start(doc)
 out = client.builds.wait(build.id)
 
 if out.status != "succeeded":
+    # There may be no failed STEP: most of a build is copying the base image, and
+    # a build that dies in `staging` or `copying` never reaches the first one.
     failed = next((s for s in out.steps if s.status == "failed"), None)
-    print(f"step {failed.n} ({failed.kind} {failed.label}) failed: {out.error}")
+    where = f"step {failed.n} ({failed.kind} {failed.label})" if failed else f"phase {out.phase}"
+    print(f"{where} failed: {out.error}")
 ```
 
 `wait()` does **not** raise for a build that failed. `succeeded` and `failed` are

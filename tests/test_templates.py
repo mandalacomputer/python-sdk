@@ -667,3 +667,101 @@ def test_a_complete_build_listing_is_an_ordinary_list(client: mc.Client) -> None
     builds = client.builds.list()
     assert len(builds) == 1
     assert builds[0].id == "bld-1"
+
+
+# --- what /code-review found on top of the adversarial pass ----------------
+
+
+class Sneaky(str):
+    """A ``str`` subclass whose ``strip()`` lies about being empty."""
+
+    def strip(self, *a: object) -> str:
+        return "x"
+
+
+def test_the_document_guard_canonicalises_before_it_checks() -> None:
+    """The one guard the previous pass said it had fixed and had not.
+
+    ``seg`` and ``template_version_params`` canonicalise first; this one checked
+    ``strip()`` on the caller's object and canonicalised afterwards, so a
+    subclass overriding ``strip`` passed the emptiness check and encoded to
+    nothing — an empty body on the wire, under a comment claiming otherwise.
+    """
+    with pytest.raises(ValueError):
+        _api.template_document(Sneaky(""))
+
+
+def test_a_trailing_newline_is_not_a_version() -> None:
+    """Python's ``$`` also matches just before a trailing newline.
+
+    So ``"1.0.0\n"`` satisfied the anchored pattern and went out as
+    ``?version=1.0.0%0A``. The platform's grammar is a JavaScript regex where
+    ``$`` is end-of-input, so it answers 400 — the exact round trip this guard
+    exists to save.
+    """
+    with pytest.raises(ValueError):
+        _api.template_version_params("1.0.0\n")
+    assert _api.template_version_params("1.0.0") == {"version": "1.0.0"}
+
+
+@pytest.mark.parametrize(
+    ("err", "retried"),
+    [
+        (mc.ConflictError("busy", status=409), True),
+        (mc.RateLimitError("slow down", status=429), True),
+        (mc.UnavailableError("no host", status=503), True),
+        (mc.GatewayTimeoutError("gateway", status=504), True),
+        (mc.OriginUnreachableError("origin", status=523), True),
+        (mc.OriginResponseError("origin", status=520), True),
+        (mc.TimeoutError("poll ran long"), True),
+        (mc.MandalaError("body did not parse"), True),
+        (mc.APIError("bad request", status=400), False),
+        (mc.NotFoundError("no such build", status=404), False),
+        (mc.PlanLimitError("no", status=402), False),
+        (mc.OriginTLSError("cert", status=525), False),
+    ],
+)
+def test_the_retry_policy_keeps_the_passing_failures_and_drops_the_decisions(
+    err: BaseException, retried: bool
+) -> None:
+    """A 4xx is a request refused on its merits; a 5xx is a passing outage.
+
+    The allow-list this replaced retried only three classes, so a 504 or a poll
+    that ran past its own cap ended a fourteen-minute wait — and
+    OriginUnreachableError's own docstring calls itself a passing outage.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(err) is retried
+
+
+def test_a_rate_limit_is_retried_no_sooner_than_it_asked() -> None:
+    """A 429 retried on a fixed five-second poll is the loop that caused it."""
+    from mandala_computer._resources import retry_delay
+
+    assert retry_delay(5.0, mc.RateLimitError("slow", status=429, retry_after=30.0)) == 30.0
+    assert retry_delay(5.0, mc.RateLimitError("slow", status=429)) == 5.0
+    assert retry_delay(5.0, mc.UnavailableError("away", status=503)) == 5.0
+
+
+@respx.mock
+def test_wait_rides_out_a_gateway_timeout(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(504, json={"error": "gateway timeout"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    assert client.builds.wait("bld-1", poll=0.01).status == "succeeded"
+
+
+def test_a_template_row_carries_its_ref() -> None:
+    """Since OPL-3789 a published template is named by its ref and nothing else.
+
+    A listing that drops it cannot tell a caller how to launch their own
+    template, which is what the platform's publicTemplate publishes it for.
+    """
+    t = mc.Template.from_api({"name": "devbox", "ref": "acc-1/devbox@1.0.0"})
+    assert t.ref == "acc-1/devbox@1.0.0"
+    # Absent stays absent: a host too old to advertise refs sends none.
+    assert mc.Template.from_api({"name": "base"}).ref is None

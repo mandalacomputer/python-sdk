@@ -157,8 +157,15 @@ def template_ref(namespace: str, name: str) -> str:
     return f"{TEMPLATES}/{seg(namespace)}/{seg(name)}"
 
 
-#: ``MAJOR.MINOR.PATCH``, no leading zeros — the platform's own version grammar.
-_VERSION = re.compile(r"^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$")
+#: ``MAJOR.MINOR.PATCH``, no leading zeros.
+#:
+#: Matched with ``fullmatch``, not ``match``: Python's ``$`` also matches just
+#: before a trailing newline, so ``"1.0.0\n"`` satisfied the anchored pattern and
+#: was sent as ``?version=1.0.0%0A``. The platform's own ``wellFormedVersion``
+#: uses a JavaScript regex, where ``$`` is end-of-input, so it answers 400 — the
+#: exact round trip this guard exists to save. Two languages, one grammar, and
+#: the anchors are not the same.
+_VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
 
 
 def template_version_params(version: str | None) -> dict[str, str]:
@@ -179,7 +186,7 @@ def template_version_params(version: str | None) -> dict[str, str]:
     if version is None:
         return {}
     version = canonical(version, "version")
-    if not _VERSION.match(version):
+    if not _VERSION.fullmatch(version):
         raise ValueError(
             f"version must be MAJOR.MINOR.PATCH with no leading zeros (got {version!r}); "
             "omit it entirely to name the whole template"
@@ -198,12 +205,15 @@ def template_document(document: str) -> bytes:
     platform answers 400 for it, and that is a round trip that never had to
     happen.
     """
-    if not isinstance(document, str) or not document.strip():
+    # Canonical FIRST, which is what makes the check below binding on the bytes
+    # that leave. Ordered the other way — as it was — a str subclass overriding
+    # ``strip()`` passed the emptiness check and then encoded to nothing, so an
+    # empty body went on the wire under a comment claiming it could not. The one
+    # guard the previous pass said it had fixed and had not.
+    text = canonical(document, "document")
+    if not text.strip():
         raise ValueError("document must be a non-empty template document, as JSON or YAML")
-    # Canonical for the reason :func:`canonical` gives: ``encode`` is overridable,
-    # and the bytes that go on the wire should be the ones ``strip()`` just
-    # agreed were non-empty.
-    return canonical(document, "document").encode("utf-8")
+    return text.encode("utf-8")
 
 
 def build(build_id: str) -> str:
@@ -218,8 +228,16 @@ def build_action(build_id: str, action: str) -> str:
 def build_params(no_reuse: bool) -> dict[str, str]:
     """``no_reuse``, sent only when it is asked for.
 
-    The platform reads the PRESENCE of the key rather than its value, so
-    ``no_reuse=false`` would ask for the opposite of what it says.
+    Omitted rather than sent as ``false``, and the reason is the documented
+    schema rather than a claim about the parser: ``lib/apidoc`` gives this
+    parameter ``enum: ['true']``, so ``true`` is the only value the reference
+    admits and a client sending ``false`` is sending something undocumented.
+
+    An earlier comment here said the platform reads the key's PRESENCE, which is
+    false — ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` — and the
+    same false claim was repeated in the other two clients and pinned as a test
+    docstring. The emitted request was right either way; the stated reason was
+    not.
     """
     return {"no_reuse": "true"} if no_reuse else {}
 
