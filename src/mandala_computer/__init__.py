@@ -53,6 +53,7 @@ from ._exceptions import (
     APIError,
     AuthenticationError,
     ConflictError,
+    ConnectionError,
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
@@ -67,6 +68,7 @@ from ._exceptions import (
     RateLimitError,
     TimeoutError,
     UnavailableError,
+    is_transient,
 )
 from ._models import (
     BuildProgress,
@@ -121,6 +123,7 @@ __all__ = [
     "Computer",
     "ComputerUsage",
     "ConflictError",
+    "ConnectionError",
     "ExecResult",
     "ExecStatus",
     "FilePart",
@@ -156,6 +159,7 @@ __all__ = [
     "Window",
     "WindowResult",
     "__version__",
+    "is_transient",
 ]
 
 

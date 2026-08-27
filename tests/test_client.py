@@ -351,6 +351,118 @@ def test_wait_until_running_times_out(client: mc.Client) -> None:
         c.wait_until_running(timeout=0, poll=0)
 
 
+def test_the_public_retry_predicate_is_safe_for_a_create() -> None:
+    """`is_transient` is exported, so its caller may be wrapping anything.
+
+    This SDK had no public predicate at all before OPL-3724 — only a private
+    fatal set that one wait consulted — so applications had no answer to give
+    but "catch MandalaError and hope". The four classes below are the whole of
+    it, and they are the same four in all three clients.
+
+    What is deliberately absent is everything whose outcome is UNKNOWN. "Worth
+    trying again" is not "the call definitely did not happen", and replaying a
+    create through a 502 is how one computer becomes two, both billable, on the
+    strength of an error that looked like nothing happened.
+    """
+    assert mc.is_transient(mc.ConflictError("busy", status=409)) is True
+    assert mc.is_transient(mc.RateLimitError("slow down", status=429)) is True
+    assert mc.is_transient(mc.UnavailableError("no host", status=503)) is True
+    assert mc.is_transient(mc.ConnectionError("connection reset")) is True
+
+    assert (
+        mc.is_transient(mc.MoveRequiredError("needs a move", status=409, move_possible=True))
+        is False
+    )
+    for status in (400, 401, 402, 403, 404, 502, 504, 520, 521, 522, 523, 524, 525, 526):
+        assert mc.is_transient(mc.APIError(f"HTTP {status}", status=status)) is False
+    assert mc.is_transient(mc.TimeoutError("the SDK gave up")) is False
+    assert mc.is_transient(ValueError("a bug in the caller")) is False
+
+
+@respx.mock
+def test_a_connection_failure_has_a_class_the_predicates_can_name() -> None:
+    """`_request_failed` raised a bare MandalaError, which nothing could match.
+
+    That is why this SDK could not have `is_transient`: the one failure both
+    sibling clients name in theirs — the request never completing — had no type
+    here. It is also Python's own ConnectionError, so either handler catches it.
+    """
+    import builtins
+
+    err = mc.ConnectionError("GET /computers could not complete")
+    assert isinstance(err, mc.MandalaError)
+    assert isinstance(err, builtins.ConnectionError)
+    assert mc.is_transient(err) is True
+
+
+@respx.mock
+def test_the_control_plane_waits_ride_out_a_blip_instead_of_ending(client: mc.Client) -> None:
+    """The bug OPL-3724 turned up while reconciling three retry policies.
+
+    ``wait_until_running``, ``wait_until_built`` and ``wait_for_move`` read the
+    computer's state with no retry around them at all — a documented gap, and
+    the sentence describing it sat in ``OriginUnreachableError``'s own docstring.
+    So one 503 mid-boot ended the wait and told the caller the machine had not
+    come up, when what had happened was a single poll not landing. Both sibling
+    clients had polled through these for as long as they had had wait loops.
+    """
+    for status in (502, 503, 504, 520, 522):
+        respx.get(f"{BASE}/computers/vm-1").mock(
+            side_effect=[
+                httpx.Response(200, json={**COMPUTER, "status": "starting"}),
+                httpx.Response(status, content=b""),
+                httpx.Response(200, json={**COMPUTER, "status": "running"}),
+            ]
+        )
+        c = mc.Computer(client._t, {**COMPUTER, "status": "starting"})
+        assert c.wait_until_running(timeout=5, poll=0).status == "running"
+
+
+@respx.mock
+def test_the_control_plane_waits_still_stop_on_a_refusal(client: mc.Client) -> None:
+    """The other side of that line, and what keeps the deny-list honest.
+
+    A 401 or a 400 answers the same way on every poll, so swallowing one spends
+    the caller's whole timeout to arrive at the wrong cause. Only failures that
+    describe the MOMENT are waited out; these describe the request.
+    """
+    for status, expected in (
+        (400, mc.APIError),
+        (401, mc.AuthenticationError),
+        (404, mc.NotFoundError),
+        (526, mc.OriginTLSError),
+    ):
+        respx.get(f"{BASE}/computers/vm-1").mock(
+            side_effect=[
+                httpx.Response(200, json={**COMPUTER, "status": "starting"}),
+                httpx.Response(status, json={"error": "no"}),
+            ]
+        )
+        c = mc.Computer(client._t, {**COMPUTER, "status": "starting"})
+        with pytest.raises(expected):
+            c.wait_until_running(timeout=30, poll=0)
+
+
+@respx.mock
+def test_a_move_wait_survives_a_poll_that_did_not_land(client: mc.Client) -> None:
+    """A move goes on running behind a failed poll, so ending the wait loses it.
+
+    ``wait_for_move``'s read was bare too, and this is the wait where giving up
+    costs most: the disk is still crossing between two hosts and there is no
+    calling it back.
+    """
+    live = {"computer_id": "vm-1", "state": "moving", "live": True}
+    done = {"computer_id": "vm-1", "state": "moved", "live": False}
+    respx.get(f"{BASE}/moves").mock(
+        side_effect=[
+            httpx.Response(200, json={"moves": [live]}),
+            httpx.Response(522, content=b""),
+            httpx.Response(200, json={"moves": [done]}),
+        ]
+    )
+    assert _computer(client).wait_for_move(timeout=5, poll=0).state == "moved"
+
+
 @respx.mock
 def test_wait_until_running_caps_refresh_to_its_remaining_budget(client: mc.Client) -> None:
     route = respx.get(f"{BASE}/computers/vm-1").mock(
@@ -1983,14 +2095,60 @@ def test_wait_for_guest_still_waits_through_a_booting_agent(client: mc.Client) -
 
 
 @respx.mock
-def test_wait_for_guest_preserves_a_rate_limit(client: mc.Client) -> None:
+def test_wait_for_guest_polls_through_a_rate_limit_on_the_platform_cadence(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """429 is a moment, and the header says how long the moment lasts.
+
+    It was in ``_FATAL_WHILE_WAITING`` for a real reason: a rate limit clears
+    only on the server's cadence, and a helper that replaces that with its own
+    faster poll turns a short limit into a longer one. But failing a wait the
+    caller asked for is not the remedy for that — honouring ``Retry-After`` is,
+    and it is what every poll loop in both clients now does (OPL-3724).
+
+    The header, not ``poll=0``, is what this waits: the caller asked for no
+    interval at all and the platform asked for twelve seconds.
+    """
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(429, headers={"Retry-After": "12"}, json={"error": "slow down"})
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "12"}, json={"error": "slow down"}),
+            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+        ]
     )
-    with pytest.raises(mc.RateLimitError) as caught:
-        _computer(client).wait_for_guest(timeout=30, poll=0)
-    assert caught.value.retry_after == 12
-    assert route.call_count == 1
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    slept: list[float] = []
+    monkeypatch.setattr(mc._computer.time, "sleep", slept.append)
+    _computer(client).wait_for_guest(timeout=30, poll=0)
+    assert route.call_count == 2
+    assert 12 in slept
+
+
+@respx.mock
+def test_wait_for_guest_still_gives_up_on_a_refusal_that_will_not_clear(
+    client: mc.Client,
+) -> None:
+    """The other half of dropping the fatal tuple: it must not have dropped these.
+
+    A revoked key, a computer that is not there, a plan that does not cover the
+    call and a certificate the edge cannot agree on all answer the same way on
+    every poll. Waiting one out costs the whole timeout and then reports "the
+    guest did not respond" — the wrong cause, and the least useful thing this
+    method could say about any of them.
+    """
+    for status, expected in (
+        (401, mc.AuthenticationError),
+        (403, mc.PermissionDeniedError),
+        (404, mc.NotFoundError),
+        (402, mc.PlanLimitError),
+        (526, mc.OriginTLSError),
+    ):
+        respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(status, json={"error": "no"}))
+        respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+        started = time.monotonic()
+        with pytest.raises(expected):
+            _computer(client).wait_for_guest(timeout=30, poll=0)
+        # Raised on the first probe rather than waited out.
+        assert time.monotonic() - started < 5
 
 
 @respx.mock
