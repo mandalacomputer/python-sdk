@@ -14,12 +14,12 @@ from . import _api
 from ._client import Transport
 from ._computer import Computer
 from ._exceptions import (
-    AuthenticationError,
+    ConflictError,
     MandalaError,
-    NotFoundError,
-    PermissionDeniedError,
-    PlanLimitError,
+    MoveRequiredError,
+    RateLimitError,
     TimeoutError,
+    UnavailableError,
 )
 from ._models import (
     BuildProgress,
@@ -38,13 +38,36 @@ from ._models import (
 
 __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
 
-#: A failure that polling again cannot fix.
-#:
-#: A wait swallows the transient ones — a hypervisor briefly away is exactly
-#: what a poll loop is for — and must not swallow these, or a wait against a
-#: deleted id, an expired key or a plan that does not permit the operation
-#: spends its whole timeout discovering it.
-PERMANENT = (AuthenticationError, PermissionDeniedError, NotFoundError, PlanLimitError)
+
+def is_transient(err: BaseException) -> bool:
+    """Whether a poll loop may swallow this and ask again.
+
+    Written as what may be RETRIED rather than what must be re-raised, which is
+    the way round that fails safe (adversarial review, OPL-3835). The first
+    version of :meth:`Builds.wait` re-raised a short list of permanent classes
+    and swallowed everything else — so a 400, a malformed body and a TLS failure
+    all burned the full half-hour default before surfacing as a misleading
+    timeout. A list of what to retry can only ever be too small; a list of what
+    to re-raise can be silently incomplete, and was.
+
+    The TypeScript SDK's ``isTransient``, class for class, because the two
+    clients disagreeing about what is worth retrying is its own open ticket
+    (OPL-3724) and this is not the place to open a second front. A move offer is
+    excluded for its reason: it is a ``ConflictError`` subclass and is a DECISION
+    about the size asked for, so the same request answers the same way for ever.
+
+    ONE DIFFERENCE FROM TYPESCRIPT, stated rather than hidden. That SDK also
+    retries a ``ConnectionError``; this one has no such class — a request that
+    fails before a response arrives becomes a bare :class:`MandalaError` (see
+    ``_request_failed``), which is indistinguishable here from a malformed body.
+    So a dropped connection propagates from a Python wait where it would be
+    retried in TypeScript. Naming a new public exception class is a wider change
+    than this ticket, and propagating is the safe direction to be wrong in.
+    """
+    if isinstance(err, MoveRequiredError):
+        return False
+    return isinstance(err, (ConflictError, RateLimitError, UnavailableError))
+
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
 
@@ -384,6 +407,32 @@ class Templates:
         return RetiredTemplates.from_api(data)
 
 
+def _wait_timed_out(
+    build_id: str, timeout: float, last: BuildProgress | None, observed: bool
+) -> str:
+    """What a build wait says when it gives up.
+
+    Three sentences rather than one, because the three situations differ in what
+    the caller should do next: a build seen running, a build that stopped
+    answering, and one that never answered at all. Shared by the sync and async
+    waits so they cannot word it differently.
+    """
+    if last is not None and observed:
+        return (
+            f"build {build_id} was still running after {timeout:g}s "
+            f"(phase {last.phase}, step {last.step} of {last.of}; "
+            "the build has not stopped, only this wait has)"
+        )
+    if last is not None:
+        return (
+            f"build {build_id} could not be reached for the last part of {timeout:g}s; "
+            f"when it last answered it was in phase {last.phase}, step {last.step} of "
+            f"{last.of}. The build has not stopped, only this wait has — read progress() "
+            "for where it got to."
+        )
+    return f"build {build_id} could not be observed within {timeout:g}s: every poll failed"
+
+
 class Builds:
     """Compiling template documents into images.
 
@@ -436,7 +485,7 @@ class Builds:
         """What became of one build. ``error`` says why a failed one failed."""
         return TemplateBuild.from_api(self._t.json_object("GET", _api.build(build_id)))
 
-    def progress(self, build_id: str) -> BuildProgress:
+    def progress(self, build_id: str, *, timeout_cap: float | None = None) -> BuildProgress:
         """What a build is DOING, as against what became of it.
 
         The polling half; :meth:`events` is the same record as a stream. Use
@@ -444,7 +493,9 @@ class Builds:
         open. It stays readable after the build has finished, so a program that
         was not attached at the time can still see which step failed.
         """
-        data = self._t.json_object("GET", _api.build_action(build_id, "progress"))
+        data = self._t.json_object(
+            "GET", _api.build_action(build_id, "progress"), timeout_cap=timeout_cap
+        )
         return BuildProgress.from_api(data)
 
     def events(self, build_id: str) -> Iterator[BuildProgress]:
@@ -471,10 +522,21 @@ class Builds:
             if event.event not in ("progress", "done"):
                 continue
             if not isinstance(event.data, Mapping):
+                # A malformed ``done`` is the end of the stream with the answer
+                # missing, and skipping it left this waiting on a connection the
+                # platform had finished with. A malformed ``progress`` is
+                # different — it is news rather than an answer, so it is skipped
+                # and the next one is read.
+                if event.event == "done":
+                    raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
             yield BuildProgress.from_api(event.data)
             if event.event == "done":
                 return
+        # The stream ended without saying so. Returning here is indistinguishable
+        # from finishing, so a caller looping over this would report a build it
+        # stopped watching as a build that ended.
+        raise MandalaError(_api.build_stream_truncated(build_id, malformed=False))
 
     def wait(self, build_id: str, timeout: float = 1800.0, poll: float = 5.0) -> BuildProgress:
         """Block until a build stops running, and answer where it got to.
@@ -500,34 +562,40 @@ class Builds:
         """
         deadline = time.monotonic() + timeout
         last: BuildProgress | None = None
+        # Whether the MOST RECENT poll answered, as against whether any ever did.
+        # Without it the timeout quotes a stale ``last`` and says the build "was
+        # still running" — a claim about the present tense, made from a reading
+        # that may be half an hour old and followed by nothing but failures.
+        observed = False
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
             try:
-                last = self.progress(build_id)
+                # The poll carries what is left of the wait, not the client's own
+                # timeout. Without the cap a ``wait(timeout=1)`` could sit in one
+                # request for the default sixty seconds — and for ever against a
+                # caller-supplied client with no timeout at all. The same cap
+                # Computer.wait_until_built passes to its refresh.
+                last = self.progress(build_id, timeout_cap=remaining)
+                observed = True
                 # ``done`` and not a comparison against a list of statuses: the
                 # platform derives it from the JOB rather than from the phase,
                 # and the phase is read out of a log the document's own steps
                 # write into.
                 if last.done:
                     return last
-            except PERMANENT:
-                # A build that does not exist, a key that does not work and a
-                # plan that does not permit this are not going to start working.
-                raise
-            except MandalaError:
-                # Everything else is what a poll loop is for — a hypervisor
-                # briefly away during a fifteen-minute build is ordinary.
-                pass
+            except MandalaError as err:
+                # A hypervisor briefly away during a fifteen-minute build is
+                # ordinary, and is what this loop is for. Everything else —
+                # a 400, a malformed body, a TLS failure — is a defect rather
+                # than a phase and propagates now rather than in half an hour.
+                if not is_transient(err):
+                    raise
+                observed = False
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(
-                    f"build {build_id} was still running after {timeout:g}s"
-                    + (
-                        f" (phase {last.phase}, step {last.step} of {last.of}; "
-                        "the build has not stopped, only this wait has)"
-                        if last is not None
-                        else ": every poll failed"
-                    )
-                )
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
             time.sleep(min(poll, remaining))
 
 

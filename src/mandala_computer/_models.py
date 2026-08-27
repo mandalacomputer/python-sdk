@@ -67,6 +67,25 @@ def _real(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
+def _texts(value: Any) -> builtins.list[str]:
+    """A list-of-strings field off the wire, or empty when it is unusable.
+
+    ``d.get("x") or []`` reads as a safe default and is not one (adversarial
+    review, OPL-3835). It guards ``None`` and nothing else: a NUMBER raises a
+    bare ``TypeError`` out of the comprehension — from a public method, about a
+    field the caller never named — and a STRING iterates by character, so
+    ``"1.2.3"`` silently became ``['1', '.', '2', '.', '3']``. A version list
+    that decodes to punctuation is worse than one that decodes to nothing.
+
+    Degrading rather than raising is this module's stated contract: unknown and
+    malformed fields are preserved in ``raw`` and never rejected, so a platform
+    that starts answering differently does not break older clients.
+    """
+    if not isinstance(value, builtins.list):
+        return []
+    return [_text(v) for v in value]
+
+
 def _text(value: Any) -> str:
     """A string field off the wire, with JSON null represented as empty."""
     return "" if value is None else str(value)
@@ -369,7 +388,7 @@ class PublishedTemplate:
             doc_digest=_text(d.get("doc_digest")),
             document=dict(document) if isinstance(document, Mapping) else {},
             template=Template.from_api(template if isinstance(template, Mapping) else {}),
-            versions=[_text(v) for v in d.get("versions") or []],
+            versions=_texts(d.get("versions")),
             # None stays None rather than becoming "": a shipped template was
             # not published by anybody, and an empty timestamp reads as one that
             # is known and blank rather than one that does not apply.
@@ -412,7 +431,7 @@ class TemplateCheck:
 
         return cls(
             valid=bool(d.get("valid", False)),
-            problems=[_text(p) for p in d.get("problems") or []],
+            problems=_texts(d.get("problems")),
             ref=maybe("ref"),
             doc_digest=maybe("doc_digest"),
             build_digest=maybe("build_digest"),
@@ -457,9 +476,9 @@ class RetiredTemplates:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> RetiredTemplates:
         return cls(
-            retired=[_text(r) for r in d.get("retired") or []],
+            retired=_texts(d.get("retired")),
             retired_at=_text(d.get("retired_at")),
-            versions=[_text(v) for v in d.get("versions") or []],
+            versions=_texts(d.get("versions")),
             templates=_num(d.get("templates")),
             refs_claimed=_num(d.get("refs_claimed")),
             raw=dict(d),
@@ -588,7 +607,8 @@ class BuildProgress:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> BuildProgress:
-        rows = d.get("steps") or []
+        rows = d.get("steps")
+        rows = rows if isinstance(rows, builtins.list) else []
         return cls(
             id=_text(d.get("id")),
             status=_text(d.get("status")),

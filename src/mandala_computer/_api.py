@@ -51,6 +51,41 @@ USAGE = "usage"
 RETENTION = "retention"
 
 
+def canonical(value: object, what: str) -> str:
+    """A real ``str``, whatever was handed in.
+
+    Every guard in this file validates a string and then hands the ORIGINAL on
+    to something that stringifies or encodes it again — and a ``str`` SUBCLASS
+    can answer differently the second time (adversarial review, OPL-3835). Two
+    were live:
+
+    * ``template_version_params`` matched the regex against the buffer, then
+      returned the object; httpx serialises a query value with ``str(value)``, so
+      a subclass whose ``__str__`` answers ``""`` passed the check and sent
+      ``?version=`` — the empty-version branch, which on a retire means every
+      version of the name and cannot be undone.
+    * ``seg`` checked ``strip(".")`` on the buffer, then called ``quote``, which
+      calls the value's own ``encode()``; a subclass returning ``b".."`` became a
+      dot segment that the client normalises into a different route.
+
+    ``str.__str__`` reads the underlying buffer rather than any override, so what
+    comes back cannot disagree with what was checked. A non-string is refused
+    here rather than coerced: ``str(None)`` is ``"None"``, which is a plausible
+    id and a nonsense one.
+    """
+    if not isinstance(value, str):
+        # ValueError, not the TypeError ruff prefers, and deliberately: every
+        # other refusal in this file is a ValueError — `seg` for an empty or
+        # all-dots id, `template_version_params` for a malformed version — and a
+        # caller wrapping a call in `except ValueError` should not catch "that is
+        # not a version" while missing "that is not a string". One type for one
+        # class of mistake beats the rule.
+        raise ValueError(  # noqa: TRY004
+            f"{what} must be a string, not {type(value).__name__}"
+        )
+    return str.__str__(value)
+
+
 def seg(value: str) -> str:
     """One path segment, percent-encoded — including ``/``.
 
@@ -71,6 +106,7 @@ def seg(value: str) -> str:
     a bad thing to hand a purge loop. An empty id does the same to the
     collection route. Neither is a real id, so both are refused here.
     """
+    value = canonical(value, "id")
     if not value.strip("."):
         raise ValueError(f"id must not be empty or all dots: {value!r}")
     return quote(value, safe="")
@@ -142,6 +178,7 @@ def template_version_params(version: str | None) -> dict[str, str]:
     """
     if version is None:
         return {}
+    version = canonical(version, "version")
     if not _VERSION.match(version):
         raise ValueError(
             f"version must be MAJOR.MINOR.PATCH with no leading zeros (got {version!r}); "
@@ -163,7 +200,10 @@ def template_document(document: str) -> bytes:
     """
     if not isinstance(document, str) or not document.strip():
         raise ValueError("document must be a non-empty template document, as JSON or YAML")
-    return document.encode("utf-8")
+    # Canonical for the reason :func:`canonical` gives: ``encode`` is overridable,
+    # and the bytes that go on the wire should be the ones ``strip()`` just
+    # agreed were non-empty.
+    return canonical(document, "document").encode("utf-8")
 
 
 def build(build_id: str) -> str:
@@ -199,6 +239,21 @@ def build_stream_failed(build_id: str, data: Any) -> str:
     return (
         f"the build event stream for {build_id} ended: {detail or 'no reason given'} "
         f"(this says nothing about the build itself — read builds.progress({build_id!r}))"
+    )
+
+
+def build_stream_truncated(build_id: str, *, malformed: bool) -> str:
+    """What to say when a build's event stream stops without a final answer.
+
+    Both halves of the same failure: the platform's contract is that ``done`` is
+    the last event, so a stream that ends without one — or with one whose payload
+    is not a record — has been cut rather than completed. One function so the
+    sync and async halves cannot word it differently.
+    """
+    how = "with a malformed final event" if malformed else "without a final event"
+    return (
+        f"the build event stream for {build_id} ended {how}; the build is probably still "
+        f"running — read progress({build_id!r}) for the outcome"
     )
 
 

@@ -28,7 +28,14 @@ from ._models import (
     TemplateCheck,
     UsageReport,
 )
-from ._resources import EPHEMERAL_DOC, PERMANENT, Builds, Templates, warn_cleanup_failed
+from ._resources import (
+    EPHEMERAL_DOC,
+    Builds,
+    Templates,
+    _wait_timed_out,
+    is_transient,
+    warn_cleanup_failed,
+)
 
 __all__ = [
     "AsyncBuilds",
@@ -301,8 +308,10 @@ class AsyncBuilds:
     async def get(self, build_id: str) -> TemplateBuild:
         return TemplateBuild.from_api(await self._t.json_object("GET", _api.build(build_id)))
 
-    async def progress(self, build_id: str) -> BuildProgress:
-        data = await self._t.json_object("GET", _api.build_action(build_id, "progress"))
+    async def progress(self, build_id: str, *, timeout_cap: float | None = None) -> BuildProgress:
+        data = await self._t.json_object(
+            "GET", _api.build_action(build_id, "progress"), timeout_cap=timeout_cap
+        )
         return BuildProgress.from_api(data)
 
     async def events(self, build_id: str) -> AsyncIterator[BuildProgress]:
@@ -312,36 +321,36 @@ class AsyncBuilds:
             if event.event not in ("progress", "done"):
                 continue
             if not isinstance(event.data, Mapping):
+                if event.event == "done":
+                    raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
             yield BuildProgress.from_api(event.data)
             if event.event == "done":
                 return
+        raise MandalaError(_api.build_stream_truncated(build_id, malformed=False))
 
     async def wait(
         self, build_id: str, timeout: float = 1800.0, poll: float = 5.0
     ) -> BuildProgress:
         deadline = time.monotonic() + timeout
         last: BuildProgress | None = None
+        observed = False
         while True:
-            try:
-                last = await self.progress(build_id)
-                if last.done:
-                    return last
-            except PERMANENT:
-                raise
-            except MandalaError:
-                pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(
-                    f"build {build_id} was still running after {timeout:g}s"
-                    + (
-                        f" (phase {last.phase}, step {last.step} of {last.of}; "
-                        "the build has not stopped, only this wait has)"
-                        if last is not None
-                        else ": every poll failed"
-                    )
-                )
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+            try:
+                last = await self.progress(build_id, timeout_cap=remaining)
+                observed = True
+                if last.done:
+                    return last
+            except MandalaError as err:
+                if not is_transient(err):
+                    raise
+                observed = False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
             # asyncio.sleep, not time.sleep: this is the one line where the two
             # halves genuinely differ, and blocking the event loop for five
             # seconds a poll across a fifteen-minute build is what the async

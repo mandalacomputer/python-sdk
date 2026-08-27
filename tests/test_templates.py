@@ -25,6 +25,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer import _api
 
 BASE = "https://api.test/api/v1"
 
@@ -446,3 +447,187 @@ async def test_async_events_stop_after_done(async_client: mc.AsyncClient) -> Non
     async with async_client as c:
         seen = [p.status async for p in c.builds.events("bld-1")]
     assert seen == ["running", "succeeded"]
+
+
+# --- what an adversarial review found (OPL-3835) --------------------------
+
+
+class Shifty(str):
+    """A ``str`` subclass that answers differently the second time it is asked.
+
+    Not exotic: it is the shape of every guard that validates a value and then
+    hands the ORIGINAL on to something that stringifies or encodes it again.
+    """
+
+    def __str__(self) -> str:
+        return ""
+
+    def encode(self, *a: object, **k: object) -> bytes:
+        return b".."
+
+
+@respx.mock
+def test_a_str_subclass_cannot_smuggle_an_empty_version(client: mc.Client) -> None:
+    """The critical one, and it is the irreversible branch.
+
+    ``template_version_params`` matched the regex against the buffer and returned
+    the object; httpx serialises a query value with ``str(value)``. A subclass
+    holding ``1.2.3`` whose ``__str__`` answers ``""`` therefore passed the check
+    and sent ``?version=`` — which on a retire means every version of the name.
+    """
+    route = respx.delete(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=RETIRED)
+    )
+    client.templates.retire("acc-1", "devbox", version=Shifty("1.2.3"))
+    # Canonicalised, so the value httpx sends is the one the regex approved.
+    assert route.calls.last.request.url.params["version"] == "1.2.3"
+
+
+@respx.mock
+def test_a_str_subclass_cannot_smuggle_a_dot_segment(client: mc.Client) -> None:
+    """The same hole in ``seg``, which is older than this branch.
+
+    ``quote()`` calls the value's own ``encode()``, so a subclass holding ``x``
+    that encodes as ``b".."`` passed the dot-segment guard and became a path the
+    client normalises into a different route.
+    """
+    route = respx.get(f"{BASE}/templates/acc-1/x").mock(
+        return_value=httpx.Response(200, json=PUBLISHED)
+    )
+    client.templates.get("acc-1", Shifty("x"))
+    assert route.calls.last.request.url.path.endswith("/templates/acc-1/x")
+
+
+def test_a_non_string_is_refused_rather_than_coerced() -> None:
+    # str(None) is "None", which is a plausible id and a nonsense one.
+    for bad in (None, 1, {}, [], True):
+        with pytest.raises(ValueError):
+            _api.canonical(bad, "id")
+
+
+@respx.mock
+def test_wait_gives_up_at_once_on_a_failure_that_is_not_transient(client: mc.Client) -> None:
+    """A 400 is a defect, not a phase.
+
+    The first version re-raised a short list of permanent classes and swallowed
+    everything else, so this burned the full 1800-second default before
+    surfacing as a misleading timeout.
+    """
+    route = respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(400, json={"error": "that is not a build id"})
+    )
+    with pytest.raises(mc.APIError):
+        client.builds.wait("bld-1", timeout=5.0, poll=0.01)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_wait_bounds_each_poll_by_what_is_left_of_the_deadline(client: mc.Client) -> None:
+    """The deadline was only checked AFTER the request returned.
+
+    So a one-second wait could sit in a single request for the client's default
+    sixty — and for ever against a caller-supplied client with no timeout. The
+    same cap ``Computer.wait_until_built`` passes to its refresh.
+    """
+    seen: list[float | None] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout", {}).get("read"))
+        return httpx.Response(200, json=RUNNING)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=record)
+    with pytest.raises(mc.TimeoutError):
+        client.builds.wait("bld-1", timeout=0.25, poll=0.01)
+    assert seen, "no poll was made"
+    assert all(t is not None and t <= 0.25 for t in seen), seen
+
+
+@respx.mock
+def test_the_timeout_does_not_quote_a_stale_reading_in_the_present_tense(
+    client: mc.Client,
+) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(200, json=RUNNING),
+            *[httpx.Response(503, json={"error": "no hypervisor could answer"})] * 20,
+        ]
+    )
+    with pytest.raises(mc.TimeoutError, match="could not be reached"):
+        client.builds.wait("bld-1", timeout=0.2, poll=0.01)
+
+
+@respx.mock
+def test_a_stream_that_ends_without_a_done_is_not_a_completed_build(
+    client: mc.Client,
+) -> None:
+    """Returning normally made a truncated stream indistinguishable from a
+    finished one, so a caller looping over it reported a build it had stopped
+    watching as a build that ended."""
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("progress", RUNNING)))
+    with pytest.raises(mc.MandalaError, match="ended without a final event"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_a_malformed_done_is_a_protocol_error_not_a_skipped_event(client: mc.Client) -> None:
+    """Skipping it left the loop waiting on a connection the platform had
+    finished with — holding one of the account's eight stream slots."""
+    body = 'event: done\ndata: "not a record"\n\n'
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"Content-Type": "text/event-stream"}
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        list(client.builds.events("bld-1"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("versions", "1.2.3"), ("versions", 7), ("versions", {"a": 1})],
+)
+def test_a_list_field_that_is_not_a_list_degrades_rather_than_raising(
+    field: str, value: object
+) -> None:
+    """``d.get("x") or []`` guards None and nothing else.
+
+    A number raised a bare TypeError out of a public method; a string iterated by
+    character, so ``"1.2.3"`` decoded to ``['1', '.', '2', '.', '3']``. This
+    module's contract is that malformed fields are preserved in ``raw`` and never
+    rejected.
+    """
+    t = mc.PublishedTemplate.from_api({field: value})
+    assert t.versions == []
+    assert t.raw[field] == value
+
+
+def test_the_other_list_fields_degrade_too() -> None:
+    assert mc.RetiredTemplates.from_api({"retired": 7}).retired == []
+    assert mc.TemplateCheck.from_api({"problems": 7}).problems == []
+    assert mc.BuildProgress.from_api({"steps": "nope"}).steps == []
+
+
+# --- and the async half, which has the same two loops ----------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_wait_gives_up_at_once_on_a_non_transient_failure(
+    async_client: mc.AsyncClient,
+) -> None:
+    route = respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(400, json={"error": "that is not a build id"})
+    )
+    async with async_client as c:
+        with pytest.raises(mc.APIError):
+            await c.builds.wait("bld-1", timeout=5.0, poll=0.01)
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_stream_without_a_done_raises(async_client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("progress", RUNNING)))
+    async with async_client as c:
+        with pytest.raises(mc.MandalaError, match="ended without a final event"):
+            [p async for p in c.builds.events("bld-1")]

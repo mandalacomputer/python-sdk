@@ -128,7 +128,7 @@ unpinned `namespace/name` resolves to.
 
 ```python
 client.templates.retire(namespace, "devbox", version="1.0.4")  # one version
-client.templates.retire(namespace, "devbox")                   # every version
+client.templates.retire(namespace, "devbox")  # every version
 ```
 
 Omitting `version` retires the **whole name** — deliberately not `get()`'s "the
