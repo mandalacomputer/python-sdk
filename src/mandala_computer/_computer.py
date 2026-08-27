@@ -1022,7 +1022,17 @@ class Computer(ComputerFields):
                 # The state read had no retry around it at all, so a hypervisor
                 # briefly out of reach ended a fifteen-minute wait on a disk
                 # copy that was still going perfectly well (OPL-3724).
-                time.sleep(_ride_out(err, deadline, poll))
+                #
+                # _ride_out is asked what to wait and then NOT slept on, unlike
+                # every other caller, because this loop's sleep is at the top:
+                # sleeping here as well spent two intervals on one failed poll
+                # and delayed noticing the build had finished (Codex adversarial
+                # review). What the answer is still good for is a 429, which
+                # asks for longer than `poll` and would otherwise be retried on
+                # this loop's own faster cadence.
+                delay = _ride_out(err, deadline, poll)
+                if delay > poll:
+                    time.sleep(min(delay - poll, max(deadline - time.monotonic(), 0.0)))
 
     def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> Computer:
         """Block until the machine is running.
@@ -1148,6 +1158,15 @@ class Computer(ComputerFields):
                     # than one on the probe; retry while the budget remains.
                     if not _is_transient_for_poll(inner):
                         raise
+                    # And it gets to ask for time on its own account. The probe
+                    # set `delay` above, so a refresh answering 429 with a
+                    # Retry-After was swallowed and then retried on the probe's
+                    # cadence — which with poll=0 is immediately, against the
+                    # rate limiter that just asked for twelve seconds (Codex
+                    # adversarial review). The longer of the two wins: both
+                    # failures have to have passed before the next probe is
+                    # worth making.
+                    delay = max(delay, _poll_delay(inner, poll))
                 else:
                     failure = self._guest_wait_failure()
                     if failure is not None:

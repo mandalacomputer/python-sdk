@@ -545,7 +545,10 @@ def _is_transient_for_poll(err: BaseException) -> bool:
 
     Everything at 5xx polls through, 502 and 520-523 included: they mean the
     outcome is unknown, and a read whose outcome is unknown can simply be read
-    again.
+    again. 5xx has an UPPER bound as well as a lower one, and it is not
+    decoration: httpx accepts any three-digit status, so a broken or hostile
+    origin can answer 700 — which ``>= 500`` alone called a passing moment and
+    polled until the caller's deadline (Codex adversarial review, OPL-3724).
 
     What the floor costs, said plainly: ``_not_an_object`` raises a bare
     :class:`MandalaError` for a proxy answering HTML where the platform's JSON
@@ -569,5 +572,5 @@ def _is_transient_for_poll(err: BaseException) -> bool:
             return False
         if err.status in (408, 409, 429):
             return True
-        return err.status >= 500
+        return 500 <= err.status < 600
     return True

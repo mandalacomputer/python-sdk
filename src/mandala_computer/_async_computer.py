@@ -417,10 +417,12 @@ class AsyncComputer(ComputerFields):
             try:
                 await self._refresh(timeout_cap=remaining)
             except MandalaError as err:
-                # The state read had no retry around it at all, so a hypervisor
-                # briefly out of reach ended a fifteen-minute wait on a disk
-                # copy that was still going perfectly well (OPL-3724).
-                await asyncio.sleep(_ride_out(err, deadline, poll))
+                # The sync twin carries the reasoning: this loop sleeps at the
+                # TOP, so sleeping the full interval here as well spent two on
+                # one failed poll. Only the excess a 429 asks for is waited.
+                delay = _ride_out(err, deadline, poll)
+                if delay > poll:
+                    await asyncio.sleep(min(delay - poll, max(deadline - time.monotonic(), 0.0)))
 
     async def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> AsyncComputer:
         """Await until the machine is running.
@@ -536,6 +538,9 @@ class AsyncComputer(ComputerFields):
                 except MandalaError as inner:
                     if not _is_transient_for_poll(inner):
                         raise
+                    # The refresh asks for time on its own account too; the
+                    # longer of the two failures wins. See the sync twin.
+                    delay = max(delay, _poll_delay(inner, poll))
                 else:
                     failure = self._guest_wait_failure()
                     if failure is not None:

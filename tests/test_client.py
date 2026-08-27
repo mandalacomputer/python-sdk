@@ -396,6 +396,77 @@ def test_a_connection_failure_has_a_class_the_predicates_can_name() -> None:
 
 
 @respx.mock
+def test_a_failed_build_refresh_costs_one_polling_interval_not_two(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """wait_until_built sleeps at the TOP of its loop, so _ride_out must not too.
+
+    The first cut of the retry wrapper slept the full interval on the failed
+    refresh as well, then went back round and slept again — two intervals spent
+    on one dropped poll, delaying the moment the finished build is noticed
+    (Codex adversarial review, OPL-3724).
+    """
+    building = {**COMPUTER, "status": "building", "build": {"state": "running"}}
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "no host"}),
+            httpx.Response(200, json=COMPUTER),
+        ]
+    )
+    slept: list[float] = []
+    monkeypatch.setattr(mc._computer.time, "sleep", slept.append)
+    mc.Computer(client._t, building).wait_until_built(timeout=60, poll=5)
+    # Two polls, two intervals. It was [5, 5, 5] before the fix: the failed
+    # refresh slept a whole interval of its own between the two.
+    assert slept == [5, 5]
+
+
+@respx.mock
+def test_a_rate_limit_on_the_nested_guest_refresh_is_honoured(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refresh behind a failed probe asks for time on its own account.
+
+    `delay` was set from the PROBE's failure, so a refresh answering 429 with a
+    Retry-After was swallowed and then retried on the probe's cadence — with
+    poll=0 that is immediately, against the rate limiter that had just asked for
+    twelve seconds (Codex adversarial review, OPL-3724).
+    """
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        side_effect=[
+            httpx.Response(409, json={"error": "the guest agent is not answering yet"}),
+            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+        ]
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=[
+            httpx.Response(200, json=COMPUTER),
+            httpx.Response(429, headers={"Retry-After": "12"}, json={"error": "slow down"}),
+            httpx.Response(200, json=COMPUTER),
+        ]
+    )
+    slept: list[float] = []
+    monkeypatch.setattr(mc._computer.time, "sleep", slept.append)
+    client.computers.get("vm-1").wait_for_guest(timeout=60, poll=0)
+    assert 12 in slept
+
+
+def test_a_status_nobody_should_be_able_to_send_is_not_a_passing_moment() -> None:
+    """5xx has an upper bound as well as a lower one.
+
+    httpx accepts any three-digit status, so a broken or hostile origin can
+    answer 700 — which `>= 500` alone called a passing moment and polled until
+    the caller's deadline (Codex adversarial review, OPL-3724).
+    """
+    from mandala_computer._exceptions import _is_transient_for_poll
+
+    for status in (500, 503, 599):
+        assert _is_transient_for_poll(mc.APIError(f"HTTP {status}", status=status)) is True
+    for status in (600, 700, 999):
+        assert _is_transient_for_poll(mc.APIError(f"HTTP {status}", status=status)) is False
+
+
+@respx.mock
 def test_the_control_plane_waits_ride_out_a_blip_instead_of_ending(client: mc.Client) -> None:
     """The bug OPL-3724 turned up while reconciling three retry policies.
 
