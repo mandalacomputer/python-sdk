@@ -341,33 +341,32 @@ class _BaseTransport:
             pool=current.pool,
         )
 
-    #: The httpx phases one request spends its budget in, in the order it spends
-    #: them: waiting for a connection from the pool, connecting, writing, then
-    #: reading. Four, and they are SEQUENTIAL, which is the whole reason
-    #: `_cap_budget` divides rather than assigns.
-    _PHASES = 4
-
     @staticmethod
     def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
-        """Cap ONE REQUEST — not one phase of it — to the time its caller has left.
+        """Tighten one request's timeouts to the time its caller has left.
 
-        Every caller passes what remains of a deadline it has promised somebody:
-        `Builds.wait`, `Computer.wait_until_built`, `wait_until_running`. Handing
-        that whole figure to each of pool, connect, write and read let a single
-        request spend it four times over, because httpx applies those in
-        sequence (adversarial review, OPL-3835) — so a `wait(timeout=1)` could
-        sit in one request for four seconds, and the loop's own deadline check
-        only ran once the request came back. Dividing is what makes the cap mean
-        what its callers document.
+        An UPPER BOUND ON EACH OPERATION, and deliberately not a wall-clock
+        deadline for the request — httpx's four settings cannot express one, and
+        a commit on this branch got that wrong in both directions before it was
+        caught (second adversarial review, OPL-3835). ``read`` is an INACTIVITY
+        timeout: httpcore reads it once and then applies it to every chunk in
+        ``_receive_response_body``, so it restarts on each one and a slow but
+        steady response can outlast any value set here. Dividing the budget
+        across the four to make them sum to it was arithmetic about a total that
+        does not exist, and it broke the callers it was meant to help — a
+        legitimate three-second refresh with eight seconds left began failing at
+        two, and `Computer.wait_until_built` and `wait_until_running` do not
+        catch a timeout on that refresh.
 
-        It bites only near the deadline. `min` keeps the client's own timeouts
-        wherever they are tighter, so a fifteen-minute build spends its middle
-        on the ordinary sixty-second read and only the last stretch on a share
-        of what is left.
+        What it is still for is the case that motivated it: a `wait(timeout=1)`
+        inheriting the client's own sixty-second read, or a caller-supplied
+        client with no timeout at all, so that one request cannot outlive the
+        wait by a wide margin. The loop's deadline check is what bounds the
+        wait; this only keeps a single request from sitting far past it.
         """
         if seconds is None:
             return current
-        cap = max(seconds / _BaseTransport._PHASES, 0.001)
+        cap = max(seconds, 0.001)
 
         def capped(value: float | None) -> float:
             return cap if value is None else min(value, cap)

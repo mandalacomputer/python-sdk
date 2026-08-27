@@ -68,20 +68,30 @@ def _real(value: Any) -> float:
 
 
 def _flag(value: Any, *, default: bool = False) -> bool:
-    """A boolean field off the wire that DECIDES something.
+    """A boolean field off the wire, or ``default`` when it is not one.
 
-    ``bool(value)`` is this module's ordinary rule and stays it for the fields
-    that only describe — ``auto``, ``orphaned``, ``degraded``. It is the wrong
-    rule for the three that steer a caller: a response spelling ``"valid":
-    "false"`` reported a document as valid, and ``"done": "false"`` told
-    :meth:`Builds.wait` a running build had finished (adversarial review,
-    OPL-3835). Truthiness on a control field fails OPEN and reverses the
-    meaning, which is the one direction a degrading decoder must not fail in.
+    EVERY boolean this module decodes goes through here. It was three of them
+    for one commit — the ones a review had named — and the arbitrariness was
+    itself the defect (second adversarial review, OPL-3835): ``unmatched``, which
+    only describes, got the strict rule while ``Move.live``, which ends both move
+    wait loops, ``ExecStatus.exited``, which decides whether a caller stops
+    polling, and ``ExecResult.timed_out``, which decides
+    :attr:`ExecResult.ok` and through it whether a guest is reported ready, all
+    kept the coercing one. Sorting fields into "steers something" and "merely
+    describes" is a judgement that has to be re-made every time a field is added
+    and was already wrong here, so there is no sorting.
 
-    Anything that is not a JSON boolean falls back to ``default``, which is the
-    safe reading in each case: not valid, not done, not unmatched. That keeps
+    ``bool(value)`` was the old rule and it fails OPEN: ``"false"`` is a
+    non-empty string and therefore true, so a response spelling ``"valid":
+    "false"`` reported a document as publishable and ``"done": "false"`` told
+    :meth:`Builds.wait` a running build had finished. Reversing a control field
+    in the permissive direction is the one way a degrading decoder must not
+    fail.
+
+    Anything that is not a JSON boolean reads as ``default``, which is False
+    everywhere it is used: not valid, not done, not live, not exited. That keeps
     the module's contract — malformed fields are preserved in ``raw`` and never
-    rejected — while making the failure a conservative one.
+    rejected — while making the failure the conservative one.
     """
     return value if isinstance(value, bool) else default
 
@@ -364,14 +374,18 @@ class Template:
     #: lib/projection publishes it for exactly that reason, and this model was
     #: dropping it on the floor.
     #:
-    #: LAST and defaulted, rather than second where it reads best. This class is
+    #: KEYWORD-ONLY, rather than second where it reads best. This class is
     #: exported, so its field order is its constructor: added ahead of ``label``
     #: it broke every ``Template("ubuntu", "Ubuntu", ...)`` that worked on the
     #: previous release, in fixtures and downstream code alike (adversarial
-    #: review, OPL-3835). Decoding never noticed — ``from_api`` passes by
-    #: keyword.
-    ref: str | None = None
+    #: review, OPL-3835). Moving it to the end fixed those six and quietly broke
+    #: the seventh — ``raw`` was the seventh positional slot, so
+    #: ``Template(..., disk_gb, raw_dict)`` bound the mapping to ``ref`` and left
+    #: ``raw`` empty, without raising (second adversarial review). ``kw_only``
+    #: is what leaves every existing position alone. Decoding never noticed
+    #: either break — ``from_api`` passes by keyword.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    ref: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Template:
@@ -697,7 +711,7 @@ class Size:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=bool(d.get("allowed", False)),
+            allowed=_flag(d.get("allowed")),
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -791,11 +805,11 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=bool(d.get("incremental", False)),
-            auto=bool(d.get("auto", False)),
+            incremental=_flag(d.get("incremental")),
+            auto=_flag(d.get("auto")),
             computer_name=_text(d.get("computer_name")),
-            orphaned=bool(d.get("orphaned", False)),
-            unreachable=bool(d.get("unreachable", False)),
+            orphaned=_flag(d.get("orphaned")),
+            unreachable=_flag(d.get("unreachable")),
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
@@ -925,7 +939,7 @@ class ComputerUsage:
             run_hours=_real(d.get("run_hours")),
             vcpu_hours=_real(d.get("vcpu_hours")),
             ram_gb_hours=_real(d.get("ram_gb_hours")),
-            gone=bool(d.get("gone", False)),
+            gone=_flag(d.get("gone")),
         )
 
 
@@ -1032,8 +1046,8 @@ class UsageReport:
             from_=_text(d.get("from")),
             to=_text(d.get("to")),
             usage=UsageTotals.from_api(totals),
-            degraded=bool(d.get("degraded", False)),
-            unmetered=bool(d.get("unmetered", False)),
+            degraded=_flag(d.get("degraded")),
+            unmetered=_flag(d.get("unmetered")),
             # Presence, not emptiness. The platform drops the key for a scoped
             # credential and sends ``[]`` for an account that ran nothing, and
             # those are different answers: one is "you may not see this", the
@@ -1099,7 +1113,7 @@ class Move:
             computer_id=_text(d.get("computer_id")),
             state=_text(d.get("state")),
             detail=_text(d.get("detail")),
-            live=bool(d.get("live")),
+            live=_flag(d.get("live")),
             cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
             ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
             disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
@@ -1147,7 +1161,7 @@ class Window:
             y=_num(d.get("y")),
             width=_num(d.get("width")),
             height=_num(d.get("height")),
-            focused=bool(d.get("focused", False)),
+            focused=_flag(d.get("focused")),
             raw=dict(d),
         )
 
@@ -1236,7 +1250,7 @@ class WindowResult:
         w = d.get("window")
         return cls(
             window=Window.from_api(w) if isinstance(w, Mapping) else None,
-            gone=bool(d.get("gone", False)),
+            gone=_flag(d.get("gone")),
             raw=dict(d),
         )
 
@@ -1295,15 +1309,15 @@ class ExecStatus:
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
-            running=bool(d.get("running", False)),
-            exited=bool(d.get("exited", False)),
+            running=_flag(d.get("running")),
+            exited=_flag(d.get("exited")),
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
-            more=bool(d.get("more", False)),
-            killed=bool(d.get("killed", False)),
+            more=_flag(d.get("more")),
+            killed=_flag(d.get("killed")),
             started_at=_text(d.get("started_at")),
             raw=dict(d),
         )
@@ -1364,8 +1378,8 @@ class ExecResult:
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
-            timed_out=bool(d.get("timed_out", False)),
-            out_truncated=bool(d.get("out_truncated", False)),
-            err_truncated=bool(d.get("err_truncated", False)),
+            timed_out=_flag(d.get("timed_out")),
+            out_truncated=_flag(d.get("out_truncated")),
+            err_truncated=_flag(d.get("err_truncated")),
             raw=dict(d),
         )

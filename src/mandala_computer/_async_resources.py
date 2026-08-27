@@ -33,7 +33,7 @@ from ._resources import (
     Builds,
     Templates,
     _wait_timed_out,
-    build_event_ended,
+    build_ended,
     check_wait_args,
     is_transient,
     retry_delay,
@@ -328,7 +328,7 @@ class AsyncBuilds:
                     raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
             progress = BuildProgress.from_api(event.data)
-            if event.event == "done" and not build_event_ended(progress):
+            if event.event == "done" and not build_ended(progress):
                 raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
             yield progress
             if event.event == "done":
@@ -355,7 +355,7 @@ class AsyncBuilds:
             try:
                 last = await self.progress(build_id, timeout_cap=remaining)
                 observed = True
-                if last.done:
+                if build_ended(last):
                     return last
             except MandalaError as err:
                 if not is_transient(err):

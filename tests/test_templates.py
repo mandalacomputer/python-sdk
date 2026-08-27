@@ -19,6 +19,7 @@ one does the same thing with them.
 from __future__ import annotations
 
 import json
+import pathlib
 import time
 from unittest import mock
 
@@ -967,15 +968,49 @@ def test_a_done_that_says_the_build_is_still_running_is_malformed(client: mc.Cli
 def test_a_done_naming_a_terminal_status_without_the_flag_is_accepted(
     client: mc.Client,
 ) -> None:
-    """The platform derives ``done`` from the job and ``status`` from the phase.
+    """The fallback is for a host too old to send the flag at all.
 
-    A host that sends one without the other is still saying the build is over,
-    so the check reads either.
+    ``done`` ABSENT and a terminal status is believed; the platform derives the
+    flag from the job and the status from the phase, and a host that sends only
+    one is still saying the build is over.
+    """
+    payload = {k: v for k, v in DONE.items() if k != "done"}
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("done", payload)))
+    assert [p.status for p in client.builds.events("bld-1")] == ["succeeded"]
+
+
+@respx.mock
+def test_a_present_done_beats_the_status_it_disagrees_with(client: mc.Client) -> None:
+    """A contradiction resolves in favour of ``done``, not the status.
+
+    The platform derives ``done`` from the JOB and the status from the phase,
+    and the phase comes out of a log the document's own steps write into. So a
+    present flag is authoritative and the status is a fallback for a host that
+    sent no flag — not a second opinion about one that did.
     """
     respx.get(f"{BASE}/builds/bld-1/events").mock(
         return_value=sse(("done", {**DONE, "done": False}))
     )
-    assert [p.status for p in client.builds.events("bld-1")] == ["succeeded"]
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_wait_ends_on_the_same_rule_events_does(client: mc.Client) -> None:
+    """The two used different rules, which is how the same payload ended one and
+    left the other polling to its deadline."""
+    payload = {k: v for k, v in DONE.items() if k != "done"}
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=payload))
+    assert client.builds.wait("bld-1", timeout=5.0, poll=0.01).status == "succeeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_wait_ends_on_it_too(async_client: mc.AsyncClient) -> None:
+    payload = {k: v for k, v in DONE.items() if k != "done"}
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=payload))
+    p = await async_client.builds.wait("bld-1", timeout=5.0, poll=0.01)
+    assert p.status == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -1013,13 +1048,11 @@ def test_5xx_is_still_transient() -> None:
     ("timeout", "poll", "what"),
     [
         (1.0, -1, "poll"),
-        (1.0, 0, "poll"),
         (1.0, float("nan"), "poll"),
         (1.0, float("inf"), "poll"),
         (float("nan"), 5.0, "timeout"),
         (float("inf"), 5.0, "timeout"),
         (-1.0, 5.0, "timeout"),
-        (0.0, 5.0, "timeout"),
         (True, 5.0, "timeout"),
         ("30", 5.0, "timeout"),
     ],
@@ -1031,7 +1064,7 @@ def test_wait_refuses_a_timeout_or_poll_it_cannot_honour(
     half and returned instantly in the async one — a tight loop against a
     metered endpoint. ``timeout=nan`` loses every ``remaining <= 0`` comparison,
     so the deadline the docstring promises never arrived."""
-    with pytest.raises(ValueError, match=f"{what} must be a finite, positive"):
+    with pytest.raises(ValueError, match=f"{what} must be a finite, non-negative"):
         client.builds.wait("bld-1", timeout=timeout, poll=poll)  # type: ignore[arg-type]
 
 
@@ -1039,34 +1072,68 @@ def test_wait_refuses_a_timeout_or_poll_it_cannot_honour(
 async def test_the_async_wait_refuses_them_identically(async_client: mc.AsyncClient) -> None:
     """The two halves diverged here, which is the part that makes it a parity
     defect as well as a correctness one."""
-    with pytest.raises(ValueError, match="poll must be a finite, positive"):
+    with pytest.raises(ValueError, match="poll must be a finite, non-negative"):
         await async_client.builds.wait("bld-1", timeout=1.0, poll=-1)
-    with pytest.raises(ValueError, match="timeout must be a finite, positive"):
+    with pytest.raises(ValueError, match="timeout must be a finite, non-negative"):
         await async_client.builds.wait("bld-1", timeout=float("nan"))
 
 
-def test_a_capped_request_cannot_spend_its_budget_once_per_phase() -> None:
-    """httpx applies pool, connect, write and read in SEQUENCE.
+@respx.mock
+def test_zero_is_allowed_because_every_sibling_wait_takes_it(client: mc.Client) -> None:
+    """``poll=0`` is what this repository's own tests pass to ``wait_until_built``,
+    ``wait_until_running`` and ``wait_for_guest`` at twenty-odd call sites, and
+    ``timeout=0`` is an already-expired deadline the siblings answer with the
+    TimeoutError their callers catch. Refusing both was a wider break than the
+    bug it fixed."""
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=DONE))
+    assert client.builds.wait("bld-1", timeout=5.0, poll=0).status == "succeeded"
+    with pytest.raises(mc.TimeoutError):
+        client.builds.wait("bld-1", timeout=0, poll=0)
 
-    Assigning the caller's whole remaining budget to each let one request run
-    for four times the deadline it was capping, so ``wait(timeout=1)`` could sit
-    in a single request for four seconds.
+
+@respx.mock
+def test_a_response_slower_than_a_quarter_of_the_budget_still_succeeds(
+    client: mc.Client,
+) -> None:
+    """The cap is an upper bound on each operation, not a wall-clock deadline.
+
+    Dividing the budget across httpx's four settings so they SUM to it was
+    arithmetic about a total that does not exist — ``read`` is an inactivity
+    timeout that restarts on every chunk — and it broke the callers it was meant
+    to help: a legitimate response taking more than a quarter of the remaining
+    time began failing, and neither ``wait_until_built`` nor
+    ``wait_until_running`` catches a timeout on its refresh.
     """
+    slow = 0.25
+
+    def delayed(request: httpx.Request) -> httpx.Response:
+        time.sleep(slow)
+        return httpx.Response(200, json=DONE)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=delayed)
+    # 0.6s left, a 0.25s response: comfortably inside the budget, and more than
+    # the 0.15s a quarter-share would have allowed.
+    assert client.builds.wait("bld-1", timeout=0.6, poll=0.01).status == "succeeded"
+
+
+def test_the_cap_still_tightens_a_looser_client_timeout() -> None:
+    """What it is for: a one-second wait must not inherit a sixty-second read,
+    and a client with no timeout at all must not wait for ever."""
     from mandala_computer._client import _BaseTransport
 
     current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
-    capped = _BaseTransport._cap_budget(current, 8.0)
-    phases = [capped.connect, capped.read, capped.write, capped.pool]
-    assert all(p is not None for p in phases)
-    assert sum(p for p in phases if p is not None) <= 8.0
+    capped = _BaseTransport._cap_budget(current, 1.0)
+    assert capped.read == 1.0
+    assert capped.connect == 1.0
+
+    none_at_all = httpx.Timeout(connect=None, read=None, write=None, pool=None)
+    assert _BaseTransport._cap_budget(none_at_all, 2.0).read == 2.0
 
 
-def test_the_cap_still_defers_to_a_tighter_client_timeout() -> None:
-    """It bites near the deadline and nowhere else: a fifteen-minute build
-    spends its middle on the ordinary sixty-second read."""
-    current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+def test_the_cap_leaves_a_tighter_client_timeout_alone() -> None:
     from mandala_computer._client import _BaseTransport
 
+    current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
     capped = _BaseTransport._cap_budget(current, 1800.0)
     assert capped.read == 60.0
     assert capped.connect == 10.0
@@ -1085,3 +1152,68 @@ def test_template_can_still_be_built_the_way_it_could_before_ref() -> None:
     assert t.disk_gb == 40
     assert t.ref is None
     assert mc.Template.from_api({"name": "u", "ref": "acc-1/u@1.0.0"}).ref == "acc-1/u@1.0.0"
+
+
+# The second adversarial-review pass, on the fix commits themselves. Two of
+# these are defects the FIRST pass's fixes introduced or left behind.
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, "", None, []])
+def test_force_stop_refuses_anything_that_is_not_a_bool(value: object) -> None:
+    """The third arming flag, missed when the other two were hardened.
+
+    ``stop(force="false")`` pulled the power and lost whatever the guest had not
+    written to disk — the same defect as the snapshot purge, on the same kind of
+    string a config file produces.
+    """
+    with pytest.raises(ValueError, match="force must be True or False"):
+        _api.stop_params(value)  # type: ignore[arg-type]
+
+
+def test_force_stop_still_takes_real_bools() -> None:
+    assert _api.stop_params(True) == {"force": "true"}
+    assert _api.stop_params(False) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "steers"),
+    [
+        (mc.Move, "live", "both move wait loops"),
+        (mc.ExecStatus, "running", "whether a caller keeps polling"),
+        (mc.ExecStatus, "exited", "whether a caller keeps polling"),
+        (mc.ExecResult, "timed_out", "ExecResult.ok, and through it wait_for_guest"),
+        (mc.TemplateCheck, "valid", "whether a document is publishable"),
+        (mc.BuildProgress, "done", "whether a wait returns"),
+    ],
+)
+def test_every_control_flow_boolean_decodes_strictly(model: type, field: str, steers: str) -> None:
+    """Hardening only the three fields a review happened to name was itself the
+    defect: ``unmatched``, which merely describes, got the strict rule while
+    ``Move.live``, ``ExecStatus.exited`` and ``ExecResult.timed_out`` — each of
+    which steers a loop — kept the coercing one."""
+    decoded = model.from_api({field: "false"})
+    assert getattr(decoded, field) is False, steers
+    assert decoded.raw[field] == "false"
+
+
+def test_no_wire_boolean_is_left_on_truthiness() -> None:
+    """The rule is every boolean, not a list somebody has to keep current."""
+    import re
+
+    source = pathlib.Path("src/mandala_computer/_models.py").read_text()
+    assert not re.findall(r"bool\(d\.get\(", source)
+
+
+def test_template_keeps_the_raw_positional_slot_too() -> None:
+    """Moving ``ref`` to the end fixed the six and broke the seventh.
+
+    ``raw`` was the seventh positional field. With ``ref`` ahead of it,
+    ``Template(..., disk_gb, raw_dict)`` bound the mapping to ``ref`` and left
+    ``raw`` empty — silently, because a mapping is a fine value for an optional
+    field. ``kw_only`` is what leaves every existing position alone.
+    """
+    t = mc.Template("ubuntu", "Ubuntu 24.04", "linux", 2, 4096, 40, {"name": "ubuntu"})
+    assert t.raw == {"name": "ubuntu"}
+    assert t.ref is None
+    with pytest.raises(TypeError):
+        mc.Template("ubuntu", "Ubuntu", "linux", 2, 4096, 40, {}, "acc/u@1.0.0")  # type: ignore[misc]

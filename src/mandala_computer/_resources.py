@@ -126,22 +126,31 @@ def is_transient(err: BaseException) -> bool:
 BUILD_TERMINAL = ("succeeded", "failed")
 
 
-def build_event_ended(progress: BuildProgress) -> bool:
-    """Whether a ``done`` event's PAYLOAD agrees that the build is over.
+def build_ended(progress: BuildProgress) -> bool:
+    """Whether a build record says the build is OVER. One rule, used twice.
 
-    The event name alone was the test, and it is not enough (adversarial review,
-    OPL-3835). Checking that the payload is a Mapping fixed the shape and left
-    the semantics: ``event: done`` carrying ``{"status": "running", "done":
-    false}`` was yielded as ordinary progress and then ended the iterator
-    normally, so a caller looping over :meth:`Builds.events` reported a build it
-    had stopped watching as a build that finished — the same defect the
-    truncated-stream guard exists to prevent, arriving through the front door.
+    ``done`` when the platform sent a real one, and the status otherwise. The
+    order matters and is the platform's own: ``done`` is derived from the JOB,
+    where the status is derived from the phase, and the phase comes out of a log
+    the document's own steps write into. So a present ``done`` is authoritative
+    and a contradiction resolves in its favour; the status is the fallback for a
+    host too old to send the flag, not a second opinion about a host that did.
 
-    ``status`` is accepted alongside ``done`` rather than ``done`` alone: the
-    platform derives the flag from the job and the status from the phase, and a
-    host that sends one without the other is still telling us the build is over.
+    It reads ``raw`` rather than :attr:`BuildProgress.done` because the decoded
+    field cannot tell absent from false — :func:`_flag` maps both to False —
+    and those two mean different things here: one is an older host, the other is
+    a build that is still running.
+
+    :meth:`Builds.wait` uses this too, and did not (second adversarial review,
+    OPL-3835). ``events()`` accepting a terminal status without the flag while
+    ``wait()`` returned only on ``last.done`` meant the same payload ended one
+    and left the other polling until its deadline — a divergence made likelier,
+    not less, by decoding ``done`` strictly.
     """
-    return progress.done or progress.status in BUILD_TERMINAL
+    flag = progress.raw.get("done")
+    if isinstance(flag, bool):
+        return flag
+    return progress.status in BUILD_TERMINAL
 
 
 def check_wait_args(timeout: float, poll: float) -> None:
@@ -155,21 +164,23 @@ def check_wait_args(timeout: float, poll: float) -> None:
     comparison is false against a NaN, so the deadline this method's docstring
     promises never arrived and the wait ran for ever.
 
-    Both must be positive. A ``timeout`` of zero is not "poll once and answer":
-    the deadline has already passed when the loop first reads it, so the only
-    thing it can do is raise, and a caller who wants one reading should call
-    :meth:`Builds.progress`. The same rule and the same reasons as
-    ``_require_positive_seconds``, which guards the durations that go on the
-    wire; these two never leave the client.
+    NEGATIVE and non-finite only. Zero was refused too for one commit, and that
+    was a compatibility break wider than the bug it was fixing (second
+    adversarial review, OPL-3835): every sibling wait in this SDK —
+    ``wait_until_built``, ``wait_until_running``, ``wait_for_guest`` — takes
+    ``poll=0``, and this repository's own tests pass it at twenty-odd call
+    sites. ``timeout=0`` is an already-expired deadline, and the sibling waits
+    answer it with the ``TimeoutError`` their callers are catching; raising a
+    ``ValueError`` instead would go past that handler.
     """
     for value, what in ((timeout, "timeout"), (poll, "poll")):
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
-            or value <= 0
+            or value < 0
         ):
-            raise ValueError(f"{what} must be a finite, positive number of seconds")
+            raise ValueError(f"{what} must be a finite, non-negative number of seconds")
 
 
 def retry_delay(poll: float, err: BaseException) -> float:
@@ -668,7 +679,7 @@ class Builds:
                     raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
             progress = BuildProgress.from_api(event.data)
-            if event.event == "done" and not build_event_ended(progress):
+            if event.event == "done" and not build_ended(progress):
                 # A ``done`` whose payload says the build is still running is the
                 # malformed case too — see build_event_ended. Raised BEFORE the
                 # yield, so a caller cannot act on it as progress and then be
@@ -699,8 +710,8 @@ class Builds:
         Raises :class:`~mandala_computer.TimeoutError` if the build is still
         going when ``timeout`` runs out. The build is not stopped by that; only
         the waiting is. ``timeout`` and ``poll`` must both be finite and
-        positive — a ``ValueError`` before the first request otherwise, in both
-        halves, for the reasons :func:`check_wait_args` gives.
+        non-negative — a ``ValueError`` before the first request otherwise, in
+        both halves, for the reasons :func:`check_wait_args` gives.
 
         The default timeout is generous because the work is: most of a build is
         copying a multi-gigabyte base image before a single step of the document
@@ -736,7 +747,7 @@ class Builds:
                 # platform derives it from the JOB rather than from the phase,
                 # and the phase is read out of a log the document's own steps
                 # write into.
-                if last.done:
+                if build_ended(last):
                     return last
             except MandalaError as err:
                 # A hypervisor briefly away during a fifteen-minute build is

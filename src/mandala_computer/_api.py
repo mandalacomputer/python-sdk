@@ -1141,5 +1141,10 @@ def stop_params(force: bool) -> dict[str, Any] | None:
     written to disk is lost with it. Kept off by default for that reason: this
     is what to reach for when a guest will not come down on its own, not the
     ordinary way to stop one.
+
+    A real bool, for the reason :func:`flag` gives. This one was missed when the
+    other two arming flags were hardened (second adversarial review, OPL-3835),
+    and it is the same defect: ``stop(force="false")`` pulled the power and lost
+    whatever the guest had not written to disk.
     """
-    return {"force": "true"} if force else None
+    return {"force": "true"} if flag(force, "force") else None
