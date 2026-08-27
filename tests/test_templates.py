@@ -2313,21 +2313,41 @@ def test_a_flag_that_says_false_is_never_a_stub_however_bare_the_row() -> None:
     assert is_unreachable_stub({"id": "s"}) is False
 
 
-def test_docstring_surgery_refuses_to_silently_do_nothing() -> None:
-    """A bare `str.replace` on a docstring no-ops when the prose is reworded,
-    and the async doc is wrong again with no test failing.
+def test_every_docstring_rewrite_still_finds_its_sentence() -> None:
+    """The drift guard, in a test rather than at import time.
 
-    That is not hypothetical: the first ephemeral correction replaced strings
-    the doc did not contain and was dead code for a whole commit (adversarial
-    review, OPL-3835). The helper refuses at import time instead.
+    A bare `str.replace` no-ops when the prose is reworded and the async doc is
+    wrong again with nothing failing — the first ephemeral correction was dead
+    code for a whole commit that way. But asserting it at IMPORT turned a
+    one-word docstring edit into `import mandala_computer` failing outright,
+    which is a worse trade than the bug (found while deciding whether to merge).
+    Loud here, harmless there.
     """
+    from mandala_computer._async_resources import DOC_REWRITES
+    from mandala_computer._resources import EPHEMERAL_DOC
+
+    sources = {
+        "AsyncComputers.ephemeral": EPHEMERAL_DOC,
+        "AsyncBuilds": mc.Builds.__doc__ or "",
+    }
+    for owner, sentence in DOC_REWRITES:
+        assert owner in sources, f"{owner} has no source registered"
+        assert sources[owner].count(sentence) == 1, (
+            f"{owner}: the sync wording no longer contains {sentence!r} exactly once, "
+            "so the async rewrite silently did nothing"
+        )
+
+    # And the rewrites really did land.
+    assert "async with`` block" in (mc.AsyncComputers.ephemeral.__doc__ or "")
+    assert ":class:`AsyncTemplates`" in (mc.AsyncBuilds.__doc__ or "")
+    assert ":class:`Templates`" not in (mc.AsyncBuilds.__doc__ or "")
+
+
+def test_a_reworded_source_does_not_break_the_import() -> None:
+    """`_reworded` degrades to a no-op rather than raising: a documentation
+    change must not strand every caller of the package."""
     from mandala_computer._async_resources import _reworded
 
+    assert _reworded("the wording changed", "``with``", "``async with``") == "the wording changed"
+    assert _reworded(None, "``with``", "``async with``") == ""
     assert _reworded("a ``with`` block", "``with``", "``async with``") == "a ``async with`` block"
-
-    with pytest.raises(AssertionError, match="expected exactly one"):
-        _reworded("the wording changed", "``with``", "``async with``")
-    with pytest.raises(AssertionError, match="expected exactly one"):
-        _reworded("``with`` and ``with``", "``with``", "``async with``")
-    with pytest.raises(AssertionError, match="expected exactly one"):
-        _reworded(None, "``with``", "``async with``")

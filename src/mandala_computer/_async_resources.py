@@ -31,18 +31,33 @@ from ._models import (
 
 
 def _reworded(doc: str | None, old: str, new: str) -> str:
-    """One half's prose with one sentence rewritten for the other, CHECKED.
+    """One half's prose with one sentence rewritten for the other.
 
     A bare ``str.replace`` on a docstring silently does nothing when the sync
     wording changes, and the async doc is then wrong again with no test failing
-    (adversarial review, OPL-3835). This refuses at import time instead.
+    (adversarial review, OPL-3835). It is not hypothetical: the first ephemeral
+    correction replaced strings the doc did not contain and was dead code for a
+    whole commit.
+
+    IT DOES NOT RAISE. The first version of this asserted at import time, which
+    turned a one-word docstring edit into ``import mandala_computer`` failing
+    outright — a worse trade than the no-op it replaced, and one that would
+    strand every caller over a documentation change. Drift is a documentation
+    bug and belongs in a test; :func:`tests.test_templates` asserts every
+    rewrite still finds its sentence.
     """
     text = doc or ""
-    if text.count(old) != 1:
-        raise AssertionError(
-            f"docstring surgery expected exactly one {old!r}, found {text.count(old)}"
-        )
     return text.replace(old, new, 1)
+
+
+#: Every docstring rewrite this module performs, so a test can check each one
+#: still matches. Its own list rather than something scraped back out of the
+#: results, because the failure being guarded against is a replacement that
+#: matched NOTHING — which is invisible in the output.
+DOC_REWRITES = (
+    ("AsyncComputers.ephemeral", "tying that to a ``with`` block"),
+    ("AsyncBuilds", ":class:`Templates`"),
+)
 
 
 from ._resources import (
