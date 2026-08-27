@@ -360,9 +360,18 @@ class _BaseTransport:
 
         What it is still for is the case that motivated it: a `wait(timeout=1)`
         inheriting the client's own sixty-second read, or a caller-supplied
-        client with no timeout at all, so that one request cannot outlive the
-        wait by a wide margin. The loop's deadline check is what bounds the
-        wait; this only keeps a single request from sitting far past it.
+        client with no timeout at all. The loop's deadline check is what bounds
+        the wait; this only keeps a single request from sitting far past it.
+
+        THE OVERSHOOT IS BOUNDED BUT NOT SMALL: the four phases are sequential,
+        so a request can spend up to four times what was left, and a wait can
+        return or raise that far past the deadline it documents
+        (/code-review, OPL-3835). Named rather than fixed, because the fix is
+        not arithmetic on these four numbers — that is what the reverted commit
+        tried — but a deadline enforced around the whole request, which is a
+        change to every caller and its own piece of work. Four times a shrinking
+        remainder is a bad hour; four copies of a full sixty-second read, which
+        is what the uncapped version gave, is a worse one.
         """
         if seconds is None:
             return current

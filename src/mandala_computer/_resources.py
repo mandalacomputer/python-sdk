@@ -194,6 +194,11 @@ def check_wait_args(timeout: float, poll: float) -> None:
             raise ValueError(f"{what} must be a finite, non-negative number of seconds")
 
 
+#: The least a wait will sleep after a 429, when `poll` and ``Retry-After``
+#: both fail to supply one. See :func:`retry_delay`.
+RATE_LIMITED_FLOOR = 1.0
+
+
 def retry_delay(poll: float, err: BaseException) -> float:
     """The ordinary polling delay, raised when the platform asked us to wait.
 
@@ -201,9 +206,18 @@ def retry_delay(poll: float, err: BaseException) -> float:
     TypeScript SDK has had ``retryDelay`` since the move work; this is the same
     thing, and the reason it did not exist here is that no Python wait retried a
     429 until this one.
+
+    THE FLOOR IS THE POINT, and ``poll`` cannot supply it. A ``RateLimitError``
+    carries ``retry_after`` only when the platform sent a ``Retry-After``
+    header, and it often does not; with ``poll=0`` — which this SDK accepts,
+    because all eight sibling waits do — the delay was then zero, so a wait hit
+    a rate limiter and retried it back to back for the full half-hour default
+    (/code-review, OPL-3835). That is the loop this function exists to break,
+    running with its one brake removed. A second is arbitrary and any positive
+    number would do; what matters is that a 429 never retries instantly.
     """
-    if isinstance(err, RateLimitError) and err.retry_after:
-        return max(poll, err.retry_after)
+    if isinstance(err, RateLimitError):
+        return max(poll, err.retry_after or RATE_LIMITED_FLOOR)
     return poll
 
 
@@ -673,7 +687,7 @@ class Builds:
         A ``done`` that disagrees with itself — the event that ends the stream,
         carrying a payload that says the build is still running — is a truncated
         stream and raises rather than ending the iteration. See
-        :func:`build_event_ended`.
+        :func:`build_ended`.
         """
         for event in self._t.sse("GET", _api.build_action(build_id, "events")):
             if event.event == "error":
@@ -692,7 +706,7 @@ class Builds:
             progress = BuildProgress.from_api(event.data)
             if event.event == "done" and not build_ended(progress):
                 # A ``done`` whose payload says the build is still running is the
-                # malformed case too — see build_event_ended. Raised BEFORE the
+                # malformed case too — see build_ended. Raised BEFORE the
                 # yield, so a caller cannot act on it as progress and then be
                 # told the stream was never valid.
                 raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))

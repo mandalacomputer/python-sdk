@@ -67,33 +67,42 @@ def _real(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
-def _flag(value: Any, *, default: bool = False) -> bool:
-    """A boolean field off the wire, or ``default`` when it is not one.
+def _flag(value: Any, *, unknown: bool = False) -> bool:
+    """A boolean field off the wire. Every one this module decodes comes here.
 
-    EVERY boolean this module decodes goes through here. It was three of them
-    for one commit — the ones a review had named — and the arbitrariness was
-    itself the defect (second adversarial review, OPL-3835): ``unmatched``, which
-    only describes, got the strict rule while ``Move.live``, which ends both move
-    wait loops, ``ExecStatus.exited``, which decides whether a caller stops
-    polling, and ``ExecResult.timed_out``, which decides
-    :attr:`ExecResult.ok` and through it whether a guest is reported ready, all
-    kept the coercing one. Sorting fields into "steers something" and "merely
-    describes" is a judgement that has to be re-made every time a field is added
-    and was already wrong here, so there is no sorting.
+    THREE CASES, and the middle one is why this is not two lines. A real JSON
+    boolean is itself. ABSENT reads False, which is what ``bool(d.get(...))``
+    did and what an older host omitting a field it has never heard of should
+    mean. PRESENT BUT NOT A BOOLEAN — ``"true"``, ``1``, ``{}`` — is a host
+    saying something this client cannot read, and that is not the same as a host
+    saying nothing: it reads ``unknown``, the cautious answer for THIS field.
 
     ``bool(value)`` was the old rule and it fails OPEN: ``"false"`` is a
-    non-empty string and therefore true, so a response spelling ``"valid":
-    "false"`` reported a document as publishable and ``"done": "false"`` told
-    :meth:`Builds.wait` a running build had finished. Reversing a control field
-    in the permissive direction is the one way a degrading decoder must not
-    fail.
+    non-empty string and therefore true, so ``"valid": "false"`` reported a
+    document as publishable. Replacing it with a blanket False failed open in
+    the other direction on the fields where False is the permissive reading
+    (/code-review, OPL-3835): a host stringifying its booleans made
+    ``Move.live`` False, and ``wait_for_move`` handed back a computer still
+    mid-migration; it made ``ExecStatus.running`` False, and the polling loop
+    that :meth:`Computer.start_exec` documents broke out of a live command to
+    read an ``exit_code`` of ``None``. Neither direction is safe as a blanket.
 
-    Anything that is not a JSON boolean reads as ``default``, which is False
-    everywhere it is used: not valid, not done, not live, not exited. That keeps
-    the module's contract — malformed fields are preserved in ``raw`` and never
-    rejected — while making the failure the conservative one.
+    So ``unknown`` is set per field, and the rule for setting it is one
+    question: if this client cannot tell, which answer avoids blessing
+    something? For ``valid``, ``done`` and ``allowed`` that is False — not
+    valid, not finished, not permitted. For ``live``, ``running``,
+    ``timed_out``, ``more``, the truncation flags and the degraded/unreachable
+    caveats it is True — still going, still incomplete, do not treat this as the
+    whole answer.
+
+    Malformed values are still preserved in ``raw`` and still never rejected,
+    which is this module's contract.
     """
-    return value if isinstance(value, bool) else default
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return unknown
 
 
 def _texts(value: Any) -> builtins.list[str]:
@@ -364,6 +373,7 @@ class Template:
     cpu: int
     ram_mb: int
     disk_gb: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
     #: The pinned ``namespace/name@version``, when the platform sent one.
     #:
     #: ``None`` only from a host too old to advertise refs. It matters more than
@@ -374,17 +384,18 @@ class Template:
     #: lib/projection publishes it for exactly that reason, and this model was
     #: dropping it on the floor.
     #:
-    #: KEYWORD-ONLY, rather than second where it reads best. This class is
-    #: exported, so its field order is its constructor: added ahead of ``label``
-    #: it broke every ``Template("ubuntu", "Ubuntu", ...)`` that worked on the
-    #: previous release, in fixtures and downstream code alike (adversarial
-    #: review, OPL-3835). Moving it to the end fixed those six and quietly broke
-    #: the seventh — ``raw`` was the seventh positional slot, so
+    #: KEYWORD-ONLY, and last, rather than second where it reads best. This
+    #: class is exported, so its field order is its constructor: added ahead of
+    #: ``label`` it broke every ``Template("ubuntu", "Ubuntu", ...)`` that worked
+    #: on the previous release, in fixtures and downstream code alike
+    #: (adversarial review, OPL-3835). Moving it past those six then quietly
+    #: broke the seventh — ``raw`` was the seventh positional slot, so
     #: ``Template(..., disk_gb, raw_dict)`` bound the mapping to ``ref`` and left
-    #: ``raw`` empty, without raising (second adversarial review). ``kw_only``
-    #: is what leaves every existing position alone. Decoding never noticed
-    #: either break — ``from_api`` passes by keyword.
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    #: ``raw`` empty, without raising (second adversarial review). ``kw_only`` is
+    #: what leaves every existing position alone, and this comment sits under
+    #: ``raw`` so that Sphinx attaches it to the field it describes rather than
+    #: to the one above it (/code-review). Decoding never noticed any of it —
+    #: ``from_api`` passes by keyword.
     ref: str | None = field(default=None, kw_only=True)
 
     @classmethod
@@ -672,7 +683,7 @@ class BuildProgress:
             note=_text(d.get("note")),
             error=_text(d.get("error")),
             updated_at=_text(d.get("updated_at")),
-            unmatched=_flag(d.get("unmatched")),
+            unmatched=_flag(d.get("unmatched"), unknown=True),
             raw=dict(d),
         )
 
@@ -809,7 +820,7 @@ class Snapshot:
             auto=_flag(d.get("auto")),
             computer_name=_text(d.get("computer_name")),
             orphaned=_flag(d.get("orphaned")),
-            unreachable=_flag(d.get("unreachable")),
+            unreachable=_flag(d.get("unreachable"), unknown=True),
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
@@ -1046,7 +1057,7 @@ class UsageReport:
             from_=_text(d.get("from")),
             to=_text(d.get("to")),
             usage=UsageTotals.from_api(totals),
-            degraded=_flag(d.get("degraded")),
+            degraded=_flag(d.get("degraded"), unknown=True),
             unmetered=_flag(d.get("unmetered")),
             # Presence, not emptiness. The platform drops the key for a scoped
             # credential and sends ``[]`` for an account that ran nothing, and
@@ -1113,7 +1124,7 @@ class Move:
             computer_id=_text(d.get("computer_id")),
             state=_text(d.get("state")),
             detail=_text(d.get("detail")),
-            live=_flag(d.get("live")),
+            live=_flag(d.get("live"), unknown=True),
             cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
             ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
             disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
@@ -1309,14 +1320,14 @@ class ExecStatus:
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
-            running=_flag(d.get("running")),
+            running=_flag(d.get("running"), unknown=True),
             exited=_flag(d.get("exited")),
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
-            more=_flag(d.get("more")),
+            more=_flag(d.get("more"), unknown=True),
             killed=_flag(d.get("killed")),
             started_at=_text(d.get("started_at")),
             raw=dict(d),
@@ -1378,8 +1389,8 @@ class ExecResult:
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
-            timed_out=_flag(d.get("timed_out")),
-            out_truncated=_flag(d.get("out_truncated")),
-            err_truncated=_flag(d.get("err_truncated")),
+            timed_out=_flag(d.get("timed_out"), unknown=True),
+            out_truncated=_flag(d.get("out_truncated"), unknown=True),
+            err_truncated=_flag(d.get("err_truncated"), unknown=True),
             raw=dict(d),
         )

@@ -28,6 +28,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+import mandala_computer._models
 from mandala_computer import _api
 
 BASE = "https://api.test/api/v1"
@@ -927,20 +928,33 @@ def test_purging_snapshots_still_takes_real_bools() -> None:
     }
 
 
-@pytest.mark.parametrize("value", ["false", "no", 0, 1, "", None, []])
-def test_a_control_field_that_is_not_a_json_boolean_reads_false(value: object) -> None:
-    """``bool("false")`` is True, and these three fields STEER a caller.
+@pytest.mark.parametrize("value", ["false", "no", 0, 1, "", []])
+def test_a_present_non_boolean_reads_the_cautious_way_for_its_field(value: object) -> None:
+    """``bool("false")`` is True, and these fields STEER a caller.
 
     ``valid`` decides whether a document is publishable and ``done`` ends a
-    wait, so a truthy non-boolean does not merely mislabel — it reverses the
-    meaning in the permissive direction. The value survives in ``raw``.
+    wait, so for those the cautious answer is False — not valid, not finished.
+    ``unmatched`` is the other direction: False would say the per-step positions
+    are trustworthy, which is the thing we cannot tell. The value survives in
+    ``raw`` either way.
     """
     check = mc.TemplateCheck.from_api({"valid": value})
     assert check.valid is False
     assert check.raw["valid"] == value
+
     progress = mc.BuildProgress.from_api({"done": value, "unmatched": value})
     assert progress.done is False
-    assert progress.unmatched is False
+    assert progress.unmatched is True
+
+
+def test_an_absent_field_is_not_the_same_as_an_unreadable_one() -> None:
+    """Absence is an older host omitting a field it never heard of, and reads
+    False as it always did. A present value this client cannot read is a
+    different thing and gets the cautious answer."""
+    assert mc.BuildProgress.from_api({}).unmatched is False
+    assert mc.BuildProgress.from_api({"unmatched": "yes"}).unmatched is True
+    assert mc.Move.from_api({}).live is False
+    assert mc.Move.from_api({"live": "true"}).live is True
 
 
 def test_real_booleans_still_decode() -> None:
@@ -1181,32 +1195,75 @@ def test_force_stop_still_takes_real_bools() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model", "field", "steers"),
+    ("model", "field", "cautious", "steers"),
     [
-        (mc.Move, "live", "both move wait loops"),
-        (mc.ExecStatus, "running", "whether a caller keeps polling"),
-        (mc.ExecStatus, "exited", "whether a caller keeps polling"),
-        (mc.ExecResult, "timed_out", "ExecResult.ok, and through it wait_for_guest"),
-        (mc.TemplateCheck, "valid", "whether a document is publishable"),
-        (mc.BuildProgress, "done", "whether a wait returns"),
+        (mc.Move, "live", True, "wait_for_move would hand back a mid-migration computer"),
+        (mc.ExecStatus, "running", True, "ExecStatus.done would end a poll on a live command"),
+        (
+            mc.ExecStatus,
+            "exited",
+            False,
+            "with running cautious, done stays False and the poll goes on",
+        ),
+        (
+            mc.ExecResult,
+            "timed_out",
+            True,
+            "it decides ExecResult.ok, and through it wait_for_guest",
+        ),
+        (mc.TemplateCheck, "valid", False, "a document is not publishable until it is known to be"),
+        (
+            mc.BuildProgress,
+            "done",
+            False,
+            "a wait does not return until the build is known to be over",
+        ),
     ],
 )
-def test_every_control_flow_boolean_decodes_strictly(model: type, field: str, steers: str) -> None:
-    """Hardening only the three fields a review happened to name was itself the
-    defect: ``unmatched``, which merely describes, got the strict rule while
-    ``Move.live``, ``ExecStatus.exited`` and ``ExecResult.timed_out`` — each of
-    which steers a loop — kept the coercing one."""
+def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
+    model: type, field: str, cautious: bool, steers: str
+) -> None:
+    """Hardening the three fields a review named was itself a defect, and so was
+    replacing it with a blanket False: on ``live`` and ``running`` False is the
+    PERMISSIVE reading, so a host stringifying its booleans ended a move wait on
+    a computer still migrating and a poll loop on a command still running."""
     decoded = model.from_api({field: "false"})
-    assert getattr(decoded, field) is False, steers
+    assert getattr(decoded, field) is cautious, steers
     assert decoded.raw[field] == "false"
 
 
+def test_the_cautious_reading_keeps_a_poll_loop_going() -> None:
+    """The two exec flags meet in ``done``, so they have to be chosen together."""
+    unreadable = mc.ExecStatus.from_api({"pid": 1, "running": "true", "exited": "false"})
+    assert unreadable.done is False, "a command this client cannot read is not finished"
+
+
+def test_the_cautious_reading_keeps_a_move_wait_going() -> None:
+    assert mc.Move.from_api({"state": "moving", "live": "true"}).live is True
+
+
+def test_an_unreadable_exec_is_not_reported_as_a_success() -> None:
+    r = mc.ExecResult.from_api({"exit_code": 0, "timed_out": "false"})
+    assert r.timed_out is True
+    assert r.ok is False, "ok must not bless an exec whose timed_out could not be read"
+
+
 def test_no_wire_boolean_is_left_on_truthiness() -> None:
-    """The rule is every boolean, not a list somebody has to keep current."""
+    """The rule is every boolean, not a list somebody has to keep current.
+
+    The path comes from the module rather than the cwd — the first version read
+    ``src/...`` relative to wherever pytest was invoked and errored anywhere but
+    the repo root (/code-review) — and it looks for a ``bool(`` call on anything
+    at all inside a ``from_api``, not just the one ``bool(d.get(...))`` spelling
+    the invariant was first written against.
+    """
     import re
 
-    source = pathlib.Path("src/mandala_computer/_models.py").read_text()
-    assert not re.findall(r"bool\(d\.get\(", source)
+    source = pathlib.Path(mc._models.__file__).read_text()
+    bodies = re.findall(r"def from_api\(.*?(?=\n    @|\n@|\nclass )", source, re.DOTALL)
+    assert bodies, "no from_api bodies found; the scan is not looking at anything"
+    offenders = [call for body in bodies for call in re.findall(r"\bbool\([^)]*\)", body)]
+    assert not offenders, offenders
 
 
 def test_template_keeps_the_raw_positional_slot_too() -> None:
@@ -1222,3 +1279,42 @@ def test_template_keeps_the_raw_positional_slot_too() -> None:
     assert t.ref is None
     with pytest.raises(TypeError):
         mc.Template("ubuntu", "Ubuntu", "linux", 2, 4096, 40, {}, "acc/u@1.0.0")  # type: ignore[misc]
+
+
+@respx.mock
+def test_a_429_without_a_retry_after_still_backs_off(client: mc.Client) -> None:
+    """``poll`` cannot be the floor, because ``poll=0`` is allowed.
+
+    ``retry_delay`` only consulted ``Retry-After``, and a RateLimitError raised
+    without that header carries ``retry_after=None``. With ``poll=0`` the delay
+    was therefore zero, so a wait that hit a rate limiter retried it back to
+    back for the full half-hour default — the loop the function exists to break,
+    with its one brake removed.
+    """
+    from mandala_computer._resources import RATE_LIMITED_FLOOR, retry_delay
+
+    bare = mc.RateLimitError("slow down", status=429)
+    assert bare.retry_after is None
+    assert retry_delay(0, bare) == RATE_LIMITED_FLOOR
+    assert retry_delay(5.0, bare) == 5.0
+
+    told = mc.RateLimitError("slow down", status=429, retry_after=30.0)
+    assert retry_delay(0, told) == 30.0
+    assert retry_delay(60.0, told) == 60.0
+
+    # A non-429 keeps the caller's poll, zero included: nothing asked us to wait.
+    assert retry_delay(0, mc.APIError("boom", status=503)) == 0
+
+
+@respx.mock
+def test_the_floor_is_actually_slept_by_a_wait(client: mc.Client) -> None:
+    slept: list[float] = []
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "slow down"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    with mock.patch("mandala_computer._resources.time.sleep", slept.append):
+        assert client.builds.wait("bld-1", timeout=30, poll=0).status == "succeeded"
+    assert slept and slept[0] >= 1.0, slept
