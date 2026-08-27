@@ -301,9 +301,9 @@ class AsyncBuilds:
         )
         return TemplateBuild.from_api(data)
 
-    async def list(self) -> builtins.list[TemplateBuild]:
-        data = await self._t.json_array("GET", _api.BUILDS)
-        return [TemplateBuild.from_api(b) for b in data]
+    async def list(self) -> Listing[TemplateBuild]:
+        data, incomplete = await self._t.listing(_api.BUILDS)
+        return Listing.of([TemplateBuild.from_api(b) for b in data or []], incomplete)
 
     async def get(self, build_id: str) -> TemplateBuild:
         return TemplateBuild.from_api(await self._t.json_object("GET", _api.build(build_id)))

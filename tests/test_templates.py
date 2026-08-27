@@ -631,3 +631,29 @@ async def test_async_stream_without_a_done_raises(async_client: mc.AsyncClient) 
     async with async_client as c:
         with pytest.raises(mc.MandalaError, match="ended without a final event"):
             [p async for p in c.builds.events("bld-1")]
+
+
+@respx.mock
+def test_a_short_build_listing_says_so(client: mc.Client) -> None:
+    """``GET /builds`` fans out and does NOT fail closed.
+
+    No ``allow_partial`` to opt into and no 503 to stop you — just a 200 and a
+    header. Read through the body alone, a hypervisor being away looked like an
+    account with fewer builds.
+    """
+    respx.get(f"{BASE}/builds").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "bld-1", "status": "running"}], headers={"X-GC-Incomplete": "0"}
+        )
+    )
+    builds = client.builds.list()
+    assert len(builds) == 1
+    assert builds.is_complete is False
+
+
+@respx.mock
+def test_a_complete_build_listing_says_that_too(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds").mock(
+        return_value=httpx.Response(200, json=[{"id": "bld-1", "status": "running"}])
+    )
+    assert client.builds.list().is_complete is True

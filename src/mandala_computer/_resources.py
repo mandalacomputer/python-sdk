@@ -476,10 +476,23 @@ class Builds:
         )
         return TemplateBuild.from_api(data)
 
-    def list(self) -> builtins.list[TemplateBuild]:
-        """Every build the fleet still holds a record of, newest first."""
-        data = self._t.json_array("GET", _api.BUILDS)
-        return [TemplateBuild.from_api(b) for b in data]
+    def list(self) -> Listing[TemplateBuild]:
+        """Every build the fleet still holds a record of, newest first.
+
+        A build lives on the hypervisor that ran it, so this is a fan-out — and
+        it does NOT fail closed the way the computer and snapshot listings do
+        (adversarial review, OPL-3835). There is no ``allow_partial`` to opt into
+        and no :class:`~mandala_computer.UnavailableError` to stop you: the
+        platform answers a short list with a 200 and ``X-GC-Incomplete``, so the
+        only thing that says a hypervisor was away is the header. Read through
+        the body alone, an outage looked like an account with fewer builds — and
+        a caller that cannot see a running build starts another one.
+
+        The returned :class:`~mandala_computer.Listing` says so:
+        ``is_complete``. It is a ``list`` subclass, so iterating it is unchanged.
+        """
+        data, incomplete = self._t.listing(_api.BUILDS)
+        return Listing.of([TemplateBuild.from_api(b) for b in data or []], incomplete)
 
     def get(self, build_id: str) -> TemplateBuild:
         """What became of one build. ``error`` says why a failed one failed."""
