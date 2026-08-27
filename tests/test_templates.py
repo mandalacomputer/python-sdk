@@ -1019,8 +1019,9 @@ def test_null_is_not_applicable_in_this_api() -> None:
 
 def test_real_booleans_still_decode() -> None:
     assert mc.TemplateCheck.from_api({"valid": True}).valid is True
-    assert mc.BuildProgress.from_api({"done": True, "unmatched": True}).done is True
-    assert mc.BuildProgress.from_api({"done": True, "unmatched": True}).unmatched is True
+    settled = {"status": "succeeded", "done": True, "unmatched": True}
+    assert mc.BuildProgress.from_api(settled).done is True
+    assert mc.BuildProgress.from_api(settled).unmatched is True
 
 
 @respx.mock
@@ -1549,9 +1550,13 @@ def test_the_floor_is_actually_slept_by_a_wait(client: mc.Client) -> None:
 @pytest.mark.parametrize(
     ("payload", "ended"),
     [
-        ({"status": "running", "done": True}, True),
-        ({"status": "running", "done": "true"}, True),
-        ({"status": "running", "done": 1}, True),
+        # A `done` the wire said was TRUE against a status a build does not
+        # stop on contradicts itself, and trusting the flag turns an active
+        # build into a settled one. The TypeScript SDK's own review of this
+        # surface caught it and this one did not (OPL-3835).
+        ({"status": "running", "done": True}, False),
+        ({"status": "running", "done": "true"}, False),
+        ({"status": "running", "done": 1}, False),
         ({"status": "succeeded", "done": False}, False),
         ({"status": "succeeded"}, True),
         ({"status": "succeeded", "done": None}, True),
@@ -2410,3 +2415,180 @@ def test_wrapped_prose_is_not_mistaken_for_a_code_example() -> None:
         if re.search(p, ln.strip())
     ]
     assert not flagged, flagged
+
+
+# The two SDKs disagreed about when a build wait ends. Each review found a real
+# defect the other did not, and the fixes did not compose (OPL-3835).
+
+
+@pytest.mark.parametrize(
+    ("payload", "done", "contradicts"),
+    [
+        ({"status": "succeeded", "done": True}, True, False),
+        ({"status": "failed", "done": True}, True, False),
+        ({"status": "running", "done": False}, False, False),
+        # Python's half: a host that said nothing is answered by the status.
+        ({"status": "succeeded"}, True, False),
+        ({"status": "succeeded", "done": None}, True, False),
+        ({"status": "succeeded", "done": "maybe"}, True, False),
+        ({"status": "running"}, False, False),
+        ({"status": "running", "done": None}, False, False),
+        ({"status": "running", "done": "maybe"}, False, False),
+        # TypeScript's half: a record that disagrees with itself is neither.
+        ({"status": "running", "done": True}, False, True),
+        ({"status": "", "done": True}, False, True),
+        ({"status": "queued", "done": True}, False, True),
+    ],
+)
+def test_the_two_sdks_agree_on_when_a_build_has_stopped(
+    payload: dict, done: bool, contradicts: bool
+) -> None:
+    """The composed rule, taking each SDK's better half.
+
+    TypeScript refused ``{done: true, status: "running"}`` and this one trusted
+    the flag. This one fell back to the status when ``done`` was absent or null
+    and TypeScript polled to its deadline instead. Neither had both halves.
+    """
+    from mandala_computer._models import build_contradiction
+
+    progress = mc.BuildProgress.from_api(payload)
+    assert progress.done is done, payload
+    assert (build_contradiction(progress) is not None) is contradicts, payload
+
+
+@respx.mock
+def test_a_wait_refuses_a_record_that_disagrees_with_itself(client: mc.Client) -> None:
+    """Silently polling it until the deadline tells the caller nothing about
+    what went wrong; the platform contradicting itself is worth saying."""
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json={"id": "bld-1", "status": "running", "done": True})
+    )
+    with pytest.raises(mc.MandalaError, match="contradicts itself"):
+        client.builds.wait("bld-1", timeout=5, poll=0)
+
+
+@respx.mock
+def test_a_stream_refuses_the_same_record(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", {**RUNNING, "done": True}))
+    )
+    with pytest.raises(mc.MandalaError, match="contradicts itself"):
+        list(client.builds.events("bld-1"))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_half_refuses_it_too(async_client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json={"id": "bld-1", "status": "running", "done": True})
+    )
+    with pytest.raises(mc.MandalaError, match="contradicts itself"):
+        await async_client.builds.wait("bld-1", timeout=5, poll=0)
+
+
+@respx.mock
+def test_an_older_host_that_omits_done_still_ends_the_wait(client: mc.Client) -> None:
+    """The half TypeScript is missing: it polls this to its deadline."""
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json={"id": "bld-1", "status": "succeeded"})
+    )
+    assert client.builds.wait("bld-1", timeout=5, poll=0).status == "succeeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_stream_refuses_a_contradictory_record_too(
+    async_client: mc.AsyncClient,
+) -> None:
+    """The sync stream was covered and this one was not.
+
+    Disabling only the async guard left the entire suite green (adversarial
+    review, OPL-3835) — the same half-covered shape this branch has produced
+    repeatedly. A valid ``done`` follows the contradictory ``progress`` so the
+    test cannot pass merely because the stream truncates afterwards.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", {**RUNNING, "done": True}), ("done", DONE))
+    )
+    with pytest.raises(mc.MandalaError, match="contradicts itself"):
+        [p async for p in async_client.builds.events("bld-1")]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_stream_still_yields_a_record_that_agrees_with_itself(
+    async_client: mc.AsyncClient,
+) -> None:
+    """The other half, so the test above cannot pass by refusing everything."""
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", DONE))
+    )
+    seen = [p.status async for p in async_client.builds.events("bld-1")]
+    assert seen == ["running", "succeeded"]
+
+
+@pytest.mark.parametrize(
+    ("status", "done", "contradicts"),
+    [
+        (["succeeded"], False, True),
+        (["succeeded"], False, False),
+        (123, False, True),
+        ({"v": "succeeded"}, False, True),
+        (None, False, True),
+        (True, False, True),
+    ],
+)
+def test_a_status_that_is_not_a_string_is_never_terminal(
+    status: object, done: bool, contradicts: bool
+) -> None:
+    """A coerced value cannot classify, and the TypeScript half proved it.
+
+    ``String(["succeeded"])`` is ``"succeeded"`` in JavaScript, so a status of
+    ``["succeeded"]`` read as terminal there. This SDK gives the right answer
+    for the same payload only because ``str(["succeeded"])`` happens to be
+    ``"['succeeded']"`` — an accident of formatting, not a rule (adversarial
+    review, OPL-3835). Both clients require a string now.
+    """
+    from mandala_computer._models import build_contradiction
+
+    payload: dict = {"id": "bld-1", "status": status}
+    if contradicts:
+        payload["done"] = True
+    progress = mc.BuildProgress.from_api(payload)
+    assert progress.done is done, payload
+    assert (build_contradiction(progress) is not None) is contradicts, payload
+
+
+def test_a_string_status_is_still_read_normally() -> None:
+    """The guard must not refuse the ordinary case."""
+    assert mc.BuildProgress.from_api({"status": "succeeded"}).done is True
+    assert mc.BuildProgress.from_api({"status": "failed", "done": True}).done is True
+    assert mc.BuildProgress.from_api({"status": "running"}).done is False
+
+
+def test_a_str_subclass_cannot_smuggle_a_terminal_status() -> None:
+    """The case that makes the explicit rule more than a restatement.
+
+    For any value JSON can carry, `_text(v) in BUILD_TERMINAL` and
+    `isinstance(v, str) and v in BUILD_TERMINAL` agree — which is why reverting
+    to the coercing form left the whole suite green. They part on a `str`
+    SUBCLASS whose `__str__` lies, which is the attack `canonical` in _api.py
+    already exists for: `_text` calls `str(value)` and takes the override,
+    while a membership test compares the underlying buffer.
+    """
+
+    class Liar(str):
+        def __str__(self) -> str:  # pragma: no cover - called by the old rule
+            return "succeeded"
+
+    from mandala_computer._models import _terminal_status
+
+    smuggled = Liar("still-running")
+    assert str(smuggled) == "succeeded", "the override is what the old rule read"
+    assert _terminal_status(smuggled) is False, "and the buffer is what decides"
+
+    progress = mc.BuildProgress.from_api({"id": "b", "status": smuggled, "done": True})
+    assert progress.done is False
+    from mandala_computer._models import build_contradiction
+
+    assert build_contradiction(progress) is not None
