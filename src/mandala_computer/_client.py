@@ -21,6 +21,7 @@ from ._exceptions import (
     AuthenticationError,
     ConflictError,
     ConnectionError,
+    ConnectionInterruptedError,
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
@@ -773,6 +774,36 @@ def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutEr
     )
 
 
+#: httpx exceptions that can only be raised before a byte of the request goes out.
+#:
+#: The allow-list ``_request_failed`` fails closed against, and httpx is what
+#: makes it short and honest: these classes name the connect phase outright,
+#: where the two TypeScript clients have to read undici's cause chain to find
+#: it. ``ConnectError`` covers DNS, a refused socket and a TLS handshake;
+#: ``ProxyError`` and ``UnsupportedProtocol`` both fail before a request is
+#: built.
+#:
+#: Everything else httpx raises describes a request already on the wire —
+#: ``ReadError``, ``WriteError``, ``RemoteProtocolError`` — or is something this
+#: SDK has no rule for, and both take the cautious answer.
+#:
+#: The two timeouts are here and are unreachable through this function today,
+#: which is deliberate rather than an oversight. Every ``httpx.TimeoutException``
+#: is caught one clause earlier and becomes :class:`TimeoutError`, which carries
+#: the same pair of answers :class:`ConnectionInterruptedError` does — fatal to
+#: :func:`is_transient`, polled through — so a timeout was never part of this
+#: hole. They are named so that this tuple states the phase correctly on its own
+#: terms, and so that reordering those clauses cannot quietly turn a connect
+#: timeout into a possible dispatch.
+_NEVER_DISPATCHED = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+)
+
+
 def _request_failed(method: str, path: str, exc: httpx.RequestError) -> ConnectionError:
     """The SDK's error for a request that failed before an HTTP response arrived.
 
@@ -781,8 +812,27 @@ def _request_failed(method: str, path: str, exc: httpx.RequestError) -> Connecti
     nothing more specific, and the retry predicates could not name it at all —
     which is why this SDK had no public :func:`is_transient` while the other two
     both listed their equivalent class in theirs.
+
+    **Two classes since OPL-3855**, because ``httpx.RequestError`` is two
+    different outcomes wearing one name. ``ConnectError`` means nothing was
+    dispatched and even a ``create`` may be replayed; ``ReadError`` and
+    ``RemoteProtocolError`` happen with the request already at the platform, so
+    it may have acted and the answer is what was lost.
+
+    **Fails closed.** Only the classes above are read as connect-phase, and
+    everything else — anything unrecognised, anything httpx adds later — is
+    treated as possibly dispatched. The two wrong answers do not cost the same:
+    calling a connect failure a possible dispatch costs one retry a caller
+    could have made blind, and calling a lost response a connect failure costs a
+    second billable computer.
     """
-    return ConnectionError(f"{method} {path} could not complete ({type(exc).__name__}): {exc}")
+    if isinstance(exc, _NEVER_DISPATCHED):
+        return ConnectionError(f"{method} {path} could not complete ({type(exc).__name__}): {exc}")
+    return ConnectionInterruptedError(
+        f"{method} {path} failed after the request was sent "
+        f"({type(exc).__name__}): {exc}. It may have been received, so treat "
+        "anything it would have changed as unknown rather than undone."
+    )
 
 
 def _retry_after(resp: httpx.Response) -> float | None:
