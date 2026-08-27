@@ -932,7 +932,7 @@ def test_purging_snapshots_still_takes_real_bools() -> None:
 #: here: those are unambiguous and are decoded, which is what keeps a backend
 #: that stringifies its booleans from getting the cautious answer on every flag
 #: of every response, for ever (/code-review, OPL-3835).
-UNREADABLE = ["maybe", "", 2, -1, [], {}, 1.5, None]
+UNREADABLE = ["maybe", "", 2, -1, [], {}, 1.5]
 
 
 @pytest.mark.parametrize("value", UNREADABLE)
@@ -978,15 +978,23 @@ def test_the_unambiguous_encodings_are_decoded_not_refused(wire: object, expecte
     assert mc.TemplateCheck.from_api({"valid": wire}).valid is expected
 
 
-def test_absent_null_and_unreadable_are_three_different_answers() -> None:
-    """``d.get(key)`` cannot tell absent from ``null``, which is why the decoder
-    takes the mapping. A host that OMITS a field never heard of it; a host that
-    sends ``"live": null`` is saying it cannot tell, and that is the one moment
-    the cautious answer exists for (/code-review)."""
-    assert mc.Move.from_api({}).live is False, "absent: an older host, as bool(d.get()) gave"
-    assert mc.Move.from_api({"live": None}).live is True, "null: the host says it cannot tell"
-    assert mc.Move.from_api({"live": "maybe"}).live is True, "unreadable"
+def test_null_reads_false_with_absent_because_this_api_means_not_applicable() -> None:
+    """Two reviews disagreed about ``null`` and the codebase settles it.
+
+    ``cpu``, ``ram_mb``, ``disk_gb``, ``finished_at`` and ``exit_code`` all use
+    ``null`` for NOT APPLICABLE, so ``live: null`` on a finished move means not
+    live. Reading it as "the host cannot tell" made ``wait_for_move`` poll a
+    finished move for its full fifteen minutes and then raise, and made
+    ``timed_out: null`` burn ``wait_for_guest``'s three minutes on a guest that
+    answered on the first probe (/code-review, OPL-3835).
+    """
+    assert mc.Move.from_api({}).live is False, "absent: an older host"
+    assert mc.Move.from_api({"live": None}).live is False, "null: not applicable"
+    assert mc.Move.from_api({"live": "maybe"}).live is True, "unreadable: the cautious answer"
     assert mc.Move.from_api({"live": False}).live is False, "a real boolean is itself"
+
+    assert mc.ExecResult.from_api({"exit_code": 0, "timed_out": None}).ok is True
+    assert mc.Move.from_api({"state": "done", "live": None}).live is False
 
 
 def test_real_booleans_still_decode() -> None:
@@ -1258,8 +1266,13 @@ def test_force_stop_still_takes_real_bools() -> None:
         ),
         (mc.UsageReport, "degraded", True, "a total that may be short must not read as complete"),
         (mc.UsageReport, "unmetered", True, "the other half of the same caveat, named with it"),
-        (mc.Snapshot, "unreachable", True, "a row whose host may not have answered"),
-        (mc.Snapshot, "orphaned", True, "restore has nowhere to put an orphan's disk"),
+        (mc.Snapshot, "unreachable", False, "True throws away every other field on a full row"),
+        (
+            mc.Snapshot,
+            "orphaned",
+            False,
+            "True steers a restore into a clone, which bills a computer",
+        ),
     ],
 )
 def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
@@ -1276,23 +1289,57 @@ def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
     assert decoded.raw[field] == "maybe"
 
 
-@respx.mock
-def test_the_documented_poll_loop_terminates_on_an_unreadable_status(client: mc.Client) -> None:
-    """The loop printed verbatim in ``Computer.start_exec``'s docstring.
+def _run_documented_poll_loop(statuses: list[mc.ExecStatus], limit: int = 6) -> dict[str, int]:
+    """The loop printed verbatim in ``Computer.start_exec``'s docstring, run.
 
-    With ``more`` cautiously True and ``running`` cautiously True it never broke
-    AND never slept: an infinite zero-delay loop against a metered endpoint, on
-    a command that had already finished. The same hammering the ``retry_delay``
-    floor was added to stop, reintroduced two commits later.
+    Bounded, and it reports what it did rather than asserting: the point of
+    these tests is which of break / sleep / spin actually happens.
     """
-    st = mc.ExecStatus.from_api({"pid": 7, "running": "maybe", "exited": "maybe", "more": "maybe"})
-    assert st.more is False, "a status this client cannot read must not demand an instant re-poll"
-    # `not more` is what makes the documented loop sleep; without it there is no
-    # delay between reads at all.
-    assert not st.more
+    reads = sleeps = 0
+    for status in statuses[:limit]:
+        reads += 1
+        if status.done and not status.more:
+            return {"reads": reads, "sleeps": sleeps, "broke": 1}
+        if not status.more:
+            sleeps += 1
+    return {"reads": reads, "sleeps": sleeps, "broke": 0}
 
-    finished = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": "maybe"})
-    assert finished.done and not finished.more, "a finished command must let the loop break"
+
+def test_a_finished_command_lets_the_documented_loop_break() -> None:
+    """``more`` cautious-True made this loop neither break nor sleep: an
+    unbounded zero-delay loop against a metered endpoint on a command that had
+    already finished (/code-review, OPL-3835)."""
+    finished = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": False})
+    assert _run_documented_poll_loop([finished] * 6) == {"reads": 1, "sleeps": 0, "broke": 1}
+
+
+def test_a_null_status_lets_the_loop_break_because_null_is_not_applicable() -> None:
+    """``null`` reads False with absent, so a finished command reported with
+    nulls still terminates the loop. Routing null to the cautious answer is what
+    made ``wait_for_move`` poll a finished move for its full timeout."""
+    nulls = mc.ExecStatus.from_api({"pid": 7, "running": None, "exited": None, "more": None})
+    assert nulls.done is True
+    assert _run_documented_poll_loop([nulls] * 6)["broke"] == 1
+
+
+def test_an_unreadable_status_backs_OFF_rather_than_spinning() -> None:
+    """The honest limit of this, stated rather than claimed away.
+
+    A status whose ``running`` cannot be read is not asserted to be finished —
+    that would end a poll on a live command — so the loop does NOT terminate.
+    What the cautious ``more`` buys is that it sleeps between reads instead of
+    spinning: a polite poll against a host sending nonsense, not a hot loop.
+    Terminating here would need a tri-state ``done``, which is a bigger change
+    than this branch.
+    """
+    junk = mc.ExecStatus.from_api(
+        {"pid": 7, "running": "maybe", "exited": "maybe", "more": "maybe"}
+    )
+    assert junk.running is True and junk.more is False
+    assert junk.done is False
+    ran = _run_documented_poll_loop([junk] * 6)
+    assert ran["broke"] == 0, "it cannot honestly break on a status it could not read"
+    assert ran["sleeps"] == ran["reads"], "but every read must be preceded by a sleep"
 
 
 def test_the_cautious_reading_keeps_a_poll_loop_going() -> None:

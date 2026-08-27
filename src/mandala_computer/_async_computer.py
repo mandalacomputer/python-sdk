@@ -1001,7 +1001,7 @@ class AsyncComputer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or _flag(s, "unreachable", unknown=True)
+            if s.get("computer_id") == self.id or _flag(s, "unreachable")
         ]
         return Listing.of(rows, incomplete)
 

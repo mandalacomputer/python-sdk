@@ -136,20 +136,21 @@ def build_ended(progress: BuildProgress) -> bool:
     and a contradiction resolves in its favour; the status is the fallback for a
     host too old to send the flag, not a second opinion about a host that did.
 
-    It reads ``raw`` rather than :attr:`BuildProgress.done` because the decoded
-    field cannot tell absent from false — :func:`_flag` maps both to False —
-    and those two mean different things here: one is an older host, the other is
-    a build that is still running.
+    It asks ``raw`` whether the key was THERE and then reads the decoded field,
+    rather than re-deciding what the payload meant. Testing ``raw`` for a real
+    ``bool`` was the same rule until :func:`_flag` learned to decode ``"true"``
+    and ``1``, at which point the two disagreed: ``{"status": "running",
+    "done": "true"}`` gave ``progress.done`` True while this returned False, so
+    a caller reading the field saw a finished build and ``wait()`` kept polling
+    to its deadline (/code-review, OPL-3835). One decoder, one answer.
 
     :meth:`Builds.wait` uses this too, and did not (second adversarial review,
     OPL-3835). ``events()`` accepting a terminal status without the flag while
     ``wait()`` returned only on ``last.done`` meant the same payload ended one
-    and left the other polling until its deadline — a divergence made likelier,
-    not less, by decoding ``done`` strictly.
+    and left the other polling until its deadline.
     """
-    flag = progress.raw.get("done")
-    if isinstance(flag, bool):
-        return flag
+    if "done" in progress.raw:
+        return progress.done
     return progress.status in BUILD_TERMINAL
 
 

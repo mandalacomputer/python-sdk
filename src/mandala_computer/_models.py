@@ -70,42 +70,47 @@ def _real(value: Any) -> float:
 def _flag(d: Mapping[str, Any], key: str, *, unknown: bool = False) -> bool:
     """A boolean field off the wire. Every one this module decodes comes here.
 
-    It takes the MAPPING and the key rather than the value, because absent and
-    ``null`` are different answers and ``d.get(key)`` cannot tell them apart
-    (/code-review, OPL-3835). A host that omits a field never heard of it; a
-    host that sends ``"live": null`` is saying it cannot tell, which is the one
-    moment ``unknown`` exists for.
-
     Four cases, in order:
 
     * A real JSON boolean is itself.
     * ABSENT is False — what ``bool(d.get(...))`` gave, and what an older host
-      omitting a field should mean.
-    * ``0``/``1`` and ``"true"``/``"false"`` are DECODED, not refused. The
-      original bug was truthiness, not recognition: ``bool("false")`` was True,
-      which is wrong, but ``"false"`` still unambiguously means false. A backend
-      that systematically encodes its booleans this way would otherwise get
-      ``unknown`` for every flag on every response — permanently, not
-      transiently — and with ``timed_out`` cautious that means
-      :attr:`ExecResult.ok` is never true and ``wait_for_guest`` always burns
-      its full timeout (/code-review).
-    * Anything else — ``null``, ``{}``, ``"maybe"``, ``2`` — reads ``unknown``,
-      the cautious answer for THIS field.
+      omitting a field it never heard of should mean.
+    * ``true``/``false`` and ``1``/``0``, however they are spelled — as JSON
+      booleans, as numbers, or as strings — are DECODED. The original bug was
+      TRUTHINESS, not recognition: ``bool("false")`` was True, which is wrong,
+      but ``"false"`` still plainly means false. A backend that systematically
+      encodes booleans this way would otherwise get the cautious answer on every
+      flag of every response, permanently, and with ``timed_out`` cautious that
+      means :attr:`ExecResult.ok` is never true and ``wait_for_guest`` — the
+      quickstart's first call — always burns its timeout (/code-review).
+    * Anything left — ``{}``, ``"maybe"``, ``2`` — reads ``unknown``.
 
-    ``unknown`` is set per field by one question: if this client cannot tell,
-    which answer avoids blessing something? False for ``valid``, ``done`` and
-    ``allowed`` — not valid, not finished, not permitted. True for the caveats
-    that say an answer is short or still moving: ``live``, ``running``,
-    ``timed_out``, the truncation flags, ``degraded``, ``unmetered``,
-    ``unreachable``, ``orphaned``, ``unmatched``.
+    ``null`` IS FALSE, WITH THE ABSENT CASE, and that is a correction rather
+    than an oversight (/code-review, OPL-3835). It was briefly routed to
+    ``unknown`` on the reasoning that a host sending ``null`` is saying it
+    cannot tell. This API's own convention says otherwise: ``cpu``, ``ram_mb``,
+    ``disk_gb``, ``finished_at`` and ``exit_code`` all use ``null`` for NOT
+    APPLICABLE, and under the other reading ``Move.live`` of ``null`` on a
+    finished move made ``wait_for_move`` poll it for the full fifteen minutes
+    and then raise, while ``timed_out`` of ``null`` made ``wait_for_guest`` burn
+    three minutes on a guest that answered on the first probe.
 
-    IT IS NOT SIMPLY "TRUE FOR CAVEATS". ``more`` is the counter-example and it
-    was got wrong (/code-review): it reads as a caveat but it is a BACKOFF
-    SWITCH — :meth:`Computer.start_exec` documents polling again immediately
-    while it is set — so a cautious True made the loop in its own docstring
-    neither break nor sleep, hammering a metered endpoint forever on a command
-    that had already finished. The question is what the flag makes a caller DO,
-    not what it sounds like.
+    ``unknown`` is set per field, and the question is not "is this a caveat?" —
+    that reading put ``more`` on the wrong side and cost an infinite loop. It is
+    what the flag makes a caller DO when it is wrong:
+
+    * TRUE where True only adds a caveat and costs a little time: ``live`` and
+      ``running`` (keep waiting), ``timed_out`` and the truncation flags (do not
+      trust this as the whole answer), ``degraded`` and ``unmetered`` (this
+      total may be short), ``unmatched`` (these step positions may not be).
+    * FALSE where True would DISCARD good data or send the caller somewhere
+      expensive: ``more`` is a backoff switch, and True means poll again with no
+      sleep; ``unreachable`` True throws away every other field on a row that
+      has them; ``orphaned`` True steers a restore into a ``clone``, which bills
+      a whole new computer, where False on a real orphan gets a cheap refusal
+      from the platform.
+    * FALSE for the plain assertions, where the cautious answer is not to
+      assert: ``valid``, ``done``, ``allowed``.
 
     Malformed values are still preserved in ``raw`` and still never rejected,
     which is this module's contract.
@@ -115,10 +120,12 @@ def _flag(d: Mapping[str, Any], key: str, *, unknown: bool = False) -> bool:
     value = d[key]
     if isinstance(value, bool):
         return value
+    if value is None:
+        return False
     if isinstance(value, int) and value in (0, 1):
         return value == 1
-    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
-        return value.strip().lower() == "true"
+    if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0"):
+        return value.strip().lower() in ("true", "1")
     return unknown
 
 
@@ -836,8 +843,8 @@ class Snapshot:
             incremental=_flag(d, "incremental"),
             auto=_flag(d, "auto"),
             computer_name=_text(d.get("computer_name")),
-            orphaned=_flag(d, "orphaned", unknown=True),
-            unreachable=_flag(d, "unreachable", unknown=True),
+            orphaned=_flag(d, "orphaned"),
+            unreachable=_flag(d, "unreachable"),
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
