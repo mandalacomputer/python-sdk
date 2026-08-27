@@ -1725,10 +1725,25 @@ def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
                 stack.append(child)
         return bound
 
-    def _loads(node: ast.AST) -> set[str]:
-        return {
-            c.id for c in ast.walk(node) if isinstance(c, ast.Name) and isinstance(c.ctx, ast.Load)
-        }
+    def _loads(node: ast.AST, *, descend: bool = True) -> set[str]:
+        """Names read by a node. ``descend=False`` skips nested function and
+        class bodies, so a module-level scan does not read a helper's own
+        locals — the binding scan already refuses to descend into them, and the
+        mismatch made `if True:` over a `def helper(path)` report ``path``
+        undefined (/code-review, OPL-3835)."""
+        read: set[str] = set()
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            for child in ast.iter_child_nodes(current):
+                if not descend and isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    continue
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    read.add(child.id)
+                stack.append(child)
+        return read
 
     for n, block in enumerate(blocks, 1):
         try:
@@ -1752,7 +1767,7 @@ def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            for name in _loads(node):
+            for name in _loads(node, descend=False):
                 if name not in defined and name not in module_level:
                     problems.append(f"block {n}: undefined name {name!r}")
         # A function body sees its own locals and arguments as well.
@@ -1760,7 +1775,7 @@ def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
             local = bound_by(node, descend=True)
-            for name in _loads(node):
+            for name in _loads(node, descend=True):
                 if name not in defined and name not in module_level and name not in local:
                     problems.append(f"block {n}: undefined name {name!r} in {node.name}")
         defined |= module_level
@@ -1944,7 +1959,11 @@ def test_the_decoded_flag_breaks_no_existing_construction() -> None:
     assert "decoded" not in mc.ExecStatus.__match_args__, "kw_only keeps it out"
     built = mc.ExecStatus(1, "c", True, False, None, "", "", 0, 0, False, False)
     assert built.decoded is False
-    assert "decoded" not in repr(built)
+    # IN the repr, because it is in `==` and flips `done`: a failed
+    # `assert status == ExecStatus(...)` printing two identical reprs with no
+    # hint why is the thing hiding it caused (/code-review, OPL-3835).
+    assert "decoded=False" in repr(built)
+    assert "decoded=True" in repr(mc.ExecStatus.from_api({"pid": 2}))
 
     off_wire = mc.ExecStatus.from_api({"pid": 2, "running": True})
     assert off_wire.decoded is True
@@ -2058,6 +2077,25 @@ def test_the_cap_is_measured_against_the_phase_that_actually_timed_out(
     assert _cut_short_by_our_own_cap(err, started, budget, ceiling) is ours
 
 
+def test_a_phase_the_client_does_not_limit_is_ours_not_unknown() -> None:
+    """A caller-supplied client with no timeout at all — the case `_cap_budget`
+    exists for — leaves the wait's cap as the ONLY thing that can have fired.
+
+    Collapsing "no limit" and "cannot name the phase" into one ``None`` made
+    that wait blame its own deadline on the fleet (/code-review, OPL-3835).
+    """
+    import time as _time
+
+    from mandala_computer._client import _BaseTransport
+    from mandala_computer._resources import _cut_short_by_our_own_cap
+
+    err = mc.TimeoutError("timed out")
+    err.__cause__ = httpx.ReadTimeout("x", request=httpx.Request("GET", "https://x.test"))
+    ceiling = _BaseTransport._phase_ceiling(httpx.Timeout(None), err)
+    assert ceiling == float("inf"), "no limit is infinite, not unknown"
+    assert _cut_short_by_our_own_cap(err, _time.monotonic() - 5, 5.0, ceiling) is True
+
+
 def test_a_timeout_whose_phase_cannot_be_named_is_not_claimed() -> None:
     """Unknown is not ours. An error with no cause, or a bare
     ``TimeoutException``, could have come from anywhere."""
@@ -2070,6 +2108,34 @@ def test_a_timeout_whose_phase_cannot_be_named_is_not_claimed() -> None:
     err = mc.TimeoutError("timed out")
     assert _BaseTransport._phase_ceiling(timeout, err) is None
     assert _cut_short_by_our_own_cap(err, _time.monotonic() - 30, 30.0, None) is False
+
+
+#: Shapes that only work on a sync client, matched at the start of an indented
+#: line where a docstring's code example lives. ONE definition, used both to
+#: scan and to prove the scan can still catch the docstring it came from — the
+#: check that was supposed to prove that used its own copy of the pattern, so
+#: mutating the scan left it green (/code-review, OPL-3835).
+SYNC_ONLY = (
+    (r"^\s+with (?!.*\basync\b)\S", "sync `with` in an example"),
+    (r"^\s+for \w+ in (?!.*\basync\b)\S", "sync `for ... in` in an example"),
+    (r":class:`(?!Async)[A-Z]\w*s`", "link to a sync class"),
+)
+
+
+def test_the_sync_only_patterns_catch_the_docstring_they_came_from() -> None:
+    """A class-level test that cannot catch the instance it generalised from is
+    not a class-level test.
+
+    The first version required `with client.` and `for x in client.` literally,
+    and the docstring the whole class of bug came from says
+    ``with closing(client.builds.events(...))`` — so restoring the shared
+    docstring would have passed it (/code-review, OPL-3835).
+    """
+    import re
+
+    fixture = mc.Builds.events.__doc__ or ""
+    assert "with closing(client.builds.events" in fixture, "the fixture moved"
+    assert any(re.search(p, fixture, re.MULTILINE) for p, _ in SYNC_ONLY), SYNC_ONLY
 
 
 def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
@@ -2087,10 +2153,40 @@ def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
             if not n.startswith("_")
         ]
         for owner, name, doc in docs:
-            if re.search(r"(?<!async )\bwith client\.", doc):
-                offenders.append((owner, name, "sync `with`"))
-            if re.search(r"(?<!async )\bfor \w+ in client\.", doc):
-                offenders.append((owner, name, "sync `for ... in`"))
-            if re.search(r":class:`(?!Async)[A-Z]\w*s`", doc):
-                offenders.append((owner, name, "link to a sync class"))
+            for pattern, why in SYNC_ONLY:
+                if re.search(pattern, doc, re.MULTILINE):
+                    offenders.append((owner, name, why))
     assert not offenders, offenders
+
+
+def test_the_async_ephemeral_docstring_teaches_async_with() -> None:
+    """Sharing it verbatim taught the sync keyword, and the first correction was
+    dead code — it replaced strings the doc does not contain, so the doc still
+    said ``with`` and only an appended note (indented under a doc at column
+    zero, so Sphinx renders it as a block quote) disagreed
+    (/code-review, OPL-3835)."""
+    async_doc = mc.AsyncComputers.ephemeral.__doc__ or ""
+    sync_doc = mc.Computers.ephemeral.__doc__ or ""
+    assert "async with`` block" in async_doc
+    assert "tying that to a ``with`` block" not in async_doc
+    assert "tying that to a ``with`` block" in sync_doc, "the sync half keeps its own wording"
+    assert not async_doc.rstrip().endswith("OPL-3835)."), "no dangling indented note"
+
+
+def test_a_stub_carrying_an_extra_field_is_still_a_stub() -> None:
+    """An exact whitelist stopped recognising a placeholder the moment the
+    platform added a key to it, and filtering those out drops precisely the
+    markers saying an answer is short (/code-review, OPL-3835)."""
+    from mandala_computer._models import is_unreachable_stub
+
+    for extra in (
+        {"created_at": "2026-08-27T00:00:00Z"},
+        {"kind": "disk"},
+        {"computer_name": None},
+    ):
+        row = {"id": "snap-1", "unreachable": True, **extra}
+        assert is_unreachable_stub(row) is True, extra
+        assert mc.Snapshot.from_api(row).unreachable is True, extra
+
+    # `state` is what every real snapshot carries and no placeholder does.
+    assert is_unreachable_stub({"id": "s", "unreachable": True, "state": "pending"}) is False

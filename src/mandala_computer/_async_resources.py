@@ -154,14 +154,17 @@ class AsyncComputers:
         else:
             await computer.delete()
 
-    ephemeral.__doc__ = (
-        EPHEMERAL_DOC.replace(
-            "with client.computers.ephemeral", "async with client.computers.ephemeral"
-        ).replace("    with ", "    async with ")
-        + "\n    ``async with``, not ``with``: this is an async context manager and the\n"
-        "    plain form raises ``TypeError``. The sync prose is otherwise the same,\n"
-        "    and sharing it verbatim taught the wrong keyword (adversarial review,\n"
-        "    OPL-3835).\n"
+    # Rewriting the sentence that names the keyword, not appending a note to
+    # the end of it. The first attempt replaced strings the doc does not contain
+    # — there is no code example in it and its one mention is the backticked
+    # ``with`` — so the correction was dead code and the doc still taught the
+    # sync form (/code-review, OPL-3835). The note it did append was indented
+    # four spaces under a doc at column zero, which renders as a block quote.
+    ephemeral.__doc__ = EPHEMERAL_DOC.replace(
+        "tying that to a ``with`` block",
+        "tying that to an ``async with`` block — and it is ``async with`` here, "
+        "since the plain form raises ``TypeError`` on an async context manager —",
+        1,
     )
 
 

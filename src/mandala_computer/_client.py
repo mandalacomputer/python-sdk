@@ -369,10 +369,16 @@ class _BaseTransport:
             value = timeout.read
         else:
             # Not a phase we can name — an httpx.TimeoutException with no
-            # subtype, or an error raised without a cause. Unknown, and the
+            # subtype, or an error raised without a cause. UNKNOWN, and the
             # caller treats unknown as "cannot claim it".
             return None
-        return None if value is None else float(value)
+        # A named phase the client puts no limit on is INFINITE, not unknown,
+        # and collapsing the two into None was a regression (/code-review,
+        # OPL-3835): against a caller-supplied client with no timeout at all —
+        # the case `_cap_budget`'s own docstring exists for — the wait's cap is
+        # then the ONLY thing that can have fired, and reading it as unknown
+        # made a wait blame its own deadline on the fleet.
+        return math.inf if value is None else float(value)
 
     @staticmethod
     def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:

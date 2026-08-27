@@ -159,7 +159,13 @@ def is_unreachable_stub(row: Mapping[str, Any]) -> bool:
     # /computers/{id}/snapshots` answers without a `computer_id` too — it is in
     # the path — so the missing key alone cannot mean placeholder. The
     # documented stub is an id and this flag and nothing more.
-    return set(row) <= {"id", "unreachable"}
+    # A TOLERANT test, not an exact whitelist. `set(row) <= {"id",
+    # "unreachable"}` stopped recognising a stub the moment the platform added a
+    # `created_at` or a `kind` to it, and filtering those out drops precisely
+    # the markers saying an answer is short (/code-review, OPL-3835). `state` is
+    # what every real snapshot carries and no placeholder does — the same shape
+    # of test `Computer.unreachable` makes with `status`.
+    return "state" not in row
 
 
 def _texts(value: Any) -> builtins.list[str]:
@@ -1426,6 +1432,12 @@ class ExecStatus:
     #: Whether this came off the wire. Keyword-only, so it changes no existing
     #: construction and stays out of ``__match_args__``.
     #:
+    #: IN THE REPR as well as in ``==``, because it is the field most likely to
+    #: be the only difference between two statuses — it is exactly the
+    #: hand-built-versus-decoded discriminator — and hiding it left a failed
+    #: ``assert status == ExecStatus(...)`` printing two identical reprs with no
+    #: hint why (/code-review, OPL-3835).
+    #:
     #: ``raw`` cannot answer it: ``from_api`` sets ``raw=dict(d)``, so a decoded
     #: ``{}`` — a proxy hiccup, a daemon answering 200 with an empty object — is
     #: indistinguishable from an object built by hand, and using its truthiness
@@ -1437,7 +1449,7 @@ class ExecStatus:
     #: the opposite of it (adversarial review, OPL-3835) — two objects equal to
     #: each other and behaviourally different is the wrong thing for an
     #: expected-value assertion or a change check to be handed.
-    decoded: bool = field(default=False, repr=False, kw_only=True)
+    decoded: bool = field(default=False, kw_only=True)
 
     @property
     def done(self) -> bool:
