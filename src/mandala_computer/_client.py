@@ -352,7 +352,7 @@ class _BaseTransport:
         """Cap ONE REQUEST — not one phase of it — to the time its caller has left.
 
         Every caller passes what remains of a deadline it has promised somebody:
-        `Builds.wait`, `Computer.wait_until_ready`, `wait_until_built`. Handing
+        `Builds.wait`, `Computer.wait_until_built`, `wait_until_running`. Handing
         that whole figure to each of pool, connect, write and read let a single
         request spend it four times over, because httpx applies those in
         sequence (adversarial review, OPL-3835) — so a `wait(timeout=1)` could
