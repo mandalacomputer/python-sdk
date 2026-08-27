@@ -634,26 +634,36 @@ async def test_async_stream_without_a_done_raises(async_client: mc.AsyncClient) 
 
 
 @respx.mock
-def test_a_short_build_listing_says_so(client: mc.Client) -> None:
-    """``GET /builds`` fans out and does NOT fail closed.
+def test_a_short_build_listing_arrives_as_a_refusal(client: mc.Client) -> None:
+    """It never reaches a caller as a short list, and that is the point.
 
-    No ``allow_partial`` to opt into and no 503 to stop you — just a 200 and a
-    header. Read through the body alone, a hypervisor being away looked like an
-    account with fewer builds.
+    lib/hvproxy does set X-GC-Incomplete on a short build listing, but
+    ``forward`` in lib/surface applies its strict-inventory check to every v1
+    route generically — so the response becomes a 503 before any client sees it.
+    A previous version of this method believed the opposite and returned a
+    Listing to carry a flag that cannot arrive.
     """
     respx.get(f"{BASE}/builds").mock(
         return_value=httpx.Response(
-            200, json=[{"id": "bld-1", "status": "running"}], headers={"X-GC-Incomplete": "0"}
+            503,
+            json={
+                "error": (
+                    "Right now a hypervisor cannot be reached, so this list would be "
+                    "incomplete. Retry, or pass allow_partial=1 to accept a partial answer."
+                )
+            },
+            headers={"X-GC-Incomplete": "0"},
         )
     )
-    builds = client.builds.list()
-    assert len(builds) == 1
-    assert builds.is_complete is False
+    with pytest.raises(mc.UnavailableError, match="would be incomplete"):
+        client.builds.list()
 
 
 @respx.mock
-def test_a_complete_build_listing_says_that_too(client: mc.Client) -> None:
+def test_a_complete_build_listing_is_an_ordinary_list(client: mc.Client) -> None:
     respx.get(f"{BASE}/builds").mock(
         return_value=httpx.Response(200, json=[{"id": "bld-1", "status": "running"}])
     )
-    assert client.builds.list().is_complete is True
+    builds = client.builds.list()
+    assert len(builds) == 1
+    assert builds[0].id == "bld-1"
