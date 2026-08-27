@@ -12,6 +12,7 @@ __all__ = [
     "APIError",
     "AuthenticationError",
     "ConflictError",
+    "ConnectionError",
     "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
@@ -25,6 +26,7 @@ __all__ = [
     "RateLimitError",
     "TimeoutError",
     "UnavailableError",
+    "is_transient",
 ]
 
 
@@ -201,28 +203,34 @@ class OriginResponseError(APIError):
 class OriginUnreachableError(APIError):
     """521-523 — a proxy in front of the platform could not reach it.
 
-    One of four classes for an edge failing rather than the platform refusing,
-    and they are four because a caller asking *did my work happen* needs four
-    answers. :class:`GatewayTimeoutError` is a hop that stopped waiting, usually
-    on a request the platform has. :class:`OriginResponseError` is 520, where the
-    platform was reached and the exchange broke coming back. :class:`OriginTLSError`
-    is a certificate that will never agree. This one is an origin that is down or
-    unreachable — what a platform restart looks like from outside, and it clears.
+        One of four classes for an edge failing rather than the platform refusing,
+        and they are four because a caller asking *did my work happen* needs four
+        answers. :class:`GatewayTimeoutError` is a hop that stopped waiting, usually
+        on a request the platform has. :class:`OriginResponseError` is 520, where the
+        platform was reached and the exchange broke coming back. :class:`OriginTLSError`
+        is a certificate that will never agree. This one is an origin that is down or
+        unreachable — what a platform restart looks like from outside, and it clears.
 
-    Almost always the request was never sent, so nothing was started and there is
-    nothing left running to account for. *Almost*, rather than never: a 522 is a
-    connection that timed out, and the edge can give up after one was
-    established, so bytes already on the wire are not unsent because no
-    acknowledgement came back. Retry a read freely; look before retrying
-    something that creates.
+        Almost always the request was never sent, so nothing was started and there is
+        nothing left running to account for. *Almost*, rather than never: a 522 is a
+        connection that timed out, and the edge can give up after one was
+        established, so bytes already on the wire are not unsent because no
+        acknowledgement came back. Retry a read freely; look before retrying
+        something that creates.
 
-    :meth:`~mandala_computer.Computer.wait_for_guest` waits one of these out, as
-    it waits out every error not named in ``_FATAL_WHILE_WAITING``.
-    :meth:`~mandala_computer.Computer.wait_until_built` and
-    :meth:`~mandala_computer.Computer.wait_until_running` do **not** — they read
-    the computer's state with no retry around it, so one of these mid-poll ends
-    the wait. :class:`OriginTLSError` is the sibling that is never waited out,
-    which is the whole reason it stopped sharing this class.
+    Every ``wait_*`` helper waits one of these out, which is a change: only
+        :meth:`~mandala_computer.Computer.wait_for_guest` used to.
+        :meth:`~mandala_computer.Computer.wait_until_built`,
+        :meth:`~mandala_computer.Computer.wait_until_running` and
+        :meth:`~mandala_computer.Computer.wait_for_move` read the control plane with
+        no retry around it at all, so one of these mid-poll ended the wait and
+        reported a machine that was coming up as one that never did (OPL-3724).
+        :class:`OriginTLSError` is the sibling that is still never waited out, which
+        is the whole reason it stopped sharing this class.
+
+        Not in :func:`is_transient`, though, and that is the other half of the same
+        change: *almost* never sent is not never, so an application replaying a
+        create through one of these can end up paying for two computers.
     """
 
 
@@ -235,11 +243,12 @@ class OriginTLSError(APIError):
     on every retry, and is a deployment somebody has to go and fix.
 
     Being its own class is what lets the ``wait_*`` helpers act on that. Sharing
-    one meant ``_FATAL_WHILE_WAITING`` could not name it, so
+    one meant the fatal set could not name it, so
     :meth:`~mandala_computer.Computer.wait_for_guest` retried a certificate
     failure for its full 180 seconds and then reported "the guest did not
     respond" — losing the cause, the class and the three minutes, while this
     error's own message said to report it rather than wait it out.
+    ``_is_transient_for_poll`` names it now, on behalf of all four waits.
     """
 
 
@@ -257,6 +266,12 @@ class RateLimitError(APIError):
     refusal on this surface that says exactly how long to wait:
     :attr:`retry_after` carries the ``Retry-After`` header in seconds. Sleeping
     that long and repeating the request is the whole remedy.
+
+    Which is what the ``wait_*`` helpers do with it, and why this left the fatal
+    set in OPL-3724. It was named there for a real reason — a rate limit clears
+    only on the server's cadence, and a poll loop substituting its own faster
+    one makes a short limit into a longer one — but honouring the header is the
+    remedy for that, and failing a wait the caller asked for is not.
     """
 
     def __init__(
@@ -395,6 +410,26 @@ class UnavailableError(APIError):
     """
 
 
+class ConnectionError(MandalaError, builtins.ConnectionError):
+    """The request could not complete — no HTTP response ever arrived.
+
+    A DNS failure, a refused connection, a TLS handshake that did not finish, a
+    proxy that closed the socket. Safe to retry without changing the request,
+    which is what :func:`is_transient` says about it.
+
+    Its own class for :class:`TimeoutError`'s reason: ``httpx.RequestError`` is
+    not a :class:`MandalaError`, so this used to leave here as a bare
+    ``MandalaError`` — catchable by the SDK-wide handler and by nothing more
+    specific. It is also both a :class:`MandalaError` and Python's built-in
+    :class:`ConnectionError`, so either handler catches it.
+
+    Named to match, and to be the same thing as, ``ConnectionError`` in
+    mandala-computer-typescript and ``ConnectivityError`` in
+    mandala-computer-mcp. All three now name it in the same retry predicate
+    (OPL-3724), and until this class existed this SDK could not.
+    """
+
+
 class TimeoutError(MandalaError, builtins.TimeoutError):
     """The SDK stopped waiting.
 
@@ -411,3 +446,131 @@ class TimeoutError(MandalaError, builtins.TimeoutError):
     wants :meth:`~mandala_computer.Computer.start_exec` rather than a longer
     deadline.
     """
+
+
+def is_transient(err: BaseException) -> bool:
+    """Whether an error is worth trying again without changing the request.
+
+    The **public** answer, and the one this SDK did not have. Its caller is
+    application code wrapping an arbitrary call in ``if is_transient(err):``
+    — possibly a ``create`` — so it names only failures that both clear on
+    their own *and* are safe to replay blind:
+
+    * :class:`ConflictError` — something in flight this cannot run alongside,
+      minus :class:`MoveRequiredError`, which is a decision rather than a moment
+    * :class:`RateLimitError` — a cadence, and the response usually says how long
+    * :class:`UnavailableError` — a hypervisor briefly out of reach
+    * :class:`ConnectionError` — the request never completed
+
+    Answered by TYPE, with no status numbers, and identical in all three clients
+    as of OPL-3724. Before it, one question had three answers: this SDK named
+    the *fatal* exceptions in ``_FATAL_WHILE_WAITING`` and retried the rest,
+    mandala-computer-mcp matched classes plus a list of status numbers, and
+    mandala-computer-typescript matched classes alone. Three mechanisms is how
+    they drifted — and the numbers are what let it happen quietly, because a
+    status can be added to a list without anyone saying which answer changed.
+
+    Deliberately absent: 502, 504, 520-523, and :class:`TimeoutError`. Every one
+    of them means the outcome is **unknown**, and "worth trying again" is not
+    "the call definitely did not happen". Replaying a create through one is how
+    one computer becomes two. The wait helpers still ride all of them out —
+    they ask :func:`_is_transient_for_poll`, which can afford to, because it
+    only ever replays a read.
+    """
+    if isinstance(err, MoveRequiredError):
+        return False
+    return isinstance(err, (ConflictError, RateLimitError, UnavailableError, ConnectionError))
+
+
+def _is_transient_for_poll(err: BaseException) -> bool:
+    """The same words, a different question: whether a poll is worth making again.
+
+    Asked only by the ``wait_*`` helpers, and deliberately private. They replay
+    a computer read, a moves listing, a build read or an ``exit 0`` guest probe
+    — idempotent, every one, and every one under a deadline the caller set.
+    That pair of properties is a fact about what those calls *do* rather than
+    about the error, which is why it cannot be published as the same ``True``.
+
+    A deny-list, where :func:`is_transient` is an allow-list, and this SDK had
+    the polarity right before either of the others: ``_FATAL_WHILE_WAITING``
+    named what to give up on and waited out the rest. What it lacked was the
+    second predicate beside it, so the same generosity could not be published,
+    and three of the four ``wait_*`` helpers had no transience handling at all.
+
+    The polarity follows from who pays for a wrong answer. Retrying something
+    unretryable costs one poll interval and at worst the deadline the caller
+    chose. *Not* retrying something that would have cleared costs a wait that
+    reports a machine as unreachable while it was coming up — and under an
+    allow-list every status the edge invents next lands there, silently, until
+    somebody adds a class.
+
+    The line is REQUEST versus MOMENT. A failure describing the request answers
+    the same way forever and is fatal here; a failure describing the moment is
+    what a poll exists to outlast. Fatal, therefore:
+
+    * anything that is not a failed request. Only :class:`APIError`,
+      :class:`ConnectionError` and :class:`TimeoutError` describe an exchange
+      with the platform that did not work. A ``ValueError`` from a bug in this
+      file is not a hypervisor being slow, and riding one out spends the
+      caller's deadline before reporting the wrong cause; a bare
+      :class:`MandalaError` is a verdict this SDK reached about a poll that
+      *succeeded*, and polling through a verdict is a loop with a deadline on
+      it. :class:`TimeoutError` is in the set because in this SDK it is also the
+      transport's own give-up, which the next poll may well survive — the one
+      place the three clients differ in spelling rather than in meaning, since
+      an equivalent failure is a ``ConnectionError`` in the TypeScript SDK.
+    * :class:`MoveRequiredError` — a decision about the size that was asked for.
+    * :class:`OriginTLSError` (525, 526) — a certificate the edge and the
+      platform cannot agree on fails identically on every retry, so waiting one
+      out spends the whole deadline to report the wrong cause.
+    * 524 — reached only by holding a request open past the edge's ceiling, so
+      an identical retry reproduces it at the same place. It shares
+      :class:`GatewayTimeoutError` with 504, which *is* worth another poll, and
+      that is the one status still matched by NUMBER: a type cannot separate two
+      statuses that share it.
+    * anything below 500 that is not named. A 4xx is a request the platform
+      refused on its merits — a bad body, a revoked key, a plan limit, a deleted
+      id, an offset past the end of a file — and repeating it unchanged cannot
+      change the answer. Three are named because they describe the moment
+      instead: 409 (something in flight), 429 (a cadence) and 408, which RFC 9110
+      defines as a request the client may repeat unchanged and which the edge in
+      front of this surface does emit.
+
+      A 3xx goes with the 4xx, which is why the rule is ``>= 500`` rather than
+      "not a 4xx": httpx is left on its default of not following redirects and
+      every non-2xx is an error here, so a base URL missing its trailing path
+      answered 301 and got polled until the deadline — half an hour ending in a
+      timeout that named nothing about the redirect (adversarial review,
+      OPL-3835, on the build wait this rule came from).
+
+    Everything at 5xx polls through, 502 and 520-523 included: they mean the
+    outcome is unknown, and a read whose outcome is unknown can simply be read
+    again. 5xx has an UPPER bound as well as a lower one, and it is not
+    decoration: httpx accepts any three-digit status, so a broken or hostile
+    origin can answer 700 — which ``>= 500`` alone called a passing moment and
+    polled until the caller's deadline (Codex adversarial review, OPL-3724).
+
+    What the floor costs, said plainly: ``_not_an_object`` raises a bare
+    :class:`MandalaError` for a proxy answering HTML where the platform's JSON
+    should be, and that used to be waited out. It is now fatal to a poll, in all
+    three clients. That is the better answer anyway — "answered text/html, not a
+    JSON object" names the cause on the first poll, where riding it out spends
+    the deadline to report a timeout that names nothing.
+
+    :class:`RateLimitError` is the one entry that moved *out* of the old fatal
+    set. It was there for a real reason — a rate limit clears only on the
+    server's cadence, and a helper replacing that with its own faster poll makes
+    a short limit into a longer one — but the fix for that is to honour
+    ``retry_after``, which the poll loops now do, rather than to fail the wait.
+    """
+    if not isinstance(err, (APIError, ConnectionError, TimeoutError)):
+        return False
+    if isinstance(err, (MoveRequiredError, OriginTLSError)):
+        return False
+    if isinstance(err, APIError):
+        if err.status == 524:
+            return False
+        if err.status in (408, 409, 429):
+            return True
+        return 500 <= err.status < 600
+    return True

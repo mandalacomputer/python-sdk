@@ -14,15 +14,11 @@ from typing import Any
 
 from . import _api
 from ._client import Transport
-from ._computer import Computer
+from ._computer import Computer, _poll_delay
 from ._exceptions import (
-    APIError,
-    ConflictError,
     MandalaError,
-    MoveRequiredError,
-    OriginTLSError,
-    RateLimitError,
     TimeoutError,
+    _is_transient_for_poll,
 )
 from ._models import (
     BuildProgress,
@@ -42,87 +38,6 @@ from ._models import (
 from ._sse import SSEEvent
 
 __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
-
-
-def is_transient(err: BaseException) -> bool:
-    """Whether a poll loop may swallow this and ask again.
-
-    STATUS-BASED for the caller-error range, class-based for the one deployment
-    fault, retry everything else. That shape took two reviews to arrive at, and
-    both corrections are worth keeping:
-
-    * It began as a deny-list of four permanent classes with ``except
-      MandalaError: pass`` under it, which swallowed a 400 and a malformed body
-      for the full half-hour default before surfacing as a misleading timeout.
-    * It was then an allow-list of three transient classes, which was worse in
-      the other direction: it dropped every failure the original rode out.
-      :class:`~mandala_computer.GatewayTimeoutError` (504/524),
-      :class:`~mandala_computer.OriginUnreachableError` (521-523) and
-      :class:`~mandala_computer.OriginResponseError` (520) all became fatal —
-      and ``OriginUnreachableError``'s own docstring in this package calls itself
-      "a passing outage" and says to retry a read freely. So did this SDK's own
-      :class:`~mandala_computer.TimeoutError`, which is what a poll capped by
-      ``timeout_cap`` raises when one fan-out runs long: a single slow poll
-      fourteen minutes into a build ended the wait.
-
-    A 4xx is a request the platform refused on its merits, and repeating it
-    unchanged cannot change the answer — except 409, 429 and 408, which are named
-    above. A 3xx goes with them: it is a decision about the URL, and the client
-    does not follow redirects. Everything at 5xx, every transport failure and
-    every timeout is the passing kind, which is what a poll loop is for.
-
-    A BARE :class:`~mandala_computer.MandalaError` IS TRANSIENT, and that is a
-    deliberate reversal worth naming, because the commit before this one claimed
-    the opposite in a comment. It is what ``_request_failed`` raises for a
-    connection that never completed, and what ``_not_an_object`` raises for a
-    captive portal or a proxy answering HTML instead of the platform — both of
-    which clear, and neither of which says the request was wrong. The wait's own
-    deadline is what bounds the retrying.
-
-    IT NO LONGER MIRRORS THE TYPESCRIPT SDK, whose ``isTransient`` is still an
-    allow-list of four classes. Several statuses now disagree between the two,
-    and that is the second front of OPL-3724 rather than something to paper over
-    here: this rule is the better one, and moving TypeScript to it means changing
-    an exported predicate that ``waitForMove`` and embedders both rely on.
-
-    An ``OriginTLSError`` is a 525/526 and the 5xx rule would retry it, so it is
-    named: the edge and the platform disagreeing about a certificate fails
-    identically on every retry and is a deployment somebody has to fix. The same
-    call ``_FATAL_WHILE_WAITING`` in _computer.py makes about it.
-
-    A move offer is excluded for its own reason — it is a
-    :class:`~mandala_computer.ConflictError` subclass and is a DECISION about the
-    size asked for, so the same request answers the same way for ever. It cannot
-    arise from a build poll; it is named so the predicate stays true wherever it
-    is reused.
-    """
-    if isinstance(err, MoveRequiredError | OriginTLSError):
-        return False
-    # The two 4xx that are not decisions, named ahead of the range rule. A 409 is
-    # a hypervisor already building — one build runs per host — and a 429 is a
-    # request that was fine and arrived too often. Whether a 409 clears is in the
-    # BODY and not the status, which is why MoveRequiredError is excluded above
-    # rather than here.
-    if isinstance(err, ConflictError | RateLimitError):
-        return True
-    # 408, which RFC 9110 defines as a request the client may repeat unchanged.
-    # Cloudflare fronts this surface and emits it, and it is not a decision about
-    # anything: it is the edge saying it waited long enough.
-    if isinstance(err, APIError) and err.status == 408:
-        return True
-    if isinstance(err, APIError):
-        # An allow-list of the ranges that pass, rather than "everything that is
-        # not 4xx". Spelled the other way it swept in 3xx (adversarial review,
-        # OPL-3835): httpx is left on its default of NOT following redirects and
-        # `_request` treats every non-2xx as an error, so a moved endpoint or a
-        # base_url missing its trailing path answered 301 and got retried until
-        # the wait's own deadline — half an hour, ending in a TimeoutError that
-        # named nothing about the redirect that caused it. A 3xx is a DECISION
-        # about the URL, as fixed as a 404.
-        return err.status >= 500
-    # A transport failure, a body that did not parse, a poll that ran past its
-    # cap: none of them says the request was wrong.
-    return True
 
 
 def check_wait_args(timeout: float, poll: float) -> None:
@@ -167,10 +82,7 @@ def check_wait_args(timeout: float, poll: float) -> None:
 
 
 #: The least a wait will sleep after a 429, when `poll` and ``Retry-After``
-#: both fail to supply one. See :func:`retry_delay`.
-RATE_LIMITED_FLOOR = 1.0
-
-
+#: both fail to supply one. See ``_poll_delay`` in _computer.py.
 class _LastPoll(Enum):
     """What became of the most recent poll, in three states rather than two.
 
@@ -216,28 +128,6 @@ def classify_poll_failure(
     if time.monotonic() - started < budget * 0.9:
         return _LastPoll.FAILED
     return _LastPoll.UNRESOLVED
-
-
-def retry_delay(poll: float, err: BaseException) -> float:
-    """The ordinary polling delay, raised when the platform asked us to wait.
-
-    A 429 retried on a fixed five-second poll is the loop that caused it. The
-    TypeScript SDK has had ``retryDelay`` since the move work; this is the same
-    thing, and the reason it did not exist here is that no Python wait retried a
-    429 until this one.
-
-    THE FLOOR IS THE POINT, and ``poll`` cannot supply it. A ``RateLimitError``
-    carries ``retry_after`` only when the platform sent a ``Retry-After``
-    header, and it often does not; with ``poll=0`` — which this SDK accepts,
-    because all eight sibling waits do — the delay was then zero, so a wait hit
-    a rate limiter and retried it back to back for the full half-hour default
-    (/code-review, OPL-3835). That is the loop this function exists to break,
-    running with its one brake removed. A second is arbitrary and any positive
-    number would do; what matters is that a 429 never retries instantly.
-    """
-    if isinstance(err, RateLimitError):
-        return max(poll, err.retry_after or RATE_LIMITED_FLOOR)
-    return poll
 
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
@@ -845,10 +735,17 @@ class Builds:
                 # A hypervisor briefly away during a fifteen-minute build is
                 # ordinary, and is what this loop is for. A 4xx other than
                 # 408/409/429 is a request the platform refused on its merits,
-                # and propagates now rather than in half an hour. See
-                # is_transient for what a bare MandalaError counts as — which is
-                # not what this comment used to claim.
-                if not is_transient(err):
+                # and propagates now rather than in half an hour.
+                #
+                # This module had its own copy of that rule, arrived at over two
+                # reviews, and its docstring called itself "the second front of
+                # OPL-3724" because it no longer matched the TypeScript SDK. It
+                # is now _is_transient_for_poll, which every wait in this package
+                # and both sibling clients ask — and which took this copy's two
+                # corrections with it: 408 is retryable per RFC 9110, and the
+                # range test is `>= 500` rather than "not a 4xx" so that a 301
+                # from a misconfigured base URL is not polled for half an hour.
+                if not _is_transient_for_poll(err):
                     raise
                 # What the MOST RECENT poll said about the platform, in three
                 # states. A poll cut short by this wait's own cap did not fail
@@ -859,7 +756,7 @@ class Builds:
                 poll_state = classify_poll_failure(
                     err, started, remaining, self._t.phase_ceiling(err)
                 )
-                delay = retry_delay(poll, err)
+                delay = _poll_delay(err, poll)
             if poll_state is _LastPoll.ANSWERED and last is not None:
                 # OUTSIDE the handler above, which treats a bare MandalaError as
                 # transient by design — raised inside it, this was swallowed and
