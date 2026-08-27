@@ -1856,3 +1856,86 @@ def test_a_timeout_that_arrives_instantly_IS_the_fleet_failing(client: mc.Client
     with pytest.raises(mc.TimeoutError) as caught:
         client.builds.wait("bld-1", timeout=0.2, poll=0.01)
     assert "could not be" in str(caught.value), str(caught.value)
+
+
+def test_a_decoded_empty_body_is_not_a_finished_command() -> None:
+    """`raw` truthiness could not tell a decoded `{}` from a hand-built object.
+
+    `from_api` sets `raw=dict(d)`, so a 200 whose body is an empty object — a
+    proxy hiccup, a daemon answering with nothing — looked exactly like an
+    `ExecStatus` somebody constructed, fell through to the fields, and declared
+    the command finished with nothing exited, nothing killed and no exit code
+    (/code-review, OPL-3835). The escape hatch reopened the hole it sat beside.
+    """
+    empty = mc.ExecStatus.from_api({})
+    assert empty.decoded is True, "it came off the wire, however little it said"
+    assert empty.done is False
+    assert empty.drained is False
+    assert _run_documented_poll_loop([empty] * 4)["broke"] == 0
+
+    built = mc.ExecStatus(
+        pid=1,
+        command="",
+        running=False,
+        exited=False,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        stdout_offset=0,
+        stderr_offset=0,
+        more=False,
+        killed=False,
+    )
+    assert built.decoded is False
+    assert built.done is True, "a caller who wrote running=False has said it stopped"
+
+
+def test_the_decoded_flag_changes_no_existing_construction() -> None:
+    """Keyword-only, out of ``repr`` and out of ``==``."""
+    kwargs: dict[str, object] = {
+        "pid": 1,
+        "command": "c",
+        "running": True,
+        "exited": False,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "stdout_offset": 0,
+        "stderr_offset": 0,
+        "more": False,
+        "killed": False,
+    }
+    assert mc.ExecStatus(**kwargs) == mc.ExecStatus(**kwargs, decoded=True)
+    assert "decoded" not in repr(mc.ExecStatus(**kwargs))
+
+
+def test_a_fresh_snapshot_without_a_computer_id_is_not_a_placeholder() -> None:
+    """`POST /computers/{id}/snapshots` answers with no `computer_id` — it is in
+    the path — and this decoder serves that response too.
+
+    Keying the fallback on the missing key alone made a freshly captured
+    snapshot carrying `"unreachable": null` read as a placeholder, on a field
+    whose docstring tells callers to check it before believing anything else
+    (/code-review, OPL-3835).
+    """
+    fresh = {"id": "snap-1", "name": "nightly", "state": "pending", "size_bytes": 123}
+    for unreadable in (None, "maybe", {}):
+        assert mc.Snapshot.from_api({**fresh, "unreachable": unreadable}).unreachable is False
+
+    # The documented stub is an id and this flag and nothing more.
+    for unreadable in (None, "maybe"):
+        assert mc.Snapshot.from_api({"id": "snap-2", "unreachable": unreadable}).unreachable is True
+    # An explicit true is believed on any row that does not say whose it is.
+    assert mc.Snapshot.from_api({**fresh, "unreachable": True}).unreachable is True
+
+
+def test_the_async_events_docstring_does_not_teach_the_sync_idiom() -> None:
+    """Shared verbatim, it told AsyncClient callers to write `with closing(...)`
+    and `for ... in` over an async generator — a TypeError from the loop and an
+    AttributeError from `closing.__exit__`, which has no `close` to call."""
+    async_doc = mc.AsyncBuilds.events.__doc__ or ""
+    sync_doc = mc.Builds.events.__doc__ or ""
+    assert "aclosing(client.builds.events" in async_doc
+    assert "with closing(client.builds.events" not in async_doc
+    assert "async for" in async_doc
+    assert "with closing(client.builds.events" in sync_doc, "the sync half keeps its own"

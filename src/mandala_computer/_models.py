@@ -151,7 +151,17 @@ def is_unreachable_stub(row: Mapping[str, Any]) -> bool:
     if "computer_id" in row:
         return False
     said = _wire(row, "unreachable")
-    return said not in (_Wire.FALSE, _Wire.ABSENT)
+    if said is _Wire.TRUE:
+        return True
+    if said in (_Wire.NULL, _Wire.MALFORMED):
+        # An unreadable flag is believed only on a row that could not be
+        # anything else. `POST /computers/{id}/snapshots` answers without a
+        # `computer_id` too — it is in the path — and this decoder serves that
+        # response as well, so keying on the missing key alone made a freshly
+        # captured snapshot carrying `"unreachable": null` read as a placeholder
+        # (/code-review, OPL-3835). The documented stub is an id and this flag.
+        return set(row) <= {"id", "unreachable"}
+    return False
 
 
 def _texts(value: Any) -> builtins.list[str]:
@@ -1415,6 +1425,16 @@ class ExecStatus:
     killed: bool
     started_at: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    #: Whether this came off the wire. Keyword-only and out of ``repr`` and
+    #: ``==`` so it changes no existing construction.
+    #:
+    #: ``raw`` cannot answer it: ``from_api`` sets ``raw=dict(d)``, so a decoded
+    #: ``{}`` — a proxy hiccup, a daemon answering 200 with an empty object — is
+    #: indistinguishable from an object built by hand, and using its truthiness
+    #: let that payload declare a command finished with nothing exited, nothing
+    #: killed and no exit code (/code-review, OPL-3835). The escape hatch
+    #: reopened the very hole it was written beside.
+    decoded: bool = field(default=False, repr=False, compare=False, kw_only=True)
 
     @property
     def done(self) -> bool:
@@ -1438,10 +1458,10 @@ class ExecStatus:
         # nothing exited, nothing killed and no exit code. Only a `running` the
         # wire actually said was FALSE is evidence of stopping.
         #
-        # `self.raw` empty means this object was built directly rather than
-        # decoded, and then its fields ARE the evidence — there is no payload to
-        # consult and the caller said what they meant.
-        if self.raw and _wire(self.raw, "running") is not _Wire.FALSE:
+        # An object built directly rather than decoded has no payload to
+        # consult, and then its fields ARE the evidence: a caller who wrote
+        # `running=False` has said it stopped.
+        if self.decoded and _wire(self.raw, "running") is not _Wire.FALSE:
             return self.exited or self.killed
         return self.exited or self.killed or not self.running
 
@@ -1485,6 +1505,7 @@ class ExecStatus:
             killed=_wire(d, "killed") is _Wire.TRUE,
             started_at=_text(d.get("started_at")),
             raw=dict(d),
+            decoded=True,
         )
 
 

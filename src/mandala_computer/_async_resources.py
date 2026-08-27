@@ -319,11 +319,32 @@ class AsyncBuilds:
         return BuildProgress.from_api(data)
 
     async def events(self, build_id: str) -> AsyncIterator[BuildProgress]:
-        # aclosing, not a bare `async for`: asyncio finalizes async generators
-        # lazily through its own hook, so a caller who breaks out of this and
-        # then `await client.aclose()`s can shut the transport down with the
-        # stream still checked out — the worse half of the same defect the sync
-        # side has (/code-review, OPL-3835).
+        """The same record as :meth:`progress`, as an event stream.
+
+        :meth:`Builds.events` for what the stream carries and what an ``error``
+        event means; only the closing idiom differs, which is why this half does
+        not share that docstring (/code-review, OPL-3835). Copied verbatim it
+        told :class:`~mandala_computer.AsyncClient` callers to write ``with
+        closing(...)`` and ``for ... in`` over an ASYNC generator — a
+        ``TypeError`` from the loop and an ``AttributeError`` from
+        ``closing.__exit__``, which has no ``close`` to call.
+
+        TO STOP READING EARLY, CLOSE THE ITERATOR, with
+        :func:`contextlib.aclosing`. A bare ``break`` leaves this generator
+        suspended at its yield and the stream checked out, and an account holds
+        only eight at once::
+
+            async with aclosing(client.builds.events(build_id)) as stream:
+                async for progress in stream:
+                    if progress.step == 3:
+                        break
+        """
+        # aclosing rather than a bare `async for`, for the reasons the sync half
+        # gives: an implementation that does not refcount, and parity with
+        # `AsyncComputer.agent_stream`. It does NOT rescue a caller's `break` —
+        # this generator is then suspended at its yield and the `async with`
+        # never unwinds — and an earlier version of this comment claimed it did
+        # (/code-review, OPL-3835). The docstring above carries the requirement.
         async with aclosing(self._t.sse("GET", _api.build_action(build_id, "events"))) as stream:
             async for progress in self._events(build_id, stream):
                 yield progress
@@ -390,7 +411,6 @@ class AsyncBuilds:
     list.__doc__ = Builds.list.__doc__
     get.__doc__ = Builds.get.__doc__
     progress.__doc__ = Builds.progress.__doc__
-    events.__doc__ = Builds.events.__doc__
     wait.__doc__ = Builds.wait.__doc__
 
 
