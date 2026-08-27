@@ -53,6 +53,7 @@ from ._models import (
     _num,
     _Wire,
     _wire,
+    is_unreachable_stub,
 )
 
 __all__ = ["BackgroundCommand", "Computer"]
@@ -318,28 +319,6 @@ _FATAL_WHILE_WAITING = (
 )
 
 
-def _is_unreachable_stub(row: Mapping[str, Any]) -> bool:
-    """Whether a snapshot row is a placeholder for one nobody could read.
-
-    ROW SHAPE, not the flag alone, and that is why this is not a decoder call
-    (adversarial review, OPL-3835). ``unreachable`` means opposite things on the
-    two rows it can appear on: on a SPARSE row — an id and the flag, no
-    ``computer_id``, because there was no daemon to say which computer it
-    belonged to — it is the marker saying this listing is short, and dropping it
-    reports a confident count over an incomplete answer. On a FULL row belonging
-    to another computer, admitting it on an unreadable flag hands back somebody
-    else's snapshots from a method read before an irreversible delete.
-
-    So an unreadable flag is believed only where the row could not be anything
-    else, and the two failures a single fallback boolean had to choose between
-    both go away.
-    """
-    if row.get("computer_id"):
-        return False
-    said = _wire(row, "unreachable")
-    return said is _Wire.TRUE or said in (_Wire.NULL, _Wire.MALFORMED)
-
-
 class ComputerFields:
     """Read-only accessors over a computer payload.
 
@@ -591,9 +570,14 @@ class ComputerFields:
         # a sparse one it must not report a reachable computer we never heard
         # from.
         said = _wire(self._data, "unreachable")
-        if said is _Wire.MALFORMED:
-            return not self._data.get("status")
-        return said is _Wire.TRUE
+        if said in (_Wire.TRUE, _Wire.FALSE):
+            return said is _Wire.TRUE
+        # Present and unreadable: believe it only on a row that could not be
+        # anything else. Key PRESENCE, not truthiness — a full payload carrying
+        # `"status": null` made every healthy computer report itself a
+        # placeholder, and callers told to check this "before believing anything
+        # else here" then stopped believing valid data (adversarial review).
+        return "status" not in self._data
 
     @property
     def vnc(self) -> VncConnect | None:
@@ -1641,7 +1625,7 @@ class Computer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or _is_unreachable_stub(s)
+            if s.get("computer_id") == self.id or is_unreachable_stub(s)
         ]
         return Listing.of(rows, incomplete)
 

@@ -61,33 +61,10 @@ from ._models import (
     SnapshotHoldings,
     Window,
     WindowResult,
-    _Wire,
-    _wire,
+    is_unreachable_stub,
 )
 
 __all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
-
-
-def _is_unreachable_stub(row: Mapping[str, Any]) -> bool:
-    """Whether a snapshot row is a placeholder for one nobody could read.
-
-    ROW SHAPE, not the flag alone, and that is why this is not a decoder call
-    (adversarial review, OPL-3835). ``unreachable`` means opposite things on the
-    two rows it can appear on: on a SPARSE row — an id and the flag, no
-    ``computer_id``, because there was no daemon to say which computer it
-    belonged to — it is the marker saying this listing is short, and dropping it
-    reports a confident count over an incomplete answer. On a FULL row belonging
-    to another computer, admitting it on an unreadable flag hands back somebody
-    else's snapshots from a method read before an irreversible delete.
-
-    So an unreadable flag is believed only where the row could not be anything
-    else, and the two failures a single fallback boolean had to choose between
-    both go away.
-    """
-    if row.get("computer_id"):
-        return False
-    said = _wire(row, "unreachable")
-    return said is _Wire.TRUE or said in (_Wire.NULL, _Wire.MALFORMED)
 
 
 class AsyncComputer(ComputerFields):
@@ -1024,7 +1001,7 @@ class AsyncComputer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or _is_unreachable_stub(s)
+            if s.get("computer_id") == self.id or is_unreachable_stub(s)
         ]
         return Listing.of(rows, incomplete)
 

@@ -999,8 +999,12 @@ def test_live_is_decided_with_the_state_when_the_wire_cannot_say() -> None:
         assert mc.Move.from_api({"state": "done", "live": unreadable}).live is False
         assert mc.Move.from_api({"state": "failed", "live": unreadable}).live is False
 
-    # Absent is an older host that never sent the flag, not a live move.
-    assert mc.Move.from_api({"state": "moving"}).live is False
+    # ABSENT defers with the rest. Reading it as False was the first version's
+    # bug: a host that omits the flag and says `moving` IS describing a live
+    # move, so returning False ended the wait on a disk still copying.
+    assert mc.Move.from_api({"state": "moving"}).live is True
+    assert mc.Move.from_api({"state": "done"}).live is False
+    assert mc.Move.from_api({}).live is False
 
 
 def test_null_is_not_applicable_in_this_api() -> None:
@@ -1354,20 +1358,38 @@ def test_a_readable_more_after_an_unreadable_one_ends_the_loop() -> None:
     }
 
 
-def test_a_null_status_lets_the_loop_break_because_null_is_not_applicable() -> None:
-    nulls = mc.ExecStatus.from_api({"pid": 7, "running": None, "exited": None, "more": None})
-    assert nulls.done is True
-    assert nulls.output_uncertain is False, "null is not-applicable, not unreadable"
-    assert _run_documented_poll_loop([nulls] * 6)["broke"] == 1
+def test_a_null_more_is_not_applicable_and_does_not_hold_the_loop_open() -> None:
+    """``more`` is the field null genuinely settles: nothing further queued."""
+    st = mc.ExecStatus.from_api({"pid": 7, "exited": True, "more": None})
+    assert st.output_uncertain is False, "null is not-applicable, not unreadable"
+    assert st.done is True and st.drained is True
+    assert _run_documented_poll_loop([st] * 6)["broke"] == 1
 
 
 def test_a_null_running_does_not_by_itself_declare_a_command_finished() -> None:
-    """Codex's second scenario: ``done`` must not turn true only because
-    ``running`` was null, with no affirmative terminal evidence."""
-    st = mc.ExecStatus.from_api({"pid": 7, "running": None, "exited": False, "more": False})
-    assert st.exited is False
-    assert st.done is True, "documented as `exited or not running`, and null is not running"
-    assert st.exit_code is None, "which is the field that says there is no verdict yet"
+    """``done`` needs AFFIRMATIVE evidence, not the absence of a readable flag.
+
+    The previous version of this test carried this name and this docstring and
+    then asserted ``done is True`` — pinning the very behaviour the name says is
+    wrong (adversarial review, OPL-3835). A ``running`` this client cannot read
+    decodes False like anything else unreadable, and ``not running`` then ended
+    the poll with no exit code, nothing exited and nothing killed.
+    """
+    for unreadable in (None, "maybe", {}):
+        st = mc.ExecStatus.from_api(
+            {"pid": 7, "running": unreadable, "exited": False, "more": False}
+        )
+        assert st.exited is False
+        assert st.exit_code is None, "no verdict yet"
+        assert st.done is False, "and so nothing has said it stopped"
+        assert st.drained is False
+        assert _run_documented_poll_loop([st] * 4)["broke"] == 0
+
+    # What DOES end it: something that actually says so.
+    for evidence in ({"exited": True}, {"killed": True}, {"running": False}):
+        st = mc.ExecStatus.from_api({"pid": 7, "more": False, **evidence})
+        assert st.done is True, evidence
+        assert _run_documented_poll_loop([st] * 4)["broke"] == 1, evidence
 
 
 def test_an_unreadable_status_backs_OFF_rather_than_spinning() -> None:
@@ -1494,32 +1516,6 @@ def test_the_floor_is_actually_slept_by_a_wait(client: mc.Client) -> None:
     assert slept and slept[0] >= 1.0, slept
 
 
-def test_a_snapshot_stub_survives_a_per_computer_filter_and_a_stranger_does_not(
-    client: mc.Client,
-) -> None:
-    """``unreachable`` means opposite things on the two rows it can appear on.
-
-    On a SPARSE row it is the marker saying the listing is short — dropping it
-    reports a confident count over an incomplete answer. On a FULL row belonging
-    to another computer, admitting it hands back somebody else's snapshots from
-    a method read before an irreversible delete. One fallback boolean had to
-    choose which of those to get wrong; row shape does not.
-    """
-    from mandala_computer._computer import _is_unreachable_stub
-
-    assert _is_unreachable_stub({"id": "snap-1", "unreachable": True}) is True
-    for unreadable in ("maybe", None, {}):
-        assert _is_unreachable_stub({"id": "snap-2", "unreachable": unreadable}) is True
-    # A full row for another computer is never a stub, however its flag reads.
-    for value in (True, "maybe", None):
-        assert (
-            _is_unreachable_stub({"id": "s", "computer_id": "vm-other", "unreachable": value})
-            is False
-        )
-    assert _is_unreachable_stub({"id": "snap-3"}) is False
-    assert _is_unreachable_stub({"id": "snap-4", "unreachable": False}) is False
-
-
 @pytest.mark.parametrize(
     ("payload", "ended"),
     [
@@ -1534,12 +1530,96 @@ def test_a_snapshot_stub_survives_a_per_computer_filter_and_a_stranger_does_not(
         ({"status": "running", "done": "maybe"}, False),
     ],
 )
-def test_build_ended_falls_back_only_when_the_value_was_not_recognised(
+def test_the_done_field_itself_falls_back_only_on_an_unrecognised_value(
     payload: dict, ended: bool
 ) -> None:
-    """Testing PRESENCE rather than recognition made ``{"status": "succeeded",
-    "done": null}`` block the fallback, so ``wait()`` ran to its half-hour
-    deadline on a finished build and the stream rejected its own final event."""
-    from mandala_computer._resources import build_ended
+    """The rule lives ON the field now, so nothing can disagree with it.
 
-    assert build_ended(mc.BuildProgress.from_api(payload)) is ended
+    It used to live in a ``build_ended`` helper beside ``BuildProgress.done``,
+    and the two drifted apart twice — most recently so that
+    ``{"status": "succeeded", "done": null}`` made ``wait()`` return an object
+    whose own documented "whether to stop polling" field said False
+    (adversarial review, OPL-3835). There is one spelling of the question now.
+    """
+    assert mc.BuildProgress.from_api(payload).done is ended
+
+
+@respx.mock
+def test_wait_never_returns_a_progress_that_contradicts_itself(client: mc.Client) -> None:
+    """The contradiction the table above would not have caught on its own."""
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json={"id": "bld-1", "status": "succeeded", "done": None})
+    )
+    p = client.builds.wait("bld-1", timeout=5, poll=0)
+    assert p.done is True, "a wait must not return an object whose own done says otherwise"
+
+
+@respx.mock
+def test_a_terminal_done_event_with_a_null_flag_is_not_malformed(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("done", {**DONE, "done": None}))
+    )
+    assert [p.status for p in client.builds.events("bld-1")] == ["succeeded"]
+
+
+@respx.mock
+def test_the_snapshot_filter_keeps_stubs_and_refuses_strangers(client: mc.Client) -> None:
+    """Through the real method, not the private helper.
+
+    The previous version called ``_is_unreachable_stub`` directly and imported
+    only the sync copy, so both filters could have stopped calling it — or the
+    async copy alone could have regressed — with the test still green
+    (adversarial review, OPL-3835). There is one shared predicate now, and this
+    goes through both public methods.
+    """
+    rows = [
+        {"id": "snap-mine", "computer_id": "vm-1", "size_bytes": 1},
+        {"id": "snap-other", "computer_id": "vm-2", "size_bytes": 1},
+        {"id": "snap-stub", "unreachable": True},
+        {"id": "snap-stub-unreadable", "unreachable": "maybe"},
+        # A FULL row that merely failed to fill in its computer_id. Truthiness
+        # read this as a stub and admitted it into every computer's list.
+        {"id": "snap-empty-cid", "computer_id": "", "unreachable": True, "size_bytes": 1},
+        {"id": "snap-null-cid", "computer_id": None, "unreachable": True, "size_bytes": 1},
+    ]
+    respx.get(f"{BASE}/snapshots").mock(return_value=httpx.Response(200, json=rows))
+    got = [s.id for s in mc.Computer(client._t, {"id": "vm-1", "status": "running"}).snapshots()]
+    assert got == ["snap-mine", "snap-stub", "snap-stub-unreadable"], got
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_snapshot_filter_agrees(async_client: mc.AsyncClient) -> None:
+    rows = [
+        {"id": "snap-mine", "computer_id": "vm-1"},
+        {"id": "snap-other", "computer_id": "vm-2"},
+        {"id": "snap-stub", "unreachable": True},
+        {"id": "snap-null-cid", "computer_id": None, "unreachable": True},
+    ]
+    respx.get(f"{BASE}/snapshots").mock(return_value=httpx.Response(200, json=rows))
+    comp = mc.AsyncComputer(async_client._t, {"id": "vm-1", "status": "running"})
+    assert [s.id for s in await comp.snapshots()] == ["snap-mine", "snap-stub"]
+
+
+def test_a_full_computer_row_is_not_a_placeholder_because_a_field_was_null(
+    client: mc.Client,
+) -> None:
+    """``not self._data.get("status")`` made every healthy computer with a null
+    status report itself a placeholder, and callers told to check this before
+    believing anything else then stopped believing valid data."""
+    full = mc.Computer(client._t, {"id": "vm-1", "status": None, "name": "x", "unreachable": "?"})
+    assert full.unreachable is False, "it has fields a placeholder would not"
+    stub = mc.Computer(client._t, {"id": "vm-1", "unreachable": "?"})
+    assert stub.unreachable is True
+    assert mc.Computer(client._t, {"id": "vm-1", "status": "running"}).unreachable is False
+
+
+def test_the_readme_publishes_the_safe_poll_loop() -> None:
+    """The README carried the old two-line form for a commit after the docstring
+    was fixed, so a caller copying it still lost output (adversarial review)."""
+    readme = pathlib.Path(mc.__file__).parent.parent.parent / "README.md"
+    if not readme.exists():  # installed without the repo alongside
+        pytest.skip("README not next to the package")
+    text = readme.read_text()
+    assert "status.done and not status.more" not in text
+    assert "status.drained" in text

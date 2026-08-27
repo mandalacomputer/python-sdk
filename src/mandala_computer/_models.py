@@ -129,13 +129,29 @@ def _wire(d: Mapping[str, Any], key: str) -> _Wire:
     return _Wire.MALFORMED
 
 
-#: Read as True unless the wire says otherwise. For the plain assertions, where
-#: the cautious answer is not to assert: not valid, not finished, not permitted.
-_SAID_SO = (_Wire.TRUE,)
-#: Read as True when the wire says so OR when it is present and unreadable. For
-#: the caveats, where the cost of a wrong True is a little time and the cost of
-#: a wrong False is blessing a short or stale answer as complete.
-_SAID_SO_OR_CANNOT_TELL = (_Wire.TRUE, _Wire.MALFORMED)
+#: The documented shape of an unreachable placeholder row: an id, the flag, and
+#: no ``computer_id``, because there was no daemon to say which computer it
+#: belonged to. Shared rather than written twice — the sync and async filters had
+#: identical copies, which is a drift waiting to happen and a test that only ever
+#: covered one of them (adversarial review, OPL-3835).
+def is_unreachable_stub(row: Mapping[str, Any]) -> bool:
+    """Whether a snapshot row stands in for one nobody could read.
+
+    ROW SHAPE, not the flag alone. ``unreachable`` means opposite things on the
+    two rows it can appear on: on a stub it is the marker saying a listing is
+    short, and dropping it reports a confident count over an incomplete answer;
+    on a FULL row belonging to another computer, admitting it hands back
+    somebody else's snapshots from a method read before an irreversible delete.
+
+    The discriminator is the PRESENCE of ``computer_id``, not its truthiness. A
+    row carrying ``"computer_id": null`` or ``""`` is a full row that failed to
+    fill the field in, and reading it as a stub admitted it into every
+    computer's list (adversarial review, OPL-3835).
+    """
+    if "computer_id" in row:
+        return False
+    said = _wire(row, "unreachable")
+    return said not in (_Wire.FALSE, _Wire.ABSENT)
 
 
 def _texts(value: Any) -> builtins.list[str]:
@@ -526,7 +542,7 @@ class TemplateCheck:
             return None if value is None else _text(value)
 
         return cls(
-            valid=_wire(d, "valid") in _SAID_SO,
+            valid=_wire(d, "valid") is _Wire.TRUE,
             problems=_texts(d.get("problems")),
             ref=maybe("ref"),
             doc_digest=maybe("doc_digest"),
@@ -651,6 +667,33 @@ class BuildStep:
         )
 
 
+#: What a build stops on. ``running`` is the only other status the platform
+#: sends. Here rather than in _resources, so the field and everything that reads
+#: it cannot drift apart — they have twice.
+BUILD_TERMINAL = ("succeeded", "failed")
+
+
+def _build_done(d: Mapping[str, Any]) -> bool:
+    """Whether a build record says the build is OVER.
+
+    A RECOGNISED ``done`` is authoritative; anything else falls through to the
+    status. The order is the platform's own: ``done`` is derived from the JOB,
+    where the status is derived from a phase read out of a log the document's
+    own steps write into.
+
+    On the FIELD rather than beside it, and that is the correction (adversarial
+    review, OPL-3835). This rule lived in ``build_ended`` in _resources while
+    ``BuildProgress.done`` decoded the key alone, so ``{"status": "succeeded",
+    "done": null}`` made ``wait()`` return an object whose own documented
+    "whether to stop polling" field said False. Two spellings of one question
+    drifted apart twice; now there is one.
+    """
+    said = _wire(d, "done")
+    if said in (_Wire.TRUE, _Wire.FALSE):
+        return said is _Wire.TRUE
+    return _text(d.get("status")) in BUILD_TERMINAL
+
+
 @dataclass(frozen=True)
 class BuildProgress:
     """What a build is DOING, as against what became of it (platform OPL-3794).
@@ -708,7 +751,7 @@ class BuildProgress:
         return cls(
             id=_text(d.get("id")),
             status=_text(d.get("status")),
-            done=_wire(d, "done") in _SAID_SO,
+            done=_build_done(d),
             phase=_text(d.get("phase")),
             step=_num(d.get("step")),
             of=_num(d.get("of")),
@@ -716,7 +759,7 @@ class BuildProgress:
             note=_text(d.get("note")),
             error=_text(d.get("error")),
             updated_at=_text(d.get("updated_at")),
-            unmatched=_wire(d, "unmatched") in _SAID_SO_OR_CANNOT_TELL,
+            unmatched=_wire(d, "unmatched") in (_Wire.TRUE, _Wire.MALFORMED),
             raw=dict(d),
         )
 
@@ -755,7 +798,7 @@ class Size:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=_wire(d, "allowed") in _SAID_SO,
+            allowed=_wire(d, "allowed") is _Wire.TRUE,
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -849,11 +892,11 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=_wire(d, "incremental") in _SAID_SO,
-            auto=_wire(d, "auto") in _SAID_SO,
+            incremental=_wire(d, "incremental") is _Wire.TRUE,
+            auto=_wire(d, "auto") is _Wire.TRUE,
             computer_name=_text(d.get("computer_name")),
-            orphaned=_wire(d, "orphaned") in _SAID_SO,
-            unreachable=_wire(d, "unreachable") in _SAID_SO,
+            orphaned=_wire(d, "orphaned") is _Wire.TRUE,
+            unreachable=_wire(d, "unreachable") is _Wire.TRUE,
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
@@ -983,7 +1026,7 @@ class ComputerUsage:
             run_hours=_real(d.get("run_hours")),
             vcpu_hours=_real(d.get("vcpu_hours")),
             ram_gb_hours=_real(d.get("ram_gb_hours")),
-            gone=_wire(d, "gone") in _SAID_SO,
+            gone=_wire(d, "gone") is _Wire.TRUE,
         )
 
 
@@ -1090,8 +1133,8 @@ class UsageReport:
             from_=_text(d.get("from")),
             to=_text(d.get("to")),
             usage=UsageTotals.from_api(totals),
-            degraded=_wire(d, "degraded") in _SAID_SO_OR_CANNOT_TELL,
-            unmetered=_wire(d, "unmetered") in _SAID_SO_OR_CANNOT_TELL,
+            degraded=_wire(d, "degraded") in (_Wire.TRUE, _Wire.MALFORMED),
+            unmetered=_wire(d, "unmetered") in (_Wire.TRUE, _Wire.MALFORMED),
             # Presence, not emptiness. The platform drops the key for a scoped
             # credential and sends ``[]`` for an account that ran nothing, and
             # those are different answers: one is "you may not see this", the
@@ -1161,15 +1204,20 @@ class Move:
     def from_api(cls, d: Mapping[str, Any]) -> Move:
         state = _text(d.get("state"))
         # `live` needs `state`, which is why this cannot be one decoder call
-        # (adversarial review, OPL-3835). Reading an unreadable or null `live` as
-        # False ended `wait_for_move` on a computer whose state said `moving`;
-        # reading it as True polled a FINISHED move to its deadline and raised.
-        # Neither is answerable without the other field. ABSENT stays False: an
-        # older host that never sent the flag is not describing a live move.
+        # (adversarial review, OPL-3835). Reading an unreadable `live` as False
+        # ended `wait_for_move` on a computer whose state said `moving`; reading
+        # it as True polled a FINISHED move to its deadline and raised. Neither
+        # is answerable without the other field.
+        #
+        # ABSENT defers with the rest, and the first version of this had it
+        # wrong: a host that omits the flag and says `state: "moving"` IS
+        # describing a live move, so returning False ended the wait on a disk
+        # still copying. Only a value the wire actually gave overrides the state.
         said = _wire(d, "live")
-        live = said is _Wire.TRUE or (
-            said in (_Wire.NULL, _Wire.MALFORMED) and state in cls.LIVE_STATES
-        )
+        if said in (_Wire.TRUE, _Wire.FALSE):
+            live = said is _Wire.TRUE
+        else:
+            live = state in cls.LIVE_STATES
         return cls(
             computer_id=_text(d.get("computer_id")),
             state=state,
@@ -1222,7 +1270,7 @@ class Window:
             y=_num(d.get("y")),
             width=_num(d.get("width")),
             height=_num(d.get("height")),
-            focused=_wire(d, "focused") in _SAID_SO,
+            focused=_wire(d, "focused") is _Wire.TRUE,
             raw=dict(d),
         )
 
@@ -1311,7 +1359,7 @@ class WindowResult:
         w = d.get("window")
         return cls(
             window=Window.from_api(w) if isinstance(w, Mapping) else None,
-            gone=_wire(d, "gone") in _SAID_SO,
+            gone=_wire(d, "gone") is _Wire.TRUE,
             raw=dict(d),
         )
 
@@ -1361,8 +1409,18 @@ class ExecStatus:
         Read with :attr:`drained`, not instead of it: a command can exit with
         output still queued, and a loop that stops at ``done`` alone drops
         whatever the last read did not reach.
+
+        AFFIRMATIVE EVIDENCE ONLY. ``exited``, ``killed``, or a ``running`` the
+        wire actually said was false. A ``running`` that is present and
+        unreadable decodes False like anything else this client cannot read, and
+        ``not running`` then declared a command finished on no evidence at all —
+        no exit code, nothing exited, nothing killed (adversarial review,
+        OPL-3835). It says nothing about whether the command stopped, so it is
+        not allowed to end the poll.
         """
-        return self.exited or not self.running
+        if _wire(self.raw, "running") in (_Wire.NULL, _Wire.MALFORMED):
+            return self.exited or self.killed
+        return self.exited or self.killed or not self.running
 
     @property
     def output_uncertain(self) -> bool:
@@ -1393,15 +1451,15 @@ class ExecStatus:
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
-            running=_wire(d, "running") in _SAID_SO_OR_CANNOT_TELL,
-            exited=_wire(d, "exited") in _SAID_SO,
+            running=_wire(d, "running") in (_Wire.TRUE, _Wire.MALFORMED),
+            exited=_wire(d, "exited") is _Wire.TRUE,
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
             more=_wire(d, "more") is _Wire.TRUE,
-            killed=_wire(d, "killed") in _SAID_SO,
+            killed=_wire(d, "killed") is _Wire.TRUE,
             started_at=_text(d.get("started_at")),
             raw=dict(d),
         )
@@ -1462,8 +1520,8 @@ class ExecResult:
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
-            timed_out=_wire(d, "timed_out") in _SAID_SO_OR_CANNOT_TELL,
-            out_truncated=_wire(d, "out_truncated") in _SAID_SO_OR_CANNOT_TELL,
-            err_truncated=_wire(d, "err_truncated") in _SAID_SO_OR_CANNOT_TELL,
+            timed_out=_wire(d, "timed_out") in (_Wire.TRUE, _Wire.MALFORMED),
+            out_truncated=_wire(d, "out_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
+            err_truncated=_wire(d, "err_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
             raw=dict(d),
         )

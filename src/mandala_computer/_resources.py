@@ -36,8 +36,6 @@ from ._models import (
     TemplateBuild,
     TemplateCheck,
     UsageReport,
-    _Wire,
-    _wire,
 )
 
 __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
@@ -122,44 +120,6 @@ def is_transient(err: BaseException) -> bool:
     # A transport failure, a body that did not parse, a poll that ran past its
     # cap: none of them says the request was wrong.
     return True
-
-
-#: The statuses a build stops on. ``running`` is the only other one.
-BUILD_TERMINAL = ("succeeded", "failed")
-
-
-def build_ended(progress: BuildProgress) -> bool:
-    """Whether a build record says the build is OVER. One rule, used twice.
-
-    ``done`` when the platform sent a real one, and the status otherwise. The
-    order matters and is the platform's own: ``done`` is derived from the JOB,
-    where the status is derived from the phase, and the phase comes out of a log
-    the document's own steps write into. So a present ``done`` is authoritative
-    and a contradiction resolves in its favour; the status is the fallback for a
-    host too old to send the flag, not a second opinion about a host that did.
-
-    A RECOGNISED value is authoritative; anything else falls through to the
-    status. Testing presence rather than recognition was the last version, and
-    it made ``{"status": "succeeded", "done": null}`` block the fallback — so
-    ``wait()`` ran to its half-hour deadline on a finished build and the stream
-    rejected its own final event as malformed (adversarial review, OPL-3835).
-
-    It reads ``raw`` rather than the decoded field because
-    :attr:`BuildProgress.done` is a ``bool`` and cannot say whether the platform
-    sent one. One classifier, so the field and this cannot disagree — they have
-    drifted apart twice.
-
-    :meth:`Builds.wait` uses this too, and did not (second adversarial review,
-    OPL-3835). ``events()`` accepting a terminal status without the flag while
-    ``wait()`` returned only on ``last.done`` meant the same payload ended one
-    and left the other polling until its deadline.
-    """
-    said = _wire(progress.raw, "done")
-    if said is _Wire.TRUE:
-        return True
-    if said is _Wire.FALSE:
-        return False
-    return progress.status in BUILD_TERMINAL
 
 
 def check_wait_args(timeout: float, poll: float) -> None:
@@ -696,7 +656,7 @@ class Builds:
         A ``done`` that disagrees with itself — the event that ends the stream,
         carrying a payload that says the build is still running — is a truncated
         stream and raises rather than ending the iteration. See
-        :func:`build_ended`.
+        :attr:`~mandala_computer.BuildProgress.done`.
         """
         for event in self._t.sse("GET", _api.build_action(build_id, "events")):
             if event.event == "error":
@@ -713,9 +673,9 @@ class Builds:
                     raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
             progress = BuildProgress.from_api(event.data)
-            if event.event == "done" and not build_ended(progress):
+            if event.event == "done" and not progress.done:
                 # A ``done`` whose payload says the build is still running is the
-                # malformed case too — see build_ended. Raised BEFORE the
+                # malformed case too — see BuildProgress.done. Raised BEFORE the
                 # yield, so a caller cannot act on it as progress and then be
                 # told the stream was never valid.
                 raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
@@ -781,7 +741,7 @@ class Builds:
                 # platform derives it from the JOB rather than from the phase,
                 # and the phase is read out of a log the document's own steps
                 # write into.
-                if build_ended(last):
+                if last.done:
                     return last
             except MandalaError as err:
                 # A hypervisor briefly away during a fifteen-minute build is

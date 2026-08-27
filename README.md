@@ -551,7 +551,7 @@ job = c.start_exec("apt-get install -y build-essential", cwd="/root")
 while True:
     status = job.poll()
     print(status.stdout, end="")
-    if status.done and not status.more:
+    if status.drained:
         break
     if not status.more:
         time.sleep(2)
