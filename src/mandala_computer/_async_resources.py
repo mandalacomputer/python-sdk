@@ -28,13 +28,31 @@ from ._models import (
     TemplateCheck,
     UsageReport,
 )
+
+
+def _reworded(doc: str | None, old: str, new: str) -> str:
+    """One half's prose with one sentence rewritten for the other, CHECKED.
+
+    A bare ``str.replace`` on a docstring silently does nothing when the sync
+    wording changes, and the async doc is then wrong again with no test failing
+    (adversarial review, OPL-3835). This refuses at import time instead.
+    """
+    text = doc or ""
+    if text.count(old) != 1:
+        raise AssertionError(
+            f"docstring surgery expected exactly one {old!r}, found {text.count(old)}"
+        )
+    return text.replace(old, new, 1)
+
+
 from ._resources import (
     EPHEMERAL_DOC,
     Builds,
     Templates,
-    _cut_short_by_our_own_cap,
+    _LastPoll,
     _wait_timed_out,
     check_wait_args,
+    classify_poll_failure,
     is_transient,
     retry_delay,
     warn_cleanup_failed,
@@ -160,11 +178,11 @@ class AsyncComputers:
     # ``with`` — so the correction was dead code and the doc still taught the
     # sync form (/code-review, OPL-3835). The note it did append was indented
     # four spaces under a doc at column zero, which renders as a block quote.
-    ephemeral.__doc__ = EPHEMERAL_DOC.replace(
+    ephemeral.__doc__ = _reworded(
+        EPHEMERAL_DOC,
         "tying that to a ``with`` block",
         "tying that to an ``async with`` block — and it is ``async with`` here, "
         "since the plain form raises ``TypeError`` on an async context manager —",
-        1,
     )
 
 
@@ -386,7 +404,7 @@ class AsyncBuilds:
         check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         last: BuildProgress | None = None
-        observed = False
+        poll_state = _LastPoll.FAILED
         while True:
             # Reset every iteration, so a Retry-After raises THIS sleep and not
             # every later one. Left assigned to `poll` it ratcheted: one 429 with
@@ -396,24 +414,23 @@ class AsyncBuilds:
             delay = poll
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
             started = time.monotonic()
             try:
                 last = await self.progress(build_id, timeout_cap=remaining)
-                observed = True
+                poll_state = _LastPoll.ANSWERED
                 if last.done:
                     return last
             except MandalaError as err:
                 if not is_transient(err):
                     raise
-                if not _cut_short_by_our_own_cap(
+                poll_state = classify_poll_failure(
                     err, started, remaining, self._t.phase_ceiling(err)
-                ):
-                    observed = False
+                )
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
             # asyncio.sleep, not time.sleep: this is the one line where the two
             # halves genuinely differ, and blocking the event loop for five
             # seconds a poll across a fifteen-minute build is what the async

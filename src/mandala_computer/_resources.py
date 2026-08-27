@@ -9,6 +9,7 @@ import warnings
 from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from datetime import datetime
+from enum import Enum, auto
 from typing import Any
 
 from . import _api
@@ -169,39 +170,51 @@ def check_wait_args(timeout: float, poll: float) -> None:
 RATE_LIMITED_FLOOR = 1.0
 
 
-def _cut_short_by_our_own_cap(
+class _LastPoll(Enum):
+    """What became of the most recent poll, in three states rather than two.
+
+    ``observed: bool`` forced a claim the SDK cannot make (adversarial review,
+    OPL-3835). A timeout that is CONSISTENT with this wait's own cap is not
+    proof it fired: a caller-supplied transport can raise ``ReadTimeout``
+    itself, and httpcore maps a phase's ``socket.timeout`` — which IS the
+    builtin ``TimeoutError`` — onto the same named class. Saying "was still
+    running" there asserts the fleet is fine on the strength of a stopwatch.
+    """
+
+    #: It answered. Whatever it said is current.
+    ANSWERED = auto()
+    #: It demonstrably did not answer — a refusal, a dropped connection, or a
+    #: timeout this wait's cap cannot have caused.
+    FAILED = auto()
+    #: A timeout consistent with this wait's own deadline and with a transport
+    #: failure alike. Neither side can be blamed, so the message blames neither.
+    UNRESOLVED = auto()
+
+
+def classify_poll_failure(
     err: BaseException, started: float, budget: float, ceiling: float | None
-) -> bool:
-    """Whether a failed poll ran out of OUR time rather than the platform's.
+) -> _LastPoll:
+    """Whether a failed poll says anything about the PLATFORM.
 
     ``ceiling`` is the client's own limit for the phase that timed out, or
-    ``None`` where it has none or the phase cannot be named: the cap is only
-    what fired if it was the TIGHTER of the two, and "tighter" is a question
-    about ONE phase — a connect stall is not measured against a read timeout
-    (adversarial review, OPL-3835). An unnamed phase is not claimed.
+    ``None`` where the phase cannot be named: "tighter" is a question about ONE
+    phase, and a connect stall measured against a read timeout got it wrong in
+    both directions (adversarial review, OPL-3835).
 
-    ``wait`` caps each poll at what is left of its deadline, so near the end a
-    perfectly healthy request gets cut off mid-flight. Counting that as a poll
-    the fleet failed to answer made a wait whose every poll succeeded report
-    "could not be reached for the last part of 30s" — a claim about the platform
-    made from this client's own clock (/code-review, OPL-3835). The TypeScript
-    twin skips the same case by name.
-
-    Measured by ELAPSED TIME against the budget the poll was given, not by
-    whether the deadline has since passed: a timeout that arrives instantly did
-    not exhaust anything and really is the platform or the network failing, and
-    a deadline check alone cannot tell the two apart.
+    Three things have to hold before a timeout is even a CANDIDATE for this
+    wait's own cap: the phase must be nameable, the cap must have been the
+    tighter of the two for that phase, and the request must have spent
+    substantially all of the budget it was given — a timeout arriving at once
+    exhausted nothing. Even then the answer is UNRESOLVED rather than "ours",
+    because none of it rules out a transport raising the same class itself.
     """
     if not isinstance(err, TimeoutError):
-        return False
-    # The cap only OWNS a timeout it actually caused: it must have been the
-    # tighter of the two for that phase. Elapsed time alone said a sixty-second
-    # network stall with sixty-six seconds left was ours, because 60 >= 66 * 0.9
-    # — and the wait then reported a build "still running" from a reading over a
-    # minute old (adversarial review, OPL-3835).
+        return _LastPoll.FAILED
     if ceiling is None or budget >= ceiling:
-        return False
-    return time.monotonic() - started >= budget * 0.9
+        return _LastPoll.FAILED
+    if time.monotonic() - started < budget * 0.9:
+        return _LastPoll.FAILED
+    return _LastPoll.UNRESOLVED
 
 
 def retry_delay(poll: float, err: BaseException) -> float:
@@ -565,20 +578,34 @@ class Templates:
 
 
 def _wait_timed_out(
-    build_id: str, timeout: float, last: BuildProgress | None, observed: bool
+    build_id: str, timeout: float, last: BuildProgress | None, poll: _LastPoll
 ) -> str:
     """What a build wait says when it gives up.
 
-    Three sentences rather than one, because the three situations differ in what
-    the caller should do next: a build seen running, a build that stopped
-    answering, and one that never answered at all. Shared by the sync and async
-    waits so they cannot word it differently.
+    Four sentences rather than one, because the situations differ in what the
+    caller should do next: a build seen running, a wait whose last poll cannot
+    be attributed to either side, a build that stopped answering, and one that
+    never answered at all. Shared by the sync and async waits so they cannot
+    word it differently.
+
+    The middle one is the correction (adversarial review, OPL-3835). It used to
+    be folded into the first, which asserted the fleet was fine on the strength
+    of a stopwatch — a timeout consistent with this wait's own cap is not proof
+    that the cap is what fired.
     """
-    if last is not None and observed:
+    if last is not None and poll is _LastPoll.ANSWERED:
         return (
             f"build {build_id} was still running after {timeout:g}s "
             f"(phase {last.phase}, step {last.step} of {last.of}; "
             "the build has not stopped, only this wait has)"
+        )
+    if last is not None and poll is _LastPoll.UNRESOLVED:
+        return (
+            f"the {timeout:g}s wait on build {build_id} ran out with its last poll still "
+            f"outstanding, so whether the fleet was answering cannot be told from here; "
+            f"when it last answered it was in phase {last.phase}, step {last.step} of "
+            f"{last.of}. The build has not stopped, only this wait has — read progress() "
+            "for where it got to."
         )
     if last is not None:
         return (
@@ -780,7 +807,7 @@ class Builds:
         # Without it the timeout quotes a stale ``last`` and says the build "was
         # still running" — a claim about the present tense, made from a reading
         # that may be half an hour old and followed by nothing but failures.
-        observed = False
+        poll_state = _LastPoll.FAILED
         while True:
             # Reset every iteration, so a Retry-After raises THIS sleep and not
             # every later one. Left assigned to `poll` it ratcheted: one 429 with
@@ -790,7 +817,7 @@ class Builds:
             delay = poll
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
             started = time.monotonic()
             try:
                 # The poll carries what is left of the wait, not the client's own
@@ -799,7 +826,7 @@ class Builds:
                 # caller-supplied client with no timeout at all. The same cap
                 # Computer.wait_until_built passes to its refresh.
                 last = self.progress(build_id, timeout_cap=remaining)
-                observed = True
+                poll_state = _LastPoll.ANSWERED
                 # ``done`` and not a comparison against a list of statuses: the
                 # platform derives it from the JOB rather than from the phase,
                 # and the phase is read out of a log the document's own steps
@@ -815,22 +842,19 @@ class Builds:
                 # not what this comment used to claim.
                 if not is_transient(err):
                     raise
-                # `observed` says whether the MOST RECENT poll answered, and a
-                # poll cut short by this wait's OWN cap did not fail to answer —
-                # it was never given time to (/code-review, OPL-3835). Counting
-                # it as a failure made a wait whose every poll succeeded report
-                # "could not be reached for the last part of 30s" instead of
-                # "was still running (phase X, step N of M)": a claim the fleet
-                # stopped answering, when only this clock ran out. The
-                # TypeScript twin skips the same case by name.
-                if not _cut_short_by_our_own_cap(
+                # What the MOST RECENT poll said about the platform, in three
+                # states. A poll cut short by this wait's own cap did not fail
+                # to answer — it was never given time to — but a timeout merely
+                # CONSISTENT with that cap is not proof it fired, so the third
+                # state exists and the message declines to blame either side
+                # (adversarial review, OPL-3835).
+                poll_state = classify_poll_failure(
                     err, started, remaining, self._t.phase_ceiling(err)
-                ):
-                    observed = False
+                )
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
             time.sleep(min(delay, remaining))
 
 

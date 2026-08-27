@@ -358,7 +358,24 @@ class _BaseTransport:
         Read off ``__cause__``, which is the httpx exception ``_timed_out``
         raises from, so no exception type or signature has to change.
         """
-        cause = err.__cause__
+        # WALKED, not read once. A custom transport or hook that wraps a
+        # phase-specific timeout in the base `TimeoutException` hid the phase one
+        # level down, and the wait then reported the fleet unreachable rather
+        # than recognising its own tightened cap (adversarial review,
+        # OPL-3835). Bounded, because a hand-built chain can loop.
+        cause: BaseException | None = err
+        for _ in range(10):
+            cause = cause.__cause__ if cause is not None else None
+            if cause is None or isinstance(
+                cause,
+                (
+                    httpx.ConnectTimeout,
+                    httpx.ReadTimeout,
+                    httpx.WriteTimeout,
+                    httpx.PoolTimeout,
+                ),
+            ):
+                break
         if isinstance(cause, httpx.ConnectTimeout):
             value = timeout.connect
         elif isinstance(cause, httpx.WriteTimeout):

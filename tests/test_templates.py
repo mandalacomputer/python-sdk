@@ -1748,6 +1748,12 @@ def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
     for n, block in enumerate(blocks, 1):
         try:
             tree = ast.parse(block)
+            # COMPILED as well as parsed: `nonlocal missing` and a few other
+            # binding errors are raised by the compiler, not the parser
+            # (adversarial review, OPL-3835).
+            # Top-level `await` is allowed: the async examples are written to
+            # be pasted into an async function or an async REPL.
+            compile(block, f"<readme block {n}>", "exec", ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
         except SyntaxError as exc:
             problems.append(f"block {n}: {exc}")
             continue
@@ -1865,7 +1871,10 @@ def test_a_poll_cut_short_by_our_own_deadline_is_not_the_fleet_failing(
     with pytest.raises(mc.TimeoutError) as caught:
         client.builds.wait("bld-1", timeout=0.3, poll=0.01)
     said = str(caught.value)
-    assert "was still running" in said, said
+    # Neither claim: a timeout consistent with our own cap is not proof it
+    # fired, so the message blames nobody (adversarial review, OPL-3835).
+    assert "cannot be told from here" in said, said
+    assert "was still running" not in said, said
     assert "could not be reached" not in said, said
     assert "phase copying" in said, "and it quotes what the last good poll saw"
 
@@ -2040,86 +2049,180 @@ def test_the_full_row_is_kept_out_of_another_computers_snapshots(client: mc.Clie
     assert got == ["snap-mine", "snap-stub"], got
 
 
-@pytest.mark.parametrize(
-    ("cause", "connect", "read", "budget", "ours"),
-    [
-        # A connect stall the wait never tightened: connect is 4.8, the budget
-        # is 5, so the cap did not cause this and the platform did.
-        (httpx.ConnectTimeout, 4.8, 60.0, 5.0, False),
-        # The wait DID tighten connect here — 2 is under 60 — so its own cap
-        # firing must not be blamed on the platform.
-        (httpx.ConnectTimeout, 60.0, 1.0, 2.0, True),
-        # The ordinary read case, both directions.
-        (httpx.ReadTimeout, 10.0, 60.0, 30.0, True),
-        (httpx.ReadTimeout, 10.0, 60.0, 66.0, False),
-    ],
-)
-def test_the_cap_is_measured_against_the_phase_that_actually_timed_out(
-    cause: type, connect: float, read: float, budget: float, ours: bool
-) -> None:
+#: Every phase httpx can time out in, with the `httpx.Timeout` field each one
+#: is measured against. All four, because covering only connect and read let a
+#: mutation that measured WRITE and POOL against the read ceiling survive
+#: (adversarial review, OPL-3835).
+PHASES = [
+    (httpx.ConnectTimeout, "connect"),
+    (httpx.ReadTimeout, "read"),
+    (httpx.WriteTimeout, "write"),
+    (httpx.PoolTimeout, "pool"),
+]
+
+
+def _timeout_err(cause: type | None) -> mc.TimeoutError:
+    err = mc.TimeoutError("timed out")
+    if cause is not None:
+        err.__cause__ = cause("stalled", request=httpx.Request("GET", "https://x.test"))
+    return err
+
+
+def _timeouts(**phase: float | None) -> httpx.Timeout:
+    base: dict[str, float | None] = {
+        "connect": 10.0,
+        "read": 10.0,
+        "write": 10.0,
+        "pool": 10.0,
+    }
+    base.update(phase)
+    return httpx.Timeout(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("cause", "phase"), PHASES)
+def test_each_phase_is_measured_against_its_own_ceiling(cause: type, phase: str) -> None:
     """A single read ceiling cannot classify a connect stall.
 
-    Comparing every timeout against ``read`` got it wrong in both directions
-    (adversarial review, OPL-3835): a genuine connect stall was excused as the
-    wait's cap, and the wait's own tightened connect cap was blamed on the
-    platform.
+    Comparing every timeout against ``read`` got it wrong in both directions:
+    a genuine connect stall was excused as the wait's cap, and the wait's own
+    tightened connect cap was blamed on the platform (adversarial review,
+    OPL-3835). Every phase, so the same hole cannot open in the two the first
+    version of this test left out.
     """
     import time as _time
 
     from mandala_computer._client import _BaseTransport
-    from mandala_computer._resources import _cut_short_by_our_own_cap
+    from mandala_computer._resources import _LastPoll, classify_poll_failure
 
-    timeout = httpx.Timeout(connect=connect, read=read, write=60.0, pool=10.0)
+    err = _timeout_err(cause)
+    # The wait's cap DID tighten this phase: 2s against the client's 60s.
+    tight = _BaseTransport._phase_ceiling(_timeouts(**{phase: 60.0}), err)
+    assert tight == 60.0
+    spent = _time.monotonic() - 2.0
+    assert classify_poll_failure(err, spent, 2.0, tight) is _LastPoll.UNRESOLVED
+
+    # It did not: the client's own 1s limit is tighter than the 5s budget.
+    loose = _BaseTransport._phase_ceiling(_timeouts(**{phase: 1.0}), err)
+    assert loose == 1.0
+    assert classify_poll_failure(err, _time.monotonic() - 5.0, 5.0, loose) is _LastPoll.FAILED
+
+    # No client limit at all: nothing but the cap could have produced this.
+    unlimited = _BaseTransport._phase_ceiling(_timeouts(**{phase: None}), err)
+    assert unlimited == float("inf"), "no limit is infinite, not unknown"
+    assert classify_poll_failure(err, spent, 2.0, unlimited) is _LastPoll.UNRESOLVED
+
+
+@pytest.mark.parametrize("cause", [None, httpx.TimeoutException, httpx.ConnectError])
+def test_a_timeout_whose_phase_cannot_be_named_is_blamed_on_nobody_and_claimed_by_nobody(
+    cause: type | None,
+) -> None:
+    """Unknown is not ours. An error with no cause, a bare
+    ``TimeoutException``, or a non-timeout could have come from anywhere —
+    and claiming a bare base exception as a read timeout was a surviving
+    mutation (adversarial review, OPL-3835)."""
+    import time as _time
+
+    from mandala_computer._client import _BaseTransport
+    from mandala_computer._resources import _LastPoll, classify_poll_failure
+
     err = mc.TimeoutError("timed out")
-    err.__cause__ = cause("stalled", request=httpx.Request("GET", "https://x.test"))
-    ceiling = _BaseTransport._phase_ceiling(timeout, err)
-    started = _time.monotonic() - budget  # it spent its whole budget
-    assert _cut_short_by_our_own_cap(err, started, budget, ceiling) is ours
+    if cause is not None:
+        err.__cause__ = cause("x", request=httpx.Request("GET", "https://x.test"))
+    assert _BaseTransport._phase_ceiling(_timeouts(), err) is None
+    assert classify_poll_failure(err, _time.monotonic() - 30, 30.0, None) is _LastPoll.FAILED
 
 
-def test_a_phase_the_client_does_not_limit_is_ours_not_unknown() -> None:
-    """A caller-supplied client with no timeout at all — the case `_cap_budget`
-    exists for — leaves the wait's cap as the ONLY thing that can have fired.
+def test_a_phase_wrapped_one_level_deeper_is_still_found() -> None:
+    """A transport or hook that wraps a phase timeout in the base class hid the
+    phase, and the wait reported the fleet unreachable rather than recognising
+    its own cap (adversarial review, OPL-3835)."""
+    from mandala_computer._client import _BaseTransport
 
-    Collapsing "no limit" and "cannot name the phase" into one ``None`` made
-    that wait blame its own deadline on the fleet (/code-review, OPL-3835).
+    req = httpx.Request("GET", "https://x.test")
+    inner = httpx.ReadTimeout("stalled", request=req)
+    middle = httpx.TimeoutException("wrapped", request=req)
+    middle.__cause__ = inner
+    err = mc.TimeoutError("timed out")
+    err.__cause__ = middle
+    assert _BaseTransport._phase_ceiling(_timeouts(read=7.0), err) == 7.0
+
+
+def test_a_cause_chain_that_loops_does_not_hang() -> None:
+    from mandala_computer._client import _BaseTransport
+
+    req = httpx.Request("GET", "https://x.test")
+    a = httpx.TimeoutException("a", request=req)
+    b = httpx.TimeoutException("b", request=req)
+    a.__cause__ = b
+    b.__cause__ = a
+    err = mc.TimeoutError("t")
+    err.__cause__ = a
+    assert _BaseTransport._phase_ceiling(_timeouts(), err) is None
+
+
+def test_an_unattributable_timeout_makes_the_wait_blame_nobody() -> None:
+    """The message is the point of the third state.
+
+    Saying "was still running" there asserts the fleet is fine on the strength
+    of a stopwatch; saying "could not be reached" asserts the opposite. Neither
+    is knowable, so it says so (adversarial review, OPL-3835).
     """
-    import time as _time
+    from mandala_computer._resources import _LastPoll, _wait_timed_out
 
-    from mandala_computer._client import _BaseTransport
-    from mandala_computer._resources import _cut_short_by_our_own_cap
+    seen = mc.BuildProgress.from_api(RUNNING)
+    answered = _wait_timed_out("bld-1", 30, seen, _LastPoll.ANSWERED)
+    unresolved = _wait_timed_out("bld-1", 30, seen, _LastPoll.UNRESOLVED)
+    failed = _wait_timed_out("bld-1", 30, seen, _LastPoll.FAILED)
 
-    err = mc.TimeoutError("timed out")
-    err.__cause__ = httpx.ReadTimeout("x", request=httpx.Request("GET", "https://x.test"))
-    ceiling = _BaseTransport._phase_ceiling(httpx.Timeout(None), err)
-    assert ceiling == float("inf"), "no limit is infinite, not unknown"
-    assert _cut_short_by_our_own_cap(err, _time.monotonic() - 5, 5.0, ceiling) is True
-
-
-def test_a_timeout_whose_phase_cannot_be_named_is_not_claimed() -> None:
-    """Unknown is not ours. An error with no cause, or a bare
-    ``TimeoutException``, could have come from anywhere."""
-    import time as _time
-
-    from mandala_computer._client import _BaseTransport
-    from mandala_computer._resources import _cut_short_by_our_own_cap
-
-    timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
-    err = mc.TimeoutError("timed out")
-    assert _BaseTransport._phase_ceiling(timeout, err) is None
-    assert _cut_short_by_our_own_cap(err, _time.monotonic() - 30, 30.0, None) is False
+    assert "was still running" in answered
+    assert "cannot be told from here" in unresolved
+    assert "was still running" not in unresolved, "it must not claim the fleet was fine"
+    assert "could not be reached" not in unresolved, "nor that it was not"
+    assert "could not be reached" in failed
+    assert "phase copying" in unresolved, "it still quotes the last good reading"
 
 
 #: Shapes that only work on a sync client, matched at the start of an indented
-#: line where a docstring's code example lives. ONE definition, used both to
-#: scan and to prove the scan can still catch the docstring it came from — the
-#: check that was supposed to prove that used its own copy of the pattern, so
-#: mutating the scan left it green (/code-review, OPL-3835).
+#: line where a docstring's code example lives. Each carries its OWN positive
+#: fixture: the self-test used `any(...)` across the set, so two of the three
+#: could be made permanently non-matching and it stayed green (adversarial
+#: review, OPL-3835).
 SYNC_ONLY = (
-    (r"^\s+with (?!.*\basync\b)\S", "sync `with` in an example"),
-    (r"^\s+for \w+ in (?!.*\basync\b)\S", "sync `for ... in` in an example"),
-    (r":class:`(?!Async)[A-Z]\w*s`", "link to a sync class"),
+    (
+        r"^\s+with (?!.*\basync\b)\S",
+        "sync `with` in an example",
+        "    with closing(client.builds.events(build_id)) as stream:",
+    ),
+    (
+        r"^\s+for \w+ in (?!.*\basync\b)\S",
+        "sync `for ... in` in an example",
+        "    for progress in stream:",
+    ),
+    (
+        r":class:`(?!Async)[A-Z]\w*s`",
+        "link to a sync class",
+        "see :class:`Templates` for the rest",
+    ),
 )
+
+
+@pytest.mark.parametrize(("pattern", "why", "fixture"), SYNC_ONLY)
+def test_each_sync_only_pattern_matches_its_own_fixture(
+    pattern: str, why: str, fixture: str
+) -> None:
+    """Every pattern is proved separately, and against the real docstring where
+    it applies. `any(...)` across the set let two of three rot unnoticed."""
+    import re
+
+    assert re.search(pattern, fixture, re.MULTILINE), (why, pattern, fixture)
+    # And the async form of the same shape must NOT match.
+    async_form = (
+        fixture.replace("    with ", "    async with ")
+        .replace("    for ", "    async for ")
+        .replace(":class:`Templates`", ":class:`AsyncTemplates`")
+    )
+    if async_form != fixture:
+        assert not re.search(pattern, async_form, re.MULTILINE), (why, async_form)
 
 
 def test_the_sync_only_patterns_catch_the_docstring_they_came_from() -> None:
@@ -2135,7 +2238,7 @@ def test_the_sync_only_patterns_catch_the_docstring_they_came_from() -> None:
 
     fixture = mc.Builds.events.__doc__ or ""
     assert "with closing(client.builds.events" in fixture, "the fixture moved"
-    assert any(re.search(p, fixture, re.MULTILINE) for p, _ in SYNC_ONLY), SYNC_ONLY
+    assert any(re.search(p, fixture, re.MULTILINE) for p, _, _ in SYNC_ONLY), SYNC_ONLY
 
 
 def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
@@ -2153,7 +2256,7 @@ def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
             if not n.startswith("_")
         ]
         for owner, name, doc in docs:
-            for pattern, why in SYNC_ONLY:
+            for pattern, why, _ in SYNC_ONLY:
                 if re.search(pattern, doc, re.MULTILINE):
                     offenders.append((owner, name, why))
     assert not offenders, offenders
@@ -2173,20 +2276,58 @@ def test_the_async_ephemeral_docstring_teaches_async_with() -> None:
     assert not async_doc.rstrip().endswith("OPL-3835)."), "no dangling indented note"
 
 
-def test_a_stub_carrying_an_extra_field_is_still_a_stub() -> None:
-    """An exact whitelist stopped recognising a placeholder the moment the
-    platform added a key to it, and filtering those out drops precisely the
-    markers saying an answer is short (/code-review, OPL-3835)."""
-    from mandala_computer._models import is_unreachable_stub
-
-    for extra in (
+@pytest.mark.parametrize("flag", [True, None, "maybe", {}])
+@pytest.mark.parametrize(
+    "extra",
+    [
         {"created_at": "2026-08-27T00:00:00Z"},
         {"kind": "disk"},
         {"computer_name": None},
-    ):
-        row = {"id": "snap-1", "unreachable": True, **extra}
-        assert is_unreachable_stub(row) is True, extra
-        assert mc.Snapshot.from_api(row).unreachable is True, extra
+        {"created_at": "x", "kind": "disk"},
+    ],
+)
+def test_a_stub_carrying_an_extra_field_is_still_a_stub(flag: object, extra: dict) -> None:
+    """An exact whitelist stopped recognising a placeholder the moment the
+    platform added a key, and filtering those out drops precisely the markers
+    saying an answer is short (/code-review, OPL-3835).
+
+    Across every flag value, because testing it only with ``true`` let a
+    mutation restoring the whitelist for null and malformed survive
+    (adversarial review, OPL-3835).
+    """
+    from mandala_computer._models import is_unreachable_stub
+
+    row = {"id": "snap-1", "unreachable": flag, **extra}
+    assert is_unreachable_stub(row) is True, (flag, extra)
+    assert mc.Snapshot.from_api(row).unreachable is True, (flag, extra)
 
     # `state` is what every real snapshot carries and no placeholder does.
-    assert is_unreachable_stub({"id": "s", "unreachable": True, "state": "pending"}) is False
+    real = {**row, "state": "pending"}
+    assert is_unreachable_stub(real) is False, (flag, extra)
+
+
+def test_a_flag_that_says_false_is_never_a_stub_however_bare_the_row() -> None:
+    from mandala_computer._models import is_unreachable_stub
+
+    assert is_unreachable_stub({"id": "s", "unreachable": False}) is False
+    assert is_unreachable_stub({"id": "s"}) is False
+
+
+def test_docstring_surgery_refuses_to_silently_do_nothing() -> None:
+    """A bare `str.replace` on a docstring no-ops when the prose is reworded,
+    and the async doc is wrong again with no test failing.
+
+    That is not hypothetical: the first ephemeral correction replaced strings
+    the doc did not contain and was dead code for a whole commit (adversarial
+    review, OPL-3835). The helper refuses at import time instead.
+    """
+    from mandala_computer._async_resources import _reworded
+
+    assert _reworded("a ``with`` block", "``with``", "``async with``") == "a ``async with`` block"
+
+    with pytest.raises(AssertionError, match="expected exactly one"):
+        _reworded("the wording changed", "``with``", "``async with``")
+    with pytest.raises(AssertionError, match="expected exactly one"):
+        _reworded("``with`` and ``with``", "``with``", "``async with``")
+    with pytest.raises(AssertionError, match="expected exactly one"):
+        _reworded(None, "``with``", "``async with``")
