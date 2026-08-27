@@ -2182,63 +2182,76 @@ def test_an_unattributable_timeout_makes_the_wait_blame_nobody() -> None:
     assert "phase copying" in unresolved, "it still quotes the last good reading"
 
 
-#: Shapes that only work on a sync client, matched at the start of an indented
-#: line where a docstring's code example lives. Each carries its OWN positive
-#: fixture: the self-test used `any(...)` across the set, so two of the three
-#: could be made permanently non-matching and it stayed green (adversarial
-#: review, OPL-3835).
+def _example_lines(doc: str | None) -> list[str]:
+    """The CODE lines of a docstring, normalised across Python versions.
+
+    Two things had to be got right here and neither was (CI, OPL-3835).
+
+    ``inspect.cleandoc`` first, because 3.13 dedents docstrings at COMPILE time
+    and 3.10-3.12 do not. A pattern anchored on leading whitespace therefore
+    matched indented lines on the older three and nothing at all on the newer
+    two, so the scan was silently inert on the interpreter I ran locally and
+    noisy on the ones CI runs.
+
+    Then only the INDENTED lines, because a docstring's code examples are
+    indented under a ``::`` and its prose is not. Matching any line beginning
+    with the word "with" flagged three wrapped sentences — "…tidy up after it.
+    With it, the" — as sync-only idioms.
+    """
+    if not doc:
+        return []
+    return [line for line in inspect.cleandoc(doc).splitlines() if line.startswith("    ")]
+
+
+#: Shapes that only work on a sync client, matched against a docstring's code
+#: lines. Each carries its OWN positive fixture: a self-test using `any(...)`
+#: across the set let two of the three be made permanently non-matching and
+#: stayed green (adversarial review, OPL-3835).
 SYNC_ONLY = (
     (
-        r"^\s+with (?!.*\basync\b)\S",
+        r"^with (?!.*\basync\b)\S",
         "sync `with` in an example",
         "    with closing(client.builds.events(build_id)) as stream:",
     ),
     (
-        r"^\s+for \w+ in (?!.*\basync\b)\S",
+        r"^for \w+ in (?!.*\basync\b)\S",
         "sync `for ... in` in an example",
         "    for progress in stream:",
     ),
-    (
-        r":class:`(?!Async)[A-Z]\w*s`",
-        "link to a sync class",
-        "see :class:`Templates` for the rest",
-    ),
 )
+
+#: Checked against the whole docstring rather than its code lines: a link is
+#: prose, not an example.
+SYNC_LINKS = (r":class:`(?!Async)[A-Z]\w*s`", "link to a sync class")
 
 
 @pytest.mark.parametrize(("pattern", "why", "fixture"), SYNC_ONLY)
 def test_each_sync_only_pattern_matches_its_own_fixture(
     pattern: str, why: str, fixture: str
 ) -> None:
-    """Every pattern is proved separately, and against the real docstring where
-    it applies. `any(...)` across the set let two of three rot unnoticed."""
+    """Every pattern is proved separately. `any(...)` across the set let two of
+    three rot unnoticed."""
     import re
 
-    assert re.search(pattern, fixture, re.MULTILINE), (why, pattern, fixture)
-    # And the async form of the same shape must NOT match.
-    async_form = (
-        fixture.replace("    with ", "    async with ")
-        .replace("    for ", "    async for ")
-        .replace(":class:`Templates`", ":class:`AsyncTemplates`")
-    )
-    if async_form != fixture:
-        assert not re.search(pattern, async_form, re.MULTILINE), (why, async_form)
+    line = fixture.strip()
+    assert re.search(pattern, line), (why, pattern, line)
+    async_form = ("async " + line) if not line.startswith("async") else line
+    assert not re.search(pattern, async_form), (why, async_form)
 
 
 def test_the_sync_only_patterns_catch_the_docstring_they_came_from() -> None:
     """A class-level test that cannot catch the instance it generalised from is
     not a class-level test.
 
-    The first version required `with client.` and `for x in client.` literally,
-    and the docstring the whole class of bug came from says
-    ``with closing(client.builds.events(...))`` — so restoring the shared
-    docstring would have passed it (/code-review, OPL-3835).
+    The first version required `with client.` literally, and the docstring the
+    whole class of bug came from says ``with closing(client.builds.events(...))``
+    — so restoring the shared docstring would have passed it.
     """
     import re
 
-    fixture = mc.Builds.events.__doc__ or ""
-    assert "with closing(client.builds.events" in fixture, "the fixture moved"
-    assert any(re.search(p, fixture, re.MULTILINE) for p, _, _ in SYNC_ONLY), SYNC_ONLY
+    lines = [line.strip() for line in _example_lines(mc.Builds.events.__doc__)]
+    assert any("with closing(client.builds.events" in line for line in lines), "the fixture moved"
+    assert any(re.search(p, line) for p, _, _ in SYNC_ONLY for line in lines), SYNC_ONLY
 
 
 def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
@@ -2256,9 +2269,12 @@ def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
             if not n.startswith("_")
         ]
         for owner, name, doc in docs:
-            for pattern, why, _ in SYNC_ONLY:
-                if re.search(pattern, doc, re.MULTILINE):
-                    offenders.append((owner, name, why))
+            for line in _example_lines(doc):
+                for pattern, why in ((p, w) for p, w, _ in SYNC_ONLY):
+                    if re.search(pattern, line.strip()):
+                        offenders.append((owner, name, why, line.strip()))
+            if re.search(SYNC_LINKS[0], doc):
+                offenders.append((owner, name, SYNC_LINKS[1], ""))
     assert not offenders, offenders
 
 
@@ -2349,3 +2365,48 @@ def test_a_reworded_source_does_not_break_the_import() -> None:
     assert _reworded("the wording changed", "``with``", "``async with``") == "the wording changed"
     assert _reworded(None, "``with``", "``async with``") == ""
     assert _reworded("a ``with`` block", "``with``", "``async with``") == "a ``async with`` block"
+
+
+def test_the_docstring_scan_reads_the_same_on_every_python() -> None:
+    """3.13 dedents docstrings at compile time and 3.10-3.12 do not.
+
+    A pattern anchored on leading whitespace therefore matched indented lines on
+    the older three and NOTHING on the newer two — so this scan was inert on the
+    interpreter used locally and noisy on the ones CI runs, and it took a CI
+    failure across three versions to surface it (OPL-3835). Both shapes are
+    normalised here so the scan cannot go quiet on any of them again.
+    """
+    raw = mc.Builds.events.__doc__ or ""
+    assert raw, "the fixture moved"
+    # What 3.10-3.12 stores: every line after the first keeps its source indent.
+    head, *rest = raw.splitlines()
+    pre_313 = head + "\n" + "\n".join(("        " + ln if ln.strip() else ln) for ln in rest)
+
+    dedented = [ln.strip() for ln in _example_lines(raw)]
+    indented = [ln.strip() for ln in _example_lines(pre_313)]
+    assert dedented == indented, (dedented, indented)
+    assert dedented, "no example lines found in either shape"
+    assert any("with closing(" in ln for ln in dedented)
+
+
+def test_wrapped_prose_is_not_mistaken_for_a_code_example() -> None:
+    """The CI failure was three FALSE positives: prose wrapped so a line began
+    with the word "with" — "…tidy up after it. With it, the" — read as a
+    sync-only idiom. Examples are indented under a `::`; prose is not."""
+    import re
+
+    doc = (
+        "Does a thing.\n\n"
+        "    Something you cannot do anything about except tidy up after it.\n"
+        "    With it, the listing stays complete.\n\n"
+        "    ::\n\n"
+        "        async with aclosing(client.builds.events(x)) as s:\n"
+        "            pass\n"
+    )
+    flagged = [
+        ln.strip()
+        for ln in _example_lines(doc)
+        for p, _, _ in SYNC_ONLY
+        if re.search(p, ln.strip())
+    ]
+    assert not flagged, flagged
