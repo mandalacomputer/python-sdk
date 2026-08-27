@@ -19,6 +19,16 @@ from urllib.parse import quote
 # --- paths ----------------------------------------------------------------
 
 TEMPLATES = "templates"
+#: The JSON Schema for a ``mandala/v1`` document (platform OPL-3568).
+TEMPLATE_SCHEMA = "templates/schema"
+#: Check a document without publishing it. Side-effect free, and claims no ref.
+TEMPLATE_VALIDATE = "templates/validate"
+#: Every build this account has started (platform OPL-3791).
+#:
+#: A collection, like :data:`MOVES` and for the same reason: a build is a job
+#: rather than a property of a computer, and it outlives the request that
+#: started it.
+BUILDS = "builds"
 SIZES = "sizes"
 COMPUTERS = "computers"
 SNAPSHOTS = "snapshots"
@@ -41,6 +51,72 @@ USAGE = "usage"
 RETENTION = "retention"
 
 
+def canonical(value: object, what: str) -> str:
+    """A real ``str``, whatever was handed in.
+
+    Every guard in this file validates a string and then hands the ORIGINAL on
+    to something that stringifies or encodes it again — and a ``str`` SUBCLASS
+    can answer differently the second time (adversarial review, OPL-3835). Two
+    were live:
+
+    * ``template_version_params`` matched the regex against the buffer, then
+      returned the object; httpx serialises a query value with ``str(value)``, so
+      a subclass whose ``__str__`` answers ``""`` passed the check and sent
+      ``?version=`` — the empty-version branch, which on a retire means every
+      version of the name and cannot be undone.
+    * ``seg`` checked ``strip(".")`` on the buffer, then called ``quote``, which
+      calls the value's own ``encode()``; a subclass returning ``b".."`` became a
+      dot segment that the client normalises into a different route.
+
+    ``str.__str__`` reads the underlying buffer rather than any override, so what
+    comes back cannot disagree with what was checked. A non-string is refused
+    here rather than coerced: ``str(None)`` is ``"None"``, which is a plausible
+    id and a nonsense one.
+    """
+    if not isinstance(value, str):
+        # ValueError, not the TypeError ruff prefers, and deliberately: every
+        # other refusal in this file is a ValueError — `seg` for an empty or
+        # all-dots id, `template_version_params` for a malformed version — and a
+        # caller wrapping a call in `except ValueError` should not catch "that is
+        # not a version" while missing "that is not a string". One type for one
+        # class of mistake beats the rule.
+        raise ValueError(  # noqa: TRY004
+            f"{what} must be a string, not {type(value).__name__}"
+        )
+    return str.__str__(value)
+
+
+def flag(value: object, what: str) -> bool:
+    """A real ``bool``, and nothing that merely behaves like one.
+
+    The companion to :func:`canonical`, and here for the same class of reason
+    (adversarial review, OPL-3835). The flags in this file were read with plain
+    truthiness, which is the wrong rule for a parameter that ARMS something:
+    ``"false"`` is a non-empty string and therefore true, so
+    ``build_params("false")`` asked for a rebuild of a multi-gigabyte image and
+    ``delete_params(purge_snapshots="false", ...)`` selected the branch that
+    destroys a computer's snapshots along with it. Both are spellings a caller
+    reaching in from a config file, an environment variable or a CLI argument
+    produces by accident, and neither is a spelling of "no".
+
+    ``1`` and ``0`` are refused with them. They read as true and false to a
+    human and would work, but admitting them puts the coercion rule back and the
+    next value through it is a string again.
+
+    Only the flags that arm something go through here. The ones that merely
+    widen a listing — ``allow_partial``, ``include=all`` — stay on truthiness:
+    nothing is destroyed or paid for by reading one of those generously.
+    """
+    if not isinstance(value, bool):
+        # ValueError, not the TypeError ruff prefers, for the reason `canonical`
+        # gives: one exception type for one class of mistake, so a caller
+        # guarding a call cannot catch half of them.
+        raise ValueError(  # noqa: TRY004
+            f"{what} must be True or False, not {type(value).__name__}"
+        )
+    return value
+
+
 def seg(value: str) -> str:
     """One path segment, percent-encoded — including ``/``.
 
@@ -61,6 +137,7 @@ def seg(value: str) -> str:
     a bad thing to hand a purge loop. An empty id does the same to the
     collection route. Neither is a real id, so both are refused here.
     """
+    value = canonical(value, "id")
     if not value.strip("."):
         raise ValueError(f"id must not be empty or all dots: {value!r}")
     return quote(value, safe="")
@@ -96,6 +173,140 @@ def window(computer_id: str, window_id: str) -> str:
     on who chose the string.
     """
     return f"computers/{seg(computer_id)}/windows/{seg(window_id)}"
+
+
+def template_ref(namespace: str, name: str) -> str:
+    """One published template, by the two halves of its ref.
+
+    Two segments and not one, because that is the shape of the route: the
+    platform reduces ``templates/<a>/<b>`` to ``templates/:namespace/:name``, so
+    a ref handed over whole — ``acc-1/devbox@1.0.0`` — would be percent-encoded
+    into a single segment and reach a route that does not exist. The version is
+    a *query* parameter on this path, not part of it; see
+    :func:`template_version_params`.
+    """
+    return f"{TEMPLATES}/{seg(namespace)}/{seg(name)}"
+
+
+#: ``MAJOR.MINOR.PATCH``, no leading zeros.
+#:
+#: Matched with ``fullmatch``, not ``match``: Python's ``$`` also matches just
+#: before a trailing newline, so ``"1.0.0\n"`` satisfied the anchored pattern and
+#: was sent as ``?version=1.0.0%0A``. The platform's own ``wellFormedVersion``
+#: uses a JavaScript regex, where ``$`` is end-of-input, so it answers 400 — the
+#: exact round trip this guard exists to save. Two languages, one grammar, and
+#: the anchors are not the same.
+_VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
+
+
+def template_version_params(version: str | None) -> dict[str, str]:
+    """The ``version`` query parameter, refused when it is not a version.
+
+    Absence and emptiness have to be different things here. The platform answers
+    400 for one that is empty or malformed rather than defaulting, and that
+    refusal exists because of a real defect: ``?version=`` — which is what most
+    clients serialise for an unset optional string — read as "no version was
+    named" and retired an entire template, irreversibly.
+
+    This SDK cannot send that at all. ``None`` omits the parameter, and anything
+    else has to be a version. Checked here rather than left to the platform
+    because the two answers are not interchangeable on a retire: omitting the
+    parameter means EVERY version, so a caller who meant one version and passed
+    an empty string would, without the platform's refusal, have retired the lot.
+    """
+    if version is None:
+        return {}
+    version = canonical(version, "version")
+    if not _VERSION.fullmatch(version):
+        raise ValueError(
+            f"version must be MAJOR.MINOR.PATCH with no leading zeros (got {version!r}); "
+            "omit it entirely to name the whole template"
+        )
+    return {"version": version}
+
+
+def template_document(document: str) -> bytes:
+    """The document a publish, a validate or a build sends.
+
+    Raw bytes, not a JSON envelope: the platform reads JSON or YAML off the body
+    itself, so a wrapper would be a document the validator never sees — and one
+    that parses, so the failure would be a complaint about the wrapper's fields.
+
+    Refused when empty for the reason :func:`seg` refuses an empty id — the
+    platform answers 400 for it, and that is a round trip that never had to
+    happen.
+    """
+    # Canonical FIRST, which is what makes the check below binding on the bytes
+    # that leave. Ordered the other way — as it was — a str subclass overriding
+    # ``strip()`` passed the emptiness check and then encoded to nothing, so an
+    # empty body went on the wire under a comment claiming it could not. The one
+    # guard the previous pass said it had fixed and had not.
+    text = canonical(document, "document")
+    if not text.strip():
+        raise ValueError("document must be a non-empty template document, as JSON or YAML")
+    return text.encode("utf-8")
+
+
+def build(build_id: str) -> str:
+    return f"{BUILDS}/{seg(build_id)}"
+
+
+def build_action(build_id: str, action: str) -> str:
+    """progress | events."""
+    return f"{BUILDS}/{seg(build_id)}/{action}"
+
+
+def build_params(no_reuse: bool) -> dict[str, str]:
+    """``no_reuse``, sent only when it is asked for.
+
+    Omitted rather than sent as ``false``, and the reason is the documented
+    schema rather than a claim about the parser: ``lib/apidoc`` gives this
+    parameter ``enum: ['true']``, so ``true`` is the only value the reference
+    admits and a client sending ``false`` is sending something undocumented.
+
+    An earlier comment here said the platform reads the key's PRESENCE, which is
+    false — ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` — and the
+    same false claim was repeated in the other two clients and pinned as a test
+    docstring. The emitted request was right either way; the stated reason was
+    not.
+
+    The flag has to BE a bool rather than merely read as one — see :func:`flag`.
+    A rebuild is the expensive branch, and ``"false"`` selected it.
+    """
+    return {"no_reuse": "true"} if flag(no_reuse, "no_reuse") else {}
+
+
+def build_stream_failed(build_id: str, data: Any) -> str:
+    """What to say when a build's event stream ends with an ``error`` event.
+
+    The stream's own failure, not the build's — named as such because a caller
+    told "the build failed" would go and read a document that is fine. One
+    function so the sync and async halves cannot word it differently.
+    """
+    detail = ""
+    if isinstance(data, Mapping):
+        detail = str(data.get("error") or "")
+    elif data is not None:
+        detail = str(data)
+    return (
+        f"the build event stream for {build_id} ended: {detail or 'no reason given'} "
+        f"(this says nothing about the build itself — read builds.progress({build_id!r}))"
+    )
+
+
+def build_stream_truncated(build_id: str, *, malformed: bool) -> str:
+    """What to say when a build's event stream stops without a final answer.
+
+    Both halves of the same failure: the platform's contract is that ``done`` is
+    the last event, so a stream that ends without one — or with one whose payload
+    is not a record — has been cut rather than completed. One function so the
+    sync and async halves cannot word it differently.
+    """
+    how = "with a malformed final event" if malformed else "without a final event"
+    return (
+        f"the build event stream for {build_id} ended {how}; the build is probably still "
+        f"running — read progress({build_id!r}) for the outcome"
+    )
 
 
 def snapshot(snapshot_id: str) -> str:
@@ -163,9 +374,13 @@ def files_params(path: str) -> dict[str, str]:
     relative path has no working directory to be relative to. The daemon
     refuses it too, but this mistake is knowable without the round trip.
     """
-    if not is_absolute_guest_path(path):
-        raise ValueError(f"guest path must be absolute: {path!r}")
-    return {"path": path}
+    # Canonical first, for the reason :func:`canonical` gives. ``startswith`` is
+    # overridable, so a str subclass could satisfy the absoluteness check and
+    # then send something else entirely — here, an empty path.
+    text = canonical(path, "guest path")
+    if not is_absolute_guest_path(text):
+        raise ValueError(f"guest path must be absolute: {text!r}")
+    return {"path": text}
 
 
 def files_range(offset: int, length: int | None) -> dict[str, str]:
@@ -319,15 +534,27 @@ def delete_params(*, purge_snapshots: bool, expect: str | None) -> dict[str, str
     stale fingerprint on an ordinary delete would refuse it for a reason that
     has nothing to do with what was asked.
     """
-    if not purge_snapshots:
+    # A real bool, not anything truthy: this is the branch that destroys a
+    # computer's snapshots along with it, and ``purge_snapshots="false"``
+    # selected it. The ``expect`` interlock below does not cover that — it binds
+    # the purge to the set that was looked at, not to whether a purge was meant.
+    if not flag(purge_snapshots, "purge_snapshots"):
         return None
-    if not expect:
+    # Canonical BEFORE the emptiness check, and this is the guard where that
+    # ordering matters most (/code-review, OPL-3835). ``__bool__`` is overridable
+    # too, so a str subclass answering True here and "" to ``str()`` passed the
+    # check and put ``?expect=`` on the wire — and ``checkExpectation`` in
+    # server/vm.go reads an empty expectation as NO expectation, so the interlock
+    # this function exists to enforce was silently disarmed on the one route that
+    # destroys a computer and its snapshots together.
+    text = canonical(expect, "expect") if expect is not None else ""
+    if not text:
         raise ValueError(
             "purging snapshots needs the fingerprint from snapshot_holdings(): "
             "read it, check the count and size are what you meant to destroy, "
             "and pass it as expect=. Nothing has been deleted."
         )
-    return {"snapshots": "delete", "expect": expect}
+    return {"snapshots": "delete", "expect": text}
 
 
 # --- responses ------------------------------------------------------------
@@ -914,5 +1141,10 @@ def stop_params(force: bool) -> dict[str, Any] | None:
     written to disk is lost with it. Kept off by default for that reason: this
     is what to reach for when a guest will not come down on its own, not the
     ordinary way to stop one.
+
+    A real bool, for the reason :func:`flag` gives. This one was missed when the
+    other two arming flags were hardened (second adversarial review, OPL-3835),
+    and it is the same defect: ``stop(force="false")`` pulled the power and lost
+    whatever the guest had not written to disk.
     """
-    return {"force": "true"} if force else None
+    return {"force": "true"} if flag(force, "force") else None

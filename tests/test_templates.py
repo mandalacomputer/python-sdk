@@ -1,0 +1,2412 @@
+"""The template store and the builds that compile documents into images.
+
+OPL-3835. The clients were three platform tickets behind here: the store
+(OPL-3789), the retire (OPL-3830) and the builds (OPL-3791/3794) were all
+reachable from an API key and from none of these SDKs. ``Templates`` had exactly
+one method, ``list()``.
+
+What is pinned below is the seam rather than the platform. The platform's own
+tests own whether a publish stores anything; these own whether a caller can tell
+a retired ref from a name that never existed, whether an unset version can widen
+a retire from one version to all of them, and whether a wait reports a failed
+build as an outcome rather than as an exception.
+
+Both halves of the client, because both have the methods and
+:mod:`tests.test_parity` only proves the signatures match — not that the async
+one does the same thing with them.
+"""
+
+from __future__ import annotations
+
+import ast
+import builtins
+import inspect
+import json
+import pathlib
+import re
+import time
+from unittest import mock
+
+import httpx
+import pytest
+import respx
+
+import mandala_computer as mc
+import mandala_computer._models
+from mandala_computer import _api
+
+BASE = "https://api.test/api/v1"
+
+PUBLISHED = {
+    "ref": "acc-1/devbox@1.0.0",
+    "doc_digest": "sha256:aaaa",
+    "document": {"apiVersion": "mandala/v1", "kind": "Template"},
+    "template": {
+        "name": "devbox",
+        "label": "My desktop",
+        "os": "linux",
+        "cpu": 2,
+        "ram_mb": 4096,
+        "disk_gb": 30,
+    },
+    "versions": ["1.0.0"],
+    "published_at": "2026-08-26T12:00:00.000Z",
+}
+
+RETIRED = {
+    "retired": ["acc-1/devbox@1.0.0"],
+    "retired_at": "2026-08-26T13:00:00.000Z",
+    "versions": [],
+    "templates": 0,
+    # Deliberately not 0 while `templates` is: a retired ref still counts, and a
+    # fixture where the two agreed would let a decoder that read one field for
+    # both pass every assertion below.
+    "refs_claimed": 1,
+}
+
+DONE = {
+    "id": "bld-1",
+    "status": "succeeded",
+    "done": True,
+    "phase": "published",
+    "step": 2,
+    "of": 2,
+    "steps": [
+        {"n": 1, "kind": "apt", "label": "ripgrep", "status": "done"},
+        {"n": 2, "kind": "finish", "label": "cleanup", "status": "done"},
+    ],
+    "note": "",
+    "error": "",
+    "updated_at": "2026-08-26T12:15:00.000Z",
+}
+
+RUNNING = {**DONE, "status": "running", "done": False, "phase": "copying"}
+
+FAILED = {
+    **DONE,
+    "status": "failed",
+    "phase": "failed",
+    "error": "apt-get returned 100",
+    "steps": [{"n": 1, "kind": "apt", "label": "nosuchpkg", "status": "failed"}],
+}
+
+
+def sse(*events: tuple[str, dict]) -> httpx.Response:
+    body = "".join(f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in events)
+    return httpx.Response(200, content=body, headers={"Content-Type": "text/event-stream"})
+
+
+@pytest.fixture
+def client() -> mc.Client:
+    return mc.Client("com_test", base_url=BASE)
+
+
+@pytest.fixture
+def async_client() -> mc.AsyncClient:
+    return mc.AsyncClient("com_test", base_url=BASE)
+
+
+# --- publishing -----------------------------------------------------------
+
+
+@respx.mock
+def test_publish_sends_the_document_as_bytes(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/templates").mock(return_value=httpx.Response(201, json=PUBLISHED))
+    client.templates.publish("apiVersion: mandala/v1\nkind: Template")
+    # The platform reads JSON or YAML off the body itself. An envelope would be a
+    # document its validator never sees — and would parse as JSON, so the failure
+    # would be a complaint about the WRAPPER's fields.
+    assert route.calls.last.request.content == b"apiVersion: mandala/v1\nkind: Template"
+
+
+@respx.mock
+def test_publish_refuses_an_empty_document_without_a_round_trip(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/templates")
+    with pytest.raises(ValueError):
+        client.templates.publish("   ")
+    assert not route.called
+
+
+@respx.mock
+def test_publish_reads_the_document_back_as_an_object(client: mc.Client) -> None:
+    respx.post(f"{BASE}/templates").mock(return_value=httpx.Response(201, json=PUBLISHED))
+    t = client.templates.publish("apiVersion: mandala/v1")
+    assert t.ref == "acc-1/devbox@1.0.0"
+    assert t.doc_digest == "sha256:aaaa"
+    assert t.document["apiVersion"] == "mandala/v1"
+    assert t.versions == ["1.0.0"]
+    assert t.template.ram_mb == 4096
+
+
+@respx.mock
+def test_a_shipped_template_has_no_published_at(client: mc.Client) -> None:
+    """None stays None rather than becoming "".
+
+    A shipped template was not published by anybody — it is compiled into the
+    daemon — and an empty timestamp reads as one that is known and blank rather
+    than one that does not apply.
+    """
+    body = {k: v for k, v in PUBLISHED.items() if k != "published_at"}
+    respx.get(f"{BASE}/templates/system/base").mock(return_value=httpx.Response(200, json=body))
+    assert client.templates.get("system", "base").published_at is None
+
+
+# --- checking -------------------------------------------------------------
+
+
+@respx.mock
+def test_validate_does_not_raise_for_an_invalid_document(client: mc.Client) -> None:
+    """An invalid document is the ANSWER to the question this method asks.
+
+    The platform says so with a 200. Raising would make the one method whose job
+    is to report problems the one method you cannot use to see them.
+    """
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(
+            200,
+            json={"valid": False, "problems": ["spec.os is required", "version is required"]},
+        )
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert check.valid is False
+    assert len(check.problems) == 2
+    assert check.ref is None
+
+
+@respx.mock
+def test_validate_carries_both_digests(client: mc.Client) -> None:
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(
+            200,
+            json={"valid": True, "doc_digest": "sha256:aaaa", "build_digest": "sha256:bbbb"},
+        )
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert check.doc_digest == "sha256:aaaa"
+    assert check.build_digest == "sha256:bbbb"
+
+
+# --- naming a version -----------------------------------------------------
+
+
+@respx.mock
+def test_no_version_omits_the_parameter(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=PUBLISHED)
+    )
+    client.templates.get("acc-1", "devbox")
+    assert "version" not in route.calls.last.request.url.params
+
+
+@respx.mock
+def test_an_empty_version_is_refused_rather_than_sent(client: mc.Client) -> None:
+    """The defect this exists to be on the right side of.
+
+    ``?version=`` — what most clients serialise for an unset optional string —
+    read as "no version was named" on the platform and retired an ENTIRE
+    template, irreversibly. The platform answers 400 for it now; this SDK cannot
+    send it at all, which is the stronger guarantee: omission and emptiness mean
+    different things on a retire, and only one of them is recoverable.
+    """
+    route = respx.delete(f"{BASE}/templates/acc-1/devbox")
+    with pytest.raises(ValueError):
+        client.templates.retire("acc-1", "devbox", version="")
+    assert not route.called
+
+
+@respx.mock
+@pytest.mark.parametrize("bad", ["1.0", "abc", "1.0.0.0", "01.0.0", "v1.0.0"])
+def test_a_malformed_version_is_refused(client: mc.Client, bad: str) -> None:
+    route = respx.get(f"{BASE}/templates/acc-1/devbox")
+    with pytest.raises(ValueError):
+        client.templates.get("acc-1", "devbox", version=bad)
+    assert not route.called
+
+
+@respx.mock
+def test_a_well_formed_version_is_sent(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=PUBLISHED)
+    )
+    client.templates.get("acc-1", "devbox", version="1.10.0")
+    assert route.calls.last.request.url.params["version"] == "1.10.0"
+
+
+@respx.mock
+def test_the_ref_goes_in_the_path_as_two_segments(client: mc.Client) -> None:
+    """The platform reduces ``templates/<a>/<b>`` to ``templates/:namespace/:name``.
+
+    A ref handed over whole would be percent-encoded into a single segment and
+    reach a route that does not exist — a 404 about a name, describing a URL.
+    """
+    route = respx.get(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=PUBLISHED)
+    )
+    client.templates.get("acc-1", "devbox", version="1.0.0")
+    assert route.calls.last.request.url.path.endswith("/templates/acc-1/devbox")
+
+
+# --- retiring -------------------------------------------------------------
+
+
+@respx.mock
+def test_retire_reports_what_went_and_both_counts(client: mc.Client) -> None:
+    respx.delete(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=RETIRED)
+    )
+    gone = client.templates.retire("acc-1", "devbox")
+    assert gone.retired == ["acc-1/devbox@1.0.0"]
+    assert gone.versions == []
+    assert gone.templates == 0
+    # The two numbers move differently, and this is the one place a caller sees
+    # it: retiring gave a template row back and gave no ref back.
+    assert gone.refs_claimed == 1
+
+
+@respx.mock
+def test_a_retired_ref_keeps_the_platforms_sentence_about_when_it_went(
+    client: mc.Client,
+) -> None:
+    """A retired ref is not an unknown ref, and the platform's 404 says which.
+
+    A client that kept only the status would throw that away — and the date is
+    the whole answer to "when did my script stop working".
+    """
+    respx.get(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(
+            404,
+            json={
+                "error": (
+                    "acc-1/devbox@1.0.0 was retired on 2026-08-26T13:00:00.000Z. A ref names "
+                    "one document for ever, so this one cannot be published again."
+                )
+            },
+        )
+    )
+    with pytest.raises(mc.NotFoundError, match="retired on 2026-08-26"):
+        client.templates.get("acc-1", "devbox", version="1.0.0")
+
+
+# --- builds ---------------------------------------------------------------
+
+
+@respx.mock
+def test_build_start_sends_bytes_and_reads_the_job(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/builds").mock(
+        return_value=httpx.Response(
+            202,
+            json={
+                "id": "bld-1",
+                "ref": "acc-1/devbox@1.0.0",
+                "status": "running",
+                "started_at": "2026-08-26T12:00:00.000Z",
+            },
+        )
+    )
+    build = client.builds.start("apiVersion: mandala/v1")
+    assert route.calls.last.request.content == b"apiVersion: mandala/v1"
+    assert build.id == "bld-1"
+    assert build.finished_at is None
+
+
+@respx.mock
+def test_no_reuse_is_sent_only_when_asked_for(client: mc.Client) -> None:
+    """``no_reuse=true`` is the only spelling the platform acts on.
+
+    ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` and ``lib/apidoc``
+    gives the parameter ``enum: ['true']``, so the key is omitted rather than
+    sent as ``false``. This docstring used to say the platform read the key's
+    PRESENCE and that ``no_reuse=false`` forced a rebuild — the claim the fix
+    commit disproved and left pinned here, one edit away from being acted on.
+    """
+    route = respx.post(f"{BASE}/builds").mock(
+        return_value=httpx.Response(202, json={"id": "bld-1", "status": "running"})
+    )
+    client.builds.start("apiVersion: mandala/v1")
+    assert "no_reuse" not in route.calls[0].request.url.params
+    client.builds.start("apiVersion: mandala/v1", no_reuse=True)
+    assert route.calls[1].request.url.params["no_reuse"] == "true"
+
+
+@respx.mock
+def test_progress_reads_the_steps_in_order(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=DONE))
+    p = client.builds.progress("bld-1")
+    assert p.done is True
+    assert [s.kind for s in p.steps] == ["apt", "finish"]
+    assert p.steps[0].status == "done"
+
+
+@respx.mock
+def test_events_yields_every_progress_and_stops_after_done(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", DONE))
+    )
+    assert [p.status for p in client.builds.events("bld-1")] == ["running", "succeeded"]
+
+
+@respx.mock
+def test_a_stream_error_says_it_is_not_the_build(client: mc.Client) -> None:
+    """An ``error`` event is the STREAM failing, not the build.
+
+    A caller told "the build failed" would go and read a document that is fine,
+    so this names what actually happened and points at the poll that can still
+    answer.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("error", {"error": "host went away"}))
+    )
+    with pytest.raises(mc.MandalaError, match="says nothing about the build itself"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_wait_returns_when_the_build_is_done(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=DONE))
+    assert client.builds.wait("bld-1", poll=0.01).status == "succeeded"
+
+
+@respx.mock
+def test_wait_does_not_raise_for_a_build_that_failed(client: mc.Client) -> None:
+    """The rule the move work established.
+
+    ``succeeded`` and ``failed`` are two situations with two remedies — one has
+    an image, the other has a step to fix — and an exception flattens them into
+    "something went wrong".
+    """
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=FAILED))
+    out = client.builds.wait("bld-1", poll=0.01)
+    assert out.status == "failed"
+    assert out.error == "apt-get returned 100"
+    assert out.steps[0].status == "failed"
+
+
+@respx.mock
+def test_wait_times_out_without_stopping_the_build(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=RUNNING))
+    with pytest.raises(mc.TimeoutError, match="only this wait has"):
+        client.builds.wait("bld-1", timeout=0.05, poll=0.01)
+
+
+@respx.mock
+def test_wait_gives_up_at_once_on_a_failure_polling_cannot_fix(client: mc.Client) -> None:
+    """A build that does not exist is not going to start existing.
+
+    A wait against a bad id must not spend its whole timeout discovering that.
+    """
+    route = respx.get(f"{BASE}/builds/bld-nope/progress").mock(
+        return_value=httpx.Response(404, json={"error": "no such build"})
+    )
+    with pytest.raises(mc.NotFoundError):
+        client.builds.wait("bld-nope", timeout=5.0, poll=0.01)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_wait_keeps_polling_through_a_failure_that_might_clear(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "no hypervisor could answer"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    assert client.builds.wait("bld-1", poll=0.01).status == "succeeded"
+
+
+# --- the async half does the same thing ------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_retire_reports_the_same_counts(async_client: mc.AsyncClient) -> None:
+    respx.delete(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=RETIRED)
+    )
+    async with async_client as c:
+        gone = await c.templates.retire("acc-1", "devbox")
+    assert gone.retired == ["acc-1/devbox@1.0.0"]
+    assert gone.refs_claimed == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_refuses_an_empty_version_too(async_client: mc.AsyncClient) -> None:
+    route = respx.delete(f"{BASE}/templates/acc-1/devbox")
+    async with async_client as c:
+        with pytest.raises(ValueError):
+            await c.templates.retire("acc-1", "devbox", version="")
+    assert not route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_wait_does_not_raise_for_a_failed_build(
+    async_client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=FAILED))
+    async with async_client as c:
+        out = await c.builds.wait("bld-1", poll=0.01)
+    assert out.status == "failed"
+    assert out.error == "apt-get returned 100"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_events_stop_after_done(async_client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", DONE))
+    )
+    async with async_client as c:
+        seen = [p.status async for p in c.builds.events("bld-1")]
+    assert seen == ["running", "succeeded"]
+
+
+# --- what an adversarial review found (OPL-3835) --------------------------
+
+
+class Shifty(str):
+    """A ``str`` subclass that answers differently the second time it is asked.
+
+    Not exotic: it is the shape of every guard that validates a value and then
+    hands the ORIGINAL on to something that stringifies or encodes it again.
+    """
+
+    def __str__(self) -> str:
+        return ""
+
+    def encode(self, *a: object, **k: object) -> bytes:
+        return b".."
+
+
+@respx.mock
+def test_a_str_subclass_cannot_smuggle_an_empty_version(client: mc.Client) -> None:
+    """The critical one, and it is the irreversible branch.
+
+    ``template_version_params`` matched the regex against the buffer and returned
+    the object; httpx serialises a query value with ``str(value)``. A subclass
+    holding ``1.2.3`` whose ``__str__`` answers ``""`` therefore passed the check
+    and sent ``?version=`` — which on a retire means every version of the name.
+    """
+    route = respx.delete(f"{BASE}/templates/acc-1/devbox").mock(
+        return_value=httpx.Response(200, json=RETIRED)
+    )
+    client.templates.retire("acc-1", "devbox", version=Shifty("1.2.3"))
+    # Canonicalised, so the value httpx sends is the one the regex approved.
+    assert route.calls.last.request.url.params["version"] == "1.2.3"
+
+
+@respx.mock
+def test_a_str_subclass_cannot_smuggle_a_dot_segment(client: mc.Client) -> None:
+    """The same hole in ``seg``, which is older than this branch.
+
+    ``quote()`` calls the value's own ``encode()``, so a subclass holding ``x``
+    that encodes as ``b".."`` passed the dot-segment guard and became a path the
+    client normalises into a different route.
+    """
+    route = respx.get(f"{BASE}/templates/acc-1/x").mock(
+        return_value=httpx.Response(200, json=PUBLISHED)
+    )
+    client.templates.get("acc-1", Shifty("x"))
+    assert route.calls.last.request.url.path.endswith("/templates/acc-1/x")
+
+
+def test_a_non_string_is_refused_rather_than_coerced() -> None:
+    # str(None) is "None", which is a plausible id and a nonsense one.
+    for bad in (None, 1, {}, [], True):
+        with pytest.raises(ValueError):
+            _api.canonical(bad, "id")
+
+
+@respx.mock
+def test_wait_gives_up_at_once_on_a_failure_that_is_not_transient(client: mc.Client) -> None:
+    """A 400 is a defect, not a phase.
+
+    The first version re-raised a short list of permanent classes and swallowed
+    everything else, so this burned the full 1800-second default before
+    surfacing as a misleading timeout.
+    """
+    route = respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(400, json={"error": "that is not a build id"})
+    )
+    with pytest.raises(mc.APIError):
+        client.builds.wait("bld-1", timeout=5.0, poll=0.01)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_wait_bounds_each_poll_by_what_is_left_of_the_deadline(client: mc.Client) -> None:
+    """The deadline was only checked AFTER the request returned.
+
+    So a one-second wait could sit in a single request for the client's default
+    sixty — and for ever against a caller-supplied client with no timeout. The
+    same cap ``Computer.wait_until_built`` passes to its refresh.
+    """
+    seen: list[float | None] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout", {}).get("read"))
+        return httpx.Response(200, json=RUNNING)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=record)
+    with pytest.raises(mc.TimeoutError):
+        client.builds.wait("bld-1", timeout=0.25, poll=0.01)
+    assert seen, "no poll was made"
+    assert all(t is not None and t <= 0.25 for t in seen), seen
+
+
+@respx.mock
+def test_the_timeout_does_not_quote_a_stale_reading_in_the_present_tense(
+    client: mc.Client,
+) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(200, json=RUNNING),
+            *[httpx.Response(503, json={"error": "no hypervisor could answer"})] * 20,
+        ]
+    )
+    with pytest.raises(mc.TimeoutError, match="could not be reached"):
+        client.builds.wait("bld-1", timeout=0.2, poll=0.01)
+
+
+@respx.mock
+def test_a_stream_that_ends_without_a_done_is_not_a_completed_build(
+    client: mc.Client,
+) -> None:
+    """Returning normally made a truncated stream indistinguishable from a
+    finished one, so a caller looping over it reported a build it had stopped
+    watching as a build that ended."""
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("progress", RUNNING)))
+    with pytest.raises(mc.MandalaError, match="ended without a final event"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_a_malformed_done_is_a_protocol_error_not_a_skipped_event(client: mc.Client) -> None:
+    """Skipping it left the loop waiting on a connection the platform had
+    finished with — holding one of the account's eight stream slots."""
+    body = 'event: done\ndata: "not a record"\n\n'
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"Content-Type": "text/event-stream"}
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        list(client.builds.events("bld-1"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("versions", "1.2.3"), ("versions", 7), ("versions", {"a": 1})],
+)
+def test_a_list_field_that_is_not_a_list_degrades_rather_than_raising(
+    field: str, value: object
+) -> None:
+    """``d.get("x") or []`` guards None and nothing else.
+
+    A number raised a bare TypeError out of a public method; a string iterated by
+    character, so ``"1.2.3"`` decoded to ``['1', '.', '2', '.', '3']``. This
+    module's contract is that malformed fields are preserved in ``raw`` and never
+    rejected.
+    """
+    t = mc.PublishedTemplate.from_api({field: value})
+    assert t.versions == []
+    assert t.raw[field] == value
+
+
+def test_the_other_list_fields_degrade_too() -> None:
+    assert mc.RetiredTemplates.from_api({"retired": 7}).retired == []
+    assert mc.TemplateCheck.from_api({"problems": 7}).problems == []
+    assert mc.BuildProgress.from_api({"steps": "nope"}).steps == []
+
+
+# --- and the async half, which has the same two loops ----------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_wait_gives_up_at_once_on_a_non_transient_failure(
+    async_client: mc.AsyncClient,
+) -> None:
+    route = respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(400, json={"error": "that is not a build id"})
+    )
+    async with async_client as c:
+        with pytest.raises(mc.APIError):
+            await c.builds.wait("bld-1", timeout=5.0, poll=0.01)
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_stream_without_a_done_raises(async_client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("progress", RUNNING)))
+    async with async_client as c:
+        with pytest.raises(mc.MandalaError, match="ended without a final event"):
+            [p async for p in c.builds.events("bld-1")]
+
+
+@respx.mock
+def test_a_short_build_listing_arrives_as_a_refusal(client: mc.Client) -> None:
+    """It never reaches a caller as a short list, and that is the point.
+
+    lib/hvproxy does set X-GC-Incomplete on a short build listing, but
+    ``forward`` in lib/surface applies its strict-inventory check to every v1
+    route generically — so the response becomes a 503 before any client sees it.
+    A previous version of this method believed the opposite and returned a
+    Listing to carry a flag that cannot arrive.
+    """
+    respx.get(f"{BASE}/builds").mock(
+        return_value=httpx.Response(
+            503,
+            json={
+                "error": (
+                    "Right now a hypervisor cannot be reached, so this list would be "
+                    "incomplete. Retry, or pass allow_partial=1 to accept a partial answer."
+                )
+            },
+            headers={"X-GC-Incomplete": "0"},
+        )
+    )
+    with pytest.raises(mc.UnavailableError, match="would be incomplete"):
+        client.builds.list()
+
+
+@respx.mock
+def test_a_complete_build_listing_is_an_ordinary_list(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds").mock(
+        return_value=httpx.Response(200, json=[{"id": "bld-1", "status": "running"}])
+    )
+    builds = client.builds.list()
+    assert len(builds) == 1
+    assert builds[0].id == "bld-1"
+
+
+# --- what /code-review found on top of the adversarial pass ----------------
+
+
+class Sneaky(str):
+    """A ``str`` subclass whose ``strip()`` lies about being empty."""
+
+    def strip(self, *a: object) -> str:
+        return "x"
+
+
+def test_the_document_guard_canonicalises_before_it_checks() -> None:
+    """The one guard the previous pass said it had fixed and had not.
+
+    ``seg`` and ``template_version_params`` canonicalise first; this one checked
+    ``strip()`` on the caller's object and canonicalised afterwards, so a
+    subclass overriding ``strip`` passed the emptiness check and encoded to
+    nothing — an empty body on the wire, under a comment claiming otherwise.
+    """
+    with pytest.raises(ValueError):
+        _api.template_document(Sneaky(""))
+
+
+def test_a_trailing_newline_is_not_a_version() -> None:
+    """Python's ``$`` also matches just before a trailing newline.
+
+    So ``"1.0.0\n"`` satisfied the anchored pattern and went out as
+    ``?version=1.0.0%0A``. The platform's grammar is a JavaScript regex where
+    ``$`` is end-of-input, so it answers 400 — the exact round trip this guard
+    exists to save.
+    """
+    with pytest.raises(ValueError):
+        _api.template_version_params("1.0.0\n")
+    assert _api.template_version_params("1.0.0") == {"version": "1.0.0"}
+
+
+@pytest.mark.parametrize(
+    ("err", "retried"),
+    [
+        (mc.ConflictError("busy", status=409), True),
+        (mc.RateLimitError("slow down", status=429), True),
+        (mc.UnavailableError("no host", status=503), True),
+        (mc.GatewayTimeoutError("gateway", status=504), True),
+        (mc.OriginUnreachableError("origin", status=523), True),
+        (mc.OriginResponseError("origin", status=520), True),
+        (mc.TimeoutError("poll ran long"), True),
+        (mc.MandalaError("body did not parse"), True),
+        (mc.APIError("bad request", status=400), False),
+        (mc.NotFoundError("no such build", status=404), False),
+        (mc.PlanLimitError("no", status=402), False),
+        (mc.OriginTLSError("cert", status=525), False),
+    ],
+)
+def test_the_retry_policy_keeps_the_passing_failures_and_drops_the_decisions(
+    err: BaseException, retried: bool
+) -> None:
+    """A 4xx is a request refused on its merits; a 5xx is a passing outage.
+
+    The allow-list this replaced retried only three classes, so a 504 or a poll
+    that ran past its own cap ended a fourteen-minute wait — and
+    OriginUnreachableError's own docstring calls itself a passing outage.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(err) is retried
+
+
+def test_a_rate_limit_is_retried_no_sooner_than_it_asked() -> None:
+    """A 429 retried on a fixed five-second poll is the loop that caused it."""
+    from mandala_computer._resources import retry_delay
+
+    assert retry_delay(5.0, mc.RateLimitError("slow", status=429, retry_after=30.0)) == 30.0
+    assert retry_delay(5.0, mc.RateLimitError("slow", status=429)) == 5.0
+    assert retry_delay(5.0, mc.UnavailableError("away", status=503)) == 5.0
+
+
+@respx.mock
+def test_wait_rides_out_a_gateway_timeout(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(504, json={"error": "gateway timeout"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    assert client.builds.wait("bld-1", poll=0.01).status == "succeeded"
+
+
+def test_a_template_row_carries_its_ref() -> None:
+    """Since OPL-3789 a published template is named by its ref and nothing else.
+
+    A listing that drops it cannot tell a caller how to launch their own
+    template, which is what the platform's publicTemplate publishes it for.
+    """
+    t = mc.Template.from_api({"name": "devbox", "ref": "acc-1/devbox@1.0.0"})
+    assert t.ref == "acc-1/devbox@1.0.0"
+    # Absent stays absent: a host too old to advertise refs sends none.
+    assert mc.Template.from_api({"name": "base"}).ref is None
+
+
+# --- what the second review pass found -------------------------------------
+
+
+class Disarming(str):
+    """A ``str`` subclass that is truthy, absolute, and empty on the wire."""
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return ""
+
+    def startswith(self, *a: object, **k: object) -> bool:
+        return True
+
+
+def test_the_purge_interlock_cannot_be_disarmed_by_a_str_subclass() -> None:
+    """``canonical()`` reached three guards, not "every guard in _api.py".
+
+    ``delete_params`` still tested ``if not expect`` on the caller's object and
+    sent that object, so a subclass answering True here and "" to ``str()`` put
+    ``?expect=`` on the wire — and ``checkExpectation`` in server/vm.go reads an
+    empty expectation as NO expectation. The interlock was silently disarmed on
+    the one route that destroys a computer and its snapshots together.
+    """
+    sent = _api.delete_params(purge_snapshots=True, expect=Disarming("abc"))
+    assert sent is not None
+    # Canonicalised, so what httpx sends is the fingerprint the check agreed to
+    # rather than whatever __str__ felt like answering the second time.
+    assert type(sent["expect"]) is str
+    assert str(sent["expect"]) == "abc"
+    # And one that is genuinely empty is still refused.
+    with pytest.raises(ValueError, match="fingerprint"):
+        _api.delete_params(purge_snapshots=True, expect=Disarming(""))
+
+
+def test_a_guest_path_cannot_be_emptied_after_the_absoluteness_check() -> None:
+    sent = _api.files_params(Disarming("/home/user/a.txt"))
+    assert type(sent["path"]) is str
+    assert str(sent["path"]) == "/home/user/a.txt"
+    # A relative path that only CLAIMS to be absolute is refused on its real
+    # contents, not on what startswith answered.
+    with pytest.raises(ValueError, match="absolute"):
+        _api.files_params(Disarming("home/user/a.txt"))
+
+
+def test_a_retry_after_does_not_set_the_pace_for_the_rest_of_the_wait() -> None:
+    """The ratchet.
+
+    ``poll = retry_delay(poll, err)`` overwrote the loop's own interval, so one
+    429 with ``Retry-After: 30`` turned a five-second poll into a thirty-second
+    one for every later iteration. The TypeScript twin keeps ``pollMs``
+    immutable and recomputes, giving [30, 5, 5] where this gave [30, 30, 30].
+    """
+    from mandala_computer._resources import retry_delay
+
+    poll = 5.0
+    slow = mc.RateLimitError("slow down", status=429, retry_after=30.0)
+    away = mc.UnavailableError("no host", status=503)
+    assert [retry_delay(poll, slow), retry_delay(poll, away), retry_delay(poll, away)] == [
+        30.0,
+        5.0,
+        5.0,
+    ]
+
+
+@respx.mock
+def test_wait_sleeps_the_retry_after_once_and_then_returns_to_its_poll(
+    client: mc.Client,
+) -> None:
+    """The loop-level half of the same thing: `delay` is reset every iteration."""
+    slept: list[float] = []
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "slow down"}, headers={"Retry-After": "0.05"}),
+            httpx.Response(503, json={"error": "no host"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    real_sleep = time.sleep
+
+    def record(seconds: float) -> None:
+        slept.append(seconds)
+        real_sleep(0)
+
+    with mock.patch("mandala_computer._resources.time.sleep", record):
+        assert client.builds.wait("bld-1", poll=0.01).status == "succeeded"
+    assert slept[0] > slept[1], slept
+
+
+def test_408_is_repeatable_by_definition() -> None:
+    """RFC 9110 defines it as a request the client may repeat unchanged.
+
+    Cloudflare fronts this surface and emits it; it is the edge saying it waited
+    long enough, not a decision about anything.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.APIError("request timeout", status=408)) is True
+    assert is_transient(mc.APIError("bad request", status=400)) is False
+
+
+def test_a_malformed_body_is_transient_and_the_docstring_says_so() -> None:
+    """Deliberate, and the reversal is named rather than left as a surprise.
+
+    A bare MandalaError is what a dropped connection and a captive portal both
+    raise. The comment that used to sit over the catch claimed the opposite.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.MandalaError("expected JSON, got <html>")) is True
+    assert "TRANSIENT" in (is_transient.__doc__ or "")
+
+
+# The adversarial-review pass on the branch (OPL-3835). Every one of these was
+# a live defect in the commits above, and every one of them fails OPEN — the
+# wrong reading is the permissive, expensive or destructive one.
+
+
+@pytest.mark.parametrize("value", ["false", "0", 0, 1, "", None, [], object()])
+def test_no_reuse_refuses_anything_that_is_not_a_bool(value: object) -> None:
+    """``build_params("false")`` asked for a rebuild.
+
+    Truthiness on a flag that ARMS something reads every non-empty string as
+    yes, and ``"false"`` is what a config file, an environment variable or a CLI
+    argument produces. A rebuild copies a multi-gigabyte base image.
+    """
+    with pytest.raises(ValueError, match="no_reuse must be True or False"):
+        _api.build_params(value)  # type: ignore[arg-type]
+
+
+def test_no_reuse_still_takes_real_bools() -> None:
+    assert _api.build_params(True) == {"no_reuse": "true"}
+    assert _api.build_params(False) == {}
+
+
+@pytest.mark.parametrize("value", ["false", "0", 0, 1, "", None])
+def test_purging_snapshots_refuses_anything_that_is_not_a_bool(value: object) -> None:
+    """The same coercion on the one route that destroys a computer AND its
+    snapshots. The ``expect`` fingerprint did not cover this: it binds the purge
+    to the set that was looked at, not to whether a purge was meant at all."""
+    with pytest.raises(ValueError, match="purge_snapshots must be True or False"):
+        _api.delete_params(purge_snapshots=value, expect="sha256:abc")  # type: ignore[arg-type]
+
+
+def test_purging_snapshots_still_takes_real_bools() -> None:
+    assert _api.delete_params(purge_snapshots=False, expect=None) is None
+    assert _api.delete_params(purge_snapshots=True, expect="sha256:abc") == {
+        "snapshots": "delete",
+        "expect": "sha256:abc",
+    }
+
+
+#: Values no decoder can read. ``0``/``1`` and ``"true"``/``"false"`` are NOT
+#: here: those are unambiguous and are decoded, which is what keeps a backend
+#: that stringifies its booleans from getting the cautious answer on every flag
+#: of every response, for ever (/code-review, OPL-3835).
+UNREADABLE = ["maybe", "", 2, -1, [], {}, 1.5]
+
+
+@pytest.mark.parametrize("value", UNREADABLE)
+def test_a_value_no_decoder_can_read_gets_its_field_s_cautious_answer(value: object) -> None:
+    """``valid`` decides whether a document is publishable and ``done`` ends a
+    wait, so for those the cautious answer is False. ``unmatched`` is the other
+    direction: False would say the per-step positions are trustworthy, which is
+    the thing we cannot tell. The value survives in ``raw`` either way."""
+    check = mc.TemplateCheck.from_api({"valid": value})
+    assert check.valid is False
+    assert check.raw["valid"] == value
+
+    progress = mc.BuildProgress.from_api({"done": value, "unmatched": value})
+    assert progress.done is False
+    assert progress.unmatched is True
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("true", True),
+        ("false", False),
+        ("TRUE", True),
+        ("False", False),
+        (" true ", True),
+    ],
+)
+def test_the_unambiguous_encodings_are_decoded_not_refused(wire: object, expected: bool) -> None:
+    """The original bug was TRUTHINESS, not recognition.
+
+    ``bool("false")`` was True and that is wrong, but ``"false"`` still plainly
+    means false. Routing it to the cautious answer instead would give a backend
+    that encodes booleans this way the wrong value on every flag of every
+    response — permanently — and with ``timed_out`` cautious that means
+    ``ExecResult.ok`` is never true and ``wait_for_guest`` always times out.
+    """
+    assert mc.ExecResult.from_api({"exit_code": 0, "timed_out": wire}).timed_out is expected
+    assert mc.Move.from_api({"live": wire}).live is expected
+    assert mc.TemplateCheck.from_api({"valid": wire}).valid is expected
+
+
+def test_live_is_decided_with_the_state_when_the_wire_cannot_say() -> None:
+    """The field two reviews disagreed about, and neither answer was available
+    to a decoder looking at one key.
+
+    Reading an unreadable or null ``live`` as False ended ``wait_for_move`` on a
+    computer whose own state said ``moving``; reading it as True polled a
+    FINISHED move to its deadline and then raised. Both are answerable, but only
+    with ``state`` — which is why this is not one decoder call.
+    """
+    # A readable flag is the flag. It stays the thing to poll on.
+    assert mc.Move.from_api({"state": "moving", "live": False}).live is False
+    assert mc.Move.from_api({"state": "done", "live": True}).live is True
+
+    # Null and malformed defer to the state.
+    for unreadable in (None, "maybe", {}):
+        assert mc.Move.from_api({"state": "moving", "live": unreadable}).live is True
+        assert mc.Move.from_api({"state": "resizing", "live": unreadable}).live is True
+        assert mc.Move.from_api({"state": "done", "live": unreadable}).live is False
+        assert mc.Move.from_api({"state": "failed", "live": unreadable}).live is False
+
+    # ABSENT defers with the rest. Reading it as False was the first version's
+    # bug: a host that omits the flag and says `moving` IS describing a live
+    # move, so returning False ended the wait on a disk still copying.
+    assert mc.Move.from_api({"state": "moving"}).live is True
+    assert mc.Move.from_api({"state": "done"}).live is False
+    assert mc.Move.from_api({}).live is False
+
+
+def test_null_is_not_applicable_in_this_api() -> None:
+    """``cpu``, ``ram_mb``, ``disk_gb``, ``finished_at`` and ``exit_code`` all use
+    ``null`` that way, which is what settles it."""
+    assert mc.ExecResult.from_api({"exit_code": 0, "timed_out": None}).ok is True
+    assert mc.BuildProgress.from_api({"done": None}).done is False
+
+
+def test_real_booleans_still_decode() -> None:
+    assert mc.TemplateCheck.from_api({"valid": True}).valid is True
+    assert mc.BuildProgress.from_api({"done": True, "unmatched": True}).done is True
+    assert mc.BuildProgress.from_api({"done": True, "unmatched": True}).unmatched is True
+
+
+@respx.mock
+def test_a_done_that_says_the_build_is_still_running_is_malformed(client: mc.Client) -> None:
+    """Checking the payload's SHAPE left its semantics unchecked.
+
+    ``event: done`` carrying ``{"status": "running", "done": false}`` was yielded
+    as ordinary progress and then ended the iterator normally — the truncated
+    stream arriving through the front door.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", RUNNING))
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_a_done_naming_a_terminal_status_without_the_flag_is_accepted(
+    client: mc.Client,
+) -> None:
+    """The fallback is for a host too old to send the flag at all.
+
+    ``done`` ABSENT and a terminal status is believed; the platform derives the
+    flag from the job and the status from the phase, and a host that sends only
+    one is still saying the build is over.
+    """
+    payload = {k: v for k, v in DONE.items() if k != "done"}
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("done", payload)))
+    assert [p.status for p in client.builds.events("bld-1")] == ["succeeded"]
+
+
+@respx.mock
+def test_a_present_done_beats_the_status_it_disagrees_with(client: mc.Client) -> None:
+    """A contradiction resolves in favour of ``done``, not the status.
+
+    The platform derives ``done`` from the JOB and the status from the phase,
+    and the phase comes out of a log the document's own steps write into. So a
+    present flag is authoritative and the status is a fallback for a host that
+    sent no flag — not a second opinion about one that did.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("done", {**DONE, "done": False}))
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_wait_ends_on_the_same_rule_events_does(client: mc.Client) -> None:
+    """The two used different rules, which is how the same payload ended one and
+    left the other polling to its deadline."""
+    payload = {k: v for k, v in DONE.items() if k != "done"}
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=payload))
+    assert client.builds.wait("bld-1", timeout=5.0, poll=0.01).status == "succeeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_wait_ends_on_it_too(async_client: mc.AsyncClient) -> None:
+    payload = {k: v for k, v in DONE.items() if k != "done"}
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=payload))
+    p = await async_client.builds.wait("bld-1", timeout=5.0, poll=0.01)
+    assert p.status == "succeeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_half_rejects_the_same_done(async_client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", RUNNING))
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        [p async for p in async_client.builds.events("bld-1")]
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308, 303])
+def test_a_redirect_is_a_decision_about_the_url_not_a_passing_failure(status: int) -> None:
+    """The rule spelled as "everything that is not 4xx" swept in 3xx.
+
+    httpx is left on its default of not following redirects and every non-2xx
+    becomes an APIError, so a moved endpoint or a base_url missing its path was
+    retried until the wait's own deadline — half an hour, ending in a
+    TimeoutError naming nothing about the redirect that caused it.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.APIError("moved", status=status)) is False
+
+
+def test_5xx_is_still_transient() -> None:
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.APIError("bad gateway", status=502)) is True
+    assert is_transient(mc.APIError("server error", status=500)) is True
+
+
+@pytest.mark.parametrize(
+    ("timeout", "poll", "what"),
+    [
+        (1.0, -1, "poll"),
+        (1.0, float("nan"), "poll"),
+        (1.0, float("inf"), "poll"),
+        (float("nan"), 5.0, "timeout"),
+        (float("inf"), 5.0, "timeout"),
+        (-1.0, 5.0, "timeout"),
+        (True, 5.0, "timeout"),
+        ("30", 5.0, "timeout"),
+    ],
+)
+def test_wait_refuses_a_timeout_or_poll_it_cannot_honour(
+    client: mc.Client, timeout: object, poll: object, what: str
+) -> None:
+    """``poll=-1`` raised a bare ValueError out of ``time.sleep`` in the sync
+    half and returned instantly in the async one — a tight loop against a
+    metered endpoint. ``timeout=nan`` loses every ``remaining <= 0`` comparison,
+    so the deadline the docstring promises never arrived."""
+    with pytest.raises(ValueError, match=f"{what} must be a finite, non-negative"):
+        client.builds.wait("bld-1", timeout=timeout, poll=poll)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_the_async_wait_refuses_them_identically(async_client: mc.AsyncClient) -> None:
+    """The two halves diverged here, which is the part that makes it a parity
+    defect as well as a correctness one."""
+    with pytest.raises(ValueError, match="poll must be a finite, non-negative"):
+        await async_client.builds.wait("bld-1", timeout=1.0, poll=-1)
+    with pytest.raises(ValueError, match="timeout must be a finite, non-negative"):
+        await async_client.builds.wait("bld-1", timeout=float("nan"))
+
+
+@respx.mock
+def test_zero_is_allowed_because_every_sibling_wait_takes_it(client: mc.Client) -> None:
+    """``poll=0`` is what this repository's own tests pass to ``wait_until_built``,
+    ``wait_until_running`` and ``wait_for_guest`` at twenty-odd call sites, and
+    ``timeout=0`` is an already-expired deadline the siblings answer with the
+    TimeoutError their callers catch. Refusing both was a wider break than the
+    bug it fixed."""
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=DONE))
+    assert client.builds.wait("bld-1", timeout=5.0, poll=0).status == "succeeded"
+    with pytest.raises(mc.TimeoutError):
+        client.builds.wait("bld-1", timeout=0, poll=0)
+
+
+@respx.mock
+def test_the_timeout_that_reaches_the_transport_is_the_whole_remaining_budget(
+    client: mc.Client,
+) -> None:
+    """The cap is an upper bound on each operation, not a quarter-share of one.
+
+    Asserted on ``request.extensions["timeout"]`` — what httpx actually carries
+    — because respx does NOT enforce timeouts: a handler that sleeps past the
+    read timeout returns 200 anyway, so a test that merely times a mocked
+    response proves nothing and would pass against the divided implementation
+    too. That was the first version of this test.
+
+    Dividing the budget across httpx's four settings so they SUM to it was
+    arithmetic about a total that does not exist — ``read`` is an inactivity
+    timeout that httpcore restarts on every chunk — and it broke the callers it
+    was meant to help: with eight seconds left a legitimate three-second refresh
+    began failing at two, and neither ``wait_until_built`` nor
+    ``wait_until_running`` catches a timeout on its refresh.
+    """
+    route = respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json=DONE)
+    )
+    client.builds.wait("bld-1", timeout=8.0, poll=0)
+    sent = route.calls.last.request.extensions["timeout"]
+    assert sent["read"] == pytest.approx(8.0, abs=0.5), sent
+    assert sent["connect"] == pytest.approx(8.0, abs=0.5), sent
+    # A quarter-share would have been 2.0 on every phase.
+    assert sent["read"] > 4.0, sent
+
+
+def test_the_cap_still_tightens_a_looser_client_timeout() -> None:
+    """What it is for: a one-second wait must not inherit a sixty-second read,
+    and a client with no timeout at all must not wait for ever."""
+    from mandala_computer._client import _BaseTransport
+
+    current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+    capped = _BaseTransport._cap_budget(current, 1.0)
+    assert capped.read == 1.0
+    assert capped.connect == 1.0
+
+    none_at_all = httpx.Timeout(connect=None, read=None, write=None, pool=None)
+    assert _BaseTransport._cap_budget(none_at_all, 2.0).read == 2.0
+
+
+def test_the_cap_leaves_a_tighter_client_timeout_alone() -> None:
+    from mandala_computer._client import _BaseTransport
+
+    current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+    capped = _BaseTransport._cap_budget(current, 1800.0)
+    assert capped.read == 60.0
+    assert capped.connect == 10.0
+
+
+def test_template_can_still_be_built_the_way_it_could_before_ref() -> None:
+    """``Template`` is exported, so its field order is its constructor.
+
+    ``ref`` added ahead of ``label`` broke every positional construction that
+    worked on the previous release — fixtures and downstream code alike, while
+    decoding never noticed because ``from_api`` passes by keyword.
+    """
+    t = mc.Template("ubuntu", "Ubuntu 24.04", "linux", 2, 4096, 40)
+    assert t.name == "ubuntu"
+    assert t.label == "Ubuntu 24.04"
+    assert t.disk_gb == 40
+    assert t.ref is None
+    assert mc.Template.from_api({"name": "u", "ref": "acc-1/u@1.0.0"}).ref == "acc-1/u@1.0.0"
+
+
+# The second adversarial-review pass, on the fix commits themselves. Two of
+# these are defects the FIRST pass's fixes introduced or left behind.
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, "", None, []])
+def test_force_stop_refuses_anything_that_is_not_a_bool(value: object) -> None:
+    """The third arming flag, missed when the other two were hardened.
+
+    ``stop(force="false")`` pulled the power and lost whatever the guest had not
+    written to disk — the same defect as the snapshot purge, on the same kind of
+    string a config file produces.
+    """
+    with pytest.raises(ValueError, match="force must be True or False"):
+        _api.stop_params(value)  # type: ignore[arg-type]
+
+
+def test_force_stop_still_takes_real_bools() -> None:
+    assert _api.stop_params(True) == {"force": "true"}
+    assert _api.stop_params(False) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "cautious", "steers"),
+    [
+        (mc.ExecStatus, "running", True, "ExecStatus.done would end a poll on a live command"),
+        (
+            mc.ExecStatus,
+            "exited",
+            False,
+            "with running cautious, done stays False and polling goes on",
+        ),
+        (
+            mc.ExecStatus,
+            "more",
+            False,
+            "more is a BACKOFF switch: True means poll again with no sleep",
+        ),
+        (
+            mc.ExecResult,
+            "timed_out",
+            True,
+            "it decides ExecResult.ok, and through it wait_for_guest",
+        ),
+        (mc.TemplateCheck, "valid", False, "a document is not publishable until it is known to be"),
+        (
+            mc.BuildProgress,
+            "done",
+            False,
+            "a wait does not return until the build is known to be over",
+        ),
+        (mc.UsageReport, "degraded", True, "a total that may be short must not read as complete"),
+        (mc.UsageReport, "unmetered", True, "the other half of the same caveat, named with it"),
+        (mc.Snapshot, "unreachable", True, "a bare row with no computer_id can only be a stub"),
+        (
+            mc.Snapshot,
+            "orphaned",
+            False,
+            "True steers a restore into a clone, which bills a computer",
+        ),
+    ],
+)
+def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
+    model: type, field: str, cautious: bool, steers: str
+) -> None:
+    """Not "True for caveats" — the question is what the flag makes a caller DO.
+
+    ``more`` reads like a caveat and is the counter-example: it is a backoff
+    switch, so a cautious True made the loop in ``start_exec``'s own docstring
+    neither break nor sleep (/code-review, OPL-3835).
+    """
+    decoded = model.from_api({field: "maybe"})
+    assert getattr(decoded, field) is cautious, steers
+    assert decoded.raw[field] == "maybe"
+
+
+def _run_documented_poll_loop(statuses: list[mc.ExecStatus], limit: int = 6) -> dict[str, int]:
+    """The loop printed verbatim in ``Computer.start_exec``'s docstring, run.
+
+    Bounded, and it reports what it did rather than asserting: the point of
+    these tests is which of break / sleep / spin actually happens.
+    """
+    reads = sleeps = 0
+    for status in statuses[:limit]:
+        reads += 1
+        if status.drained:
+            return {"reads": reads, "sleeps": sleeps, "broke": 1}
+        if not status.more:
+            sleeps += 1
+    return {"reads": reads, "sleeps": sleeps, "broke": 0}
+
+
+def test_a_finished_command_lets_the_documented_loop_break() -> None:
+    finished = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": False})
+    assert finished.drained is True
+    assert _run_documented_poll_loop([finished] * 6) == {"reads": 1, "sleeps": 0, "broke": 1}
+
+
+def test_a_finished_command_with_an_UNREADABLE_more_does_not_drop_its_tail() -> None:
+    """The output-loss case, which the previous version of these tests missed.
+
+    ``poll()`` consumes — its own docstring says dropping the bytes drops them
+    for good — so breaking on ``done and not more`` when ``more`` could not be
+    read threw away whatever was still queued. Neither value of a plain boolean
+    is safe here: True spins with no delay, False truncates. ``drained`` is the
+    third answer.
+    """
+    st = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": "maybe"})
+    assert st.done is True, "the command really has stopped"
+    assert st.more is False, "and must not demand an instant re-poll"
+    assert st.output_uncertain is True, "but we cannot say the queue is empty"
+    assert st.drained is False, "so the loop must not stop reading"
+
+    ran = _run_documented_poll_loop([st] * 6)
+    assert ran["broke"] == 0, "breaking here is where the tail was lost"
+    assert ran["sleeps"] == ran["reads"], "and it must back off rather than spin"
+
+
+def test_a_readable_more_after_an_unreadable_one_ends_the_loop() -> None:
+    """It backs off until the host says something it can read, then stops."""
+    junk = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": "maybe"})
+    good = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": False})
+    assert _run_documented_poll_loop([junk, junk, good, good]) == {
+        "reads": 3,
+        "sleeps": 2,
+        "broke": 1,
+    }
+
+
+def test_a_null_more_is_not_applicable_and_does_not_hold_the_loop_open() -> None:
+    """``more`` is the field null genuinely settles: nothing further queued."""
+    st = mc.ExecStatus.from_api({"pid": 7, "exited": True, "more": None})
+    assert st.output_uncertain is False, "null is not-applicable, not unreadable"
+    assert st.done is True and st.drained is True
+    assert _run_documented_poll_loop([st] * 6)["broke"] == 1
+
+
+def test_a_null_running_does_not_by_itself_declare_a_command_finished() -> None:
+    """``done`` needs AFFIRMATIVE evidence, not the absence of a readable flag.
+
+    The previous version of this test carried this name and this docstring and
+    then asserted ``done is True`` — pinning the very behaviour the name says is
+    wrong (adversarial review, OPL-3835). A ``running`` this client cannot read
+    decodes False like anything else unreadable, and ``not running`` then ended
+    the poll with no exit code, nothing exited and nothing killed.
+    """
+    for unreadable in (None, "maybe", {}):
+        st = mc.ExecStatus.from_api(
+            {"pid": 7, "running": unreadable, "exited": False, "more": False}
+        )
+        assert st.exited is False
+        assert st.exit_code is None, "no verdict yet"
+        assert st.done is False, "and so nothing has said it stopped"
+        assert st.drained is False
+        assert _run_documented_poll_loop([st] * 4)["broke"] == 0
+
+    # The key GENUINELY ABSENT, not present-with-an-unreadable-value. This is
+    # the case the guard missed and the tests missed with it: `{}` as the value
+    # exercises MALFORMED, not ABSENT (adversarial review, OPL-3835).
+    absent = mc.ExecStatus.from_api({"pid": 7, "exited": False, "more": False})
+    assert "running" not in absent.raw
+    assert absent.done is False, "nothing in that payload says the command stopped"
+    assert absent.drained is False
+    assert _run_documented_poll_loop([absent] * 4)["broke"] == 0
+
+    # And an object built directly rather than decoded: its FIELDS are the
+    # evidence, because there is no payload to consult.
+    direct = mc.ExecStatus(
+        pid=7,
+        command="",
+        running=False,
+        exited=False,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        stdout_offset=0,
+        stderr_offset=0,
+        more=False,
+        killed=False,
+    )
+    assert direct.raw == {}
+    assert direct.done is True, "a caller who says running=False has said it stopped"
+
+    # What DOES end it: something that actually says so.
+    for evidence in ({"exited": True}, {"killed": True}, {"running": False}):
+        st = mc.ExecStatus.from_api({"pid": 7, "more": False, **evidence})
+        assert st.done is True, evidence
+        assert _run_documented_poll_loop([st] * 4)["broke"] == 1, evidence
+
+
+def test_an_unreadable_status_backs_OFF_rather_than_spinning() -> None:
+    """The honest limit, stated rather than claimed away.
+
+    A status whose ``running`` cannot be read is not asserted to be finished —
+    that would end a poll on a live command — so the loop does NOT terminate.
+    What the cautious reading buys is that it sleeps between reads instead of
+    spinning. Terminating here would need a tri-state ``done``, which is a
+    bigger change than this branch.
+    """
+    junk = mc.ExecStatus.from_api(
+        {"pid": 7, "running": "maybe", "exited": "maybe", "more": "maybe"}
+    )
+    assert junk.running is True and junk.more is False and junk.done is False
+    ran = _run_documented_poll_loop([junk] * 6)
+    assert ran["broke"] == 0
+    assert ran["sleeps"] == ran["reads"]
+
+
+def test_the_cautious_reading_keeps_a_poll_loop_going() -> None:
+    """The two exec flags meet in ``done``, so they have to be chosen together."""
+    unreadable = mc.ExecStatus.from_api({"pid": 1, "running": "maybe", "exited": "maybe"})
+    assert unreadable.done is False, "a command this client cannot read is not finished"
+
+
+def test_the_cautious_reading_keeps_a_move_wait_going() -> None:
+    assert mc.Move.from_api({"state": "moving", "live": "maybe"}).live is True
+
+
+def test_an_unreadable_exec_is_not_reported_as_a_success() -> None:
+    r = mc.ExecResult.from_api({"exit_code": 0, "timed_out": "maybe"})
+    assert r.timed_out is True
+    assert r.ok is False, "ok must not bless an exec whose timed_out could not be read"
+
+
+def test_no_wire_boolean_is_left_on_truthiness() -> None:
+    """The rule is every boolean, and the scan checks its own coverage.
+
+    Three holes have been found in it: a cwd-relative path, a regex pinning one
+    spelling, and a lookahead that silently dropped the LAST decoder in the
+    module — which was ``ExecResult``'s, one this branch changed. A scan that
+    quietly covers less than it claims is worse than no scan.
+    """
+    import re
+
+    for name in ("_models", "_computer", "_async_computer"):
+        source = pathlib.Path(getattr(mc, name).__file__).read_text()
+        bodies = re.findall(r"def from_api\(.*?(?=\n    @|\n@|\nclass |\Z)", source, re.DOTALL)
+        assert len(bodies) == source.count("def from_api("), (
+            f"{name}: scanned {len(bodies)} of {source.count('def from_api(')} decoders"
+        )
+        offenders = [call for body in bodies for call in re.findall(r"\bbool\([^)]*\)", body)]
+        assert not offenders, (name, offenders)
+        for flag in ("unreachable", "orphaned", "degraded", "unmetered", "live", "timed_out"):
+            raw = re.findall(rf'(?<!_wire\()[\w.]*get\("{flag}"[^)]*\)', source)
+            assert not raw, (name, flag, raw)
+
+
+def test_the_classifier_has_no_fallback_knob() -> None:
+    """``_flag`` returned a bool and took an ``unknown=`` fallback to pick one.
+
+    That shape produced four rounds of defects, because the right answer needs
+    context a single-key decoder cannot see. If it comes back, so do they.
+    """
+    import mandala_computer._models as models
+
+    assert not hasattr(models, "_flag")
+    assert "unknown" not in inspect.signature(models._wire).parameters
+    assert inspect.signature(models._wire).return_annotation.endswith("_Wire")
+
+
+def test_template_keeps_the_raw_positional_slot_too() -> None:
+    """Moving ``ref`` to the end fixed the six and broke the seventh.
+
+    ``raw`` was the seventh positional field. With ``ref`` ahead of it,
+    ``Template(..., disk_gb, raw_dict)`` bound the mapping to ``ref`` and left
+    ``raw`` empty — silently, because a mapping is a fine value for an optional
+    field. ``kw_only`` is what leaves every existing position alone.
+    """
+    t = mc.Template("ubuntu", "Ubuntu 24.04", "linux", 2, 4096, 40, {"name": "ubuntu"})
+    assert t.raw == {"name": "ubuntu"}
+    assert t.ref is None
+    with pytest.raises(TypeError):
+        mc.Template("ubuntu", "Ubuntu", "linux", 2, 4096, 40, {}, "acc/u@1.0.0")  # type: ignore[misc]
+
+
+@respx.mock
+def test_a_429_without_a_retry_after_still_backs_off(client: mc.Client) -> None:
+    """``poll`` cannot be the floor, because ``poll=0`` is allowed.
+
+    ``retry_delay`` only consulted ``Retry-After``, and a RateLimitError raised
+    without that header carries ``retry_after=None``. With ``poll=0`` the delay
+    was therefore zero, so a wait that hit a rate limiter retried it back to
+    back for the full half-hour default — the loop the function exists to break,
+    with its one brake removed.
+    """
+    from mandala_computer._resources import RATE_LIMITED_FLOOR, retry_delay
+
+    bare = mc.RateLimitError("slow down", status=429)
+    assert bare.retry_after is None
+    assert retry_delay(0, bare) == RATE_LIMITED_FLOOR
+    assert retry_delay(5.0, bare) == 5.0
+
+    told = mc.RateLimitError("slow down", status=429, retry_after=30.0)
+    assert retry_delay(0, told) == 30.0
+    assert retry_delay(60.0, told) == 60.0
+
+    # A non-429 keeps the caller's poll, zero included: nothing asked us to wait.
+    assert retry_delay(0, mc.APIError("boom", status=503)) == 0
+
+
+@respx.mock
+def test_the_floor_is_actually_slept_by_a_wait(client: mc.Client) -> None:
+    slept: list[float] = []
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "slow down"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    with mock.patch("mandala_computer._resources.time.sleep", slept.append):
+        assert client.builds.wait("bld-1", timeout=30, poll=0).status == "succeeded"
+    assert slept and slept[0] >= 1.0, slept
+
+
+@pytest.mark.parametrize(
+    ("payload", "ended"),
+    [
+        ({"status": "running", "done": True}, True),
+        ({"status": "running", "done": "true"}, True),
+        ({"status": "running", "done": 1}, True),
+        ({"status": "succeeded", "done": False}, False),
+        ({"status": "succeeded"}, True),
+        ({"status": "succeeded", "done": None}, True),
+        ({"status": "succeeded", "done": "maybe"}, True),
+        ({"status": "running", "done": None}, False),
+        ({"status": "running", "done": "maybe"}, False),
+        # `failed` is terminal too, and removing it from BUILD_TERMINAL left the
+        # whole table green: every other row carries a readable `done`, so
+        # nothing exercised the fallback for a build that FAILED (adversarial
+        # review, OPL-3835). A legacy payload of only {"status": "failed"} would
+        # have been polled until timeout.
+        ({"status": "failed"}, True),
+        ({"status": "failed", "done": None}, True),
+        ({"status": "failed", "done": "maybe"}, True),
+        ({"status": "failed", "done": False}, False),
+        ({"status": "cancelled"}, False),
+    ],
+)
+def test_the_done_field_itself_falls_back_only_on_an_unrecognised_value(
+    payload: dict, ended: bool
+) -> None:
+    """The rule lives ON the field now, so nothing can disagree with it.
+
+    It used to live in a ``build_ended`` helper beside ``BuildProgress.done``,
+    and the two drifted apart twice — most recently so that
+    ``{"status": "succeeded", "done": null}`` made ``wait()`` return an object
+    whose own documented "whether to stop polling" field said False
+    (adversarial review, OPL-3835). There is one spelling of the question now.
+    """
+    assert mc.BuildProgress.from_api(payload).done is ended
+
+
+@respx.mock
+def test_wait_never_returns_a_progress_that_contradicts_itself(client: mc.Client) -> None:
+    """The contradiction the table above would not have caught on its own."""
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json={"id": "bld-1", "status": "succeeded", "done": None})
+    )
+    p = client.builds.wait("bld-1", timeout=5, poll=0)
+    assert p.done is True, "a wait must not return an object whose own done says otherwise"
+
+
+@respx.mock
+def test_a_terminal_done_event_with_a_null_flag_is_not_malformed(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("done", {**DONE, "done": None}))
+    )
+    assert [p.status for p in client.builds.events("bld-1")] == ["succeeded"]
+
+
+@respx.mock
+def test_the_snapshot_filter_keeps_stubs_and_refuses_strangers(client: mc.Client) -> None:
+    """Through the real method, not the private helper.
+
+    The previous version called ``_is_unreachable_stub`` directly and imported
+    only the sync copy, so both filters could have stopped calling it — or the
+    async copy alone could have regressed — with the test still green
+    (adversarial review, OPL-3835). There is one shared predicate now, and this
+    goes through both public methods.
+    """
+    rows = [
+        {"id": "snap-mine", "computer_id": "vm-1", "size_bytes": 1},
+        {"id": "snap-other", "computer_id": "vm-2", "size_bytes": 1},
+        {"id": "snap-stub", "unreachable": True},
+        {"id": "snap-stub-unreadable", "unreachable": "maybe"},
+        # A FULL row that merely failed to fill in its computer_id. Truthiness
+        # read this as a stub and admitted it into every computer's list.
+        {"id": "snap-empty-cid", "computer_id": "", "unreachable": True, "size_bytes": 1},
+        {"id": "snap-null-cid", "computer_id": None, "unreachable": True, "size_bytes": 1},
+    ]
+    respx.get(f"{BASE}/snapshots").mock(return_value=httpx.Response(200, json=rows))
+    got = [s.id for s in mc.Computer(client._t, {"id": "vm-1", "status": "running"}).snapshots()]
+    assert got == ["snap-mine", "snap-stub", "snap-stub-unreadable"], got
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_snapshot_filter_agrees(async_client: mc.AsyncClient) -> None:
+    rows = [
+        {"id": "snap-mine", "computer_id": "vm-1"},
+        {"id": "snap-other", "computer_id": "vm-2"},
+        {"id": "snap-stub", "unreachable": True},
+        {"id": "snap-null-cid", "computer_id": None, "unreachable": True},
+    ]
+    respx.get(f"{BASE}/snapshots").mock(return_value=httpx.Response(200, json=rows))
+    comp = mc.AsyncComputer(async_client._t, {"id": "vm-1", "status": "running"})
+    assert [s.id for s in await comp.snapshots()] == ["snap-mine", "snap-stub"]
+
+
+def test_a_full_computer_row_is_not_a_placeholder_because_a_field_was_null(
+    client: mc.Client,
+) -> None:
+    """``not self._data.get("status")`` made every healthy computer with a null
+    status report itself a placeholder, and callers told to check this before
+    believing anything else then stopped believing valid data."""
+    full = mc.Computer(client._t, {"id": "vm-1", "status": None, "name": "x", "unreachable": "?"})
+    assert full.unreachable is False, "it has fields a placeholder would not"
+    stub = mc.Computer(client._t, {"id": "vm-1", "unreachable": "?"})
+    assert stub.unreachable is True
+    assert mc.Computer(client._t, {"id": "vm-1", "status": "running"}).unreachable is False
+
+
+def _readme() -> pathlib.Path:
+    return pathlib.Path(mc.__file__).parent.parent.parent / "README.md"
+
+
+def _python_blocks(text: str) -> list[str]:
+    return re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+
+
+def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
+    """The README is the first thing anyone runs, and it did not run.
+
+    Two blocks called ``Path(...)`` with no ``pathlib`` import and used an
+    undefined ``namespace``; thirteen more read names nothing had bound —
+    missing ``import time``, ``import mandala_computer as mc``, and coordinates
+    and keys the prose described but no line assigned. Every one is a NameError
+    on paste (/code-review, OPL-3835).
+
+    Names carry FORWARD between blocks, because a reader working down the page
+    does too: a block may use ``c`` from the block that created it. What it may
+    not do is use something no earlier block ever defined.
+    """
+    readme = _readme()
+    if not readme.exists():  # installed without the repo alongside
+        pytest.skip("README not next to the package")
+    blocks = _python_blocks(readme.read_text())
+    assert len(blocks) > 30, f"only found {len(blocks)} blocks; the fence regex has drifted"
+
+    defined = set(dir(builtins))
+    problems = []
+
+    def bound_by(tree: ast.AST, *, descend: bool) -> set[str]:
+        """Every name a block binds at MODULE level.
+
+        ``descend=False`` skips function and class bodies, because a name
+        assigned only inside a ``def`` is local to it. The first version added
+        those to the document-level set, so a later block could read a name that
+        only ever existed inside an earlier block's function and still pass
+        (adversarial review, OPL-3835).
+        """
+        bound: set[str] = set()
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    bound.add(child.name)
+                    if not descend:
+                        continue
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    bound.add(child.id)
+                elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                    for alias in child.names:
+                        bound.add((alias.asname or alias.name).split(".")[0])
+                elif isinstance(child, ast.ExceptHandler) and child.name:
+                    bound.add(child.name)
+                elif isinstance(child, ast.arg):
+                    bound.add(child.arg)
+                # A `case Foo(bar)` BINDS bar. Counting those as reads is what
+                # made the first version of this sweep report false positives.
+                elif (
+                    isinstance(child, ast.MatchAs)
+                    and child.name
+                    or isinstance(child, ast.MatchStar)
+                    and child.name
+                ):
+                    bound.add(child.name)
+                elif isinstance(child, ast.MatchMapping) and child.rest:
+                    bound.add(child.rest)
+                stack.append(child)
+        return bound
+
+    def _loads(node: ast.AST, *, descend: bool = True) -> set[str]:
+        """Names read by a node. ``descend=False`` skips nested function and
+        class bodies, so a module-level scan does not read a helper's own
+        locals — the binding scan already refuses to descend into them, and the
+        mismatch made `if True:` over a `def helper(path)` report ``path``
+        undefined (/code-review, OPL-3835)."""
+        read: set[str] = set()
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            for child in ast.iter_child_nodes(current):
+                if not descend and isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    continue
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    read.add(child.id)
+                stack.append(child)
+        return read
+
+    for n, block in enumerate(blocks, 1):
+        try:
+            tree = ast.parse(block)
+            # COMPILED as well as parsed: `nonlocal missing` and a few other
+            # binding errors are raised by the compiler, not the parser
+            # (adversarial review, OPL-3835).
+            # Top-level `await` is allowed: the async examples are written to
+            # be pasted into an async function or an async REPL.
+            compile(block, f"<readme block {n}>", "exec", ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        except SyntaxError as exc:
+            problems.append(f"block {n}: {exc}")
+            continue
+        # PER SCOPE. Ordering within a block is deliberately not checked — a
+        # `for` target is read later in its own loop, an `except ... as e` in
+        # its own handler, and a statement-ordered version reported a dozen
+        # false positives on exactly those shapes. But scope is checked: reads
+        # at module level are satisfied only by module-level bindings, because
+        # pooling every scope's names let a function-local mask a genuine
+        # undefined load in the same block (adversarial review, OPL-3835)::
+        #
+        #     print(token)            # NameError, and it used to pass
+        #
+        #     def helper():
+        #         token = "local"
+        module_level = bound_by(tree, descend=False)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for name in _loads(node, descend=False):
+                if name not in defined and name not in module_level:
+                    problems.append(f"block {n}: undefined name {name!r}")
+        # A function body sees its own locals and arguments as well.
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            local = bound_by(node, descend=True)
+            for name in _loads(node, descend=True):
+                if name not in defined and name not in module_level and name not in local:
+                    problems.append(f"block {n}: undefined name {name!r} in {node.name}")
+        defined |= module_level
+    assert not problems, "\n".join(dict.fromkeys(problems))
+
+
+def test_the_readme_publishes_the_safe_poll_loop() -> None:
+    """It carried the old two-line form for a commit after the docstring was
+    fixed, so a caller copying it lost output on an unreadable ``more``."""
+    readme = _readme()
+    if not readme.exists():
+        pytest.skip("README not next to the package")
+    text = readme.read_text()
+    assert "status.done and not status.more" not in text
+    assert "status.drained" in text
+
+
+@respx.mock
+def test_events_closes_its_stream_when_the_iterator_is_closed(client: mc.Client) -> None:
+    """The stream is released on the normal path and on an early close.
+
+    HONEST ABOUT WHAT THIS PROVES, because the first version of it was not: on
+    CPython it passes with or without the ``closing`` wrapper in ``events()``.
+    Refcounting drops the inner generator the moment the outer frame goes, so
+    the bare ``for event in self._t.sse(...)`` this replaced was already prompt
+    here — verified by reverting the wrapper and watching both tests still pass.
+
+    The wrapper is not for CPython. It is for an implementation that does not
+    refcount, where an abandoned generator closes whenever the collector gets
+    to it and an account holds only eight streams at once; and it is for
+    matching ``Computer.agent_stream``, which wraps its own stream and says why.
+    What this test pins is the property itself — that the response really is
+    released, on both the ``done`` path and an early exit — so that a future
+    change which genuinely leaks it fails here.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("progress", RUNNING), ("done", DONE))
+    )
+    closed: list[str] = []
+    real = mc._client.Transport.sse
+
+    def tracking(self, method, path, **kw):
+        gen = real(self, method, path, **kw)
+        try:
+            yield from gen
+        finally:
+            closed.append(path)
+
+    with mock.patch.object(mc._client.Transport, "sse", tracking):
+        # The normal path: run to the `done` event and return.
+        assert len(list(client.builds.events("bld-1"))) == 3
+        assert closed, "the done path left the response open"
+
+        closed.clear()
+        stream = client.builds.events("bld-1")
+        next(stream)
+        stream.close()  # the early exit the docstring warns callers about
+        assert closed, "closing the iterator left the response open"
+
+
+@respx.mock
+def test_a_poll_cut_short_by_our_own_deadline_is_not_the_fleet_failing(
+    client: mc.Client,
+) -> None:
+    """`observed` says whether the MOST RECENT poll answered.
+
+    A poll the wait's own cap cut off did not fail to answer — it was never
+    given time to. Counting it as a failure made a wait whose every poll
+    succeeded report "could not be reached", a claim about the fleet made from
+    this client's own clock running out (/code-review, OPL-3835).
+    """
+    calls = {"n": 0}
+
+    def one_good_then_slow(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=RUNNING)
+        # A cap firing means the request spent the budget it was given, which
+        # is what tells it apart from a network failure arriving at once. Well
+        # past it, not marginally: the first version slept 0.3s against a 0.35s
+        # budget and so passed alone and failed in the suite, which is a flaky
+        # test rather than a fact about the code.
+        time.sleep(0.5)
+        raise httpx.ReadTimeout("cap fired", request=request)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=one_good_then_slow)
+    with pytest.raises(mc.TimeoutError) as caught:
+        client.builds.wait("bld-1", timeout=0.3, poll=0.01)
+    said = str(caught.value)
+    # Neither claim: a timeout consistent with our own cap is not proof it
+    # fired, so the message blames nobody (adversarial review, OPL-3835).
+    assert "cannot be told from here" in said, said
+    assert "was still running" not in said, said
+    assert "could not be reached" not in said, said
+    assert "phase copying" in said, "and it quotes what the last good poll saw"
+
+
+@respx.mock
+def test_a_timeout_that_arrives_instantly_IS_the_fleet_failing(client: mc.Client) -> None:
+    """The other side of the same rule, and why elapsed time is the signal.
+
+    A timeout that exhausted nothing is the network or the platform, not this
+    wait's clock, and must still be reported as a poll that did not answer. A
+    deadline check alone cannot tell the two apart — it was the first attempt at
+    this fix and it called both cases ours.
+    """
+
+    def instant(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("connection died", request=request)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=instant)
+    with pytest.raises(mc.TimeoutError) as caught:
+        client.builds.wait("bld-1", timeout=0.2, poll=0.01)
+    assert "could not be" in str(caught.value), str(caught.value)
+
+
+def test_a_decoded_empty_body_is_not_a_finished_command() -> None:
+    """`raw` truthiness could not tell a decoded `{}` from a hand-built object.
+
+    `from_api` sets `raw=dict(d)`, so a 200 whose body is an empty object — a
+    proxy hiccup, a daemon answering with nothing — looked exactly like an
+    `ExecStatus` somebody constructed, fell through to the fields, and declared
+    the command finished with nothing exited, nothing killed and no exit code
+    (/code-review, OPL-3835). The escape hatch reopened the hole it sat beside.
+    """
+    empty = mc.ExecStatus.from_api({})
+    assert empty.decoded is True, "it came off the wire, however little it said"
+    assert empty.done is False
+    assert empty.drained is False
+    assert _run_documented_poll_loop([empty] * 4)["broke"] == 0
+
+    built = mc.ExecStatus(
+        pid=1,
+        command="",
+        running=False,
+        exited=False,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        stdout_offset=0,
+        stderr_offset=0,
+        more=False,
+        killed=False,
+    )
+    assert built.decoded is False
+    assert built.done is True, "a caller who wrote running=False has said it stopped"
+
+
+def test_the_decoded_flag_is_in_equality_because_it_changes_done() -> None:
+    """Two objects equal to each other and behaviourally different is the wrong
+    thing to hand an expected-value assertion.
+
+    It was excluded from ``==`` at first, so ``from_api({})`` compared equal to
+    a hand-built status reporting the opposite ``done`` (adversarial review,
+    OPL-3835). Provenance that changes public behaviour belongs in equality.
+    """
+    kwargs: dict[str, object] = {
+        "pid": 1,
+        "command": "c",
+        "running": False,
+        "exited": False,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "stdout_offset": 0,
+        "stderr_offset": 0,
+        "more": False,
+        "killed": False,
+    }
+    built = mc.ExecStatus(**kwargs)  # type: ignore[arg-type]
+    decoded = mc.ExecStatus(**kwargs, decoded=True)  # type: ignore[arg-type]
+    assert built.done is not decoded.done, "the flag changes behaviour"
+    assert built != decoded, "so it must change equality with it"
+    assert built == mc.ExecStatus(**kwargs)  # type: ignore[arg-type]
+
+
+def test_the_decoded_flag_breaks_no_existing_construction() -> None:
+    """Adding a field to an exported frozen dataclass, checked rather than
+    assumed: positional construction, positional match patterns, ``replace``
+    and pickling all have to survive it."""
+    import dataclasses
+    import pickle
+
+    assert "decoded" not in mc.ExecStatus.__match_args__, "kw_only keeps it out"
+    built = mc.ExecStatus(1, "c", True, False, None, "", "", 0, 0, False, False)
+    assert built.decoded is False
+    # IN the repr, because it is in `==` and flips `done`: a failed
+    # `assert status == ExecStatus(...)` printing two identical reprs with no
+    # hint why is the thing hiding it caused (/code-review, OPL-3835).
+    assert "decoded=False" in repr(built)
+    assert "decoded=True" in repr(mc.ExecStatus.from_api({"pid": 2}))
+
+    off_wire = mc.ExecStatus.from_api({"pid": 2, "running": True})
+    assert off_wire.decoded is True
+    assert dataclasses.replace(off_wire, pid=9).decoded is True, "replace carries it"
+    assert pickle.loads(pickle.dumps(off_wire)).decoded is True
+
+    match built:
+        case mc.ExecStatus(pid, command):
+            assert (pid, command) == (1, "c")
+        case _:  # pragma: no cover
+            raise AssertionError("positional pattern stopped matching")
+
+
+def test_a_fresh_snapshot_without_a_computer_id_is_not_a_placeholder() -> None:
+    """`POST /computers/{id}/snapshots` answers with no `computer_id` — it is in
+    the path — and this decoder serves that response too.
+
+    Keying the fallback on the missing key alone made a freshly captured
+    snapshot carrying `"unreachable": null` read as a placeholder, on a field
+    whose docstring tells callers to check it before believing anything else
+    (/code-review, OPL-3835).
+    """
+    fresh = {"id": "snap-1", "name": "nightly", "state": "pending", "size_bytes": 123}
+    for unreadable in (None, "maybe", {}):
+        assert mc.Snapshot.from_api({**fresh, "unreachable": unreadable}).unreachable is False
+
+    # The documented stub is an id and this flag and nothing more.
+    for unreadable in (None, "maybe"):
+        assert mc.Snapshot.from_api({"id": "snap-2", "unreachable": unreadable}).unreachable is True
+    # An explicit true is believed on any row that does not say whose it is.
+    assert mc.Snapshot.from_api({**fresh, "unreachable": True}).unreachable is True
+
+
+def test_the_async_events_docstring_does_not_teach_the_sync_idiom() -> None:
+    """Shared verbatim, it told AsyncClient callers to write `with closing(...)`
+    and `for ... in` over an async generator — a TypeError from the loop and an
+    AttributeError from `closing.__exit__`, which has no `close` to call."""
+    async_doc = mc.AsyncBuilds.events.__doc__ or ""
+    sync_doc = mc.Builds.events.__doc__ or ""
+    assert "aclosing(client.builds.events" in async_doc
+    assert "with closing(client.builds.events" not in async_doc
+    assert "async for" in async_doc
+    assert "with closing(client.builds.events" in sync_doc, "the sync half keeps its own"
+
+
+def test_a_full_row_without_a_computer_id_is_not_admitted_to_every_listing() -> None:
+    """The shape is required whatever the flag says.
+
+    Applying it only to null and unreadable left the same hole one branch over:
+    a full row with no ``computer_id`` and ``unreachable: true`` was admitted
+    into EVERY computer's filtered list (adversarial review, OPL-3835).
+    """
+    from mandala_computer._models import is_unreachable_stub
+
+    full = {"id": "snap-other", "name": "nightly", "state": "pending", "size_bytes": 123}
+    assert is_unreachable_stub({**full, "unreachable": True}) is False
+    assert is_unreachable_stub({"id": "snap-1", "unreachable": True}) is True
+    assert is_unreachable_stub({"id": "snap-1", "unreachable": None}) is True
+    assert is_unreachable_stub({"id": "snap-1"}) is False
+    # The FIELD still believes an explicit true wherever it appears — that is a
+    # different question from "is this row a placeholder for another computer".
+    assert mc.Snapshot.from_api({**full, "unreachable": True}).unreachable is True
+
+
+@respx.mock
+def test_the_full_row_is_kept_out_of_another_computers_snapshots(client: mc.Client) -> None:
+    rows = [
+        {"id": "snap-mine", "computer_id": "vm-1"},
+        {"id": "snap-stub", "unreachable": True},
+        {"id": "snap-full-no-cid", "name": "n", "state": "pending", "unreachable": True},
+    ]
+    respx.get(f"{BASE}/snapshots").mock(return_value=httpx.Response(200, json=rows))
+    got = [s.id for s in mc.Computer(client._t, {"id": "vm-1", "status": "running"}).snapshots()]
+    assert got == ["snap-mine", "snap-stub"], got
+
+
+#: Every phase httpx can time out in, with the `httpx.Timeout` field each one
+#: is measured against. All four, because covering only connect and read let a
+#: mutation that measured WRITE and POOL against the read ceiling survive
+#: (adversarial review, OPL-3835).
+PHASES = [
+    (httpx.ConnectTimeout, "connect"),
+    (httpx.ReadTimeout, "read"),
+    (httpx.WriteTimeout, "write"),
+    (httpx.PoolTimeout, "pool"),
+]
+
+
+def _timeout_err(cause: type | None) -> mc.TimeoutError:
+    err = mc.TimeoutError("timed out")
+    if cause is not None:
+        err.__cause__ = cause("stalled", request=httpx.Request("GET", "https://x.test"))
+    return err
+
+
+def _timeouts(**phase: float | None) -> httpx.Timeout:
+    base: dict[str, float | None] = {
+        "connect": 10.0,
+        "read": 10.0,
+        "write": 10.0,
+        "pool": 10.0,
+    }
+    base.update(phase)
+    return httpx.Timeout(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("cause", "phase"), PHASES)
+def test_each_phase_is_measured_against_its_own_ceiling(cause: type, phase: str) -> None:
+    """A single read ceiling cannot classify a connect stall.
+
+    Comparing every timeout against ``read`` got it wrong in both directions:
+    a genuine connect stall was excused as the wait's cap, and the wait's own
+    tightened connect cap was blamed on the platform (adversarial review,
+    OPL-3835). Every phase, so the same hole cannot open in the two the first
+    version of this test left out.
+    """
+    import time as _time
+
+    from mandala_computer._client import _BaseTransport
+    from mandala_computer._resources import _LastPoll, classify_poll_failure
+
+    err = _timeout_err(cause)
+    # The wait's cap DID tighten this phase: 2s against the client's 60s.
+    tight = _BaseTransport._phase_ceiling(_timeouts(**{phase: 60.0}), err)
+    assert tight == 60.0
+    spent = _time.monotonic() - 2.0
+    assert classify_poll_failure(err, spent, 2.0, tight) is _LastPoll.UNRESOLVED
+
+    # It did not: the client's own 1s limit is tighter than the 5s budget.
+    loose = _BaseTransport._phase_ceiling(_timeouts(**{phase: 1.0}), err)
+    assert loose == 1.0
+    assert classify_poll_failure(err, _time.monotonic() - 5.0, 5.0, loose) is _LastPoll.FAILED
+
+    # No client limit at all: nothing but the cap could have produced this.
+    unlimited = _BaseTransport._phase_ceiling(_timeouts(**{phase: None}), err)
+    assert unlimited == float("inf"), "no limit is infinite, not unknown"
+    assert classify_poll_failure(err, spent, 2.0, unlimited) is _LastPoll.UNRESOLVED
+
+
+@pytest.mark.parametrize("cause", [None, httpx.TimeoutException, httpx.ConnectError])
+def test_a_timeout_whose_phase_cannot_be_named_is_blamed_on_nobody_and_claimed_by_nobody(
+    cause: type | None,
+) -> None:
+    """Unknown is not ours. An error with no cause, a bare
+    ``TimeoutException``, or a non-timeout could have come from anywhere —
+    and claiming a bare base exception as a read timeout was a surviving
+    mutation (adversarial review, OPL-3835)."""
+    import time as _time
+
+    from mandala_computer._client import _BaseTransport
+    from mandala_computer._resources import _LastPoll, classify_poll_failure
+
+    err = mc.TimeoutError("timed out")
+    if cause is not None:
+        err.__cause__ = cause("x", request=httpx.Request("GET", "https://x.test"))
+    assert _BaseTransport._phase_ceiling(_timeouts(), err) is None
+    assert classify_poll_failure(err, _time.monotonic() - 30, 30.0, None) is _LastPoll.FAILED
+
+
+def test_a_phase_wrapped_one_level_deeper_is_still_found() -> None:
+    """A transport or hook that wraps a phase timeout in the base class hid the
+    phase, and the wait reported the fleet unreachable rather than recognising
+    its own cap (adversarial review, OPL-3835)."""
+    from mandala_computer._client import _BaseTransport
+
+    req = httpx.Request("GET", "https://x.test")
+    inner = httpx.ReadTimeout("stalled", request=req)
+    middle = httpx.TimeoutException("wrapped", request=req)
+    middle.__cause__ = inner
+    err = mc.TimeoutError("timed out")
+    err.__cause__ = middle
+    assert _BaseTransport._phase_ceiling(_timeouts(read=7.0), err) == 7.0
+
+
+def test_a_cause_chain_that_loops_does_not_hang() -> None:
+    from mandala_computer._client import _BaseTransport
+
+    req = httpx.Request("GET", "https://x.test")
+    a = httpx.TimeoutException("a", request=req)
+    b = httpx.TimeoutException("b", request=req)
+    a.__cause__ = b
+    b.__cause__ = a
+    err = mc.TimeoutError("t")
+    err.__cause__ = a
+    assert _BaseTransport._phase_ceiling(_timeouts(), err) is None
+
+
+def test_an_unattributable_timeout_makes_the_wait_blame_nobody() -> None:
+    """The message is the point of the third state.
+
+    Saying "was still running" there asserts the fleet is fine on the strength
+    of a stopwatch; saying "could not be reached" asserts the opposite. Neither
+    is knowable, so it says so (adversarial review, OPL-3835).
+    """
+    from mandala_computer._resources import _LastPoll, _wait_timed_out
+
+    seen = mc.BuildProgress.from_api(RUNNING)
+    answered = _wait_timed_out("bld-1", 30, seen, _LastPoll.ANSWERED)
+    unresolved = _wait_timed_out("bld-1", 30, seen, _LastPoll.UNRESOLVED)
+    failed = _wait_timed_out("bld-1", 30, seen, _LastPoll.FAILED)
+
+    assert "was still running" in answered
+    assert "cannot be told from here" in unresolved
+    assert "was still running" not in unresolved, "it must not claim the fleet was fine"
+    assert "could not be reached" not in unresolved, "nor that it was not"
+    assert "could not be reached" in failed
+    assert "phase copying" in unresolved, "it still quotes the last good reading"
+
+
+def _example_lines(doc: str | None) -> list[str]:
+    """The CODE lines of a docstring, normalised across Python versions.
+
+    Two things had to be got right here and neither was (CI, OPL-3835).
+
+    ``inspect.cleandoc`` first, because 3.13 dedents docstrings at COMPILE time
+    and 3.10-3.12 do not. A pattern anchored on leading whitespace therefore
+    matched indented lines on the older three and nothing at all on the newer
+    two, so the scan was silently inert on the interpreter I ran locally and
+    noisy on the ones CI runs.
+
+    Then only the INDENTED lines, because a docstring's code examples are
+    indented under a ``::`` and its prose is not. Matching any line beginning
+    with the word "with" flagged three wrapped sentences — "…tidy up after it.
+    With it, the" — as sync-only idioms.
+    """
+    if not doc:
+        return []
+    return [line for line in inspect.cleandoc(doc).splitlines() if line.startswith("    ")]
+
+
+#: Shapes that only work on a sync client, matched against a docstring's code
+#: lines. Each carries its OWN positive fixture: a self-test using `any(...)`
+#: across the set let two of the three be made permanently non-matching and
+#: stayed green (adversarial review, OPL-3835).
+SYNC_ONLY = (
+    (
+        r"^with (?!.*\basync\b)\S",
+        "sync `with` in an example",
+        "    with closing(client.builds.events(build_id)) as stream:",
+    ),
+    (
+        r"^for \w+ in (?!.*\basync\b)\S",
+        "sync `for ... in` in an example",
+        "    for progress in stream:",
+    ),
+)
+
+#: Checked against the whole docstring rather than its code lines: a link is
+#: prose, not an example.
+SYNC_LINKS = (r":class:`(?!Async)[A-Z]\w*s`", "link to a sync class")
+
+
+@pytest.mark.parametrize(("pattern", "why", "fixture"), SYNC_ONLY)
+def test_each_sync_only_pattern_matches_its_own_fixture(
+    pattern: str, why: str, fixture: str
+) -> None:
+    """Every pattern is proved separately. `any(...)` across the set let two of
+    three rot unnoticed."""
+    import re
+
+    line = fixture.strip()
+    assert re.search(pattern, line), (why, pattern, line)
+    async_form = ("async " + line) if not line.startswith("async") else line
+    assert not re.search(pattern, async_form), (why, async_form)
+
+
+def test_the_sync_only_patterns_catch_the_docstring_they_came_from() -> None:
+    """A class-level test that cannot catch the instance it generalised from is
+    not a class-level test.
+
+    The first version required `with client.` literally, and the docstring the
+    whole class of bug came from says ``with closing(client.builds.events(...))``
+    — so restoring the shared docstring would have passed it.
+    """
+    import re
+
+    lines = [line.strip() for line in _example_lines(mc.Builds.events.__doc__)]
+    assert any("with closing(client.builds.events" in line for line in lines), "the fixture moved"
+    assert any(re.search(p, line) for p, _, _ in SYNC_ONLY for line in lines), SYNC_ONLY
+
+
+def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
+    """A class of bug, not one instance: `events` was found and fixed, and the
+    same shortcut had put a `with` block in `ephemeral` and a link to the sync
+    `Templates` in `AsyncBuilds` (adversarial review, OPL-3835)."""
+    import re
+
+    offenders = []
+    for cls in (mc.AsyncComputers, mc.AsyncTemplates, mc.AsyncBuilds, mc.AsyncSnapshots):
+        docs = [(cls.__name__, "<class>", cls.__doc__ or "")]
+        docs += [
+            (cls.__name__, n, getattr(cls, n).__doc__ or "")
+            for n in dir(cls)
+            if not n.startswith("_")
+        ]
+        for owner, name, doc in docs:
+            for line in _example_lines(doc):
+                for pattern, why in ((p, w) for p, w, _ in SYNC_ONLY):
+                    if re.search(pattern, line.strip()):
+                        offenders.append((owner, name, why, line.strip()))
+            if re.search(SYNC_LINKS[0], doc):
+                offenders.append((owner, name, SYNC_LINKS[1], ""))
+    assert not offenders, offenders
+
+
+def test_the_async_ephemeral_docstring_teaches_async_with() -> None:
+    """Sharing it verbatim taught the sync keyword, and the first correction was
+    dead code — it replaced strings the doc does not contain, so the doc still
+    said ``with`` and only an appended note (indented under a doc at column
+    zero, so Sphinx renders it as a block quote) disagreed
+    (/code-review, OPL-3835)."""
+    async_doc = mc.AsyncComputers.ephemeral.__doc__ or ""
+    sync_doc = mc.Computers.ephemeral.__doc__ or ""
+    assert "async with`` block" in async_doc
+    assert "tying that to a ``with`` block" not in async_doc
+    assert "tying that to a ``with`` block" in sync_doc, "the sync half keeps its own wording"
+    assert not async_doc.rstrip().endswith("OPL-3835)."), "no dangling indented note"
+
+
+@pytest.mark.parametrize("flag", [True, None, "maybe", {}])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"created_at": "2026-08-27T00:00:00Z"},
+        {"kind": "disk"},
+        {"computer_name": None},
+        {"created_at": "x", "kind": "disk"},
+    ],
+)
+def test_a_stub_carrying_an_extra_field_is_still_a_stub(flag: object, extra: dict) -> None:
+    """An exact whitelist stopped recognising a placeholder the moment the
+    platform added a key, and filtering those out drops precisely the markers
+    saying an answer is short (/code-review, OPL-3835).
+
+    Across every flag value, because testing it only with ``true`` let a
+    mutation restoring the whitelist for null and malformed survive
+    (adversarial review, OPL-3835).
+    """
+    from mandala_computer._models import is_unreachable_stub
+
+    row = {"id": "snap-1", "unreachable": flag, **extra}
+    assert is_unreachable_stub(row) is True, (flag, extra)
+    assert mc.Snapshot.from_api(row).unreachable is True, (flag, extra)
+
+    # `state` is what every real snapshot carries and no placeholder does.
+    real = {**row, "state": "pending"}
+    assert is_unreachable_stub(real) is False, (flag, extra)
+
+
+def test_a_flag_that_says_false_is_never_a_stub_however_bare_the_row() -> None:
+    from mandala_computer._models import is_unreachable_stub
+
+    assert is_unreachable_stub({"id": "s", "unreachable": False}) is False
+    assert is_unreachable_stub({"id": "s"}) is False
+
+
+def test_every_docstring_rewrite_still_finds_its_sentence() -> None:
+    """The drift guard, in a test rather than at import time.
+
+    A bare `str.replace` no-ops when the prose is reworded and the async doc is
+    wrong again with nothing failing. But asserting it at IMPORT turned a
+    one-word docstring edit into `import mandala_computer` failing outright,
+    which is a worse trade than the bug. Loud here, harmless there.
+
+    It reads what the rewrites actually DID, not a list restating them. The
+    first version was such a list, and a call added without an entry passed
+    silently — a registry you have to remember to update is the same class of
+    bug as the drift it was written to catch (adversarial review, OPL-3835).
+    """
+    from mandala_computer._async_resources import _REWRITES
+
+    assert _REWRITES, "no rewrites recorded; the module no longer performs any"
+    for sentence, found in _REWRITES:
+        assert found == 1, (
+            f"the source wording no longer contains {sentence!r} exactly once "
+            f"(found {found}), so that rewrite silently did nothing"
+        )
+
+    # And the rewrites really did land.
+    assert "async with`` block" in (mc.AsyncComputers.ephemeral.__doc__ or "")
+    assert ":class:`AsyncTemplates`" in (mc.AsyncBuilds.__doc__ or "")
+    assert ":class:`Templates`" not in (mc.AsyncBuilds.__doc__ or "")
+
+
+def test_a_reworded_source_does_not_break_the_import() -> None:
+    """`_reworded` degrades to a no-op rather than raising: a documentation
+    change must not strand every caller of the package."""
+    from mandala_computer._async_resources import _reworded
+
+    assert _reworded("the wording changed", "``with``", "``async with``") == "the wording changed"
+    assert _reworded(None, "``with``", "``async with``") == ""
+    assert _reworded("a ``with`` block", "``with``", "``async with``") == "a ``async with`` block"
+
+
+def test_the_docstring_scan_reads_the_same_on_every_python() -> None:
+    """3.13 dedents docstrings at compile time and 3.10-3.12 do not.
+
+    A pattern anchored on leading whitespace therefore matched indented lines on
+    the older three and NOTHING on the newer two — so this scan was inert on the
+    interpreter used locally and noisy on the ones CI runs, and it took a CI
+    failure across three versions to surface it (OPL-3835). Both shapes are
+    normalised here so the scan cannot go quiet on any of them again.
+    """
+    raw = mc.Builds.events.__doc__ or ""
+    assert raw, "the fixture moved"
+    # What 3.10-3.12 stores: every line after the first keeps its source indent.
+    head, *rest = raw.splitlines()
+    pre_313 = head + "\n" + "\n".join(("        " + ln if ln.strip() else ln) for ln in rest)
+
+    dedented = [ln.strip() for ln in _example_lines(raw)]
+    indented = [ln.strip() for ln in _example_lines(pre_313)]
+    assert dedented == indented, (dedented, indented)
+    assert dedented, "no example lines found in either shape"
+    assert any("with closing(" in ln for ln in dedented)
+
+
+def test_wrapped_prose_is_not_mistaken_for_a_code_example() -> None:
+    """The CI failure was three FALSE positives: prose wrapped so a line began
+    with the word "with" — "…tidy up after it. With it, the" — read as a
+    sync-only idiom. Examples are indented under a `::`; prose is not."""
+    import re
+
+    doc = (
+        "Does a thing.\n\n"
+        "    Something you cannot do anything about except tidy up after it.\n"
+        "    With it, the listing stays complete.\n\n"
+        "    ::\n\n"
+        "        async with aclosing(client.builds.events(x)) as s:\n"
+        "            pass\n"
+    )
+    flagged = [
+        ln.strip()
+        for ln in _example_lines(doc)
+        for p, _, _ in SYNC_ONLY
+        if re.search(p, ln.strip())
+    ]
+    assert not flagged, flagged

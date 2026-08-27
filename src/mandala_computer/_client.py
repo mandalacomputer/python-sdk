@@ -342,8 +342,93 @@ class _BaseTransport:
         )
 
     @staticmethod
+    def _phase_ceiling(timeout: httpx.Timeout, err: BaseException) -> float | None:
+        """The client's own limit for the PHASE that actually timed out.
+
+        What a poll's deadline cap is measured against: a cap wider than this
+        never tightened anything, so a timeout under it belongs to the platform
+        rather than to the wait. Per phase, because httpx has four and they
+        differ — comparing every timeout against ``read`` alone got both
+        directions wrong (adversarial review, OPL-3835). With ``connect=4.8``
+        and ``read=60``, a five-second budget tightens neither, yet a genuine
+        connect stall at 4.8s was excused as ours; with ``connect=60`` and
+        ``read=1``, a two-second budget DOES tighten connect, and its own cap
+        firing was blamed on the platform.
+
+        Read off ``__cause__``, which is the httpx exception ``_timed_out``
+        raises from, so no exception type or signature has to change.
+        """
+        # WALKED, not read once. A custom transport or hook that wraps a
+        # phase-specific timeout in the base `TimeoutException` hid the phase one
+        # level down, and the wait then reported the fleet unreachable rather
+        # than recognising its own tightened cap (adversarial review,
+        # OPL-3835). Bounded, because a hand-built chain can loop.
+        cause: BaseException | None = err
+        for _ in range(10):
+            cause = cause.__cause__ if cause is not None else None
+            if cause is None or isinstance(
+                cause,
+                (
+                    httpx.ConnectTimeout,
+                    httpx.ReadTimeout,
+                    httpx.WriteTimeout,
+                    httpx.PoolTimeout,
+                ),
+            ):
+                break
+        if isinstance(cause, httpx.ConnectTimeout):
+            value = timeout.connect
+        elif isinstance(cause, httpx.WriteTimeout):
+            value = timeout.write
+        elif isinstance(cause, httpx.PoolTimeout):
+            value = timeout.pool
+        elif isinstance(cause, httpx.ReadTimeout):
+            value = timeout.read
+        else:
+            # Not a phase we can name — an httpx.TimeoutException with no
+            # subtype, or an error raised without a cause. UNKNOWN, and the
+            # caller treats unknown as "cannot claim it".
+            return None
+        # A named phase the client puts no limit on is INFINITE, not unknown,
+        # and collapsing the two into None was a regression (/code-review,
+        # OPL-3835): against a caller-supplied client with no timeout at all —
+        # the case `_cap_budget`'s own docstring exists for — the wait's cap is
+        # then the ONLY thing that can have fired, and reading it as unknown
+        # made a wait blame its own deadline on the fleet.
+        return math.inf if value is None else float(value)
+
+    @staticmethod
     def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
-        """Cap every phase of one request to the time its caller has left."""
+        """Tighten one request's timeouts to the time its caller has left.
+
+        An UPPER BOUND ON EACH OPERATION, and deliberately not a wall-clock
+        deadline for the request — httpx's four settings cannot express one, and
+        a commit on this branch got that wrong in both directions before it was
+        caught (second adversarial review, OPL-3835). ``read`` is an INACTIVITY
+        timeout: httpcore reads it once and then applies it to every chunk in
+        ``_receive_response_body``, so it restarts on each one and a slow but
+        steady response can outlast any value set here. Dividing the budget
+        across the four to make them sum to it was arithmetic about a total that
+        does not exist, and it broke the callers it was meant to help — a
+        legitimate three-second refresh with eight seconds left began failing at
+        two, and `Computer.wait_until_built` and `wait_until_running` do not
+        catch a timeout on that refresh.
+
+        What it is still for is the case that motivated it: a `wait(timeout=1)`
+        inheriting the client's own sixty-second read, or a caller-supplied
+        client with no timeout at all. The loop's deadline check is what bounds
+        the wait; this only keeps a single request from sitting far past it.
+
+        THE OVERSHOOT IS BOUNDED BUT NOT SMALL: the four phases are sequential,
+        so a request can spend up to four times what was left, and a wait can
+        return or raise that far past the deadline it documents
+        (/code-review, OPL-3835). Named rather than fixed, because the fix is
+        not arithmetic on these four numbers — that is what the reverted commit
+        tried — but a deadline enforced around the whole request, which is a
+        change to every caller and its own piece of work. Four times a shrinking
+        remainder is a bad hour; four copies of a full sixty-second read, which
+        is what the uncapped version gave, is a worse one.
+        """
         if seconds is None:
             return current
         cap = max(seconds, 0.001)
@@ -720,6 +805,10 @@ def _retry_after(resp: httpx.Response) -> float | None:
 class Transport(_BaseTransport):
     """Blocking transport."""
 
+    def phase_ceiling(self, err: BaseException) -> float | None:
+        """See :meth:`_BaseTransport._phase_ceiling`."""
+        return self._phase_ceiling(self._http.timeout, err)
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -891,6 +980,10 @@ class Transport(_BaseTransport):
 
 class AsyncTransport(_BaseTransport):
     """Non-blocking transport."""
+
+    def phase_ceiling(self, err: BaseException) -> float | None:
+        """See :meth:`_BaseTransport._phase_ceiling`."""
+        return self._phase_ceiling(self._http.timeout, err)
 
     def __init__(
         self,

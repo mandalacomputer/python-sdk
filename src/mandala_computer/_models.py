@@ -6,24 +6,32 @@ rejected, so a server that starts returning more does not break older clients.
 
 from __future__ import annotations
 
+import builtins
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from operator import index as integer_index
 from typing import Any, SupportsIndex, TypeVar, overload
 
 from ._exceptions import MandalaError
 
 __all__ = [
+    "BuildProgress",
+    "BuildStep",
     "ComputerUsage",
     "ExecResult",
     "ExecStatus",
     "FilePart",
     "Listing",
+    "PublishedTemplate",
+    "RetiredTemplates",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
     "Template",
+    "TemplateBuild",
+    "TemplateCheck",
     "UsagePeriod",
     "UsageReport",
     "UsageTotals",
@@ -58,6 +66,125 @@ def _real(value: Any) -> float:
     except (OverflowError, TypeError, ValueError):
         return 0.0
     return number if math.isfinite(number) else 0.0
+
+
+class _Wire(Enum):
+    """What a boolean field on the wire actually was, before anyone decided what
+    it MEANS.
+
+    Five states, because five is how many there are. ``_flag`` returned a
+    ``bool`` and took an ``unknown=`` fallback to pick one, and that shape was
+    the source of four rounds of defects on this branch (adversarial review,
+    OPL-3835): every fallback boolean is wrong somewhere, because the right
+    answer needs context the decoder cannot see. ``Move.live`` needs
+    ``Move.state``; ``ExecStatus.more`` is both the sleep switch and half the
+    break condition, so neither value is safe; a snapshot's ``unreachable``
+    means opposite things on a sparse row and a full one. Handing callers a
+    classification and letting each decide is the fix, and the reason this is an
+    enum rather than another knob.
+    """
+
+    #: The key was not there. An older host that never heard of the field.
+    ABSENT = auto()
+    #: ``null``. NOT APPLICABLE in this API's own convention — ``cpu``,
+    #: ``finished_at`` and ``exit_code`` all use it that way — rather than
+    #: "cannot tell".
+    NULL = auto()
+    TRUE = auto()
+    FALSE = auto()
+    #: Present, and not anything this client can read.
+    MALFORMED = auto()
+
+
+def _wire(d: Mapping[str, Any], key: str) -> _Wire:
+    """Classify one boolean field. It decides nothing.
+
+    ``true``/``false`` and ``1``/``0`` are recognised however they are spelled —
+    as JSON booleans, as numbers, or as strings. The original bug was
+    TRUTHINESS, not recognition: ``bool("false")`` was True, which is wrong, but
+    ``"false"`` still plainly means false, and a backend that encodes its
+    booleans that way must not be told its every flag is unreadable.
+
+    Integral floats are recognised with the ints. ``json.loads`` gives ``1`` for
+    ``1`` and ``1.0`` for ``1.0``, so accepting one and not the other made the
+    same wire value decode two ways (adversarial review, OPL-3835).
+    """
+    if key not in d:
+        return _Wire.ABSENT
+    value = d[key]
+    # Before the numeric branch: `True == 1` in Python, and a real boolean must
+    # not be classified by the int rule.
+    if isinstance(value, bool):
+        return _Wire.TRUE if value else _Wire.FALSE
+    if value is None:
+        return _Wire.NULL
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return _Wire.TRUE if value == 1 else _Wire.FALSE
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1"):
+            return _Wire.TRUE
+        if text in ("false", "0"):
+            return _Wire.FALSE
+    return _Wire.MALFORMED
+
+
+#: The documented shape of an unreachable placeholder row: an id, the flag, and
+#: no ``computer_id``, because there was no daemon to say which computer it
+#: belonged to. Shared rather than written twice — the sync and async filters had
+#: identical copies, which is a drift waiting to happen and a test that only ever
+#: covered one of them (adversarial review, OPL-3835).
+def is_unreachable_stub(row: Mapping[str, Any]) -> bool:
+    """Whether a snapshot row stands in for one nobody could read.
+
+    ROW SHAPE, not the flag alone. ``unreachable`` means opposite things on the
+    two rows it can appear on: on a stub it is the marker saying a listing is
+    short, and dropping it reports a confident count over an incomplete answer;
+    on a FULL row belonging to another computer, admitting it hands back
+    somebody else's snapshots from a method read before an irreversible delete.
+
+    The discriminator is the PRESENCE of ``computer_id``, not its truthiness. A
+    row carrying ``"computer_id": null`` or ``""`` is a full row that failed to
+    fill the field in, and reading it as a stub admitted it into every
+    computer's list (adversarial review, OPL-3835).
+    """
+    if "computer_id" in row:
+        return False
+    if _wire(row, "unreachable") in (_Wire.FALSE, _Wire.ABSENT):
+        return False
+    # THE SHAPE IS REQUIRED WHATEVER THE FLAG SAYS, and applying it only to the
+    # unreadable values left the same hole one branch over (adversarial review,
+    # OPL-3835): a full row with no `computer_id` and `unreachable: true` was
+    # admitted into EVERY computer's filtered list. `POST
+    # /computers/{id}/snapshots` answers without a `computer_id` too — it is in
+    # the path — so the missing key alone cannot mean placeholder. The
+    # documented stub is an id and this flag and nothing more.
+    # A TOLERANT test, not an exact whitelist. `set(row) <= {"id",
+    # "unreachable"}` stopped recognising a stub the moment the platform added a
+    # `created_at` or a `kind` to it, and filtering those out drops precisely
+    # the markers saying an answer is short (/code-review, OPL-3835). `state` is
+    # what every real snapshot carries and no placeholder does — the same shape
+    # of test `Computer.unreachable` makes with `status`.
+    return "state" not in row
+
+
+def _texts(value: Any) -> builtins.list[str]:
+    """A list-of-strings field off the wire, or empty when it is unusable.
+
+    ``d.get("x") or []`` reads as a safe default and is not one (adversarial
+    review, OPL-3835). It guards ``None`` and nothing else: a NUMBER raises a
+    bare ``TypeError`` out of the comprehension — from a public method, about a
+    field the caller never named — and a STRING iterates by character, so
+    ``"1.2.3"`` silently became ``['1', '.', '2', '.', '3']``. A version list
+    that decodes to punctuation is worse than one that decodes to nothing.
+
+    Degrading rather than raising is this module's stated contract: unknown and
+    malformed fields are preserved in ``raw`` and never rejected, so a platform
+    that starts answering differently does not break older clients.
+    """
+    if not isinstance(value, builtins.list):
+        return []
+    return [_text(v) for v in value]
 
 
 def _text(value: Any) -> str:
@@ -310,16 +437,343 @@ class Template:
     ram_mb: int
     disk_gb: int
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    #: The pinned ``namespace/name@version``, when the platform sent one.
+    #:
+    #: ``None`` only from a host too old to advertise refs. It matters more than
+    #: it looks: since OPL-3789 a template an account PUBLISHED is named by its
+    #: ref and by nothing else — the short ``name`` still resolves to the
+    #: platform's own catalogue — so a listing without this cannot tell a caller
+    #: how to launch their own template. ``publicTemplate`` in the platform's
+    #: lib/projection publishes it for exactly that reason, and this model was
+    #: dropping it on the floor.
+    #:
+    #: KEYWORD-ONLY, and last, rather than second where it reads best. This
+    #: class is exported, so its field order is its constructor: added ahead of
+    #: ``label`` it broke every ``Template("ubuntu", "Ubuntu", ...)`` that worked
+    #: on the previous release, in fixtures and downstream code alike
+    #: (adversarial review, OPL-3835). Moving it past those six then quietly
+    #: broke the seventh — ``raw`` was the seventh positional slot, so
+    #: ``Template(..., disk_gb, raw_dict)`` bound the mapping to ``ref`` and left
+    #: ``raw`` empty, without raising (second adversarial review). ``kw_only`` is
+    #: what leaves every existing position alone, and this comment sits under
+    #: ``raw`` so that Sphinx attaches it to the field it describes rather than
+    #: to the one above it (/code-review). Decoding never noticed any of it —
+    #: ``from_api`` passes by keyword.
+    ref: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Template:
+        ref = d.get("ref")
         return cls(
             name=_text(d.get("name")),
+            ref=None if ref is None else _text(ref),
             label=_text(d.get("label")),
             os=_text(d.get("os")),
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class PublishedTemplate:
+    """A document this account published, from ``publish()`` or ``get()``.
+
+    :class:`Template` is what a LISTING answers — a name, a size, enough to
+    launch it. This is what a template IS, and the two are different shapes on
+    purpose: the listing has to stay small enough to render a picker from, and
+    the document carries build steps that can run to pages.
+    """
+
+    #: ``namespace/name@version``. What you pass as ``template`` to create.
+    ref: str
+    #: ``sha256:…`` of the document. Two publishes of the same digest are the
+    #: same template, which is what makes republishing an unchanged document a
+    #: no-op rather than a conflict.
+    doc_digest: str
+    #: The document itself, in canonical form — the bytes :attr:`doc_digest` is
+    #: over. Key order and whitespace may differ from what was sent; nothing
+    #: else does.
+    document: Mapping[str, Any]
+    #: The catalogue row this document describes.
+    template: Template
+    #: Every version of this name, newest first.
+    versions: builtins.list[str]
+    #: ``None`` on a template the platform publishes — nobody published it.
+    published_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> PublishedTemplate:
+        document = d.get("document")
+        template = d.get("template")
+        published = d.get("published_at")
+        return cls(
+            ref=_text(d.get("ref")),
+            doc_digest=_text(d.get("doc_digest")),
+            document=dict(document) if isinstance(document, Mapping) else {},
+            template=Template.from_api(template if isinstance(template, Mapping) else {}),
+            versions=_texts(d.get("versions")),
+            # None stays None rather than becoming "": a shipped template was
+            # not published by anybody, and an empty timestamp reads as one that
+            # is known and blank rather than one that does not apply.
+            published_at=None if published is None else _text(published),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class TemplateCheck:
+    """What ``validate()`` said about a document.
+
+    Both outcomes are a 200 — an invalid document is an answer to the question,
+    not a failed request — so nothing here raises for :attr:`valid` being False.
+    That is the point of validating: :attr:`problems` lists EVERY problem at
+    once, where publishing reports the first thing that stops it.
+    """
+
+    valid: bool
+    #: Every problem with the document, not just the first. Empty when valid.
+    problems: builtins.list[str]
+    #: The ref the document claims, once it parsed far enough to have one.
+    ref: str | None
+    #: ``sha256:…`` of the whole document. Changes with any edit, a label included.
+    doc_digest: str | None
+    #: ``sha256:…`` of only what decides the IMAGE.
+    #:
+    #: A new label or a version bump leaves it alone, so comparing it against a
+    #: previous run is how you tell whether an edit means a rebuild. ``None``
+    #: for a document naming a parent in ``spec.from``, which cannot be computed
+    #: without the parent's.
+    build_digest: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> TemplateCheck:
+        def maybe(key: str) -> str | None:
+            value = d.get(key)
+            return None if value is None else _text(value)
+
+        return cls(
+            valid=_wire(d, "valid") is _Wire.TRUE,
+            problems=_texts(d.get("problems")),
+            ref=maybe("ref"),
+            doc_digest=maybe("doc_digest"),
+            build_digest=maybe("build_digest"),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class RetiredTemplates:
+    """What a retire took away, from ``retire()``.
+
+    Not a :class:`PublishedTemplate` with a flag on it: the document is gone, so
+    there is nothing of that shape left to answer with.
+
+    WHAT A RETIRE COSTS is worth knowing before calling it. It breaks
+    RESOLUTION and nothing else — a computer is built from the image the ref
+    resolved to and holds no reference to the document, so anything already
+    running, stopped or suspended is untouched. What it does not give back is
+    the NAME: a retired ref is refused for ever, identical bytes included, and
+    :attr:`refs_claimed` does not go down.
+    """
+
+    #: The refs that went, newest version first. Never empty — an empty retire
+    #: is a 404.
+    retired: builtins.list[str]
+    #: One value: everything in :attr:`retired` went in the same write.
+    retired_at: str
+    #: The versions of this name still published, newest first. Empty means the
+    #: name is gone.
+    versions: builtins.list[str]
+    #: How many templates the account holds now — the number the per-account
+    #: ceiling is against.
+    templates: int
+    #: How many refs this account has ever claimed, live and retired together.
+    #:
+    #: It does NOT go down when you retire, and there is a much larger ceiling
+    #: on it than on :attr:`templates`. The two move differently, and somebody
+    #: watching only the first would conclude that retiring is free.
+    refs_claimed: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> RetiredTemplates:
+        return cls(
+            retired=_texts(d.get("retired")),
+            retired_at=_text(d.get("retired_at")),
+            versions=_texts(d.get("versions")),
+            templates=_num(d.get("templates")),
+            refs_claimed=_num(d.get("refs_claimed")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class TemplateBuild:
+    """Compiling a document into an image (platform OPL-3791).
+
+    Not to be confused with a computer's disk copy, which the platform also
+    calls a build. This one is minutes long: ``start()`` answers immediately
+    with a job, and ``wait()`` is what watches it.
+    """
+
+    #: ``bld-a1b2c3d4e5f6``-shaped.
+    id: str
+    #: The document this was built from, as ``namespace/name@version``.
+    ref: str
+    #: ``running``, ``succeeded`` or ``failed``.
+    status: str
+    #: Why it failed, when it did. For a failing ``run:`` step, the end of that
+    #: step's own output.
+    error: str
+    started_at: str
+    #: ``None`` while it is still running.
+    finished_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> TemplateBuild:
+        finished = d.get("finished_at")
+        return cls(
+            id=_text(d.get("id")),
+            ref=_text(d.get("ref")),
+            status=_text(d.get("status")),
+            error=_text(d.get("error")),
+            started_at=_text(d.get("started_at")),
+            finished_at=None if finished is None else _text(finished),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class BuildStep:
+    """One step of a build, in the order the document declares them."""
+
+    #: Its position, 1-based.
+    n: int
+    #: ``apt``, ``run``, ``file``, ``mkdir``, ``env``, or ``finish`` for the
+    #: cleanup every build ends with.
+    kind: str
+    #: What the step does, from the document — the packages, the path, or the
+    #: first real line of the script.
+    label: str
+    #: ``pending``, ``running``, ``done``, ``failed``, or ``skipped`` for one an
+    #: earlier failure meant we never reached.
+    status: str
+    started_at: str | None
+    finished_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> BuildStep:
+        started, finished = d.get("started_at"), d.get("finished_at")
+        return cls(
+            n=_num(d.get("n")),
+            kind=_text(d.get("kind")),
+            label=_text(d.get("label")),
+            status=_text(d.get("status")),
+            started_at=None if started is None else _text(started),
+            finished_at=None if finished is None else _text(finished),
+            raw=dict(d),
+        )
+
+
+#: What a build stops on. ``running`` is the only other status the platform
+#: sends. Here rather than in _resources, so the field and everything that reads
+#: it cannot drift apart — they have twice.
+BUILD_TERMINAL = ("succeeded", "failed")
+
+
+def _build_done(d: Mapping[str, Any]) -> bool:
+    """Whether a build record says the build is OVER.
+
+    A RECOGNISED ``done`` is authoritative; anything else falls through to the
+    status. The order is the platform's own: ``done`` is derived from the JOB,
+    where the status is derived from a phase read out of a log the document's
+    own steps write into.
+
+    On the FIELD rather than beside it, and that is the correction (adversarial
+    review, OPL-3835). This rule lived in ``build_ended`` in _resources while
+    ``BuildProgress.done`` decoded the key alone, so ``{"status": "succeeded",
+    "done": null}`` made ``wait()`` return an object whose own documented
+    "whether to stop polling" field said False. Two spellings of one question
+    drifted apart twice; now there is one.
+    """
+    said = _wire(d, "done")
+    if said in (_Wire.TRUE, _Wire.FALSE):
+        return said is _Wire.TRUE
+    return _text(d.get("status")) in BUILD_TERMINAL
+
+
+@dataclass(frozen=True)
+class BuildProgress:
+    """What a build is DOING, as against what became of it (platform OPL-3794).
+
+    A build is minutes long — most of it spent copying a multi-gigabyte base
+    image and then running the document's steps — so this says which step of how
+    many is running, and which one failed. It stays readable after the build has
+    finished, so a program that was not attached at the time can still see where
+    it stopped.
+    """
+
+    id: str
+    #: The job's own status, restated so one poll answers both questions.
+    status: str
+    #: Whether to stop polling.
+    #:
+    #: Derived from :attr:`status` and not from :attr:`phase`: a phase is read
+    #: out of the build's log, which the document's own ``run:`` steps write
+    #: into, and only the job decides whether a build worked.
+    done: bool
+    #: ``planning``, ``staging``, ``copying``, ``building``, ``publishing``, and
+    #: then ``published``, ``reused`` or ``failed``.
+    #:
+    #: ``unknown`` means the build finished without keeping a step-by-step
+    #: record — every build from before the endpoint existed is one. It is not
+    #: reported as ``published`` because a build that REUSED an existing image
+    #: succeeds too, and that distinction lived in the record that is missing.
+    #: :attr:`status` is still the answer.
+    phase: str
+    #: Which step is running, 1-based, or the one that failed. ``0`` before the
+    #: first.
+    step: int
+    #: How many steps there are.
+    of: int
+    #: Every step, in order, whatever its status — so the whole list renders
+    #: from the first read.
+    steps: builtins.list[BuildStep]
+    #: One line about the phase, or why a failed build failed.
+    note: str
+    #: Why it failed, when it did. The same value ``get()`` gives.
+    error: str
+    #: When the build last MOVED, and not when this was last read — a build
+    #: whose steps have stopped advancing is one whose ``updated_at`` stops.
+    updated_at: str
+    #: True only where the fleet could not recognise its own build tool's
+    #: output, so the per-step position is unavailable. The build itself is
+    #: unaffected and :attr:`status` is still the answer.
+    unmatched: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> BuildProgress:
+        rows = d.get("steps")
+        rows = rows if isinstance(rows, builtins.list) else []
+        return cls(
+            id=_text(d.get("id")),
+            status=_text(d.get("status")),
+            done=_build_done(d),
+            phase=_text(d.get("phase")),
+            step=_num(d.get("step")),
+            of=_num(d.get("of")),
+            steps=[BuildStep.from_api(r) for r in rows if isinstance(r, Mapping)],
+            note=_text(d.get("note")),
+            error=_text(d.get("error")),
+            updated_at=_text(d.get("updated_at")),
+            unmatched=_wire(d, "unmatched") in (_Wire.TRUE, _Wire.MALFORMED),
             raw=dict(d),
         )
 
@@ -358,7 +812,7 @@ class Size:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=bool(d.get("allowed", False)),
+            allowed=_wire(d, "allowed") is _Wire.TRUE,
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -452,11 +906,25 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=bool(d.get("incremental", False)),
-            auto=bool(d.get("auto", False)),
+            incremental=_wire(d, "incremental") is _Wire.TRUE,
+            auto=_wire(d, "auto") is _Wire.TRUE,
             computer_name=_text(d.get("computer_name")),
-            orphaned=bool(d.get("orphaned", False)),
-            unreachable=bool(d.get("unreachable", False)),
+            orphaned=_wire(d, "orphaned") is _Wire.TRUE,
+            # The same reading `is_unreachable_stub` uses, and it did not match:
+            # the filter kept a row whose flag was null or unreadable and then
+            # this decoded it False, so a caller told to check `unreachable`
+            # before believing anything else read a placeholder — empty
+            # computer_id, empty state, zero bytes — as a real snapshot, and
+            # summed it into a total or passed its id to a delete
+            # (/code-review, OPL-3835). Row shape decides an unreadable flag
+            # here too: only a row that could not be anything but a stub.
+            unreachable=(
+                _wire(d, "unreachable") is _Wire.TRUE
+                or (
+                    _wire(d, "unreachable") in (_Wire.NULL, _Wire.MALFORMED)
+                    and is_unreachable_stub(d)
+                )
+            ),
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
@@ -586,7 +1054,7 @@ class ComputerUsage:
             run_hours=_real(d.get("run_hours")),
             vcpu_hours=_real(d.get("vcpu_hours")),
             ram_gb_hours=_real(d.get("ram_gb_hours")),
-            gone=bool(d.get("gone", False)),
+            gone=_wire(d, "gone") is _Wire.TRUE,
         )
 
 
@@ -693,8 +1161,8 @@ class UsageReport:
             from_=_text(d.get("from")),
             to=_text(d.get("to")),
             usage=UsageTotals.from_api(totals),
-            degraded=bool(d.get("degraded", False)),
-            unmetered=bool(d.get("unmetered", False)),
+            degraded=_wire(d, "degraded") in (_Wire.TRUE, _Wire.MALFORMED),
+            unmetered=_wire(d, "unmetered") in (_Wire.TRUE, _Wire.MALFORMED),
             # Presence, not emptiness. The platform drops the key for a scoped
             # credential and sends ``[]`` for an account that ran nothing, and
             # those are different answers: one is "you may not see this", the
@@ -754,13 +1222,35 @@ class Move:
     finished_at: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
+    #: The states this model's own docstring calls live. Consulted ONLY when the
+    #: wire did not give a readable ``live`` — the flag stays the thing to poll
+    #: on, exactly as documented, and this is the fallback for a payload that
+    #: cannot answer.
+    LIVE_STATES = frozenset({"staging", "moving", "resizing"})
+
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Move:
+        state = _text(d.get("state"))
+        # `live` needs `state`, which is why this cannot be one decoder call
+        # (adversarial review, OPL-3835). Reading an unreadable `live` as False
+        # ended `wait_for_move` on a computer whose state said `moving`; reading
+        # it as True polled a FINISHED move to its deadline and raised. Neither
+        # is answerable without the other field.
+        #
+        # ABSENT defers with the rest, and the first version of this had it
+        # wrong: a host that omits the flag and says `state: "moving"` IS
+        # describing a live move, so returning False ended the wait on a disk
+        # still copying. Only a value the wire actually gave overrides the state.
+        said = _wire(d, "live")
+        if said in (_Wire.TRUE, _Wire.FALSE):
+            live = said is _Wire.TRUE
+        else:
+            live = state in cls.LIVE_STATES
         return cls(
             computer_id=_text(d.get("computer_id")),
-            state=_text(d.get("state")),
+            state=state,
             detail=_text(d.get("detail")),
-            live=bool(d.get("live")),
+            live=live,
             cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
             ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
             disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
@@ -808,7 +1298,7 @@ class Window:
             y=_num(d.get("y")),
             width=_num(d.get("width")),
             height=_num(d.get("height")),
-            focused=bool(d.get("focused", False)),
+            focused=_wire(d, "focused") is _Wire.TRUE,
             raw=dict(d),
         )
 
@@ -897,7 +1387,7 @@ class WindowResult:
         w = d.get("window")
         return cls(
             window=Window.from_api(w) if isinstance(w, Mapping) else None,
-            gone=bool(d.get("gone", False)),
+            gone=_wire(d, "gone") is _Wire.TRUE,
             raw=dict(d),
         )
 
@@ -939,16 +1429,79 @@ class ExecStatus:
     killed: bool
     started_at: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    #: Whether this came off the wire. Keyword-only, so it changes no existing
+    #: construction and stays out of ``__match_args__``.
+    #:
+    #: IN THE REPR as well as in ``==``, because it is the field most likely to
+    #: be the only difference between two statuses — it is exactly the
+    #: hand-built-versus-decoded discriminator — and hiding it left a failed
+    #: ``assert status == ExecStatus(...)`` printing two identical reprs with no
+    #: hint why (/code-review, OPL-3835).
+    #:
+    #: ``raw`` cannot answer it: ``from_api`` sets ``raw=dict(d)``, so a decoded
+    #: ``{}`` — a proxy hiccup, a daemon answering 200 with an empty object — is
+    #: indistinguishable from an object built by hand, and using its truthiness
+    #: let that payload declare a command finished with nothing exited, nothing
+    #: killed and no exit code (/code-review, OPL-3835). The escape hatch
+    #: reopened the very hole it was written beside.
+    #: IN ``==``, because it changes :attr:`done`. Excluded at first, which
+    #: made ``from_api({})`` compare equal to a hand-built status that reports
+    #: the opposite of it (adversarial review, OPL-3835) — two objects equal to
+    #: each other and behaviourally different is the wrong thing for an
+    #: expected-value assertion or a change check to be handed.
+    decoded: bool = field(default=False, kw_only=True)
 
     @property
     def done(self) -> bool:
         """True once the command has stopped, however it stopped.
 
-        Read with :attr:`more`, not instead of it: a command can exit with
+        Read with :attr:`drained`, not instead of it: a command can exit with
         output still queued, and a loop that stops at ``done`` alone drops
         whatever the last read did not reach.
+
+        AFFIRMATIVE EVIDENCE ONLY. ``exited``, ``killed``, or a ``running`` the
+        wire actually said was false. A ``running`` that is present and
+        unreadable decodes False like anything else this client cannot read, and
+        ``not running`` then declared a command finished on no evidence at all —
+        no exit code, nothing exited, nothing killed (adversarial review,
+        OPL-3835). It says nothing about whether the command stopped, so it is
+        not allowed to end the poll.
         """
-        return self.exited or not self.running
+        # ABSENT belongs with null and malformed and was left out (adversarial
+        # review, OPL-3835): a payload with no `running` at all decodes it False
+        # like anything else missing, and `not running` then ended the poll with
+        # nothing exited, nothing killed and no exit code. Only a `running` the
+        # wire actually said was FALSE is evidence of stopping.
+        #
+        # An object built directly rather than decoded has no payload to
+        # consult, and then its fields ARE the evidence: a caller who wrote
+        # `running=False` has said it stopped.
+        if self.decoded and _wire(self.raw, "running") is not _Wire.FALSE:
+            return self.exited or self.killed
+        return self.exited or self.killed or not self.running
+
+    @property
+    def output_uncertain(self) -> bool:
+        """The host sent a :attr:`more` this client could not read.
+
+        Its own field cannot carry this. ``more`` is TWO things to a polling
+        loop — the sleep switch and half the break condition — so neither value
+        is safe when it is unreadable: True spins with no delay, False breaks and
+        drops output that a consuming read can never fetch again. It reads False
+        so the loop sleeps, and this says why, so the loop can decline to stop.
+        """
+        return _wire(self.raw, "more") is _Wire.MALFORMED
+
+    @property
+    def drained(self) -> bool:
+        """Safe to stop reading: stopped, nothing queued, nothing unreadable.
+
+        What a polling loop actually wants, and the reason it is a property
+        rather than two conditions a caller has to remember to write. Spelled as
+        ``done and not more`` it silently dropped queued output whenever ``more``
+        could not be read (adversarial review, OPL-3835).
+        """
+        return self.done and not self.more and not self.output_uncertain
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ExecStatus:
@@ -956,17 +1509,18 @@ class ExecStatus:
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
-            running=bool(d.get("running", False)),
-            exited=bool(d.get("exited", False)),
+            running=_wire(d, "running") in (_Wire.TRUE, _Wire.MALFORMED),
+            exited=_wire(d, "exited") is _Wire.TRUE,
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
-            more=bool(d.get("more", False)),
-            killed=bool(d.get("killed", False)),
+            more=_wire(d, "more") is _Wire.TRUE,
+            killed=_wire(d, "killed") is _Wire.TRUE,
             started_at=_text(d.get("started_at")),
             raw=dict(d),
+            decoded=True,
         )
 
 
@@ -1025,8 +1579,8 @@ class ExecResult:
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
-            timed_out=bool(d.get("timed_out", False)),
-            out_truncated=bool(d.get("out_truncated", False)),
-            err_truncated=bool(d.get("err_truncated", False)),
+            timed_out=_wire(d, "timed_out") in (_Wire.TRUE, _Wire.MALFORMED),
+            out_truncated=_wire(d, "out_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
+            err_truncated=_wire(d, "err_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
             raw=dict(d),
         )

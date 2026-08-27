@@ -51,6 +51,9 @@ from ._models import (
     Window,
     WindowResult,
     _num,
+    _Wire,
+    _wire,
+    is_unreachable_stub,
 )
 
 __all__ = ["BackgroundCommand", "Computer"]
@@ -559,7 +562,22 @@ class ComputerFields:
         :attr:`status` reads ``""`` rather than anything true — check this
         before believing anything else here.
         """
-        return bool(self._data.get("unreachable", False))
+        # Row shape decides an unreadable flag, the same way it does for a
+        # snapshot stub (adversarial review, OPL-3835). A stub has an id and this
+        # and nothing else, so an empty `status` is what tells them apart: on a
+        # FULL payload an unreadable flag must not make a healthy computer report
+        # itself a placeholder and have callers stop believing valid data, and on
+        # a sparse one it must not report a reachable computer we never heard
+        # from.
+        said = _wire(self._data, "unreachable")
+        if said in (_Wire.TRUE, _Wire.FALSE):
+            return said is _Wire.TRUE
+        # Present and unreadable: believe it only on a row that could not be
+        # anything else. Key PRESENCE, not truthiness — a full payload carrying
+        # `"status": null` made every healthy computer report itself a
+        # placeholder, and callers told to check this "before believing anything
+        # else here" then stopped believing valid data (adversarial review).
+        return "status" not in self._data
 
     @property
     def vnc(self) -> VncConnect | None:
@@ -1292,7 +1310,7 @@ class Computer(ComputerFields):
             while True:
                 status = job.poll()
                 print(status.stdout, end="")
-                if status.done and not status.more:
+                if status.drained:
                     break
                 if not status.more:
                     time.sleep(2)
@@ -1607,7 +1625,7 @@ class Computer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or s.get("unreachable")
+            if s.get("computer_id") == self.id or is_unreachable_stub(s)
         ]
         return Listing.of(rows, incomplete)
 
