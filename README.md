@@ -234,7 +234,7 @@ Every response that *is* one computer carries the credentials and URLs to open
 its live desktop, so putting a screen on your own page costs no extra call:
 
 ```python
-c = client.computers.get(computer_id)
+c = client.computers.get("vm-0a1b2c3d4e5f")
 c.vnc.embed_url  # watch-only, drop straight into an <iframe>
 c.vnc.url  # full control: keyboard and pointer — not the clipboard
 c.vnc.view_url  # watch only — the platform drops input on this socket
@@ -265,6 +265,8 @@ selection at all.
 import base64
 
 got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
+
+text = "what you want on the clipboard"
 b64 = base64.b64encode(text.encode()).decode()
 c.exec(
     f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
@@ -360,6 +362,8 @@ host in the same region may be able to run it, and the computer can be moved
 there.
 
 ```python
+import mandala_computer as mc
+
 try:
     c.resize(ram_mb=32768)
 except mc.MoveRequiredError as e:
@@ -419,6 +423,8 @@ are the 1280×800 default, which is only what a computer that asked for nothing
 else renders at.
 
 ```python
+x, y = 640, 480
+
 c.move(x, y)
 c.click(x, y)
 c.right_click(x, y)
@@ -552,6 +558,8 @@ slower — and for anything slower than a few seconds, which is a lower bar —
 start it instead:
 
 ```python
+import time
+
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
 
 while True:
@@ -621,6 +629,10 @@ what to do, does it, and repeats, until the task is done or it runs out of
 steps. The point is that ten clicks stop being ten images in your context.
 
 ```python
+import os
+
+key = os.environ["ANTHROPIC_API_KEY"]  # your own; see below
+
 result = c.agent("Open the settings and turn on dark mode.", model_key=key)
 print(result.text)
 if not result.finished:
@@ -644,6 +656,8 @@ A run is minutes of clicking, so `agent_stream()` reports as it goes — somethi
 that says nothing until it is over cannot be told from a hang:
 
 ```python
+import mandala_computer as mc
+
 for event in c.agent_stream("Find the cheapest flight to Lisbon", model_key=key):
     match event:
         case mc.AgentStepEvent(step):
@@ -675,9 +689,11 @@ on a key the platform never meters, and the clicks are still on the desktop.
 `agent_stream()` hands the same record over as an `AgentFailed` event.
 
 ```python
+import mandala_computer as mc
+
 try:
     c.agent("Book the flight", model_key=key)
-except mandala_computer.MandalaError as e:
+except mc.MandalaError as e:
     if e.agent:
         print(f"{len(e.agent.steps)} steps, {e.agent.usage.input_tokens} tokens in")
 ```
@@ -731,6 +747,8 @@ to boot yet — starting, stopping, snapshotting or cloning it raises
 `ConflictError` until the copy lands.
 
 ```python
+snap = c.snapshot()
+
 c = client.snapshots.clone(snap.id)
 c.is_building  # True
 c.wait_until_built()  # minutes, for a large disk
@@ -991,6 +1009,8 @@ rather than a dead end.
 
 ```python
 c.download_file("/home/user/out.tar", "out.tar")  # 2 GB, a part at a time
+
+open_handle = open("out.tar", "wb")
 c.download_file("/home/user/out.tar", open_handle)  # or into anything writable
 
 tail = c.read_file_part("/var/log/build.log", offset=-4096)  # the last 4 KiB
@@ -1008,6 +1028,7 @@ asking — so the `FilePart` that comes back is the authority on what arrived an
 where to ask from next, never the numbers passed in:
 
 ```python
+path = "/home/user/out.tar"
 part = c.read_file_part(path, offset=0, length=1 << 20)
 part.data  # the bytes
 part.offset  # where they start in the file
@@ -1157,9 +1178,11 @@ stays silent past its boot window stops being a conflict and becomes a 502
 `APIError`, which is the platform saying the agent is broken rather than late.
 
 ```python
+import mandala_computer as mc
+
 try:
     c.snapshot()
-except mandala_computer.ConflictError:
+except mc.ConflictError:
     c.wait_until_built()  # or just try again shortly
     c.snapshot()
 ```

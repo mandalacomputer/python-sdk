@@ -18,9 +18,12 @@ one does the same thing with them.
 
 from __future__ import annotations
 
+import ast
+import builtins
 import inspect
 import json
 import pathlib
+import re
 import time
 from unittest import mock
 
@@ -1614,11 +1617,77 @@ def test_a_full_computer_row_is_not_a_placeholder_because_a_field_was_null(
     assert mc.Computer(client._t, {"id": "vm-1", "status": "running"}).unreachable is False
 
 
-def test_the_readme_publishes_the_safe_poll_loop() -> None:
-    """The README carried the old two-line form for a commit after the docstring
-    was fixed, so a caller copying it still lost output (adversarial review)."""
-    readme = pathlib.Path(mc.__file__).parent.parent.parent / "README.md"
+def _readme() -> pathlib.Path:
+    return pathlib.Path(mc.__file__).parent.parent.parent / "README.md"
+
+
+def _python_blocks(text: str) -> list[str]:
+    return re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+
+
+def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
+    """The README is the first thing anyone runs, and it did not run.
+
+    Two blocks called ``Path(...)`` with no ``pathlib`` import and used an
+    undefined ``namespace``; thirteen more read names nothing had bound —
+    missing ``import time``, ``import mandala_computer as mc``, and coordinates
+    and keys the prose described but no line assigned. Every one is a NameError
+    on paste (/code-review, OPL-3835).
+
+    Names carry FORWARD between blocks, because a reader working down the page
+    does too: a block may use ``c`` from the block that created it. What it may
+    not do is use something no earlier block ever defined.
+    """
+    readme = _readme()
     if not readme.exists():  # installed without the repo alongside
+        pytest.skip("README not next to the package")
+    blocks = _python_blocks(readme.read_text())
+    assert len(blocks) > 30, f"only found {len(blocks)} blocks; the fence regex has drifted"
+
+    defined = set(dir(builtins))
+    problems = []
+    for n, block in enumerate(blocks, 1):
+        try:
+            tree = ast.parse(block)
+        except SyntaxError as exc:
+            problems.append(f"block {n}: {exc}")
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                defined.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    defined.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.arg):
+                defined.add(node.arg)
+            elif (
+                isinstance(node, ast.ExceptHandler)
+                and node.name
+                or isinstance(node, ast.MatchAs)
+                and node.name
+                or isinstance(node, ast.MatchStar)
+                and node.name
+            ):
+                defined.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                defined.add(node.rest)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id not in defined
+            ):
+                problems.append(f"block {n}: undefined name {node.id!r}")
+    assert not problems, "\n".join(dict.fromkeys(problems))
+
+
+def test_the_readme_publishes_the_safe_poll_loop() -> None:
+    """It carried the old two-line form for a commit after the docstring was
+    fixed, so a caller copying it lost output on an unreadable ``more``."""
+    readme = _readme()
+    if not readme.exists():
         pytest.skip("README not next to the package")
     text = readme.read_text()
     assert "status.done and not status.more" not in text
@@ -1687,15 +1756,37 @@ def test_a_poll_cut_short_by_our_own_deadline_is_not_the_fleet_failing(
         calls["n"] += 1
         if calls["n"] == 1:
             return httpx.Response(200, json=RUNNING)
-        # A cap firing means the request spent the whole budget it was given,
-        # which is what tells it apart from a network failure arriving at once.
-        time.sleep(0.3)
+        # A cap firing means the request spent the budget it was given, which
+        # is what tells it apart from a network failure arriving at once. Well
+        # past it, not marginally: the first version slept 0.3s against a 0.35s
+        # budget and so passed alone and failed in the suite, which is a flaky
+        # test rather than a fact about the code.
+        time.sleep(0.5)
         raise httpx.ReadTimeout("cap fired", request=request)
 
     respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=one_good_then_slow)
     with pytest.raises(mc.TimeoutError) as caught:
-        client.builds.wait("bld-1", timeout=0.35, poll=0.01)
+        client.builds.wait("bld-1", timeout=0.3, poll=0.01)
     said = str(caught.value)
     assert "was still running" in said, said
     assert "could not be reached" not in said, said
     assert "phase copying" in said, "and it quotes what the last good poll saw"
+
+
+@respx.mock
+def test_a_timeout_that_arrives_instantly_IS_the_fleet_failing(client: mc.Client) -> None:
+    """The other side of the same rule, and why elapsed time is the signal.
+
+    A timeout that exhausted nothing is the network or the platform, not this
+    wait's clock, and must still be reported as a poll that did not answer. A
+    deadline check alone cannot tell the two apart — it was the first attempt at
+    this fix and it called both cases ours.
+    """
+
+    def instant(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("connection died", request=request)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=instant)
+    with pytest.raises(mc.TimeoutError) as caught:
+        client.builds.wait("bld-1", timeout=0.2, poll=0.01)
+    assert "could not be" in str(caught.value), str(caught.value)
