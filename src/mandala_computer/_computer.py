@@ -233,8 +233,14 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
     checked rather than assumed because the coordinates are still present and
     still zero in that case, which is indistinguishable from the corner of the
     screen — the exact wrong answer to give a caller about to move relative to it.
+
+    Read TRUE-only, through the classifier every other claim about the world
+    goes through (``valid``, ``allowed``, ``gone``, ``orphaned``). Raw truthiness
+    read a ``known`` of ``"false"`` — what a backend encoding its booleans as
+    strings sends — as a non-empty string and therefore as the pointer being
+    somewhere, and a flag nobody can read is not somebody saying where it is.
     """
-    if not res.get("known"):
+    if _wire(res, "known") is not _Wire.TRUE:
         return None
     x, y = res.get("x"), res.get("y")
     # known=true with a missing or unusable coordinate is the same as unknown:

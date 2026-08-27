@@ -723,6 +723,32 @@ def test_a_known_cursor_with_no_coordinates_is_unknown(client: mc.Client) -> Non
 
 
 @respx.mock
+@pytest.mark.parametrize("known", ["false", "False", "0", 0, None, "maybe", {}, [1]])
+def test_a_cursor_flag_that_does_not_read_as_true_is_unknown(
+    client: mc.Client, known: object
+) -> None:
+    """Anything but a readable true is nobody saying where the pointer is.
+
+    Raw truthiness read ``"false"`` — what a backend encoding its booleans as
+    strings sends — as a non-empty string and so as a placed pointer, and the
+    coordinates that come with it are the corner of the screen.
+    """
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        httpx.Response(200, json={"ok": True, "x": 0, "y": 0, "known": known})
+    )
+    assert _computer(client).cursor_position() is None
+
+
+@respx.mock
+@pytest.mark.parametrize("known", ["true", "True", "1", 1])
+def test_a_cursor_flag_spelled_any_readable_way_is_known(client: mc.Client, known: object) -> None:
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        httpx.Response(200, json={"ok": True, "x": 640, "y": 400, "known": known})
+    )
+    assert _computer(client).cursor_position() == (640, 400)
+
+
+@respx.mock
 def test_scroll_takes_all_four_directions_and_refuses_the_rest(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = _computer(client)
