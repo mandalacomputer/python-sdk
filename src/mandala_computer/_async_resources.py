@@ -2,19 +2,77 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import time
+from collections.abc import AsyncIterator, Mapping
+from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any
 
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import AsyncTransport
-from ._models import Listing, Move, Retention, Size, Snapshot, Template, UsageReport
-from ._resources import EPHEMERAL_DOC, warn_cleanup_failed
+from ._exceptions import MandalaError, TimeoutError
+from ._models import (
+    BuildProgress,
+    Listing,
+    Move,
+    PublishedTemplate,
+    Retention,
+    RetiredTemplates,
+    Size,
+    Snapshot,
+    Template,
+    TemplateBuild,
+    TemplateCheck,
+    UsageReport,
+)
+
+#: Every rewrite actually performed at import, as ``(sentence, occurrences)``.
+#: RECORDED rather than restated: the first version of this guard was a
+#: hand-maintained list beside the calls, and a third call added without a
+#: matching entry silently did nothing while the whole suite stayed green
+#: (adversarial review, OPL-3835). A list you have to remember to update is the
+#: same class of bug as the one it was written to catch.
+_REWRITES: list[tuple[str, int]] = []
+
+
+def _reworded(doc: str | None, old: str, new: str) -> str:
+    """One half's prose with one sentence rewritten for the other.
+
+    A bare ``str.replace`` on a docstring silently does nothing when the sync
+    wording changes, and the async doc is then wrong again with no test failing.
+    It is not hypothetical: the first ephemeral correction replaced strings the
+    doc did not contain and was dead code for a whole commit.
+
+    IT DOES NOT RAISE. A version of this asserted at import time, which turned a
+    one-word docstring edit into ``import mandala_computer`` failing outright —
+    a worse trade than the no-op it replaced, and one that would strand every
+    caller over a documentation change. What it does instead is RECORD what it
+    found, so a test can fail loudly while the package still imports.
+    """
+    text = doc or ""
+    _REWRITES.append((old, text.count(old)))
+    return text.replace(old, new, 1)
+
+
+from ._resources import (
+    EPHEMERAL_DOC,
+    Builds,
+    Templates,
+    _LastPoll,
+    _wait_timed_out,
+    check_wait_args,
+    classify_poll_failure,
+    is_transient,
+    retry_delay,
+    warn_cleanup_failed,
+)
+from ._sse import SSEEvent
 
 __all__ = [
+    "AsyncBuilds",
     "AsyncComputers",
     "AsyncMoves",
     "AsyncSizes",
@@ -126,7 +184,18 @@ class AsyncComputers:
         else:
             await computer.delete()
 
-    ephemeral.__doc__ = EPHEMERAL_DOC
+    # Rewriting the sentence that names the keyword, not appending a note to
+    # the end of it. The first attempt replaced strings the doc does not contain
+    # — there is no code example in it and its one mention is the backticked
+    # ``with`` — so the correction was dead code and the doc still taught the
+    # sync form (/code-review, OPL-3835). The note it did append was indented
+    # four spaces under a doc at column zero, which renders as a block quote.
+    ephemeral.__doc__ = _reworded(
+        EPHEMERAL_DOC,
+        "tying that to a ``with`` block",
+        "tying that to an ``async with`` block — and it is ``async with`` here, "
+        "since the plain form raises ``TypeError`` on an async context manager —",
+    )
 
 
 class AsyncSnapshots:
@@ -214,6 +283,177 @@ class AsyncTemplates:
     async def list(self) -> builtins.list[Template]:
         data = await self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
+
+    async def schema(self) -> Mapping[str, Any]:
+        return await self._t.json_object("GET", _api.TEMPLATE_SCHEMA)
+
+    async def validate(self, document: str) -> TemplateCheck:
+        data = await self._t.json_object(
+            "POST", _api.TEMPLATE_VALIDATE, content=_api.template_document(document)
+        )
+        return TemplateCheck.from_api(data)
+
+    async def publish(self, document: str) -> PublishedTemplate:
+        data = await self._t.json_object(
+            "POST", _api.TEMPLATES, content=_api.template_document(document)
+        )
+        return PublishedTemplate.from_api(data)
+
+    async def get(
+        self, namespace: str, name: str, *, version: str | None = None
+    ) -> PublishedTemplate:
+        data = await self._t.json_object(
+            "GET",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return PublishedTemplate.from_api(data)
+
+    async def retire(
+        self, namespace: str, name: str, *, version: str | None = None
+    ) -> RetiredTemplates:
+        data = await self._t.json_object(
+            "DELETE",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return RetiredTemplates.from_api(data)
+
+    # Taken from the sync twin rather than written again. These are long — the
+    # retire's alone is three paragraphs about what a retire does and does not
+    # cost — and two copies of a paragraph is two paragraphs to keep true. The
+    # parity test compares signatures; nothing compares prose, which is exactly
+    # why prose is the half that drifts.
+    schema.__doc__ = Templates.schema.__doc__
+    validate.__doc__ = Templates.validate.__doc__
+    publish.__doc__ = Templates.publish.__doc__
+    get.__doc__ = Templates.get.__doc__
+    retire.__doc__ = Templates.retire.__doc__
+
+
+class AsyncBuilds:
+    __doc__ = _reworded(Builds.__doc__, ":class:`Templates`", ":class:`AsyncTemplates`")
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def start(self, document: str, *, no_reuse: bool = False) -> TemplateBuild:
+        data = await self._t.json_object(
+            "POST",
+            _api.BUILDS,
+            content=_api.template_document(document),
+            params=_api.build_params(no_reuse),
+        )
+        return TemplateBuild.from_api(data)
+
+    async def list(self) -> builtins.list[TemplateBuild]:
+        data = await self._t.json_array("GET", _api.BUILDS)
+        return [TemplateBuild.from_api(b) for b in data]
+
+    async def get(self, build_id: str) -> TemplateBuild:
+        return TemplateBuild.from_api(await self._t.json_object("GET", _api.build(build_id)))
+
+    async def progress(self, build_id: str, *, timeout_cap: float | None = None) -> BuildProgress:
+        data = await self._t.json_object(
+            "GET", _api.build_action(build_id, "progress"), timeout_cap=timeout_cap
+        )
+        return BuildProgress.from_api(data)
+
+    async def events(self, build_id: str) -> AsyncIterator[BuildProgress]:
+        """The same record as :meth:`progress`, as an event stream.
+
+        :meth:`Builds.events` for what the stream carries and what an ``error``
+        event means; only the closing idiom differs, which is why this half does
+        not share that docstring (/code-review, OPL-3835). Copied verbatim it
+        told :class:`~mandala_computer.AsyncClient` callers to write ``with
+        closing(...)`` and ``for ... in`` over an ASYNC generator — a
+        ``TypeError`` from the loop and an ``AttributeError`` from
+        ``closing.__exit__``, which has no ``close`` to call.
+
+        TO STOP READING EARLY, CLOSE THE ITERATOR, with
+        :func:`contextlib.aclosing`. A bare ``break`` leaves this generator
+        suspended at its yield and the stream checked out, and an account holds
+        only eight at once::
+
+            async with aclosing(client.builds.events(build_id)) as stream:
+                async for progress in stream:
+                    if progress.step == 3:
+                        break
+        """
+        # aclosing rather than a bare `async for`, for the reasons the sync half
+        # gives: an implementation that does not refcount, and parity with
+        # `AsyncComputer.agent_stream`. It does NOT rescue a caller's `break` —
+        # this generator is then suspended at its yield and the `async with`
+        # never unwinds — and an earlier version of this comment claimed it did
+        # (/code-review, OPL-3835). The docstring above carries the requirement.
+        async with aclosing(self._t.sse("GET", _api.build_action(build_id, "events"))) as stream:
+            async for progress in self._events(build_id, stream):
+                yield progress
+
+    async def _events(
+        self, build_id: str, stream: AsyncIterator[SSEEvent]
+    ) -> AsyncIterator[BuildProgress]:
+        async for event in stream:
+            if event.event == "error":
+                raise MandalaError(_api.build_stream_failed(build_id, event.data))
+            if event.event not in ("progress", "done"):
+                continue
+            if not isinstance(event.data, Mapping):
+                if event.event == "done":
+                    raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
+                continue
+            progress = BuildProgress.from_api(event.data)
+            if event.event == "done" and not progress.done:
+                raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
+            yield progress
+            if event.event == "done":
+                return
+        raise MandalaError(_api.build_stream_truncated(build_id, malformed=False))
+
+    async def wait(
+        self, build_id: str, timeout: float = 1800.0, poll: float = 5.0
+    ) -> BuildProgress:
+        check_wait_args(timeout, poll)
+        deadline = time.monotonic() + timeout
+        last: BuildProgress | None = None
+        poll_state = _LastPoll.FAILED
+        while True:
+            # Reset every iteration, so a Retry-After raises THIS sleep and not
+            # every later one. Left assigned to `poll` it ratcheted: one 429 with
+            # Retry-After: 30 turned a five-second poll into a thirty-second one
+            # for the rest of the wait (/code-review, OPL-3835). The TypeScript
+            # twin keeps `pollMs` immutable for the same reason.
+            delay = poll
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
+            started = time.monotonic()
+            try:
+                last = await self.progress(build_id, timeout_cap=remaining)
+                poll_state = _LastPoll.ANSWERED
+                if last.done:
+                    return last
+            except MandalaError as err:
+                if not is_transient(err):
+                    raise
+                poll_state = classify_poll_failure(
+                    err, started, remaining, self._t.phase_ceiling(err)
+                )
+                delay = retry_delay(poll, err)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
+            # asyncio.sleep, not time.sleep: this is the one line where the two
+            # halves genuinely differ, and blocking the event loop for five
+            # seconds a poll across a fifteen-minute build is what the async
+            # client exists not to do.
+            await asyncio.sleep(min(delay, remaining))
+
+    start.__doc__ = Builds.start.__doc__
+    list.__doc__ = Builds.list.__doc__
+    get.__doc__ = Builds.get.__doc__
+    progress.__doc__ = Builds.progress.__doc__
+    wait.__doc__ = Builds.wait.__doc__
 
 
 class AsyncMoves:

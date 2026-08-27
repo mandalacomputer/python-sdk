@@ -61,6 +61,7 @@ from ._models import (
     SnapshotHoldings,
     Window,
     WindowResult,
+    is_unreachable_stub,
 )
 
 __all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
@@ -760,7 +761,7 @@ class AsyncComputer(ComputerFields):
             while True:
                 status = await job.poll()
                 print(status.stdout, end="")
-                if status.done and not status.more:
+                if status.drained:
                     break
                 if not status.more:
                     await asyncio.sleep(2)
@@ -1000,7 +1001,7 @@ class AsyncComputer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or s.get("unreachable")
+            if s.get("computer_id") == self.id or is_unreachable_stub(s)
         ]
         return Listing.of(rows, incomplete)
 
