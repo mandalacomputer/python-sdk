@@ -14,6 +14,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer._exceptions import _is_transient_for_poll
 
 BASE = "https://api.test/api/v1"
 
@@ -393,6 +394,119 @@ def test_a_connection_failure_has_a_class_the_predicates_can_name() -> None:
     assert isinstance(err, mc.MandalaError)
     assert isinstance(err, builtins.ConnectionError)
     assert mc.is_transient(err) is True
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("[Errno 61] Connection refused"),
+        httpx.ProxyError("the proxy refused"),
+        httpx.UnsupportedProtocol("no scheme"),
+    ],
+)
+def test_a_connect_failure_is_still_safe_to_replay_blind(
+    client: mc.Client, exc: httpx.RequestError
+) -> None:
+    """Nothing was written, so even a create may be replayed (OPL-3855).
+
+    httpx is what makes this decidable, and it is the friendliest of the three
+    transports for it: these classes name the connect phase outright, where the
+    TypeScript clients have to read undici's cause chain to find it.
+    """
+    respx.get(f"{BASE}/computers").mock(side_effect=exc)
+    with pytest.raises(mc.ConnectionError) as caught:
+        client.computers.list()
+    err = caught.value
+    assert not isinstance(err, mc.ConnectionInterruptedError)
+    assert mc.is_transient(err) is True
+    assert _is_transient_for_poll(err) is True
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadError("connection reset by peer"),
+        httpx.WriteError("broken pipe"),
+        httpx.RemoteProtocolError("server disconnected without sending a response"),
+        httpx.CloseError("the connection would not close"),
+    ],
+)
+def test_a_lost_response_is_not_a_request_that_never_left(
+    client: mc.Client, exc: httpx.RequestError
+) -> None:
+    """The hazard, as one test.
+
+    `computers.create()` reaches the platform, the platform builds the computer,
+    and the socket dies while the response is being read. Every one of these
+    used to be a plain ConnectionError, so `is_transient` said yes, a caller
+    replayed the create, and the account paid for two computers (OPL-3855).
+    """
+    respx.get(f"{BASE}/computers").mock(side_effect=exc)
+    with pytest.raises(mc.ConnectionInterruptedError) as caught:
+        client.computers.list()
+    err = caught.value
+    # Still a ConnectionError — and still Python's own — which is what makes the
+    # split non-breaking: existing handlers, and the poll predicate's floor, see
+    # no change.
+    assert isinstance(err, mc.ConnectionError)
+    assert isinstance(err, builtins.ConnectionError)
+    # The two predicates, disagreeing on purpose. A create must not be replayed
+    # blind; a read the wait helpers poll may be made again.
+    assert mc.is_transient(err) is False
+    assert _is_transient_for_poll(err) is True
+    # And the message says which of the two happened, since the old one told
+    # every reader the request had not completed.
+    assert "unknown rather than undone" in str(err)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectTimeout("the connect attempt timed out"),
+        httpx.PoolTimeout("no connection came free"),
+        httpx.ReadTimeout("the response never finished"),
+    ],
+)
+def test_a_timeout_reaches_the_class_that_was_already_cautious_about_it(
+    client: mc.Client, exc: httpx.TimeoutException
+) -> None:
+    """The question OPL-3855 asked about `TimeoutError`, answered: nothing to do.
+
+    Every `httpx.TimeoutException` is caught ahead of `RequestError` and becomes
+    :class:`TimeoutError`, which was already fatal to :func:`is_transient` and
+    already polled through — the same pair of answers
+    :class:`ConnectionInterruptedError` now gets. So a timeout was never the
+    hole; the hole was the failures that arrived as a bare
+    :class:`ConnectionError`.
+
+    This is over-cautious for a `ConnectTimeout`, where nothing was in fact
+    dispatched, and that is left alone deliberately. It is the safe direction,
+    and it is what the other two clients now do as well — a timeout is
+    blind-replayable in none of the three.
+    """
+    respx.get(f"{BASE}/computers").mock(side_effect=exc)
+    with pytest.raises(mc.TimeoutError) as caught:
+        client.computers.list()
+    assert mc.is_transient(caught.value) is False
+    assert _is_transient_for_poll(caught.value) is True
+
+
+@respx.mock
+def test_an_unrecognised_transport_failure_is_not_called_a_connect_failure(
+    client: mc.Client,
+) -> None:
+    """The fail-closed half.
+
+    An httpx failure this SDK has no rule for — one added in a later version,
+    say — must be read as possibly dispatched, because the caller who pays for a
+    wrong answer here is application code replaying a create.
+    """
+    respx.get(f"{BASE}/computers").mock(side_effect=httpx.RequestError("something new"))
+    with pytest.raises(mc.ConnectionInterruptedError):
+        client.computers.list()
 
 
 @respx.mock
