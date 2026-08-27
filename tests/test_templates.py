@@ -2525,3 +2525,70 @@ async def test_the_async_stream_still_yields_a_record_that_agrees_with_itself(
     )
     seen = [p.status async for p in async_client.builds.events("bld-1")]
     assert seen == ["running", "succeeded"]
+
+
+@pytest.mark.parametrize(
+    ("status", "done", "contradicts"),
+    [
+        (["succeeded"], False, True),
+        (["succeeded"], False, False),
+        (123, False, True),
+        ({"v": "succeeded"}, False, True),
+        (None, False, True),
+        (True, False, True),
+    ],
+)
+def test_a_status_that_is_not_a_string_is_never_terminal(
+    status: object, done: bool, contradicts: bool
+) -> None:
+    """A coerced value cannot classify, and the TypeScript half proved it.
+
+    ``String(["succeeded"])`` is ``"succeeded"`` in JavaScript, so a status of
+    ``["succeeded"]`` read as terminal there. This SDK gives the right answer
+    for the same payload only because ``str(["succeeded"])`` happens to be
+    ``"['succeeded']"`` — an accident of formatting, not a rule (adversarial
+    review, OPL-3835). Both clients require a string now.
+    """
+    from mandala_computer._models import build_contradiction
+
+    payload: dict = {"id": "bld-1", "status": status}
+    if contradicts:
+        payload["done"] = True
+    progress = mc.BuildProgress.from_api(payload)
+    assert progress.done is done, payload
+    assert (build_contradiction(progress) is not None) is contradicts, payload
+
+
+def test_a_string_status_is_still_read_normally() -> None:
+    """The guard must not refuse the ordinary case."""
+    assert mc.BuildProgress.from_api({"status": "succeeded"}).done is True
+    assert mc.BuildProgress.from_api({"status": "failed", "done": True}).done is True
+    assert mc.BuildProgress.from_api({"status": "running"}).done is False
+
+
+def test_a_str_subclass_cannot_smuggle_a_terminal_status() -> None:
+    """The case that makes the explicit rule more than a restatement.
+
+    For any value JSON can carry, `_text(v) in BUILD_TERMINAL` and
+    `isinstance(v, str) and v in BUILD_TERMINAL` agree — which is why reverting
+    to the coercing form left the whole suite green. They part on a `str`
+    SUBCLASS whose `__str__` lies, which is the attack `canonical` in _api.py
+    already exists for: `_text` calls `str(value)` and takes the override,
+    while a membership test compares the underlying buffer.
+    """
+
+    class Liar(str):
+        def __str__(self) -> str:  # pragma: no cover - called by the old rule
+            return "succeeded"
+
+    from mandala_computer._models import _terminal_status
+
+    smuggled = Liar("still-running")
+    assert str(smuggled) == "succeeded", "the override is what the old rule read"
+    assert _terminal_status(smuggled) is False, "and the buffer is what decides"
+
+    progress = mc.BuildProgress.from_api({"id": "b", "status": smuggled, "done": True})
+    assert progress.done is False
+    from mandala_computer._models import build_contradiction
+
+    assert build_contradiction(progress) is not None

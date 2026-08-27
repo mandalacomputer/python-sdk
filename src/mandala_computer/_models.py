@@ -687,6 +687,19 @@ class BuildStep:
 BUILD_TERMINAL = ("succeeded", "failed")
 
 
+def _terminal_status(value: Any) -> bool:
+    """Whether the wire sent a status a build STOPS on.
+
+    Reads the RAW value and requires a string. This SDK is safe from the
+    coercion that caught the TypeScript one — ``str(["succeeded"])`` is
+    ``"['succeeded']"`` where ``String(["succeeded"])`` is ``"succeeded"``,
+    because a JavaScript array of one joins to its element — but it is safe by
+    accident of formatting rather than by rule (adversarial review, OPL-3835).
+    Accident is not agreement, so both clients say it outright.
+    """
+    return isinstance(value, str) and value in BUILD_TERMINAL
+
+
 def _build_done(d: Mapping[str, Any]) -> bool:
     """Whether a build record says the build is OVER.
 
@@ -711,10 +724,10 @@ def _build_done(d: Mapping[str, Any]) -> bool:
     """
     said = _wire(d, "done")
     if said is _Wire.TRUE:
-        return _text(d.get("status")) in BUILD_TERMINAL
+        return _terminal_status(d.get("status"))
     if said is _Wire.FALSE:
         return False
-    return _text(d.get("status")) in BUILD_TERMINAL
+    return _terminal_status(d.get("status"))
 
 
 def build_contradiction(progress: BuildProgress) -> str | None:
@@ -733,7 +746,9 @@ def build_contradiction(progress: BuildProgress) -> str | None:
     """
     if _wire(progress.raw, "done") is not _Wire.TRUE:
         return None
-    if progress.status in BUILD_TERMINAL:
+    # The RAW status, for the reason `_terminal_status` gives: `progress.status`
+    # has been through `_text` and a coerced value cannot classify.
+    if _terminal_status(progress.raw.get("status")):
         return None
     return (
         f"build {progress.id or '?'} reports done with status "
