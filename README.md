@@ -190,8 +190,13 @@ and says so. An account may hold eight streams open at once.
 
 **A build that declares its own family is not launchable yet.** The fleet does
 not advertise a family it built rather than shipped, so a create naming such a
-ref is still refused with a `503`. Publishing the document is worth doing anyway
-— it claims the ref, and it is what `builds.start()` takes.
+ref is refused with a `400` — a bare `APIError`, and a permanent answer: the
+message says in words that retrying the create changes nothing and that what
+would change it is publishing a new version. Deliberately not a `503`, which
+arrives as `UnavailableError` and reads to a retry loop as an answer worth
+waiting for. A `503` on this path still means the case that does come good: a
+shipped family whose only holder is unreachable. Publishing the document is
+worth doing anyway — it claims the ref, and it is what `builds.start()` takes.
 
 Everything here has an async twin: `await client.templates.publish(doc)`,
 `await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
