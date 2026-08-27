@@ -2493,3 +2493,35 @@ def test_an_older_host_that_omits_done_still_ends_the_wait(client: mc.Client) ->
         return_value=httpx.Response(200, json={"id": "bld-1", "status": "succeeded"})
     )
     assert client.builds.wait("bld-1", timeout=5, poll=0).status == "succeeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_stream_refuses_a_contradictory_record_too(
+    async_client: mc.AsyncClient,
+) -> None:
+    """The sync stream was covered and this one was not.
+
+    Disabling only the async guard left the entire suite green (adversarial
+    review, OPL-3835) — the same half-covered shape this branch has produced
+    repeatedly. A valid ``done`` follows the contradictory ``progress`` so the
+    test cannot pass merely because the stream truncates afterwards.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", {**RUNNING, "done": True}), ("done", DONE))
+    )
+    with pytest.raises(mc.MandalaError, match="contradicts itself"):
+        [p async for p in async_client.builds.events("bld-1")]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_stream_still_yields_a_record_that_agrees_with_itself(
+    async_client: mc.AsyncClient,
+) -> None:
+    """The other half, so the test above cannot pass by refusing everything."""
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", DONE))
+    )
+    seen = [p.status async for p in async_client.builds.events("bld-1")]
+    assert seen == ["running", "succeeded"]
