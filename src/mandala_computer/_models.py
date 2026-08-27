@@ -896,7 +896,21 @@ class Snapshot:
             auto=_wire(d, "auto") is _Wire.TRUE,
             computer_name=_text(d.get("computer_name")),
             orphaned=_wire(d, "orphaned") is _Wire.TRUE,
-            unreachable=_wire(d, "unreachable") is _Wire.TRUE,
+            # The same reading `is_unreachable_stub` uses, and it did not match:
+            # the filter kept a row whose flag was null or unreadable and then
+            # this decoded it False, so a caller told to check `unreachable`
+            # before believing anything else read a placeholder — empty
+            # computer_id, empty state, zero bytes — as a real snapshot, and
+            # summed it into a total or passed its id to a delete
+            # (/code-review, OPL-3835). Row shape decides an unreadable flag
+            # here too: only a row that could not be anything but a stub.
+            unreachable=(
+                _wire(d, "unreachable") is _Wire.TRUE
+                or (
+                    _wire(d, "unreachable") in (_Wire.NULL, _Wire.MALFORMED)
+                    and is_unreachable_stub(d)
+                )
+            ),
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),

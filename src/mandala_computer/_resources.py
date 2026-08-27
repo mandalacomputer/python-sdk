@@ -7,7 +7,7 @@ import math
 import time
 import warnings
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 from typing import Any
 
@@ -37,6 +37,7 @@ from ._models import (
     TemplateCheck,
     UsageReport,
 )
+from ._sse import SSEEvent
 
 __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
 
@@ -166,6 +167,26 @@ def check_wait_args(timeout: float, poll: float) -> None:
 #: The least a wait will sleep after a 429, when `poll` and ``Retry-After``
 #: both fail to supply one. See :func:`retry_delay`.
 RATE_LIMITED_FLOOR = 1.0
+
+
+def _cut_short_by_our_own_cap(err: BaseException, started: float, budget: float) -> bool:
+    """Whether a failed poll ran out of OUR time rather than the platform's.
+
+    ``wait`` caps each poll at what is left of its deadline, so near the end a
+    perfectly healthy request gets cut off mid-flight. Counting that as a poll
+    the fleet failed to answer made a wait whose every poll succeeded report
+    "could not be reached for the last part of 30s" — a claim about the platform
+    made from this client's own clock (/code-review, OPL-3835). The TypeScript
+    twin skips the same case by name.
+
+    Measured by ELAPSED TIME against the budget the poll was given, not by
+    whether the deadline has since passed: a timeout that arrives instantly did
+    not exhaust anything and really is the platform or the network failing, and
+    a deadline check alone cannot tell the two apart.
+    """
+    if not isinstance(err, TimeoutError):
+        return False
+    return time.monotonic() - started >= budget * 0.9
 
 
 def retry_delay(poll: float, err: BaseException) -> float:
@@ -658,7 +679,19 @@ class Builds:
         stream and raises rather than ending the iteration. See
         :attr:`~mandala_computer.BuildProgress.done`.
         """
-        for event in self._t.sse("GET", _api.build_action(build_id, "events")):
+        # Closed explicitly, the way `Computer.agent_stream` closes its own
+        # stream and for the same reason (/code-review, OPL-3835). Every exit
+        # from this loop abandons the inner generator rather than finishing it:
+        # the NORMAL one is a `return` on the done event, and the three failures
+        # are raises. Left bare, the `with self._http.stream(...)` inside
+        # Transport.sse unwinds whenever the collector reaches it, and an
+        # account may hold only eight of these open at once — the ninth is a
+        # RateLimitError. A leaked stream costs a real slot.
+        with closing(self._t.sse("GET", _api.build_action(build_id, "events"))) as stream:
+            yield from self._events(build_id, stream)
+
+    def _events(self, build_id: str, stream: Iterator[SSEEvent]) -> Iterator[BuildProgress]:
+        for event in stream:
             if event.event == "error":
                 raise MandalaError(_api.build_stream_failed(build_id, event.data))
             if event.event not in ("progress", "done"):
@@ -729,6 +762,7 @@ class Builds:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+            started = time.monotonic()
             try:
                 # The poll carries what is left of the wait, not the client's own
                 # timeout. Without the cap a ``wait(timeout=1)`` could sit in one
@@ -752,7 +786,16 @@ class Builds:
                 # not what this comment used to claim.
                 if not is_transient(err):
                     raise
-                observed = False
+                # `observed` says whether the MOST RECENT poll answered, and a
+                # poll cut short by this wait's OWN cap did not fail to answer —
+                # it was never given time to (/code-review, OPL-3835). Counting
+                # it as a failure made a wait whose every poll succeeded report
+                # "could not be reached for the last part of 30s" instead of
+                # "was still running (phase X, step N of M)": a claim the fleet
+                # stopped answering, when only this clock ran out. The
+                # TypeScript twin skips the same case by name.
+                if not _cut_short_by_our_own_cap(err, started, remaining):
+                    observed = False
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:

@@ -1282,7 +1282,7 @@ def test_force_stop_still_takes_real_bools() -> None:
         ),
         (mc.UsageReport, "degraded", True, "a total that may be short must not read as complete"),
         (mc.UsageReport, "unmetered", True, "the other half of the same caveat, named with it"),
-        (mc.Snapshot, "unreachable", False, "True throws away every other field on a full row"),
+        (mc.Snapshot, "unreachable", True, "a bare row with no computer_id can only be a stub"),
         (
             mc.Snapshot,
             "orphaned",
@@ -1623,3 +1623,79 @@ def test_the_readme_publishes_the_safe_poll_loop() -> None:
     text = readme.read_text()
     assert "status.done and not status.more" not in text
     assert "status.drained" in text
+
+
+@respx.mock
+def test_breaking_out_of_events_closes_the_stream(client: mc.Client) -> None:
+    """Every exit from that loop abandons the inner generator — the NORMAL one
+    is a `return` on the done event — so without `closing` the streamed response
+    unwound whenever the collector got to it. An account holds eight of these at
+    once and the ninth is a RateLimitError, so a leak costs a real slot."""
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("progress", RUNNING), ("done", DONE))
+    )
+    closed: list[str] = []
+    real = mc._client.Transport.sse
+
+    def tracking(self, method, path, **kw):
+        gen = real(self, method, path, **kw)
+        try:
+            yield from gen
+        finally:
+            closed.append(path)
+
+    with mock.patch.object(mc._client.Transport, "sse", tracking):
+        for _ in client.builds.events("bld-1"):
+            break  # the early exit the docstring warns about
+    assert closed, "the stream was abandoned rather than closed"
+
+
+@respx.mock
+def test_events_closes_the_stream_on_the_normal_done_path(client: mc.Client) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", DONE))
+    )
+    closed: list[str] = []
+    real = mc._client.Transport.sse
+
+    def tracking(self, method, path, **kw):
+        gen = real(self, method, path, **kw)
+        try:
+            yield from gen
+        finally:
+            closed.append(path)
+
+    with mock.patch.object(mc._client.Transport, "sse", tracking):
+        assert len(list(client.builds.events("bld-1"))) == 2
+    assert closed
+
+
+@respx.mock
+def test_a_poll_cut_short_by_our_own_deadline_is_not_the_fleet_failing(
+    client: mc.Client,
+) -> None:
+    """`observed` says whether the MOST RECENT poll answered.
+
+    A poll the wait's own cap cut off did not fail to answer — it was never
+    given time to. Counting it as a failure made a wait whose every poll
+    succeeded report "could not be reached", a claim about the fleet made from
+    this client's own clock running out (/code-review, OPL-3835).
+    """
+    calls = {"n": 0}
+
+    def one_good_then_slow(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=RUNNING)
+        # A cap firing means the request spent the whole budget it was given,
+        # which is what tells it apart from a network failure arriving at once.
+        time.sleep(0.3)
+        raise httpx.ReadTimeout("cap fired", request=request)
+
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=one_good_then_slow)
+    with pytest.raises(mc.TimeoutError) as caught:
+        client.builds.wait("bld-1", timeout=0.35, poll=0.01)
+    said = str(caught.value)
+    assert "was still running" in said, said
+    assert "could not be reached" not in said, said
+    assert "phase copying" in said, "and it quotes what the last good poll saw"

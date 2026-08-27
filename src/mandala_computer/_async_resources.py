@@ -6,7 +6,7 @@ import asyncio
 import builtins
 import time
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -32,12 +32,14 @@ from ._resources import (
     EPHEMERAL_DOC,
     Builds,
     Templates,
+    _cut_short_by_our_own_cap,
     _wait_timed_out,
     check_wait_args,
     is_transient,
     retry_delay,
     warn_cleanup_failed,
 )
+from ._sse import SSEEvent
 
 __all__ = [
     "AsyncBuilds",
@@ -317,7 +319,19 @@ class AsyncBuilds:
         return BuildProgress.from_api(data)
 
     async def events(self, build_id: str) -> AsyncIterator[BuildProgress]:
-        async for event in self._t.sse("GET", _api.build_action(build_id, "events")):
+        # aclosing, not a bare `async for`: asyncio finalizes async generators
+        # lazily through its own hook, so a caller who breaks out of this and
+        # then `await client.aclose()`s can shut the transport down with the
+        # stream still checked out — the worse half of the same defect the sync
+        # side has (/code-review, OPL-3835).
+        async with aclosing(self._t.sse("GET", _api.build_action(build_id, "events"))) as stream:
+            async for progress in self._events(build_id, stream):
+                yield progress
+
+    async def _events(
+        self, build_id: str, stream: AsyncIterator[SSEEvent]
+    ) -> AsyncIterator[BuildProgress]:
+        async for event in stream:
             if event.event == "error":
                 raise MandalaError(_api.build_stream_failed(build_id, event.data))
             if event.event not in ("progress", "done"):
@@ -351,6 +365,7 @@ class AsyncBuilds:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
+            started = time.monotonic()
             try:
                 last = await self.progress(build_id, timeout_cap=remaining)
                 observed = True
@@ -359,7 +374,8 @@ class AsyncBuilds:
             except MandalaError as err:
                 if not is_transient(err):
                     raise
-                observed = False
+                if not _cut_short_by_our_own_cap(err, started, remaining):
+                    observed = False
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:

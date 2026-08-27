@@ -91,6 +91,8 @@ is layered onto, and the shape a computer gets when the create names no numbers.
 Publishing one gives it a ref you can launch by name.
 
 ```python
+from pathlib import Path
+
 doc = Path("devbox.yaml").read_text()
 
 # Worth doing while you iterate: this reports EVERY problem at once, and claims
@@ -118,6 +120,10 @@ Read one back — yours or `system`, so you can see what you are layering onto:
 
 ```python
 base = client.templates.get("system", "base")
+
+# Your namespace is your account id — the one `metadata.namespace` carries, and
+# the first half of any ref you published.
+namespace = t.ref.split("/", 1)[0]
 pinned = client.templates.get(namespace, "devbox", version="1.0.0")
 ```
 
