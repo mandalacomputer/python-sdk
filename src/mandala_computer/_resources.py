@@ -36,6 +36,8 @@ from ._models import (
     TemplateBuild,
     TemplateCheck,
     UsageReport,
+    _Wire,
+    _wire,
 )
 
 __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
@@ -136,21 +138,27 @@ def build_ended(progress: BuildProgress) -> bool:
     and a contradiction resolves in its favour; the status is the fallback for a
     host too old to send the flag, not a second opinion about a host that did.
 
-    It asks ``raw`` whether the key was THERE and then reads the decoded field,
-    rather than re-deciding what the payload meant. Testing ``raw`` for a real
-    ``bool`` was the same rule until :func:`_flag` learned to decode ``"true"``
-    and ``1``, at which point the two disagreed: ``{"status": "running",
-    "done": "true"}`` gave ``progress.done`` True while this returned False, so
-    a caller reading the field saw a finished build and ``wait()`` kept polling
-    to its deadline (/code-review, OPL-3835). One decoder, one answer.
+    A RECOGNISED value is authoritative; anything else falls through to the
+    status. Testing presence rather than recognition was the last version, and
+    it made ``{"status": "succeeded", "done": null}`` block the fallback — so
+    ``wait()`` ran to its half-hour deadline on a finished build and the stream
+    rejected its own final event as malformed (adversarial review, OPL-3835).
+
+    It reads ``raw`` rather than the decoded field because
+    :attr:`BuildProgress.done` is a ``bool`` and cannot say whether the platform
+    sent one. One classifier, so the field and this cannot disagree — they have
+    drifted apart twice.
 
     :meth:`Builds.wait` uses this too, and did not (second adversarial review,
     OPL-3835). ``events()`` accepting a terminal status without the flag while
     ``wait()`` returned only on ``last.done`` meant the same payload ended one
     and left the other polling until its deadline.
     """
-    if "done" in progress.raw:
-        return progress.done
+    said = _wire(progress.raw, "done")
+    if said is _Wire.TRUE:
+        return True
+    if said is _Wire.FALSE:
+        return False
     return progress.status in BUILD_TERMINAL
 
 

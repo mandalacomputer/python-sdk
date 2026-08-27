@@ -50,8 +50,9 @@ from ._models import (
     VncConnect,
     Window,
     WindowResult,
-    _flag,
     _num,
+    _Wire,
+    _wire,
 )
 
 __all__ = ["BackgroundCommand", "Computer"]
@@ -317,6 +318,28 @@ _FATAL_WHILE_WAITING = (
 )
 
 
+def _is_unreachable_stub(row: Mapping[str, Any]) -> bool:
+    """Whether a snapshot row is a placeholder for one nobody could read.
+
+    ROW SHAPE, not the flag alone, and that is why this is not a decoder call
+    (adversarial review, OPL-3835). ``unreachable`` means opposite things on the
+    two rows it can appear on: on a SPARSE row — an id and the flag, no
+    ``computer_id``, because there was no daemon to say which computer it
+    belonged to — it is the marker saying this listing is short, and dropping it
+    reports a confident count over an incomplete answer. On a FULL row belonging
+    to another computer, admitting it on an unreadable flag hands back somebody
+    else's snapshots from a method read before an irreversible delete.
+
+    So an unreadable flag is believed only where the row could not be anything
+    else, and the two failures a single fallback boolean had to choose between
+    both go away.
+    """
+    if row.get("computer_id"):
+        return False
+    said = _wire(row, "unreachable")
+    return said is _Wire.TRUE or said in (_Wire.NULL, _Wire.MALFORMED)
+
+
 class ComputerFields:
     """Read-only accessors over a computer payload.
 
@@ -560,10 +583,17 @@ class ComputerFields:
         :attr:`status` reads ``""`` rather than anything true — check this
         before believing anything else here.
         """
-        # The same decoder the models use, not `bool()`: this is the flag whose
-        # own docstring says to check it before believing anything else on the
-        # row, and `bool("false")` read it backwards (/code-review, OPL-3835).
-        return _flag(self._data, "unreachable")
+        # Row shape decides an unreadable flag, the same way it does for a
+        # snapshot stub (adversarial review, OPL-3835). A stub has an id and this
+        # and nothing else, so an empty `status` is what tells them apart: on a
+        # FULL payload an unreadable flag must not make a healthy computer report
+        # itself a placeholder and have callers stop believing valid data, and on
+        # a sparse one it must not report a reachable computer we never heard
+        # from.
+        said = _wire(self._data, "unreachable")
+        if said is _Wire.MALFORMED:
+            return not self._data.get("status")
+        return said is _Wire.TRUE
 
     @property
     def vnc(self) -> VncConnect | None:
@@ -1296,7 +1326,7 @@ class Computer(ComputerFields):
             while True:
                 status = job.poll()
                 print(status.stdout, end="")
-                if status.done and not status.more:
+                if status.drained:
                     break
                 if not status.more:
                     time.sleep(2)
@@ -1611,7 +1641,7 @@ class Computer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or _flag(s, "unreachable")
+            if s.get("computer_id") == self.id or _is_unreachable_stub(s)
         ]
         return Listing.of(rows, incomplete)
 

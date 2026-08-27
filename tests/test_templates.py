@@ -18,6 +18,7 @@ one does the same thing with them.
 
 from __future__ import annotations
 
+import inspect
 import json
 import pathlib
 import time
@@ -978,23 +979,35 @@ def test_the_unambiguous_encodings_are_decoded_not_refused(wire: object, expecte
     assert mc.TemplateCheck.from_api({"valid": wire}).valid is expected
 
 
-def test_null_reads_false_with_absent_because_this_api_means_not_applicable() -> None:
-    """Two reviews disagreed about ``null`` and the codebase settles it.
+def test_live_is_decided_with_the_state_when_the_wire_cannot_say() -> None:
+    """The field two reviews disagreed about, and neither answer was available
+    to a decoder looking at one key.
 
-    ``cpu``, ``ram_mb``, ``disk_gb``, ``finished_at`` and ``exit_code`` all use
-    ``null`` for NOT APPLICABLE, so ``live: null`` on a finished move means not
-    live. Reading it as "the host cannot tell" made ``wait_for_move`` poll a
-    finished move for its full fifteen minutes and then raise, and made
-    ``timed_out: null`` burn ``wait_for_guest``'s three minutes on a guest that
-    answered on the first probe (/code-review, OPL-3835).
+    Reading an unreadable or null ``live`` as False ended ``wait_for_move`` on a
+    computer whose own state said ``moving``; reading it as True polled a
+    FINISHED move to its deadline and then raised. Both are answerable, but only
+    with ``state`` — which is why this is not one decoder call.
     """
-    assert mc.Move.from_api({}).live is False, "absent: an older host"
-    assert mc.Move.from_api({"live": None}).live is False, "null: not applicable"
-    assert mc.Move.from_api({"live": "maybe"}).live is True, "unreadable: the cautious answer"
-    assert mc.Move.from_api({"live": False}).live is False, "a real boolean is itself"
+    # A readable flag is the flag. It stays the thing to poll on.
+    assert mc.Move.from_api({"state": "moving", "live": False}).live is False
+    assert mc.Move.from_api({"state": "done", "live": True}).live is True
 
+    # Null and malformed defer to the state.
+    for unreadable in (None, "maybe", {}):
+        assert mc.Move.from_api({"state": "moving", "live": unreadable}).live is True
+        assert mc.Move.from_api({"state": "resizing", "live": unreadable}).live is True
+        assert mc.Move.from_api({"state": "done", "live": unreadable}).live is False
+        assert mc.Move.from_api({"state": "failed", "live": unreadable}).live is False
+
+    # Absent is an older host that never sent the flag, not a live move.
+    assert mc.Move.from_api({"state": "moving"}).live is False
+
+
+def test_null_is_not_applicable_in_this_api() -> None:
+    """``cpu``, ``ram_mb``, ``disk_gb``, ``finished_at`` and ``exit_code`` all use
+    ``null`` that way, which is what settles it."""
     assert mc.ExecResult.from_api({"exit_code": 0, "timed_out": None}).ok is True
-    assert mc.Move.from_api({"state": "done", "live": None}).live is False
+    assert mc.BuildProgress.from_api({"done": None}).done is False
 
 
 def test_real_booleans_still_decode() -> None:
@@ -1237,7 +1250,6 @@ def test_force_stop_still_takes_real_bools() -> None:
 @pytest.mark.parametrize(
     ("model", "field", "cautious", "steers"),
     [
-        (mc.Move, "live", True, "wait_for_move would hand back a mid-migration computer"),
         (mc.ExecStatus, "running", True, "ExecStatus.done would end a poll on a live command"),
         (
             mc.ExecStatus,
@@ -1298,7 +1310,7 @@ def _run_documented_poll_loop(statuses: list[mc.ExecStatus], limit: int = 6) -> 
     reads = sleeps = 0
     for status in statuses[:limit]:
         reads += 1
-        if status.done and not status.more:
+        if status.drained:
             return {"reads": reads, "sleeps": sleeps, "broke": 1}
         if not status.more:
             sleeps += 1
@@ -1306,40 +1318,74 @@ def _run_documented_poll_loop(statuses: list[mc.ExecStatus], limit: int = 6) -> 
 
 
 def test_a_finished_command_lets_the_documented_loop_break() -> None:
-    """``more`` cautious-True made this loop neither break nor sleep: an
-    unbounded zero-delay loop against a metered endpoint on a command that had
-    already finished (/code-review, OPL-3835)."""
     finished = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": False})
+    assert finished.drained is True
     assert _run_documented_poll_loop([finished] * 6) == {"reads": 1, "sleeps": 0, "broke": 1}
 
 
+def test_a_finished_command_with_an_UNREADABLE_more_does_not_drop_its_tail() -> None:
+    """The output-loss case, which the previous version of these tests missed.
+
+    ``poll()`` consumes — its own docstring says dropping the bytes drops them
+    for good — so breaking on ``done and not more`` when ``more`` could not be
+    read threw away whatever was still queued. Neither value of a plain boolean
+    is safe here: True spins with no delay, False truncates. ``drained`` is the
+    third answer.
+    """
+    st = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": "maybe"})
+    assert st.done is True, "the command really has stopped"
+    assert st.more is False, "and must not demand an instant re-poll"
+    assert st.output_uncertain is True, "but we cannot say the queue is empty"
+    assert st.drained is False, "so the loop must not stop reading"
+
+    ran = _run_documented_poll_loop([st] * 6)
+    assert ran["broke"] == 0, "breaking here is where the tail was lost"
+    assert ran["sleeps"] == ran["reads"], "and it must back off rather than spin"
+
+
+def test_a_readable_more_after_an_unreadable_one_ends_the_loop() -> None:
+    """It backs off until the host says something it can read, then stops."""
+    junk = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": "maybe"})
+    good = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": False})
+    assert _run_documented_poll_loop([junk, junk, good, good]) == {
+        "reads": 3,
+        "sleeps": 2,
+        "broke": 1,
+    }
+
+
 def test_a_null_status_lets_the_loop_break_because_null_is_not_applicable() -> None:
-    """``null`` reads False with absent, so a finished command reported with
-    nulls still terminates the loop. Routing null to the cautious answer is what
-    made ``wait_for_move`` poll a finished move for its full timeout."""
     nulls = mc.ExecStatus.from_api({"pid": 7, "running": None, "exited": None, "more": None})
     assert nulls.done is True
+    assert nulls.output_uncertain is False, "null is not-applicable, not unreadable"
     assert _run_documented_poll_loop([nulls] * 6)["broke"] == 1
 
 
+def test_a_null_running_does_not_by_itself_declare_a_command_finished() -> None:
+    """Codex's second scenario: ``done`` must not turn true only because
+    ``running`` was null, with no affirmative terminal evidence."""
+    st = mc.ExecStatus.from_api({"pid": 7, "running": None, "exited": False, "more": False})
+    assert st.exited is False
+    assert st.done is True, "documented as `exited or not running`, and null is not running"
+    assert st.exit_code is None, "which is the field that says there is no verdict yet"
+
+
 def test_an_unreadable_status_backs_OFF_rather_than_spinning() -> None:
-    """The honest limit of this, stated rather than claimed away.
+    """The honest limit, stated rather than claimed away.
 
     A status whose ``running`` cannot be read is not asserted to be finished —
     that would end a poll on a live command — so the loop does NOT terminate.
-    What the cautious ``more`` buys is that it sleeps between reads instead of
-    spinning: a polite poll against a host sending nonsense, not a hot loop.
-    Terminating here would need a tri-state ``done``, which is a bigger change
-    than this branch.
+    What the cautious reading buys is that it sleeps between reads instead of
+    spinning. Terminating here would need a tri-state ``done``, which is a
+    bigger change than this branch.
     """
     junk = mc.ExecStatus.from_api(
         {"pid": 7, "running": "maybe", "exited": "maybe", "more": "maybe"}
     )
-    assert junk.running is True and junk.more is False
-    assert junk.done is False
+    assert junk.running is True and junk.more is False and junk.done is False
     ran = _run_documented_poll_loop([junk] * 6)
-    assert ran["broke"] == 0, "it cannot honestly break on a status it could not read"
-    assert ran["sleeps"] == ran["reads"], "but every read must be preceded by a sleep"
+    assert ran["broke"] == 0
+    assert ran["sleeps"] == ran["reads"]
 
 
 def test_the_cautious_reading_keeps_a_poll_loop_going() -> None:
@@ -1359,20 +1405,16 @@ def test_an_unreadable_exec_is_not_reported_as_a_success() -> None:
 
 
 def test_no_wire_boolean_is_left_on_truthiness() -> None:
-    """The rule is every boolean, not a list somebody has to keep current.
+    """The rule is every boolean, and the scan checks its own coverage.
 
-    Three holes have been found in this scan, which is why it now checks its own
-    coverage. It read ``src/...`` relative to the cwd and errored anywhere but
-    the repo root. Its regex pinned one spelling, so ``bool(d["x"])`` walked
-    past. And its lookahead required a FOLLOWING decorator or class, so it
-    silently dropped the last ``from_api`` in the module — which was
-    ``ExecResult``'s, one this branch changed (/code-review, OPL-3835). A scan
-    that quietly covers less than it claims is worse than no scan.
+    Three holes have been found in it: a cwd-relative path, a regex pinning one
+    spelling, and a lookahead that silently dropped the LAST decoder in the
+    module — which was ``ExecResult``'s, one this branch changed. A scan that
+    quietly covers less than it claims is worse than no scan.
     """
     import re
 
-    modules = ["_models", "_computer", "_async_computer"]
-    for name in modules:
+    for name in ("_models", "_computer", "_async_computer"):
         source = pathlib.Path(getattr(mc, name).__file__).read_text()
         bodies = re.findall(r"def from_api\(.*?(?=\n    @|\n@|\nclass |\Z)", source, re.DOTALL)
         assert len(bodies) == source.count("def from_api("), (
@@ -1380,10 +1422,22 @@ def test_no_wire_boolean_is_left_on_truthiness() -> None:
         )
         offenders = [call for body in bodies for call in re.findall(r"\bbool\([^)]*\)", body)]
         assert not offenders, (name, offenders)
-        # And nothing anywhere in these modules may read a caveat flag raw.
         for flag in ("unreachable", "orphaned", "degraded", "unmetered", "live", "timed_out"):
-            raw = re.findall(rf'(?<!_flag\()[\w.]*get\("{flag}"[^)]*\)', source)
+            raw = re.findall(rf'(?<!_wire\()[\w.]*get\("{flag}"[^)]*\)', source)
             assert not raw, (name, flag, raw)
+
+
+def test_the_classifier_has_no_fallback_knob() -> None:
+    """``_flag`` returned a bool and took an ``unknown=`` fallback to pick one.
+
+    That shape produced four rounds of defects, because the right answer needs
+    context a single-key decoder cannot see. If it comes back, so do they.
+    """
+    import mandala_computer._models as models
+
+    assert not hasattr(models, "_flag")
+    assert "unknown" not in inspect.signature(models._wire).parameters
+    assert inspect.signature(models._wire).return_annotation.endswith("_Wire")
 
 
 def test_template_keeps_the_raw_positional_slot_too() -> None:
@@ -1438,3 +1492,54 @@ def test_the_floor_is_actually_slept_by_a_wait(client: mc.Client) -> None:
     with mock.patch("mandala_computer._resources.time.sleep", slept.append):
         assert client.builds.wait("bld-1", timeout=30, poll=0).status == "succeeded"
     assert slept and slept[0] >= 1.0, slept
+
+
+def test_a_snapshot_stub_survives_a_per_computer_filter_and_a_stranger_does_not(
+    client: mc.Client,
+) -> None:
+    """``unreachable`` means opposite things on the two rows it can appear on.
+
+    On a SPARSE row it is the marker saying the listing is short — dropping it
+    reports a confident count over an incomplete answer. On a FULL row belonging
+    to another computer, admitting it hands back somebody else's snapshots from
+    a method read before an irreversible delete. One fallback boolean had to
+    choose which of those to get wrong; row shape does not.
+    """
+    from mandala_computer._computer import _is_unreachable_stub
+
+    assert _is_unreachable_stub({"id": "snap-1", "unreachable": True}) is True
+    for unreadable in ("maybe", None, {}):
+        assert _is_unreachable_stub({"id": "snap-2", "unreachable": unreadable}) is True
+    # A full row for another computer is never a stub, however its flag reads.
+    for value in (True, "maybe", None):
+        assert (
+            _is_unreachable_stub({"id": "s", "computer_id": "vm-other", "unreachable": value})
+            is False
+        )
+    assert _is_unreachable_stub({"id": "snap-3"}) is False
+    assert _is_unreachable_stub({"id": "snap-4", "unreachable": False}) is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "ended"),
+    [
+        ({"status": "running", "done": True}, True),
+        ({"status": "running", "done": "true"}, True),
+        ({"status": "running", "done": 1}, True),
+        ({"status": "succeeded", "done": False}, False),
+        ({"status": "succeeded"}, True),
+        ({"status": "succeeded", "done": None}, True),
+        ({"status": "succeeded", "done": "maybe"}, True),
+        ({"status": "running", "done": None}, False),
+        ({"status": "running", "done": "maybe"}, False),
+    ],
+)
+def test_build_ended_falls_back_only_when_the_value_was_not_recognised(
+    payload: dict, ended: bool
+) -> None:
+    """Testing PRESENCE rather than recognition made ``{"status": "succeeded",
+    "done": null}`` block the fallback, so ``wait()`` ran to its half-hour
+    deadline on a finished build and the stream rejected its own final event."""
+    from mandala_computer._resources import build_ended
+
+    assert build_ended(mc.BuildProgress.from_api(payload)) is ended

@@ -10,6 +10,7 @@ import builtins
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from operator import index as integer_index
 from typing import Any, SupportsIndex, TypeVar, overload
 
@@ -67,66 +68,74 @@ def _real(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
-def _flag(d: Mapping[str, Any], key: str, *, unknown: bool = False) -> bool:
-    """A boolean field off the wire. Every one this module decodes comes here.
+class _Wire(Enum):
+    """What a boolean field on the wire actually was, before anyone decided what
+    it MEANS.
 
-    Four cases, in order:
+    Five states, because five is how many there are. ``_flag`` returned a
+    ``bool`` and took an ``unknown=`` fallback to pick one, and that shape was
+    the source of four rounds of defects on this branch (adversarial review,
+    OPL-3835): every fallback boolean is wrong somewhere, because the right
+    answer needs context the decoder cannot see. ``Move.live`` needs
+    ``Move.state``; ``ExecStatus.more`` is both the sleep switch and half the
+    break condition, so neither value is safe; a snapshot's ``unreachable``
+    means opposite things on a sparse row and a full one. Handing callers a
+    classification and letting each decide is the fix, and the reason this is an
+    enum rather than another knob.
+    """
 
-    * A real JSON boolean is itself.
-    * ABSENT is False — what ``bool(d.get(...))`` gave, and what an older host
-      omitting a field it never heard of should mean.
-    * ``true``/``false`` and ``1``/``0``, however they are spelled — as JSON
-      booleans, as numbers, or as strings — are DECODED. The original bug was
-      TRUTHINESS, not recognition: ``bool("false")`` was True, which is wrong,
-      but ``"false"`` still plainly means false. A backend that systematically
-      encodes booleans this way would otherwise get the cautious answer on every
-      flag of every response, permanently, and with ``timed_out`` cautious that
-      means :attr:`ExecResult.ok` is never true and ``wait_for_guest`` — the
-      quickstart's first call — always burns its timeout (/code-review).
-    * Anything left — ``{}``, ``"maybe"``, ``2`` — reads ``unknown``.
+    #: The key was not there. An older host that never heard of the field.
+    ABSENT = auto()
+    #: ``null``. NOT APPLICABLE in this API's own convention — ``cpu``,
+    #: ``finished_at`` and ``exit_code`` all use it that way — rather than
+    #: "cannot tell".
+    NULL = auto()
+    TRUE = auto()
+    FALSE = auto()
+    #: Present, and not anything this client can read.
+    MALFORMED = auto()
 
-    ``null`` IS FALSE, WITH THE ABSENT CASE, and that is a correction rather
-    than an oversight (/code-review, OPL-3835). It was briefly routed to
-    ``unknown`` on the reasoning that a host sending ``null`` is saying it
-    cannot tell. This API's own convention says otherwise: ``cpu``, ``ram_mb``,
-    ``disk_gb``, ``finished_at`` and ``exit_code`` all use ``null`` for NOT
-    APPLICABLE, and under the other reading ``Move.live`` of ``null`` on a
-    finished move made ``wait_for_move`` poll it for the full fifteen minutes
-    and then raise, while ``timed_out`` of ``null`` made ``wait_for_guest`` burn
-    three minutes on a guest that answered on the first probe.
 
-    ``unknown`` is set per field, and the question is not "is this a caveat?" —
-    that reading put ``more`` on the wrong side and cost an infinite loop. It is
-    what the flag makes a caller DO when it is wrong:
+def _wire(d: Mapping[str, Any], key: str) -> _Wire:
+    """Classify one boolean field. It decides nothing.
 
-    * TRUE where True only adds a caveat and costs a little time: ``live`` and
-      ``running`` (keep waiting), ``timed_out`` and the truncation flags (do not
-      trust this as the whole answer), ``degraded`` and ``unmetered`` (this
-      total may be short), ``unmatched`` (these step positions may not be).
-    * FALSE where True would DISCARD good data or send the caller somewhere
-      expensive: ``more`` is a backoff switch, and True means poll again with no
-      sleep; ``unreachable`` True throws away every other field on a row that
-      has them; ``orphaned`` True steers a restore into a ``clone``, which bills
-      a whole new computer, where False on a real orphan gets a cheap refusal
-      from the platform.
-    * FALSE for the plain assertions, where the cautious answer is not to
-      assert: ``valid``, ``done``, ``allowed``.
+    ``true``/``false`` and ``1``/``0`` are recognised however they are spelled —
+    as JSON booleans, as numbers, or as strings. The original bug was
+    TRUTHINESS, not recognition: ``bool("false")`` was True, which is wrong, but
+    ``"false"`` still plainly means false, and a backend that encodes its
+    booleans that way must not be told its every flag is unreadable.
 
-    Malformed values are still preserved in ``raw`` and still never rejected,
-    which is this module's contract.
+    Integral floats are recognised with the ints. ``json.loads`` gives ``1`` for
+    ``1`` and ``1.0`` for ``1.0``, so accepting one and not the other made the
+    same wire value decode two ways (adversarial review, OPL-3835).
     """
     if key not in d:
-        return False
+        return _Wire.ABSENT
     value = d[key]
+    # Before the numeric branch: `True == 1` in Python, and a real boolean must
+    # not be classified by the int rule.
     if isinstance(value, bool):
-        return value
+        return _Wire.TRUE if value else _Wire.FALSE
     if value is None:
-        return False
-    if isinstance(value, int) and value in (0, 1):
-        return value == 1
-    if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0"):
-        return value.strip().lower() in ("true", "1")
-    return unknown
+        return _Wire.NULL
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return _Wire.TRUE if value == 1 else _Wire.FALSE
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1"):
+            return _Wire.TRUE
+        if text in ("false", "0"):
+            return _Wire.FALSE
+    return _Wire.MALFORMED
+
+
+#: Read as True unless the wire says otherwise. For the plain assertions, where
+#: the cautious answer is not to assert: not valid, not finished, not permitted.
+_SAID_SO = (_Wire.TRUE,)
+#: Read as True when the wire says so OR when it is present and unreadable. For
+#: the caveats, where the cost of a wrong True is a little time and the cost of
+#: a wrong False is blessing a short or stale answer as complete.
+_SAID_SO_OR_CANNOT_TELL = (_Wire.TRUE, _Wire.MALFORMED)
 
 
 def _texts(value: Any) -> builtins.list[str]:
@@ -517,7 +526,7 @@ class TemplateCheck:
             return None if value is None else _text(value)
 
         return cls(
-            valid=_flag(d, "valid"),
+            valid=_wire(d, "valid") in _SAID_SO,
             problems=_texts(d.get("problems")),
             ref=maybe("ref"),
             doc_digest=maybe("doc_digest"),
@@ -699,7 +708,7 @@ class BuildProgress:
         return cls(
             id=_text(d.get("id")),
             status=_text(d.get("status")),
-            done=_flag(d, "done"),
+            done=_wire(d, "done") in _SAID_SO,
             phase=_text(d.get("phase")),
             step=_num(d.get("step")),
             of=_num(d.get("of")),
@@ -707,7 +716,7 @@ class BuildProgress:
             note=_text(d.get("note")),
             error=_text(d.get("error")),
             updated_at=_text(d.get("updated_at")),
-            unmatched=_flag(d, "unmatched", unknown=True),
+            unmatched=_wire(d, "unmatched") in _SAID_SO_OR_CANNOT_TELL,
             raw=dict(d),
         )
 
@@ -746,7 +755,7 @@ class Size:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=_flag(d, "allowed"),
+            allowed=_wire(d, "allowed") in _SAID_SO,
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -840,11 +849,11 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=_flag(d, "incremental"),
-            auto=_flag(d, "auto"),
+            incremental=_wire(d, "incremental") in _SAID_SO,
+            auto=_wire(d, "auto") in _SAID_SO,
             computer_name=_text(d.get("computer_name")),
-            orphaned=_flag(d, "orphaned"),
-            unreachable=_flag(d, "unreachable"),
+            orphaned=_wire(d, "orphaned") in _SAID_SO,
+            unreachable=_wire(d, "unreachable") in _SAID_SO,
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
@@ -974,7 +983,7 @@ class ComputerUsage:
             run_hours=_real(d.get("run_hours")),
             vcpu_hours=_real(d.get("vcpu_hours")),
             ram_gb_hours=_real(d.get("ram_gb_hours")),
-            gone=_flag(d, "gone"),
+            gone=_wire(d, "gone") in _SAID_SO,
         )
 
 
@@ -1081,8 +1090,8 @@ class UsageReport:
             from_=_text(d.get("from")),
             to=_text(d.get("to")),
             usage=UsageTotals.from_api(totals),
-            degraded=_flag(d, "degraded", unknown=True),
-            unmetered=_flag(d, "unmetered", unknown=True),
+            degraded=_wire(d, "degraded") in _SAID_SO_OR_CANNOT_TELL,
+            unmetered=_wire(d, "unmetered") in _SAID_SO_OR_CANNOT_TELL,
             # Presence, not emptiness. The platform drops the key for a scoped
             # credential and sends ``[]`` for an account that ran nothing, and
             # those are different answers: one is "you may not see this", the
@@ -1142,13 +1151,30 @@ class Move:
     finished_at: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
+    #: The states this model's own docstring calls live. Consulted ONLY when the
+    #: wire did not give a readable ``live`` — the flag stays the thing to poll
+    #: on, exactly as documented, and this is the fallback for a payload that
+    #: cannot answer.
+    LIVE_STATES = frozenset({"staging", "moving", "resizing"})
+
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Move:
+        state = _text(d.get("state"))
+        # `live` needs `state`, which is why this cannot be one decoder call
+        # (adversarial review, OPL-3835). Reading an unreadable or null `live` as
+        # False ended `wait_for_move` on a computer whose state said `moving`;
+        # reading it as True polled a FINISHED move to its deadline and raised.
+        # Neither is answerable without the other field. ABSENT stays False: an
+        # older host that never sent the flag is not describing a live move.
+        said = _wire(d, "live")
+        live = said is _Wire.TRUE or (
+            said in (_Wire.NULL, _Wire.MALFORMED) and state in cls.LIVE_STATES
+        )
         return cls(
             computer_id=_text(d.get("computer_id")),
-            state=_text(d.get("state")),
+            state=state,
             detail=_text(d.get("detail")),
-            live=_flag(d, "live", unknown=True),
+            live=live,
             cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
             ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
             disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
@@ -1196,7 +1222,7 @@ class Window:
             y=_num(d.get("y")),
             width=_num(d.get("width")),
             height=_num(d.get("height")),
-            focused=_flag(d, "focused"),
+            focused=_wire(d, "focused") in _SAID_SO,
             raw=dict(d),
         )
 
@@ -1285,7 +1311,7 @@ class WindowResult:
         w = d.get("window")
         return cls(
             window=Window.from_api(w) if isinstance(w, Mapping) else None,
-            gone=_flag(d, "gone"),
+            gone=_wire(d, "gone") in _SAID_SO,
             raw=dict(d),
         )
 
@@ -1332,11 +1358,34 @@ class ExecStatus:
     def done(self) -> bool:
         """True once the command has stopped, however it stopped.
 
-        Read with :attr:`more`, not instead of it: a command can exit with
+        Read with :attr:`drained`, not instead of it: a command can exit with
         output still queued, and a loop that stops at ``done`` alone drops
         whatever the last read did not reach.
         """
         return self.exited or not self.running
+
+    @property
+    def output_uncertain(self) -> bool:
+        """The host sent a :attr:`more` this client could not read.
+
+        Its own field cannot carry this. ``more`` is TWO things to a polling
+        loop — the sleep switch and half the break condition — so neither value
+        is safe when it is unreadable: True spins with no delay, False breaks and
+        drops output that a consuming read can never fetch again. It reads False
+        so the loop sleeps, and this says why, so the loop can decline to stop.
+        """
+        return _wire(self.raw, "more") is _Wire.MALFORMED
+
+    @property
+    def drained(self) -> bool:
+        """Safe to stop reading: stopped, nothing queued, nothing unreadable.
+
+        What a polling loop actually wants, and the reason it is a property
+        rather than two conditions a caller has to remember to write. Spelled as
+        ``done and not more`` it silently dropped queued output whenever ``more``
+        could not be read (adversarial review, OPL-3835).
+        """
+        return self.done and not self.more and not self.output_uncertain
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ExecStatus:
@@ -1344,15 +1393,15 @@ class ExecStatus:
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
-            running=_flag(d, "running", unknown=True),
-            exited=_flag(d, "exited"),
+            running=_wire(d, "running") in _SAID_SO_OR_CANNOT_TELL,
+            exited=_wire(d, "exited") in _SAID_SO,
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
-            more=_flag(d, "more"),
-            killed=_flag(d, "killed"),
+            more=_wire(d, "more") is _Wire.TRUE,
+            killed=_wire(d, "killed") in _SAID_SO,
             started_at=_text(d.get("started_at")),
             raw=dict(d),
         )
@@ -1413,8 +1462,8 @@ class ExecResult:
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
-            timed_out=_flag(d, "timed_out", unknown=True),
-            out_truncated=_flag(d, "out_truncated", unknown=True),
-            err_truncated=_flag(d, "err_truncated", unknown=True),
+            timed_out=_wire(d, "timed_out") in _SAID_SO_OR_CANNOT_TELL,
+            out_truncated=_wire(d, "out_truncated") in _SAID_SO_OR_CANNOT_TELL,
+            err_truncated=_wire(d, "err_truncated") in _SAID_SO_OR_CANNOT_TELL,
             raw=dict(d),
         )
