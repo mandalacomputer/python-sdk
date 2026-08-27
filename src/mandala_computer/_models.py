@@ -1432,7 +1432,16 @@ class ExecStatus:
         OPL-3835). It says nothing about whether the command stopped, so it is
         not allowed to end the poll.
         """
-        if _wire(self.raw, "running") in (_Wire.NULL, _Wire.MALFORMED):
+        # ABSENT belongs with null and malformed and was left out (adversarial
+        # review, OPL-3835): a payload with no `running` at all decodes it False
+        # like anything else missing, and `not running` then ended the poll with
+        # nothing exited, nothing killed and no exit code. Only a `running` the
+        # wire actually said was FALSE is evidence of stopping.
+        #
+        # `self.raw` empty means this object was built directly rather than
+        # decoded, and then its fields ARE the evidence — there is no payload to
+        # consult and the caller said what they meant.
+        if self.raw and _wire(self.raw, "running") is not _Wire.FALSE:
             return self.exited or self.killed
         return self.exited or self.killed or not self.running
 

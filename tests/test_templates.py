@@ -1388,6 +1388,33 @@ def test_a_null_running_does_not_by_itself_declare_a_command_finished() -> None:
         assert st.drained is False
         assert _run_documented_poll_loop([st] * 4)["broke"] == 0
 
+    # The key GENUINELY ABSENT, not present-with-an-unreadable-value. This is
+    # the case the guard missed and the tests missed with it: `{}` as the value
+    # exercises MALFORMED, not ABSENT (adversarial review, OPL-3835).
+    absent = mc.ExecStatus.from_api({"pid": 7, "exited": False, "more": False})
+    assert "running" not in absent.raw
+    assert absent.done is False, "nothing in that payload says the command stopped"
+    assert absent.drained is False
+    assert _run_documented_poll_loop([absent] * 4)["broke"] == 0
+
+    # And an object built directly rather than decoded: its FIELDS are the
+    # evidence, because there is no payload to consult.
+    direct = mc.ExecStatus(
+        pid=7,
+        command="",
+        running=False,
+        exited=False,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        stdout_offset=0,
+        stderr_offset=0,
+        more=False,
+        killed=False,
+    )
+    assert direct.raw == {}
+    assert direct.done is True, "a caller who says running=False has said it stopped"
+
     # What DOES end it: something that actually says so.
     for evidence in ({"exited": True}, {"killed": True}, {"running": False}):
         st = mc.ExecStatus.from_api({"pid": 7, "more": False, **evidence})
@@ -1531,6 +1558,16 @@ def test_the_floor_is_actually_slept_by_a_wait(client: mc.Client) -> None:
         ({"status": "succeeded", "done": "maybe"}, True),
         ({"status": "running", "done": None}, False),
         ({"status": "running", "done": "maybe"}, False),
+        # `failed` is terminal too, and removing it from BUILD_TERMINAL left the
+        # whole table green: every other row carries a readable `done`, so
+        # nothing exercised the fallback for a build that FAILED (adversarial
+        # review, OPL-3835). A legacy payload of only {"status": "failed"} would
+        # have been polled until timeout.
+        ({"status": "failed"}, True),
+        ({"status": "failed", "done": None}, True),
+        ({"status": "failed", "done": "maybe"}, True),
+        ({"status": "failed", "done": False}, False),
+        ({"status": "cancelled"}, False),
     ],
 )
 def test_the_done_field_itself_falls_back_only_on_an_unrecognised_value(
@@ -1646,40 +1683,71 @@ def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
 
     defined = set(dir(builtins))
     problems = []
+
+    def bound_by(tree: ast.AST, *, descend: bool) -> set[str]:
+        """Every name a block binds at MODULE level.
+
+        ``descend=False`` skips function and class bodies, because a name
+        assigned only inside a ``def`` is local to it. The first version added
+        those to the document-level set, so a later block could read a name that
+        only ever existed inside an earlier block's function and still pass
+        (adversarial review, OPL-3835).
+        """
+        bound: set[str] = set()
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    bound.add(child.name)
+                    if not descend:
+                        continue
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    bound.add(child.id)
+                elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                    for alias in child.names:
+                        bound.add((alias.asname or alias.name).split(".")[0])
+                elif isinstance(child, ast.ExceptHandler) and child.name:
+                    bound.add(child.name)
+                elif isinstance(child, ast.arg):
+                    bound.add(child.arg)
+                # A `case Foo(bar)` BINDS bar. Counting those as reads is what
+                # made the first version of this sweep report false positives.
+                elif (
+                    isinstance(child, ast.MatchAs)
+                    and child.name
+                    or isinstance(child, ast.MatchStar)
+                    and child.name
+                ):
+                    bound.add(child.name)
+                elif isinstance(child, ast.MatchMapping) and child.rest:
+                    bound.add(child.rest)
+                stack.append(child)
+        return bound
+
     for n, block in enumerate(blocks, 1):
         try:
             tree = ast.parse(block)
         except SyntaxError as exc:
             problems.append(f"block {n}: {exc}")
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                defined.add(node.id)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    defined.add((alias.asname or alias.name).split(".")[0])
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                defined.add(node.name)
-            elif isinstance(node, ast.arg):
-                defined.add(node.arg)
-            elif (
-                isinstance(node, ast.ExceptHandler)
-                and node.name
-                or isinstance(node, ast.MatchAs)
-                and node.name
-                or isinstance(node, ast.MatchStar)
-                and node.name
-            ):
-                defined.add(node.name)
-            elif isinstance(node, ast.MatchMapping) and node.rest:
-                defined.add(node.rest)
+        # Everything the block binds anywhere counts WITHIN the block — a `for`
+        # target is read later in its own loop, an `except ... as e` inside its
+        # own handler — so ordering is not checked inside a block. A stricter
+        # statement-ordered version reported a dozen false positives on exactly
+        # those shapes, and catching `print(x); x = 1` is not worth them. What
+        # is checked is what actually broke: a name no block ever binds, and a
+        # name that only exists inside some earlier block's function.
+        inside = bound_by(tree, descend=True)
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Name)
                 and isinstance(node.ctx, ast.Load)
                 and node.id not in defined
+                and node.id not in inside
             ):
                 problems.append(f"block {n}: undefined name {node.id!r}")
+        defined |= bound_by(tree, descend=False)
     assert not problems, "\n".join(dict.fromkeys(problems))
 
 
@@ -1695,11 +1763,23 @@ def test_the_readme_publishes_the_safe_poll_loop() -> None:
 
 
 @respx.mock
-def test_breaking_out_of_events_closes_the_stream(client: mc.Client) -> None:
-    """Every exit from that loop abandons the inner generator — the NORMAL one
-    is a `return` on the done event — so without `closing` the streamed response
-    unwound whenever the collector got to it. An account holds eight of these at
-    once and the ninth is a RateLimitError, so a leak costs a real slot."""
+def test_events_closes_its_stream_when_the_iterator_is_closed(client: mc.Client) -> None:
+    """The stream is released on the normal path and on an early close.
+
+    HONEST ABOUT WHAT THIS PROVES, because the first version of it was not: on
+    CPython it passes with or without the ``closing`` wrapper in ``events()``.
+    Refcounting drops the inner generator the moment the outer frame goes, so
+    the bare ``for event in self._t.sse(...)`` this replaced was already prompt
+    here — verified by reverting the wrapper and watching both tests still pass.
+
+    The wrapper is not for CPython. It is for an implementation that does not
+    refcount, where an abandoned generator closes whenever the collector gets
+    to it and an account holds only eight streams at once; and it is for
+    matching ``Computer.agent_stream``, which wraps its own stream and says why.
+    What this test pins is the property itself — that the response really is
+    released, on both the ``done`` path and an early exit — so that a future
+    change which genuinely leaks it fails here.
+    """
     respx.get(f"{BASE}/builds/bld-1/events").mock(
         return_value=sse(("progress", RUNNING), ("progress", RUNNING), ("done", DONE))
     )
@@ -1714,29 +1794,15 @@ def test_breaking_out_of_events_closes_the_stream(client: mc.Client) -> None:
             closed.append(path)
 
     with mock.patch.object(mc._client.Transport, "sse", tracking):
-        for _ in client.builds.events("bld-1"):
-            break  # the early exit the docstring warns about
-    assert closed, "the stream was abandoned rather than closed"
+        # The normal path: run to the `done` event and return.
+        assert len(list(client.builds.events("bld-1"))) == 3
+        assert closed, "the done path left the response open"
 
-
-@respx.mock
-def test_events_closes_the_stream_on_the_normal_done_path(client: mc.Client) -> None:
-    respx.get(f"{BASE}/builds/bld-1/events").mock(
-        return_value=sse(("progress", RUNNING), ("done", DONE))
-    )
-    closed: list[str] = []
-    real = mc._client.Transport.sse
-
-    def tracking(self, method, path, **kw):
-        gen = real(self, method, path, **kw)
-        try:
-            yield from gen
-        finally:
-            closed.append(path)
-
-    with mock.patch.object(mc._client.Transport, "sse", tracking):
-        assert len(list(client.builds.events("bld-1"))) == 2
-    assert closed
+        closed.clear()
+        stream = client.builds.events("bld-1")
+        next(stream)
+        stream.close()  # the early exit the docstring warns callers about
+        assert closed, "closing the iterator left the response open"
 
 
 @respx.mock

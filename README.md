@@ -1010,8 +1010,10 @@ rather than a dead end.
 ```python
 c.download_file("/home/user/out.tar", "out.tar")  # 2 GB, a part at a time
 
-open_handle = open("out.tar", "wb")
-c.download_file("/home/user/out.tar", open_handle)  # or into anything writable
+# Or into anything writable. A handle you opened is a handle you close —
+# `download_file` deliberately does not close one it did not open.
+with open("out.tar", "wb") as open_handle:
+    c.download_file("/home/user/out.tar", open_handle)
 
 tail = c.read_file_part("/var/log/build.log", offset=-4096)  # the last 4 KiB
 head = c.read_file_part("/home/user/out.tar", length=512)  # the first 512 B

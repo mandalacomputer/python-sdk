@@ -374,7 +374,7 @@ class AsyncBuilds:
             except MandalaError as err:
                 if not is_transient(err):
                     raise
-                if not _cut_short_by_our_own_cap(err, started, remaining):
+                if not _cut_short_by_our_own_cap(err, started, remaining, self._t.read_ceiling):
                     observed = False
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()

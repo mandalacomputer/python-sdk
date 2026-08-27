@@ -342,6 +342,19 @@ class _BaseTransport:
         )
 
     @staticmethod
+    def _read_ceiling(timeout: httpx.Timeout) -> float | None:
+        """A client's own read timeout, or ``None`` where it has none.
+
+        What a poll's deadline cap is measured AGAINST: a cap wider than this
+        never tightened anything, so a timeout under it belongs to the platform
+        rather than to the wait (adversarial review, OPL-3835). Static, and each
+        half exposes it as a property over its own client — annotating `_http`
+        on this base as a union of the two makes every narrowed use of it in the
+        subclasses fail.
+        """
+        return None if timeout.read is None else float(timeout.read)
+
+    @staticmethod
     def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
         """Tighten one request's timeouts to the time its caller has left.
 
@@ -749,6 +762,11 @@ def _retry_after(resp: httpx.Response) -> float | None:
 class Transport(_BaseTransport):
     """Blocking transport."""
 
+    @property
+    def read_ceiling(self) -> float | None:
+        """See :meth:`_BaseTransport._read_ceiling`."""
+        return self._read_ceiling(self._http.timeout)
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -920,6 +938,11 @@ class Transport(_BaseTransport):
 
 class AsyncTransport(_BaseTransport):
     """Non-blocking transport."""
+
+    @property
+    def read_ceiling(self) -> float | None:
+        """See :meth:`_BaseTransport._read_ceiling`."""
+        return self._read_ceiling(self._http.timeout)
 
     def __init__(
         self,

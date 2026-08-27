@@ -169,8 +169,13 @@ def check_wait_args(timeout: float, poll: float) -> None:
 RATE_LIMITED_FLOOR = 1.0
 
 
-def _cut_short_by_our_own_cap(err: BaseException, started: float, budget: float) -> bool:
+def _cut_short_by_our_own_cap(
+    err: BaseException, started: float, budget: float, ceiling: float | None
+) -> bool:
     """Whether a failed poll ran out of OUR time rather than the platform's.
+
+    ``ceiling`` is the client's own read timeout, or ``None`` where it has
+    none: the cap is only what fired if it was the TIGHTER of the two.
 
     ``wait`` caps each poll at what is left of its deadline, so near the end a
     perfectly healthy request gets cut off mid-flight. Counting that as a poll
@@ -185,6 +190,13 @@ def _cut_short_by_our_own_cap(err: BaseException, started: float, budget: float)
     a deadline check alone cannot tell the two apart.
     """
     if not isinstance(err, TimeoutError):
+        return False
+    # The cap only OWNS a timeout it actually caused. Elapsed time alone said a
+    # sixty-second network stall with sixty-six seconds left was ours, because
+    # 60 >= 66 * 0.9 — and the wait then reported a build "still running" from a
+    # reading over a minute old (adversarial review, OPL-3835). If the client's
+    # own timeout was the tighter of the two, the stall is the platform's.
+    if ceiling is not None and budget >= ceiling:
         return False
     return time.monotonic() - started >= budget * 0.9
 
@@ -674,6 +686,20 @@ class Builds:
         An account may hold eight of these open at once; the ninth is a
         :class:`~mandala_computer.RateLimitError`.
 
+
+        TO STOP READING EARLY, CLOSE THE ITERATOR. A bare ``break`` leaves this
+        generator suspended at its yield, and nothing inside it unwinds until it
+        is closed or collected — so the stream stays checked out, and an account
+        holds only eight at once (adversarial review, OPL-3835). The ``closing``
+        wrapper inside cannot help with that: it runs when this generator ends,
+        which a ``break`` does not do. :func:`contextlib.closing` around the call
+        makes it concise, the same way :meth:`Computer.agent_stream` says::
+
+            with closing(client.builds.events(build_id)) as stream:
+                for progress in stream:
+                    if progress.step == 3:
+                        break
+
         A ``done`` that disagrees with itself — the event that ends the stream,
         carrying a payload that says the build is still running — is a truncated
         stream and raises rather than ending the iteration. See
@@ -794,7 +820,7 @@ class Builds:
                 # "was still running (phase X, step N of M)": a claim the fleet
                 # stopped answering, when only this clock ran out. The
                 # TypeScript twin skips the same case by name.
-                if not _cut_short_by_our_own_cap(err, started, remaining):
+                if not _cut_short_by_our_own_cap(err, started, remaining, self._t.read_ceiling):
                     observed = False
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
