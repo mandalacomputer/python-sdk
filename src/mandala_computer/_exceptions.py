@@ -13,6 +13,7 @@ __all__ = [
     "AuthenticationError",
     "ConflictError",
     "ConnectionError",
+    "ConnectionInterruptedError",
     "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
@@ -411,11 +412,19 @@ class UnavailableError(APIError):
 
 
 class ConnectionError(MandalaError, builtins.ConnectionError):
-    """The request could not complete — no HTTP response ever arrived.
+    """The request never left. Nothing was dispatched, so anything may be replayed.
 
-    A DNS failure, a refused connection, a TLS handshake that did not finish, a
-    proxy that closed the socket. Safe to retry without changing the request,
-    which is what :func:`is_transient` says about it.
+    A DNS failure, a refused connection, a TLS handshake that did not finish.
+    Safe to retry without changing the request, which is what
+    :func:`is_transient` says about it.
+
+    **Narrower than it used to be**, and the narrowing is the point. This class
+    once wrapped every ``httpx.RequestError``, which includes ``ReadError`` and
+    ``RemoteProtocolError`` — failures that happen *after* the request reached
+    the platform. Those wear the opposite outcome: the platform may well have
+    acted, and the answer is what was lost. They now get
+    :class:`ConnectionInterruptedError`, which is a subclass, so
+    ``except ConnectionError`` still catches both.
 
     Its own class for :class:`TimeoutError`'s reason: ``httpx.RequestError`` is
     not a :class:`MandalaError`, so this used to leave here as a bare
@@ -427,6 +436,46 @@ class ConnectionError(MandalaError, builtins.ConnectionError):
     mandala-computer-typescript and ``ConnectivityError`` in
     mandala-computer-mcp. All three now name it in the same retry predicate
     (OPL-3724), and until this class existed this SDK could not.
+    """
+
+
+class ConnectionInterruptedError(ConnectionError):
+    """The request was dispatched and the answer was lost. Outcome unknown.
+
+    A socket that resets while the response body is being read, a protocol
+    error on the way back, a write that failed with part of the request already
+    out. The shared property is the one that matters: the platform may have
+    received the request and acted on it, and nothing in the error says whether
+    it did.
+
+    So this is **fatal** to :func:`is_transient` and transparent to
+    ``_is_transient_for_poll``, and the split is the same one OPL-3724 made for
+    502 and 504. Its reasoning applies here unchanged, and this case had escaped
+    it only because it wears a class whose name says the request never left.
+    ``computers.create()`` reaches the platform, the platform builds the
+    computer, the socket dies mid-response: a caller asking
+    :func:`is_transient` used to be told yes, replayed the create, and paid for
+    two computers (OPL-3855).
+
+    A **subclass** rather than a sibling, which is what keeps this from breaking
+    anyone. ``except ConnectionError`` still catches it, and so does
+    ``except builtins.ConnectionError``, so existing handlers and
+    ``_is_transient_for_poll``'s floor need no change; only the one predicate
+    that promises a blind replay had to learn the difference. It is the same
+    shape :class:`MoveRequiredError` has under :class:`ConflictError`, for the
+    same reason: a case that is genuinely a kind of its parent and genuinely
+    answers one question the other way.
+
+    httpx is what makes the split possible here, and it is the friendliest of
+    the three transports for it — ``ConnectError`` and ``ConnectTimeout`` name
+    the connect phase outright, where the TypeScript clients have to read
+    undici's cause chain. See ``_request_failed`` in ``_client.py``.
+
+    The poll predicate still rides it out, and that is not an oversight. The
+    ``wait_*`` helpers replay reads — a computer read, an ``exit 0`` probe — and
+    a read whose outcome was lost can simply be read again. Only a caller who
+    might be replaying a **write** needs the distinction, which is exactly the
+    caller :func:`is_transient` is exported for.
     """
 
 
@@ -460,7 +509,15 @@ def is_transient(err: BaseException) -> bool:
       minus :class:`MoveRequiredError`, which is a decision rather than a moment
     * :class:`RateLimitError` — a cadence, and the response usually says how long
     * :class:`UnavailableError` — a hypervisor briefly out of reach
-    * :class:`ConnectionError` — the request never completed
+    * :class:`ConnectionError` — the request never left
+
+    That last line is now literally true, and it was not always. The class used
+    to cover every ``httpx.RequestError``, a lost response body included, so
+    this predicate told a caller replaying a create that the request had never
+    completed when in fact it had been received and the *answer* was what went
+    missing. :class:`ConnectionInterruptedError` carries that case now and is
+    excluded below — the same decision as the paragraph after this one, applied
+    to the one class it had missed (OPL-3855).
 
     Answered by TYPE, with no status numbers, and identical in all three clients
     as of OPL-3724. Before it, one question had three answers: this SDK named
@@ -478,6 +535,11 @@ def is_transient(err: BaseException) -> bool:
     only ever replays a read.
     """
     if isinstance(err, MoveRequiredError):
+        return False
+    # A lost RESPONSE is not a request that never left, and only one of the two
+    # is safe to replay blind. Same shape as the line above and the same reason:
+    # a subclass of a branch below that would otherwise say yes (OPL-3855).
+    if isinstance(err, ConnectionInterruptedError):
         return False
     return isinstance(err, (ConflictError, RateLimitError, UnavailableError, ConnectionError))
 
