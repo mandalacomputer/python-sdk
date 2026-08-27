@@ -305,9 +305,13 @@ def test_build_start_sends_bytes_and_reads_the_job(client: mc.Client) -> None:
 
 @respx.mock
 def test_no_reuse_is_sent_only_when_asked_for(client: mc.Client) -> None:
-    """The platform reads the PRESENCE of the key, not its value.
+    """``no_reuse=true`` is the only spelling the platform acts on.
 
-    ``no_reuse=false`` would therefore ask for the opposite of what it says.
+    ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` and ``lib/apidoc``
+    gives the parameter ``enum: ['true']``, so the key is omitted rather than
+    sent as ``false``. This docstring used to say the platform read the key's
+    PRESENCE and that ``no_reuse=false`` forced a rebuild — the claim the fix
+    commit disproved and left pinned here, one edit away from being acted on.
     """
     route = respx.post(f"{BASE}/builds").mock(
         return_value=httpx.Response(202, json={"id": "bld-1", "status": "running"})
@@ -881,3 +885,203 @@ def test_a_malformed_body_is_transient_and_the_docstring_says_so() -> None:
 
     assert is_transient(mc.MandalaError("expected JSON, got <html>")) is True
     assert "TRANSIENT" in (is_transient.__doc__ or "")
+
+
+# The adversarial-review pass on the branch (OPL-3835). Every one of these was
+# a live defect in the commits above, and every one of them fails OPEN — the
+# wrong reading is the permissive, expensive or destructive one.
+
+
+@pytest.mark.parametrize("value", ["false", "0", 0, 1, "", None, [], object()])
+def test_no_reuse_refuses_anything_that_is_not_a_bool(value: object) -> None:
+    """``build_params("false")`` asked for a rebuild.
+
+    Truthiness on a flag that ARMS something reads every non-empty string as
+    yes, and ``"false"`` is what a config file, an environment variable or a CLI
+    argument produces. A rebuild copies a multi-gigabyte base image.
+    """
+    with pytest.raises(ValueError, match="no_reuse must be True or False"):
+        _api.build_params(value)  # type: ignore[arg-type]
+
+
+def test_no_reuse_still_takes_real_bools() -> None:
+    assert _api.build_params(True) == {"no_reuse": "true"}
+    assert _api.build_params(False) == {}
+
+
+@pytest.mark.parametrize("value", ["false", "0", 0, 1, "", None])
+def test_purging_snapshots_refuses_anything_that_is_not_a_bool(value: object) -> None:
+    """The same coercion on the one route that destroys a computer AND its
+    snapshots. The ``expect`` fingerprint did not cover this: it binds the purge
+    to the set that was looked at, not to whether a purge was meant at all."""
+    with pytest.raises(ValueError, match="purge_snapshots must be True or False"):
+        _api.delete_params(purge_snapshots=value, expect="sha256:abc")  # type: ignore[arg-type]
+
+
+def test_purging_snapshots_still_takes_real_bools() -> None:
+    assert _api.delete_params(purge_snapshots=False, expect=None) is None
+    assert _api.delete_params(purge_snapshots=True, expect="sha256:abc") == {
+        "snapshots": "delete",
+        "expect": "sha256:abc",
+    }
+
+
+@pytest.mark.parametrize("value", ["false", "no", 0, 1, "", None, []])
+def test_a_control_field_that_is_not_a_json_boolean_reads_false(value: object) -> None:
+    """``bool("false")`` is True, and these three fields STEER a caller.
+
+    ``valid`` decides whether a document is publishable and ``done`` ends a
+    wait, so a truthy non-boolean does not merely mislabel — it reverses the
+    meaning in the permissive direction. The value survives in ``raw``.
+    """
+    check = mc.TemplateCheck.from_api({"valid": value})
+    assert check.valid is False
+    assert check.raw["valid"] == value
+    progress = mc.BuildProgress.from_api({"done": value, "unmatched": value})
+    assert progress.done is False
+    assert progress.unmatched is False
+
+
+def test_real_booleans_still_decode() -> None:
+    assert mc.TemplateCheck.from_api({"valid": True}).valid is True
+    assert mc.BuildProgress.from_api({"done": True, "unmatched": True}).done is True
+    assert mc.BuildProgress.from_api({"done": True, "unmatched": True}).unmatched is True
+
+
+@respx.mock
+def test_a_done_that_says_the_build_is_still_running_is_malformed(client: mc.Client) -> None:
+    """Checking the payload's SHAPE left its semantics unchecked.
+
+    ``event: done`` carrying ``{"status": "running", "done": false}`` was yielded
+    as ordinary progress and then ended the iterator normally — the truncated
+    stream arriving through the front door.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", RUNNING))
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        list(client.builds.events("bld-1"))
+
+
+@respx.mock
+def test_a_done_naming_a_terminal_status_without_the_flag_is_accepted(
+    client: mc.Client,
+) -> None:
+    """The platform derives ``done`` from the job and ``status`` from the phase.
+
+    A host that sends one without the other is still saying the build is over,
+    so the check reads either.
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("done", {**DONE, "done": False}))
+    )
+    assert [p.status for p in client.builds.events("bld-1")] == ["succeeded"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_async_half_rejects_the_same_done(async_client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/builds/bld-1/events").mock(
+        return_value=sse(("progress", RUNNING), ("done", RUNNING))
+    )
+    with pytest.raises(mc.MandalaError, match="malformed final event"):
+        [p async for p in async_client.builds.events("bld-1")]
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308, 303])
+def test_a_redirect_is_a_decision_about_the_url_not_a_passing_failure(status: int) -> None:
+    """The rule spelled as "everything that is not 4xx" swept in 3xx.
+
+    httpx is left on its default of not following redirects and every non-2xx
+    becomes an APIError, so a moved endpoint or a base_url missing its path was
+    retried until the wait's own deadline — half an hour, ending in a
+    TimeoutError naming nothing about the redirect that caused it.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.APIError("moved", status=status)) is False
+
+
+def test_5xx_is_still_transient() -> None:
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.APIError("bad gateway", status=502)) is True
+    assert is_transient(mc.APIError("server error", status=500)) is True
+
+
+@pytest.mark.parametrize(
+    ("timeout", "poll", "what"),
+    [
+        (1.0, -1, "poll"),
+        (1.0, 0, "poll"),
+        (1.0, float("nan"), "poll"),
+        (1.0, float("inf"), "poll"),
+        (float("nan"), 5.0, "timeout"),
+        (float("inf"), 5.0, "timeout"),
+        (-1.0, 5.0, "timeout"),
+        (0.0, 5.0, "timeout"),
+        (True, 5.0, "timeout"),
+        ("30", 5.0, "timeout"),
+    ],
+)
+def test_wait_refuses_a_timeout_or_poll_it_cannot_honour(
+    client: mc.Client, timeout: object, poll: object, what: str
+) -> None:
+    """``poll=-1`` raised a bare ValueError out of ``time.sleep`` in the sync
+    half and returned instantly in the async one — a tight loop against a
+    metered endpoint. ``timeout=nan`` loses every ``remaining <= 0`` comparison,
+    so the deadline the docstring promises never arrived."""
+    with pytest.raises(ValueError, match=f"{what} must be a finite, positive"):
+        client.builds.wait("bld-1", timeout=timeout, poll=poll)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_the_async_wait_refuses_them_identically(async_client: mc.AsyncClient) -> None:
+    """The two halves diverged here, which is the part that makes it a parity
+    defect as well as a correctness one."""
+    with pytest.raises(ValueError, match="poll must be a finite, positive"):
+        await async_client.builds.wait("bld-1", timeout=1.0, poll=-1)
+    with pytest.raises(ValueError, match="timeout must be a finite, positive"):
+        await async_client.builds.wait("bld-1", timeout=float("nan"))
+
+
+def test_a_capped_request_cannot_spend_its_budget_once_per_phase() -> None:
+    """httpx applies pool, connect, write and read in SEQUENCE.
+
+    Assigning the caller's whole remaining budget to each let one request run
+    for four times the deadline it was capping, so ``wait(timeout=1)`` could sit
+    in a single request for four seconds.
+    """
+    from mandala_computer._client import _BaseTransport
+
+    current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+    capped = _BaseTransport._cap_budget(current, 8.0)
+    phases = [capped.connect, capped.read, capped.write, capped.pool]
+    assert all(p is not None for p in phases)
+    assert sum(p for p in phases if p is not None) <= 8.0
+
+
+def test_the_cap_still_defers_to_a_tighter_client_timeout() -> None:
+    """It bites near the deadline and nowhere else: a fifteen-minute build
+    spends its middle on the ordinary sixty-second read."""
+    current = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+    from mandala_computer._client import _BaseTransport
+
+    capped = _BaseTransport._cap_budget(current, 1800.0)
+    assert capped.read == 60.0
+    assert capped.connect == 10.0
+
+
+def test_template_can_still_be_built_the_way_it_could_before_ref() -> None:
+    """``Template`` is exported, so its field order is its constructor.
+
+    ``ref`` added ahead of ``label`` broke every positional construction that
+    worked on the previous release — fixtures and downstream code alike, while
+    decoding never noticed because ``from_api`` passes by keyword.
+    """
+    t = mc.Template("ubuntu", "Ubuntu 24.04", "linux", 2, 4096, 40)
+    assert t.name == "ubuntu"
+    assert t.label == "Ubuntu 24.04"
+    assert t.disk_gb == 40
+    assert t.ref is None
+    assert mc.Template.from_api({"name": "u", "ref": "acc-1/u@1.0.0"}).ref == "acc-1/u@1.0.0"

@@ -67,6 +67,25 @@ def _real(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
+def _flag(value: Any, *, default: bool = False) -> bool:
+    """A boolean field off the wire that DECIDES something.
+
+    ``bool(value)`` is this module's ordinary rule and stays it for the fields
+    that only describe — ``auto``, ``orphaned``, ``degraded``. It is the wrong
+    rule for the three that steer a caller: a response spelling ``"valid":
+    "false"`` reported a document as valid, and ``"done": "false"`` told
+    :meth:`Builds.wait` a running build had finished (adversarial review,
+    OPL-3835). Truthiness on a control field fails OPEN and reverses the
+    meaning, which is the one direction a degrading decoder must not fail in.
+
+    Anything that is not a JSON boolean falls back to ``default``, which is the
+    safe reading in each case: not valid, not done, not unmatched. That keeps
+    the module's contract — malformed fields are preserved in ``raw`` and never
+    rejected — while making the failure a conservative one.
+    """
+    return value if isinstance(value, bool) else default
+
+
 def _texts(value: Any) -> builtins.list[str]:
     """A list-of-strings field off the wire, or empty when it is unusable.
 
@@ -330,6 +349,11 @@ class VncConnect:
 @dataclass(frozen=True)
 class Template:
     name: str
+    label: str
+    os: str
+    cpu: int
+    ram_mb: int
+    disk_gb: int
     #: The pinned ``namespace/name@version``, when the platform sent one.
     #:
     #: ``None`` only from a host too old to advertise refs. It matters more than
@@ -339,12 +363,14 @@ class Template:
     #: how to launch their own template. ``publicTemplate`` in the platform's
     #: lib/projection publishes it for exactly that reason, and this model was
     #: dropping it on the floor.
-    ref: str | None
-    label: str
-    os: str
-    cpu: int
-    ram_mb: int
-    disk_gb: int
+    #:
+    #: LAST and defaulted, rather than second where it reads best. This class is
+    #: exported, so its field order is its constructor: added ahead of ``label``
+    #: it broke every ``Template("ubuntu", "Ubuntu", ...)`` that worked on the
+    #: previous release, in fixtures and downstream code alike (adversarial
+    #: review, OPL-3835). Decoding never noticed — ``from_api`` passes by
+    #: keyword.
+    ref: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -442,7 +468,7 @@ class TemplateCheck:
             return None if value is None else _text(value)
 
         return cls(
-            valid=bool(d.get("valid", False)),
+            valid=_flag(d.get("valid")),
             problems=_texts(d.get("problems")),
             ref=maybe("ref"),
             doc_digest=maybe("doc_digest"),
@@ -624,7 +650,7 @@ class BuildProgress:
         return cls(
             id=_text(d.get("id")),
             status=_text(d.get("status")),
-            done=bool(d.get("done", False)),
+            done=_flag(d.get("done")),
             phase=_text(d.get("phase")),
             step=_num(d.get("step")),
             of=_num(d.get("of")),
@@ -632,7 +658,7 @@ class BuildProgress:
             note=_text(d.get("note")),
             error=_text(d.get("error")),
             updated_at=_text(d.get("updated_at")),
-            unmatched=bool(d.get("unmatched", False)),
+            unmatched=_flag(d.get("unmatched")),
             raw=dict(d),
         )
 

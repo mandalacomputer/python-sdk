@@ -341,12 +341,33 @@ class _BaseTransport:
             pool=current.pool,
         )
 
+    #: The httpx phases one request spends its budget in, in the order it spends
+    #: them: waiting for a connection from the pool, connecting, writing, then
+    #: reading. Four, and they are SEQUENTIAL, which is the whole reason
+    #: `_cap_budget` divides rather than assigns.
+    _PHASES = 4
+
     @staticmethod
     def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
-        """Cap every phase of one request to the time its caller has left."""
+        """Cap ONE REQUEST — not one phase of it — to the time its caller has left.
+
+        Every caller passes what remains of a deadline it has promised somebody:
+        `Builds.wait`, `Computer.wait_until_ready`, `wait_until_built`. Handing
+        that whole figure to each of pool, connect, write and read let a single
+        request spend it four times over, because httpx applies those in
+        sequence (adversarial review, OPL-3835) — so a `wait(timeout=1)` could
+        sit in one request for four seconds, and the loop's own deadline check
+        only ran once the request came back. Dividing is what makes the cap mean
+        what its callers document.
+
+        It bites only near the deadline. `min` keeps the client's own timeouts
+        wherever they are tighter, so a fifteen-minute build spends its middle
+        on the ordinary sixty-second read and only the last stretch on a share
+        of what is left.
+        """
         if seconds is None:
             return current
-        cap = max(seconds, 0.001)
+        cap = max(seconds / _BaseTransport._PHASES, 0.001)
 
         def capped(value: float | None) -> float:
             return cap if value is None else min(value, cap)

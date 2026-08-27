@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import math
 import time
 import warnings
 from collections.abc import Iterator, Mapping
@@ -63,8 +64,9 @@ def is_transient(err: BaseException) -> bool:
 
     A 4xx is a request the platform refused on its merits, and repeating it
     unchanged cannot change the answer — except 409, 429 and 408, which are named
-    above. Everything at 5xx, every transport failure and every timeout is the
-    passing kind, which is what a poll loop is for.
+    above. A 3xx goes with them: it is a decision about the URL, and the client
+    does not follow redirects. Everything at 5xx, every transport failure and
+    every timeout is the passing kind, which is what a poll loop is for.
 
     A BARE :class:`~mandala_computer.MandalaError` IS TRANSIENT, and that is a
     deliberate reversal worth naming, because the commit before this one claimed
@@ -106,10 +108,68 @@ def is_transient(err: BaseException) -> bool:
     if isinstance(err, APIError) and err.status == 408:
         return True
     if isinstance(err, APIError):
-        return not (400 <= err.status < 500)
+        # An allow-list of the ranges that pass, rather than "everything that is
+        # not 4xx". Spelled the other way it swept in 3xx (adversarial review,
+        # OPL-3835): httpx is left on its default of NOT following redirects and
+        # `_request` treats every non-2xx as an error, so a moved endpoint or a
+        # base_url missing its trailing path answered 301 and got retried until
+        # the wait's own deadline — half an hour, ending in a TimeoutError that
+        # named nothing about the redirect that caused it. A 3xx is a DECISION
+        # about the URL, as fixed as a 404.
+        return err.status >= 500
     # A transport failure, a body that did not parse, a poll that ran past its
     # cap: none of them says the request was wrong.
     return True
+
+
+#: The statuses a build stops on. ``running`` is the only other one.
+BUILD_TERMINAL = ("succeeded", "failed")
+
+
+def build_event_ended(progress: BuildProgress) -> bool:
+    """Whether a ``done`` event's PAYLOAD agrees that the build is over.
+
+    The event name alone was the test, and it is not enough (adversarial review,
+    OPL-3835). Checking that the payload is a Mapping fixed the shape and left
+    the semantics: ``event: done`` carrying ``{"status": "running", "done":
+    false}`` was yielded as ordinary progress and then ended the iterator
+    normally, so a caller looping over :meth:`Builds.events` reported a build it
+    had stopped watching as a build that finished — the same defect the
+    truncated-stream guard exists to prevent, arriving through the front door.
+
+    ``status`` is accepted alongside ``done`` rather than ``done`` alone: the
+    platform derives the flag from the job and the status from the phase, and a
+    host that sends one without the other is still telling us the build is over.
+    """
+    return progress.done or progress.status in BUILD_TERMINAL
+
+
+def check_wait_args(timeout: float, poll: float) -> None:
+    """The two numbers :meth:`Builds.wait` is steered by, checked once.
+
+    Shared so the halves cannot diverge, and they had (adversarial review,
+    OPL-3835): ``poll=-1`` reached ``time.sleep(-1)`` and raised a bare
+    ``ValueError`` out of the sync half, while ``asyncio.sleep(-1)`` returned at
+    once and turned the async half into a tight loop against a metered endpoint.
+    ``timeout=float("nan")`` was worse in both — every ``remaining <= 0``
+    comparison is false against a NaN, so the deadline this method's docstring
+    promises never arrived and the wait ran for ever.
+
+    Both must be positive. A ``timeout`` of zero is not "poll once and answer":
+    the deadline has already passed when the loop first reads it, so the only
+    thing it can do is raise, and a caller who wants one reading should call
+    :meth:`Builds.progress`. The same rule and the same reasons as
+    ``_require_positive_seconds``, which guards the durations that go on the
+    wire; these two never leave the client.
+    """
+    for value, what in ((timeout, "timeout"), (poll, "poll")):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{what} must be a finite, positive number of seconds")
 
 
 def retry_delay(poll: float, err: BaseException) -> float:
@@ -587,6 +647,11 @@ class Builds:
 
         An account may hold eight of these open at once; the ninth is a
         :class:`~mandala_computer.RateLimitError`.
+
+        A ``done`` that disagrees with itself — the event that ends the stream,
+        carrying a payload that says the build is still running — is a truncated
+        stream and raises rather than ending the iteration. See
+        :func:`build_event_ended`.
         """
         for event in self._t.sse("GET", _api.build_action(build_id, "events")):
             if event.event == "error":
@@ -602,7 +667,14 @@ class Builds:
                 if event.event == "done":
                     raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
-            yield BuildProgress.from_api(event.data)
+            progress = BuildProgress.from_api(event.data)
+            if event.event == "done" and not build_event_ended(progress):
+                # A ``done`` whose payload says the build is still running is the
+                # malformed case too — see build_event_ended. Raised BEFORE the
+                # yield, so a caller cannot act on it as progress and then be
+                # told the stream was never valid.
+                raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
+            yield progress
             if event.event == "done":
                 return
         # The stream ended without saying so. Returning here is indistinguishable
@@ -626,12 +698,15 @@ class Builds:
 
         Raises :class:`~mandala_computer.TimeoutError` if the build is still
         going when ``timeout`` runs out. The build is not stopped by that; only
-        the waiting is.
+        the waiting is. ``timeout`` and ``poll`` must both be finite and
+        positive — a ``ValueError`` before the first request otherwise, in both
+        halves, for the reasons :func:`check_wait_args` gives.
 
         The default timeout is generous because the work is: most of a build is
         copying a multi-gigabyte base image before a single step of the document
         runs, and an agent image is roughly fifteen minutes in total.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         last: BuildProgress | None = None
         # Whether the MOST RECENT poll answered, as against whether any ever did.

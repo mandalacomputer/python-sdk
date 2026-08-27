@@ -86,6 +86,37 @@ def canonical(value: object, what: str) -> str:
     return str.__str__(value)
 
 
+def flag(value: object, what: str) -> bool:
+    """A real ``bool``, and nothing that merely behaves like one.
+
+    The companion to :func:`canonical`, and here for the same class of reason
+    (adversarial review, OPL-3835). The flags in this file were read with plain
+    truthiness, which is the wrong rule for a parameter that ARMS something:
+    ``"false"`` is a non-empty string and therefore true, so
+    ``build_params("false")`` asked for a rebuild of a multi-gigabyte image and
+    ``delete_params(purge_snapshots="false", ...)`` selected the branch that
+    destroys a computer's snapshots along with it. Both are spellings a caller
+    reaching in from a config file, an environment variable or a CLI argument
+    produces by accident, and neither is a spelling of "no".
+
+    ``1`` and ``0`` are refused with them. They read as true and false to a
+    human and would work, but admitting them puts the coercion rule back and the
+    next value through it is a string again.
+
+    Only the flags that arm something go through here. The ones that merely
+    widen a listing — ``allow_partial``, ``include=all`` — stay on truthiness:
+    nothing is destroyed or paid for by reading one of those generously.
+    """
+    if not isinstance(value, bool):
+        # ValueError, not the TypeError ruff prefers, for the reason `canonical`
+        # gives: one exception type for one class of mistake, so a caller
+        # guarding a call cannot catch half of them.
+        raise ValueError(  # noqa: TRY004
+            f"{what} must be True or False, not {type(value).__name__}"
+        )
+    return value
+
+
 def seg(value: str) -> str:
     """One path segment, percent-encoded — including ``/``.
 
@@ -238,8 +269,11 @@ def build_params(no_reuse: bool) -> dict[str, str]:
     same false claim was repeated in the other two clients and pinned as a test
     docstring. The emitted request was right either way; the stated reason was
     not.
+
+    The flag has to BE a bool rather than merely read as one — see :func:`flag`.
+    A rebuild is the expensive branch, and ``"false"`` selected it.
     """
-    return {"no_reuse": "true"} if no_reuse else {}
+    return {"no_reuse": "true"} if flag(no_reuse, "no_reuse") else {}
 
 
 def build_stream_failed(build_id: str, data: Any) -> str:
@@ -500,7 +534,11 @@ def delete_params(*, purge_snapshots: bool, expect: str | None) -> dict[str, str
     stale fingerprint on an ordinary delete would refuse it for a reason that
     has nothing to do with what was asked.
     """
-    if not purge_snapshots:
+    # A real bool, not anything truthy: this is the branch that destroys a
+    # computer's snapshots along with it, and ``purge_snapshots="false"``
+    # selected it. The ``expect`` interlock below does not cover that — it binds
+    # the purge to the set that was looked at, not to whether a purge was meant.
+    if not flag(purge_snapshots, "purge_snapshots"):
         return None
     # Canonical BEFORE the emptiness check, and this is the guard where that
     # ordering matters most (/code-review, OPL-3835). ``__bool__`` is overridable
