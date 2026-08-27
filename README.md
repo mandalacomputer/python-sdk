@@ -1091,6 +1091,7 @@ Everything derives from `MandalaError`.
 | `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
 | `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
+| `ConnectionError` | the request never completed: DNS, refused socket, broken TLS |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 `PlanLimitError`'s message names the limit that was hit.
@@ -1166,6 +1167,19 @@ happened.
 The rule of thumb across all four: reads are always safe to retry, and anything
 that creates deserves a look first.
 
+`is_transient(err)` is that rule as a function, and it answers for the riskiest
+caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
+`ConflictError` (minus `MoveRequiredError`), `RateLimitError`, `UnavailableError`
+and `ConnectionError`, and no to everything above whose outcome is unknown,
+502 and 504 included. The same four classes, and only those, answer yes in
+mandala-computer-typescript and mandala-computer-mcp.
+
+The `wait_*` helpers do not ask it. They replay idempotent reads under a
+deadline you set, so they ride out every 5xx — a hypervisor briefly away during
+a boot is what a poll loop is *for* — and give up only on a failure describing
+the **request**: a 4xx other than 408, 409 and 429, a 3xx, a certificate, or a
+524. Two audiences, two answers.
+
 One caveat the table cannot show: these classes are for failures that arrive as
 an HTTP status. The agent loop reports its own failures as events inside a
 successful response, and a gateway or origin status relayed that way comes back
@@ -1180,9 +1194,10 @@ under way, a guest agent that has not finished coming up, or a suspend committed
 to the computer a moment before your call. Waiting and retrying is the fix;
 changing the request is not.
 
-A retry loop on it terminates rather than spinning forever: a guest agent that
-stays silent past its boot window stops being a conflict and becomes a 502
-`APIError`, which is the platform saying the agent is broken rather than late.
+A retry loop on it terminates because it has a deadline, not because of any
+status: a guest agent that stays silent past its boot window does stop being a
+conflict and become a 502, but `wait_for_guest` polls through a 502 as well —
+an agent that is merely slow answers one for its first seconds too.
 
 ```python
 import mandala_computer as mc

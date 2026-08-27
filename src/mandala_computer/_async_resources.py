@@ -58,6 +58,8 @@ def _reworded(doc: str | None, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+from ._computer import _poll_delay
+from ._exceptions import _is_transient_for_poll
 from ._resources import (
     EPHEMERAL_DOC,
     Builds,
@@ -66,8 +68,6 @@ from ._resources import (
     _wait_timed_out,
     check_wait_args,
     classify_poll_failure,
-    is_transient,
-    retry_delay,
     warn_cleanup_failed,
 )
 from ._sse import SSEEvent
@@ -442,12 +442,12 @@ class AsyncBuilds:
                 if last.done:
                     return last
             except MandalaError as err:
-                if not is_transient(err):
+                if not _is_transient_for_poll(err):
                     raise
                 poll_state = classify_poll_failure(
                     err, started, remaining, self._t.phase_ceiling(err)
                 )
-                delay = retry_delay(poll, err)
+                delay = _poll_delay(err, poll)
             if poll_state is _LastPoll.ANSWERED and last is not None:
                 # OUTSIDE the handler above, which treats a bare MandalaError as
                 # transient by design — raised inside it, this was swallowed and

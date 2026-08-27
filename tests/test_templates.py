@@ -726,7 +726,8 @@ def test_a_trailing_newline_is_not_a_version() -> None:
         (mc.OriginUnreachableError("origin", status=523), True),
         (mc.OriginResponseError("origin", status=520), True),
         (mc.TimeoutError("poll ran long"), True),
-        (mc.MandalaError("body did not parse"), True),
+        (mc.ConnectionError("connection reset"), True),
+        (mc.MandalaError("body did not parse"), False),
         (mc.APIError("bad request", status=400), False),
         (mc.NotFoundError("no such build", status=404), False),
         (mc.PlanLimitError("no", status=402), False),
@@ -742,18 +743,18 @@ def test_the_retry_policy_keeps_the_passing_failures_and_drops_the_decisions(
     that ran past its own cap ended a fourteen-minute wait — and
     OriginUnreachableError's own docstring calls itself a passing outage.
     """
-    from mandala_computer._resources import is_transient
+    from mandala_computer._exceptions import _is_transient_for_poll as is_transient
 
     assert is_transient(err) is retried
 
 
 def test_a_rate_limit_is_retried_no_sooner_than_it_asked() -> None:
     """A 429 retried on a fixed five-second poll is the loop that caused it."""
-    from mandala_computer._resources import retry_delay
+    from mandala_computer._computer import _poll_delay as retry_delay
 
-    assert retry_delay(5.0, mc.RateLimitError("slow", status=429, retry_after=30.0)) == 30.0
-    assert retry_delay(5.0, mc.RateLimitError("slow", status=429)) == 5.0
-    assert retry_delay(5.0, mc.UnavailableError("away", status=503)) == 5.0
+    assert retry_delay(mc.RateLimitError("slow", status=429, retry_after=30.0), 5.0) == 30.0
+    assert retry_delay(mc.RateLimitError("slow", status=429), 5.0) == 5.0
+    assert retry_delay(mc.UnavailableError("away", status=503), 5.0) == 5.0
 
 
 @respx.mock
@@ -833,12 +834,12 @@ def test_a_retry_after_does_not_set_the_pace_for_the_rest_of_the_wait() -> None:
     one for every later iteration. The TypeScript twin keeps ``pollMs``
     immutable and recomputes, giving [30, 5, 5] where this gave [30, 30, 30].
     """
-    from mandala_computer._resources import retry_delay
+    from mandala_computer._computer import _poll_delay as retry_delay
 
     poll = 5.0
     slow = mc.RateLimitError("slow down", status=429, retry_after=30.0)
     away = mc.UnavailableError("no host", status=503)
-    assert [retry_delay(poll, slow), retry_delay(poll, away), retry_delay(poll, away)] == [
+    assert [retry_delay(slow, poll), retry_delay(away, poll), retry_delay(away, poll)] == [
         30.0,
         5.0,
         5.0,
@@ -875,22 +876,34 @@ def test_408_is_repeatable_by_definition() -> None:
     Cloudflare fronts this surface and emits it; it is the edge saying it waited
     long enough, not a decision about anything.
     """
-    from mandala_computer._resources import is_transient
+    from mandala_computer._exceptions import _is_transient_for_poll as is_transient
 
     assert is_transient(mc.APIError("request timeout", status=408)) is True
     assert is_transient(mc.APIError("bad request", status=400)) is False
 
 
-def test_a_malformed_body_is_transient_and_the_docstring_says_so() -> None:
-    """Deliberate, and the reversal is named rather than left as a surprise.
+def test_a_bare_mandala_error_is_no_longer_polled_through() -> None:
+    """Reversed again in OPL-3724, and the second reversal is the durable one.
 
-    A bare MandalaError is what a dropped connection and a captive portal both
-    raise. The comment that used to sit over the catch claimed the opposite.
+    A bare MandalaError used to be transient here because it was what a dropped
+    connection raised — and that half is now a :class:`ConnectionError`, which
+    every client's predicates name. What is left under the base class is a
+    response that arrived and made no sense, plus the VERDICTS the poll loops
+    raise about a poll that succeeded ("this move is no longer listed"). Polling
+    through a verdict is an infinite loop with a deadline on it: it cost this
+    package a fix in OPL-3835, where the throw had to be moved outside the
+    handler, and it cost the TypeScript SDK three non-terminating tests when the
+    predicate was first ported there with MandalaError as its floor.
+
+    The floor is now "a failed request" rather than "our error", so the verdict
+    is safe wherever it is raised, and the captive portal reports "answered
+    text/html, not a JSON object" on the first poll instead of a timeout that
+    names nothing half an hour later.
     """
-    from mandala_computer._resources import is_transient
+    from mandala_computer._exceptions import _is_transient_for_poll as is_transient
 
-    assert is_transient(mc.MandalaError("expected JSON, got <html>")) is True
-    assert "TRANSIENT" in (is_transient.__doc__ or "")
+    assert is_transient(mc.MandalaError("expected JSON, got <html>")) is False
+    assert is_transient(mc.ConnectionError("connection reset by peer")) is True
 
 
 # The adversarial-review pass on the branch (OPL-3835). Every one of these was
@@ -1107,13 +1120,13 @@ def test_a_redirect_is_a_decision_about_the_url_not_a_passing_failure(status: in
     retried until the wait's own deadline — half an hour, ending in a
     TimeoutError naming nothing about the redirect that caused it.
     """
-    from mandala_computer._resources import is_transient
+    from mandala_computer._exceptions import _is_transient_for_poll as is_transient
 
     assert is_transient(mc.APIError("moved", status=status)) is False
 
 
 def test_5xx_is_still_transient() -> None:
-    from mandala_computer._resources import is_transient
+    from mandala_computer._exceptions import _is_transient_for_poll as is_transient
 
     assert is_transient(mc.APIError("bad gateway", status=502)) is True
     assert is_transient(mc.APIError("server error", status=500)) is True
@@ -1518,19 +1531,20 @@ def test_a_429_without_a_retry_after_still_backs_off(client: mc.Client) -> None:
     back for the full half-hour default — the loop the function exists to break,
     with its one brake removed.
     """
-    from mandala_computer._resources import RATE_LIMITED_FLOOR, retry_delay
+    from mandala_computer._computer import RATE_LIMITED_FLOOR
+    from mandala_computer._computer import _poll_delay as retry_delay
 
     bare = mc.RateLimitError("slow down", status=429)
     assert bare.retry_after is None
-    assert retry_delay(0, bare) == RATE_LIMITED_FLOOR
-    assert retry_delay(5.0, bare) == 5.0
+    assert retry_delay(bare, 0) == RATE_LIMITED_FLOOR
+    assert retry_delay(bare, 5.0) == 5.0
 
     told = mc.RateLimitError("slow down", status=429, retry_after=30.0)
-    assert retry_delay(0, told) == 30.0
-    assert retry_delay(60.0, told) == 60.0
+    assert retry_delay(told, 0) == 30.0
+    assert retry_delay(told, 60.0) == 60.0
 
     # A non-429 keeps the caller's poll, zero included: nothing asked us to wait.
-    assert retry_delay(0, mc.APIError("boom", status=503)) == 0
+    assert retry_delay(mc.APIError("boom", status=503), 0) == 0
 
 
 @respx.mock
