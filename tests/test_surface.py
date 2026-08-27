@@ -51,6 +51,18 @@ ALLOWED = {
     # Schema, and a check of a document against it that stores nothing.
     ("GET", "templates/schema"),
     ("POST", "templates/validate"),
+    # The store (platform OPL-3789, OPL-3830): publish a document under a ref of
+    # your own, read one back, retire one.
+    ("POST", "templates"),
+    ("GET", "templates/:namespace/:name"),
+    ("DELETE", "templates/:namespace/:name"),
+    # Compiling a document into an image (platform OPL-3791, OPL-3794). The job,
+    # its record, and the two halves of watching it — a poll and a stream.
+    ("POST", "builds"),
+    ("GET", "builds"),
+    ("GET", "builds/:id"),
+    ("GET", "builds/:id/progress"),
+    ("GET", "builds/:id/events"),
     ("GET", "sizes"),
     ("GET", "computers"),
     ("POST", "computers"),
@@ -118,14 +130,12 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # The template document routes (platform OPL-3568). Listed rather than
-    # wrapped because there is nothing yet to wrap them FOR: no route publishes
-    # a document, so an SDK method that validated one would be a checker for a
-    # file this SDK gives its caller no way to use. They become worth a method
-    # with publish and launch-by-ref, and until then the gap stays a line
-    # somebody has to delete. The TypeScript SDK holds them in the same set.
-    ("GET", "templates/schema"),
-    ("POST", "templates/validate"),
+    # The two template document routes were pinned here, behind a comment saying
+    # they "become worth a method with publish and launch-by-ref". Publish
+    # shipped in platform OPL-3789 and launch-by-ref in OPL-3788, so the line
+    # became somebody's to delete and this is it (OPL-3835). Nothing has replaced
+    # them: every route this SDK can reach, it calls. The TypeScript SDK deleted
+    # the same two.
 }
 
 # Every query, header and body field the platform documents, by route —
@@ -146,6 +156,21 @@ PARAMETERS: dict[str, set[str]] = {
     # so it contributes nothing here, the same way the file upload's does not.
     "GET templates/schema": set(),
     "POST templates/validate": set(),
+    # The publish and the build take their document the same way, raw, so they
+    # contribute no body fields either.
+    "POST templates": set(),
+    # `version` on both halves of the ref route, and the two mean different
+    # things by omission: the newest on a read, every version on a retire. An
+    # EMPTY one is refused by this SDK before it is sent — see
+    # `_api.template_version_params`, and the platform defect it exists to be on
+    # the right side of.
+    "GET templates/:namespace/:name": {"query:version"},
+    "DELETE templates/:namespace/:name": {"query:version"},
+    "POST builds": {"query:no_reuse"},
+    "GET builds": set(),
+    "GET builds/:id": set(),
+    "GET builds/:id/progress": set(),
+    "GET builds/:id/events": set(),
     "GET sizes": set(),
     "GET computers": {"query:allow_partial"},
     "POST computers": {
@@ -312,6 +337,78 @@ USAGE = {
 AGENT_DONE = b'event: done\ndata: {"steps": 1, "stop": "end_turn", "text": "done"}\n\n'
 AGENT_RESULT = {"steps": 1, "stop": "end_turn", "text": "done"}
 
+# One published template, in the platform's own spelling (platform OPL-3789).
+#
+# `document` as an OBJECT, not the canonical string the store keeps: the platform
+# parses it back on the way out so a caller reading a template gets JSON it can
+# address. A fixture holding the string would let a decoder that forgot to expect
+# an object pass.
+PUBLISHED_TEMPLATE = {
+    "ref": "acc-1/devbox@1.0.0",
+    "doc_digest": "sha256:aaaa",
+    "document": {"apiVersion": "mandala/v1", "kind": "Template"},
+    "template": {
+        "name": "devbox",
+        "ref": "acc-1/devbox@1.0.0",
+        "label": "My desktop",
+        "os": "linux",
+        "cpu": 2,
+        "ram_mb": 4096,
+        "disk_gb": 30,
+    },
+    "versions": ["1.0.0"],
+    "published_at": "2026-08-26T12:00:00.000Z",
+}
+
+# What a retire took away (platform OPL-3830). `templates` and `refs_claimed`
+# deliberately differ: a retired ref still counts, and a fixture where the two
+# agreed would let a decoder that read one field for both pass.
+RETIRED_TEMPLATES = {
+    "retired": ["acc-1/devbox@1.0.0"],
+    "retired_at": "2026-08-26T13:00:00.000Z",
+    "versions": [],
+    "templates": 0,
+    "refs_claimed": 1,
+}
+
+TEMPLATE_CHECK = {
+    "valid": True,
+    "ref": "acc-1/devbox@1.0.0",
+    "doc_digest": "sha256:aaaa",
+    "build_digest": "sha256:bbbb",
+}
+
+TEMPLATE_BUILD = {
+    "id": "bld-1",
+    "ref": "acc-1/devbox@1.0.0",
+    "status": "running",
+    "started_at": "2026-08-26T12:00:00.000Z",
+}
+
+BUILD_PROGRESS = {
+    "id": "bld-1",
+    "status": "succeeded",
+    "done": True,
+    "phase": "published",
+    "step": 2,
+    "of": 2,
+    "steps": [
+        {"n": 1, "kind": "apt", "label": "ripgrep", "status": "done"},
+        {"n": 2, "kind": "finish", "label": "cleanup", "status": "done"},
+    ],
+    "note": "",
+    "error": "",
+    "updated_at": "2026-08-26T12:15:00.000Z",
+}
+
+BUILD_EVENTS = (
+    b"event: progress\ndata: "
+    + json.dumps({**BUILD_PROGRESS, "done": False, "status": "running"}).encode()
+    + b"\n\nevent: done\ndata: "
+    + json.dumps(BUILD_PROGRESS).encode()
+    + b"\n\n"
+)
+
 
 def pattern_for(path: str) -> str:
     """Reduce a concrete path to its route shape, as the server's proxy does.
@@ -327,7 +424,7 @@ def pattern_for(path: str) -> str:
     parts = [p for p in path.strip("/").split("/") if p]
 
     def one(i: int, seg: str) -> str:
-        if i and parts[i - 1] in ("computers", "snapshots"):
+        if i and parts[i - 1] in ("computers", "snapshots", "builds"):
             return ":id"
         if i == 3 and parts[0] == "computers" and parts[2] == "windows":
             return ":window"
@@ -335,6 +432,15 @@ def pattern_for(path: str) -> str:
             return ":pid"
         return seg
 
+    # A template ref's two halves, pinned to a THREE-segment path under
+    # `templates` — which is what keeps the two-segment literals,
+    # `templates/schema` and `templates/validate`, reducing to themselves. The
+    # platform's own patternFor pins them the same way and for the same reason,
+    # and a mirror that reduced them differently would compare two different
+    # tables and call them equal. Two placeholders and not one, because a
+    # namespace is an account id and a name is not.
+    if len(parts) == 3 and parts[0] == "templates":
+        return "templates/:namespace/:name"
     return "/".join(one(i, seg) for i, seg in enumerate(parts))
 
 
@@ -374,8 +480,31 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"windows": [WINDOW]})
     if "/windows/" in path:
         return httpx.Response(200, json={"ok": True, "window": WINDOW, "gone": False})
+    if path.endswith("/templates/schema"):
+        return httpx.Response(200, json={"$id": f"{BASE}/templates/schema"})
+    if path.endswith("/templates/validate"):
+        return httpx.Response(200, json=TEMPLATE_CHECK)
+    if path.endswith("/builds/bld-1/events"):
+        return httpx.Response(
+            200, content=BUILD_EVENTS, headers={"Content-Type": "text/event-stream"}
+        )
+    if path.endswith("/progress"):
+        return httpx.Response(200, json=BUILD_PROGRESS)
+    if path.endswith("/builds"):
+        return httpx.Response(200, json=[TEMPLATE_BUILD] if get else TEMPLATE_BUILD)
+    if "/builds/" in path:
+        return httpx.Response(200, json=TEMPLATE_BUILD)
     if path.endswith(("/templates", "/sizes")):
-        return httpx.Response(200, json=[])
+        # A publish is a POST to the collection and answers with the one
+        # template it stored, the same way a snapshot POST does below.
+        return httpx.Response(200, json=[] if get else PUBLISHED_TEMPLATE)
+    # The store's ref route, which is three segments and is therefore NOT
+    # `/templates`. DELETE and GET answer different shapes, which is the point:
+    # a retire has no document left to hand back.
+    if "/templates/" in path:
+        return httpx.Response(
+            200, json=RETIRED_TEMPLATES if request.method == "DELETE" else PUBLISHED_TEMPLATE
+        )
     # Collections list on GET and return a single object on POST — getting this
     # backwards is what made the first version of this test fail.
     if path.endswith("/snapshots"):
@@ -427,6 +556,26 @@ def called_routes(calls: object) -> set[tuple[str, str]]:
 def exercise_everything(client: mc.Client) -> None:
     """Call every method the SDK exposes that performs a request."""
     client.templates.list()
+    # The document format, and the store on top of it (platform OPL-3568,
+    # OPL-3789, OPL-3830). Both spellings of the ref routes, because `version` is
+    # a parameter like any other and a call that never sends one is the gap the
+    # parameter half of this test exists to see.
+    client.templates.schema()
+    client.templates.validate("apiVersion: mandala/v1")
+    client.templates.publish("apiVersion: mandala/v1")
+    client.templates.get("acc-1", "devbox")
+    client.templates.get("acc-1", "devbox", version="1.0.0")
+    client.templates.retire("acc-1", "devbox", version="1.0.0")
+    client.templates.retire("acc-1", "devbox")
+    # Compiling one (platform OPL-3791, OPL-3794). `no_reuse` on one of the two,
+    # for the same reason.
+    client.builds.start("apiVersion: mandala/v1")
+    client.builds.start("apiVersion: mandala/v1", no_reuse=True)
+    client.builds.list()
+    client.builds.get("bld-1")
+    client.builds.progress("bld-1")
+    for _ in client.builds.events("bld-1"):
+        break
     client.sizes.list()
     client.computers.list()
     client.computers.get("vm-1")
@@ -531,6 +680,20 @@ def exercise_everything(client: mc.Client) -> None:
 async def exercise_everything_async(client: mc.AsyncClient) -> None:
     """The async mirror of exercise_everything."""
     await client.templates.list()
+    await client.templates.schema()
+    await client.templates.validate("apiVersion: mandala/v1")
+    await client.templates.publish("apiVersion: mandala/v1")
+    await client.templates.get("acc-1", "devbox")
+    await client.templates.get("acc-1", "devbox", version="1.0.0")
+    await client.templates.retire("acc-1", "devbox", version="1.0.0")
+    await client.templates.retire("acc-1", "devbox")
+    await client.builds.start("apiVersion: mandala/v1")
+    await client.builds.start("apiVersion: mandala/v1", no_reuse=True)
+    await client.builds.list()
+    await client.builds.get("bld-1")
+    await client.builds.progress("bld-1")
+    async for _ in client.builds.events("bld-1"):
+        break
     await client.sizes.list()
     await client.computers.list()
     await client.computers.get("vm-1")

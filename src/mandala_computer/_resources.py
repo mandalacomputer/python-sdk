@@ -3,18 +3,241 @@
 from __future__ import annotations
 
 import builtins
+import math
+import time
 import warnings
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import closing, contextmanager
 from datetime import datetime
+from enum import Enum, auto
 from typing import Any
 
 from . import _api
 from ._client import Transport
 from ._computer import Computer
-from ._models import Listing, Move, Retention, Size, Snapshot, Template, UsageReport
+from ._exceptions import (
+    APIError,
+    ConflictError,
+    MandalaError,
+    MoveRequiredError,
+    OriginTLSError,
+    RateLimitError,
+    TimeoutError,
+)
+from ._models import (
+    BuildProgress,
+    Listing,
+    Move,
+    PublishedTemplate,
+    Retention,
+    RetiredTemplates,
+    Size,
+    Snapshot,
+    Template,
+    TemplateBuild,
+    TemplateCheck,
+    UsageReport,
+)
+from ._sse import SSEEvent
 
-__all__ = ["Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
+__all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
+
+
+def is_transient(err: BaseException) -> bool:
+    """Whether a poll loop may swallow this and ask again.
+
+    STATUS-BASED for the caller-error range, class-based for the one deployment
+    fault, retry everything else. That shape took two reviews to arrive at, and
+    both corrections are worth keeping:
+
+    * It began as a deny-list of four permanent classes with ``except
+      MandalaError: pass`` under it, which swallowed a 400 and a malformed body
+      for the full half-hour default before surfacing as a misleading timeout.
+    * It was then an allow-list of three transient classes, which was worse in
+      the other direction: it dropped every failure the original rode out.
+      :class:`~mandala_computer.GatewayTimeoutError` (504/524),
+      :class:`~mandala_computer.OriginUnreachableError` (521-523) and
+      :class:`~mandala_computer.OriginResponseError` (520) all became fatal —
+      and ``OriginUnreachableError``'s own docstring in this package calls itself
+      "a passing outage" and says to retry a read freely. So did this SDK's own
+      :class:`~mandala_computer.TimeoutError`, which is what a poll capped by
+      ``timeout_cap`` raises when one fan-out runs long: a single slow poll
+      fourteen minutes into a build ended the wait.
+
+    A 4xx is a request the platform refused on its merits, and repeating it
+    unchanged cannot change the answer — except 409, 429 and 408, which are named
+    above. A 3xx goes with them: it is a decision about the URL, and the client
+    does not follow redirects. Everything at 5xx, every transport failure and
+    every timeout is the passing kind, which is what a poll loop is for.
+
+    A BARE :class:`~mandala_computer.MandalaError` IS TRANSIENT, and that is a
+    deliberate reversal worth naming, because the commit before this one claimed
+    the opposite in a comment. It is what ``_request_failed`` raises for a
+    connection that never completed, and what ``_not_an_object`` raises for a
+    captive portal or a proxy answering HTML instead of the platform — both of
+    which clear, and neither of which says the request was wrong. The wait's own
+    deadline is what bounds the retrying.
+
+    IT NO LONGER MIRRORS THE TYPESCRIPT SDK, whose ``isTransient`` is still an
+    allow-list of four classes. Several statuses now disagree between the two,
+    and that is the second front of OPL-3724 rather than something to paper over
+    here: this rule is the better one, and moving TypeScript to it means changing
+    an exported predicate that ``waitForMove`` and embedders both rely on.
+
+    An ``OriginTLSError`` is a 525/526 and the 5xx rule would retry it, so it is
+    named: the edge and the platform disagreeing about a certificate fails
+    identically on every retry and is a deployment somebody has to fix. The same
+    call ``_FATAL_WHILE_WAITING`` in _computer.py makes about it.
+
+    A move offer is excluded for its own reason — it is a
+    :class:`~mandala_computer.ConflictError` subclass and is a DECISION about the
+    size asked for, so the same request answers the same way for ever. It cannot
+    arise from a build poll; it is named so the predicate stays true wherever it
+    is reused.
+    """
+    if isinstance(err, MoveRequiredError | OriginTLSError):
+        return False
+    # The two 4xx that are not decisions, named ahead of the range rule. A 409 is
+    # a hypervisor already building — one build runs per host — and a 429 is a
+    # request that was fine and arrived too often. Whether a 409 clears is in the
+    # BODY and not the status, which is why MoveRequiredError is excluded above
+    # rather than here.
+    if isinstance(err, ConflictError | RateLimitError):
+        return True
+    # 408, which RFC 9110 defines as a request the client may repeat unchanged.
+    # Cloudflare fronts this surface and emits it, and it is not a decision about
+    # anything: it is the edge saying it waited long enough.
+    if isinstance(err, APIError) and err.status == 408:
+        return True
+    if isinstance(err, APIError):
+        # An allow-list of the ranges that pass, rather than "everything that is
+        # not 4xx". Spelled the other way it swept in 3xx (adversarial review,
+        # OPL-3835): httpx is left on its default of NOT following redirects and
+        # `_request` treats every non-2xx as an error, so a moved endpoint or a
+        # base_url missing its trailing path answered 301 and got retried until
+        # the wait's own deadline — half an hour, ending in a TimeoutError that
+        # named nothing about the redirect that caused it. A 3xx is a DECISION
+        # about the URL, as fixed as a 404.
+        return err.status >= 500
+    # A transport failure, a body that did not parse, a poll that ran past its
+    # cap: none of them says the request was wrong.
+    return True
+
+
+def check_wait_args(timeout: float, poll: float) -> None:
+    """The two numbers :meth:`Builds.wait` is steered by, checked once.
+
+    Shared so the halves cannot diverge, and they had (adversarial review,
+    OPL-3835): ``poll=-1`` reached ``time.sleep(-1)`` and raised a bare
+    ``ValueError`` out of the sync half, while ``asyncio.sleep(-1)`` returned at
+    once and turned the async half into a tight loop against a metered endpoint.
+    ``timeout=float("nan")`` was worse in both — every ``remaining <= 0``
+    comparison is false against a NaN, so the deadline this method's docstring
+    promises never arrived and the wait ran for ever.
+
+    NEGATIVE and non-finite only. Zero was refused too for one commit, and that
+    was a compatibility break wider than the bug it was fixing (second
+    adversarial review, OPL-3835): every sibling wait in this SDK —
+    ``wait_until_built``, ``wait_until_running``, ``wait_for_guest`` — takes
+    ``poll=0``, and this repository's own tests pass it at twenty-odd call
+    sites. ``timeout=0`` is an already-expired deadline, and the sibling waits
+    answer it with the ``TimeoutError`` their callers are catching; raising a
+    ``ValueError`` instead would go past that handler.
+
+    ``poll=0`` DOES mean no delay between polls, and against a live endpoint
+    that is a hammering loop — ``time.sleep(0)`` and ``await asyncio.sleep(0)``
+    both return at once (third adversarial review, OPL-3835). It is allowed
+    anyway because it is not this method's property to fix: all eight sibling
+    wait loops in _computer.py and _async_computer.py do the same thing with the
+    same argument and there is no poll floor anywhere in the SDK, so refusing it
+    HERE would make one wait stricter than the eight beside it while leaving the
+    hammering reachable through any of them. A floor is worth having; it is
+    worth having everywhere at once, not smuggled in through the one wait a
+    review happened to look at.
+    """
+    for value, what in ((timeout, "timeout"), (poll, "poll")):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{what} must be a finite, non-negative number of seconds")
+
+
+#: The least a wait will sleep after a 429, when `poll` and ``Retry-After``
+#: both fail to supply one. See :func:`retry_delay`.
+RATE_LIMITED_FLOOR = 1.0
+
+
+class _LastPoll(Enum):
+    """What became of the most recent poll, in three states rather than two.
+
+    ``observed: bool`` forced a claim the SDK cannot make (adversarial review,
+    OPL-3835). A timeout that is CONSISTENT with this wait's own cap is not
+    proof it fired: a caller-supplied transport can raise ``ReadTimeout``
+    itself, and httpcore maps a phase's ``socket.timeout`` — which IS the
+    builtin ``TimeoutError`` — onto the same named class. Saying "was still
+    running" there asserts the fleet is fine on the strength of a stopwatch.
+    """
+
+    #: It answered. Whatever it said is current.
+    ANSWERED = auto()
+    #: It demonstrably did not answer — a refusal, a dropped connection, or a
+    #: timeout this wait's cap cannot have caused.
+    FAILED = auto()
+    #: A timeout consistent with this wait's own deadline and with a transport
+    #: failure alike. Neither side can be blamed, so the message blames neither.
+    UNRESOLVED = auto()
+
+
+def classify_poll_failure(
+    err: BaseException, started: float, budget: float, ceiling: float | None
+) -> _LastPoll:
+    """Whether a failed poll says anything about the PLATFORM.
+
+    ``ceiling`` is the client's own limit for the phase that timed out, or
+    ``None`` where the phase cannot be named: "tighter" is a question about ONE
+    phase, and a connect stall measured against a read timeout got it wrong in
+    both directions (adversarial review, OPL-3835).
+
+    Three things have to hold before a timeout is even a CANDIDATE for this
+    wait's own cap: the phase must be nameable, the cap must have been the
+    tighter of the two for that phase, and the request must have spent
+    substantially all of the budget it was given — a timeout arriving at once
+    exhausted nothing. Even then the answer is UNRESOLVED rather than "ours",
+    because none of it rules out a transport raising the same class itself.
+    """
+    if not isinstance(err, TimeoutError):
+        return _LastPoll.FAILED
+    if ceiling is None or budget >= ceiling:
+        return _LastPoll.FAILED
+    if time.monotonic() - started < budget * 0.9:
+        return _LastPoll.FAILED
+    return _LastPoll.UNRESOLVED
+
+
+def retry_delay(poll: float, err: BaseException) -> float:
+    """The ordinary polling delay, raised when the platform asked us to wait.
+
+    A 429 retried on a fixed five-second poll is the loop that caused it. The
+    TypeScript SDK has had ``retryDelay`` since the move work; this is the same
+    thing, and the reason it did not exist here is that no Python wait retried a
+    429 until this one.
+
+    THE FLOOR IS THE POINT, and ``poll`` cannot supply it. A ``RateLimitError``
+    carries ``retry_after`` only when the platform sent a ``Retry-After``
+    header, and it often does not; with ``poll=0`` — which this SDK accepts,
+    because all eight sibling waits do — the delay was then zero, so a wait hit
+    a rate limiter and retried it back to back for the full half-hour default
+    (/code-review, OPL-3835). That is the loop this function exists to break,
+    running with its one brake removed. A second is arbitrary and any positive
+    number would do; what matters is that a 429 never retries instantly.
+    """
+    if isinstance(err, RateLimitError):
+        return max(poll, err.retry_after or RATE_LIMITED_FLOOR)
+    return poll
+
 
 EPHEMERAL_DOC = """Provision a computer for the duration of the block, then destroy it.
 
@@ -244,6 +467,395 @@ class Templates:
     def list(self) -> builtins.list[Template]:
         data = self._t.json_array("GET", _api.TEMPLATES)
         return [Template.from_api(t) for t in data]
+
+    def schema(self) -> Mapping[str, Any]:
+        """The JSON Schema for a ``mandala/v1`` document.
+
+        Returned as it arrives rather than wrapped in a type, because it is a
+        schema: what a caller does with it is point an editor or a validator at
+        it, and a shape of our own over the top would be a second, worse
+        description of the same thing. Its ``$id`` is the URL it came from, so a
+        ``$ref`` to it resolves.
+        """
+        return self._t.json_object("GET", _api.TEMPLATE_SCHEMA)
+
+    def validate(self, document: str) -> TemplateCheck:
+        """Check a document without publishing it.
+
+        Side-effect free and claims no ref, so it is safe on a draft and safe to
+        call repeatedly. Worth doing while iterating: a document that is wrong
+        comes back with EVERY problem at once, where :meth:`publish` reports the
+        first thing that stops it.
+
+        Does not raise for an invalid document. That is not leniency — an
+        invalid document is the answer to the question this method asks, and the
+        platform says so with a 200. Read
+        :attr:`~mandala_computer.TemplateCheck.valid`.
+
+        The document goes as raw bytes, JSON or YAML, exactly as written. There
+        is no envelope to build and none to get wrong.
+        """
+        data = self._t.json_object(
+            "POST", _api.TEMPLATE_VALIDATE, content=_api.template_document(document)
+        )
+        return TemplateCheck.from_api(data)
+
+    def publish(self, document: str) -> PublishedTemplate:
+        """Store a document under a ref of your own, so a create can launch it.
+
+        THE NAMESPACE IS YOUR ACCOUNT. ``metadata.namespace`` has to be your
+        account id — anything else is a
+        :class:`~mandala_computer.PermissionDeniedError`, ``system`` included —
+        and this SDK does not rewrite it, because silently relocating somebody's
+        document would publish a ref that is not the one in the file they
+        submitted.
+
+        A REF IS IMMUTABLE. Publishing the identical document again succeeds and
+        changes nothing, so a pipeline that republishes on every commit is safe.
+        Publishing a DIFFERENT document under the same ref is a
+        :class:`~mandala_computer.ConflictError`, and the fix is to bump
+        ``metadata.version``. What counts as different is the digest, so a
+        changed label is a change.
+
+        A ref you have RETIRED stays spoken for and cannot be republished,
+        identical bytes included. See :meth:`retire`.
+        """
+        data = self._t.json_object("POST", _api.TEMPLATES, content=_api.template_document(document))
+        return PublishedTemplate.from_api(data)
+
+    def get(self, namespace: str, name: str, *, version: str | None = None) -> PublishedTemplate:
+        """Read one template back, as the document it was written as.
+
+        Works for your own namespace and for ``system``, so you can see what you
+        are layering onto. Another account's namespace is a
+        :class:`~mandala_computer.NotFoundError`, the same answer a name that
+        does not exist gets.
+
+        Without ``version`` this is the newest published version of that name —
+        which is also what a create naming the unpinned ``namespace/name``
+        resolves to. :attr:`~mandala_computer.PublishedTemplate.versions` lists
+        the rest.
+
+        A ref you retired is a :class:`~mandala_computer.NotFoundError` whose
+        message names the date it went, rather than claiming the template never
+        existed. Read the message before concluding you mistyped something.
+        """
+        data = self._t.json_object(
+            "GET",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return PublishedTemplate.from_api(data)
+
+    def retire(self, namespace: str, name: str, *, version: str | None = None) -> RetiredTemplates:
+        """Retire a template you published, so it stops resolving and stops
+        counting against your ceiling.
+
+        WITH ``version`` this retires that one version. WITHOUT it, this retires
+        EVERY version of the name — which is what "retire this template" means,
+        and is deliberately not :meth:`get`'s "the newest": a delete that
+        quietly took the latest one would let a loop walk backwards through a
+        history it never asked about. An empty string is refused here rather
+        than sent, for the same reason.
+
+        COMPUTERS ARE NOT AFFECTED. A computer is built from the IMAGE the ref
+        resolved to and holds no reference to the document, so anything already
+        running, stopped or suspended is untouched. What a retire breaks is
+        resolution: a NEW create naming the ref is refused.
+
+        THE REF IS STILL SPOKEN FOR, AND STILL COUNTS ONCE. Publishing it again
+        afterwards is a :class:`~mandala_computer.ConflictError`, identical
+        bytes included, and
+        :attr:`~mandala_computer.RetiredTemplates.refs_claimed` does not go
+        down. Publish the next version instead.
+        """
+        data = self._t.json_object(
+            "DELETE",
+            _api.template_ref(namespace, name),
+            params=_api.template_version_params(version),
+        )
+        return RetiredTemplates.from_api(data)
+
+
+def _wait_timed_out(
+    build_id: str, timeout: float, last: BuildProgress | None, poll: _LastPoll
+) -> str:
+    """What a build wait says when it gives up.
+
+    Four sentences rather than one, because the situations differ in what the
+    caller should do next: a build seen running, a wait whose last poll cannot
+    be attributed to either side, a build that stopped answering, and one that
+    never answered at all. Shared by the sync and async waits so they cannot
+    word it differently.
+
+    The middle one is the correction (adversarial review, OPL-3835). It used to
+    be folded into the first, which asserted the fleet was fine on the strength
+    of a stopwatch — a timeout consistent with this wait's own cap is not proof
+    that the cap is what fired.
+    """
+    if last is not None and poll is _LastPoll.ANSWERED:
+        return (
+            f"build {build_id} was still running after {timeout:g}s "
+            f"(phase {last.phase}, step {last.step} of {last.of}; "
+            "the build has not stopped, only this wait has)"
+        )
+    if last is not None and poll is _LastPoll.UNRESOLVED:
+        return (
+            f"the {timeout:g}s wait on build {build_id} ran out with its last poll still "
+            f"outstanding, so whether the fleet was answering cannot be told from here; "
+            f"when it last answered it was in phase {last.phase}, step {last.step} of "
+            f"{last.of}. The build has not stopped, only this wait has — read progress() "
+            "for where it got to."
+        )
+    if last is not None:
+        return (
+            f"build {build_id} could not be reached for the last part of {timeout:g}s; "
+            f"when it last answered it was in phase {last.phase}, step {last.step} of "
+            f"{last.of}. The build has not stopped, only this wait has — read progress() "
+            "for where it got to."
+        )
+    return f"build {build_id} could not be observed within {timeout:g}s: every poll failed"
+
+
+class Builds:
+    """Compiling template documents into images.
+
+    Its own collection rather than methods on :class:`Templates`, because a
+    build is not a property of a published template: ``POST /builds`` takes a
+    DOCUMENT, not a ref, and the job it answers with outlives the request and is
+    read back by its own id. Publishing and building are separate acts with very
+    different costs, and the platform keeps them apart for that reason.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def start(self, document: str, *, no_reuse: bool = False) -> TemplateBuild:
+        """Compile a document into a golden image, and return with a job.
+
+        A build takes minutes — an agent image is roughly fifteen — so this
+        never blocks. :meth:`wait` is what watches one, :meth:`progress` is the
+        poll and :meth:`events` is the stream.
+
+        THE NAMESPACE AND THE FAMILY BOTH HAVE TO BE YOURS, and either one is a
+        :class:`~mandala_computer.PermissionDeniedError`. ``spec.family`` is what
+        the built image is CALLED on a hypervisor, in a directory shared with
+        every computer on that machine, so a build may only write into
+        ``golden-<your account id>`` or that and a ``-`` and a name of your
+        choosing.
+
+        A :class:`~mandala_computer.ConflictError` means a hypervisor is busy —
+        one build runs per host at a time — rather than that anything is wrong
+        with the document, and is worth retrying.
+
+        ``no_reuse`` builds again even when an image already carries this
+        document's build digest. Identical documents normally share an image,
+        which is what makes a repeated build cheap.
+        """
+        data = self._t.json_object(
+            "POST",
+            _api.BUILDS,
+            content=_api.template_document(document),
+            params=_api.build_params(no_reuse),
+        )
+        return TemplateBuild.from_api(data)
+
+    def list(self) -> builtins.list[TemplateBuild]:
+        """Every build the fleet still holds a record of, newest first.
+
+        A build lives on the hypervisor that ran it, so this is a fan-out — and
+        like every other fan-out on this surface it FAILS CLOSED. ``forward`` in
+        the platform's lib/surface applies its strict-inventory check to every v1
+        route generically, not only to computers and snapshots: a response
+        carrying ``X-GC-Incomplete`` becomes a 503 unless the request passed
+        ``allow_partial``, which ``GET /builds`` does not document and this
+        method does not send. So a hypervisor being away arrives as an
+        :class:`~mandala_computer.UnavailableError`, and there is no short list
+        for a caller to detect.
+
+        Worth stating because a previous version of this method said the opposite
+        and returned a :class:`~mandala_computer.Listing` to carry a flag the
+        surface never lets through. lib/hvproxy does set the header; the tier
+        above turns that response into the 503 before any client sees it.
+        """
+        data = self._t.json_array("GET", _api.BUILDS)
+        return [TemplateBuild.from_api(b) for b in data]
+
+    def get(self, build_id: str) -> TemplateBuild:
+        """What became of one build. ``error`` says why a failed one failed."""
+        return TemplateBuild.from_api(self._t.json_object("GET", _api.build(build_id)))
+
+    def progress(self, build_id: str, *, timeout_cap: float | None = None) -> BuildProgress:
+        """What a build is DOING, as against what became of it.
+
+        The polling half; :meth:`events` is the same record as a stream. Use
+        this for anything that reconnects, restarts, or cannot hold a socket
+        open. It stays readable after the build has finished, so a program that
+        was not attached at the time can still see which step failed.
+        """
+        data = self._t.json_object(
+            "GET", _api.build_action(build_id, "progress"), timeout_cap=timeout_cap
+        )
+        return BuildProgress.from_api(data)
+
+    def events(self, build_id: str) -> Iterator[BuildProgress]:
+        """The same record as :meth:`progress`, as an event stream.
+
+        Yields every ``progress`` and the final ``done``. A ``progress`` is sent
+        only when something actually moved, so every one of them is news; the
+        ``done`` is the last event of a build that finished, INCLUDING one that
+        failed — a failed build is a ``done`` whose ``status`` says ``failed``,
+        not an ``error`` event.
+
+        An ``error`` event means the STREAM could not go on and says nothing
+        about the build; it is raised, because a caller who kept reading would be
+        told nothing more and a build they still care about needs
+        :meth:`progress`. Attaching to a build that has already finished is not
+        an error — one ``progress`` and one ``done`` arrive immediately.
+
+        An account may hold eight of these open at once; the ninth is a
+        :class:`~mandala_computer.RateLimitError`.
+
+
+        TO STOP READING EARLY, CLOSE THE ITERATOR. A bare ``break`` leaves this
+        generator suspended at its yield, and nothing inside it unwinds until it
+        is closed or collected — so the stream stays checked out, and an account
+        holds only eight at once (adversarial review, OPL-3835). The ``closing``
+        wrapper inside cannot help with that: it runs when this generator ends,
+        which a ``break`` does not do. :func:`contextlib.closing` around the call
+        makes it concise, the same way :meth:`Computer.agent_stream` says::
+
+            with closing(client.builds.events(build_id)) as stream:
+                for progress in stream:
+                    if progress.step == 3:
+                        break
+
+        A ``done`` that disagrees with itself — the event that ends the stream,
+        carrying a payload that says the build is still running — is a truncated
+        stream and raises rather than ending the iteration. See
+        :attr:`~mandala_computer.BuildProgress.done`.
+        """
+        # Closed explicitly, the way `Computer.agent_stream` closes its own
+        # stream and for the same reason (/code-review, OPL-3835). Every exit
+        # from this loop abandons the inner generator rather than finishing it:
+        # the NORMAL one is a `return` on the done event, and the three failures
+        # are raises. Left bare, the `with self._http.stream(...)` inside
+        # Transport.sse unwinds whenever the collector reaches it, and an
+        # account may hold only eight of these open at once — the ninth is a
+        # RateLimitError. A leaked stream costs a real slot.
+        with closing(self._t.sse("GET", _api.build_action(build_id, "events"))) as stream:
+            yield from self._events(build_id, stream)
+
+    def _events(self, build_id: str, stream: Iterator[SSEEvent]) -> Iterator[BuildProgress]:
+        for event in stream:
+            if event.event == "error":
+                raise MandalaError(_api.build_stream_failed(build_id, event.data))
+            if event.event not in ("progress", "done"):
+                continue
+            if not isinstance(event.data, Mapping):
+                # A malformed ``done`` is the end of the stream with the answer
+                # missing, and skipping it left this waiting on a connection the
+                # platform had finished with. A malformed ``progress`` is
+                # different — it is news rather than an answer, so it is skipped
+                # and the next one is read.
+                if event.event == "done":
+                    raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
+                continue
+            progress = BuildProgress.from_api(event.data)
+            if event.event == "done" and not progress.done:
+                # A ``done`` whose payload says the build is still running is the
+                # malformed case too — see BuildProgress.done. Raised BEFORE the
+                # yield, so a caller cannot act on it as progress and then be
+                # told the stream was never valid.
+                raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
+            yield progress
+            if event.event == "done":
+                return
+        # The stream ended without saying so. Returning here is indistinguishable
+        # from finishing, so a caller looping over this would report a build it
+        # stopped watching as a build that ended.
+        raise MandalaError(_api.build_stream_truncated(build_id, malformed=False))
+
+    def wait(self, build_id: str, timeout: float = 1800.0, poll: float = 5.0) -> BuildProgress:
+        """Block until a build stops running, and answer where it got to.
+
+        Polls :meth:`progress` rather than holding the stream open, because a
+        wait is the case the stream is worst at: it reconnects badly, it is
+        bounded to eight per account, and a caller who only wants the outcome
+        has no use for the events in between.
+
+        It does NOT raise for a build that failed. ``succeeded`` and ``failed``
+        are two situations with two remedies — one has an image and the other
+        has a step to fix — and an exception flattens them into "something went
+        wrong", which is the mistake the move work established the rule about.
+        Read ``status``, ``error``, and ``steps`` to see which step stopped it.
+
+        Raises :class:`~mandala_computer.TimeoutError` if the build is still
+        going when ``timeout`` runs out. The build is not stopped by that; only
+        the waiting is. ``timeout`` and ``poll`` must both be finite and
+        non-negative — a ``ValueError`` before the first request otherwise, in
+        both halves, for the reasons :func:`check_wait_args` gives.
+
+        The default timeout is generous because the work is: most of a build is
+        copying a multi-gigabyte base image before a single step of the document
+        runs, and an agent image is roughly fifteen minutes in total.
+        """
+        check_wait_args(timeout, poll)
+        deadline = time.monotonic() + timeout
+        last: BuildProgress | None = None
+        # Whether the MOST RECENT poll answered, as against whether any ever did.
+        # Without it the timeout quotes a stale ``last`` and says the build "was
+        # still running" — a claim about the present tense, made from a reading
+        # that may be half an hour old and followed by nothing but failures.
+        poll_state = _LastPoll.FAILED
+        while True:
+            # Reset every iteration, so a Retry-After raises THIS sleep and not
+            # every later one. Left assigned to `poll` it ratcheted: one 429 with
+            # Retry-After: 30 turned a five-second poll into a thirty-second one
+            # for the rest of the wait (/code-review, OPL-3835). The TypeScript
+            # twin keeps `pollMs` immutable for the same reason.
+            delay = poll
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
+            started = time.monotonic()
+            try:
+                # The poll carries what is left of the wait, not the client's own
+                # timeout. Without the cap a ``wait(timeout=1)`` could sit in one
+                # request for the default sixty seconds — and for ever against a
+                # caller-supplied client with no timeout at all. The same cap
+                # Computer.wait_until_built passes to its refresh.
+                last = self.progress(build_id, timeout_cap=remaining)
+                poll_state = _LastPoll.ANSWERED
+                # ``done`` and not a comparison against a list of statuses: the
+                # platform derives it from the JOB rather than from the phase,
+                # and the phase is read out of a log the document's own steps
+                # write into.
+                if last.done:
+                    return last
+            except MandalaError as err:
+                # A hypervisor briefly away during a fifteen-minute build is
+                # ordinary, and is what this loop is for. A 4xx other than
+                # 408/409/429 is a request the platform refused on its merits,
+                # and propagates now rather than in half an hour. See
+                # is_transient for what a bare MandalaError counts as — which is
+                # not what this comment used to claim.
+                if not is_transient(err):
+                    raise
+                # What the MOST RECENT poll said about the platform, in three
+                # states. A poll cut short by this wait's own cap did not fail
+                # to answer — it was never given time to — but a timeout merely
+                # CONSISTENT with that cap is not proof it fired, so the third
+                # state exists and the message declines to blame either side
+                # (adversarial review, OPL-3835).
+                poll_state = classify_poll_failure(
+                    err, started, remaining, self._t.phase_ceiling(err)
+                )
+                delay = retry_delay(poll, err)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))
+            time.sleep(min(delay, remaining))
 
 
 class Moves:

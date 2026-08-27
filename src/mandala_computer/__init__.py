@@ -39,6 +39,7 @@ from ._agent import (
 )
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import (
+    AsyncBuilds,
     AsyncComputers,
     AsyncMoves,
     AsyncSizes,
@@ -68,17 +69,23 @@ from ._exceptions import (
     UnavailableError,
 )
 from ._models import (
+    BuildProgress,
+    BuildStep,
     ComputerUsage,
     ExecResult,
     ExecStatus,
     FilePart,
     Listing,
     Move,
+    PublishedTemplate,
     Retention,
+    RetiredTemplates,
     Size,
     Snapshot,
     SnapshotHoldings,
     Template,
+    TemplateBuild,
+    TemplateCheck,
     UsagePeriod,
     UsageReport,
     UsageTotals,
@@ -86,7 +93,7 @@ from ._models import (
     Window,
     WindowResult,
 )
-from ._resources import Computers, Moves, Sizes, Snapshots, Templates, Usage
+from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, Usage
 
 __version__ = "0.1.0"
 
@@ -108,6 +115,8 @@ __all__ = [
     "AsyncComputer",
     "AuthenticationError",
     "BackgroundCommand",
+    "BuildProgress",
+    "BuildStep",
     "Client",
     "Computer",
     "ComputerUsage",
@@ -127,13 +136,17 @@ __all__ = [
     "OriginUnreachableError",
     "PermissionDeniedError",
     "PlanLimitError",
+    "PublishedTemplate",
     "RangeNotSatisfiableError",
     "RateLimitError",
     "Retention",
+    "RetiredTemplates",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
     "Template",
+    "TemplateBuild",
+    "TemplateCheck",
     "TimeoutError",
     "UnavailableError",
     "UsagePeriod",
@@ -162,6 +175,7 @@ class Client:
         http_client: httpx.Client | None = None,
     ) -> None:
         self._t = Transport(api_key, base_url=base_url, timeout=timeout, client=http_client)
+        self.builds = Builds(self._t)
         self.computers = Computers(self._t)
         self.moves = Moves(self._t)
         self.snapshots = Snapshots(self._t)
@@ -203,6 +217,7 @@ class AsyncClient:
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._t = AsyncTransport(api_key, base_url=base_url, timeout=timeout, client=http_client)
+        self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
         self.moves = AsyncMoves(self._t)
         self.snapshots = AsyncSnapshots(self._t)

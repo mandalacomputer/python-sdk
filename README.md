@@ -84,6 +84,118 @@ if c.start_error:
     c.start()  # often works on a second attempt
 ```
 
+### Your own templates
+
+A template is a `mandala/v1` document — the image family it resolves to, what it
+is layered onto, and the shape a computer gets when the create names no numbers.
+Publishing one gives it a ref you can launch by name.
+
+```python
+from pathlib import Path
+
+doc = Path("devbox.yaml").read_text()
+
+# Worth doing while you iterate: this reports EVERY problem at once, and claims
+# no ref. It does not raise for an invalid document — that is the answer.
+check = client.templates.validate(doc)
+if not check.valid:
+    raise SystemExit("\n".join(check.problems))
+
+t = client.templates.publish(doc)
+c = client.computers.create(template=t.ref)
+```
+
+**The namespace is your account.** `metadata.namespace` has to be your account
+id — anything else is a `PermissionDeniedError`, `system` included — and this SDK
+does not rewrite it, because publishing a ref that is not the one in your file
+would be worse than refusing.
+
+**A ref is immutable.** Publishing the identical document again succeeds and
+changes nothing, so a pipeline that republishes on every commit is safe.
+Publishing a *different* document under the same ref is a `ConflictError`; bump
+`metadata.version`. What counts as different is the digest, so a changed label is
+a change.
+
+Read one back — yours or `system`, so you can see what you are layering onto:
+
+```python
+base = client.templates.get("system", "base")
+
+# Your namespace is your account id — the one `metadata.namespace` carries, and
+# the first half of any ref you published.
+namespace = t.ref.split("/", 1)[0]
+pinned = client.templates.get(namespace, "devbox", version="1.0.0")
+```
+
+Without `version` you get the newest, which is also what a create naming the
+unpinned `namespace/name` resolves to.
+
+#### Retiring one
+
+```python
+client.templates.retire(namespace, "devbox", version="1.0.4")  # one version
+client.templates.retire(namespace, "devbox")  # every version
+```
+
+Omitting `version` retires the **whole name** — deliberately not `get()`'s "the
+newest", which on a delete would let a loop walk backwards through a history it
+never asked about. An empty string is refused before it is sent, for the same
+reason.
+
+**Computers are not affected.** A computer is built from the image the ref
+resolved to and holds no reference to the document, so anything already running,
+stopped or suspended is untouched. What a retire breaks is resolution: a *new*
+create naming the ref is refused.
+
+**The ref stays spoken for, and still counts once.** Publishing it again is a
+`ConflictError`, identical bytes included, and `refs_claimed` on the result does
+not go down — it is the count against a much larger, separate ceiling than
+`templates`. A ref you retired is a `NotFoundError` whose message names the date
+it went, rather than claiming the template never existed; read the message before
+concluding you mistyped something.
+
+### Building one
+
+A document that declares `spec.build` steps has to be compiled into an image
+before anything can launch it. That is minutes of work — an agent image is
+roughly fifteen — so it never blocks:
+
+```python
+build = client.builds.start(doc)
+out = client.builds.wait(build.id)
+
+if out.status != "succeeded":
+    # There may be no failed STEP: most of a build is copying the base image, and
+    # a build that dies in `staging` or `copying` never reaches the first one.
+    failed = next((s for s in out.steps if s.status == "failed"), None)
+    where = f"step {failed.n} ({failed.kind} {failed.label})" if failed else f"phase {out.phase}"
+    print(f"{where} failed: {out.error}")
+```
+
+`wait()` does **not** raise for a build that failed. `succeeded` and `failed` are
+two situations with two remedies — one has an image, the other has a step to fix
+— and an exception flattens them into "something went wrong". Read `status`.
+
+For a terminal, stream it instead of polling:
+
+```python
+for p in client.builds.events(build.id):
+    print(f"{p.phase} {p.step}/{p.of} {p.note}")
+```
+
+Each event is news — the platform sends one only when something moved — and the
+last one is the `done`, **including for a build that failed**. An `error` event
+means the *stream* could not go on and says nothing about the build; it raises,
+and says so. An account may hold eight streams open at once.
+
+**A build that declares its own family is not launchable yet.** The fleet does
+not advertise a family it built rather than shipped, so a create naming such a
+ref is still refused with a `503`. Publishing the document is worth doing anyway
+— it claims the ref, and it is what `builds.start()` takes.
+
+Everything here has an async twin: `await client.templates.publish(doc)`,
+`await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
+
 ### Suspending
 
 A suspend writes the guest's RAM to disk and gives the host its memory back.
@@ -122,7 +234,7 @@ Every response that *is* one computer carries the credentials and URLs to open
 its live desktop, so putting a screen on your own page costs no extra call:
 
 ```python
-c = client.computers.get(computer_id)
+c = client.computers.get("vm-0a1b2c3d4e5f")
 c.vnc.embed_url  # watch-only, drop straight into an <iframe>
 c.vnc.url  # full control: keyboard and pointer — not the clipboard
 c.vnc.view_url  # watch only — the platform drops input on this socket
@@ -153,6 +265,8 @@ selection at all.
 import base64
 
 got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
+
+text = "what you want on the clipboard"
 b64 = base64.b64encode(text.encode()).decode()
 c.exec(
     f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
@@ -248,6 +362,8 @@ host in the same region may be able to run it, and the computer can be moved
 there.
 
 ```python
+import mandala_computer as mc
+
 try:
     c.resize(ram_mb=32768)
 except mc.MoveRequiredError as e:
@@ -307,6 +423,8 @@ are the 1280×800 default, which is only what a computer that asked for nothing
 else renders at.
 
 ```python
+x, y = 640, 480
+
 c.move(x, y)
 c.click(x, y)
 c.right_click(x, y)
@@ -440,12 +558,14 @@ slower — and for anything slower than a few seconds, which is a lower bar —
 start it instead:
 
 ```python
+import time
+
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
 
 while True:
     status = job.poll()
     print(status.stdout, end="")
-    if status.done and not status.more:
+    if status.drained:
         break
     if not status.more:
         time.sleep(2)
@@ -509,6 +629,10 @@ what to do, does it, and repeats, until the task is done or it runs out of
 steps. The point is that ten clicks stop being ten images in your context.
 
 ```python
+import os
+
+key = os.environ["ANTHROPIC_API_KEY"]  # your own; see below
+
 result = c.agent("Open the settings and turn on dark mode.", model_key=key)
 print(result.text)
 if not result.finished:
@@ -532,6 +656,8 @@ A run is minutes of clicking, so `agent_stream()` reports as it goes — somethi
 that says nothing until it is over cannot be told from a hang:
 
 ```python
+import mandala_computer as mc
+
 for event in c.agent_stream("Find the cheapest flight to Lisbon", model_key=key):
     match event:
         case mc.AgentStepEvent(step):
@@ -563,9 +689,11 @@ on a key the platform never meters, and the clicks are still on the desktop.
 `agent_stream()` hands the same record over as an `AgentFailed` event.
 
 ```python
+import mandala_computer as mc
+
 try:
     c.agent("Book the flight", model_key=key)
-except mandala_computer.MandalaError as e:
+except mc.MandalaError as e:
     if e.agent:
         print(f"{len(e.agent.steps)} steps, {e.agent.usage.input_tokens} tokens in")
 ```
@@ -619,6 +747,8 @@ to boot yet — starting, stopping, snapshotting or cloning it raises
 `ConflictError` until the copy lands.
 
 ```python
+snap = c.snapshot()
+
 c = client.snapshots.clone(snap.id)
 c.is_building  # True
 c.wait_until_built()  # minutes, for a large disk
@@ -879,7 +1009,11 @@ rather than a dead end.
 
 ```python
 c.download_file("/home/user/out.tar", "out.tar")  # 2 GB, a part at a time
-c.download_file("/home/user/out.tar", open_handle)  # or into anything writable
+
+# Or into anything writable. A handle you opened is a handle you close —
+# `download_file` deliberately does not close one it did not open.
+with open("out.tar", "wb") as open_handle:
+    c.download_file("/home/user/out.tar", open_handle)
 
 tail = c.read_file_part("/var/log/build.log", offset=-4096)  # the last 4 KiB
 head = c.read_file_part("/home/user/out.tar", length=512)  # the first 512 B
@@ -896,6 +1030,7 @@ asking — so the `FilePart` that comes back is the authority on what arrived an
 where to ask from next, never the numbers passed in:
 
 ```python
+path = "/home/user/out.tar"
 part = c.read_file_part(path, offset=0, length=1 << 20)
 part.data  # the bytes
 part.offset  # where they start in the file
@@ -1045,9 +1180,11 @@ stays silent past its boot window stops being a conflict and becomes a 502
 `APIError`, which is the platform saying the agent is broken rather than late.
 
 ```python
+import mandala_computer as mc
+
 try:
     c.snapshot()
-except mandala_computer.ConflictError:
+except mc.ConflictError:
     c.wait_until_built()  # or just try again shortly
     c.snapshot()
 ```
