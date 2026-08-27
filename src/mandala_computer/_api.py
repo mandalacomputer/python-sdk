@@ -340,9 +340,13 @@ def files_params(path: str) -> dict[str, str]:
     relative path has no working directory to be relative to. The daemon
     refuses it too, but this mistake is knowable without the round trip.
     """
-    if not is_absolute_guest_path(path):
-        raise ValueError(f"guest path must be absolute: {path!r}")
-    return {"path": path}
+    # Canonical first, for the reason :func:`canonical` gives. ``startswith`` is
+    # overridable, so a str subclass could satisfy the absoluteness check and
+    # then send something else entirely — here, an empty path.
+    text = canonical(path, "guest path")
+    if not is_absolute_guest_path(text):
+        raise ValueError(f"guest path must be absolute: {text!r}")
+    return {"path": text}
 
 
 def files_range(offset: int, length: int | None) -> dict[str, str]:
@@ -498,13 +502,21 @@ def delete_params(*, purge_snapshots: bool, expect: str | None) -> dict[str, str
     """
     if not purge_snapshots:
         return None
-    if not expect:
+    # Canonical BEFORE the emptiness check, and this is the guard where that
+    # ordering matters most (/code-review, OPL-3835). ``__bool__`` is overridable
+    # too, so a str subclass answering True here and "" to ``str()`` passed the
+    # check and put ``?expect=`` on the wire — and ``checkExpectation`` in
+    # server/vm.go reads an empty expectation as NO expectation, so the interlock
+    # this function exists to enforce was silently disarmed on the one route that
+    # destroys a computer and its snapshots together.
+    text = canonical(expect, "expect") if expect is not None else ""
+    if not text:
         raise ValueError(
             "purging snapshots needs the fingerprint from snapshot_holdings(): "
             "read it, check the count and size are what you meant to destroy, "
             "and pass it as expect=. Nothing has been deleted."
         )
-    return {"snapshots": "delete", "expect": expect}
+    return {"snapshots": "delete", "expect": text}
 
 
 # --- responses ------------------------------------------------------------

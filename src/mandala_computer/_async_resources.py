@@ -337,6 +337,12 @@ class AsyncBuilds:
         last: BuildProgress | None = None
         observed = False
         while True:
+            # Reset every iteration, so a Retry-After raises THIS sleep and not
+            # every later one. Left assigned to `poll` it ratcheted: one 429 with
+            # Retry-After: 30 turned a five-second poll into a thirty-second one
+            # for the rest of the wait (/code-review, OPL-3835). The TypeScript
+            # twin keeps `pollMs` immutable for the same reason.
+            delay = poll
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
@@ -349,7 +355,7 @@ class AsyncBuilds:
                 if not is_transient(err):
                     raise
                 observed = False
-                poll = retry_delay(poll, err)
+                delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
@@ -357,7 +363,7 @@ class AsyncBuilds:
             # halves genuinely differ, and blocking the event loop for five
             # seconds a poll across a fifteen-minute build is what the async
             # client exists not to do.
-            await asyncio.sleep(min(poll, remaining))
+            await asyncio.sleep(min(delay, remaining))
 
     start.__doc__ = Builds.start.__doc__
     list.__doc__ = Builds.list.__doc__

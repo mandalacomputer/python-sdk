@@ -19,6 +19,8 @@ one does the same thing with them.
 from __future__ import annotations
 
 import json
+import time
+from unittest import mock
 
 import httpx
 import pytest
@@ -765,3 +767,117 @@ def test_a_template_row_carries_its_ref() -> None:
     assert t.ref == "acc-1/devbox@1.0.0"
     # Absent stays absent: a host too old to advertise refs sends none.
     assert mc.Template.from_api({"name": "base"}).ref is None
+
+
+# --- what the second review pass found -------------------------------------
+
+
+class Disarming(str):
+    """A ``str`` subclass that is truthy, absolute, and empty on the wire."""
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return ""
+
+    def startswith(self, *a: object, **k: object) -> bool:
+        return True
+
+
+def test_the_purge_interlock_cannot_be_disarmed_by_a_str_subclass() -> None:
+    """``canonical()`` reached three guards, not "every guard in _api.py".
+
+    ``delete_params`` still tested ``if not expect`` on the caller's object and
+    sent that object, so a subclass answering True here and "" to ``str()`` put
+    ``?expect=`` on the wire — and ``checkExpectation`` in server/vm.go reads an
+    empty expectation as NO expectation. The interlock was silently disarmed on
+    the one route that destroys a computer and its snapshots together.
+    """
+    sent = _api.delete_params(purge_snapshots=True, expect=Disarming("abc"))
+    assert sent is not None
+    # Canonicalised, so what httpx sends is the fingerprint the check agreed to
+    # rather than whatever __str__ felt like answering the second time.
+    assert type(sent["expect"]) is str
+    assert str(sent["expect"]) == "abc"
+    # And one that is genuinely empty is still refused.
+    with pytest.raises(ValueError, match="fingerprint"):
+        _api.delete_params(purge_snapshots=True, expect=Disarming(""))
+
+
+def test_a_guest_path_cannot_be_emptied_after_the_absoluteness_check() -> None:
+    sent = _api.files_params(Disarming("/home/user/a.txt"))
+    assert type(sent["path"]) is str
+    assert str(sent["path"]) == "/home/user/a.txt"
+    # A relative path that only CLAIMS to be absolute is refused on its real
+    # contents, not on what startswith answered.
+    with pytest.raises(ValueError, match="absolute"):
+        _api.files_params(Disarming("home/user/a.txt"))
+
+
+def test_a_retry_after_does_not_set_the_pace_for_the_rest_of_the_wait() -> None:
+    """The ratchet.
+
+    ``poll = retry_delay(poll, err)`` overwrote the loop's own interval, so one
+    429 with ``Retry-After: 30`` turned a five-second poll into a thirty-second
+    one for every later iteration. The TypeScript twin keeps ``pollMs``
+    immutable and recomputes, giving [30, 5, 5] where this gave [30, 30, 30].
+    """
+    from mandala_computer._resources import retry_delay
+
+    poll = 5.0
+    slow = mc.RateLimitError("slow down", status=429, retry_after=30.0)
+    away = mc.UnavailableError("no host", status=503)
+    assert [retry_delay(poll, slow), retry_delay(poll, away), retry_delay(poll, away)] == [
+        30.0,
+        5.0,
+        5.0,
+    ]
+
+
+@respx.mock
+def test_wait_sleeps_the_retry_after_once_and_then_returns_to_its_poll(
+    client: mc.Client,
+) -> None:
+    """The loop-level half of the same thing: `delay` is reset every iteration."""
+    slept: list[float] = []
+    respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": "slow down"}, headers={"Retry-After": "0.05"}),
+            httpx.Response(503, json={"error": "no host"}),
+            httpx.Response(200, json=DONE),
+        ]
+    )
+    real_sleep = time.sleep
+
+    def record(seconds: float) -> None:
+        slept.append(seconds)
+        real_sleep(0)
+
+    with mock.patch("mandala_computer._resources.time.sleep", record):
+        assert client.builds.wait("bld-1", poll=0.01).status == "succeeded"
+    assert slept[0] > slept[1], slept
+
+
+def test_408_is_repeatable_by_definition() -> None:
+    """RFC 9110 defines it as a request the client may repeat unchanged.
+
+    Cloudflare fronts this surface and emits it; it is the edge saying it waited
+    long enough, not a decision about anything.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.APIError("request timeout", status=408)) is True
+    assert is_transient(mc.APIError("bad request", status=400)) is False
+
+
+def test_a_malformed_body_is_transient_and_the_docstring_says_so() -> None:
+    """Deliberate, and the reversal is named rather than left as a surprise.
+
+    A bare MandalaError is what a dropped connection and a captive portal both
+    raise. The comment that used to sit over the catch claimed the opposite.
+    """
+    from mandala_computer._resources import is_transient
+
+    assert is_transient(mc.MandalaError("expected JSON, got <html>")) is True
+    assert "TRANSIENT" in (is_transient.__doc__ or "")

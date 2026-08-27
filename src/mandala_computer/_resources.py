@@ -62,9 +62,23 @@ def is_transient(err: BaseException) -> bool:
       fourteen minutes into a build ended the wait.
 
     A 4xx is a request the platform refused on its merits, and repeating it
-    unchanged cannot change the answer — except a 429, which is a request that
-    was fine and arrived too often. Everything at 5xx, every transport failure
-    and every timeout is the passing kind, which is what a poll loop is for.
+    unchanged cannot change the answer — except 409, 429 and 408, which are named
+    above. Everything at 5xx, every transport failure and every timeout is the
+    passing kind, which is what a poll loop is for.
+
+    A BARE :class:`~mandala_computer.MandalaError` IS TRANSIENT, and that is a
+    deliberate reversal worth naming, because the commit before this one claimed
+    the opposite in a comment. It is what ``_request_failed`` raises for a
+    connection that never completed, and what ``_not_an_object`` raises for a
+    captive portal or a proxy answering HTML instead of the platform — both of
+    which clear, and neither of which says the request was wrong. The wait's own
+    deadline is what bounds the retrying.
+
+    IT NO LONGER MIRRORS THE TYPESCRIPT SDK, whose ``isTransient`` is still an
+    allow-list of four classes. Several statuses now disagree between the two,
+    and that is the second front of OPL-3724 rather than something to paper over
+    here: this rule is the better one, and moving TypeScript to it means changing
+    an exported predicate that ``waitForMove`` and embedders both rely on.
 
     An ``OriginTLSError`` is a 525/526 and the 5xx rule would retry it, so it is
     named: the edge and the platform disagreeing about a certificate fails
@@ -85,6 +99,11 @@ def is_transient(err: BaseException) -> bool:
     # BODY and not the status, which is why MoveRequiredError is excluded above
     # rather than here.
     if isinstance(err, ConflictError | RateLimitError):
+        return True
+    # 408, which RFC 9110 defines as a request the client may repeat unchanged.
+    # Cloudflare fronts this surface and emits it, and it is not a decision about
+    # anything: it is the edge saying it waited long enough.
+    if isinstance(err, APIError) and err.status == 408:
         return True
     if isinstance(err, APIError):
         return not (400 <= err.status < 500)
@@ -621,6 +640,12 @@ class Builds:
         # that may be half an hour old and followed by nothing but failures.
         observed = False
         while True:
+            # Reset every iteration, so a Retry-After raises THIS sleep and not
+            # every later one. Left assigned to `poll` it ratcheted: one 429 with
+            # Retry-After: 30 turned a five-second poll into a thirty-second one
+            # for the rest of the wait (/code-review, OPL-3835). The TypeScript
+            # twin keeps `pollMs` immutable for the same reason.
+            delay = poll
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
@@ -640,17 +665,19 @@ class Builds:
                     return last
             except MandalaError as err:
                 # A hypervisor briefly away during a fifteen-minute build is
-                # ordinary, and is what this loop is for. Everything else —
-                # a 400, a malformed body, a TLS failure — is a defect rather
-                # than a phase and propagates now rather than in half an hour.
+                # ordinary, and is what this loop is for. A 4xx other than
+                # 408/409/429 is a request the platform refused on its merits,
+                # and propagates now rather than in half an hour. See
+                # is_transient for what a bare MandalaError counts as — which is
+                # not what this comment used to claim.
                 if not is_transient(err):
                     raise
                 observed = False
-                poll = retry_delay(poll, err)
+                delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, observed))
-            time.sleep(min(poll, remaining))
+            time.sleep(min(delay, remaining))
 
 
 class Moves:
