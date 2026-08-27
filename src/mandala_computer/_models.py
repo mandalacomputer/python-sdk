@@ -67,41 +67,58 @@ def _real(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
-def _flag(value: Any, *, unknown: bool = False) -> bool:
+def _flag(d: Mapping[str, Any], key: str, *, unknown: bool = False) -> bool:
     """A boolean field off the wire. Every one this module decodes comes here.
 
-    THREE CASES, and the middle one is why this is not two lines. A real JSON
-    boolean is itself. ABSENT reads False, which is what ``bool(d.get(...))``
-    did and what an older host omitting a field it has never heard of should
-    mean. PRESENT BUT NOT A BOOLEAN — ``"true"``, ``1``, ``{}`` — is a host
-    saying something this client cannot read, and that is not the same as a host
-    saying nothing: it reads ``unknown``, the cautious answer for THIS field.
+    It takes the MAPPING and the key rather than the value, because absent and
+    ``null`` are different answers and ``d.get(key)`` cannot tell them apart
+    (/code-review, OPL-3835). A host that omits a field never heard of it; a
+    host that sends ``"live": null`` is saying it cannot tell, which is the one
+    moment ``unknown`` exists for.
 
-    ``bool(value)`` was the old rule and it fails OPEN: ``"false"`` is a
-    non-empty string and therefore true, so ``"valid": "false"`` reported a
-    document as publishable. Replacing it with a blanket False failed open in
-    the other direction on the fields where False is the permissive reading
-    (/code-review, OPL-3835): a host stringifying its booleans made
-    ``Move.live`` False, and ``wait_for_move`` handed back a computer still
-    mid-migration; it made ``ExecStatus.running`` False, and the polling loop
-    that :meth:`Computer.start_exec` documents broke out of a live command to
-    read an ``exit_code`` of ``None``. Neither direction is safe as a blanket.
+    Four cases, in order:
 
-    So ``unknown`` is set per field, and the rule for setting it is one
-    question: if this client cannot tell, which answer avoids blessing
-    something? For ``valid``, ``done`` and ``allowed`` that is False — not
-    valid, not finished, not permitted. For ``live``, ``running``,
-    ``timed_out``, ``more``, the truncation flags and the degraded/unreachable
-    caveats it is True — still going, still incomplete, do not treat this as the
-    whole answer.
+    * A real JSON boolean is itself.
+    * ABSENT is False — what ``bool(d.get(...))`` gave, and what an older host
+      omitting a field should mean.
+    * ``0``/``1`` and ``"true"``/``"false"`` are DECODED, not refused. The
+      original bug was truthiness, not recognition: ``bool("false")`` was True,
+      which is wrong, but ``"false"`` still unambiguously means false. A backend
+      that systematically encodes its booleans this way would otherwise get
+      ``unknown`` for every flag on every response — permanently, not
+      transiently — and with ``timed_out`` cautious that means
+      :attr:`ExecResult.ok` is never true and ``wait_for_guest`` always burns
+      its full timeout (/code-review).
+    * Anything else — ``null``, ``{}``, ``"maybe"``, ``2`` — reads ``unknown``,
+      the cautious answer for THIS field.
+
+    ``unknown`` is set per field by one question: if this client cannot tell,
+    which answer avoids blessing something? False for ``valid``, ``done`` and
+    ``allowed`` — not valid, not finished, not permitted. True for the caveats
+    that say an answer is short or still moving: ``live``, ``running``,
+    ``timed_out``, the truncation flags, ``degraded``, ``unmetered``,
+    ``unreachable``, ``orphaned``, ``unmatched``.
+
+    IT IS NOT SIMPLY "TRUE FOR CAVEATS". ``more`` is the counter-example and it
+    was got wrong (/code-review): it reads as a caveat but it is a BACKOFF
+    SWITCH — :meth:`Computer.start_exec` documents polling again immediately
+    while it is set — so a cautious True made the loop in its own docstring
+    neither break nor sleep, hammering a metered endpoint forever on a command
+    that had already finished. The question is what the flag makes a caller DO,
+    not what it sounds like.
 
     Malformed values are still preserved in ``raw`` and still never rejected,
     which is this module's contract.
     """
+    if key not in d:
+        return False
+    value = d[key]
     if isinstance(value, bool):
         return value
-    if value is None:
-        return False
+    if isinstance(value, int) and value in (0, 1):
+        return value == 1
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
     return unknown
 
 
@@ -493,7 +510,7 @@ class TemplateCheck:
             return None if value is None else _text(value)
 
         return cls(
-            valid=_flag(d.get("valid")),
+            valid=_flag(d, "valid"),
             problems=_texts(d.get("problems")),
             ref=maybe("ref"),
             doc_digest=maybe("doc_digest"),
@@ -675,7 +692,7 @@ class BuildProgress:
         return cls(
             id=_text(d.get("id")),
             status=_text(d.get("status")),
-            done=_flag(d.get("done")),
+            done=_flag(d, "done"),
             phase=_text(d.get("phase")),
             step=_num(d.get("step")),
             of=_num(d.get("of")),
@@ -683,7 +700,7 @@ class BuildProgress:
             note=_text(d.get("note")),
             error=_text(d.get("error")),
             updated_at=_text(d.get("updated_at")),
-            unmatched=_flag(d.get("unmatched"), unknown=True),
+            unmatched=_flag(d, "unmatched", unknown=True),
             raw=dict(d),
         )
 
@@ -722,7 +739,7 @@ class Size:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=_flag(d.get("allowed")),
+            allowed=_flag(d, "allowed"),
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -816,11 +833,11 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=_flag(d.get("incremental")),
-            auto=_flag(d.get("auto")),
+            incremental=_flag(d, "incremental"),
+            auto=_flag(d, "auto"),
             computer_name=_text(d.get("computer_name")),
-            orphaned=_flag(d.get("orphaned")),
-            unreachable=_flag(d.get("unreachable"), unknown=True),
+            orphaned=_flag(d, "orphaned", unknown=True),
+            unreachable=_flag(d, "unreachable", unknown=True),
             os=_text(d.get("os")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
@@ -950,7 +967,7 @@ class ComputerUsage:
             run_hours=_real(d.get("run_hours")),
             vcpu_hours=_real(d.get("vcpu_hours")),
             ram_gb_hours=_real(d.get("ram_gb_hours")),
-            gone=_flag(d.get("gone")),
+            gone=_flag(d, "gone"),
         )
 
 
@@ -1057,8 +1074,8 @@ class UsageReport:
             from_=_text(d.get("from")),
             to=_text(d.get("to")),
             usage=UsageTotals.from_api(totals),
-            degraded=_flag(d.get("degraded"), unknown=True),
-            unmetered=_flag(d.get("unmetered")),
+            degraded=_flag(d, "degraded", unknown=True),
+            unmetered=_flag(d, "unmetered", unknown=True),
             # Presence, not emptiness. The platform drops the key for a scoped
             # credential and sends ``[]`` for an account that ran nothing, and
             # those are different answers: one is "you may not see this", the
@@ -1124,7 +1141,7 @@ class Move:
             computer_id=_text(d.get("computer_id")),
             state=_text(d.get("state")),
             detail=_text(d.get("detail")),
-            live=_flag(d.get("live"), unknown=True),
+            live=_flag(d, "live", unknown=True),
             cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
             ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
             disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
@@ -1172,7 +1189,7 @@ class Window:
             y=_num(d.get("y")),
             width=_num(d.get("width")),
             height=_num(d.get("height")),
-            focused=_flag(d.get("focused")),
+            focused=_flag(d, "focused"),
             raw=dict(d),
         )
 
@@ -1261,7 +1278,7 @@ class WindowResult:
         w = d.get("window")
         return cls(
             window=Window.from_api(w) if isinstance(w, Mapping) else None,
-            gone=_flag(d.get("gone")),
+            gone=_flag(d, "gone"),
             raw=dict(d),
         )
 
@@ -1320,15 +1337,15 @@ class ExecStatus:
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
-            running=_flag(d.get("running"), unknown=True),
-            exited=_flag(d.get("exited")),
+            running=_flag(d, "running", unknown=True),
+            exited=_flag(d, "exited"),
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
-            more=_flag(d.get("more"), unknown=True),
-            killed=_flag(d.get("killed")),
+            more=_flag(d, "more"),
+            killed=_flag(d, "killed"),
             started_at=_text(d.get("started_at")),
             raw=dict(d),
         )
@@ -1389,8 +1406,8 @@ class ExecResult:
             exit_code=_exit_code(code),
             stdout=_text(d.get("stdout")),
             stderr=_text(d.get("stderr")),
-            timed_out=_flag(d.get("timed_out"), unknown=True),
-            out_truncated=_flag(d.get("out_truncated"), unknown=True),
-            err_truncated=_flag(d.get("err_truncated"), unknown=True),
+            timed_out=_flag(d, "timed_out", unknown=True),
+            out_truncated=_flag(d, "out_truncated", unknown=True),
+            err_truncated=_flag(d, "err_truncated", unknown=True),
             raw=dict(d),
         )

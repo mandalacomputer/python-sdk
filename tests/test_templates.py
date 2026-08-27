@@ -928,16 +928,19 @@ def test_purging_snapshots_still_takes_real_bools() -> None:
     }
 
 
-@pytest.mark.parametrize("value", ["false", "no", 0, 1, "", []])
-def test_a_present_non_boolean_reads_the_cautious_way_for_its_field(value: object) -> None:
-    """``bool("false")`` is True, and these fields STEER a caller.
+#: Values no decoder can read. ``0``/``1`` and ``"true"``/``"false"`` are NOT
+#: here: those are unambiguous and are decoded, which is what keeps a backend
+#: that stringifies its booleans from getting the cautious answer on every flag
+#: of every response, for ever (/code-review, OPL-3835).
+UNREADABLE = ["maybe", "", 2, -1, [], {}, 1.5, None]
 
-    ``valid`` decides whether a document is publishable and ``done`` ends a
-    wait, so for those the cautious answer is False — not valid, not finished.
-    ``unmatched`` is the other direction: False would say the per-step positions
-    are trustworthy, which is the thing we cannot tell. The value survives in
-    ``raw`` either way.
-    """
+
+@pytest.mark.parametrize("value", UNREADABLE)
+def test_a_value_no_decoder_can_read_gets_its_field_s_cautious_answer(value: object) -> None:
+    """``valid`` decides whether a document is publishable and ``done`` ends a
+    wait, so for those the cautious answer is False. ``unmatched`` is the other
+    direction: False would say the per-step positions are trustworthy, which is
+    the thing we cannot tell. The value survives in ``raw`` either way."""
     check = mc.TemplateCheck.from_api({"valid": value})
     assert check.valid is False
     assert check.raw["valid"] == value
@@ -947,14 +950,43 @@ def test_a_present_non_boolean_reads_the_cautious_way_for_its_field(value: objec
     assert progress.unmatched is True
 
 
-def test_an_absent_field_is_not_the_same_as_an_unreadable_one() -> None:
-    """Absence is an older host omitting a field it never heard of, and reads
-    False as it always did. A present value this client cannot read is a
-    different thing and gets the cautious answer."""
-    assert mc.BuildProgress.from_api({}).unmatched is False
-    assert mc.BuildProgress.from_api({"unmatched": "yes"}).unmatched is True
-    assert mc.Move.from_api({}).live is False
-    assert mc.Move.from_api({"live": "true"}).live is True
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("true", True),
+        ("false", False),
+        ("TRUE", True),
+        ("False", False),
+        (" true ", True),
+    ],
+)
+def test_the_unambiguous_encodings_are_decoded_not_refused(wire: object, expected: bool) -> None:
+    """The original bug was TRUTHINESS, not recognition.
+
+    ``bool("false")`` was True and that is wrong, but ``"false"`` still plainly
+    means false. Routing it to the cautious answer instead would give a backend
+    that encodes booleans this way the wrong value on every flag of every
+    response — permanently — and with ``timed_out`` cautious that means
+    ``ExecResult.ok`` is never true and ``wait_for_guest`` always times out.
+    """
+    assert mc.ExecResult.from_api({"exit_code": 0, "timed_out": wire}).timed_out is expected
+    assert mc.Move.from_api({"live": wire}).live is expected
+    assert mc.TemplateCheck.from_api({"valid": wire}).valid is expected
+
+
+def test_absent_null_and_unreadable_are_three_different_answers() -> None:
+    """``d.get(key)`` cannot tell absent from ``null``, which is why the decoder
+    takes the mapping. A host that OMITS a field never heard of it; a host that
+    sends ``"live": null`` is saying it cannot tell, and that is the one moment
+    the cautious answer exists for (/code-review)."""
+    assert mc.Move.from_api({}).live is False, "absent: an older host, as bool(d.get()) gave"
+    assert mc.Move.from_api({"live": None}).live is True, "null: the host says it cannot tell"
+    assert mc.Move.from_api({"live": "maybe"}).live is True, "unreadable"
+    assert mc.Move.from_api({"live": False}).live is False, "a real boolean is itself"
 
 
 def test_real_booleans_still_decode() -> None:
@@ -1203,7 +1235,13 @@ def test_force_stop_still_takes_real_bools() -> None:
             mc.ExecStatus,
             "exited",
             False,
-            "with running cautious, done stays False and the poll goes on",
+            "with running cautious, done stays False and polling goes on",
+        ),
+        (
+            mc.ExecStatus,
+            "more",
+            False,
+            "more is a BACKOFF switch: True means poll again with no sleep",
         ),
         (
             mc.ExecResult,
@@ -1218,32 +1256,57 @@ def test_force_stop_still_takes_real_bools() -> None:
             False,
             "a wait does not return until the build is known to be over",
         ),
+        (mc.UsageReport, "degraded", True, "a total that may be short must not read as complete"),
+        (mc.UsageReport, "unmetered", True, "the other half of the same caveat, named with it"),
+        (mc.Snapshot, "unreachable", True, "a row whose host may not have answered"),
+        (mc.Snapshot, "orphaned", True, "restore has nowhere to put an orphan's disk"),
     ],
 )
 def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
     model: type, field: str, cautious: bool, steers: str
 ) -> None:
-    """Hardening the three fields a review named was itself a defect, and so was
-    replacing it with a blanket False: on ``live`` and ``running`` False is the
-    PERMISSIVE reading, so a host stringifying its booleans ended a move wait on
-    a computer still migrating and a poll loop on a command still running."""
-    decoded = model.from_api({field: "false"})
+    """Not "True for caveats" — the question is what the flag makes a caller DO.
+
+    ``more`` reads like a caveat and is the counter-example: it is a backoff
+    switch, so a cautious True made the loop in ``start_exec``'s own docstring
+    neither break nor sleep (/code-review, OPL-3835).
+    """
+    decoded = model.from_api({field: "maybe"})
     assert getattr(decoded, field) is cautious, steers
-    assert decoded.raw[field] == "false"
+    assert decoded.raw[field] == "maybe"
+
+
+@respx.mock
+def test_the_documented_poll_loop_terminates_on_an_unreadable_status(client: mc.Client) -> None:
+    """The loop printed verbatim in ``Computer.start_exec``'s docstring.
+
+    With ``more`` cautiously True and ``running`` cautiously True it never broke
+    AND never slept: an infinite zero-delay loop against a metered endpoint, on
+    a command that had already finished. The same hammering the ``retry_delay``
+    floor was added to stop, reintroduced two commits later.
+    """
+    st = mc.ExecStatus.from_api({"pid": 7, "running": "maybe", "exited": "maybe", "more": "maybe"})
+    assert st.more is False, "a status this client cannot read must not demand an instant re-poll"
+    # `not more` is what makes the documented loop sleep; without it there is no
+    # delay between reads at all.
+    assert not st.more
+
+    finished = mc.ExecStatus.from_api({"pid": 7, "running": False, "exited": True, "more": "maybe"})
+    assert finished.done and not finished.more, "a finished command must let the loop break"
 
 
 def test_the_cautious_reading_keeps_a_poll_loop_going() -> None:
     """The two exec flags meet in ``done``, so they have to be chosen together."""
-    unreadable = mc.ExecStatus.from_api({"pid": 1, "running": "true", "exited": "false"})
+    unreadable = mc.ExecStatus.from_api({"pid": 1, "running": "maybe", "exited": "maybe"})
     assert unreadable.done is False, "a command this client cannot read is not finished"
 
 
 def test_the_cautious_reading_keeps_a_move_wait_going() -> None:
-    assert mc.Move.from_api({"state": "moving", "live": "true"}).live is True
+    assert mc.Move.from_api({"state": "moving", "live": "maybe"}).live is True
 
 
 def test_an_unreadable_exec_is_not_reported_as_a_success() -> None:
-    r = mc.ExecResult.from_api({"exit_code": 0, "timed_out": "false"})
+    r = mc.ExecResult.from_api({"exit_code": 0, "timed_out": "maybe"})
     assert r.timed_out is True
     assert r.ok is False, "ok must not bless an exec whose timed_out could not be read"
 
@@ -1251,19 +1314,29 @@ def test_an_unreadable_exec_is_not_reported_as_a_success() -> None:
 def test_no_wire_boolean_is_left_on_truthiness() -> None:
     """The rule is every boolean, not a list somebody has to keep current.
 
-    The path comes from the module rather than the cwd — the first version read
-    ``src/...`` relative to wherever pytest was invoked and errored anywhere but
-    the repo root (/code-review) — and it looks for a ``bool(`` call on anything
-    at all inside a ``from_api``, not just the one ``bool(d.get(...))`` spelling
-    the invariant was first written against.
+    Three holes have been found in this scan, which is why it now checks its own
+    coverage. It read ``src/...`` relative to the cwd and errored anywhere but
+    the repo root. Its regex pinned one spelling, so ``bool(d["x"])`` walked
+    past. And its lookahead required a FOLLOWING decorator or class, so it
+    silently dropped the last ``from_api`` in the module — which was
+    ``ExecResult``'s, one this branch changed (/code-review, OPL-3835). A scan
+    that quietly covers less than it claims is worse than no scan.
     """
     import re
 
-    source = pathlib.Path(mc._models.__file__).read_text()
-    bodies = re.findall(r"def from_api\(.*?(?=\n    @|\n@|\nclass )", source, re.DOTALL)
-    assert bodies, "no from_api bodies found; the scan is not looking at anything"
-    offenders = [call for body in bodies for call in re.findall(r"\bbool\([^)]*\)", body)]
-    assert not offenders, offenders
+    modules = ["_models", "_computer", "_async_computer"]
+    for name in modules:
+        source = pathlib.Path(getattr(mc, name).__file__).read_text()
+        bodies = re.findall(r"def from_api\(.*?(?=\n    @|\n@|\nclass |\Z)", source, re.DOTALL)
+        assert len(bodies) == source.count("def from_api("), (
+            f"{name}: scanned {len(bodies)} of {source.count('def from_api(')} decoders"
+        )
+        offenders = [call for body in bodies for call in re.findall(r"\bbool\([^)]*\)", body)]
+        assert not offenders, (name, offenders)
+        # And nothing anywhere in these modules may read a caveat flag raw.
+        for flag in ("unreachable", "orphaned", "degraded", "unmetered", "live", "timed_out"):
+            raw = re.findall(rf'(?<!_flag\()[\w.]*get\("{flag}"[^)]*\)', source)
+            assert not raw, (name, flag, raw)
 
 
 def test_template_keeps_the_raw_positional_slot_too() -> None:

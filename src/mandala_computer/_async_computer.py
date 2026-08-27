@@ -61,6 +61,7 @@ from ._models import (
     SnapshotHoldings,
     Window,
     WindowResult,
+    _flag,
 )
 
 __all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
@@ -1000,7 +1001,7 @@ class AsyncComputer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or s.get("unreachable")
+            if s.get("computer_id") == self.id or _flag(s, "unreachable", unknown=True)
         ]
         return Listing.of(rows, incomplete)
 

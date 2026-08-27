@@ -50,6 +50,7 @@ from ._models import (
     VncConnect,
     Window,
     WindowResult,
+    _flag,
     _num,
 )
 
@@ -559,7 +560,10 @@ class ComputerFields:
         :attr:`status` reads ``""`` rather than anything true — check this
         before believing anything else here.
         """
-        return bool(self._data.get("unreachable", False))
+        # The same decoder the models use, not `bool()`: this is the flag whose
+        # own docstring says to check it before believing anything else on the
+        # row, and `bool("false")` read it backwards (/code-review, OPL-3835).
+        return _flag(self._data, "unreachable", unknown=True)
 
     @property
     def vnc(self) -> VncConnect | None:
@@ -1607,7 +1611,7 @@ class Computer(ComputerFields):
         rows = [
             Snapshot.from_api(s)
             for s in data or []
-            if s.get("computer_id") == self.id or s.get("unreachable")
+            if s.get("computer_id") == self.id or _flag(s, "unreachable", unknown=True)
         ]
         return Listing.of(rows, incomplete)
 
