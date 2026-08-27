@@ -37,6 +37,7 @@ from ._models import (
     TemplateBuild,
     TemplateCheck,
     UsageReport,
+    build_contradiction,
 )
 from ._sse import SSEEvent
 
@@ -762,6 +763,13 @@ class Builds:
                     raise MandalaError(_api.build_stream_truncated(build_id, malformed=True))
                 continue
             progress = BuildProgress.from_api(event.data)
+            contradiction = build_contradiction(progress)
+            if contradiction is not None:
+                # A record that disagrees with itself, on either event. Raised
+                # rather than yielded: a caller cannot act on a build that is
+                # both finished and running, and the TypeScript SDK refuses the
+                # same shape (OPL-3835).
+                raise MandalaError(contradiction)
             if event.event == "done" and not progress.done:
                 # A ``done`` whose payload says the build is still running is the
                 # malformed case too — see BuildProgress.done. Raised BEFORE the
@@ -852,6 +860,13 @@ class Builds:
                     err, started, remaining, self._t.phase_ceiling(err)
                 )
                 delay = retry_delay(poll, err)
+            if poll_state is _LastPoll.ANSWERED and last is not None:
+                # OUTSIDE the handler above, which treats a bare MandalaError as
+                # transient by design — raised inside it, this was swallowed and
+                # retried until the deadline (OPL-3835).
+                contradiction = build_contradiction(last)
+                if contradiction is not None:
+                    raise MandalaError(contradiction)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_wait_timed_out(build_id, timeout, last, poll_state))

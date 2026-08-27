@@ -690,10 +690,10 @@ BUILD_TERMINAL = ("succeeded", "failed")
 def _build_done(d: Mapping[str, Any]) -> bool:
     """Whether a build record says the build is OVER.
 
-    A RECOGNISED ``done`` is authoritative; anything else falls through to the
-    status. The order is the platform's own: ``done`` is derived from the JOB,
-    where the status is derived from a phase read out of a log the document's
-    own steps write into.
+    A RECOGNISED ``done`` is authoritative; absent, null or unreadable falls
+    through to the status. The order is the platform's own: ``done`` is derived
+    from the JOB, where the status is derived from a phase read out of a log the
+    document's own steps write into.
 
     On the FIELD rather than beside it, and that is the correction (adversarial
     review, OPL-3835). This rule lived in ``build_ended`` in _resources while
@@ -701,11 +701,46 @@ def _build_done(d: Mapping[str, Any]) -> bool:
     "done": null}`` made ``wait()`` return an object whose own documented
     "whether to stop polling" field said False. Two spellings of one question
     drifted apart twice; now there is one.
+
+    A ``done`` OF TRUE AGAINST A RUNNING STATUS IS NOT TERMINAL. The record
+    contradicts itself, and the reading that trusts the flag turns an active
+    build into a settled one. This half comes from the TypeScript SDK, whose own
+    review of the same surface caught it while this one did not — see
+    :func:`build_contradiction` for the other half of the answer, which is that
+    a wait says so rather than polling a self-contradicting record in silence.
     """
     said = _wire(d, "done")
-    if said in (_Wire.TRUE, _Wire.FALSE):
-        return said is _Wire.TRUE
+    if said is _Wire.TRUE:
+        return _text(d.get("status")) in BUILD_TERMINAL
+    if said is _Wire.FALSE:
+        return False
     return _text(d.get("status")) in BUILD_TERMINAL
+
+
+def build_contradiction(progress: BuildProgress) -> str | None:
+    """Why this record cannot be believed, or ``None`` if it can.
+
+    Only one shape qualifies: a ``done`` the wire actually said was true,
+    against a status that is not terminal. Absent, null and unreadable are NOT
+    contradictions — they are a host that said nothing, and the status answers
+    for them.
+
+    Separate from :func:`_build_done` because the two answer different
+    questions and only one of them belongs on a model whose contract is that
+    malformed fields are preserved and never rejected. The field stays lenient;
+    the wait and the stream, which would otherwise poll a record like this until
+    their deadline, raise.
+    """
+    if _wire(progress.raw, "done") is not _Wire.TRUE:
+        return None
+    if progress.status in BUILD_TERMINAL:
+        return None
+    return (
+        f"build {progress.id or '?'} reports done with status "
+        f"{progress.status!r}, which is not one a build stops on "
+        f"({' or '.join(BUILD_TERMINAL)}). The record contradicts itself, so "
+        "neither half of it can be trusted — read progress() again."
+    )
 
 
 @dataclass(frozen=True)
