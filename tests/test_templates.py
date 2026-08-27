@@ -1092,28 +1092,33 @@ def test_zero_is_allowed_because_every_sibling_wait_takes_it(client: mc.Client) 
 
 
 @respx.mock
-def test_a_response_slower_than_a_quarter_of_the_budget_still_succeeds(
+def test_the_timeout_that_reaches_the_transport_is_the_whole_remaining_budget(
     client: mc.Client,
 ) -> None:
-    """The cap is an upper bound on each operation, not a wall-clock deadline.
+    """The cap is an upper bound on each operation, not a quarter-share of one.
+
+    Asserted on ``request.extensions["timeout"]`` — what httpx actually carries
+    — because respx does NOT enforce timeouts: a handler that sleeps past the
+    read timeout returns 200 anyway, so a test that merely times a mocked
+    response proves nothing and would pass against the divided implementation
+    too. That was the first version of this test.
 
     Dividing the budget across httpx's four settings so they SUM to it was
     arithmetic about a total that does not exist — ``read`` is an inactivity
-    timeout that restarts on every chunk — and it broke the callers it was meant
-    to help: a legitimate response taking more than a quarter of the remaining
-    time began failing, and neither ``wait_until_built`` nor
+    timeout that httpcore restarts on every chunk — and it broke the callers it
+    was meant to help: with eight seconds left a legitimate three-second refresh
+    began failing at two, and neither ``wait_until_built`` nor
     ``wait_until_running`` catches a timeout on its refresh.
     """
-    slow = 0.25
-
-    def delayed(request: httpx.Request) -> httpx.Response:
-        time.sleep(slow)
-        return httpx.Response(200, json=DONE)
-
-    respx.get(f"{BASE}/builds/bld-1/progress").mock(side_effect=delayed)
-    # 0.6s left, a 0.25s response: comfortably inside the budget, and more than
-    # the 0.15s a quarter-share would have allowed.
-    assert client.builds.wait("bld-1", timeout=0.6, poll=0.01).status == "succeeded"
+    route = respx.get(f"{BASE}/builds/bld-1/progress").mock(
+        return_value=httpx.Response(200, json=DONE)
+    )
+    client.builds.wait("bld-1", timeout=8.0, poll=0)
+    sent = route.calls.last.request.extensions["timeout"]
+    assert sent["read"] == pytest.approx(8.0, abs=0.5), sent
+    assert sent["connect"] == pytest.approx(8.0, abs=0.5), sent
+    # A quarter-share would have been 2.0 on every phase.
+    assert sent["read"] > 4.0, sent
 
 
 def test_the_cap_still_tightens_a_looser_client_timeout() -> None:

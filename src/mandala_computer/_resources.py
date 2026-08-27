@@ -172,6 +172,17 @@ def check_wait_args(timeout: float, poll: float) -> None:
     sites. ``timeout=0`` is an already-expired deadline, and the sibling waits
     answer it with the ``TimeoutError`` their callers are catching; raising a
     ``ValueError`` instead would go past that handler.
+
+    ``poll=0`` DOES mean no delay between polls, and against a live endpoint
+    that is a hammering loop — ``time.sleep(0)`` and ``await asyncio.sleep(0)``
+    both return at once (third adversarial review, OPL-3835). It is allowed
+    anyway because it is not this method's property to fix: all eight sibling
+    wait loops in _computer.py and _async_computer.py do the same thing with the
+    same argument and there is no poll floor anywhere in the SDK, so refusing it
+    HERE would make one wait stricter than the eight beside it while leaving the
+    hammering reachable through any of them. A floor is worth having; it is
+    worth having everywhere at once, not smuggled in through the one wait a
+    review happened to look at.
     """
     for value, what in ((timeout, "timeout"), (poll, "poll")):
         if (
