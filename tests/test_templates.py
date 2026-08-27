@@ -2317,24 +2317,22 @@ def test_every_docstring_rewrite_still_finds_its_sentence() -> None:
     """The drift guard, in a test rather than at import time.
 
     A bare `str.replace` no-ops when the prose is reworded and the async doc is
-    wrong again with nothing failing — the first ephemeral correction was dead
-    code for a whole commit that way. But asserting it at IMPORT turned a
+    wrong again with nothing failing. But asserting it at IMPORT turned a
     one-word docstring edit into `import mandala_computer` failing outright,
-    which is a worse trade than the bug (found while deciding whether to merge).
-    Loud here, harmless there.
-    """
-    from mandala_computer._async_resources import DOC_REWRITES
-    from mandala_computer._resources import EPHEMERAL_DOC
+    which is a worse trade than the bug. Loud here, harmless there.
 
-    sources = {
-        "AsyncComputers.ephemeral": EPHEMERAL_DOC,
-        "AsyncBuilds": mc.Builds.__doc__ or "",
-    }
-    for owner, sentence in DOC_REWRITES:
-        assert owner in sources, f"{owner} has no source registered"
-        assert sources[owner].count(sentence) == 1, (
-            f"{owner}: the sync wording no longer contains {sentence!r} exactly once, "
-            "so the async rewrite silently did nothing"
+    It reads what the rewrites actually DID, not a list restating them. The
+    first version was such a list, and a call added without an entry passed
+    silently — a registry you have to remember to update is the same class of
+    bug as the drift it was written to catch (adversarial review, OPL-3835).
+    """
+    from mandala_computer._async_resources import _REWRITES
+
+    assert _REWRITES, "no rewrites recorded; the module no longer performs any"
+    for sentence, found in _REWRITES:
+        assert found == 1, (
+            f"the source wording no longer contains {sentence!r} exactly once "
+            f"(found {found}), so that rewrite silently did nothing"
         )
 
     # And the rewrites really did land.

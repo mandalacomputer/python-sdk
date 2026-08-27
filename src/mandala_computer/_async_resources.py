@@ -29,35 +29,32 @@ from ._models import (
     UsageReport,
 )
 
+#: Every rewrite actually performed at import, as ``(sentence, occurrences)``.
+#: RECORDED rather than restated: the first version of this guard was a
+#: hand-maintained list beside the calls, and a third call added without a
+#: matching entry silently did nothing while the whole suite stayed green
+#: (adversarial review, OPL-3835). A list you have to remember to update is the
+#: same class of bug as the one it was written to catch.
+_REWRITES: list[tuple[str, int]] = []
+
 
 def _reworded(doc: str | None, old: str, new: str) -> str:
     """One half's prose with one sentence rewritten for the other.
 
     A bare ``str.replace`` on a docstring silently does nothing when the sync
-    wording changes, and the async doc is then wrong again with no test failing
-    (adversarial review, OPL-3835). It is not hypothetical: the first ephemeral
-    correction replaced strings the doc did not contain and was dead code for a
-    whole commit.
+    wording changes, and the async doc is then wrong again with no test failing.
+    It is not hypothetical: the first ephemeral correction replaced strings the
+    doc did not contain and was dead code for a whole commit.
 
-    IT DOES NOT RAISE. The first version of this asserted at import time, which
-    turned a one-word docstring edit into ``import mandala_computer`` failing
-    outright — a worse trade than the no-op it replaced, and one that would
-    strand every caller over a documentation change. Drift is a documentation
-    bug and belongs in a test; :func:`tests.test_templates` asserts every
-    rewrite still finds its sentence.
+    IT DOES NOT RAISE. A version of this asserted at import time, which turned a
+    one-word docstring edit into ``import mandala_computer`` failing outright —
+    a worse trade than the no-op it replaced, and one that would strand every
+    caller over a documentation change. What it does instead is RECORD what it
+    found, so a test can fail loudly while the package still imports.
     """
     text = doc or ""
+    _REWRITES.append((old, text.count(old)))
     return text.replace(old, new, 1)
-
-
-#: Every docstring rewrite this module performs, so a test can check each one
-#: still matches. Its own list rather than something scraped back out of the
-#: results, because the failure being guarded against is a replacement that
-#: matched NOTHING — which is invisible in the output.
-DOC_REWRITES = (
-    ("AsyncComputers.ephemeral", "tying that to a ``with`` block"),
-    ("AsyncBuilds", ":class:`Templates`"),
-)
 
 
 from ._resources import (
@@ -335,7 +332,7 @@ class AsyncTemplates:
 
 
 class AsyncBuilds:
-    __doc__ = (Builds.__doc__ or "").replace(":class:`Templates`", ":class:`AsyncTemplates`")
+    __doc__ = _reworded(Builds.__doc__, ":class:`Templates`", ":class:`AsyncTemplates`")
 
     def __init__(self, transport: AsyncTransport) -> None:
         self._t = transport
