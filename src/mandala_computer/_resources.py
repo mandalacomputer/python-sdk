@@ -174,8 +174,11 @@ def _cut_short_by_our_own_cap(
 ) -> bool:
     """Whether a failed poll ran out of OUR time rather than the platform's.
 
-    ``ceiling`` is the client's own read timeout, or ``None`` where it has
-    none: the cap is only what fired if it was the TIGHTER of the two.
+    ``ceiling`` is the client's own limit for the phase that timed out, or
+    ``None`` where it has none or the phase cannot be named: the cap is only
+    what fired if it was the TIGHTER of the two, and "tighter" is a question
+    about ONE phase — a connect stall is not measured against a read timeout
+    (adversarial review, OPL-3835). An unnamed phase is not claimed.
 
     ``wait`` caps each poll at what is left of its deadline, so near the end a
     perfectly healthy request gets cut off mid-flight. Counting that as a poll
@@ -191,12 +194,12 @@ def _cut_short_by_our_own_cap(
     """
     if not isinstance(err, TimeoutError):
         return False
-    # The cap only OWNS a timeout it actually caused. Elapsed time alone said a
-    # sixty-second network stall with sixty-six seconds left was ours, because
-    # 60 >= 66 * 0.9 — and the wait then reported a build "still running" from a
-    # reading over a minute old (adversarial review, OPL-3835). If the client's
-    # own timeout was the tighter of the two, the stall is the platform's.
-    if ceiling is not None and budget >= ceiling:
+    # The cap only OWNS a timeout it actually caused: it must have been the
+    # tighter of the two for that phase. Elapsed time alone said a sixty-second
+    # network stall with sixty-six seconds left was ours, because 60 >= 66 * 0.9
+    # — and the wait then reported a build "still running" from a reading over a
+    # minute old (adversarial review, OPL-3835).
+    if ceiling is None or budget >= ceiling:
         return False
     return time.monotonic() - started >= budget * 0.9
 
@@ -820,7 +823,9 @@ class Builds:
                 # "was still running (phase X, step N of M)": a claim the fleet
                 # stopped answering, when only this clock ran out. The
                 # TypeScript twin skips the same case by name.
-                if not _cut_short_by_our_own_cap(err, started, remaining, self._t.read_ceiling):
+                if not _cut_short_by_our_own_cap(
+                    err, started, remaining, self._t.phase_ceiling(err)
+                ):
                     observed = False
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()

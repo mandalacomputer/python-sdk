@@ -154,7 +154,15 @@ class AsyncComputers:
         else:
             await computer.delete()
 
-    ephemeral.__doc__ = EPHEMERAL_DOC
+    ephemeral.__doc__ = (
+        EPHEMERAL_DOC.replace(
+            "with client.computers.ephemeral", "async with client.computers.ephemeral"
+        ).replace("    with ", "    async with ")
+        + "\n    ``async with``, not ``with``: this is an async context manager and the\n"
+        "    plain form raises ``TypeError``. The sync prose is otherwise the same,\n"
+        "    and sharing it verbatim taught the wrong keyword (adversarial review,\n"
+        "    OPL-3835).\n"
+    )
 
 
 class AsyncSnapshots:
@@ -291,7 +299,7 @@ class AsyncTemplates:
 
 
 class AsyncBuilds:
-    __doc__ = Builds.__doc__
+    __doc__ = (Builds.__doc__ or "").replace(":class:`Templates`", ":class:`AsyncTemplates`")
 
     def __init__(self, transport: AsyncTransport) -> None:
         self._t = transport
@@ -395,7 +403,9 @@ class AsyncBuilds:
             except MandalaError as err:
                 if not is_transient(err):
                     raise
-                if not _cut_short_by_our_own_cap(err, started, remaining, self._t.read_ceiling):
+                if not _cut_short_by_our_own_cap(
+                    err, started, remaining, self._t.phase_ceiling(err)
+                ):
                     observed = False
                 delay = retry_delay(poll, err)
             remaining = deadline - time.monotonic()

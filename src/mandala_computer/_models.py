@@ -150,18 +150,16 @@ def is_unreachable_stub(row: Mapping[str, Any]) -> bool:
     """
     if "computer_id" in row:
         return False
-    said = _wire(row, "unreachable")
-    if said is _Wire.TRUE:
-        return True
-    if said in (_Wire.NULL, _Wire.MALFORMED):
-        # An unreadable flag is believed only on a row that could not be
-        # anything else. `POST /computers/{id}/snapshots` answers without a
-        # `computer_id` too — it is in the path — and this decoder serves that
-        # response as well, so keying on the missing key alone made a freshly
-        # captured snapshot carrying `"unreachable": null` read as a placeholder
-        # (/code-review, OPL-3835). The documented stub is an id and this flag.
-        return set(row) <= {"id", "unreachable"}
-    return False
+    if _wire(row, "unreachable") in (_Wire.FALSE, _Wire.ABSENT):
+        return False
+    # THE SHAPE IS REQUIRED WHATEVER THE FLAG SAYS, and applying it only to the
+    # unreadable values left the same hole one branch over (adversarial review,
+    # OPL-3835): a full row with no `computer_id` and `unreachable: true` was
+    # admitted into EVERY computer's filtered list. `POST
+    # /computers/{id}/snapshots` answers without a `computer_id` too — it is in
+    # the path — so the missing key alone cannot mean placeholder. The
+    # documented stub is an id and this flag and nothing more.
+    return set(row) <= {"id", "unreachable"}
 
 
 def _texts(value: Any) -> builtins.list[str]:
@@ -1425,8 +1423,8 @@ class ExecStatus:
     killed: bool
     started_at: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
-    #: Whether this came off the wire. Keyword-only and out of ``repr`` and
-    #: ``==`` so it changes no existing construction.
+    #: Whether this came off the wire. Keyword-only, so it changes no existing
+    #: construction and stays out of ``__match_args__``.
     #:
     #: ``raw`` cannot answer it: ``from_api`` sets ``raw=dict(d)``, so a decoded
     #: ``{}`` — a proxy hiccup, a daemon answering 200 with an empty object — is
@@ -1434,7 +1432,12 @@ class ExecStatus:
     #: let that payload declare a command finished with nothing exited, nothing
     #: killed and no exit code (/code-review, OPL-3835). The escape hatch
     #: reopened the very hole it was written beside.
-    decoded: bool = field(default=False, repr=False, compare=False, kw_only=True)
+    #: IN ``==``, because it changes :attr:`done`. Excluded at first, which
+    #: made ``from_api({})`` compare equal to a hand-built status that reports
+    #: the opposite of it (adversarial review, OPL-3835) — two objects equal to
+    #: each other and behaviourally different is the wrong thing for an
+    #: expected-value assertion or a change check to be handed.
+    decoded: bool = field(default=False, repr=False, kw_only=True)
 
     @property
     def done(self) -> bool:

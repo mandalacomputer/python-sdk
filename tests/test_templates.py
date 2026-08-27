@@ -1725,29 +1725,45 @@ def test_every_readme_example_parses_and_defines_what_it_uses() -> None:
                 stack.append(child)
         return bound
 
+    def _loads(node: ast.AST) -> set[str]:
+        return {
+            c.id for c in ast.walk(node) if isinstance(c, ast.Name) and isinstance(c.ctx, ast.Load)
+        }
+
     for n, block in enumerate(blocks, 1):
         try:
             tree = ast.parse(block)
         except SyntaxError as exc:
             problems.append(f"block {n}: {exc}")
             continue
-        # Everything the block binds anywhere counts WITHIN the block — a `for`
-        # target is read later in its own loop, an `except ... as e` inside its
-        # own handler — so ordering is not checked inside a block. A stricter
-        # statement-ordered version reported a dozen false positives on exactly
-        # those shapes, and catching `print(x); x = 1` is not worth them. What
-        # is checked is what actually broke: a name no block ever binds, and a
-        # name that only exists inside some earlier block's function.
-        inside = bound_by(tree, descend=True)
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Name)
-                and isinstance(node.ctx, ast.Load)
-                and node.id not in defined
-                and node.id not in inside
-            ):
-                problems.append(f"block {n}: undefined name {node.id!r}")
-        defined |= bound_by(tree, descend=False)
+        # PER SCOPE. Ordering within a block is deliberately not checked — a
+        # `for` target is read later in its own loop, an `except ... as e` in
+        # its own handler, and a statement-ordered version reported a dozen
+        # false positives on exactly those shapes. But scope is checked: reads
+        # at module level are satisfied only by module-level bindings, because
+        # pooling every scope's names let a function-local mask a genuine
+        # undefined load in the same block (adversarial review, OPL-3835)::
+        #
+        #     print(token)            # NameError, and it used to pass
+        #
+        #     def helper():
+        #         token = "local"
+        module_level = bound_by(tree, descend=False)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for name in _loads(node):
+                if name not in defined and name not in module_level:
+                    problems.append(f"block {n}: undefined name {name!r}")
+        # A function body sees its own locals and arguments as well.
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            local = bound_by(node, descend=True)
+            for name in _loads(node):
+                if name not in defined and name not in module_level and name not in local:
+                    problems.append(f"block {n}: undefined name {name!r} in {node.name}")
+        defined |= module_level
     assert not problems, "\n".join(dict.fromkeys(problems))
 
 
@@ -1890,12 +1906,18 @@ def test_a_decoded_empty_body_is_not_a_finished_command() -> None:
     assert built.done is True, "a caller who wrote running=False has said it stopped"
 
 
-def test_the_decoded_flag_changes_no_existing_construction() -> None:
-    """Keyword-only, out of ``repr`` and out of ``==``."""
+def test_the_decoded_flag_is_in_equality_because_it_changes_done() -> None:
+    """Two objects equal to each other and behaviourally different is the wrong
+    thing to hand an expected-value assertion.
+
+    It was excluded from ``==`` at first, so ``from_api({})`` compared equal to
+    a hand-built status reporting the opposite ``done`` (adversarial review,
+    OPL-3835). Provenance that changes public behaviour belongs in equality.
+    """
     kwargs: dict[str, object] = {
         "pid": 1,
         "command": "c",
-        "running": True,
+        "running": False,
         "exited": False,
         "exit_code": None,
         "stdout": "",
@@ -1905,8 +1927,35 @@ def test_the_decoded_flag_changes_no_existing_construction() -> None:
         "more": False,
         "killed": False,
     }
-    assert mc.ExecStatus(**kwargs) == mc.ExecStatus(**kwargs, decoded=True)
-    assert "decoded" not in repr(mc.ExecStatus(**kwargs))
+    built = mc.ExecStatus(**kwargs)  # type: ignore[arg-type]
+    decoded = mc.ExecStatus(**kwargs, decoded=True)  # type: ignore[arg-type]
+    assert built.done is not decoded.done, "the flag changes behaviour"
+    assert built != decoded, "so it must change equality with it"
+    assert built == mc.ExecStatus(**kwargs)  # type: ignore[arg-type]
+
+
+def test_the_decoded_flag_breaks_no_existing_construction() -> None:
+    """Adding a field to an exported frozen dataclass, checked rather than
+    assumed: positional construction, positional match patterns, ``replace``
+    and pickling all have to survive it."""
+    import dataclasses
+    import pickle
+
+    assert "decoded" not in mc.ExecStatus.__match_args__, "kw_only keeps it out"
+    built = mc.ExecStatus(1, "c", True, False, None, "", "", 0, 0, False, False)
+    assert built.decoded is False
+    assert "decoded" not in repr(built)
+
+    off_wire = mc.ExecStatus.from_api({"pid": 2, "running": True})
+    assert off_wire.decoded is True
+    assert dataclasses.replace(off_wire, pid=9).decoded is True, "replace carries it"
+    assert pickle.loads(pickle.dumps(off_wire)).decoded is True
+
+    match built:
+        case mc.ExecStatus(pid, command):
+            assert (pid, command) == (1, "c")
+        case _:  # pragma: no cover
+            raise AssertionError("positional pattern stopped matching")
 
 
 def test_a_fresh_snapshot_without_a_computer_id_is_not_a_placeholder() -> None:
@@ -1939,3 +1988,109 @@ def test_the_async_events_docstring_does_not_teach_the_sync_idiom() -> None:
     assert "with closing(client.builds.events" not in async_doc
     assert "async for" in async_doc
     assert "with closing(client.builds.events" in sync_doc, "the sync half keeps its own"
+
+
+def test_a_full_row_without_a_computer_id_is_not_admitted_to_every_listing() -> None:
+    """The shape is required whatever the flag says.
+
+    Applying it only to null and unreadable left the same hole one branch over:
+    a full row with no ``computer_id`` and ``unreachable: true`` was admitted
+    into EVERY computer's filtered list (adversarial review, OPL-3835).
+    """
+    from mandala_computer._models import is_unreachable_stub
+
+    full = {"id": "snap-other", "name": "nightly", "state": "pending", "size_bytes": 123}
+    assert is_unreachable_stub({**full, "unreachable": True}) is False
+    assert is_unreachable_stub({"id": "snap-1", "unreachable": True}) is True
+    assert is_unreachable_stub({"id": "snap-1", "unreachable": None}) is True
+    assert is_unreachable_stub({"id": "snap-1"}) is False
+    # The FIELD still believes an explicit true wherever it appears — that is a
+    # different question from "is this row a placeholder for another computer".
+    assert mc.Snapshot.from_api({**full, "unreachable": True}).unreachable is True
+
+
+@respx.mock
+def test_the_full_row_is_kept_out_of_another_computers_snapshots(client: mc.Client) -> None:
+    rows = [
+        {"id": "snap-mine", "computer_id": "vm-1"},
+        {"id": "snap-stub", "unreachable": True},
+        {"id": "snap-full-no-cid", "name": "n", "state": "pending", "unreachable": True},
+    ]
+    respx.get(f"{BASE}/snapshots").mock(return_value=httpx.Response(200, json=rows))
+    got = [s.id for s in mc.Computer(client._t, {"id": "vm-1", "status": "running"}).snapshots()]
+    assert got == ["snap-mine", "snap-stub"], got
+
+
+@pytest.mark.parametrize(
+    ("cause", "connect", "read", "budget", "ours"),
+    [
+        # A connect stall the wait never tightened: connect is 4.8, the budget
+        # is 5, so the cap did not cause this and the platform did.
+        (httpx.ConnectTimeout, 4.8, 60.0, 5.0, False),
+        # The wait DID tighten connect here — 2 is under 60 — so its own cap
+        # firing must not be blamed on the platform.
+        (httpx.ConnectTimeout, 60.0, 1.0, 2.0, True),
+        # The ordinary read case, both directions.
+        (httpx.ReadTimeout, 10.0, 60.0, 30.0, True),
+        (httpx.ReadTimeout, 10.0, 60.0, 66.0, False),
+    ],
+)
+def test_the_cap_is_measured_against_the_phase_that_actually_timed_out(
+    cause: type, connect: float, read: float, budget: float, ours: bool
+) -> None:
+    """A single read ceiling cannot classify a connect stall.
+
+    Comparing every timeout against ``read`` got it wrong in both directions
+    (adversarial review, OPL-3835): a genuine connect stall was excused as the
+    wait's cap, and the wait's own tightened connect cap was blamed on the
+    platform.
+    """
+    import time as _time
+
+    from mandala_computer._client import _BaseTransport
+    from mandala_computer._resources import _cut_short_by_our_own_cap
+
+    timeout = httpx.Timeout(connect=connect, read=read, write=60.0, pool=10.0)
+    err = mc.TimeoutError("timed out")
+    err.__cause__ = cause("stalled", request=httpx.Request("GET", "https://x.test"))
+    ceiling = _BaseTransport._phase_ceiling(timeout, err)
+    started = _time.monotonic() - budget  # it spent its whole budget
+    assert _cut_short_by_our_own_cap(err, started, budget, ceiling) is ours
+
+
+def test_a_timeout_whose_phase_cannot_be_named_is_not_claimed() -> None:
+    """Unknown is not ours. An error with no cause, or a bare
+    ``TimeoutException``, could have come from anywhere."""
+    import time as _time
+
+    from mandala_computer._client import _BaseTransport
+    from mandala_computer._resources import _cut_short_by_our_own_cap
+
+    timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+    err = mc.TimeoutError("timed out")
+    assert _BaseTransport._phase_ceiling(timeout, err) is None
+    assert _cut_short_by_our_own_cap(err, _time.monotonic() - 30, 30.0, None) is False
+
+
+def test_no_async_docstring_teaches_a_sync_only_idiom() -> None:
+    """A class of bug, not one instance: `events` was found and fixed, and the
+    same shortcut had put a `with` block in `ephemeral` and a link to the sync
+    `Templates` in `AsyncBuilds` (adversarial review, OPL-3835)."""
+    import re
+
+    offenders = []
+    for cls in (mc.AsyncComputers, mc.AsyncTemplates, mc.AsyncBuilds, mc.AsyncSnapshots):
+        docs = [(cls.__name__, "<class>", cls.__doc__ or "")]
+        docs += [
+            (cls.__name__, n, getattr(cls, n).__doc__ or "")
+            for n in dir(cls)
+            if not n.startswith("_")
+        ]
+        for owner, name, doc in docs:
+            if re.search(r"(?<!async )\bwith client\.", doc):
+                offenders.append((owner, name, "sync `with`"))
+            if re.search(r"(?<!async )\bfor \w+ in client\.", doc):
+                offenders.append((owner, name, "sync `for ... in`"))
+            if re.search(r":class:`(?!Async)[A-Z]\w*s`", doc):
+                offenders.append((owner, name, "link to a sync class"))
+    assert not offenders, offenders

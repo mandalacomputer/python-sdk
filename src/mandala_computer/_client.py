@@ -342,17 +342,37 @@ class _BaseTransport:
         )
 
     @staticmethod
-    def _read_ceiling(timeout: httpx.Timeout) -> float | None:
-        """A client's own read timeout, or ``None`` where it has none.
+    def _phase_ceiling(timeout: httpx.Timeout, err: BaseException) -> float | None:
+        """The client's own limit for the PHASE that actually timed out.
 
-        What a poll's deadline cap is measured AGAINST: a cap wider than this
+        What a poll's deadline cap is measured against: a cap wider than this
         never tightened anything, so a timeout under it belongs to the platform
-        rather than to the wait (adversarial review, OPL-3835). Static, and each
-        half exposes it as a property over its own client — annotating `_http`
-        on this base as a union of the two makes every narrowed use of it in the
-        subclasses fail.
+        rather than to the wait. Per phase, because httpx has four and they
+        differ — comparing every timeout against ``read`` alone got both
+        directions wrong (adversarial review, OPL-3835). With ``connect=4.8``
+        and ``read=60``, a five-second budget tightens neither, yet a genuine
+        connect stall at 4.8s was excused as ours; with ``connect=60`` and
+        ``read=1``, a two-second budget DOES tighten connect, and its own cap
+        firing was blamed on the platform.
+
+        Read off ``__cause__``, which is the httpx exception ``_timed_out``
+        raises from, so no exception type or signature has to change.
         """
-        return None if timeout.read is None else float(timeout.read)
+        cause = err.__cause__
+        if isinstance(cause, httpx.ConnectTimeout):
+            value = timeout.connect
+        elif isinstance(cause, httpx.WriteTimeout):
+            value = timeout.write
+        elif isinstance(cause, httpx.PoolTimeout):
+            value = timeout.pool
+        elif isinstance(cause, httpx.ReadTimeout):
+            value = timeout.read
+        else:
+            # Not a phase we can name — an httpx.TimeoutException with no
+            # subtype, or an error raised without a cause. Unknown, and the
+            # caller treats unknown as "cannot claim it".
+            return None
+        return None if value is None else float(value)
 
     @staticmethod
     def _cap_budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
@@ -762,10 +782,9 @@ def _retry_after(resp: httpx.Response) -> float | None:
 class Transport(_BaseTransport):
     """Blocking transport."""
 
-    @property
-    def read_ceiling(self) -> float | None:
-        """See :meth:`_BaseTransport._read_ceiling`."""
-        return self._read_ceiling(self._http.timeout)
+    def phase_ceiling(self, err: BaseException) -> float | None:
+        """See :meth:`_BaseTransport._phase_ceiling`."""
+        return self._phase_ceiling(self._http.timeout, err)
 
     def __init__(
         self,
@@ -939,10 +958,9 @@ class Transport(_BaseTransport):
 class AsyncTransport(_BaseTransport):
     """Non-blocking transport."""
 
-    @property
-    def read_ceiling(self) -> float | None:
-        """See :meth:`_BaseTransport._read_ceiling`."""
-        return self._read_ceiling(self._http.timeout)
+    def phase_ceiling(self, err: BaseException) -> float | None:
+        """See :meth:`_BaseTransport._phase_ceiling`."""
+        return self._phase_ceiling(self._http.timeout, err)
 
     def __init__(
         self,
