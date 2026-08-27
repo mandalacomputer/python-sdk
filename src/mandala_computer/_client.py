@@ -20,6 +20,7 @@ from ._exceptions import (
     APIError,
     AuthenticationError,
     ConflictError,
+    ConnectionError,
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
@@ -772,9 +773,16 @@ def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutEr
     )
 
 
-def _request_failed(method: str, path: str, exc: httpx.RequestError) -> MandalaError:
-    """The SDK's error for a request that failed before an HTTP response arrived."""
-    return MandalaError(f"{method} {path} could not complete ({type(exc).__name__}): {exc}")
+def _request_failed(method: str, path: str, exc: httpx.RequestError) -> ConnectionError:
+    """The SDK's error for a request that failed before an HTTP response arrived.
+
+    A :class:`ConnectionError` rather than a bare :class:`MandalaError` since
+    OPL-3724. The base class was catchable by the SDK-wide handler and by
+    nothing more specific, and the retry predicates could not name it at all —
+    which is why this SDK had no public :func:`is_transient` while the other two
+    both listed their equivalent class in theirs.
+    """
+    return ConnectionError(f"{method} {path} could not complete ({type(exc).__name__}): {exc}")
 
 
 def _retry_after(resp: httpx.Response) -> float | None:

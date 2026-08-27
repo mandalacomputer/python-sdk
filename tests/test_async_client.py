@@ -419,14 +419,26 @@ async def test_wait_for_guest_does_not_wait_out_a_revoked_key(client: mc.AsyncCl
 
 
 @respx.mock
-async def test_wait_for_guest_preserves_a_rate_limit(client: mc.AsyncClient) -> None:
+async def test_wait_for_guest_polls_through_a_rate_limit_on_the_platform_cadence(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The async half of the same rule: honour Retry-After, do not fail the wait."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(429, headers={"Retry-After": "8"}, json={"error": "slow down"})
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "8"}, json={"error": "slow down"}),
+            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+        ]
     )
-    with pytest.raises(mc.RateLimitError) as caught:
-        await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)
-    assert caught.value.retry_after == 8
-    assert route.call_count == 1
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    slept: list[float] = []
+
+    async def _record(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(mc._async_computer.asyncio, "sleep", _record)
+    await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)
+    assert route.call_count == 2
+    assert 8 in slept
     await client.aclose()
 
 

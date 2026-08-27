@@ -29,15 +29,12 @@ from ._client import (
     error_for_status,
 )
 from ._exceptions import (
-    AuthenticationError,
+    APIError,
     MandalaError,
-    NotFoundError,
-    OriginTLSError,
-    PermissionDeniedError,
-    PlanLimitError,
     RangeNotSatisfiableError,
     RateLimitError,
     TimeoutError,
+    _is_transient_for_poll,
 )
 from ._models import (
     ExecResult,
@@ -300,29 +297,78 @@ def _require_background_pid(data: Mapping[str, Any]) -> None:
         raise MandalaError("exec start answered without a positive pid")
 
 
-#: Errors that :meth:`Computer.wait_for_guest` must not hide. Most cannot be
-#: resolved by waiting; a rate limit can, but only on the server's retry cadence,
-#: which this helper must preserve for its caller rather than replacing with its
-#: own shorter poll.
+#: The shortest a poll may wait after a 429, when the platform named no interval.
 #:
-#: Everything else in the
-#: hierarchy is either transient by definition (:class:`ConflictError`, which
-#: the guest agent answers with in the first seconds of a start, and
-#: :class:`UnavailableError`) or a 502 from an agent that has not spoken yet —
-#: all of which are exactly what this method exists to wait out.
-_FATAL_WHILE_WAITING = (
-    AuthenticationError,
-    PermissionDeniedError,
-    NotFoundError,
-    PlanLimitError,
-    RateLimitError,
-    # A certificate the edge and the platform cannot agree on fails identically
-    # on every retry, so waiting one out spends the whole timeout to report "the
-    # guest did not respond" — the wrong cause, the wrong class, and three
-    # minutes, about a deployment somebody has to go and fix. Its own message
-    # says to report it rather than wait it out; this is what makes that true.
-    OriginTLSError,
-)
+#: Arbitrary, and any positive number would do; what matters is that a rate
+#: limit never retries instantly.
+RATE_LIMITED_FLOOR = 1.0
+
+
+def _poll_delay(err: MandalaError, poll: float) -> float:
+    """How long to leave before the next poll, when the last one failed.
+
+    The ordinary interval, unless the platform asked for longer. A 429 is the
+    one failure that says how long to wait, and ``_is_transient_for_poll`` polls
+    through it — so a loop that ignored ``retry_after`` and asked again on its
+    own faster cadence would be spending a rate limit to discover it was still
+    rate limited. That is precisely why :class:`RateLimitError` used to be in
+    ``_FATAL_WHILE_WAITING``, and honouring the header is the fix that set was
+    standing in for (OPL-3724).
+
+    THE FLOOR IS THE POINT, and ``poll`` cannot supply it. A ``RateLimitError``
+    carries ``retry_after`` only when the platform sent a ``Retry-After``
+    header, and it often does not; with ``poll=0`` — which this SDK accepts,
+    because all eight waits do — the delay was then zero, so a wait hit a rate
+    limiter and retried it back to back for the full half-hour default
+    (/code-review, OPL-3835). That is the loop this floor exists to break.
+
+    This was ``retry_delay`` in _resources.py, reached only by the build wait,
+    while the other waits had nothing of the kind. One copy now, for the reason
+    there is one predicate: the same question deserves the same answer wherever
+    it is asked.
+    """
+    if isinstance(err, RateLimitError):
+        after = err.retry_after
+        usable = after if isinstance(after, (int, float)) and math.isfinite(after) else None
+        return max(poll, usable or RATE_LIMITED_FLOOR)
+    return poll
+
+
+def _guest_not_running(err: BaseException) -> bool:
+    """Whether this is the guest routes' 400 for a machine that is not up yet.
+
+    The one place a status means opposite things on two routes. ``POST
+    computers/:id/exec`` answers 400 when the computer is not running — a
+    moment, and one :meth:`Computer.wait_for_guest` exists to wait out. The
+    control plane answers 400 for a malformed request, which is a defect, and
+    ``_is_transient_for_poll`` is right to give up on it.
+
+    Nothing in the error separates them, so the CALLER does: only the guest
+    probe asks this, and only about its own failure. Kept out of the shared
+    predicate for exactly that reason — a wait on a build or a move has no
+    business waiting out a 400.
+    """
+    return isinstance(err, APIError) and err.status == 400
+
+
+def _ride_out(err: MandalaError, deadline: float, poll: float) -> float:
+    """How long to sleep past a failed poll — or a re-raise, if it is not one.
+
+    What every ``wait_*`` helper does with an exception, in one place, so that
+    eight loops (four here, four on :class:`AsyncComputer`) cannot drift into
+    eight answers the way three clients did.
+
+    Returns a delay rather than sleeping, because the async twin has to await
+    its sleep and the policy must not be written twice to say so. Never longer
+    than what is left, so a caller polls once more and then meets its own
+    deadline check — which is what ends the wait, so a failure on the last poll
+    becomes the wait's ordinary timeout rather than a platform error nobody
+    asked about.
+    """
+    if not _is_transient_for_poll(err):
+        raise err
+    remaining = deadline - time.monotonic()
+    return min(_poll_delay(err, poll), remaining) if remaining > 0 else 0.0
 
 
 class ComputerFields:
@@ -851,7 +897,22 @@ class Computer(ComputerFields):
         deadline = time.monotonic() + timeout
         last: Move | None = None
         while True:
-            mine = self._my_move(self._t.json_object("GET", _api.MOVES))
+            try:
+                listed = self._t.json_object("GET", _api.MOVES)
+            except MandalaError as err:
+                # The poll reads the control plane's own table, and one edge
+                # blip mid-move used to end the wait and report a move that was
+                # still running as one that could not be watched (OPL-3724).
+                time.sleep(_ride_out(err, deadline, poll))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"{self.id} was still moving after {timeout:g}s "
+                        f"(state {last.state if last else 'unknown'}; the move has not "
+                        "stopped, only this wait has)"
+                    ) from err
+                continue
+            mine = self._my_move(listed)
             if mine is None:
                 raise MandalaError(
                     f"{self.id} has no move any more; the platform reaps one "
@@ -955,7 +1016,23 @@ class Computer(ComputerFields):
                 )
             time.sleep(min(poll, remaining))
             remaining = deadline - time.monotonic()
-            self._refresh(timeout_cap=remaining)
+            try:
+                self._refresh(timeout_cap=remaining)
+            except MandalaError as err:
+                # The state read had no retry around it at all, so a hypervisor
+                # briefly out of reach ended a fifteen-minute wait on a disk
+                # copy that was still going perfectly well (OPL-3724).
+                #
+                # _ride_out is asked what to wait and then NOT slept on, unlike
+                # every other caller, because this loop's sleep is at the top:
+                # sleeping here as well spent two intervals on one failed poll
+                # and delayed noticing the build had finished (Codex adversarial
+                # review). What the answer is still good for is a 429, which
+                # asks for longer than `poll` and would otherwise be retried on
+                # this loop's own faster cadence.
+                delay = _ride_out(err, deadline, poll)
+                if delay > poll:
+                    time.sleep(min(delay - poll, max(deadline - time.monotonic(), 0.0)))
 
     def wait_until_running(self, timeout: float = 120.0, poll: float = 2.0) -> Computer:
         """Block until the machine is running.
@@ -973,7 +1050,14 @@ class Computer(ComputerFields):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
-            self._refresh(timeout_cap=remaining)
+            try:
+                self._refresh(timeout_cap=remaining)
+            except MandalaError as err:
+                # Bare, like wait_until_built's was: one 503 during a boot ended
+                # the wait and told the caller the machine had not come up, when
+                # what had happened was a single poll not landing (OPL-3724).
+                time.sleep(_ride_out(err, deadline, poll))
+                continue
             if self.status == "running":
                 return self
             # A computer with no disk will never start on its own, and waiting
@@ -1027,6 +1111,8 @@ class Computer(ComputerFields):
         """
         deadline = time.monotonic() + timeout
         while True:
+            # The caller's interval, unless a failure below asks for longer.
+            delay = poll
             failure = self._guest_wait_failure()
             if failure is not None:
                 raise failure
@@ -1041,22 +1127,46 @@ class Computer(ComputerFields):
                     timeout_cap=remaining,
                 ).ok:
                     return self
-            except _FATAL_WHILE_WAITING:
-                raise
-            except MandalaError:
-                # A failed probe may mean that the cached lifecycle state is
-                # stale. Re-read it before deciding the failure is transient.
+            except MandalaError as err:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
+                    raise TimeoutError(
+                        f"{self.id} guest did not respond within {timeout:g}s"
+                    ) from err
+                # _is_transient_for_poll, plus the one status this probe knows
+                # about and a predicate taking an error cannot: the GUEST routes
+                # answer 400 while the machine is not running yet, which is a
+                # moment, where a 400 from the control plane is a malformed
+                # request and a defect. The status is identical and the meaning
+                # is opposite, so the route decides — and only here, in the one
+                # method that talks to the guest agent (OPL-3724).
+                if not (_is_transient_for_poll(err) or _guest_not_running(err)):
+                    raise
+                # From here the failure is being waited out, so it gets to say
+                # how long. A 429 carries the platform's own answer to that, and
+                # ignoring it is how a short rate limit becomes a longer one —
+                # which is exactly what kept RateLimitError in the old fatal set.
+                delay = _poll_delay(err, poll)
+                # A failed probe may also mean the cached lifecycle state is
+                # stale. Re-read it before waiting the failure out — that read
+                # is what turns "the guest is quiet" into "it is stopped; call
+                # start()", which is the answer the caller can act on.
                 try:
                     self._refresh(timeout_cap=remaining)
-                except _FATAL_WHILE_WAITING:
-                    raise
-                except MandalaError:
+                except MandalaError as inner:
                     # A transient failure on the state read is no more final
                     # than one on the probe; retry while the budget remains.
-                    pass
+                    if not _is_transient_for_poll(inner):
+                        raise
+                    # And it gets to ask for time on its own account. The probe
+                    # set `delay` above, so a refresh answering 429 with a
+                    # Retry-After was swallowed and then retried on the probe's
+                    # cadence — which with poll=0 is immediately, against the
+                    # rate limiter that just asked for twelve seconds (Codex
+                    # adversarial review). The longer of the two wins: both
+                    # failures have to have passed before the next probe is
+                    # worth making.
+                    delay = max(delay, _poll_delay(inner, poll))
                 else:
                     failure = self._guest_wait_failure()
                     if failure is not None:
@@ -1064,7 +1174,7 @@ class Computer(ComputerFields):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
-            time.sleep(min(poll, remaining))
+            time.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------
 
