@@ -167,7 +167,10 @@ PARAMETERS: dict[str, set[str]] = {
     "GET templates/:namespace/:name": {"query:version"},
     "DELETE templates/:namespace/:name": {"query:version"},
     "POST builds": {"query:no_reuse"},
-    "GET builds": set(),
+    # The third fan-out listing, and the last to be able to say so: the platform
+    # has answered 503 on this route since it started merging across the fleet,
+    # and only documented the way out of it in OPL-3840.
+    "GET builds": {"query:allow_partial"},
     "GET builds/:id": set(),
     "GET builds/:id/progress": set(),
     "GET builds/:id/events": set(),
@@ -572,6 +575,10 @@ def exercise_everything(client: mc.Client) -> None:
     client.builds.start("apiVersion: mandala/v1")
     client.builds.start("apiVersion: mandala/v1", no_reuse=True)
     client.builds.list()
+    # Both spellings, the way the computer listing is exercised below: a build
+    # listing fails closed on a degraded fleet like every other fan-out, and
+    # OPL-3840 is what made the way out of it something a client can send.
+    client.builds.list(allow_partial=True)
     client.builds.get("bld-1")
     client.builds.progress("bld-1")
     for _ in client.builds.events("bld-1"):
@@ -690,6 +697,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.builds.start("apiVersion: mandala/v1")
     await client.builds.start("apiVersion: mandala/v1", no_reuse=True)
     await client.builds.list()
+    await client.builds.list(allow_partial=True)
     await client.builds.get("bld-1")
     await client.builds.progress("bld-1")
     async for _ in client.builds.events("bld-1"):
