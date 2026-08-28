@@ -84,7 +84,19 @@ class PlanLimitError(APIError):
 
 
 class FileTooLargeError(APIError):
-    """A guest transfer larger than the 64 MiB one request moves (413).
+    """More than one request carries, in either direction (413).
+
+    Named for the case it was written for and now raised by three routes, only
+    two of which move a file. :meth:`~mandala_computer.Computer.clipboard` is
+    the third: a selection past 128 KiB is refused rather than truncated, and
+    **the paging remedy below does not apply to it** — there is no ``Range`` on
+    a clipboard, so the text is either under the cap or out of reach. The name
+    stays because renaming a public exception breaks every caller catching it;
+    read the message, which names the limit that actually applied.
+
+    The file case, which is the rest of this docstring:
+
+    A guest transfer larger than the 64 MiB one request moves.
 
     The ceiling is on what a single *request* moves, not on the file. The bytes
     cross the guest agent's one connection in chunks and a transfer holds it for

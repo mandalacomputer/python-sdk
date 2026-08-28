@@ -1701,11 +1701,19 @@ class Computer(ComputerFields):
         The X ``CLIPBOARD`` selection — what Ctrl-C writes and Ctrl-V pastes —
         not the ``PRIMARY`` selection that middle-click uses.
 
-        This is the road that works on every Linux computer with a desktop: no
-        cold boot, no particular image, no permission from a browser. The other
-        road is RFB extended cut text over the desktop socket, which is live and
-        needs hardware and an image not every computer has — see
+        This is the road that needs nothing of the HARDWARE — no cold boot, and
+        no permission from a browser. The other road is RFB extended cut text
+        over the desktop socket, which is live and needs a virtio-serial channel
+        a computer only acquires on a cold boot — see
         :class:`~mandala_computer.VncConnect`.
+
+        It does want one thing of the IMAGE, and unlike the socket's conditions
+        it is stated in the answer rather than left to be inferred: ``xclip`` in
+        the guest. Every golden built since mid-2026 carries it, so in practice
+        this is a computer created before then — and a computer keeps the image
+        it was created from. The refusal is a **400** and it is permanent:
+        install ``xclip`` in the guest, which you can do since you have root
+        there, or create a new computer. Do not retry it.
 
         A read, not a subscription. Nothing notices a Ctrl-C in the guest on its
         own, and this does NOT resume a suspended computer: what somebody copied
@@ -1714,6 +1722,16 @@ class Computer(ComputerFields):
 
         An empty clipboard is ``""`` and a failure raises, which is the
         distinction the ``exec`` recipe this replaces could not make.
+
+        A clipboard past 128 KiB is refused rather than truncated — half a
+        password is not less of an answer, it is a wrong one that looks
+        completely normal — and it arrives as
+        :class:`~mandala_computer.FileTooLargeError`, which is that class's
+        third producer and the only one that is not a file. **The remedy
+        attached to it everywhere else does not exist here**: there is no
+        ``Range`` on a selection, so :meth:`read_file_part` and
+        :meth:`download_file` have no equivalent. The text is either under the
+        cap or out of reach.
 
         Linux only.
         """
@@ -1742,10 +1760,17 @@ class Computer(ComputerFields):
 
         The platform confirms the write by reading the selection back before it
         answers, so this returning means the desktop is *holding* the text
-        rather than that a command ran. A
-        :class:`~mandala_computer.ConflictError` means something else claimed
-        the selection in that instant — a clipboard manager settling, usually —
-        and it clears.
+        rather than that a command ran.
+
+        NOT EVERY :class:`~mandala_computer.ConflictError` HERE IS WORTH
+        RETRYING, and they do not look different. One is: "the desktop did not
+        take the text" means something else claimed the selection in that
+        instant — a clipboard manager settling, usually — and it clears on its
+        own. The others describe a state you have to change: the computer is not
+        running (:meth:`start` it), or its X server is not up yet.
+        :func:`~mandala_computer.is_transient` answers ``True`` for all of them,
+        so a blanket retry spins until your deadline against a computer that is
+        simply stopped. Read the message, or bound the loop in attempts.
 
         Linux only.
         """

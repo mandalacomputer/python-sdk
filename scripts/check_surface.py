@@ -34,6 +34,7 @@ what is missing is the argument that made it worth making.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -52,7 +53,17 @@ APIDOC = Path("web/lib/apidoc.ts")
 #: refuses a value early to save the caller a round trip, and a ceiling that has
 #: drifted turns that favour into a refusal of a run the platform would have
 #: taken — with nothing failing here to say so.
-CONSTANTS = [("MAX_STEPS", AGENT, "MAX_MAX_STEPS")]
+#: ``clipboardWriteMax`` is the one entry that is not TypeScript. The platform
+#: states that ceiling in its daemon rather than in ``web/lib``, and the first
+#: version of this SDK's mirror wrote "NOT machine-checked" in a docstring and
+#: left it there — which is an admission, not a check. The reader below takes
+#: either language, so the note could become true.
+CLIPBOARD = Path("server/clipboard.go")
+
+CONSTANTS = [
+    ("MAX_STEPS", AGENT, "MAX_MAX_STEPS"),
+    ("MAX_CLIPBOARD_BYTES", CLIPBOARD, "clipboardWriteMax"),
+]
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
@@ -182,11 +193,57 @@ def parameters(platform: Path) -> dict[str, set[str]]:
 
 
 def constant(source: str, name: str) -> int:
-    """One ``export const NAME = <int>`` out of a platform module."""
-    m = re.search(rf"export const {re.escape(name)}\s*=\s*(\d+)", source)
-    if m is None:
-        raise SystemExit(f"{name} not found — has it moved or changed shape?")
-    return int(m.group(1))
+    """One integer constant out of a platform module, TypeScript or Go.
+
+    Two declaration forms because the platform states these numbers in two
+    languages: ``export const NAME = <expr>`` in ``web/lib``, and a bare
+    ``name = <expr>`` inside a Go ``const`` block in ``server/``. The Go form is
+    matched at the start of a line so that a mention of the name in a comment or
+    in another expression is not read as its declaration.
+
+    The value is an EXPRESSION, not a literal, because both languages write
+    these as products — ``64 * 1024`` is how a byte ceiling is legible, and a
+    reader that demanded a bare integer could not see the very constants it exists to
+    compare. Evaluated with a grammar that admits integers, ``*``, ``+`` and
+    parentheses and nothing else: no names, no calls, no attribute access. A
+    declaration this cannot evaluate raises rather than being skipped, on the
+    rule the rest of this file follows — "could not tell" and "they agree" must
+    never be the same answer.
+    """
+    for pattern in (
+        rf"export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)\s*(?:;|//|\n)",
+        rf"^\s*{re.escape(name)}\s*=\s*([0-9*+()\s]+?)\s*(?://|\n)",
+    ):
+        m = re.search(pattern, source, re.MULTILINE)
+        if m is None:
+            continue
+        try:
+            return _arith(ast.parse(m.group(1).strip(), mode="eval").body)
+        except (SyntaxError, ValueError) as err:
+            raise SystemExit(
+                f"{name} is {m.group(1)!r}, which this reader cannot evaluate"
+            ) from err
+    raise SystemExit(f"{name} not found — has it moved or changed shape?")
+
+
+def _arith(node: ast.expr) -> int:
+    """Evaluate an integer arithmetic expression, and nothing else.
+
+    Deliberately not :func:`eval`, and not :func:`ast.literal_eval` either —
+    the first would run whatever a platform file happened to contain, and the
+    second refuses ``64 * 1024``, which is the only shape these constants are
+    ever written in.
+    """
+    if (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+    ):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Add)):
+        left, right = _arith(node.left), _arith(node.right)
+        return left * right if isinstance(node.op, ast.Mult) else left + right
+    raise ValueError(f"not integer arithmetic: {ast.dump(node)}")
 
 
 def constant_drift(platform: Path) -> list[str]:
@@ -269,8 +326,12 @@ def main() -> int:
         n = len(CONSTANTS)
         counted = sum(len(names) for names in mirrored_parameters().values())
         print(
+            # `platform`, not `platform / SURFACE.parent`. The routes and
+            # parameters come from web/lib and the constants no longer all do —
+            # clipboardWriteMax is read out of server/ — so naming one
+            # directory understated what had been compared.
             f"check-surface — {len(mirror)} routes, {counted} parameters and {n} constant"
-            f"{'' if n == 1 else 's'}, in step with {platform / SURFACE.parent}."
+            f"{'' if n == 1 else 's'}, in step with {platform}."
         )
         return 0
 

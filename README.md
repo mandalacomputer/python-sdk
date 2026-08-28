@@ -225,10 +225,13 @@ would have to guess which of those two you meant. Start it or stop it first.
 
 **A computer can suspend without you asking.** Its host puts down anything
 nobody has used for the host's idle window — 30 minutes by default. Input,
-`exec()` and file transfers all count as use and resume it automatically;
-**`screenshot()` deliberately does not**, so a loop that only polls the screen
-can watch its own machine go down under it. Drive the desktop, or accept the
-resume.
+`exec()`, file transfers and `set_clipboard()` all count as use and resume it
+automatically; **`screenshot()` and `clipboard()` deliberately do not**, so a
+loop that only polls the screen — or waits for somebody to copy something — can
+watch its own machine go down under it. The two reads differ in what happens
+next: `screenshot()` keeps answering, while `clipboard()` starts raising
+`ConflictError`, because a suspended computer has no clipboard to read. Drive
+the desktop, or accept the resume.
 
 `wait_until_running()` raises rather than spinning if it finds a suspended
 computer, because that state does not resolve on its own — `start()` is the fix.
@@ -284,7 +287,9 @@ below whichever you get.
 
 [`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
 — the reliable one, not merely the fallback — because they need nothing of the
-hardware: no cold boot, no particular image, no permission from a browser. Where
+*hardware*: no cold boot, no permission from a browser. They ask one thing of
+the image (`xclip`, in every golden since mid-2026) and say so in the answer
+when it is missing, which is one condition stated instead of two inferred. Where
 the socket *does* carry the clipboard the two do not fight over it: those
 methods write the same X `CLIPBOARD` selection the agent then offers onward.
 
@@ -640,10 +645,12 @@ five windows, four of which are not applications. Linux only.
 
 The desktop's `CLIPBOARD` selection — what Ctrl-C writes and Ctrl-V pastes —
 read and written from outside the guest. Linux only, and it needs nothing of
-the hardware: no cold boot, no particular image, no permission from a browser,
-which is what makes it the road that works on every computer. (The other road
-is RFB extended cut text over the desktop socket, which is live and
-conditional; see [Showing somebody the desktop](#showing-somebody-the-desktop).)
+the *hardware*: no cold boot, no permission from a browser. What it does need is
+`xclip` in the guest, which every golden built since mid-2026 carries — so in
+practice this is the road that works on every computer, and where it is not, the
+refusal says so. (The other road is RFB extended cut text over the desktop
+socket, which is live and conditional; see
+[Showing somebody the desktop](#showing-somebody-the-desktop).)
 
 ```python
 c.set_clipboard("https://mandala.computer")
@@ -660,9 +667,22 @@ are refused here, before the request goes out.
 
 The platform confirms the write by reading the selection back before it
 answers, so `set_clipboard()` returning means the desktop is *holding* the text
-rather than that a command ran. A `ConflictError` means something else claimed
-the selection in that instant — a clipboard manager settling, usually — and it
-clears.
+rather than that a command ran.
+
+**Not every `ConflictError` here is worth retrying, and they do not look
+different.** One is: *the desktop did not take the text* means something else
+claimed the selection in that instant — a clipboard manager settling, usually —
+and it clears on its own. The others describe a state you have to change: the
+computer is not running (`start()` it), or its X server is not up yet.
+`is_transient()` answers `True` for all of them, so a blanket retry spins until
+your deadline against a computer that is simply stopped. Read the message, or
+bound the loop in attempts.
+
+Two others worth knowing. A **400** never clears: a computer built from a golden
+that predates `xclip` is refused permanently — install `xclip` in the guest, or
+create a new computer. And an over-cap read raises `FileTooLargeError`, whose
+usual remedy does not apply: there is no `Range` on a selection, so the text is
+either under 128 KiB or out of reach.
 
 The two differ on one thing worth knowing: `set_clipboard()` **resumes a
 suspended computer**, because putting text on a clipboard is the first half of
@@ -1163,7 +1183,7 @@ Everything derives from `MandalaError`.
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
 | `ConflictError` | 409 — right request, wrong moment; retry |
 | `MoveRequiredError` | 409 — …except this one: the size needs a host that can run it |
-| `FileTooLargeError` | 413 — past the 64 MiB one request moves; ask for a window |
+| `FileTooLargeError` | 413 — past what one request carries. A file over 64 MiB: ask for a window. A clipboard over 128 KiB: there is no window to ask for |
 | `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |

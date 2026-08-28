@@ -800,10 +800,12 @@ def window_body(
 #: The most text ``PUT /computers/{id}/clipboard`` carries INTO a guest, in bytes.
 #:
 #: Mirrored rather than left to the server, so a request that can only fail is
-#: not made. NOT machine-checked, unlike :data:`MAX_STEPS`: the platform's copy
-#: is ``clipboardWriteMax`` in its ``server/clipboard.go``, a Go constant, and
-#: ``scripts/check_surface.py`` reads ``web/lib`` only. The number is not ours
-#: and is not arbitrary: the
+#: not made, and kept in step by ``scripts/check_surface.py`` like
+#: :data:`MAX_STEPS`. The platform states this one in Go — ``clipboardWriteMax``
+#: in its ``server/clipboard.go`` — which the checker refused to read at first;
+#: the docstring here said "NOT machine-checked" instead, which is an admission
+#: rather than a check, so the reader learned Go and the sentence became true.
+#: The number is not ours and is not arbitrary: the
 #: platform puts the text inside one argument of one command, Linux caps a single
 #: argv string at 128 KiB, and two layers of base64 stand between the text and
 #: that ceiling — so each byte costs about 1.8 of it and 64 KiB is where the

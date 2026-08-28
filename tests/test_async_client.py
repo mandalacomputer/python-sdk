@@ -85,6 +85,43 @@ async def test_exec_does_not_turn_an_empty_200_into_success(client: mc.AsyncClie
 
 
 @respx.mock
+@pytest.mark.parametrize("body", [{}, {"text": 42}, {"text": None}])
+async def test_the_async_clipboard_read_guards_its_own_decode(
+    client: mc.AsyncClient, body: object
+) -> None:
+    """The async half decodes for itself, so it has to be tested for itself.
+
+    ``test_parity`` compares signatures, not bodies — by design, since a body
+    comparison would be a diff nobody could act on — so a guard dropped from
+    only this copy passes every other test in the suite. The sync twin is
+    ``test_a_clipboard_read_with_no_text_raises_rather_than_coercing``, and the
+    thing both are about is that ``str(None)`` is "None": a four-letter
+    clipboard nobody copied, which a caller pastes.
+    """
+    respx.get(f"{BASE}/computers/vm-1/clipboard").mock(httpx.Response(200, json=body))
+    with pytest.raises(mc.MandalaError, match="did not come back with any text"):
+        await mc.AsyncComputer(client._t, COMPUTER).clipboard()
+    await client.aclose()
+
+
+@respx.mock
+async def test_the_async_clipboard_keeps_an_empty_selection(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1/clipboard").mock(httpx.Response(200, json={"text": ""}))
+    assert await mc.AsyncComputer(client._t, COMPUTER).clipboard() == ""
+    await client.aclose()
+
+
+@respx.mock
+async def test_the_async_clipboard_write_sends_the_one_field(client: mc.AsyncClient) -> None:
+    route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    await mc.AsyncComputer(client._t, COMPUTER).set_clipboard("hello")
+    assert json.loads(route.calls.last.request.content) == {"text": "hello"}
+    await client.aclose()
+
+
+@respx.mock
 async def test_click_payload(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     await mc.AsyncComputer(client._t, COMPUTER).click(10, 20)
