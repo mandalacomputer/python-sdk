@@ -233,6 +233,11 @@ class Listing(list[T]):
     thing that says the answer was short: there is no placement cache for
     builds, so the platform has neither a count to give nor a marked row to
     append. A whole one is ``None`` like any other.
+
+    The same is true of the other two whenever the key is scoped to one
+    workspace: the platform withholds the marked rows from such a credential
+    rather than name it ids from workspaces it cannot see, so this object is
+    again all there is.
     """
 
     #: Rows missing, or ``None`` when nothing was missing. See the class note on

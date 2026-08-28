@@ -653,9 +653,10 @@ def _fleet_partly_down(rows: list[dict[str, str]] | None = None) -> respx.Route:
     ``X-GC-Incomplete`` into a 503 unless the request opted in.
 
     ``rows`` is what short LOOKS like for builds — fewer rows and nothing
-    marking what is gone. Computers and snapshots append one flagged row per
-    thing they could not reach; the platform keeps no record of which hypervisor
-    ran which build, so there is nothing to append and the count is always 0.
+    marking what is gone. The platform keeps no record of which hypervisor ran
+    which build, so there is nothing to append and the count is always 0.
+    Computers and snapshots do append one flagged row per thing they could not
+    reach, for an account-wide key; a workspace-scoped one gets none either.
     """
     short = {"X-GC-Incomplete": "0"}
 
@@ -702,8 +703,8 @@ def test_a_short_build_listing_is_handed_over_when_asked_for(client: mc.Client) 
     could not carry the parameter and this method could not send it. A build
     listing was therefore strictly less available than a computer listing.
 
-    The count is ``0`` rather than a number, and with no marked rows to notice
-    it the :class:`Listing` is the only evidence the answer was short.
+    The count is ``0`` rather than a number, and with nothing in the rows to
+    notice it the :class:`Listing` is the only evidence the answer was short.
     """
     route = _fleet_partly_down()
     builds = client.builds.list(allow_partial=True)

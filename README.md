@@ -996,6 +996,12 @@ absent and `incomplete` is `0` rather than a count. An outage and an account
 that has never built anything are the same rows; only the `Listing` tells them
 apart.
 
+The marked rows above are also an account-wide key's alone. A key scoped to one
+workspace gets none, on any of the three listings: naming the missing ids means
+reading them out of a placement cache with no workspace column, which would hand
+a confined credential ids from the workspaces it is confined away from. With
+such a key, `is_complete` is the only signal everywhere.
+
 ### Files
 
 One file in or out of the guest, no shell involved — the way a credential

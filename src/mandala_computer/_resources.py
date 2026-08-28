@@ -567,13 +567,18 @@ class Builds:
         there was no way through at all — a build listing was strictly less
         available than a computer listing for no reason anybody decided.
 
-        The difference is what a short answer LOOKS like. A short computer or
-        snapshot listing appends one marked row per thing it could not reach; a
-        short build listing appends nothing, because the platform keeps no
-        record of which hypervisor ran which build. The missing builds are
-        simply absent, ``incomplete`` is ``0`` rather than a count, and the
+        The difference is what a short answer LOOKS like. A short build listing
+        appends nothing at all, because the platform keeps no record of which
+        hypervisor ran which build: the missing builds are simply absent,
+        ``incomplete`` is ``0`` rather than a count, and the
         :class:`~mandala_computer.Listing` saying ``is_complete`` is false is the
         only evidence there is.
+
+        A short computer or snapshot listing appends one marked row per thing it
+        could not reach — but only for a key that spans the account. A key
+        scoped to one workspace gets no marked rows from any of the three, since
+        the ids would come out of a placement cache with no workspace column.
+        On such a key the Listing is the only evidence everywhere.
         """
         data, incomplete = self._t.listing(_api.BUILDS, params=_api.partial_params(allow_partial))
         return Listing.of([TemplateBuild.from_api(b) for b in data or []], incomplete)
