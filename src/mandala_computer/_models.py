@@ -334,21 +334,46 @@ class VncConnect:
 
     ``token``
         Full control — keyboard and pointer. Root-equivalent on that one
-        machine, so it belongs on a server or in a page you trust. NOT the
-        clipboard, whatever a noVNC client offers on it: QEMU carries cut text
-        only through a vdagent channel these guests are not started with, so a
-        paste arrives and is dropped with no error. Move text with
-        :meth:`Computer.exec` and ``desktop=True``. A write needs ``setsid``, so
-        the holder outlives the command — an X selection belongs to a live
-        process — AND ``>/dev/null 2>&1``, without which the resident xclip
-        holds the pipe the guest agent is reading and the exec runs to its full
-        timeout before answering. Send the text base64 rather than quoted, since
-        an apostrophe would otherwise end the shell word, and poll rather than
-        reading straight back: being granted a selection is asynchronous, so the
-        next read can still be the old one.
+        machine, so it belongs on a server or in a page you trust. The
+        CLIPBOARD crosses this socket on a Linux computer whose QEMU has the
+        vdagent channel and whose image carries the agent, and not otherwise,
+        so a client that has to work on any computer should not depend on it.
+        The two halves are acquired SEPARATELY and a computer needs both. The
+        channel comes from a COLD start — stop the computer and start it again,
+        or restart one that is already stopped, which starts it; restarting a
+        RUNNING computer does not do it, because that resets the guest rather
+        than rebuilding the machine QEMU was given. The agent is
+        ``spice-vdagent`` inside the guest, which comes from the IMAGE, and a
+        computer keeps the image it was created from — there is no operation
+        that moves an existing one onto a newer one, so a computer built before
+        the agent shipped needs it installed in the guest, which you can do
+        yourself since you have root there, or replacing with a newly created
+        computer. Windows guests never have it, whatever the hardware says.
+        Where both are present, standard RFB extended cut text works in both
+        directions and nothing below is needed. Where either is absent, text a
+        client pastes reaches QEMU and stops — silently, with no error to catch
+        — and no field tells you which you have.
+
+        :meth:`Computer.exec` with ``desktop=True`` is the route to build on if
+        you only want to write it once, because it needs nothing of the
+        hardware — but it is not universal either: it drives the guest's own
+        desktop session, so it needs a Linux guest with a display and
+        ``xclip``, and it is refused outright on Windows. A write needs
+        ``setsid``, so the holder outlives the command — an X selection belongs
+        to a live process — AND ``>/dev/null 2>&1``, without which the resident
+        xclip holds the pipe the guest agent is reading and the exec runs to
+        its full timeout before answering. Send the text base64 rather than
+        quoted, since an apostrophe would otherwise end the shell word, and
+        poll rather than reading straight back: being granted a selection is
+        asynchronous, so the next read can still be the old one.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
-        browser holding this one cannot type even from a patched client.
+        browser holding this one cannot type even from a patched client. The
+        guest's CLIPBOARD does not come back over it either, and that is
+        enforced rather than asked for: the daemon takes the clipboard
+        capability out of the connection as it is negotiated. Worth knowing if
+        you embed this — whatever the person using the desktop copies,
+        including a password, is not visible to anyone holding this URL.
 
     Both are scoped to a single computer, and neither is the account API key —
     which is every computer on the account, forever, and must never reach a
