@@ -645,40 +645,116 @@ async def test_async_stream_without_a_done_raises(async_client: mc.AsyncClient) 
             [p async for p in c.builds.events("bld-1")]
 
 
+def _fleet_partly_down(rows: list[dict[str, str]] | None = None) -> respx.Route:
+    """A build listing the fleet could only half answer.
+
+    Strict without ``allow_partial`` and short with it, which is the platform's
+    own behaviour: ``forward`` in lib/surface turns any response carrying
+    ``X-GC-Incomplete`` into a 503 unless the request opted in.
+
+    ``rows`` is what short LOOKS like for builds — fewer rows and nothing
+    marking what is gone. Computers and snapshots append one flagged row per
+    thing they could not reach; the platform keeps no record of which hypervisor
+    ran which build, so there is nothing to append and the count is always 0.
+    """
+    short = {"X-GC-Incomplete": "0"}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if not request.url.params.get("allow_partial"):
+            return httpx.Response(
+                503,
+                json={
+                    "error": (
+                        "Right now a hypervisor cannot be reached, so this list would be "
+                        "incomplete. Retry, or pass allow_partial=1 to accept a partial answer."
+                    )
+                },
+                headers=short,
+            )
+        return httpx.Response(
+            200,
+            json=rows if rows is not None else [{"id": "bld-1", "status": "running"}],
+            headers=short,
+        )
+
+    return respx.get(f"{BASE}/builds").mock(side_effect=answer)
+
+
 @respx.mock
 def test_a_short_build_listing_arrives_as_a_refusal(client: mc.Client) -> None:
-    """It never reaches a caller as a short list, and that is the point.
+    """The DEFAULT is the refusal, and that is the point.
 
-    lib/hvproxy does set X-GC-Incomplete on a short build listing, but
-    ``forward`` in lib/surface applies its strict-inventory check to every v1
-    route generically — so the response becomes a 503 before any client sees it.
-    A previous version of this method believed the opposite and returned a
-    Listing to carry a flag that cannot arrive.
+    A caller who asked no question about partial answers gets an error rather
+    than a list that has quietly lost a hypervisor's worth of builds.
     """
-    respx.get(f"{BASE}/builds").mock(
-        return_value=httpx.Response(
-            503,
-            json={
-                "error": (
-                    "Right now a hypervisor cannot be reached, so this list would be "
-                    "incomplete. Retry, or pass allow_partial=1 to accept a partial answer."
-                )
-            },
-            headers={"X-GC-Incomplete": "0"},
-        )
-    )
+    _fleet_partly_down()
     with pytest.raises(mc.UnavailableError, match="would be incomplete"):
         client.builds.list()
 
 
 @respx.mock
+def test_a_short_build_listing_is_handed_over_when_asked_for(client: mc.Client) -> None:
+    """OPL-3840. The remedy the refusal names is now one this client can take.
+
+    The platform read ``allow_partial`` on this route from the day it started
+    fanning out — ``allowsPartial`` reads the query string of whatever request
+    it is handed — but did not document it, so the mirror in tests/test_surface
+    could not carry the parameter and this method could not send it. A build
+    listing was therefore strictly less available than a computer listing.
+
+    The count is ``0`` rather than a number, and with no marked rows to notice
+    it the :class:`Listing` is the only evidence the answer was short.
+    """
+    route = _fleet_partly_down()
+    builds = client.builds.list(allow_partial=True)
+    assert route.calls.last.request.url.params["allow_partial"] == "1"
+    assert len(builds) == 1
+    assert not builds.is_complete
+    assert builds.incomplete == 0
+
+
+@respx.mock
+def test_a_short_build_listing_that_came_back_empty_still_says_it_is_short(
+    client: mc.Client,
+) -> None:
+    """The dangerous case, and more so here than for computers.
+
+    With no rows and no flagged stubs there is nothing whatever in the payload
+    to tell an outage from an account that has never built anything. Only the
+    header does, which is why this method returns a Listing rather than a list.
+    """
+    _fleet_partly_down([])
+    builds = client.builds.list(allow_partial=True)
+    assert len(builds) == 0
+    assert not builds.is_complete
+
+
+@respx.mock
 def test_a_complete_build_listing_is_an_ordinary_list(client: mc.Client) -> None:
-    respx.get(f"{BASE}/builds").mock(
+    route = respx.get(f"{BASE}/builds").mock(
         return_value=httpx.Response(200, json=[{"id": "bld-1", "status": "running"}])
     )
     builds = client.builds.list()
     assert len(builds) == 1
     assert builds[0].id == "bld-1"
+    assert builds.is_complete
+    # Absent rather than sent as `0` when nobody asked — see partial_params.
+    assert "allow_partial" not in route.calls.last.request.url.params
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_build_listing_takes_the_same_escape_hatch(
+    async_client: mc.AsyncClient,
+) -> None:
+    """The parity test pins the SIGNATURES; this pins that both halves send it."""
+    route = _fleet_partly_down()
+    async with async_client as c:
+        with pytest.raises(mc.UnavailableError, match="would be incomplete"):
+            await c.builds.list()
+        builds = await c.builds.list(allow_partial=True)
+    assert route.calls.last.request.url.params["allow_partial"] == "1"
+    assert not builds.is_complete
 
 
 # --- what /code-review found on top of the adversarial pass ----------------
