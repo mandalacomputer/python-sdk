@@ -383,16 +383,19 @@ class UnavailableError(APIError):
     Universal on this surface rather than particular to listings, because every
     route on it ends at a hypervisor. Four things raise it:
 
-    - **A listing would have been short.** ``GET /computers`` and ``GET
-      /snapshots`` fan out across every hypervisor holding something of yours,
-      so one that cannot be reached makes the answer incomplete, and the
-      platform fails closed rather than answering a short 200. A short list is
-      not a smaller truth — it reads exactly like the missing rows were deleted,
-      and the obvious next thing a script does with a computer that has
-      disappeared is tidy up after it. Pass ``allow_partial=True`` to take the
-      short answer knowingly, which returns a
+    - **A listing would have been short.** ``GET /computers``, ``GET
+      /snapshots`` and ``GET /builds`` fan out across every hypervisor holding
+      something of yours, so one that cannot be reached makes the answer
+      incomplete, and the platform fails closed rather than answering a short
+      200. A short list is not a smaller truth — it reads exactly like the
+      missing rows were deleted, and the obvious next thing a script does with a
+      computer that has disappeared is tidy up after it. Pass
+      ``allow_partial=True`` to take the short answer knowingly, which returns a
       :class:`~mandala_computer.Listing` whose
-      :attr:`~mandala_computer.Listing.is_complete` is False.
+      :attr:`~mandala_computer.Listing.is_complete` is False. Three listings and
+      not two since OPL-3840: the builds one always answered this way and
+      documented no way out, which made it strictly less available than the
+      other two.
     - **The host holding one named computer is unreachable.** Every route that
       names a computer answers this rather than a 404, on the same reasoning:
       the computer has not gone anywhere. So ``start()``, ``exec()``,

@@ -960,12 +960,13 @@ u = await client.usage.read()
 
 ### Partial listings
 
-`client.computers.list()` and `client.snapshots.list()` fan out across every
-hypervisor holding something of yours, so one that cannot be reached makes the
-answer incomplete. By default the platform refuses to send it and this raises
-`UnavailableError` — because a short list is not a smaller truth. It reads
-exactly like the missing computers were deleted, and the obvious next thing a
-script does with a computer that has disappeared is tidy up after it.
+`client.computers.list()`, `client.snapshots.list()` and `client.builds.list()`
+fan out across every hypervisor holding something of yours, so one that cannot
+be reached makes the answer incomplete. By default the platform refuses to send
+it and this raises `UnavailableError` — because a short list is not a smaller
+truth. It reads exactly like the missing computers were deleted, and the obvious
+next thing a script does with a computer that has disappeared is tidy up after
+it.
 
 ```python
 computers = client.computers.list(allow_partial=True)
@@ -987,6 +988,19 @@ and nothing else. Everything else on such a row is absent, so `status` reads
 though they cannot be attributed to a computer: dropping them would remove
 precisely the markers saying the answer is short, and then report a confident
 count.
+
+Builds are the exception, and the reason to read `is_complete` there rather than
+the rows. A short build listing has no marked rows at all — the platform keeps
+no record of which hypervisor ran which build, so the missing ones are simply
+absent and `incomplete` is `0` rather than a count. An outage and an account
+that has never built anything are the same rows; only the `Listing` tells them
+apart.
+
+The marked rows above are also an account-wide key's alone. A key scoped to one
+workspace gets none, on any of the three listings: naming the missing ids means
+reading them out of a placement cache with no workspace column, which would hand
+a confined credential ids from the workspaces it is confined away from. With
+such a key, `is_complete` is the only signal everywhere.
 
 ### Files
 
@@ -1127,8 +1141,8 @@ raises it — `start()`, `exec()`, `screenshot()` — rather than a `NotFoundErr
 because the computer has not gone anywhere. Creates and resizes raise it when
 the fan-out that checks your plan comes back short, and so does a host with no
 room left for another guest. Retrying is the fix; `allow_partial=True` applies
-only to the two listings, which are the one case where a partial answer exists
-(see [Partial listings](#partial-listings)).
+only to the fan-out listings, which are the one case where a partial answer
+exists (see [Partial listings](#partial-listings)).
 
 These four are the edge failing rather than the platform refusing, and they are
 four classes rather than one because a caller asking *did my work happen* needs

@@ -211,9 +211,10 @@ class Listing(list[T]):
     and nothing has to be unwrapped. What it adds is the answer to a question a
     bare list cannot carry: whether this is all of them.
 
-    ``GET /computers`` and ``GET /snapshots`` fan out across every hypervisor
-    holding something of yours. One that cannot be reached makes the answer
-    incomplete, and by default the platform refuses to send it —
+    ``GET /computers``, ``GET /snapshots`` and ``GET /builds`` fan out across
+    every hypervisor holding something of yours. One that cannot be reached
+    makes the answer incomplete, and by default the platform refuses to send it
+    —
     :class:`~mandala_computer.UnavailableError`. Passing ``allow_partial=True``
     takes the short answer instead, and this is where it says so::
 
@@ -226,6 +227,17 @@ class Listing(list[T]):
     legitimately ``0``, because a computer created during the outage was never
     cached against the host now holding it. So branch on
     :attr:`is_complete`, never on the number.
+
+    A SHORT build listing puts ``0`` here rather than a count — never a number,
+    the way a computer listing sometimes can — and this object is then the only
+    thing that says the answer was short: there is no placement cache for
+    builds, so the platform has neither a count to give nor a marked row to
+    append. A whole one is ``None`` like any other.
+
+    The same is true of the other two whenever the key is scoped to one
+    workspace: the platform withholds the marked rows from such a credential
+    rather than name it ids from workspaces it cannot see, so this object is
+    again all there is.
     """
 
     #: Rows missing, or ``None`` when nothing was missing. See the class note on
