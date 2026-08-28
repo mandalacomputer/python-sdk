@@ -192,14 +192,21 @@ def parameters(platform: Path) -> dict[str, set[str]]:
     return table
 
 
-def constant(source: str, name: str) -> int:
+def constant(source: str, name: str, module: Path) -> int:
     """One integer constant out of a platform module, TypeScript or Go.
 
     Two declaration forms because the platform states these numbers in two
     languages: ``export const NAME = <expr>`` in ``web/lib``, and a bare
-    ``name = <expr>`` inside a Go ``const`` block in ``server/``. The Go form is
-    matched at the start of a line so that a mention of the name in a comment or
-    in another expression is not read as its declaration.
+    ``name = <expr>`` inside a Go ``const`` block in ``server/``. BOTH forms are
+    matched at the start of a line, and over source whose comments have been
+    blanked first, so that a mention of the name in a comment or in another
+    expression is not read as its declaration — the Go form always was, and the
+    TypeScript one was not, which made a commented-out declaration upstream a
+    silent match here.
+
+    Which form is tried is decided by the module's suffix rather than by trying
+    both: the two patterns are close enough that a file answering to the wrong
+    one is a way for this to agree by accident.
 
     The value is an EXPRESSION, not a literal, because both languages write
     these as products — ``64 * 1024`` is how a byte ceiling is legible, and a
@@ -210,20 +217,21 @@ def constant(source: str, name: str) -> int:
     rule the rest of this file follows — "could not tell" and "they agree" must
     never be the same answer.
     """
-    for pattern in (
-        rf"export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)\s*(?:;|//|\n)",
-        rf"^\s*{re.escape(name)}\s*=\s*([0-9*+()\s]+?)\s*(?://|\n)",
-    ):
-        m = re.search(pattern, source, re.MULTILINE)
-        if m is None:
-            continue
-        try:
-            return _arith(ast.parse(m.group(1).strip(), mode="eval").body)
-        except (SyntaxError, ValueError) as err:
-            raise SystemExit(
-                f"{name} is {m.group(1)!r}, which this reader cannot evaluate"
-            ) from err
-    raise SystemExit(f"{name} not found — has it moved or changed shape?")
+    blanked = strip_comments(source)
+    pattern = (
+        rf"^\s*{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
+        if module.suffix == ".go"
+        else rf"^\s*export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
+    )
+    m = re.search(pattern, blanked, re.MULTILINE)
+    if m is None:
+        raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
+    try:
+        return _arith(ast.parse(m.group(1).strip(), mode="eval").body)
+    except (SyntaxError, ValueError) as err:
+        raise SystemExit(
+            f"{name} is {m.group(1)!r} in {module}, which this reader cannot evaluate"
+        ) from err
 
 
 def _arith(node: ast.expr) -> int:
@@ -259,7 +267,13 @@ def constant_drift(platform: Path) -> list[str]:
     drifted = []
     for ours, module, theirs in CONSTANTS:
         mine = getattr(_api, ours)
-        upstream = constant((platform / module).read_text(), theirs)
+        try:
+            source = (platform / module).read_text()
+        except OSError as err:
+            raise SystemExit(
+                f"{module} is not readable in the platform checkout — has it moved or changed shape?"
+            ) from err
+        upstream = constant(source, theirs, module)
         if mine != upstream:
             drifted.append(f"  ! {ours} is {mine}, but {module}'s {theirs} is {upstream}")
     return drifted

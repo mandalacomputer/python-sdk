@@ -148,8 +148,8 @@ def computer(computer_id: str) -> str:
 
 
 def computer_action(computer_id: str, action: str) -> str:
-    """start | stop | suspend | restart | clone | screenshot | input | exec |
-    snapshots | schedule."""
+    """agent | clipboard | clone | exec | input | move | restart | schedule |
+    screenshot | snapshots | start | stop | suspend | windows."""
     return f"computers/{seg(computer_id)}/{action}"
 
 
@@ -830,8 +830,13 @@ def clipboard_body(text: str) -> dict[str, Any]:
     them, so a ``len(text)`` check would pass four times the legal payload to an
     ``execve`` that answers E2BIG.
     """
-    if not isinstance(text, str):
-        raise TypeError(f"clipboard text must be a str, not {type(text).__name__}")
+    # `canonical` rather than an isinstance check, for the reason it documents:
+    # every check below reads `text`, and the request then encodes the ORIGINAL
+    # object again. A `str` subclass can answer differently the second time — an
+    # override that reports empty here and a full buffer to the serialiser walks
+    # past all three refusals. It also makes this a ValueError like every other
+    # refusal in this file, rather than the one TypeError among them.
+    text = canonical(text, "clipboard text")
     # Empty is refused rather than sent, matching the platform: clearing the
     # clipboard is not what that endpoint does, and a caller who meant to clear
     # it should hear so rather than read a status code.
@@ -1167,6 +1172,7 @@ def agent_body(
     :data:`MAX_STEPS`. A ``2.5`` or a ``10000`` that got through here would come
     back as the 400 this function exists to save the caller.
     """
+    prompt = canonical(prompt, "prompt")
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if max_steps is not None:

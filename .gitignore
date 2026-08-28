@@ -23,3 +23,6 @@ htmlcov/
 # bare `.claude/` does nothing at all and the file below stays invisible.
 .claude/*
 !.claude/linear-sync.json
+
+# Reports written by the /grok-bug-hunt skill.
+.grok-bug-hunt/

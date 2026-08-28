@@ -38,6 +38,7 @@ from ._computer import (
     ComputerFields,
     _agent_once_outcome,
     _agent_outcome,
+    _clipboard_text,
     _continues,
     _cursor,
     _download_sink,
@@ -1045,13 +1046,7 @@ class AsyncComputer(ComputerFields):
         Linux only.
         """
         data = await self._t.json_object("GET", _api.computer_action(self.id, "clipboard"))
-        text = data.get("text")
-        # Checked rather than coerced. ``str(None)`` is "None" — a four-letter
-        # clipboard nobody copied, indistinguishable from a real one, and pasted
-        # somewhere by whoever asked for it.
-        if not isinstance(text, str):
-            raise MandalaError("the clipboard read did not come back with any text in it")
-        return text
+        return _clipboard_text(data)
 
     async def set_clipboard(self, text: str) -> None:
         """Put ``text`` on the desktop's clipboard, ready to paste.

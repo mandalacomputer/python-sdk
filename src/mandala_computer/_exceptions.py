@@ -336,11 +336,19 @@ class ConflictError(APIError):
     502 :class:`APIError`, so a retry loop on this exception terminates rather
     than being told "still booting" forever.
 
-    NEARLY every one, and the exception is :class:`MoveRequiredError`. Whether a
-    409 clears is a property of the body rather than of the status: a refusal
-    that clears describes a passing state, and one that does not describes a
-    decision about the request. This docstring said "every one" of them, which
-    made a resize past what a host can run something to retry forever.
+    NEARLY every one, and there are two exceptions. Whether a 409 clears is a
+    property of the body rather than of the status: a refusal that clears
+    describes a passing state, and one that does not describes a decision about
+    the request, or a state that only a different call will change. This
+    docstring said "every one" of them, which made a resize past what a host can
+    run something to retry forever.
+
+    The first is :class:`MoveRequiredError`, which has a class of its own. The
+    second does not: a clipboard read or write against a computer that is
+    stopped or suspended answers 409, and no amount of waiting resolves it
+    because the computer will not start itself. Nothing in the body
+    distinguishes it, so :func:`is_transient` answers ``True`` for it — read the
+    message, or bound the retry in attempts.
     """
 
 
@@ -525,6 +533,16 @@ def is_transient(err: BaseException) -> bool:
     * :class:`RateLimitError` — a cadence, and the response usually says how long
     * :class:`UnavailableError` — a hypervisor briefly out of reach
     * :class:`ConnectionError` — the request never left
+
+    One 409 escapes that first bullet, and this predicate cannot be made to see
+    it: a clipboard read or write against a computer that is stopped or
+    suspended. It does not clear on its own — ``start()`` is the fix, not
+    another attempt — but the platform sends nothing in the body that tells it
+    apart from a conflict that is merely passing, so there is no type to split
+    off the way :class:`MoveRequiredError` was. Around
+    :meth:`~mandala_computer.Computer.clipboard` and
+    :meth:`~mandala_computer.Computer.set_clipboard`, read the message or bound
+    the loop in attempts rather than trusting this answer by itself.
 
     That last line is now literally true, and it was not always. The class used
     to cover every ``httpx.RequestError``, a lost response body included, so

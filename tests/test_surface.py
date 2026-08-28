@@ -983,6 +983,10 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
     # reason this half exists: a whole feature, on a route the line above was
     # already satisfied by.
     assert check_surface.parameter_drift(check_surface.parameters(platform), PARAMETERS) == []
+    # And the mirrored NUMBERS, which drift the same way and were the half this
+    # test imported without ever calling: MAX_CLIPBOARD_BYTES can diverge from
+    # the platform's `clipboardWriteMax` through a green run of this suite.
+    assert check_surface.constant_drift(platform) == []
 
 
 def test_allowlist_excludes_the_daemons_internal_routes() -> None:

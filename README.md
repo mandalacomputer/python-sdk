@@ -1181,7 +1181,7 @@ Everything derives from `MandalaError`.
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
-| `ConflictError` | 409 — right request, wrong moment; retry |
+| `ConflictError` | 409 — right request, wrong moment; retry, except the two cases below |
 | `MoveRequiredError` | 409 — …except this one: the size needs a host that can run it |
 | `FileTooLargeError` | 413 — past what one request carries. A file over 64 MiB: ask for a window. A clipboard over 128 KiB: there is no window to ask for |
 | `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
@@ -1197,7 +1197,7 @@ Everything derives from `MandalaError`.
 
 `PlanLimitError`'s message names the limit that was hit.
 
-`MoveRequiredError` is the one 409 that does **not** clear, and it is a subclass
+`MoveRequiredError` is a 409 that does **not** clear, and it is a subclass
 of `ConflictError` so that an `except ConflictError` written before it existed
 still catches it. It means the size asked for is more RAM than the host this
 computer is on can run — and the host will not grow, so the same request answers
@@ -1206,10 +1206,13 @@ branch: `True` means somewhere else in the region can run that size and
 `relocate()` takes the offer up, `False` means nowhere can and the size is the
 thing to change. See [Growing past the host](#growing-past-the-host).
 
-`FileTooLargeError` and `RangeNotSatisfiableError` are the two file statuses,
+`FileTooLargeError` and `RangeNotSatisfiableError` are the two size statuses,
 and each has a next move attached, which is why neither is a bare `APIError`.
-A 413 means the ceiling applies to what one request moves, so ask for part of it
-— `download_file()` is that loop already written. A 416 carries the file's real
+A 413 on a **file** means the ceiling applies to what one request moves, so ask
+for part of it — `download_file()` is that loop already written. A 413 on the
+**clipboard** has no such remedy: there is no `Range` on a selection, so a
+clipboard past 128 KiB is out of reach rather than something to page through,
+and `download_file()` is not a method it has. A 416 carries the file's real
 length in `size`, which is the whole point of the status: you asked about a file
 whose length you did not know, and the number comes back with the refusal
 instead of behind another request. See [Files](#files).
@@ -1288,12 +1291,20 @@ as a plain `APIError` — the stream having been delivered is proof no proxy
 abandoned anything. So `except GatewayTimeoutError` around `agent()` will not
 catch a 504 the platform is *reporting*; catch `APIError` and read `.status`.
 
-`ConflictError` is the one worth catching separately, because it is the only one
-that clears itself: something is in flight that the operation cannot run
-alongside — a disk still being copied, a snapshot being taken, a delete already
-under way, a guest agent that has not finished coming up, or a suspend committed
-to the computer a moment before your call. Waiting and retrying is the fix;
-changing the request is not.
+`ConflictError` is the one worth catching separately, because nearly every one
+clears itself: something is in flight that the operation cannot run alongside —
+a disk still being copied, a snapshot being taken, a delete already under way, a
+guest agent that has not finished coming up, or a suspend committed to the
+computer a moment before your call. Waiting and retrying is the fix; changing
+the request is not.
+
+Two do not clear. `MoveRequiredError` is one, and it has a class you can catch.
+The other does not: `clipboard()` and `set_clipboard()` answer 409 on a computer
+that is stopped or suspended, and waiting will not start it — `start()` is a
+different request, and that is the fix. `is_transient()` cannot tell that 409
+from a passing one, because the platform sends nothing that distinguishes them,
+so a blanket retry loop around the clipboard spins until its deadline. Read the
+message, or bound the loop in attempts.
 
 A retry loop on it terminates because it has a deadline, not because of any
 status: a guest agent that stays silent past its boot window does stop being a

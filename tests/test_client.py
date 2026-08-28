@@ -1951,8 +1951,51 @@ def test_the_clipboard_write_refuses_locally_what_the_platform_would_refuse() ->
     # already worked.
     with pytest.raises(ValueError, match="NUL"):
         mc._api.clipboard_body("a\0b")
-    with pytest.raises(TypeError, match="must be a str"):
+    # A ValueError like every other refusal in `_api`, not the one TypeError
+    # among them: a caller wrapping this in `except ValueError` should not catch
+    # "that is not a version" while missing "that is not a string".
+    with pytest.raises(ValueError, match="must be a string"):
         mc._api.clipboard_body(None)  # type: ignore[arg-type]
+
+
+def test_the_clipboard_write_sends_the_buffer_it_checked() -> None:
+    """A `str` subclass can answer differently the second time it is read.
+
+    Every guard above reads `text`; the request then encodes the object again.
+    An override that reports empty to the checks and a full buffer to the
+    serialiser walks past all three, which is the hole `canonical` exists to
+    close and which this builder was not using.
+    """
+
+    class Shifty(str):
+        def __str__(self) -> str:
+            return ""
+
+    body = mc._api.clipboard_body(Shifty("hello"))
+    assert body["text"] == "hello"
+    assert type(body["text"]) is str
+
+
+@respx.mock
+def test_the_clipboard_write_refuses_before_it_reaches_the_wire(client: mc.Client) -> None:
+    """The refusals above are pinned on the body builder; this is the method.
+
+    A guard checked only one layer down stays green while the public method
+    quietly stops calling it.
+    """
+    route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    computer = _computer(client)
+    with pytest.raises(ValueError, match="must not be empty"):
+        computer.set_clipboard("")
+    with pytest.raises(ValueError, match="NUL"):
+        computer.set_clipboard("a\0b")
+    with pytest.raises(ValueError, match="at most"):
+        computer.set_clipboard("x" * (mc._api.MAX_CLIPBOARD_BYTES + 1))
+    with pytest.raises(ValueError, match="must be a string"):
+        computer.set_clipboard(None)  # type: ignore[arg-type]
+    assert not route.called
 
 
 def test_the_clipboard_cap_is_counted_in_bytes_not_characters() -> None:

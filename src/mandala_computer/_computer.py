@@ -262,6 +262,23 @@ def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
     return [Window.from_api(row) for row in rows]
 
 
+def _clipboard_text(data: Mapping[str, Any]) -> str:
+    """The selection out of a clipboard read, checked rather than coerced.
+
+    ``str(None)`` is "None" — a four-letter clipboard nobody copied,
+    indistinguishable from a real one, and pasted somewhere by whoever asked for
+    it.
+
+    Shared with the async client rather than written twice, for the reason
+    :func:`_windows_from_response` is shared: two copies of a validation are two
+    places to change it, and the one that gets missed fails open.
+    """
+    text = data.get("text")
+    if not isinstance(text, str):
+        raise MandalaError("the clipboard read did not come back with any text in it")
+    return text
+
+
 def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
     """The delete count, with malformed success payloads kept inside the SDK error family."""
     deleted = data.get("snapshots_deleted")
@@ -1736,13 +1753,7 @@ class Computer(ComputerFields):
         Linux only.
         """
         data = self._t.json_object("GET", _api.computer_action(self.id, "clipboard"))
-        text = data.get("text")
-        # Checked rather than coerced. ``str(None)`` is "None" — a four-letter
-        # clipboard nobody copied, indistinguishable from a real one, and pasted
-        # somewhere by whoever asked for it.
-        if not isinstance(text, str):
-            raise MandalaError("the clipboard read did not come back with any text in it")
-        return text
+        return _clipboard_text(data)
 
     def set_clipboard(self, text: str) -> None:
         """Put ``text`` on the desktop's clipboard, ready to paste.
