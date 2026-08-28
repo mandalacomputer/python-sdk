@@ -103,9 +103,10 @@ def flag(value: object, what: str) -> bool:
     human and would work, but admitting them puts the coercion rule back and the
     next value through it is a string again.
 
-    Only the flags that arm something go through here. The ones that merely
-    widen a listing — ``allow_partial``, ``include=all`` — stay on truthiness:
-    nothing is destroyed or paid for by reading one of those generously.
+    Only the flags that arm something, or that change which session a call runs
+    as, go through here. The ones that merely widen a listing —
+    ``allow_partial``, ``include=all`` — stay on truthiness: nothing is destroyed
+    or paid for by reading one of those generously.
     """
     if not isinstance(value, bool):
         # ValueError, not the TypeError ruff prefers, for the reason `canonical`
@@ -153,6 +154,19 @@ def computer_action(computer_id: str, action: str) -> str:
     return f"computers/{seg(computer_id)}/{action}"
 
 
+def guest_pid(pid: object) -> int:
+    """A real positive pid, not a bool and not zero.
+
+    Interpolated into the path, so a value that is not a positive integer builds
+    ``computers/:id/exec/True`` or ``.../exec/0`` — a 404 about a route rather
+    than a sentence about the pid that was wrong. ``bool`` is an ``int``
+    subclass, so ``True`` would otherwise become ``1``.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError(f"pid must be a positive integer, not {pid!r}")
+    return pid
+
+
 def exec_handle(computer_id: str, pid: int) -> str:
     """A backgrounded command, addressed by the guest pid ``exec`` answered with.
 
@@ -160,7 +174,7 @@ def exec_handle(computer_id: str, pid: int) -> str:
     own ``patternFor`` reduces it to ``:pid`` rather than to ``:id`` — it names
     something inside a computer rather than a thing the platform owns.
     """
-    return f"computers/{seg(computer_id)}/exec/{pid}"
+    return f"computers/{seg(computer_id)}/exec/{guest_pid(pid)}"
 
 
 def window(computer_id: str, window_id: str) -> str:
@@ -620,7 +634,7 @@ def create_body(
             "size already names a template and a shape; send size alone, "
             "or template/cpu/ram_mb/disk_gb without it"
         )
-    _require_optional_name(name)
+    name = _require_optional_name(name)
     body: dict[str, Any] = {"start": start}
     for key, value in (
         ("name", name),
@@ -642,13 +656,25 @@ def name_body(name: str | None) -> dict[str, Any]:
     Omission asks the platform to generate one. Empty text cannot express that
     omission and is refused consistently with create and rename.
     """
-    _require_optional_name(name)
+    name = _require_optional_name(name)
     return {} if name is None else {"name": name}
 
 
-def _require_optional_name(name: str | None) -> None:
-    if name is not None and not name.strip():
+def _require_optional_name(name: str | None) -> str | None:
+    """An optional name, canonicalised, or ``None`` when the caller omitted one.
+
+    Empty text cannot express omission and is refused. Canonical first, for the
+    reason :func:`canonical` gives: ``strip`` is overridable, so a subclass
+    could pass the emptiness check and then send something else — here, an
+    empty name. A non-string is a ``ValueError`` rather than the
+    ``AttributeError`` ``strip`` would raise.
+    """
+    if name is None:
+        return None
+    text = canonical(name, "name")
+    if not text.strip():
         raise ValueError("name must not be empty")
+    return text
 
 
 def rename_body(name: str) -> dict[str, Any]:
@@ -659,10 +685,10 @@ def rename_body(name: str) -> dict[str, Any]:
     caller cleared the field, and a round trip to be told so is a round trip
     that never had to happen.
     """
-    if name is None:
+    checked = _require_optional_name(name)
+    if checked is None:
         raise ValueError("name must not be empty")
-    _require_optional_name(name)
-    return {"name": name}
+    return {"name": checked}
 
 
 def exec_body(
@@ -698,17 +724,74 @@ def exec_body(
     if not background:
         _require_positive_seconds(timeout, "timeout must be positive for a foreground exec")
         body["timeout_s"] = timeout
-    if desktop:
+    # A real bool, not anything truthy: this is the switch from the system
+    # context to the logged-in session, and ``desktop="false"`` selected it.
+    if flag(desktop, "desktop"):
         body["session"] = "desktop"
     if background:
         body["background"] = True
     if cwd is not None:
-        if not is_absolute_guest_path(cwd):
-            raise ValueError(f"cwd must be absolute: {cwd!r}")
-        body["cwd"] = cwd
+        # Canonical first, for the reason :func:`canonical` gives. ``startswith``
+        # is overridable, so a str subclass could satisfy the absoluteness check
+        # and then send something else — here, a relative cwd.
+        text = canonical(cwd, "cwd")
+        if not is_absolute_guest_path(text):
+            raise ValueError(f"cwd must be absolute: {text!r}")
+        body["cwd"] = text
     if env:
-        body["env"] = dict(env)
+        body["env"] = _env_object(env)
     return body
+
+
+#: The most environment entries an exec may carry, and the longest one entry
+#: may be. Both are the platform's bounds (``execMaxEnv`` / ``execMaxEnvLen`` in
+#: ``server/execbg.go``), and a value past either is a request the guest agent
+#: would refuse after the round trip.
+MAX_ENV_ENTRIES = 64
+MAX_ENV_ENTRY_BYTES = 4096
+
+
+def _env_object(env: Mapping[str, str]) -> dict[str, str]:
+    """A copy of ``env`` whose names and values the guest can actually use.
+
+    JSON will carry a number, a null, an empty name. The guest agent will not:
+    it turns this into a ``KEY=value`` list, so a non-string becomes a JSON type
+    the agent never asked for, an empty name or a ``=`` inside one splits the
+    entry at the wrong place, and a NUL is dropped rather than refused. Both
+    produce a command that runs with an environment nobody asked for and reports
+    success. Mirrored from the platform's ``execEnvList``, for the same reason
+    :func:`canonical` is.
+
+    A copy because the body is built once and sent later: a caller that mutates
+    the object it passed would otherwise change what goes on the wire after the
+    checks below have already passed over it.
+    """
+    names = list(env)
+    if len(names) > MAX_ENV_ENTRIES:
+        raise ValueError(
+            f"env has {len(names)} entries; the platform accepts at most {MAX_ENV_ENTRIES}"
+        )
+    out: dict[str, str] = {}
+    for name in names:
+        key = canonical(name, "env name")
+        if not key:
+            raise ValueError("env has an entry with an empty name")
+        if "=" in key or "\0" in key:
+            raise ValueError(f"env name {key!r} must not contain '=' or a NUL")
+        text = canonical(env[name], f"env value for {key!r}")
+        if "\0" in text:
+            raise ValueError(f"env value for {key!r} must not contain a NUL")
+        try:
+            size = len(key.encode("utf-8")) + len(text.encode("utf-8")) + 1
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"env entry {key!r} must be valid UTF-8") from exc
+        if size > MAX_ENV_ENTRY_BYTES:
+            raise ValueError(
+                f"env entry {key!r} is {size} bytes; the platform accepts "
+                f"at most {MAX_ENV_ENTRY_BYTES}"
+            )
+        out[key] = text
+    return out
 
 
 def open_url_command(url: str) -> str:
@@ -724,7 +807,13 @@ def open_url_command(url: str) -> str:
     call would block until the timeout killed it and come back as a failure,
     having opened the window anyway.
     """
-    url = url.strip()
+    # Canonical first, then strip the canonical string — not the original.
+    # ``str.strip`` returns ``self`` when there is nothing to strip, so a
+    # subclass could override ``startswith`` and sneak a leading dash past the
+    # guard below; ``shlex.quote`` would then quote the real buffer. A
+    # non-string is a ``ValueError`` rather than the ``AttributeError``
+    # ``strip`` would raise.
+    url = canonical(url, "url").strip()
     if not url:
         raise ValueError("url must not be empty")
     # shlex.quote stops the URL reaching the shell as anything but one argument.
@@ -737,7 +826,7 @@ def open_url_command(url: str) -> str:
 
 def snapshot_body(memory: bool, name: str | None = None) -> dict[str, Any]:
     """A capture request. An omitted name asks the platform to generate one."""
-    _require_optional_name(name)
+    name = _require_optional_name(name)
     body: dict[str, Any] = {"memory": memory}
     if name is not None:
         body["name"] = name
@@ -844,7 +933,14 @@ def clipboard_body(text: str) -> dict[str, Any]:
         raise ValueError("clipboard text must not be empty")
     if "\0" in text:
         raise ValueError("clipboard text must not contain a NUL")
-    size = len(text.encode("utf-8"))
+    # UTF-8 bytes, not characters — see the docstring. Unpaired surrogates are
+    # not UTF-8; ``encode`` raises ``UnicodeEncodeError``, which a caller wrapping
+    # this in ``except ValueError`` would miss, so it is the same refusal as the
+    # rest.
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("clipboard text must be valid UTF-8") from exc
     if size > MAX_CLIPBOARD_BYTES:
         raise ValueError(
             f"clipboard text is {size} bytes; the platform accepts at most {MAX_CLIPBOARD_BYTES}"
@@ -934,6 +1030,12 @@ def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
 
 
 def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str, Any]:
+    # Bools are ints, so ``0 <= True <= 23`` is true and ``json.dumps`` then
+    # encodes them as booleans. The platform wants 0–23, not a JSON ``true``.
+    if isinstance(hour, bool) or not isinstance(hour, int):
+        raise TypeError(f"hour must be an integer, not {hour!r}")
+    if isinstance(minute, bool) or not isinstance(minute, int):
+        raise TypeError(f"minute must be an integer, not {minute!r}")
     if not 0 <= hour <= 23:
         raise ValueError("hour must be 0-23")
     if not 0 <= minute <= 59:

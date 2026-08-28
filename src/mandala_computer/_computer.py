@@ -1115,12 +1115,16 @@ class Computer(ComputerFields):
 
         What it does not wait through is a refusal that will never clear: a revoked
         key, a computer that is not there, an account that is not allowed, a
-        plan that does not cover this, a rate limit, or a TLS handshake the edge
-        and the platform cannot agree on. Those are raised at once. Waiting on
-        one of them costs the full timeout and then reports "the guest did not
+        plan that does not cover this, or a TLS handshake the edge and the
+        platform cannot agree on. Those are raised at once. Waiting on one of
+        them costs the full timeout and then reports "the guest did not
         respond", which is both wrong and the least useful thing this method
         could say about a 401 — or, as measured, about an expired certificate
         that had already told the caller to report it rather than wait it out.
+
+        A rate limit is waited out on the platform's own cadence: ``Retry-After``
+        when the platform named an interval, and a short floor when it did not
+        (OPL-3724).
 
         A stopped computer is also refused immediately, including one carrying
         :attr:`start_error` from a failed boot. A suspended computer is not:
@@ -1468,8 +1472,13 @@ class Computer(ComputerFields):
         it does not verify the pid: the first :meth:`BackgroundCommand.poll`
         raises :class:`~mandala_computer.NotFoundError` if the daemon has no
         such handle.
+
+        Existence is what is not verified. The pid itself still has to be a
+        positive integer: ``True`` is an ``int`` subclass and would address
+        ``exec/1``, and ``None`` would be a ``TypeError`` from ``int()`` rather
+        than a sentence about the pid.
         """
-        return BackgroundCommand(self._t, self.id, {"pid": pid})
+        return BackgroundCommand(self._t, self.id, {"pid": _api.guest_pid(pid)})
 
     def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::

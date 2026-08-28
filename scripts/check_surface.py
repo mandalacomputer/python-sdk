@@ -39,6 +39,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
 
 from surface_text import balanced, strip_comments, top_level_keys
 
@@ -82,8 +83,14 @@ def platform_repo() -> Path | None:
         for p in (os.environ.get("MANDALA_PLATFORM_REPO"), *(REPO.parent / s for s in SIBLINGS))
         if p
     ]
+    # SURFACE and APIDOC are the route and parameter tables; every path in
+    # CONSTANTS is a number this script compares. A checkout that has the two
+    # TypeScript files but not ``server/clipboard.go`` used to look complete,
+    # then ``constant_drift`` died in ``Path.read_text`` instead of taking the
+    # skip path this function exists to open.
+    needed = (SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))
     return next(
-        (d for d in candidates if (d / SURFACE).is_file() and (d / APIDOC).is_file()),
+        (d for d in candidates if all((d / p).is_file() for p in needed)),
         None,
     )
 
@@ -279,24 +286,38 @@ def constant_drift(platform: Path) -> list[str]:
     return drifted
 
 
-def mirrored() -> set[tuple[str, str]]:
-    """This repo's mirror, read from the test rather than re-parsed.
+def _surface_tables() -> ModuleType:
+    """Import the mirror tables without pulling in pytest, httpx or respx.
 
-    Imported, not scraped: the test is the mirror, and a second parser over it
-    would be one more thing that can disagree with what the suite actually pins.
+    They used to live in ``test_surface``, which imports those at module level,
+    so the comparison path — the one that does real work — could not run without
+    the test extra. ``sys.path`` is restored so a later import cannot pick up
+    this repo as a top-level package by accident.
     """
-    sys.path.insert(0, str(REPO / "tests"))
-    from test_surface import ALLOWED
+    path = str(REPO)
+    sys.path.insert(0, path)
+    try:
+        from tests import surface_tables
 
-    return set(ALLOWED)
+        return surface_tables
+    finally:
+        if sys.path and sys.path[0] == path:
+            sys.path.pop(0)
+
+
+def mirrored() -> set[tuple[str, str]]:
+    """This repo's mirror, read from the tables rather than re-parsed.
+
+    Imported, not scraped: the tables are the mirror, and a second parser over
+    them would be one more thing that can disagree with what the suite actually
+    pins.
+    """
+    return set(_surface_tables().ALLOWED)
 
 
 def mirrored_parameters() -> dict[str, set[str]]:
     """The parameter mirror, imported for the same reason :func:`mirrored` is."""
-    sys.path.insert(0, str(REPO / "tests"))
-    from test_surface import PARAMETERS
-
-    return {route: set(names) for route, names in PARAMETERS.items()}
+    return {route: set(names) for route, names in _surface_tables().PARAMETERS.items()}
 
 
 def parameter_drift(upstream: dict[str, set[str]], mirror: dict[str, set[str]]) -> list[str]:
@@ -359,7 +380,7 @@ def main() -> int:
         print(line)
     print(
         "\ncheck-surface — the mirror has drifted from the platform.\n"
-        "  Update ALLOWED and PARAMETERS in tests/test_surface.py, and add anything\n"
+        "  Update ALLOWED and PARAMETERS in tests/surface_tables.py, and add anything\n"
         "  new to UNIMPLEMENTED or UNIMPLEMENTED_PARAMETERS until this SDK can send\n"
         "  it — which is the line that makes a gap somebody's to close rather than\n"
         "  nobody's to notice. A constant that has moved belongs in\n"

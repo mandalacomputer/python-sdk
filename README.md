@@ -1192,7 +1192,8 @@ Everything derives from `MandalaError`.
 | `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
 | `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
-| `ConnectionError` | the request never completed: DNS, refused socket, broken TLS |
+| `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
+| `ConnectionInterruptedError` | the request was dispatched and the answer was lost; do not replay a create |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 `PlanLimitError`'s message names the limit that was hit.
@@ -1205,6 +1206,15 @@ the same way for as long as the computer is where it is. `move_possible` is the
 branch: `True` means somewhere else in the region can run that size and
 `relocate()` takes the offer up, `False` means nowhere can and the size is the
 thing to change. See [Growing past the host](#growing-past-the-host).
+
+`ConnectionInterruptedError` is a `ConnectionError` that does **not** mean the
+request never left, and it is a subclass of `ConnectionError` so that an
+`except ConnectionError` written before it existed still catches it. It means
+the request was dispatched and the answer was lost — a socket reset while the
+body was being read, a protocol error on the way back. The platform may have
+acted. Do not replay a create on the strength of it; check whether the first
+attempt took effect. `is_transient` says no, matching `MoveRequiredError` under
+`ConflictError`.
 
 `FileTooLargeError` and `RangeNotSatisfiableError` are the two size statuses,
 and each has a next move attached, which is why neither is a bare `APIError`.
@@ -1274,9 +1284,9 @@ that creates deserves a look first.
 `is_transient(err)` is that rule as a function, and it answers for the riskiest
 caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
 `ConflictError` (minus `MoveRequiredError`), `RateLimitError`, `UnavailableError`
-and `ConnectionError`, and no to everything above whose outcome is unknown,
-502 and 504 included. The same four classes, and only those, answer yes in
-mandala-computer-typescript and mandala-computer-mcp.
+and `ConnectionError` (minus `ConnectionInterruptedError`), and no to everything
+above whose outcome is unknown, 502 and 504 included. The same four classes, and
+only those, answer yes in mandala-computer-typescript and mandala-computer-mcp.
 
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during
