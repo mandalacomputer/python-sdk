@@ -72,6 +72,17 @@ CONSTANTS = [
     ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
 ]
 
+#: The files whose contents this check mirrors. Kept separately from the
+#: markers that identify a platform checkout: a checkout with one of these
+#: missing is evidence of drift (or an incomplete checkout), not evidence that
+#: there is no checkout and therefore permission to skip the comparison.
+MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))))
+
+#: The stable core files that distinguish a platform checkout from an unrelated
+#: directory at one of the candidate locations. They identify the repository;
+#: ``MIRROR_SOURCES`` separately says whether it is complete enough to check.
+PLATFORM_MARKERS = (SURFACE, APIDOC)
+
 
 #: Directory names the platform repo answers to when checked out beside this one.
 #:
@@ -89,16 +100,23 @@ def platform_repo() -> Path | None:
         for p in (os.environ.get("MANDALA_PLATFORM_REPO"), *(REPO.parent / s for s in SIBLINGS))
         if p
     ]
-    # SURFACE and APIDOC are the route and parameter tables; every path in
-    # CONSTANTS is a number this script compares. A checkout that has the two
-    # TypeScript files but not ``server/clipboard.go`` used to look complete,
-    # then ``constant_drift`` died in ``Path.read_text`` instead of taking the
-    # skip path this function exists to open.
-    needed = (SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))
     return next(
-        (d for d in candidates if all((d / p).is_file() for p in needed)),
+        (d for d in candidates if all((d / marker).is_file() for marker in PLATFORM_MARKERS)),
         None,
     )
+
+
+def missing_mirror_sources(platform: Path) -> list[Path]:
+    """Files a recognized platform checkout is missing for this comparison.
+
+    This used to be folded into :func:`platform_repo`: a checkout that had the
+    route and parameter tables but had lost ``server/clipboard.go`` looked
+    absent, so the entire check skipped. Before that skip was added it looked
+    complete and ``constant_drift`` died in ``Path.read_text``. Neither answer
+    distinguishes "there is no checkout" from "the checkout drifted underneath
+    the mirror"; this inventory is the third state that does.
+    """
+    return [source for source in MIRROR_SOURCES if not (platform / source).is_file()]
 
 
 def table(source: str, name: str) -> set[tuple[str, str]]:
@@ -355,6 +373,14 @@ def main() -> int:
             f"  Set MANDALA_PLATFORM_REPO to compare against {SURFACE}."
         )
         return 0
+
+    missing = missing_mirror_sources(platform)
+    if missing:
+        print("check-surface — platform repo found, but mirror sources are missing.")
+        for source in missing:
+            print(f"  ! {platform / source}")
+        print("  Restore or update these paths before comparing the mirrored surface.")
+        return 1
 
     upstream = table((platform / SURFACE).read_text(), "V1_ROUTES")
     mirror = mirrored()

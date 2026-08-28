@@ -122,6 +122,32 @@ async def test_the_async_clipboard_write_sends_the_one_field(client: mc.AsyncCli
 
 
 @respx.mock
+async def test_the_async_clipboard_write_refuses_before_it_reaches_the_wire(
+    client: mc.AsyncClient,
+) -> None:
+    """The public async method must keep using the shared body builder.
+
+    The builder's own tests stay green if this method quietly replaces it with
+    a raw ``{"text": text}``. Driving every refusal through the method and
+    watching the route proves validation still happens before a write can
+    resume and bill a suspended computer.
+    """
+    route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    computer = mc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="must not be empty"):
+        await computer.set_clipboard("")
+    with pytest.raises(ValueError, match="NUL"):
+        await computer.set_clipboard("a\0b")
+    with pytest.raises(ValueError, match="at most"):
+        await computer.set_clipboard("x" * (mc._api.MAX_CLIPBOARD_BYTES + 1))
+    with pytest.raises(ValueError, match="must be a string"):
+        await computer.set_clipboard(None)  # type: ignore[arg-type]
+    assert not route.called
+
+
+@respx.mock
 async def test_click_payload(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     await mc.AsyncComputer(client._t, COMPUTER).click(10, 20)
