@@ -551,26 +551,37 @@ class Builds:
         )
         return TemplateBuild.from_api(data)
 
-    def list(self) -> builtins.list[TemplateBuild]:
+    def list(self, *, allow_partial: bool = False) -> Listing[TemplateBuild]:
         """Every build the fleet still holds a record of, newest first.
 
         A build lives on the hypervisor that ran it, so this is a fan-out — and
-        like every other fan-out on this surface it FAILS CLOSED. ``forward`` in
-        the platform's lib/surface applies its strict-inventory check to every v1
-        route generically, not only to computers and snapshots: a response
-        carrying ``X-GC-Incomplete`` becomes a 503 unless the request passed
-        ``allow_partial``, which ``GET /builds`` does not document and this
-        method does not send. So a hypervisor being away arrives as an
-        :class:`~mandala_computer.UnavailableError`, and there is no short list
-        for a caller to detect.
+        like every other fan-out on this surface it FAILS CLOSED. A response
+        carrying ``X-GC-Incomplete`` becomes a 503, so a hypervisor being away
+        arrives as an :class:`~mandala_computer.UnavailableError` rather than as
+        a short list.
 
-        Worth stating because a previous version of this method said the opposite
-        and returned a :class:`~mandala_computer.Listing` to carry a flag the
-        surface never lets through. lib/hvproxy does set the header; the tier
-        above turns that response into the 503 before any client sees it.
+        ``allow_partial`` is the way through, and it is
+        :meth:`Computers.list`'s with one difference that matters. The platform
+        honoured it here all along and did not DOCUMENT it until OPL-3840, which
+        is why this method did not send it and why the text here used to say
+        there was no way through at all — a build listing was strictly less
+        available than a computer listing for no reason anybody decided.
+
+        The difference is what a short answer LOOKS like. A short build listing
+        appends nothing at all, because the platform keeps no record of which
+        hypervisor ran which build: the missing builds are simply absent,
+        ``incomplete`` is ``0`` rather than a count, and the
+        :class:`~mandala_computer.Listing` saying ``is_complete`` is false is the
+        only evidence there is.
+
+        A short computer or snapshot listing appends one marked row per thing it
+        could not reach — but only for a key that spans the account. A key
+        scoped to one workspace gets no marked rows from any of the three, since
+        the ids would come out of a placement cache with no workspace column.
+        On such a key the Listing is the only evidence everywhere.
         """
-        data = self._t.json_array("GET", _api.BUILDS)
-        return [TemplateBuild.from_api(b) for b in data]
+        data, incomplete = self._t.listing(_api.BUILDS, params=_api.partial_params(allow_partial))
+        return Listing.of([TemplateBuild.from_api(b) for b in data or []], incomplete)
 
     def get(self, build_id: str) -> TemplateBuild:
         """What became of one build. ``error`` says why a failed one failed."""
