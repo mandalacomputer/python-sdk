@@ -228,9 +228,11 @@ class Listing(list[T]):
     cached against the host now holding it. So branch on
     :attr:`is_complete`, never on the number.
 
-    On a build listing it is ALWAYS ``0``, and this object is the only thing
-    that says the answer was short: there is no placement cache for builds, so
-    the platform has neither a count to give nor a marked row to append.
+    A SHORT build listing puts ``0`` here rather than a count — never a number,
+    the way a computer listing sometimes can — and this object is then the only
+    thing that says the answer was short: there is no placement cache for
+    builds, so the platform has neither a count to give nor a marked row to
+    append. A whole one is ``None`` like any other.
     """
 
     #: Rows missing, or ``None`` when nothing was missing. See the class note on

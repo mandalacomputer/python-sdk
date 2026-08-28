@@ -467,7 +467,13 @@ class AsyncBuilds:
             await asyncio.sleep(min(delay, remaining))
 
     start.__doc__ = Builds.start.__doc__
-    list.__doc__ = Builds.list.__doc__
+    # Through _reworded, not a bare assignment: the shared text cross-references
+    # :meth:`Computers.list`, and handing that to an async reader points them at
+    # the blocking class. AsyncSnapshots.list writes its copy out by hand for
+    # the same reason; this half shares its prose, so it rewrites instead.
+    list.__doc__ = _reworded(
+        Builds.list.__doc__, ":meth:`Computers.list`", ":meth:`AsyncComputers.list`"
+    )
     get.__doc__ = Builds.get.__doc__
     progress.__doc__ = Builds.progress.__doc__
     wait.__doc__ = Builds.wait.__doc__
