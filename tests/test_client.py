@@ -1899,6 +1899,74 @@ def test_window_actions_require_only_the_geometry_they_use() -> None:
         mc._api.window_body("close", width=10, height=10)
 
 
+# --- the clipboard ----------------------------------------------------------
+
+
+@respx.mock
+def test_reading_the_clipboard_hands_back_the_text(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"text": "https://mandala.computer"})
+    )
+    assert _computer(client).clipboard() == "https://mandala.computer"
+    assert route.calls.last.request.method == "GET"
+
+
+@respx.mock
+def test_an_empty_clipboard_is_a_clipboard(client: mc.Client) -> None:
+    """`""` survives, so the guard is on the TYPE rather than on truthiness."""
+    respx.get(f"{BASE}/computers/vm-1/clipboard").mock(httpx.Response(200, json={"text": ""}))
+    assert _computer(client).clipboard() == ""
+
+
+@respx.mock
+@pytest.mark.parametrize("body", [{}, {"text": 42}, {"text": None}])
+def test_a_clipboard_read_with_no_text_raises_rather_than_coercing(
+    client: mc.Client, body: object
+) -> None:
+    """`str(None)` is "None" — a four-letter clipboard nobody copied."""
+    respx.get(f"{BASE}/computers/vm-1/clipboard").mock(httpx.Response(200, json=body))
+    with pytest.raises(mc.MandalaError, match="did not come back with any text"):
+        _computer(client).clipboard()
+
+
+@respx.mock
+def test_writing_the_clipboard_sends_the_one_field_the_platform_decodes(
+    client: mc.Client,
+) -> None:
+    route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    _computer(client).set_clipboard("hello")
+    assert json.loads(route.calls.last.request.content) == {"text": "hello"}
+
+
+def test_the_clipboard_write_refuses_locally_what_the_platform_would_refuse() -> None:
+    # Empty: clearing the clipboard is not what that endpoint does, and a caller
+    # who meant to clear it should hear so rather than read a status code.
+    with pytest.raises(ValueError, match="must not be empty"):
+        mc._api.clipboard_body("")
+    # A NUL would LAND and then be reported as a failure: the platform confirms
+    # the write through a command substitution, a shell truncates one at the
+    # first NUL, and the answer is a 409 inviting a retry at something that has
+    # already worked.
+    with pytest.raises(ValueError, match="NUL"):
+        mc._api.clipboard_body("a\0b")
+    with pytest.raises(TypeError, match="must be a str"):
+        mc._api.clipboard_body(None)  # type: ignore[arg-type]
+
+
+def test_the_clipboard_cap_is_counted_in_bytes_not_characters() -> None:
+    """An emoji is four UTF-8 bytes, so `len(text)` would pass four times the
+    legal payload to an execve that answers E2BIG."""
+    cap = mc._api.MAX_CLIPBOARD_BYTES
+    assert mc._api.clipboard_body("x" * cap) == {"text": "x" * cap}
+    with pytest.raises(ValueError, match="at most"):
+        mc._api.clipboard_body("x" * (cap + 1))
+    assert mc._api.clipboard_body("\U0001f600" * (cap // 4))["text"]
+    with pytest.raises(ValueError, match="at most"):
+        mc._api.clipboard_body("\U0001f600" * (cap // 4 + 1))
+
+
 # --- resize and the idle window ---------------------------------------------
 
 

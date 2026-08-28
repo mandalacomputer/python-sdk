@@ -797,6 +797,54 @@ def window_body(
     return body
 
 
+#: The most text ``PUT /computers/{id}/clipboard`` carries INTO a guest, in bytes.
+#:
+#: Mirrored rather than left to the server, so a request that can only fail is
+#: not made. NOT machine-checked, unlike :data:`MAX_STEPS`: the platform's copy
+#: is ``clipboardWriteMax`` in its ``server/clipboard.go``, a Go constant, and
+#: ``scripts/check_surface.py`` reads ``web/lib`` only. The number is not ours
+#: and is not arbitrary: the
+#: platform puts the text inside one argument of one command, Linux caps a single
+#: argv string at 128 KiB, and two layers of base64 stand between the text and
+#: that ceiling — so each byte costs about 1.8 of it and 64 KiB is where the
+#: platform stops. Past it ``execve`` fails with E2BIG rather than truncating.
+#:
+#: The READ cap is 128 KiB, a different bound on a different channel, and is
+#: deliberately not mirrored: nothing here can meet it, since that text comes
+#: from the guest.
+MAX_CLIPBOARD_BYTES = 64 * 1024
+
+
+def clipboard_body(text: str) -> dict[str, Any]:
+    """Text for the desktop's clipboard, checked before it costs a round trip.
+
+    Three refusals, each of which the platform also makes. The NUL is the one
+    worth explaining: the platform confirms a write by reading the selection
+    back through a command substitution, and a shell truncates that at the first
+    NUL — so the write would land, the read-back would disagree, and the answer
+    would be a 409 inviting a retry at something that had already worked.
+
+    The cap is counted in UTF-8 BYTES rather than characters. An emoji is four of
+    them, so a ``len(text)`` check would pass four times the legal payload to an
+    ``execve`` that answers E2BIG.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"clipboard text must be a str, not {type(text).__name__}")
+    # Empty is refused rather than sent, matching the platform: clearing the
+    # clipboard is not what that endpoint does, and a caller who meant to clear
+    # it should hear so rather than read a status code.
+    if not text:
+        raise ValueError("clipboard text must not be empty")
+    if "\0" in text:
+        raise ValueError("clipboard text must not contain a NUL")
+    size = len(text.encode("utf-8"))
+    if size > MAX_CLIPBOARD_BYTES:
+        raise ValueError(
+            f"clipboard text is {size} bytes; the platform accepts at most {MAX_CLIPBOARD_BYTES}"
+        )
+    return {"text": text}
+
+
 def resize_body(*, cpu: int | None, ram_mb: int | None, disk_gb: int | None) -> dict[str, Any]:
     """A new shape for a stopped computer.
 

@@ -282,62 +282,11 @@ however the guest is configured. Where any of it is absent a paste reaches QEMU
 and stops, silently, and **no field tells you which you have**. Keep the route
 below whichever you get.
 
-`exec` with `desktop=True` is the route to build on — the reliable one, not
-merely the fallback — because it needs nothing of the hardware. It is not
-universal either: it drives the guest's own desktop session, so it needs a
-Linux guest with a display and `xclip`, and it is refused outright on Windows. Three things about
-the write are quiet when you get them wrong: the holder must outlive the
-command, because an X selection belongs to a live process; its output must be
-redirected, or the resident `xclip` holds the pipe the guest agent reads and the
-exec runs to its full timeout before answering; and the text goes over base64,
-whose alphabet has no quote in it, so an apostrophe in what you are pasting
-cannot end the shell word.
-
-Being granted the selection is also asynchronous, so a read straight after the
-write returns the *previous* clipboard — poll until it matches, and give up
-after a few seconds. Every poll is another billable exec, and the redirection
-above swallows xclip's own errors, so a guest without it never changes the
-selection at all.
-
-```python
-import base64, time
-
-READ = "xclip -o -selection clipboard"
-
-# Reading. `ok` matters: xclip exits non-zero when there is no display, and a
-# failed read and an empty clipboard both arrive as "".
-got = c.exec(READ, desktop=True)
-on_clipboard = got.stdout if got.ok else None
-
-# Writing.
-text = "what you want on the clipboard"
-b64 = base64.b64encode(text.encode()).decode()  # b64encode does not wrap; encodebytes wraps at 76
-c.exec(
-    f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
-    desktop=True,
-)
-
-# The write answers 200 whether or not it worked, so the read-back is the check
-# rather than a courtesy. Bounded in ATTEMPTS, not on the clock: each exec
-# carries its own timeout, so a hung guest overruns this by one of them.
-for _ in range(20):
-    back = c.exec(READ, desktop=True)
-    if back.ok and back.stdout == text:
-        break
-    time.sleep(0.25)
-else:
-    raise RuntimeError("clipboard write never landed — no xclip, no display, or no X session")
-```
-
-One caveat on that comparison, and it is the platform's own: `desktop=True` runs
-your command in a **login shell**, so the desktop user's profile is sourced and
-anything it prints lands on the same stdout, ahead of your output. That is
-wanted for `exec` — you asked to run a command the way the user would — but it
-means an `echo` in the guest's `.profile` corrupts this read, and no framing you
-add here fixes it, since a profile that prints the frame owns everything after
-it. The default image prints nothing; if you have customised the profile of a
-guest you also want to read clipboards from, that is the interaction to know
-about.
+[`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
+— the reliable one, not merely the fallback — because they need nothing of the
+hardware: no cold boot, no particular image, no permission from a browser. Where
+the socket *does* carry the clipboard the two do not fight over it: those
+methods write the same X `CLIPBOARD` selection the agent then offers onward.
 
 `vnc` is `None` on a computer that came from `list()`. That is deliberate on the
 platform's side: a desktop credential in every list response is a credential in
@@ -686,6 +635,64 @@ what separates that from an action the guest simply could not report on.
 `include_all=True` keeps the desktop's own furniture — panels, docks, the
 wallpaper window. Off by default because a stock guest showing one terminal has
 five windows, four of which are not applications. Linux only.
+
+### The clipboard
+
+The desktop's `CLIPBOARD` selection — what Ctrl-C writes and Ctrl-V pastes —
+read and written from outside the guest. Linux only, and it needs nothing of
+the hardware: no cold boot, no particular image, no permission from a browser,
+which is what makes it the road that works on every computer. (The other road
+is RFB extended cut text over the desktop socket, which is live and
+conditional; see [Showing somebody the desktop](#showing-somebody-the-desktop).)
+
+```python
+c.set_clipboard("https://mandala.computer")
+c.key("ctrl", "v")  # into whatever has focus
+
+on_clipboard = c.clipboard()  # "" is an empty clipboard
+```
+
+`set_clipboard()` takes at most 64 KiB of UTF-8; `clipboard()` returns at most
+128 KiB. They are different bounds on different channels, and the read is
+**refused rather than truncated** past its own — half a password is not less of
+an answer, it is a wrong one that looks completely normal. Empty text and a NUL
+are refused here, before the request goes out.
+
+The platform confirms the write by reading the selection back before it
+answers, so `set_clipboard()` returning means the desktop is *holding* the text
+rather than that a command ran. A `ConflictError` means something else claimed
+the selection in that instant — a clipboard manager settling, usually — and it
+clears.
+
+The two differ on one thing worth knowing: `set_clipboard()` **resumes a
+suspended computer**, because putting text on a clipboard is the first half of
+pasting it and that is somebody working on the machine. `clipboard()` does not
+— what somebody copied is not worth waking a machine for — so reading a
+suspended computer is a 409 rather than a start you did not ask for.
+
+A read failure raises; an empty clipboard is `""`. That is the distinction the
+`exec` recipe these replace could not make.
+
+#### What these replace
+
+Until platform OPL-3768 the only public road was a recipe over `exec` with
+`desktop=True`, documented at length in this README. Do not go back to it.
+`exec` runs a **login shell**, so the desktop user's profile is sourced and
+anything it prints lands on the same stdout as your command's output, ahead of
+it. That is wanted when you asked to run a command the way the user would, and
+fatal when you are reading a value: an `echo` in the guest's `.profile`
+corrupts the answer and a deliberate one forges it. No framing you add fixes
+that — a profile that prints your frame owns everything after it. The clipboard
+endpoints do not share that stream.
+
+The write was worse. An X selection belongs to a live process, so the holder
+had to outlive the exec under `setsid` and have its output redirected, or the
+resident `xclip` held the pipe the guest agent reads and the call ran to its
+full timeout before answering. The text had to travel base64 and quoted, since
+an apostrophe would otherwise end the shell word. And because being granted a
+selection is asynchronous, the result had to be polled for in a loop bounded in
+*attempts* — each one a billable exec — rather than trusted. `set_clipboard()`
+does all of it in one call.
 
 ### Letting the platform drive
 

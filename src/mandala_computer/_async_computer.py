@@ -1004,6 +1004,66 @@ class AsyncComputer(ComputerFields):
         )
         return WindowResult.from_api(data)
 
+    async def clipboard(self) -> str:
+        """What is on the desktop's clipboard.
+
+        The X ``CLIPBOARD`` selection — what Ctrl-C writes and Ctrl-V pastes —
+        not the ``PRIMARY`` selection that middle-click uses.
+
+        This is the road that works on every Linux computer with a desktop: no
+        cold boot, no particular image, no permission from a browser. The other
+        road is RFB extended cut text over the desktop socket, which is live and
+        needs hardware and an image not every computer has — see
+        :class:`~mandala_computer.VncConnect`.
+
+        A read, not a subscription. Nothing notices a Ctrl-C in the guest on its
+        own, and this does NOT resume a suspended computer: what somebody copied
+        is not worth waking a machine for, so a stopped or suspended one answers
+        409 rather than starting. :meth:`set_clipboard` is the other way round.
+
+        An empty clipboard is ``""`` and a failure raises, which is the
+        distinction the ``exec`` recipe this replaces could not make.
+
+        Linux only.
+        """
+        data = await self._t.json_object("GET", _api.computer_action(self.id, "clipboard"))
+        text = data.get("text")
+        # Checked rather than coerced. ``str(None)`` is "None" — a four-letter
+        # clipboard nobody copied, indistinguishable from a real one, and pasted
+        # somewhere by whoever asked for it.
+        if not isinstance(text, str):
+            raise MandalaError("the clipboard read did not come back with any text in it")
+        return text
+
+    async def set_clipboard(self, text: str) -> None:
+        """Put ``text`` on the desktop's clipboard, ready to paste.
+
+        This leaves the text on the clipboard and touches nothing on screen.
+        Pair it with ``key("ctrl", "v")`` to get it into whatever has focus.
+
+        Unlike :meth:`clipboard`, this DRIVES the computer: a suspended one is
+        resumed to serve it, which is a start and is charged like one.
+
+        At most 64 KiB of UTF-8 goes in — half what comes out, and the two are
+        different bounds on different channels rather than one number rounded
+        twice; see ``_api.MAX_CLIPBOARD_BYTES``. Empty text and a NUL are
+        refused here rather than on the wire.
+
+        The platform confirms the write by reading the selection back before it
+        answers, so this returning means the desktop is *holding* the text
+        rather than that a command ran. A
+        :class:`~mandala_computer.ConflictError` means something else claimed
+        the selection in that instant — a clipboard manager settling, usually —
+        and it clears.
+
+        Linux only.
+        """
+        await self._t.json_object(
+            "PUT",
+            _api.computer_action(self.id, "clipboard"),
+            json=_api.clipboard_body(text),
+        )
+
     # --- snapshots ------------------------------------------------------
 
     async def snapshot(self, *, memory: bool = False, name: str | None = None) -> Snapshot:

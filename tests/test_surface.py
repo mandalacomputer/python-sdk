@@ -87,6 +87,10 @@ ALLOWED = {
     ("DELETE", "computers/:id/exec/:pid"),
     ("GET", "computers/:id/windows"),
     ("POST", "computers/:id/windows/:window"),
+    # The desktop's clipboard (platform OPL-3743, OPL-3768). Session-only for
+    # its first month; on v1 since the shape settled by not moving.
+    ("GET", "computers/:id/clipboard"),
+    ("PUT", "computers/:id/clipboard"),
     ("GET", "snapshots"),
     ("GET", "computers/:id/snapshots"),
     ("POST", "computers/:id/snapshots"),
@@ -240,6 +244,8 @@ PARAMETERS: dict[str, set[str]] = {
         "body:width",
         "body:height",
     },
+    "GET computers/:id/clipboard": set(),
+    "PUT computers/:id/clipboard": {"body:text"},
     "POST computers/:id/agent": {
         "header:X-Model-Key",
         "body:prompt",
@@ -479,6 +485,11 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         )
     if "/exec/" in path:
         return httpx.Response(200, json=EXEC_STATUS)
+    # Both verbs on one path, told apart by the method: the read answers text
+    # and the write answers an ack, and a mock that gave both one shape would
+    # let a decoder reading the wrong field pass.
+    if path.endswith("/clipboard"):
+        return httpx.Response(200, json={"text": "on the clipboard"} if get else {"ok": True})
     if path.endswith("/windows"):
         return httpx.Response(200, json={"windows": [WINDOW]})
     if "/windows/" in path:
@@ -642,6 +653,9 @@ def exercise_everything(client: mc.Client) -> None:
     c.window_action("0x2600003", "focus")
     c.window_action("0x2600003", "move", x=10, y=20)
     c.window_action("0x2600003", "resize", width=800, height=600)
+
+    c.clipboard()
+    c.set_clipboard("on the clipboard")
     c.resize(cpu=4, ram_mb=8192)
     c.resize(disk_gb=64)
     # All three sizing fields in one call: the platform reads exactly these off a
@@ -757,6 +771,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.window_action("0x2600003", "focus")
     await c.window_action("0x2600003", "move", x=10, y=20)
     await c.window_action("0x2600003", "resize", width=800, height=600)
+
+    await c.clipboard()
+    await c.set_clipboard("on the clipboard")
     await c.resize(cpu=4, ram_mb=8192)
     await c.resize(disk_gb=64)
     await c.relocate(ram_mb=26000, cpu=2, disk_gb=64)

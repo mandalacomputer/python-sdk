@@ -364,24 +364,33 @@ class VncConnect:
         QEMU and stops — silently, with no error to catch — and no field tells
         you which you have. Keep the route below whichever you get.
 
-        :meth:`Computer.exec` with ``desktop=True`` is the route to build on —
-        the reliable one, not merely the fallback — because it needs nothing of
-        the hardware — but it is not universal either: it drives the guest's own
-        desktop session, so it needs a Linux guest with a display and
-        ``xclip``, and it is refused outright on Windows. A write needs
-        ``setsid``, so the holder outlives the command — an X selection belongs
-        to a live process — AND ``>/dev/null 2>&1``, without which the resident
-        xclip holds the pipe the guest agent is reading and the exec runs to
-        its full timeout before answering. Send the text base64 rather than
-        quoted, since an apostrophe would otherwise end the shell word. Then
-        read it back and compare, rather than trusting the answer: being
-        granted a selection is asynchronous, so an immediate read returns the
-        PREVIOUS clipboard, and the redirection above swallows xclip's own
-        errors, so a guest with no display answers 200 and changes nothing.
-        Check :attr:`ExecResult.ok` on the read as well as its text — a failed
-        read and an empty clipboard are both ``""``. Bound the loop in
-        ATTEMPTS: each one is another billable exec, and each carries its own
-        timeout, so a wall-clock deadline is not one this can hold to.
+        :meth:`Computer.clipboard` and :meth:`Computer.set_clipboard` are the
+        route to build on — the reliable one, not merely the fallback — because
+        they need nothing of the hardware: no cold boot, no particular image,
+        no permission from a browser. They are not universal either, and in a
+        different way: they drive the guest's own desktop session, so they want
+        a Linux guest with a display, and they are refused outright on Windows.
+        Where the socket does carry the clipboard the two do not fight over it
+        — those methods write the same X CLIPBOARD selection the agent then
+        offers onward.
+
+        They replace what this SDK documented here as a recipe over
+        :meth:`Computer.exec` with ``desktop=True``, and going back to it is a
+        mistake worth naming. Public ``exec`` runs a LOGIN shell, which sources
+        the desktop user's own profile onto the same stdout your command prints
+        to, ahead of it — wanted when you asked to run a command the way the
+        user would, and fatal for reading a value, since an ``echo`` left in a
+        ``.profile`` corrupts the answer and a deliberate one forges it. No
+        framing you add fixes that: a profile that prints your frame owns
+        everything after it. The clipboard endpoints do not share that stream.
+        The write was worse — an X selection belongs to a live process, so the
+        holder had to outlive the exec under ``setsid`` and have its output
+        redirected or the call hung to its full timeout; the text had to be
+        base64 and quoted or an apostrophe ended the shell word; and the result
+        had to be polled for in a loop bounded in ATTEMPTS, each one billable,
+        because being granted a selection is asynchronous.
+        :meth:`Computer.set_clipboard` does all of it, confirms the selection
+        was taken before it returns, and bills once.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
         browser holding this one cannot type even from a patched client. The
