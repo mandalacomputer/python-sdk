@@ -288,7 +288,7 @@ below whichever you get.
 [`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
 — the reliable one, not merely the fallback — because they need nothing of the
 *hardware*: no cold boot, no permission from a browser. They ask one thing of
-the image (`xclip`, in every golden since mid-2026) and say so in the answer
+the image (`xclip`, in every golden since August 2026) and say so in the answer
 when it is missing, which is one condition stated instead of two inferred. Where
 the socket *does* carry the clipboard the two do not fight over it: those
 methods write the same X `CLIPBOARD` selection the agent then offers onward.
@@ -646,7 +646,7 @@ five windows, four of which are not applications. Linux only.
 The desktop's `CLIPBOARD` selection — what Ctrl-C writes and Ctrl-V pastes —
 read and written from outside the guest. Linux only, and it needs nothing of
 the *hardware*: no cold boot, no permission from a browser. What it does need is
-`xclip` in the guest, which every golden built since mid-2026 carries — so in
+`xclip` in the guest, which every golden built since August 2026 carries — so in
 practice this is the road that works on every computer, and where it is not, the
 refusal says so. (The other road is RFB extended cut text over the desktop
 socket, which is live and conditional; see

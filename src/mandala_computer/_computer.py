@@ -1709,7 +1709,7 @@ class Computer(ComputerFields):
 
         It does want one thing of the IMAGE, and unlike the socket's conditions
         it is stated in the answer rather than left to be inferred: ``xclip`` in
-        the guest. Every golden built since mid-2026 carries it, so in practice
+        the guest. Every golden built since August 2026 carries it, so in practice
         this is a computer created before then — and a computer keeps the image
         it was created from. The refusal is a **400** and it is permanent:
         install ``xclip`` in the guest, which you can do since you have root
