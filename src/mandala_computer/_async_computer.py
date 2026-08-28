@@ -1081,6 +1081,11 @@ class AsyncComputer(ComputerFields):
         so a blanket retry spins until your deadline against a computer that is
         simply stopped. Read the message, or bound the loop in attempts.
 
+        And two 400s here never clear at all, which matters more on this method
+        than on the read for exactly that reason: the guest needs ``xclip`` in
+        its image (see :meth:`clipboard`), and Windows is refused outright. Both
+        say which they are.
+
         Linux only.
         """
         await self._t.json_object(
