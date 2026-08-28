@@ -348,15 +348,25 @@ class VncConnect:
         that moves an existing one onto a newer one, so a computer built before
         the agent shipped needs it installed in the guest, which you can do
         yourself since you have root there, or replacing with a newly created
-        computer. Windows guests never have it, whatever the hardware says.
-        Where both are present, standard RFB extended cut text works in both
-        directions and nothing below is needed. Where either is absent, text a
-        client pastes reaches QEMU and stops — silently, with no error to catch
-        — and no field tells you which you have.
+        computer — and note that a current image STARTS it unaided, while
+        installing the package into a guest that is already logged in leaves
+        that session unbridged until it logs in again. Windows guests never
+        have it, whatever the hardware says.
+        A resumed or snapshot-restored session keeps the topology of the
+        capture it came from, so a computer that had the channel can come back
+        without one and reacquires it on its next stop and start. Where both
+        halves are present, RFB extended cut text is AVAILABLE — which is the
+        transport being open rather than a promise that a copy or a paste
+        succeeds. The first paste of a session is often dropped, because the
+        guest PULLS the text and vdagent may not own the selection yet, and a
+        browser will not hand over the guest's clipboard without focus and
+        permission. Where either half is absent, text a client pastes reaches
+        QEMU and stops — silently, with no error to catch — and no field tells
+        you which you have. Keep the route below whichever you get.
 
-        :meth:`Computer.exec` with ``desktop=True`` is the route to build on if
-        you only want to write it once, because it needs nothing of the
-        hardware — but it is not universal either: it drives the guest's own
+        :meth:`Computer.exec` with ``desktop=True`` is the route to build on —
+        the reliable one, not merely the fallback — because it needs nothing of
+        the hardware — but it is not universal either: it drives the guest's own
         desktop session, so it needs a Linux guest with a display and
         ``xclip``, and it is refused outright on Windows. A write needs
         ``setsid``, so the holder outlives the command — an X selection belongs
