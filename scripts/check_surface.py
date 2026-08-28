@@ -60,10 +60,16 @@ APIDOC = Path("web/lib/apidoc.ts")
 #: left it there — which is an admission, not a check. The reader below takes
 #: either language, so the note could become true.
 CLIPBOARD = Path("server/clipboard.go")
+EXEC = Path("server/execbg.go")
 
 CONSTANTS = [
     ("MAX_STEPS", AGENT, "MAX_MAX_STEPS"),
     ("MAX_CLIPBOARD_BYTES", CLIPBOARD, "clipboardWriteMax"),
+    # A mirrored number that nothing compares is a number that drifts, which is
+    # the whole reason this list exists — and these two arrived as local
+    # constants without an entry here.
+    ("MAX_ENV_ENTRIES", EXEC, "execMaxEnv"),
+    ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
 ]
 
 
