@@ -275,9 +275,12 @@ Where both halves are present the RFB clipboard path is *available* — the
 transport is open, which is not the same as a copy or a paste succeeding. The
 first paste of a session is often dropped, because the guest *pulls* the text
 and vdagent may not own the selection yet, and a browser will not hand over the
-guest's clipboard without focus and permission. Where either half is absent a
-paste reaches QEMU and stops, silently, and **no field tells you which you
-have**. Keep the route below whichever you get.
+guest's clipboard without focus and permission. A client also has to negotiate
+the extended-clipboard pseudo-encoding — that is QEMU's only door to the guest's
+clipboard, so an RFB client of your own that does not offer it receives nothing
+however the guest is configured. Where any of it is absent a paste reaches QEMU
+and stops, silently, and **no field tells you which you have**. Keep the route
+below whichever you get.
 
 `exec` with `desktop=True` is the route to build on — the reliable one, not
 merely the fallback — because it needs nothing of the hardware. It is not
@@ -301,24 +304,40 @@ import base64, time
 
 READ = "xclip -o -selection clipboard"
 
-got = c.exec(READ, desktop=True).stdout  # read the guest's clipboard
+# Reading. `ok` matters: xclip exits non-zero when there is no display, and a
+# failed read and an empty clipboard both arrive as "".
+got = c.exec(READ, desktop=True)
+on_clipboard = got.stdout if got.ok else None
 
+# Writing.
 text = "what you want on the clipboard"
-b64 = base64.b64encode(text.encode()).decode()  # b64encode does not wrap; encodebytes does
+b64 = base64.b64encode(text.encode()).decode()  # b64encode does not wrap; encodebytes wraps at 76
 c.exec(
     f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
     desktop=True,
 )
 
 # The write answers 200 whether or not it worked, so the read-back is the check
-# rather than a courtesy. Bounded: a selection that never arrives means it did
-# not happen, and every attempt is another billable exec.
-deadline = time.monotonic() + 5
-while c.exec(READ, desktop=True).stdout != text:
-    if time.monotonic() > deadline:
-        raise RuntimeError("clipboard write never landed — no xclip, or no display")
+# rather than a courtesy. Bounded in ATTEMPTS, not on the clock: each exec
+# carries its own timeout, so a hung guest overruns this by one of them.
+for _ in range(20):
+    back = c.exec(READ, desktop=True)
+    if back.ok and back.stdout == text:
+        break
     time.sleep(0.25)
+else:
+    raise RuntimeError("clipboard write never landed — no xclip, no display, or no X session")
 ```
+
+One caveat on that comparison, and it is the platform's own: `desktop=True` runs
+your command in a **login shell**, so the desktop user's profile is sourced and
+anything it prints lands on the same stdout, ahead of your output. That is
+wanted for `exec` — you asked to run a command the way the user would — but it
+means an `echo` in the guest's `.profile` corrupts this read, and no framing you
+add here fixes it, since a profile that prints the frame owns everything after
+it. The default image prints nothing; if you have customised the profile of a
+guest you also want to read clipboards from, that is the interaction to know
+about.
 
 `vnc` is `None` on a computer that came from `list()`. That is deliberate on the
 platform's side: a desktop credential in every list response is a credential in

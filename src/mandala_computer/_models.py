@@ -373,9 +373,15 @@ class VncConnect:
         to a live process — AND ``>/dev/null 2>&1``, without which the resident
         xclip holds the pipe the guest agent is reading and the exec runs to
         its full timeout before answering. Send the text base64 rather than
-        quoted, since an apostrophe would otherwise end the shell word, and
-        poll rather than reading straight back: being granted a selection is
-        asynchronous, so the next read can still be the old one.
+        quoted, since an apostrophe would otherwise end the shell word. Then
+        read it back and compare, rather than trusting the answer: being
+        granted a selection is asynchronous, so an immediate read returns the
+        PREVIOUS clipboard, and the redirection above swallows xclip's own
+        errors, so a guest with no display answers 200 and changes nothing.
+        Check :attr:`ExecResult.ok` on the read as well as its text — a failed
+        read and an empty clipboard are both ``""``. Bound the loop in
+        ATTEMPTS: each one is another billable exec, and each carries its own
+        timeout, so a wall-clock deadline is not one this can hold to.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
         browser holding this one cannot type even from a patched client. The
