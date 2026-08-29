@@ -34,10 +34,12 @@ what is missing is the argument that made it worth making.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
 
 from surface_text import balanced, strip_comments, top_level_keys
 
@@ -52,7 +54,34 @@ APIDOC = Path("web/lib/apidoc.ts")
 #: refuses a value early to save the caller a round trip, and a ceiling that has
 #: drifted turns that favour into a refusal of a run the platform would have
 #: taken — with nothing failing here to say so.
-CONSTANTS = [("MAX_STEPS", AGENT, "MAX_MAX_STEPS")]
+#: ``clipboardWriteMax`` is the one entry that is not TypeScript. The platform
+#: states that ceiling in its daemon rather than in ``web/lib``, and the first
+#: version of this SDK's mirror wrote "NOT machine-checked" in a docstring and
+#: left it there — which is an admission, not a check. The reader below takes
+#: either language, so the note could become true.
+CLIPBOARD = Path("server/clipboard.go")
+EXEC = Path("server/execbg.go")
+
+CONSTANTS = [
+    ("MAX_STEPS", AGENT, "MAX_MAX_STEPS"),
+    ("MAX_CLIPBOARD_BYTES", CLIPBOARD, "clipboardWriteMax"),
+    # A mirrored number that nothing compares is a number that drifts, which is
+    # the whole reason this list exists — and these two arrived as local
+    # constants without an entry here.
+    ("MAX_ENV_ENTRIES", EXEC, "execMaxEnv"),
+    ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
+]
+
+#: The files whose contents this check mirrors. Kept separately from the
+#: markers that identify a platform checkout: a checkout with one of these
+#: missing is evidence of drift (or an incomplete checkout), not evidence that
+#: there is no checkout and therefore permission to skip the comparison.
+MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))))
+
+#: The stable core files that distinguish a platform checkout from an unrelated
+#: directory at one of the candidate locations. They identify the repository;
+#: ``MIRROR_SOURCES`` separately says whether it is complete enough to check.
+PLATFORM_MARKERS = (SURFACE, APIDOC)
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
@@ -72,9 +101,22 @@ def platform_repo() -> Path | None:
         if p
     ]
     return next(
-        (d for d in candidates if (d / SURFACE).is_file() and (d / APIDOC).is_file()),
+        (d for d in candidates if all((d / marker).is_file() for marker in PLATFORM_MARKERS)),
         None,
     )
+
+
+def missing_mirror_sources(platform: Path) -> list[Path]:
+    """Files a recognized platform checkout is missing for this comparison.
+
+    This used to be folded into :func:`platform_repo`: a checkout that had the
+    route and parameter tables but had lost ``server/clipboard.go`` looked
+    absent, so the entire check skipped. Before that skip was added it looked
+    complete and ``constant_drift`` died in ``Path.read_text``. Neither answer
+    distinguishes "there is no checkout" from "the checkout drifted underneath
+    the mirror"; this inventory is the third state that does.
+    """
+    return [source for source in MIRROR_SOURCES if not (platform / source).is_file()]
 
 
 def table(source: str, name: str) -> set[tuple[str, str]]:
@@ -181,12 +223,66 @@ def parameters(platform: Path) -> dict[str, set[str]]:
     return table
 
 
-def constant(source: str, name: str) -> int:
-    """One ``export const NAME = <int>`` out of a platform module."""
-    m = re.search(rf"export const {re.escape(name)}\s*=\s*(\d+)", source)
+def constant(source: str, name: str, module: Path) -> int:
+    """One integer constant out of a platform module, TypeScript or Go.
+
+    Two declaration forms because the platform states these numbers in two
+    languages: ``export const NAME = <expr>`` in ``web/lib``, and a bare
+    ``name = <expr>`` inside a Go ``const`` block in ``server/``. BOTH forms are
+    matched at the start of a line, and over source whose comments have been
+    blanked first, so that a mention of the name in a comment or in another
+    expression is not read as its declaration — the Go form always was, and the
+    TypeScript one was not, which made a commented-out declaration upstream a
+    silent match here.
+
+    Which form is tried is decided by the module's suffix rather than by trying
+    both: the two patterns are close enough that a file answering to the wrong
+    one is a way for this to agree by accident.
+
+    The value is an EXPRESSION, not a literal, because both languages write
+    these as products — ``64 * 1024`` is how a byte ceiling is legible, and a
+    reader that demanded a bare integer could not see the very constants it exists to
+    compare. Evaluated with a grammar that admits integers, ``*``, ``+`` and
+    parentheses and nothing else: no names, no calls, no attribute access. A
+    declaration this cannot evaluate raises rather than being skipped, on the
+    rule the rest of this file follows — "could not tell" and "they agree" must
+    never be the same answer.
+    """
+    blanked = strip_comments(source)
+    pattern = (
+        rf"^\s*{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
+        if module.suffix == ".go"
+        else rf"^\s*export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
+    )
+    m = re.search(pattern, blanked, re.MULTILINE)
     if m is None:
-        raise SystemExit(f"{name} not found — has it moved or changed shape?")
-    return int(m.group(1))
+        raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
+    try:
+        return _arith(ast.parse(m.group(1).strip(), mode="eval").body)
+    except (SyntaxError, ValueError) as err:
+        raise SystemExit(
+            f"{name} is {m.group(1)!r} in {module}, which this reader cannot evaluate"
+        ) from err
+
+
+def _arith(node: ast.expr) -> int:
+    """Evaluate an integer arithmetic expression, and nothing else.
+
+    Deliberately not :func:`eval`, and not :func:`ast.literal_eval` either —
+    the first would run whatever a platform file happened to contain, and the
+    second refuses ``64 * 1024``, which is the only shape these constants are
+    ever written in.
+    """
+    if (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+    ):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Add)):
+        left, right = _arith(node.left), _arith(node.right)
+        return left * right if isinstance(node.op, ast.Mult) else left + right
+    raise ValueError(f"not integer arithmetic: {ast.dump(node)}")
 
 
 def constant_drift(platform: Path) -> list[str]:
@@ -202,30 +298,50 @@ def constant_drift(platform: Path) -> list[str]:
     drifted = []
     for ours, module, theirs in CONSTANTS:
         mine = getattr(_api, ours)
-        upstream = constant((platform / module).read_text(), theirs)
+        try:
+            source = (platform / module).read_text()
+        except OSError as err:
+            raise SystemExit(
+                f"{module} is not readable in the platform checkout — has it moved or changed shape?"
+            ) from err
+        upstream = constant(source, theirs, module)
         if mine != upstream:
             drifted.append(f"  ! {ours} is {mine}, but {module}'s {theirs} is {upstream}")
     return drifted
 
 
-def mirrored() -> set[tuple[str, str]]:
-    """This repo's mirror, read from the test rather than re-parsed.
+def _surface_tables() -> ModuleType:
+    """Import the mirror tables without pulling in pytest, httpx or respx.
 
-    Imported, not scraped: the test is the mirror, and a second parser over it
-    would be one more thing that can disagree with what the suite actually pins.
+    They used to live in ``test_surface``, which imports those at module level,
+    so the comparison path — the one that does real work — could not run without
+    the test extra. ``sys.path`` is restored so a later import cannot pick up
+    this repo as a top-level package by accident.
     """
-    sys.path.insert(0, str(REPO / "tests"))
-    from test_surface import ALLOWED
+    path = str(REPO)
+    sys.path.insert(0, path)
+    try:
+        from tests import surface_tables
 
-    return set(ALLOWED)
+        return surface_tables
+    finally:
+        if sys.path and sys.path[0] == path:
+            sys.path.pop(0)
+
+
+def mirrored() -> set[tuple[str, str]]:
+    """This repo's mirror, read from the tables rather than re-parsed.
+
+    Imported, not scraped: the tables are the mirror, and a second parser over
+    them would be one more thing that can disagree with what the suite actually
+    pins.
+    """
+    return set(_surface_tables().ALLOWED)
 
 
 def mirrored_parameters() -> dict[str, set[str]]:
     """The parameter mirror, imported for the same reason :func:`mirrored` is."""
-    sys.path.insert(0, str(REPO / "tests"))
-    from test_surface import PARAMETERS
-
-    return {route: set(names) for route, names in PARAMETERS.items()}
+    return {route: set(names) for route, names in _surface_tables().PARAMETERS.items()}
 
 
 def parameter_drift(upstream: dict[str, set[str]], mirror: dict[str, set[str]]) -> list[str]:
@@ -258,6 +374,14 @@ def main() -> int:
         )
         return 0
 
+    missing = missing_mirror_sources(platform)
+    if missing:
+        print("check-surface — platform repo found, but mirror sources are missing.")
+        for source in missing:
+            print(f"  ! {platform / source}")
+        print("  Restore or update these paths before comparing the mirrored surface.")
+        return 1
+
     upstream = table((platform / SURFACE).read_text(), "V1_ROUTES")
     mirror = mirrored()
     added = sorted(upstream - mirror)
@@ -269,8 +393,12 @@ def main() -> int:
         n = len(CONSTANTS)
         counted = sum(len(names) for names in mirrored_parameters().values())
         print(
+            # `platform`, not `platform / SURFACE.parent`. The routes and
+            # parameters come from web/lib and the constants no longer all do —
+            # clipboardWriteMax is read out of server/ — so naming one
+            # directory understated what had been compared.
             f"check-surface — {len(mirror)} routes, {counted} parameters and {n} constant"
-            f"{'' if n == 1 else 's'}, in step with {platform / SURFACE.parent}."
+            f"{'' if n == 1 else 's'}, in step with {platform}."
         )
         return 0
 
@@ -284,7 +412,7 @@ def main() -> int:
         print(line)
     print(
         "\ncheck-surface — the mirror has drifted from the platform.\n"
-        "  Update ALLOWED and PARAMETERS in tests/test_surface.py, and add anything\n"
+        "  Update ALLOWED and PARAMETERS in tests/surface_tables.py, and add anything\n"
         "  new to UNIMPLEMENTED or UNIMPLEMENTED_PARAMETERS until this SDK can send\n"
         "  it — which is the line that makes a gap somebody's to close rather than\n"
         "  nobody's to notice. A constant that has moved belongs in\n"

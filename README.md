@@ -225,10 +225,13 @@ would have to guess which of those two you meant. Start it or stop it first.
 
 **A computer can suspend without you asking.** Its host puts down anything
 nobody has used for the host's idle window — 30 minutes by default. Input,
-`exec()` and file transfers all count as use and resume it automatically;
-**`screenshot()` deliberately does not**, so a loop that only polls the screen
-can watch its own machine go down under it. Drive the desktop, or accept the
-resume.
+`exec()`, file transfers and `set_clipboard()` all count as use and resume it
+automatically; **`screenshot()` and `clipboard()` deliberately do not**, so a
+loop that only polls the screen — or waits for somebody to copy something — can
+watch its own machine go down under it. The two reads differ in what happens
+next: `screenshot()` keeps answering, while `clipboard()` starts raising
+`ConflictError`, because a suspended computer has no clipboard to read. Drive
+the desktop, or accept the resume.
 
 `wait_until_running()` raises rather than spinning if it finds a suspended
 computer, because that state does not resolve on its own — `start()` is the fix.
@@ -241,43 +244,61 @@ its live desktop, so putting a screen on your own page costs no extra call:
 ```python
 c = client.computers.get("vm-0a1b2c3d4e5f")
 c.vnc.embed_url  # watch-only, drop straight into an <iframe>
-c.vnc.url  # full control: keyboard and pointer — not the clipboard
+c.vnc.url  # full control: keyboard and pointer (clipboard only on some guests — see below)
 c.vnc.view_url  # watch only — the platform drops input on this socket
 ```
 
 Two credentials, because they are not the same permission. `view_token` cannot
-type even from a patched client; `token` is root-equivalent on that machine.
-Neither is your API key — which is every computer on the account, forever, and
+type even from a patched client, and the guest's clipboard does not come back
+over it either — the daemon takes that capability out of the connection as it is
+negotiated, so whatever the person at the desktop copies, a password included,
+is not visible to whoever holds the watch-only link. `token` is root-equivalent
+on that machine. Neither is your API key — which is every computer on the account, forever, and
 must never reach a browser. Both end when the computer restarts.
 
-The clipboard does not cross that socket, whatever a noVNC client offers on it:
-QEMU carries cut text only through a vdagent channel these guests are not started
-with, so a paste arrives and is dropped without an error. Move text with `exec`
-and `desktop=True`. Three things about the write are quiet when you get them
-wrong: the holder must outlive the command, because an X selection belongs to a
-live process; its output must be redirected, or the resident `xclip` holds the
-pipe the guest agent reads and the exec runs to its full timeout before
-answering; and the text goes over base64, whose alphabet has no quote in it, so
-an apostrophe in what you are pasting cannot end the shell word.
-
-Being granted the selection is also asynchronous, so a read straight after the
-write returns the *previous* clipboard — poll until it matches, and give up
-after a few seconds. Every poll is another billable exec, and the redirection
-above swallows xclip's own errors, so a guest without it never changes the
-selection at all.
+Whether the clipboard crosses that socket is a property of the computer, and
+`c.vnc.clipboard` is the field that answers it:
 
 ```python
-import base64
-
-got = c.exec("xclip -o -selection clipboard", desktop=True).stdout
-
-text = "what you want on the clipboard"
-b64 = base64.b64encode(text.encode()).decode()
-c.exec(
-    f"printf %s '{b64}' | base64 -d | setsid xclip -selection clipboard >/dev/null 2>&1 &",
-    desktop=True,
-)
+if c.vnc.clipboard:
+    ...  # the RFB clipboard path was provisioned on this computer
 ```
+
+It reports *provisioning*, not live health — the vdagent channel QEMU was given
+at cold boot, together with whether the image this computer was built from was
+verified to ship `spice-vdagent`. Somebody with root in the guest can install,
+remove or stop the agent afterwards and the field will not move. It is also
+always `False` on `view_url`, where the `False` is about the credential rather
+than the computer.
+
+`True` means the transport is open, which is not the same as a copy or a paste
+succeeding. The first paste of a session is often dropped, because the guest
+*pulls* the text and vdagent may not own the selection yet, and a browser will
+not hand over the guest's clipboard without focus and permission. A client of
+your own also has to negotiate the extended-clipboard pseudo-encoding — that is
+QEMU's only door to the guest's clipboard, so an RFB client that does not offer
+it receives nothing however the guest is configured. `False` means a paste
+reaches QEMU and stops, silently, with nothing to catch.
+
+A `False` is sometimes fixable. The channel is hardware and comes from a *cold*
+start: stop the computer and start it again. Restarting a *running* computer
+does not do it — that resets the guest rather than rebuilding the machine QEMU
+was given. The agent comes from the image, which a computer keeps for life, so
+one built before the agent shipped needs the package installed in the guest —
+you have root there — or replacing with a newly created one. Windows guests
+never have it, whatever the hardware says. A resumed or snapshot-restored
+session keeps the topology of the capture it came from, so a computer that had
+the channel can come back without one and reacquires it on its next stop and
+start; the field is computed per response rather than stored, so it follows that
+rather than going stale. Keep the route below whichever you get.
+
+[`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
+— the reliable one, not merely the fallback — because they need nothing of the
+*hardware*: no cold boot, no permission from a browser. They ask one thing of
+the image (`xclip`, in every golden since August 2026) and say so in the answer
+when it is missing, which is one condition stated instead of two inferred. Where
+the socket *does* carry the clipboard the two do not fight over it: those
+methods write the same X `CLIPBOARD` selection the agent then offers onward.
 
 `vnc` is `None` on a computer that came from `list()`. That is deliberate on the
 platform's side: a desktop credential in every list response is a credential in
@@ -626,6 +647,80 @@ what separates that from an action the guest simply could not report on.
 `include_all=True` keeps the desktop's own furniture — panels, docks, the
 wallpaper window. Off by default because a stock guest showing one terminal has
 five windows, four of which are not applications. Linux only.
+
+### The clipboard
+
+The desktop's `CLIPBOARD` selection — what Ctrl-C writes and Ctrl-V pastes —
+read and written from outside the guest. Linux only, and it needs nothing of
+the *hardware*: no cold boot, no permission from a browser. What it does need is
+`xclip` in the guest, which every golden built since August 2026 carries — so in
+practice this is the road that works on every computer, and where it is not, the
+refusal says so. (The other road is RFB extended cut text over the desktop
+socket, which is live and conditional; see
+[Showing somebody the desktop](#showing-somebody-the-desktop).)
+
+```python
+c.set_clipboard("https://mandala.computer")
+c.key("ctrl", "v")  # into whatever has focus
+
+on_clipboard = c.clipboard()  # "" is an empty clipboard
+```
+
+`set_clipboard()` takes at most 64 KiB of UTF-8; `clipboard()` returns at most
+128 KiB. They are different bounds on different channels, and the read is
+**refused rather than truncated** past its own — half a password is not less of
+an answer, it is a wrong one that looks completely normal. Empty text and a NUL
+are refused here, before the request goes out.
+
+The platform confirms the write by reading the selection back before it
+answers, so `set_clipboard()` returning means the desktop is *holding* the text
+rather than that a command ran.
+
+**Not every `ConflictError` here is worth retrying.** Classified refusals carry
+an `APIError.reason`: `contention` and `starting` clear on their own, while
+`unavailable` and `unsupported` require a different action. `is_transient()`
+therefore answers `True` for the first pair and `False` for the second. A
+stopped or suspended computer is `unavailable`; start it instead of retrying
+the clipboard request. If an older platform response has no recognised reason,
+the SDK preserves the historical `ConflictError` fallback of `True`, so code
+that must support unclassified responses should verify the computer state and
+keep its retry loop bounded.
+
+Two others worth knowing. A **400** never clears: a computer built from a golden
+that predates `xclip` is refused permanently — install `xclip` in the guest, or
+create a new computer. And an over-cap read raises `FileTooLargeError`, whose
+usual remedy does not apply: there is no `Range` on a selection, so the text is
+either under 128 KiB or out of reach.
+
+The two differ on one thing worth knowing: `set_clipboard()` **resumes a
+suspended computer**, because putting text on a clipboard is the first half of
+pasting it and that is somebody working on the machine. `clipboard()` does not
+— what somebody copied is not worth waking a machine for — so reading a
+suspended computer is a 409 rather than a start you did not ask for.
+
+A read failure raises; an empty clipboard is `""`. That is the distinction the
+`exec` recipe these replace could not make.
+
+#### What these replace
+
+Until platform OPL-3768 the only public road was a recipe over `exec` with
+`desktop=True`, documented at length in this README. Do not go back to it.
+`exec` runs a **login shell**, so the desktop user's profile is sourced and
+anything it prints lands on the same stdout as your command's output, ahead of
+it. That is wanted when you asked to run a command the way the user would, and
+fatal when you are reading a value: an `echo` in the guest's `.profile`
+corrupts the answer and a deliberate one forges it. No framing you add fixes
+that — a profile that prints your frame owns everything after it. The clipboard
+endpoints do not share that stream.
+
+The write was worse. An X selection belongs to a live process, so the holder
+had to outlive the exec under `setsid` and have its output redirected, or the
+resident `xclip` held the pipe the guest agent reads and the call ran to its
+full timeout before answering. The text had to travel base64 and quoted, since
+an apostrophe would otherwise end the shell word. And because being granted a
+selection is asynchronous, the result had to be polled for in a loop bounded in
+*attempts* — each one a billable exec — rather than trusted. `set_clipboard()`
+does all of it in one call.
 
 ### Letting the platform drive
 
@@ -1094,9 +1189,9 @@ Everything derives from `MandalaError`.
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such resource (also another tenant's) |
-| `ConflictError` | 409 — right request, wrong moment; retry |
+| `ConflictError` | 409 — right request, wrong moment; retry, except the two cases below |
 | `MoveRequiredError` | 409 — …except this one: the size needs a host that can run it |
-| `FileTooLargeError` | 413 — past the 64 MiB one request moves; ask for a window |
+| `FileTooLargeError` | 413 — past what one request carries. A file over 64 MiB: ask for a window. A clipboard over 128 KiB: there is no window to ask for |
 | `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — a hypervisor could not be reached; retry |
@@ -1105,12 +1200,13 @@ Everything derives from `MandalaError`.
 | `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
 | `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
-| `ConnectionError` | the request never completed: DNS, refused socket, broken TLS |
+| `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
+| `ConnectionInterruptedError` | the request was dispatched and the answer was lost; do not replay a create |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 `PlanLimitError`'s message names the limit that was hit.
 
-`MoveRequiredError` is the one 409 that does **not** clear, and it is a subclass
+`MoveRequiredError` is a 409 that does **not** clear, and it is a subclass
 of `ConflictError` so that an `except ConflictError` written before it existed
 still catches it. It means the size asked for is more RAM than the host this
 computer is on can run — and the host will not grow, so the same request answers
@@ -1119,10 +1215,22 @@ branch: `True` means somewhere else in the region can run that size and
 `relocate()` takes the offer up, `False` means nowhere can and the size is the
 thing to change. See [Growing past the host](#growing-past-the-host).
 
-`FileTooLargeError` and `RangeNotSatisfiableError` are the two file statuses,
+`ConnectionInterruptedError` is a `ConnectionError` that does **not** mean the
+request never left, and it is a subclass of `ConnectionError` so that an
+`except ConnectionError` written before it existed still catches it. It means
+the request was dispatched and the answer was lost — a socket reset while the
+body was being read, a protocol error on the way back. The platform may have
+acted. Do not replay a create on the strength of it; check whether the first
+attempt took effect. `is_transient` says no, matching `MoveRequiredError` under
+`ConflictError`.
+
+`FileTooLargeError` and `RangeNotSatisfiableError` are the two size statuses,
 and each has a next move attached, which is why neither is a bare `APIError`.
-A 413 means the ceiling applies to what one request moves, so ask for part of it
-— `download_file()` is that loop already written. A 416 carries the file's real
+A 413 on a **file** means the ceiling applies to what one request moves, so ask
+for part of it — `download_file()` is that loop already written. A 413 on the
+**clipboard** has no such remedy: there is no `Range` on a selection, so a
+clipboard past 128 KiB is out of reach rather than something to page through,
+and `download_file()` is not a method it has. A 416 carries the file's real
 length in `size`, which is the whole point of the status: you asked about a file
 whose length you did not know, and the number comes back with the refusal
 instead of behind another request. See [Files](#files).
@@ -1184,9 +1292,9 @@ that creates deserves a look first.
 `is_transient(err)` is that rule as a function, and it answers for the riskiest
 caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
 `ConflictError` (minus `MoveRequiredError`), `RateLimitError`, `UnavailableError`
-and `ConnectionError`, and no to everything above whose outcome is unknown,
-502 and 504 included. The same four classes, and only those, answer yes in
-mandala-computer-typescript and mandala-computer-mcp.
+and `ConnectionError` (minus `ConnectionInterruptedError`), and no to everything
+above whose outcome is unknown, 502 and 504 included. The same four classes, and
+only those, answer yes in mandala-computer-typescript and mandala-computer-mcp.
 
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during
@@ -1201,12 +1309,21 @@ as a plain `APIError` — the stream having been delivered is proof no proxy
 abandoned anything. So `except GatewayTimeoutError` around `agent()` will not
 catch a 504 the platform is *reporting*; catch `APIError` and read `.status`.
 
-`ConflictError` is the one worth catching separately, because it is the only one
-that clears itself: something is in flight that the operation cannot run
-alongside — a disk still being copied, a snapshot being taken, a delete already
-under way, a guest agent that has not finished coming up, or a suspend committed
-to the computer a moment before your call. Waiting and retrying is the fix;
-changing the request is not.
+`ConflictError` is the one worth catching separately, because nearly every one
+clears itself: something is in flight that the operation cannot run alongside —
+a disk still being copied, a snapshot being taken, a delete already under way, a
+guest agent that has not finished coming up, or a suspend committed to the
+computer a moment before your call. Waiting and retrying is the fix; changing
+the request is not.
+
+Two do not clear. `MoveRequiredError` is one, and it has a class you can catch.
+The other is a clipboard refusal on a stopped or suspended computer: waiting
+will not start it, so `start()` is the fix. Current platform responses classify
+that refusal with `APIError.reason == "unavailable"`, and `is_transient()`
+answers `False`; `contention` and `starting` answer `True`. An absent or unknown
+reason is deliberately treated as unclassified and falls back to the exception
+type, so a legacy `ConflictError` still answers `True`. If you support such
+responses, check the computer state and keep the retry loop bounded.
 
 A retry loop on it terminates because it has a deadline, not because of any
 status: a guest agent that stays silent past its boot window does stop being a
