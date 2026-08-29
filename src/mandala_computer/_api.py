@@ -103,9 +103,10 @@ def flag(value: object, what: str) -> bool:
     human and would work, but admitting them puts the coercion rule back and the
     next value through it is a string again.
 
-    Only the flags that arm something go through here. The ones that merely
-    widen a listing — ``allow_partial``, ``include=all`` — stay on truthiness:
-    nothing is destroyed or paid for by reading one of those generously.
+    Only the flags that arm something, or that change which session a call runs
+    as, go through here. The ones that merely widen a listing —
+    ``allow_partial``, ``include=all`` — stay on truthiness: nothing is destroyed
+    or paid for by reading one of those generously.
     """
     if not isinstance(value, bool):
         # ValueError, not the TypeError ruff prefers, for the reason `canonical`
@@ -115,6 +116,63 @@ def flag(value: object, what: str) -> bool:
             f"{what} must be True or False, not {type(value).__name__}"
         )
     return value
+
+
+def whole(
+    value: object, what: str, *, exc: type[Exception] = TypeError, message: str | None = None
+) -> int:
+    """A real ``int``, whatever was handed in.
+
+    The numeric companion to :func:`canonical`, and here for its reason (Codex
+    adversarial review, OPL-3869). Every guard below compares a number and then
+    hands the ORIGINAL object on to be serialised, and an ``int`` SUBCLASS can
+    answer one thing to ``>`` and another to whatever formats it. Both halves
+    were live:
+
+    * :func:`guest_pid` checked ``pid > 0`` and interpolated the object, so a
+      subclass whose ``__format__`` answers ``"../stop"`` passed the check and
+      addressed ``computers/vm-1/exec/../stop`` — a different route entirely.
+    * every ``< 0`` and ``<= 0`` guard here is an overridable comparison, so a
+      subclass answering ``False`` to them put ``w=-1``, ``max_steps=-1`` and
+      ``Range: bytes=-1-`` on the wire, past the checks written to stop exactly
+      those.
+
+    ``int.__index__`` reads the underlying value rather than any override, the
+    way ``str.__str__`` does for a string, so what comes back cannot disagree
+    with what was checked — and the CHECK must be made on what comes back, not
+    on the argument. ``bool`` is refused rather than read as 0/1: it is an
+    ``int`` subclass, and ``json.dumps`` writes it as ``true``.
+
+    The exception type and message are the caller's, because these guards
+    predate this helper and their wording is what tests and users already read.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise exc(message or f"{what} must be a whole number, not {value!r}")
+    return int.__index__(value)
+
+
+def real(value: object, what: str, *, message: str | None = None) -> float:
+    """A real finite number, whatever was handed in.
+
+    :func:`whole` for the durations, which take a float as readily as an int.
+    An ``int`` stays an ``int`` so that ``wait(5)`` still sends ``5`` rather
+    than ``5.0``.
+
+    Finiteness belongs here rather than with the caller: NaN fails every ordered
+    comparison, so ``seconds <= 0`` alone lets it through and it becomes a
+    timeout of ``nan``; infinity passes that comparison honestly and serialises
+    as a bare ``Infinity`` that is not JSON.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # ValueError for the reason `canonical` gives: one exception type for
+        # one class of mistake, so a caller guarding a call catches all of it.
+        raise ValueError(  # noqa: TRY004
+            message or f"{what} must be a number, not {value!r}"
+        )
+    number = float.__float__(value) if isinstance(value, float) else int.__index__(value)
+    if not math.isfinite(number):
+        raise ValueError(message or f"{what} must be a finite number, not {value!r}")
+    return number
 
 
 def seg(value: str) -> str:
@@ -148,9 +206,43 @@ def computer(computer_id: str) -> str:
 
 
 def computer_action(computer_id: str, action: str) -> str:
-    """start | stop | suspend | restart | clone | screenshot | input | exec |
-    snapshots | schedule."""
+    """agent | clipboard | clone | exec | input | move | restart | schedule |
+    screenshot | snapshots | start | stop | suspend | windows."""
     return f"computers/{seg(computer_id)}/{action}"
+
+
+def guest_pid(pid: object) -> int:
+    """A real positive pid, not a bool and not zero.
+
+    Interpolated into the path, so a value that is not a positive integer builds
+    ``computers/:id/exec/True`` or ``.../exec/0`` — a 404 about a route rather
+    than a sentence about the pid that was wrong. ``bool`` is an ``int``
+    subclass, so ``True`` would otherwise become ``1``.
+    """
+    text = f"pid must be a positive integer, not {pid!r}"
+    # ValueError throughout, not TypeError for the type half: `canonical`'s rule,
+    # so `except ValueError` around a call catches every way a pid can be wrong.
+    if isinstance(pid, bool):
+        raise ValueError(text)  # noqa: TRY004
+    if isinstance(pid, str):
+        # A decimal string is accepted and converted, because this value is the
+        # one that CROSSES A PROCESS BOUNDARY — a job id out of a queue, a pid
+        # written down by the run before this one — and those arrive as text.
+        # `background_command("4242")` worked before this guard existed, and
+        # refusing it was a regression rather than a tightening: the platform's
+        # own strconv.Atoi takes it. What is refused is a string that is not a
+        # plain positive decimal.
+        digits = str.__str__(pid).strip()
+        if not digits.isdecimal():
+            raise ValueError(text)
+        number = int(digits)
+    elif isinstance(pid, int):
+        number = int.__index__(pid)
+    else:
+        raise ValueError(text)  # noqa: TRY004
+    if number <= 0:
+        raise ValueError(text)
+    return number
 
 
 def exec_handle(computer_id: str, pid: int) -> str:
@@ -160,7 +252,7 @@ def exec_handle(computer_id: str, pid: int) -> str:
     own ``patternFor`` reduces it to ``:pid`` rather than to ``:id`` — it names
     something inside a computer rather than a thing the platform owns.
     """
-    return f"computers/{seg(computer_id)}/exec/{pid}"
+    return f"computers/{seg(computer_id)}/exec/{guest_pid(pid)}"
 
 
 def window(computer_id: str, window_id: str) -> str:
@@ -404,10 +496,15 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
     anchored at both ends, and the header has no way to spell that; naming the
     two forms apart is better than picking one silently.
     """
-    if isinstance(offset, bool) or not isinstance(offset, int):
-        raise TypeError(f"offset must be an integer byte position, not {offset!r}")
-    if length is not None and (isinstance(length, bool) or not isinstance(length, int)):
-        raise TypeError(f"length must be an integer byte count or None, not {length!r}")
+    offset = whole(
+        offset, "offset", message=f"offset must be an integer byte position, not {offset!r}"
+    )
+    if length is not None:
+        length = whole(
+            length,
+            "length",
+            message=f"length must be an integer byte count or None, not {length!r}",
+        )
     if offset < 0:
         if length is not None:
             raise ValueError(
@@ -456,12 +553,22 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
         # the offset IS the instant, and normalising it would be this SDK
         # deciding what the caller meant.
         return value.isoformat()
-    if not isinstance(value, str) or not _RFC3339.match(value):
+    # `canonical` before the regex, and the CANONICAL string is what goes back:
+    # a `str` subclass can hold a valid 2026 stamp and answer a valid 2030 one
+    # to httpx, which bills a window nobody asked about on the one call whose
+    # output is compared against an invoice.
+    if not isinstance(value, str):
+        raise ValueError(  # noqa: TRY004
+            f"{what} must be an RFC 3339 timestamp with a time zone, e.g. "
+            f"2026-08-01T00:00:00Z (or pass an aware datetime): {value!r}"
+        )
+    text = canonical(value, what)
+    if not _RFC3339.match(text):
         raise ValueError(
             f"{what} must be an RFC 3339 timestamp with a time zone, e.g. "
             f"2026-08-01T00:00:00Z (or pass an aware datetime): {value!r}"
         )
-    return value
+    return text
 
 
 def usage_params(
@@ -620,8 +727,8 @@ def create_body(
             "size already names a template and a shape; send size alone, "
             "or template/cpu/ram_mb/disk_gb without it"
         )
-    _require_optional_name(name)
-    body: dict[str, Any] = {"start": start}
+    name = _require_optional_name(name)
+    body: dict[str, Any] = {"start": flag(start, "start")}
     for key, value in (
         ("name", name),
         ("size", size),
@@ -642,13 +749,25 @@ def name_body(name: str | None) -> dict[str, Any]:
     Omission asks the platform to generate one. Empty text cannot express that
     omission and is refused consistently with create and rename.
     """
-    _require_optional_name(name)
+    name = _require_optional_name(name)
     return {} if name is None else {"name": name}
 
 
-def _require_optional_name(name: str | None) -> None:
-    if name is not None and not name.strip():
+def _require_optional_name(name: str | None) -> str | None:
+    """An optional name, canonicalised, or ``None`` when the caller omitted one.
+
+    Empty text cannot express omission and is refused. Canonical first, for the
+    reason :func:`canonical` gives: ``strip`` is overridable, so a subclass
+    could pass the emptiness check and then send something else — here, an
+    empty name. A non-string is a ``ValueError`` rather than the
+    ``AttributeError`` ``strip`` would raise.
+    """
+    if name is None:
+        return None
+    text = canonical(name, "name")
+    if not text.strip():
         raise ValueError("name must not be empty")
+    return text
 
 
 def rename_body(name: str) -> dict[str, Any]:
@@ -659,10 +778,10 @@ def rename_body(name: str) -> dict[str, Any]:
     caller cleared the field, and a round trip to be told so is a round trip
     that never had to happen.
     """
-    if name is None:
+    checked = _require_optional_name(name)
+    if checked is None:
         raise ValueError("name must not be empty")
-    _require_optional_name(name)
-    return {"name": name}
+    return {"name": checked}
 
 
 def exec_body(
@@ -695,20 +814,80 @@ def exec_body(
     resolves somewhere nobody named.
     """
     body: dict[str, Any] = {"command": command}
-    if not background:
-        _require_positive_seconds(timeout, "timeout must be positive for a foreground exec")
-        body["timeout_s"] = timeout
-    if desktop:
+    # A real bool for the same reason `desktop` is one below: `background="false"`
+    # is truthy, and it selects the branch that sends NO timeout at all.
+    if not flag(background, "background"):
+        body["timeout_s"] = _positive_seconds(
+            timeout, "timeout must be positive for a foreground exec"
+        )
+    # A real bool, not anything truthy: this is the switch from the system
+    # context to the logged-in session, and ``desktop="false"`` selected it.
+    if flag(desktop, "desktop"):
         body["session"] = "desktop"
     if background:
         body["background"] = True
     if cwd is not None:
-        if not is_absolute_guest_path(cwd):
-            raise ValueError(f"cwd must be absolute: {cwd!r}")
-        body["cwd"] = cwd
+        # Canonical first, for the reason :func:`canonical` gives. ``startswith``
+        # is overridable, so a str subclass could satisfy the absoluteness check
+        # and then send something else — here, a relative cwd.
+        text = canonical(cwd, "cwd")
+        if not is_absolute_guest_path(text):
+            raise ValueError(f"cwd must be absolute: {text!r}")
+        body["cwd"] = text
     if env:
-        body["env"] = dict(env)
+        body["env"] = _env_object(env)
     return body
+
+
+#: The most environment entries an exec may carry, and the longest one entry
+#: may be. Both are the platform's bounds (``execMaxEnv`` / ``execMaxEnvLen`` in
+#: ``server/execbg.go``), and a value past either is a request the guest agent
+#: would refuse after the round trip.
+MAX_ENV_ENTRIES = 64
+MAX_ENV_ENTRY_BYTES = 4096
+
+
+def _env_object(env: Mapping[str, str]) -> dict[str, str]:
+    """A copy of ``env`` whose names and values the guest can actually use.
+
+    JSON will carry a number, a null, an empty name. The guest agent will not:
+    it turns this into a ``KEY=value`` list, so a non-string becomes a JSON type
+    the agent never asked for, an empty name or a ``=`` inside one splits the
+    entry at the wrong place, and a NUL is dropped rather than refused. Both
+    produce a command that runs with an environment nobody asked for and reports
+    success. Mirrored from the platform's ``execEnvList``, for the same reason
+    :func:`canonical` is.
+
+    A copy because the body is built once and sent later: a caller that mutates
+    the object it passed would otherwise change what goes on the wire after the
+    checks below have already passed over it.
+    """
+    names = list(env)
+    if len(names) > MAX_ENV_ENTRIES:
+        raise ValueError(
+            f"env has {len(names)} entries; the platform accepts at most {MAX_ENV_ENTRIES}"
+        )
+    out: dict[str, str] = {}
+    for name in names:
+        key = canonical(name, "env name")
+        if not key:
+            raise ValueError("env has an entry with an empty name")
+        if "=" in key or "\0" in key:
+            raise ValueError(f"env name {key!r} must not contain '=' or a NUL")
+        text = canonical(env[name], f"env value for {key!r}")
+        if "\0" in text:
+            raise ValueError(f"env value for {key!r} must not contain a NUL")
+        try:
+            size = len(key.encode("utf-8")) + len(text.encode("utf-8")) + 1
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"env entry {key!r} must be valid UTF-8") from exc
+        if size > MAX_ENV_ENTRY_BYTES:
+            raise ValueError(
+                f"env entry {key!r} is {size} bytes; the platform accepts "
+                f"at most {MAX_ENV_ENTRY_BYTES}"
+            )
+        out[key] = text
+    return out
 
 
 def open_url_command(url: str) -> str:
@@ -724,7 +903,13 @@ def open_url_command(url: str) -> str:
     call would block until the timeout killed it and come back as a failure,
     having opened the window anyway.
     """
-    url = url.strip()
+    # Canonical first, then strip the canonical string — not the original.
+    # ``str.strip`` returns ``self`` when there is nothing to strip, so a
+    # subclass could override ``startswith`` and sneak a leading dash past the
+    # guard below; ``shlex.quote`` would then quote the real buffer. A
+    # non-string is a ``ValueError`` rather than the ``AttributeError``
+    # ``strip`` would raise.
+    url = canonical(url, "url").strip()
     if not url:
         raise ValueError("url must not be empty")
     # shlex.quote stops the URL reaching the shell as anything but one argument.
@@ -736,8 +921,13 @@ def open_url_command(url: str) -> str:
 
 
 def snapshot_body(memory: bool, name: str | None = None) -> dict[str, Any]:
-    """A capture request. An omitted name asks the platform to generate one."""
-    _require_optional_name(name)
+    """A capture request. An omitted name asks the platform to generate one.
+
+    ``memory`` is a real bool: it decides whether RAM is captured alongside the
+    disk, which is what the snapshot costs and how long it takes.
+    """
+    memory = flag(memory, "memory")
+    name = _require_optional_name(name)
     body: dict[str, Any] = {"memory": memory}
     if name is not None:
         body["name"] = name
@@ -775,6 +965,10 @@ def window_body(
     window to the edge of the screen while the call reports success. The action
     happens, in the wrong place, and nothing says so.
     """
+    # Canonical BEFORE the membership test: `in` asks the value's own __eq__,
+    # so a `str` subclass can compare equal to "move" and serialise something
+    # else entirely.
+    action = canonical(action, "action")
     if action not in WINDOW_ACTIONS:
         raise ValueError(f"action must be one of {WINDOW_ACTIONS}")
     if (x is None) != (y is None):
@@ -795,6 +989,68 @@ def window_body(
     if width is not None and height is not None:
         body["width"], body["height"] = width, height
     return body
+
+
+#: The most text ``PUT /computers/{id}/clipboard`` carries INTO a guest, in bytes.
+#:
+#: Mirrored rather than left to the server, so a request that can only fail is
+#: not made, and kept in step by ``scripts/check_surface.py`` like
+#: :data:`MAX_STEPS`. The platform states this one in Go — ``clipboardWriteMax``
+#: in its ``server/clipboard.go`` — which the checker refused to read at first;
+#: the docstring here said "NOT machine-checked" instead, which is an admission
+#: rather than a check, so the reader learned Go and the sentence became true.
+#: The number is not ours and is not arbitrary: the
+#: platform puts the text inside one argument of one command, Linux caps a single
+#: argv string at 128 KiB, and two layers of base64 stand between the text and
+#: that ceiling — so each byte costs about 1.8 of it and 64 KiB is where the
+#: platform stops. Past it ``execve`` fails with E2BIG rather than truncating.
+#:
+#: The READ cap is 128 KiB, a different bound on a different channel, and is
+#: deliberately not mirrored: nothing here can meet it, since that text comes
+#: from the guest.
+MAX_CLIPBOARD_BYTES = 64 * 1024
+
+
+def clipboard_body(text: str) -> dict[str, Any]:
+    """Text for the desktop's clipboard, checked before it costs a round trip.
+
+    Three refusals, each of which the platform also makes. The NUL is the one
+    worth explaining: the platform confirms a write by reading the selection
+    back through a command substitution, and a shell truncates that at the first
+    NUL — so the write would land, the read-back would disagree, and the answer
+    would be a 409 inviting a retry at something that had already worked.
+
+    The cap is counted in UTF-8 BYTES rather than characters. An emoji is four of
+    them, so a ``len(text)`` check would pass four times the legal payload to an
+    ``execve`` that answers E2BIG.
+    """
+    # `canonical` rather than an isinstance check, for the reason it documents:
+    # every check below reads `text`, and the request then encodes the ORIGINAL
+    # object again. A `str` subclass can answer differently the second time — an
+    # override that reports empty here and a full buffer to the serialiser walks
+    # past all three refusals. It also makes this a ValueError like every other
+    # refusal in this file, rather than the one TypeError among them.
+    text = canonical(text, "clipboard text")
+    # Empty is refused rather than sent, matching the platform: clearing the
+    # clipboard is not what that endpoint does, and a caller who meant to clear
+    # it should hear so rather than read a status code.
+    if not text:
+        raise ValueError("clipboard text must not be empty")
+    if "\0" in text:
+        raise ValueError("clipboard text must not contain a NUL")
+    # UTF-8 bytes, not characters — see the docstring. Unpaired surrogates are
+    # not UTF-8; ``encode`` raises ``UnicodeEncodeError``, which a caller wrapping
+    # this in ``except ValueError`` would miss, so it is the same refusal as the
+    # rest.
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("clipboard text must be valid UTF-8") from exc
+    if size > MAX_CLIPBOARD_BYTES:
+        raise ValueError(
+            f"clipboard text is {size} bytes; the platform accepts at most {MAX_CLIPBOARD_BYTES}"
+        )
+    return {"text": text}
 
 
 def resize_body(*, cpu: int | None, ram_mb: int | None, disk_gb: int | None) -> dict[str, Any]:
@@ -863,12 +1119,15 @@ def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
     The platform requires this to be the only field in the PATCH, which is why
     it has a method of its own rather than a keyword on ``rename``.
     """
-    if isinstance(minutes, bool) or not isinstance(minutes, (int, type(None))):
-        # Floats are refused rather than rounded, and that also shuts the NaN
-        # door: `nan < 0` is False, so a NaN would otherwise sail past the
-        # negative check and onto the wire as an idle window.
-        raise TypeError(
-            f"idle_suspend_min must be an integer minute count or None, not {minutes!r}"
+    # Floats are refused rather than rounded, and that also shuts the NaN door:
+    # `nan < 0` is False, so a NaN would otherwise sail past the negative check
+    # and onto the wire as an idle window. `whole` also settles the subclass
+    # question — the value compared below is the value that goes out.
+    if minutes is not None:
+        minutes = whole(
+            minutes,
+            "idle_suspend_min",
+            message=f"idle_suspend_min must be an integer minute count or None, not {minutes!r}",
         )
     if minutes is not None and minutes < 0:
         raise ValueError(
@@ -879,11 +1138,16 @@ def idle_suspend_body(minutes: int | None) -> dict[str, Any]:
 
 
 def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str, Any]:
+    # Bools are ints, so ``0 <= True <= 23`` is true and ``json.dumps`` then
+    # encodes them as booleans. The platform wants 0–23, not a JSON ``true``.
+    hour = whole(hour, "hour", message=f"hour must be an integer, not {hour!r}")
+    minute = whole(minute, "minute", message=f"minute must be an integer, not {minute!r}")
     if not 0 <= hour <= 23:
         raise ValueError("hour must be 0-23")
     if not 0 <= minute <= 59:
         raise ValueError("minute must be 0-59")
-    return {"enabled": enabled, "hour": hour, "minute": minute, "tz": tz}
+    # `enabled` ARMS the schedule, so it is a flag rather than anything truthy.
+    return {"enabled": flag(enabled, "enabled"), "hour": hour, "minute": minute, "tz": tz}
 
 
 # --- input ----------------------------------------------------------------
@@ -895,15 +1159,14 @@ def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str
 # writing the same seven stubs.
 
 
-def _coordinate(value: Any, name: str) -> None:
+def _coordinate(value: Any, name: str) -> int:
     """Reject values JSON can carry but the guest cannot use as coordinates."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{name} must be an integer coordinate")
+    return whole(value, name, message=f"{name} must be an integer coordinate")
 
 
 def pointer_body(action: str, x: int, y: int) -> dict[str, Any]:
-    _coordinate(x, "x")
-    _coordinate(y, "y")
+    x = _coordinate(x, "x")
+    y = _coordinate(y, "y")
     return {"action": action, "x": x, "y": y}
 
 
@@ -993,8 +1256,10 @@ def scroll_body(
     is what a defaulted ``scroll()`` did before the coordinate keys became
     optional.
     """
+    direction = canonical(direction, "direction")
     if direction not in _SCROLL_DIRECTIONS:
         raise ValueError(f"direction must be one of {_SCROLL_DIRECTIONS}")
+    amount = whole(amount, "amount", exc=ValueError, message="amount must be positive")
     if amount <= 0:
         raise ValueError("amount must be positive")
     _whole_point(x, y)
@@ -1026,31 +1291,28 @@ def key_body(keys: tuple[str, ...]) -> dict[str, Any]:
     return {"action": "key", "keys": list(keys)}
 
 
-def _require_positive_seconds(seconds: float, message: str = "seconds must be positive") -> None:
+def _positive_seconds(seconds: object, message: str = "seconds must be positive") -> float:
     # NaN fails every ordered comparison, so `seconds <= 0` alone would let it
     # through and become an HTTP timeout of nan + slack. Infinity passes that
     # comparison honestly and is worse: it serialises as a bare `Infinity` that
     # is not JSON, and as an httpx timeout it means a hung guest hangs the
     # caller with no deadline at all. Finiteness, not just sign, is what makes
     # a duration sendable.
-    if (
-        isinstance(seconds, bool)
-        or not isinstance(seconds, (int, float))
-        or not math.isfinite(seconds)
-        or seconds <= 0
-    ):
+    number = real(seconds, "seconds", message=message)
+    if number <= 0:
         raise ValueError(message)
+    return number
 
 
 def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
     if not keys:
         raise ValueError("hold_key() needs at least one key")
-    _require_positive_seconds(seconds)
+    seconds = _positive_seconds(seconds)
     return {"action": "hold_key", "keys": list(keys), "duration": seconds}
 
 
 def wait_body(seconds: float) -> dict[str, Any]:
-    _require_positive_seconds(seconds)
+    seconds = _positive_seconds(seconds)
     return {"action": "wait", "duration": seconds}
 
 
@@ -1073,10 +1335,11 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
     """
     params: dict[str, Any] = {}
     if width is not None:
+        width = whole(width, "width", exc=ValueError, message="width must be positive")
         if width <= 0:
             raise ValueError("width must be positive")
         params["w"] = width
-    if fresh:
+    if flag(fresh, "fresh"):
         params["fresh"] = 1
     return params or None
 
@@ -1117,11 +1380,13 @@ def agent_body(
     :data:`MAX_STEPS`. A ``2.5`` or a ``10000`` that got through here would come
     back as the 400 this function exists to save the caller.
     """
+    prompt = canonical(prompt, "prompt")
     if not prompt.strip():
         raise ValueError("prompt must not be empty")
     if max_steps is not None:
-        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
-            raise ValueError("max_steps must be a whole number")
+        max_steps = whole(
+            max_steps, "max_steps", exc=ValueError, message="max_steps must be a whole number"
+        )
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         if max_steps > MAX_STEPS:

@@ -85,6 +85,69 @@ async def test_exec_does_not_turn_an_empty_200_into_success(client: mc.AsyncClie
 
 
 @respx.mock
+@pytest.mark.parametrize("body", [{}, {"text": 42}, {"text": None}])
+async def test_the_async_clipboard_read_guards_its_own_decode(
+    client: mc.AsyncClient, body: object
+) -> None:
+    """The async half decodes for itself, so it has to be tested for itself.
+
+    ``test_parity`` compares signatures, not bodies — by design, since a body
+    comparison would be a diff nobody could act on — so a guard dropped from
+    only this copy passes every other test in the suite. The sync twin is
+    ``test_a_clipboard_read_with_no_text_raises_rather_than_coercing``, and the
+    thing both are about is that ``str(None)`` is "None": a four-letter
+    clipboard nobody copied, which a caller pastes.
+    """
+    respx.get(f"{BASE}/computers/vm-1/clipboard").mock(httpx.Response(200, json=body))
+    with pytest.raises(mc.MandalaError, match="did not come back with any text"):
+        await mc.AsyncComputer(client._t, COMPUTER).clipboard()
+    await client.aclose()
+
+
+@respx.mock
+async def test_the_async_clipboard_keeps_an_empty_selection(client: mc.AsyncClient) -> None:
+    respx.get(f"{BASE}/computers/vm-1/clipboard").mock(httpx.Response(200, json={"text": ""}))
+    assert await mc.AsyncComputer(client._t, COMPUTER).clipboard() == ""
+    await client.aclose()
+
+
+@respx.mock
+async def test_the_async_clipboard_write_sends_the_one_field(client: mc.AsyncClient) -> None:
+    route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    await mc.AsyncComputer(client._t, COMPUTER).set_clipboard("hello")
+    assert json.loads(route.calls.last.request.content) == {"text": "hello"}
+    await client.aclose()
+
+
+@respx.mock
+async def test_the_async_clipboard_write_refuses_before_it_reaches_the_wire(
+    client: mc.AsyncClient,
+) -> None:
+    """The public async method must keep using the shared body builder.
+
+    The builder's own tests stay green if this method quietly replaces it with
+    a raw ``{"text": text}``. Driving every refusal through the method and
+    watching the route proves validation still happens before a write can
+    resume and bill a suspended computer.
+    """
+    route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    computer = mc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="must not be empty"):
+        await computer.set_clipboard("")
+    with pytest.raises(ValueError, match="NUL"):
+        await computer.set_clipboard("a\0b")
+    with pytest.raises(ValueError, match="at most"):
+        await computer.set_clipboard("x" * (mc._api.MAX_CLIPBOARD_BYTES + 1))
+    with pytest.raises(ValueError, match="must be a string"):
+        await computer.set_clipboard(None)  # type: ignore[arg-type]
+    assert not route.called
+
+
+@respx.mock
 async def test_click_payload(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     await mc.AsyncComputer(client._t, COMPUTER).click(10, 20)

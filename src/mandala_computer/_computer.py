@@ -262,6 +262,23 @@ def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
     return [Window.from_api(row) for row in rows]
 
 
+def _clipboard_text(data: Mapping[str, Any]) -> str:
+    """The selection out of a clipboard read, checked rather than coerced.
+
+    ``str(None)`` is "None" — a four-letter clipboard nobody copied,
+    indistinguishable from a real one, and pasted somewhere by whoever asked for
+    it.
+
+    Shared with the async client rather than written twice, for the reason
+    :func:`_windows_from_response` is shared: two copies of a validation are two
+    places to change it, and the one that gets missed fails open.
+    """
+    text = data.get("text")
+    if not isinstance(text, str):
+        raise MandalaError("the clipboard read did not come back with any text in it")
+    return text
+
+
 def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
     """The delete count, with malformed success payloads kept inside the SDK error family."""
     deleted = data.get("snapshots_deleted")
@@ -1098,12 +1115,16 @@ class Computer(ComputerFields):
 
         What it does not wait through is a refusal that will never clear: a revoked
         key, a computer that is not there, an account that is not allowed, a
-        plan that does not cover this, a rate limit, or a TLS handshake the edge
-        and the platform cannot agree on. Those are raised at once. Waiting on
-        one of them costs the full timeout and then reports "the guest did not
+        plan that does not cover this, or a TLS handshake the edge and the
+        platform cannot agree on. Those are raised at once. Waiting on one of
+        them costs the full timeout and then reports "the guest did not
         respond", which is both wrong and the least useful thing this method
         could say about a 401 — or, as measured, about an expired certificate
         that had already told the caller to report it rather than wait it out.
+
+        A rate limit is waited out on the platform's own cadence: ``Retry-After``
+        when the platform named an interval, and a short floor when it did not
+        (OPL-3724).
 
         A stopped computer is also refused immediately, including one carrying
         :attr:`start_error` from a failed boot. A suspended computer is not:
@@ -1451,8 +1472,13 @@ class Computer(ComputerFields):
         it does not verify the pid: the first :meth:`BackgroundCommand.poll`
         raises :class:`~mandala_computer.NotFoundError` if the daemon has no
         such handle.
+
+        Existence is what is not verified. The pid itself still has to be a
+        positive integer: ``True`` is an ``int`` subclass and would address
+        ``exec/1``, and ``None`` would be a ``TypeError`` from ``int()`` rather
+        than a sentence about the pid.
         """
-        return BackgroundCommand(self._t, self.id, {"pid": pid})
+        return BackgroundCommand(self._t, self.id, {"pid": _api.guest_pid(pid)})
 
     def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::
@@ -1694,6 +1720,91 @@ class Computer(ComputerFields):
             json=_api.window_body(action, x=x, y=y, width=width, height=height),
         )
         return WindowResult.from_api(data)
+
+    def clipboard(self) -> str:
+        """What is on the desktop's clipboard.
+
+        The X ``CLIPBOARD`` selection — what Ctrl-C writes and Ctrl-V pastes —
+        not the ``PRIMARY`` selection that middle-click uses.
+
+        This is the road that needs nothing of the HARDWARE — no cold boot, and
+        no permission from a browser. The other road is RFB extended cut text
+        over the desktop socket, which is live and needs a virtio-serial channel
+        a computer only acquires on a cold boot — see
+        :class:`~mandala_computer.VncConnect`.
+
+        It does want one thing of the IMAGE, and unlike the socket's conditions
+        it is stated in the answer rather than left to be inferred: ``xclip`` in
+        the guest. Every golden built since August 2026 carries it, so in practice
+        this is a computer created before then — and a computer keeps the image
+        it was created from. The refusal is a **400** and it is permanent:
+        install ``xclip`` in the guest, which you can do since you have root
+        there, or create a new computer. Do not retry it.
+
+        A read, not a subscription. Nothing notices a Ctrl-C in the guest on its
+        own, and this does NOT resume a suspended computer: what somebody copied
+        is not worth waking a machine for, so a stopped or suspended one answers
+        409 rather than starting. :meth:`set_clipboard` is the other way round.
+
+        An empty clipboard is ``""`` and a failure raises, which is the
+        distinction the ``exec`` recipe this replaces could not make.
+
+        A clipboard past 128 KiB is refused rather than truncated — half a
+        password is not less of an answer, it is a wrong one that looks
+        completely normal — and it arrives as
+        :class:`~mandala_computer.FileTooLargeError`, which is that class's
+        third producer and the only one that is not a file. **The remedy
+        attached to it everywhere else does not exist here**: there is no
+        ``Range`` on a selection, so :meth:`read_file_part` and
+        :meth:`download_file` have no equivalent. The text is either under the
+        cap or out of reach.
+
+        Linux only.
+        """
+        data = self._t.json_object("GET", _api.computer_action(self.id, "clipboard"))
+        return _clipboard_text(data)
+
+    def set_clipboard(self, text: str) -> None:
+        """Put ``text`` on the desktop's clipboard, ready to paste.
+
+        This leaves the text on the clipboard and touches nothing on screen.
+        Pair it with ``key("ctrl", "v")`` to get it into whatever has focus.
+
+        Unlike :meth:`clipboard`, this DRIVES the computer: a suspended one is
+        resumed to serve it, which is a start and is charged like one.
+
+        At most 64 KiB of UTF-8 goes in — half what comes out, and the two are
+        different bounds on different channels rather than one number rounded
+        twice; see ``_api.MAX_CLIPBOARD_BYTES``. Empty text and a NUL are
+        refused here rather than on the wire.
+
+        The platform confirms the write by reading the selection back before it
+        answers, so this returning means the desktop is *holding* the text
+        rather than that a command ran.
+
+        NOT EVERY :class:`~mandala_computer.ConflictError` HERE IS WORTH
+        RETRYING. Classified refusals carry :attr:`~mandala_computer.APIError.reason`:
+        ``contention`` and ``starting`` clear on their own, while ``unavailable``
+        and ``unsupported`` require a different action.
+        :func:`~mandala_computer.is_transient` answers ``True`` for the first
+        pair and ``False`` for the second. A stopped or suspended computer is
+        ``unavailable``; :meth:`start` it instead of retrying this request. An
+        absent or unknown reason remains unclassified and falls back to the
+        historical ``ConflictError`` answer of ``True``, so code supporting
+        such responses should verify the computer state and bound its retries.
+
+        And two 400s here never clear at all, which matters more on this method
+        than on the read for exactly that reason: the guest needs ``xclip`` in
+        its image (see :meth:`clipboard`), and Windows is refused outright. Both
+        say which they are.
+
+        Linux only.
+        """
+        self._t.json_object(
+            "PUT",
+            _api.computer_action(self.id, "clipboard"),
+            json=_api.clipboard_body(text),
+        )
 
     # --- snapshots ------------------------------------------------------
 

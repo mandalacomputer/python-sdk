@@ -1,0 +1,195 @@
+"""The values a caller controls, and what a hostile shape of them does.
+
+OPL-3869, after three reviews found the same defect three times. The pattern is
+never a missing check — it is a check made against something OTHER than what is
+sent:
+
+* a ``str`` subclass answers the regex, the membership test or the ``strip``
+  with one buffer and the serialiser with another
+* an ``int`` subclass answers ``> 0`` honestly and the FORMATTER with a path
+  segment, or lies to the comparison and passes an unchanged negative onward
+* ``"false"`` is a non-empty string, so every bare truthiness test reads it as
+  yes — on parameters that arm a machine, a snapshot or a schedule
+
+Two hunts and one adversarial review each fixed the sites they happened to name,
+and each time a later pass found more. So this file is an INVENTORY rather than
+a list of cases: every caller-controlled string, bool and guarded number that
+reaches the wire gets a row, and a new builder with no row here is the thing to
+notice in review.
+
+The helpers are :func:`canonical`, :func:`flag`, :func:`whole` and :func:`real`.
+What each guarantees is the same one thing: the value CHECKED is the value SENT.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import mandala_computer as mc
+
+A = mc._api
+
+
+class Liar(str):
+    """Passes a string check, then serialises as something else."""
+
+    def __str__(self) -> str:
+        return " injected"
+
+    def __eq__(self, other: object) -> bool:  # membership tests ask this
+        return True
+
+    def __hash__(self) -> int:
+        return hash("move")
+
+
+class Crooked(int):
+    """Answers every ordered comparison the way that gets it through."""
+
+    def __gt__(self, other: object) -> bool:
+        return True
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __le__(self, other: object) -> bool:
+        return False
+
+
+class Forger(int):
+    """Passes a positive check, writes a path segment when formatted."""
+
+    def __format__(self, spec: str) -> str:
+        return "../stop"
+
+    def __str__(self) -> str:
+        return "../stop"
+
+
+# --- booleans that ARM something -------------------------------------------
+#
+# Not the ones that merely widen a listing: `allow_partial` and `include=all`
+# stay on truthiness deliberately, because reading one of those generously
+# destroys nothing. These five start a machine, capture RAM, arm a schedule,
+# force a capture, or decide whether a deadline is sent at all.
+ARMING_FLAGS = [
+    (
+        "create start",
+        lambda v: A.create_body(
+            name=None,
+            template=None,
+            cpu=None,
+            ram_mb=None,
+            disk_gb=None,
+            start=v,
+            resolution=None,
+            size=None,
+        ),
+    ),
+    ("snapshot memory", lambda v: A.snapshot_body(v)),
+    ("schedule enabled", lambda v: A.schedule_body(enabled=v, hour=4, minute=0, tz="UTC")),
+    ("screenshot fresh", lambda v: A.screenshot_params(None, v)),
+    (
+        "exec background",
+        lambda v: A.exec_body(
+            command="x", timeout=30, background=v, desktop=False, cwd=None, env=None
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "build"), ARMING_FLAGS, ids=[n for n, _ in ARMING_FLAGS])
+@pytest.mark.parametrize("truthy", ["false", "0", 1, 0, "no"])
+def test_an_arming_flag_refuses_anything_that_is_not_a_bool(name, build, truthy) -> None:
+    """``"false"`` is truthy, and it is what a config file or a CLI argument gives."""
+    with pytest.raises(ValueError, match="True or False"):
+        build(truthy)
+
+
+# --- numbers whose guard is an overridable comparison ----------------------
+REJECTS_NEGATIVE = [
+    ("screenshot width", lambda v: A.screenshot_params(v)),
+    (
+        "agent max_steps",
+        lambda v: A.agent_body(prompt="x", system=None, max_steps=v, model=None, stream=False),
+    ),
+    ("scroll amount", lambda v: A.scroll_body(None, None, "up", v)),
+    ("idle_suspend_min", lambda v: A.idle_suspend_body(v)),
+    ("schedule hour", lambda v: A.schedule_body(enabled=True, hour=v, minute=0, tz="UTC")),
+    (
+        "exec timeout",
+        lambda v: A.exec_body(
+            command="x", timeout=v, background=False, desktop=False, cwd=None, env=None
+        ),
+    ),
+    ("wait duration", lambda v: A.wait_body(v)),
+]
+
+
+@pytest.mark.parametrize(("name", "build"), REJECTS_NEGATIVE, ids=[n for n, _ in REJECTS_NEGATIVE])
+def test_a_guarded_number_is_judged_on_its_real_value(name, build) -> None:
+    """The comparison has to see the buffer, not the subclass's opinion of it."""
+    with pytest.raises((ValueError, TypeError)):
+        build(Crooked(-1))
+
+
+def test_a_pid_cannot_format_itself_into_another_route() -> None:
+    """``exec_handle`` interpolates the pid, so ``__format__`` is the attack."""
+    assert A.exec_handle("vm-1", Forger(1)) == "computers/vm-1/exec/1"
+
+
+def test_a_pid_still_accepts_the_decimal_string_that_crosses_a_process() -> None:
+    """A job id out of a queue arrives as text; refusing it was a regression."""
+    assert A.exec_handle("vm-1", "4242") == "computers/vm-1/exec/4242"
+    for bad in ("", "  ", "-1", "0", "4.2", "0x10", True, 0, -1, None, 1.5):
+        with pytest.raises(ValueError):
+            A.guest_pid(bad)
+
+
+def test_a_duration_keeps_the_type_it_was_given() -> None:
+    """Normalising must not turn ``wait(5)`` into ``5.0`` on the wire."""
+    assert A.wait_body(5)["duration"] == 5
+    assert isinstance(A.wait_body(5)["duration"], int)
+    assert A.wait_body(0.5)["duration"] == 0.5
+
+
+# --- strings checked one way and serialised another ------------------------
+def test_a_usage_bound_sends_the_stamp_it_validated() -> None:
+    """The one call whose output somebody compares against an invoice."""
+
+    class Shifted(str):
+        def __str__(self) -> str:
+            return "2030-01-01T00:00:00Z"
+
+    params = A.usage_params("2026-08-01T00:00:00Z", Shifted("2026-08-02T00:00:00Z"))
+    assert type(params["to"]) is str
+    assert str(params["to"]) == "2026-08-02T00:00:00Z"
+
+
+def test_a_membership_test_cannot_be_answered_by_the_value_itself() -> None:
+    """``in`` asks the value's own ``__eq__``, which a subclass owns.
+
+    The buffer here is NOT a valid action, and the subclass claims equality with
+    one. Before the guard canonicalised first, that claim was the whole test and
+    the invalid buffer went out.
+    """
+    for build in (
+        lambda v: A.window_body(v),
+        lambda v: A.scroll_body(None, None, v, 1),
+    ):
+        with pytest.raises(ValueError):
+            build(Liar("nonsense"))
+
+
+def test_every_guarded_string_refuses_a_non_string() -> None:
+    """One exception type for one class of mistake, so a caller can catch it."""
+    for build in (
+        lambda v: A.clipboard_body(v),
+        lambda v: A.open_url_command(v),
+        lambda v: A.agent_body(prompt=v, system=None, max_steps=None, model=None, stream=False),
+    ):
+        with pytest.raises(ValueError, match="must be a string"):
+            build(None)
