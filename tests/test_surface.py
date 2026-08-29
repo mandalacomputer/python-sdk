@@ -27,6 +27,14 @@ a route ALLOWED already listed — so every check here stayed green through a
 whole feature going missing. A parameter is not a smaller kind of surface: the
 call lands in the right place either way, and what is absent is the argument
 that made it worth making.
+
+Both of those compare this SDK to the platform. `surface_inventory` is the third
+dimension and points inward: every public method of this SDK is named in
+`exercise_everything`, not merely every route reached by one. They are different
+claims wherever two methods share a route, which here is most of them — `exec`,
+`open` and the guest wait are all `POST computers/:id/exec` — so a method added
+beside an existing one and left out of the exercise shipped with no coverage at
+all, on a suite whose whole design is that the surface is enumerable (OPL-3900).
 """
 
 from __future__ import annotations
@@ -34,12 +42,14 @@ from __future__ import annotations
 import io
 import json
 import sys
+from contextlib import aclosing, closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
+from tests.surface_inventory import half, inventory, names, record_named_calls
 from tests.surface_tables import ALLOWED, PARAMETERS
 
 import mandala_computer as mc
@@ -115,6 +125,32 @@ COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu"
 SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", "state": "durable"}
 HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
 RETENTION = {"daily": 7, "weekly": 4, "monthly": 12}
+# One finished move, in the account-wide envelope the route actually answers.
+#
+# Two rows, and only one of them this computer's: `Computer.wait_for_move`
+# filters `GET /moves` by `computer_id`, and a fixture with a single row would
+# be satisfied by a filter that took the first one — which is the bug the
+# filter exists to prevent, since a finished move for a different computer stays
+# listed for a day. `live: false` is what lets the wait return rather than poll.
+MOVES = {
+    "moves": [
+        {
+            "id": "mv-0",
+            "computer_id": "vm-other",
+            "state": "moving",
+            "live": True,
+            "started_at": "2026-08-26T11:00:00.000Z",
+        },
+        {
+            "id": "mv-1",
+            "computer_id": "vm-1",
+            "state": "moved",
+            "live": False,
+            "started_at": "2026-08-26T12:00:00.000Z",
+            "finished_at": "2026-08-26T12:05:00.000Z",
+        },
+    ]
+}
 WINDOW = {"id": "0x2600003", "title": "T", "class": "Firefox"}
 EXEC_STATUS = {"pid": 4242, "running": False, "exited": True, "exit_code": 0}
 USAGE = {
@@ -207,6 +243,13 @@ BUILD_EVENTS = (
     + json.dumps(BUILD_PROGRESS).encode()
     + b"\n\n"
 )
+
+
+#: Every public callable in this SDK that can put a request on the wire, by the
+#: class that defines it — read out of the source rather than listed here. See
+#: ``surface_inventory``: the completeness check below it counts ROUTES, and a
+#: second method on a route somebody else already reaches is invisible to it.
+SURFACE = inventory()
 
 
 def pattern_for(path: str) -> str:
@@ -320,6 +363,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=HOLDINGS if "/computers/" in path else [SNAPSHOT])
     if path.endswith("/usage"):
         return httpx.Response(200, json=USAGE)
+    if path.endswith("/moves"):
+        return httpx.Response(200, json=MOVES)
     if path.endswith("/retention"):
         return httpx.Response(200, json=RETENTION)
     if path.endswith("/computers"):
@@ -382,6 +427,10 @@ def exercise_everything(client: mc.Client) -> None:
     client.builds.list(allow_partial=True)
     client.builds.get("bld-1")
     client.builds.progress("bld-1")
+    # The poll on top of progress. It shares `GET builds/:id/progress` with the
+    # call above, so the route half of this file cannot tell whether it was ever
+    # driven — see `surface_inventory`, which is what does.
+    client.builds.wait("bld-1")
     for _ in client.builds.events("bld-1"):
         break
     client.sizes.list()
@@ -401,7 +450,17 @@ def exercise_everything(client: mc.Client) -> None:
         start=False,
     )
     client.computers.create(size="small")
+    # The create/delete pair as one scope. Both its routes are reached by their
+    # own methods elsewhere here, so nothing but the inventory sees this line.
+    with client.computers.ephemeral(template="base"):
+        pass
     c.refresh()
+    # The three readiness waits, which poll routes the calls around them already
+    # reach: `GET computers/:id` for the first two and `POST computers/:id/exec`
+    # for the guest probe.
+    c.wait_until_built()
+    c.wait_until_running()
+    c.wait_for_guest()
     c.start()
     c.stop()
     c.stop(force=True)
@@ -434,6 +493,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.exec("true", cwd="/tmp", env={"CI": "1"})
     # `desktop` is the wire's `session`, and the only value it takes.
     c.exec("true", desktop=True)
+    # Sugar over the exec above, and therefore invisible to the route check.
+    c.open("https://example.com")
     job = c.start_exec("sleep 60")
     job.poll()
     job.kill()
@@ -452,6 +513,9 @@ def exercise_everything(client: mc.Client) -> None:
     # move body, and the parameter sweep is what proves the SDK sends them.
     # `move` on the handle is the mouse pointer — see Computer.relocate.
     c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
+    # The wait on the move, which reads the same account-wide listing as
+    # `moves.list()` below and is a different method for doing it.
+    c.wait_for_move()
     client.moves.list()
     # Both bounds, because a call that names neither cannot show the parameter
     # sweep that this SDK can send either.
@@ -475,6 +539,11 @@ def exercise_everything(client: mc.Client) -> None:
     c.agent("do the thing", model_key="sk-ant-test")
     c.agent("do the thing", model_key="sk-ant-test", system="be brief", max_steps=5, model="m")
     c.agent_once("do the thing", model_key="sk-ant-test")
+    # The streaming entry point the two calls above wait out for you. All three
+    # are `POST computers/:id/agent`, so the route check sees one method here.
+    with closing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
+        for _ in events:
+            break
     client.computers.list(allow_partial=True)
     client.snapshots.list()
     client.snapshots.list(include_unfinished=True, allow_partial=True)
@@ -504,6 +573,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.builds.list(allow_partial=True)
     await client.builds.get("bld-1")
     await client.builds.progress("bld-1")
+    await client.builds.wait("bld-1")
     async for _ in client.builds.events("bld-1"):
         break
     await client.sizes.list()
@@ -520,7 +590,12 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         start=False,
     )
     await client.computers.create(size="small")
+    async with client.computers.ephemeral(template="base"):
+        pass
     await c.refresh()
+    await c.wait_until_built()
+    await c.wait_until_running()
+    await c.wait_for_guest()
     await c.start()
     await c.stop()
     await c.stop(force=True)
@@ -552,6 +627,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.exec("true")
     await c.exec("true", cwd="/tmp", env={"CI": "1"})
     await c.exec("true", desktop=True)
+    await c.open("https://example.com")
     job = await c.start_exec("sleep 60")
     await job.poll()
     await job.kill()
@@ -567,6 +643,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.resize(cpu=4, ram_mb=8192)
     await c.resize(disk_gb=64)
     await c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
+    await c.wait_for_move()
     await client.moves.list()
     await client.usage.read()
     await client.usage.read(
@@ -592,6 +669,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         "do the thing", model_key="sk-ant-test", system="be brief", max_steps=5, model="m"
     )
     await c.agent_once("do the thing", model_key="sk-ant-test")
+    async with aclosing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
+        async for _ in events:
+            break
     await client.computers.list(allow_partial=True)
     await client.snapshots.list()
     await client.snapshots.list(include_unfinished=True, allow_partial=True)
@@ -735,6 +815,116 @@ def test_the_unreached_part_of_the_surface_is_exactly_what_we_think(
     exercise_everything(client)
 
     assert ALLOWED - called_routes(route.calls) == UNIMPLEMENTED
+
+
+@respx.mock
+def test_every_public_method_is_named_in_the_exercise(client: mc.Client) -> None:
+    """The claim the route check above cannot make.
+
+    ``ALLOWED - called_routes(...) == UNIMPLEMENTED`` proves every route was
+    reached by SOMETHING. It says nothing about a method that shares a route
+    with one already exercised, and on this surface most of them do: three
+    methods are `POST computers/:id/exec`, three are `POST computers/:id/agent`,
+    and every mouse and keyboard call is `POST computers/:id/input`. Eight
+    methods had gone missing that way by the time this was written (OPL-3900).
+
+    The inventory is derived from the source, so closing this is adding the call
+    rather than editing a list — and a method added tomorrow is in the inventory
+    before anyone thinks about coverage.
+    """
+    respx.route(host="api.test").mock(side_effect=api_handler)
+    surface = half(SURFACE, asynchronous=False)
+    with record_named_calls(surface, [exercise_everything]) as named:
+        exercise_everything(client)
+
+    missed = names(surface) - named
+    assert not missed, (
+        f"public methods the exercise never calls: {sorted(missed)}. Add them to "
+        "exercise_everything() — sharing a route with a method that IS called is "
+        "not coverage."
+    )
+
+
+@respx.mock
+async def test_every_public_async_method_is_named_in_the_exercise(
+    async_client: mc.AsyncClient,
+) -> None:
+    """The same claim for the other half.
+
+    Its own test rather than a parity comparison, and that is the point:
+    ``test_both_clients_hit_exactly_the_same_routes`` is satisfied by two halves
+    that are missing the same method, which is exactly how a method goes missing
+    — it is added to one half and mirrored into the other, and forgotten in both
+    exercises at once.
+    """
+    respx.route(host="api.test").mock(side_effect=api_handler)
+    surface = half(SURFACE, asynchronous=True)
+    with record_named_calls(surface, [exercise_everything_async]) as named:
+        await exercise_everything_async(async_client)
+
+    missed = names(surface) - named
+    assert not missed, (
+        f"public async methods the exercise never calls: {sorted(missed)}. "
+        "Add them to exercise_everything_async()."
+    )
+
+
+def test_the_two_halves_offer_the_same_methods() -> None:
+    """Parity read off the source, before either exercise runs.
+
+    The route and parameter parity tests next door compare what the two halves
+    DO, which cannot see a method the async side never grew — that half simply
+    makes no call, and a call nobody makes matches a call nobody makes.
+    """
+
+    def paired(surface: dict[type, frozenset[str]]) -> set[str]:
+        return {
+            f"{cls.__name__.removeprefix('Async')}.{method}"
+            for cls, methods in surface.items()
+            for method in methods
+        }
+
+    assert paired(half(SURFACE, asynchronous=True)) == paired(half(SURFACE, asynchronous=False))
+
+
+@respx.mock
+def test_a_method_sharing_a_reached_route_is_caught(client: mc.Client) -> None:
+    """The regression test for OPL-3900, on a real pair rather than a mock one.
+
+    ``Computer.open`` is sugar over ``Computer.exec``: same route, same verb,
+    different method. So the two exercises below reach an IDENTICAL set of
+    routes, and every route-shaped check in this file is equally happy with
+    both — which is the hole. Only the inventory tells them apart.
+
+    Without this, the new assertion above would be as unfalsifiable as the one
+    it was written to shore up.
+    """
+    surface = half(SURFACE, asynchronous=False)
+
+    def forgot_open(c: mc.Computer) -> None:
+        c.exec("true")
+
+    def called_open(c: mc.Computer) -> None:
+        c.exec("true")
+        c.open("https://example.com")
+
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    with record_named_calls(surface, [forgot_open]) as forgetful:
+        forgot_open(client.computers.get("vm-1"))
+    forgetful_routes = called_routes(route.calls)
+
+    respx.reset()
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    with record_named_calls(surface, [called_open]) as complete:
+        called_open(client.computers.get("vm-1"))
+
+    assert called_routes(route.calls) == forgetful_routes, (
+        "the two exercises must reach the same routes, or this proves nothing "
+        "about a method that shares one"
+    )
+    assert "Computer.open" in names(surface)
+    assert "Computer.open" not in forgetful
+    assert "Computer.open" in complete
 
 
 def test_pattern_for_treats_ids_as_ids() -> None:
