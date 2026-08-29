@@ -1783,14 +1783,15 @@ class Computer(ComputerFields):
         rather than that a command ran.
 
         NOT EVERY :class:`~mandala_computer.ConflictError` HERE IS WORTH
-        RETRYING, and they do not look different. One is: "the desktop did not
-        take the text" means something else claimed the selection in that
-        instant — a clipboard manager settling, usually — and it clears on its
-        own. The others describe a state you have to change: the computer is not
-        running (:meth:`start` it), or its X server is not up yet.
-        :func:`~mandala_computer.is_transient` answers ``True`` for all of them,
-        so a blanket retry spins until your deadline against a computer that is
-        simply stopped. Read the message, or bound the loop in attempts.
+        RETRYING. Classified refusals carry :attr:`~mandala_computer.APIError.reason`:
+        ``contention`` and ``starting`` clear on their own, while ``unavailable``
+        and ``unsupported`` require a different action.
+        :func:`~mandala_computer.is_transient` answers ``True`` for the first
+        pair and ``False`` for the second. A stopped or suspended computer is
+        ``unavailable``; :meth:`start` it instead of retrying this request. An
+        absent or unknown reason remains unclassified and falls back to the
+        historical ``ConflictError`` answer of ``True``, so code supporting
+        such responses should verify the computer state and bound its retries.
 
         And two 400s here never clear at all, which matters more on this method
         than on the read for exactly that reason: the guest needs ``xclip`` in

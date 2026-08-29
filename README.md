@@ -676,14 +676,15 @@ The platform confirms the write by reading the selection back before it
 answers, so `set_clipboard()` returning means the desktop is *holding* the text
 rather than that a command ran.
 
-**Not every `ConflictError` here is worth retrying, and they do not look
-different.** One is: *the desktop did not take the text* means something else
-claimed the selection in that instant — a clipboard manager settling, usually —
-and it clears on its own. The others describe a state you have to change: the
-computer is not running (`start()` it), or its X server is not up yet.
-`is_transient()` answers `True` for all of them, so a blanket retry spins until
-your deadline against a computer that is simply stopped. Read the message, or
-bound the loop in attempts.
+**Not every `ConflictError` here is worth retrying.** Classified refusals carry
+an `APIError.reason`: `contention` and `starting` clear on their own, while
+`unavailable` and `unsupported` require a different action. `is_transient()`
+therefore answers `True` for the first pair and `False` for the second. A
+stopped or suspended computer is `unavailable`; start it instead of retrying
+the clipboard request. If an older platform response has no recognised reason,
+the SDK preserves the historical `ConflictError` fallback of `True`, so code
+that must support unclassified responses should verify the computer state and
+keep its retry loop bounded.
 
 Two others worth knowing. A **400** never clears: a computer built from a golden
 that predates `xclip` is refused permanently — install `xclip` in the guest, or
@@ -1316,12 +1317,13 @@ computer a moment before your call. Waiting and retrying is the fix; changing
 the request is not.
 
 Two do not clear. `MoveRequiredError` is one, and it has a class you can catch.
-The other does not: `clipboard()` and `set_clipboard()` answer 409 on a computer
-that is stopped or suspended, and waiting will not start it — `start()` is a
-different request, and that is the fix. `is_transient()` cannot tell that 409
-from a passing one, because the platform sends nothing that distinguishes them,
-so a blanket retry loop around the clipboard spins until its deadline. Read the
-message, or bound the loop in attempts.
+The other is a clipboard refusal on a stopped or suspended computer: waiting
+will not start it, so `start()` is the fix. Current platform responses classify
+that refusal with `APIError.reason == "unavailable"`, and `is_transient()`
+answers `False`; `contention` and `starting` answer `True`. An absent or unknown
+reason is deliberately treated as unclassified and falls back to the exception
+type, so a legacy `ConflictError` still answers `True`. If you support such
+responses, check the computer state and keep the retry loop bounded.
 
 A retry loop on it terminates because it has a deadline, not because of any
 status: a guest agent that stays silent past its boot window does stop being a

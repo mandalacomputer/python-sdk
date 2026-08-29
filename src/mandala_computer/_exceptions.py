@@ -635,11 +635,15 @@ def is_transient(err: BaseException) -> bool:
     # being read as permanent. That fallback is the contract, not an oversight:
     # the platform states that a client must treat an unrecognised value as no
     # answer given.
-    reason = getattr(err, "reason", None)
-    if reason in _REASON_CLEARS:
-        return True
-    if reason in _REASON_PERMANENT:
-        return False
+    # Only APIError owns the platform's shape-checked refusal classification.
+    # Arbitrary exceptions may also happen to expose ``reason`` — including an
+    # unhashable value — but that is neither this protocol nor retry advice.
+    if isinstance(err, APIError):
+        reason = err.reason
+        if reason in _REASON_CLEARS:
+            return True
+        if reason in _REASON_PERMANENT:
+            return False
     return isinstance(err, (ConflictError, RateLimitError, UnavailableError, ConnectionError))
 
 

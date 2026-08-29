@@ -446,7 +446,11 @@ class VncConnect:
     #: caller nothing but the socket, since :meth:`Computer.clipboard` and
     #: :meth:`Computer.set_clipboard` work there too; a ``True`` about an absent
     #: one is the silently dropped paste this field exists to end.
-    clipboard: bool = False
+    # Keyword-only so adding this field does not move the long-established
+    # positional slot for ``raw``. Besides breaking construction, accepting an
+    # old positional ``raw`` value here would make the hand-written repr render
+    # that payload (and any credentials in it) as ``clipboard``.
+    clipboard: bool = field(default=False, kw_only=True)
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod

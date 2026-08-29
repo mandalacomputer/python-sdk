@@ -380,6 +380,23 @@ def test_the_public_retry_predicate_is_safe_for_a_create() -> None:
     assert mc.is_transient(ValueError("a bug in the caller")) is False
 
 
+def test_an_unrelated_exception_reason_is_not_api_retry_advice() -> None:
+    """Only API errors carry the platform's refusal classification.
+
+    `is_transient` accepts any exception, so an application's own exception may
+    coincidentally have a `reason` attribute. It must neither opt that exception
+    into retries nor make this predicate raise when its value is unhashable.
+    """
+
+    class ApplicationError(Exception):
+        def __init__(self, reason: object) -> None:
+            super().__init__("application failure")
+            self.reason = reason
+
+    assert mc.is_transient(ApplicationError("contention")) is False
+    assert mc.is_transient(ApplicationError({"kind": "contention"})) is False
+
+
 def test_the_refusal_reason_decides_before_the_type_does() -> None:
     """The 409 that never clears, told apart at last (OPL-3898).
 
@@ -2304,6 +2321,21 @@ def test_the_vnc_repr_survives_an_empty_terminal_url() -> None:
     vnc = mc.VncConnect.from_api({"url": "wss://h/v", "token": "a", "view_token": "b"})
     assert vnc is not None
     assert "terminal_url=''" in repr(vnc)
+
+
+def test_the_vnc_clipboard_field_does_not_move_the_positional_raw_slot() -> None:
+    """The pre-clipboard seven-argument constructor remains compatible.
+
+    A raw API payload can contain the same credentials the repr deliberately
+    redacts, so binding this positional argument to `clipboard` would be both a
+    compatibility break and a credential leak.
+    """
+    raw = {"token": "POSITIONAL_SECRET"}
+    vnc = mc.VncConnect("wss://h/v", "wss://h/view", "a", "b", "https://h/embed", "", raw)
+
+    assert vnc.raw is raw
+    assert vnc.clipboard is False
+    assert "POSITIONAL_SECRET" not in repr(vnc)
 
 
 def test_the_vnc_clipboard_field_is_read_off_the_body() -> None:
