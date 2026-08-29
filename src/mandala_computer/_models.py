@@ -335,34 +335,30 @@ class VncConnect:
     ``token``
         Full control — keyboard and pointer. Root-equivalent on that one
         machine, so it belongs on a server or in a page you trust. The
-        CLIPBOARD crosses this socket on a Linux computer whose QEMU has the
-        vdagent channel and whose image carries the agent, and not otherwise,
-        so a client that has to work on any computer should not depend on it.
-        The two halves are acquired SEPARATELY and a computer needs both. The
-        channel comes from a COLD start — stop the computer and start it again,
-        or restart one that is already stopped, which starts it; restarting a
-        RUNNING computer does not do it, because that resets the guest rather
-        than rebuilding the machine QEMU was given. The agent is
-        ``spice-vdagent`` inside the guest, which comes from the IMAGE, and a
-        computer keeps the image it was created from — there is no operation
-        that moves an existing one onto a newer one, so a computer built before
-        the agent shipped needs it installed in the guest, which you can do
-        yourself since you have root there, or replacing with a newly created
-        computer — and note that a current image STARTS it unaided, while
-        installing the package into a guest that is already logged in leaves
-        that session unbridged until it logs in again. Windows guests never
-        have it, whatever the hardware says.
-        A resumed or snapshot-restored session keeps the topology of the
-        capture it came from, so a computer that had the channel can come back
-        without one and reacquires it on its next stop and start. Where both
-        halves are present, RFB extended cut text is AVAILABLE — which is the
-        transport being open rather than a promise that a copy or a paste
+        CLIPBOARD crosses this socket where the bridge was provisioned, and
+        :attr:`clipboard` is the field that says whether it was on this
+        computer. Everything below used to be written so that a caller could
+        infer that answer; it is now read rather than inferred, and what is
+        left is what to do with it.
+
+        ``True`` means the transport is open, not that a copy or a paste
         succeeds. The first paste of a session is often dropped, because the
         guest PULLS the text and vdagent may not own the selection yet, and a
         browser will not hand over the guest's clipboard without focus and
-        permission. Where either half is absent, text a client pastes reaches
-        QEMU and stops — silently, with no error to catch — and no field tells
-        you which you have. Keep the route below whichever you get.
+        permission. ``False`` means text a client pastes reaches QEMU and
+        stops, silently, with no error to catch.
+
+        A ``False`` is sometimes fixable and sometimes not, because the bridge
+        has two halves. The channel is hardware and comes from a COLD start —
+        stop the computer and start it again; restarting a RUNNING one does
+        not do it, since that resets the guest rather than rebuilding the
+        machine QEMU was given. The agent is ``spice-vdagent`` in the guest and
+        comes from the IMAGE, which a computer keeps for life, so one built
+        before the agent shipped needs it installed there — which you may do,
+        having root — or replacing with a newly created computer. Windows
+        guests never have it, whatever the hardware says.
+
+        Keep the route below whichever you get.
 
         :meth:`Computer.clipboard` and :meth:`Computer.set_clipboard` are the
         route to build on — the reliable one, not merely the fallback — because
@@ -431,6 +427,26 @@ class VncConnect:
     #: started. A restart will not do it — that resets the same QEMU, and the
     #: command line only changes on a cold boot.
     terminal_url: str = ""
+    #: Whether this socket was provisioned with the platform-controlled halves
+    #: of the guest clipboard bridge (OPL-3870) — the vdagent channel QEMU was
+    #: given at cold boot, and whether the image this computer was built from
+    #: was verified to ship ``spice-vdagent``.
+    #:
+    #: A PROVISIONING signal rather than current availability, and the
+    #: distinction is not pedantic: somebody with root in the guest can install,
+    #: remove, disable or stop the agent afterwards and this field will not
+    #: move. It is also always ``False`` on a socket opened with
+    #: :attr:`view_token`, because the daemon takes the extended-clipboard
+    #: capability out of a watch-only connection as it is negotiated — there the
+    #: ``False`` is about the credential rather than about the computer.
+    #:
+    #: ``False`` when the platform does not send it at all, which is the
+    #: conservative reading and deliberately not "unknown": the two ways to be
+    #: wrong are not symmetric. A ``False`` about a working bridge costs a
+    #: caller nothing but the socket, since :meth:`Computer.clipboard` and
+    #: :meth:`Computer.set_clipboard` work there too; a ``True`` about an absent
+    #: one is the silently dropped paste this field exists to end.
+    clipboard: bool = False
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -455,6 +471,13 @@ class VncConnect:
             view_token=view_token,
             embed_url=str(d.get("embed_url", "")),
             terminal_url=str(d.get("terminal_url") or ""),
+            # `is True` rather than truthiness, and absent lands on False: the
+            # platform sends this present-and-false rather than omitting it, so
+            # anything that is not a literal true — a missing key on an older
+            # deployment, a string, a null — is not an assertion that the bridge
+            # is there, and this is the field where guessing yes is the costly
+            # direction.
+            clipboard=d.get("clipboard") is True,
             raw=dict(d),
         )
 
@@ -488,7 +511,11 @@ class VncConnect:
             f"view_url={self._without_credential(self.view_url)!r}, "
             f"token=<redacted>, view_token=<redacted>, "
             f"embed_url={self._without_credential(self.embed_url)!r}, "
-            f"terminal_url={self._without_credential(self.terminal_url)!r})"
+            f"terminal_url={self._without_credential(self.terminal_url)!r}, "
+            # Not a credential and not derived from one, so it is printed
+            # whole. It is also the field somebody reading a repr to work out
+            # why a paste went nowhere is looking for.
+            f"clipboard={self.clipboard!r})"
         )
 
 

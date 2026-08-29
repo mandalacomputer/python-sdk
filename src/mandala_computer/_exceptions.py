@@ -49,6 +49,38 @@ class MandalaError(Exception):
     agent: AgentFailed | None = None
 
 
+#: The four words the platform will put in a refusal's ``reason`` (OPL-3898),
+#: split by what a retry loop should do about each. ``error`` beside it stays a
+#: sentence for a person and stays free to be reworded; this is the part a
+#: program is allowed to depend on.
+#:
+#: Kept as data rather than as four classes deliberately. The platform states
+#: that a fifth word may be added and that a client must read one it does not
+#: recognise as "no answer given" — an allow-list of types would instead make
+#: the next word a breaking change, and the same word can arrive on more than
+#: one status, so a subclass of one of them could not carry it. See
+#: :func:`is_transient`.
+_REASON_CLEARS = frozenset({"contention", "starting"})
+_REASON_PERMANENT = frozenset({"unavailable", "unsupported"})
+
+
+def _refusal_reason(body: object) -> str | None:
+    """The platform's one-word classification of a refusal, or ``None``.
+
+    Shape-checked in the manner of :func:`_move_offer`, and for the same
+    reason: an unrecognised value has to read as "no answer given" and fall
+    back to what this SDK did before the key existed, rather than as a
+    permanent refusal. So a non-``dict`` body, a missing key and a ``reason``
+    that is not a string all answer ``None``, and so does a word this version
+    has never heard of — that last one is checked by the callers rather than
+    here, because the set it is compared against is the contract.
+    """
+    if not isinstance(body, dict):
+        return None
+    reason = body.get("reason")
+    return reason if isinstance(reason, str) else None
+
+
 class APIError(MandalaError):
     """The API returned an unsuccessful response."""
 
@@ -56,6 +88,20 @@ class APIError(MandalaError):
         super().__init__(message)
         self.status = status
         self.body = body
+        #: The platform's own word for what kind of refusal this is, when it
+        #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"`` or
+        #: ``"unsupported"`` (OPL-3898). ``None`` where it sent nothing, which
+        #: is most errors and always will be — not every refusal has one of
+        #: those four answers, and the platform is explicit that absent means
+        #: unclassified rather than "none of them".
+        #:
+        #: Read on the base class rather than on the one 409 it was filed for,
+        #: because the platform sends it as a property of the ERROR and not of
+        #: the route: the same sentinel is reached from several endpoints, and
+        #: ``unavailable`` in particular arrives as a 400 as well as a 409 —
+        #: whoever loses the race to the running check hears the same fact the
+        #: earlier caller heard.
+        self.reason = _refusal_reason(body)
 
 
 class AuthenticationError(APIError):
@@ -344,11 +390,12 @@ class ConflictError(APIError):
     run something to retry forever.
 
     The first is :class:`MoveRequiredError`, which has a class of its own. The
-    second does not: a clipboard read or write against a computer that is
-    stopped or suspended answers 409, and no amount of waiting resolves it
-    because the computer will not start itself. Nothing in the body
-    distinguishes it, so :func:`is_transient` answers ``True`` for it — read the
-    message, or bound the retry in attempts.
+    second is a clipboard read or write against a computer that is stopped or
+    suspended: it answers 409, and no amount of waiting resolves it because the
+    computer will not start itself. It has no class of its own and does not need
+    one — the body carries :attr:`APIError.reason` = ``"unavailable"``, which
+    :func:`is_transient` reads, so it answers ``False`` for this one without a
+    caller having to match on the sentence (OPL-3898).
     """
 
 
@@ -534,15 +581,21 @@ def is_transient(err: BaseException) -> bool:
     * :class:`UnavailableError` — a hypervisor briefly out of reach
     * :class:`ConnectionError` — the request never left
 
-    One 409 escapes that first bullet, and this predicate cannot be made to see
-    it: a clipboard read or write against a computer that is stopped or
-    suspended. It does not clear on its own — ``start()`` is the fix, not
-    another attempt — but the platform sends nothing in the body that tells it
-    apart from a conflict that is merely passing, so there is no type to split
-    off the way :class:`MoveRequiredError` was. Around
-    :meth:`~mandala_computer.Computer.clipboard` and
-    :meth:`~mandala_computer.Computer.set_clipboard`, read the message or bound
-    the loop in attempts rather than trusting this answer by itself.
+    One 409 used to escape that first bullet, and this predicate could not be
+    made to see it: a clipboard read or write against a computer that is stopped
+    or suspended does not clear on its own — ``start()`` is the fix, not another
+    attempt — and nothing in the body told it apart from a conflict that is
+    merely passing. The advice here was to read the message or bound the loop in
+    attempts, which is prose-matching of exactly the kind OPL-3724 got three
+    clients out of.
+
+    The platform now says which kind it is. :attr:`APIError.reason` carries one
+    of four words when one was sent — ``contention`` and ``starting`` clear on
+    their own, ``unavailable`` and ``unsupported`` never do — and it is
+    consulted BEFORE the types below, because it is the more specific answer.
+    Where it is absent, or is a word this version does not know, the type answer
+    stands unchanged; the platform is explicit that an unrecognised value means
+    no answer given, which is what makes a fifth word safe to add later.
 
     That last line is now literally true, and it was not always. The class used
     to cover every ``httpx.RequestError``, a lost response body included, so
@@ -573,6 +626,19 @@ def is_transient(err: BaseException) -> bool:
     # is safe to replay blind. Same shape as the line above and the same reason:
     # a subclass of a branch below that would otherwise say yes (OPL-3855).
     if isinstance(err, ConnectionInterruptedError):
+        return False
+    # The platform's own word, where it sent one, ahead of the types below —
+    # it is the more specific answer and it is the one that can tell the 409
+    # that never clears from the two that do. Both memberships are tested
+    # rather than one being inferred from the other, so a FIFTH word this
+    # version has never heard of falls through to the type answer instead of
+    # being read as permanent. That fallback is the contract, not an oversight:
+    # the platform states that a client must treat an unrecognised value as no
+    # answer given.
+    reason = getattr(err, "reason", None)
+    if reason in _REASON_CLEARS:
+        return True
+    if reason in _REASON_PERMANENT:
         return False
     return isinstance(err, (ConflictError, RateLimitError, UnavailableError, ConnectionError))
 

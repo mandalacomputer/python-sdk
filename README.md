@@ -256,34 +256,41 @@ is not visible to whoever holds the watch-only link. `token` is root-equivalent
 on that machine. Neither is your API key — which is every computer on the account, forever, and
 must never reach a browser. Both end when the computer restarts.
 
-The clipboard crosses that socket on a Linux computer whose QEMU has the vdagent
-channel and whose image carries the agent, and not otherwise — so a client that
-has to work on any computer should not depend on it. The two halves are acquired
-separately and a computer needs both. The channel comes from a *cold* start:
-stop the computer and start it again, or restart one that is already stopped,
-which starts it. Restarting a *running* computer does not do it — that resets
-the guest rather than rebuilding the machine QEMU was given. The agent is
-`spice-vdagent` inside the guest, which comes from the image, and a computer
-keeps the image it was created from; there is no operation that moves an
-existing one onto a newer one, so a computer built before the agent shipped
-needs the package installed in the guest — you have root there — or replacing
-with a newly created one. A current image *starts* it unaided; installing the
-package into a guest that is already logged in leaves that session unbridged
-until it logs in again. Windows guests never have it, whatever the hardware
-says. A resumed or snapshot-restored session keeps the topology of the capture
-it came from, so a computer that had the channel can come back without one, and
-reacquires it on its next stop and start.
+Whether the clipboard crosses that socket is a property of the computer, and
+`c.vnc.clipboard` is the field that answers it:
 
-Where both halves are present the RFB clipboard path is *available* — the
-transport is open, which is not the same as a copy or a paste succeeding. The
-first paste of a session is often dropped, because the guest *pulls* the text
-and vdagent may not own the selection yet, and a browser will not hand over the
-guest's clipboard without focus and permission. A client also has to negotiate
-the extended-clipboard pseudo-encoding — that is QEMU's only door to the guest's
-clipboard, so an RFB client of your own that does not offer it receives nothing
-however the guest is configured. Where any of it is absent a paste reaches QEMU
-and stops, silently, and **no field tells you which you have**. Keep the route
-below whichever you get.
+```python
+if c.vnc.clipboard:
+    ...  # the RFB clipboard path was provisioned on this computer
+```
+
+It reports *provisioning*, not live health — the vdagent channel QEMU was given
+at cold boot, together with whether the image this computer was built from was
+verified to ship `spice-vdagent`. Somebody with root in the guest can install,
+remove or stop the agent afterwards and the field will not move. It is also
+always `False` on `view_url`, where the `False` is about the credential rather
+than the computer.
+
+`True` means the transport is open, which is not the same as a copy or a paste
+succeeding. The first paste of a session is often dropped, because the guest
+*pulls* the text and vdagent may not own the selection yet, and a browser will
+not hand over the guest's clipboard without focus and permission. A client of
+your own also has to negotiate the extended-clipboard pseudo-encoding — that is
+QEMU's only door to the guest's clipboard, so an RFB client that does not offer
+it receives nothing however the guest is configured. `False` means a paste
+reaches QEMU and stops, silently, with nothing to catch.
+
+A `False` is sometimes fixable. The channel is hardware and comes from a *cold*
+start: stop the computer and start it again. Restarting a *running* computer
+does not do it — that resets the guest rather than rebuilding the machine QEMU
+was given. The agent comes from the image, which a computer keeps for life, so
+one built before the agent shipped needs the package installed in the guest —
+you have root there — or replacing with a newly created one. Windows guests
+never have it, whatever the hardware says. A resumed or snapshot-restored
+session keeps the topology of the capture it came from, so a computer that had
+the channel can come back without one and reacquires it on its next stop and
+start; the field is computed per response rather than stored, so it follows that
+rather than going stale. Keep the route below whichever you get.
 
 [`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
 — the reliable one, not merely the fallback — because they need nothing of the

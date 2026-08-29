@@ -380,6 +380,89 @@ def test_the_public_retry_predicate_is_safe_for_a_create() -> None:
     assert mc.is_transient(ValueError("a bug in the caller")) is False
 
 
+def test_the_refusal_reason_decides_before_the_type_does() -> None:
+    """The 409 that never clears, told apart at last (OPL-3898).
+
+    `ConflictError` covers a guest agent busy for a second and a clipboard read
+    against a stopped computer. One is fixed by sending the same request again
+    and the other only by starting the machine, and until the platform sent a
+    word for it the predicate had to answer `True` for both — so a generic retry
+    loop spun against a stopped machine until somebody's deadline, spending the
+    account's request allowance a turn at a time.
+    """
+
+    def conflict(reason: str) -> mc.ConflictError:
+        return mc.ConflictError("refused", status=409, body={"error": "refused", "reason": reason})
+
+    # The two a retry loop is right about. `starting` is kept apart from
+    # `contention` by the platform because the wait is a different size, not
+    # because the answer here differs.
+    assert mc.is_transient(conflict("contention")) is True
+    assert mc.is_transient(conflict("starting")) is True
+    # The one the ticket was filed for, and its permanent neighbour.
+    assert mc.is_transient(conflict("unavailable")) is False
+    assert mc.is_transient(conflict("unsupported")) is False
+
+
+def test_a_reason_this_version_has_never_heard_of_falls_back_to_the_type() -> None:
+    """The half of the contract that makes a fifth word safe to add.
+
+    The platform states that a client must read an absent value, and one it does
+    not recognise, as "no answer given" and do what it did before this key
+    existed. So an unknown word must not be treated as permanent — a client that
+    guessed `False` there would stop retrying a genuinely passing refusal the
+    first time the platform grew its vocabulary, and would do it silently.
+
+    Both memberships are therefore tested rather than one inferred from the
+    other. `not in _REASON_CLEARS` would have been the bug.
+    """
+    for reason in ("quiesced", "", "CONTENTION"):
+        err = mc.ConflictError("refused", status=409, body={"reason": reason})
+        assert err.reason == reason
+        assert mc.is_transient(err) is True, reason
+
+
+def test_a_body_with_no_usable_reason_leaves_the_answer_where_it_was() -> None:
+    """Absent, malformed and non-dict bodies are all "no answer given"."""
+    for body in (None, {}, {"error": "refused"}, {"reason": 7}, {"reason": None}, "html"):
+        err = mc.ConflictError("refused", status=409, body=body)
+        assert err.reason is None, body
+        assert mc.is_transient(err) is True, body
+
+
+def test_the_reason_rides_on_the_base_class_not_on_the_conflict() -> None:
+    """It is a property of the error rather than of the route (OPL-3898).
+
+    `unavailable` arrives as a 400 as well as a 409 — whoever loses the race to
+    the running check hears the same fact the earlier caller heard — so a
+    subclass of `ConflictError` could not have carried it.
+    """
+    stopped_underfoot = mc.APIError(
+        "not running", status=400, body={"error": "not running", "reason": "unavailable"}
+    )
+    assert stopped_underfoot.reason == "unavailable"
+    # Already False by status, and it stays False. The point is that the word
+    # is readable here at all.
+    assert mc.is_transient(stopped_underfoot) is False
+
+
+def test_a_move_offer_still_outranks_its_reason() -> None:
+    """`MoveRequiredError` is a decision, and it is checked before the word.
+
+    The platform deliberately gives `errResumeNeeded` and the move refusals no
+    `reason` — but if one ever gained a transient-looking word, this ordering is
+    what stops a resize past what a host can run becoming retry advice again.
+    """
+    err = mc.MoveRequiredError(
+        "needs a move",
+        status=409,
+        body={"reason": "contention", "move": {"required": True, "possible": True}},
+        move_possible=True,
+    )
+    assert err.reason == "contention"
+    assert mc.is_transient(err) is False
+
+
 @respx.mock
 def test_a_connection_failure_has_a_class_the_predicates_can_name() -> None:
     """`_request_failed` raised a bare MandalaError, which nothing could match.
@@ -2221,6 +2304,45 @@ def test_the_vnc_repr_survives_an_empty_terminal_url() -> None:
     vnc = mc.VncConnect.from_api({"url": "wss://h/v", "token": "a", "view_token": "b"})
     assert vnc is not None
     assert "terminal_url=''" in repr(vnc)
+
+
+def test_the_vnc_clipboard_field_is_read_off_the_body() -> None:
+    """`clipboard` is what OPL-3870 put on the connect surface.
+
+    Before it, this SDK spent several hundred words explaining a condition and
+    ended by saying no field reported it. The words were the workaround.
+    """
+    base = {"url": "wss://h/v", "token": "a", "view_token": "b"}
+    provisioned = mc.VncConnect.from_api({**base, "clipboard": True})
+    assert provisioned is not None
+    assert provisioned.clipboard is True
+
+    withheld = mc.VncConnect.from_api({**base, "clipboard": False})
+    assert withheld is not None
+    assert withheld.clipboard is False
+
+
+def test_an_unsaid_vnc_clipboard_is_false_rather_than_true() -> None:
+    """Absent, null and the wrong type all land on the safe side.
+
+    The platform sends this present-and-false rather than omitting it, so a
+    missing key means an older deployment rather than a considered no. The two
+    ways to be wrong are not symmetric: a `False` about a working bridge costs
+    the caller nothing but the socket, since the clipboard endpoints work there
+    too, while a `True` about an absent one is the silently dropped paste the
+    field exists to end. So anything that is not a literal `true` reads as
+    `False`, and `is True` rather than truthiness is what pins the last two.
+    """
+    base = {"url": "wss://h/v", "token": "a", "view_token": "b"}
+    for body in (
+        base,
+        {**base, "clipboard": None},
+        {**base, "clipboard": "true"},
+        {**base, "clipboard": 1},
+    ):
+        vnc = mc.VncConnect.from_api(body)
+        assert vnc is not None
+        assert vnc.clipboard is False, body
 
 
 # --- exec results carry what they were built from --------------------------
