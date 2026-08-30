@@ -955,6 +955,16 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
     if platform is None:
         pytest.skip("platform repo not checked out; set MANDALA_PLATFORM_REPO to compare")
 
+    # Recognition is identity now (OPL-3901), so a checkout can be the platform
+    # and still be missing the files this reads: a sparse or half-deleted clone
+    # is the state the script reports at exit 1, and reading straight through it
+    # would raise FileNotFoundError from inside a comparison instead. Fails here
+    # with the same inventory the script prints.
+    missing = check_surface.missing_mirror_sources(platform)
+    assert missing == [], "the platform checkout is missing mirror sources: " + ", ".join(
+        str(platform / source) for source in missing
+    )
+
     # Compared as sets rather than through main(), so a drift prints as the
     # routes that differ instead of as a non-zero exit code.
     upstream = check_surface.table((platform / check_surface.SURFACE).read_text(), "V1_ROUTES")
