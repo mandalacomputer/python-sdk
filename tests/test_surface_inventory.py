@@ -140,6 +140,44 @@ class Report:
     assert requesting_methods(source) == {}
 
 
+def test_an_unrecognized_transport_member_fails_instead_of_disappearing() -> None:
+    """A new wire wrapper must first be classified by the inventory.
+
+    Without this failure, ``self._t.post`` looks like no request at all and the
+    public method silently falls out of every completeness assertion this
+    inventory feeds — the exact blind spot the derivation exists to close.
+    """
+    source = """
+class Computers:
+    def create(self, body):
+        return self._t.post("computers", json=body)
+"""
+    with pytest.raises(
+        ValueError,
+        match=r"unclassified transport member in Computers\.create: self\._t\.post",
+    ):
+        requesting_methods(source)
+
+
+def test_known_non_request_transport_members_stay_out_of_the_inventory() -> None:
+    """Lifecycle, configuration and retry-budget reads are classified too."""
+    source = """
+class Client:
+    def url(self):
+        return self._t.base_url
+
+    def close(self):
+        self._t.close()
+
+    async def aclose(self):
+        await self._t.aclose()
+
+    def retry_budget(self, err):
+        return self._t.phase_ceiling(err)
+"""
+    assert requesting_methods(source) == {}
+
+
 def test_the_derived_inventory_matches_the_shipped_classes() -> None:
     """Every name derived from source is really there on the class.
 

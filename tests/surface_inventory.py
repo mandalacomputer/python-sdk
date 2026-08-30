@@ -74,6 +74,12 @@ VERBS = frozenset(
     }
 )
 
+#: Public transport members that deliberately do not put a request on the
+#: wire. Together with :data:`VERBS`, this makes the classification exhaustive:
+#: adding a second request wrapper (or any other transport spelling) must be
+#: classified here rather than silently disappearing from the inventory.
+NON_REQUEST_TRANSPORT = frozenset({"aclose", "base_url", "close", "phase_ceiling"})
+
 
 class _Reaches(ast.NodeVisitor):
     """What one method body touches: the transport, and its own siblings.
@@ -86,18 +92,21 @@ class _Reaches(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self.transport = False
+        self.unclassified_transport: set[str] = set()
         self.siblings: set[str] = set()
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         inner = node.value
         if (
-            node.attr in VERBS
-            and isinstance(inner, ast.Attribute)
+            isinstance(inner, ast.Attribute)
             and inner.attr == TRANSPORT
             and isinstance(inner.value, ast.Name)
             and inner.value.id == "self"
         ):
-            self.transport = True
+            if node.attr in VERBS:
+                self.transport = True
+            elif node.attr not in NON_REQUEST_TRANSPORT:
+                self.unclassified_transport.add(node.attr)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -118,6 +127,13 @@ def _methods(cls: ast.ClassDef) -> dict[str, _Reaches]:
             reaches = _Reaches()
             for statement in node.body:
                 reaches.visit(statement)
+            if reaches.unclassified_transport:
+                members = ", ".join(
+                    f"self.{TRANSPORT}.{name}" for name in sorted(reaches.unclassified_transport)
+                )
+                raise ValueError(
+                    f"unclassified transport member in {cls.name}.{node.name}: {members}"
+                )
             found[node.name] = reaches
     return found
 
