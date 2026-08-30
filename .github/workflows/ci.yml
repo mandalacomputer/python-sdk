@@ -42,10 +42,6 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev]"
       - run: pytest -q
-      # Exits 0 and says so when the platform repo is not checked out, which is
-      # always the case here. It runs anyway so the skip stays visible: a job
-      # that silently stopped running is how the mirror drifted the first time.
-      - run: python scripts/check_surface.py
 
   build:
     runs-on: ubuntu-latest
