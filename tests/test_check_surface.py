@@ -39,7 +39,7 @@ def _platform_without(check_surface: ModuleType, tmp_path: Path, missing: Path) 
     return platform
 
 
-def _clone_of(remote: str, directory: Path) -> Path:
+def _clone_of(check_surface: ModuleType, remote: str, directory: Path) -> Path:
     """A git repository that says it came from ``remote``, and nothing else.
 
     Enough for recognition by identity: a real ``.git`` and a real remote URL,
@@ -47,11 +47,19 @@ def _clone_of(remote: str, directory: Path) -> Path:
     there.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    subprocess.run(("git", "init", "--quiet", str(directory)), check=True, capture_output=True)
+    # Through `git_environment()` for the reason it exists: under an ambient
+    # GIT_DIR — a hook, `git rebase --exec`, a wrapper — `git init` re-initializes
+    # whatever that names instead of this directory, and the `remote add` then
+    # writes a fixture's remote into a real repository.
+    env = check_surface.git_environment()
+    subprocess.run(
+        ("git", "init", "--quiet", str(directory)), check=True, capture_output=True, env=env
+    )
     subprocess.run(
         ("git", "-C", str(directory), "remote", "add", "origin", remote),
         check=True,
         capture_output=True,
+        env=env,
     )
     return directory
 
@@ -70,7 +78,7 @@ def test_a_checkout_that_lost_only_apidoc_ts_is_recognized_by_its_remote(
     exit 0. Identity does not care which files are there.
     """
     platform = _platform_without(check_surface, tmp_path, check_surface.APIDOC)
-    _clone_of(f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", platform)
+    _clone_of(check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", platform)
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
     assert check_surface.platform_repo() == platform
@@ -86,7 +94,7 @@ def test_a_clone_with_no_mirror_sources_at_all_is_still_the_platform(
 ) -> None:
     """The general form: an empty clone is a checkout that is missing everything."""
     platform = _clone_of(
-        f"https://github.com/{check_surface.PLATFORM_REMOTE}", tmp_path / "platform"
+        check_surface, f"https://github.com/{check_surface.PLATFORM_REMOTE}", tmp_path / "platform"
     )
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
@@ -104,7 +112,9 @@ def test_a_clone_of_an_unrelated_repository_is_not_the_platform(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Identity widens recognition; it does not hand the name to a neighbour."""
-    other = _clone_of("git@github.com:mandalacomputer/python-sdk.git", tmp_path / "sdk")
+    other = _clone_of(
+        check_surface, "git@github.com:mandalacomputer/python-sdk.git", tmp_path / "sdk"
+    )
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(other))
 
     assert check_surface.platform_repo() is None
@@ -131,7 +141,9 @@ def test_a_directory_inside_a_repository_does_not_borrow_its_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``git -C`` answers about the enclosing repo; a plain subdirectory is not it."""
-    clone = _clone_of(f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "platform")
+    clone = _clone_of(
+        check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "platform"
+    )
     inside = clone / "web"
     inside.mkdir()
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(inside))
@@ -153,8 +165,12 @@ def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
     again, since recognition then falls back to the marker files that a missing
     ``apidoc.ts`` defeats.
     """
-    platform = _clone_of(f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "app")
-    other = _clone_of("git@github.com:mandalacomputer/python-sdk.git", tmp_path / "sdk")
+    platform = _clone_of(
+        check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "app"
+    )
+    other = _clone_of(
+        check_surface, "git@github.com:mandalacomputer/python-sdk.git", tmp_path / "sdk"
+    )
 
     monkeypatch.setenv("GIT_DIR", str(platform / ".git"))
     assert check_surface.remotes(other) == frozenset({"mandalacomputer/python-sdk"})

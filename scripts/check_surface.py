@@ -107,6 +107,18 @@ REMOTE_TAIL = re.compile(r"[:/](?P<owner>[^/:]+)/(?P<name>[^/:]+?)(?:\.git)?/?$"
 #: being denied its own name.
 GIT_ELSEWHERE = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
+
+def git_environment() -> dict[str, str]:
+    """This environment, minus the variables that name a repository of their own.
+
+    A helper rather than a line inside :func:`remotes` because the tests build
+    their fixtures with git too, and ``git init`` under an ambient ``GIT_DIR``
+    does not create the repository it was handed — it re-initializes the one the
+    variable names, and the ``git remote add`` after it writes there as well.
+    """
+    return {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
+
+
 #: The files that identify a platform checkout git cannot vouch for — an export,
 #: a vendored copy, a clone whose remote was removed. A fallback rather than the
 #: primary test: they are contents, and contents are what goes missing when the
@@ -142,15 +154,24 @@ def remotes(directory: Path) -> frozenset[str]:
     """
     if not (directory / ".git").exists():
         return frozenset()
-    env = {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
     try:
         done = subprocess.run(
-            ("git", "-C", str(directory), "config", "--get-regexp", r"^remote\..*\.url$"),
+            # --local: a remote belongs to a checkout, and the unqualified query
+            # would also read whatever global or system config had to say.
+            (
+                "git",
+                "-C",
+                str(directory),
+                "config",
+                "--local",
+                "--get-regexp",
+                r"^remote\..*\.url$",
+            ),
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
-            env=env,
+            env=git_environment(),
         )
     except (OSError, subprocess.SubprocessError):
         return frozenset()
