@@ -15,11 +15,21 @@ stayed green throughout — "every call lands on an allowlisted route" is
 trivially true of a route the allowlist has never heard of, and so is "the
 unreached part of the surface is exactly what we think".
 
-Exits 0 and says so when the platform repo is not there. That is the ordinary
-case in CI on this repository, and failing over it would make this a check
-people learn to ignore. Where it earns its keep is on a machine that has both,
-and in any job that checks out both — which is where a route added upstream
-stops being invisible.
+Exits 0 and says so when the platform repo is not there, which is most of the
+time: nothing in this repository's CI has both, and failing over an absence
+would make this a check people learn to ignore.
+
+Where it is enforced is the platform's own CI, which checks this repo out
+beside itself and runs this script against it (OPL-3916). That is the run a
+route added upstream cannot get past, and it is deliberately not here. The
+comparison prints the routes, parameters and constant values that have not
+shipped yet, and this repository's Actions logs are world-readable the day it
+goes public; the platform's are not. Running it here would also mean a read key
+for a private repo living in a public one, which is the wrong direction for a
+credential to point.
+
+So on a laptop with both checked out this is the check that catches drift
+before a push, and everywhere else it is the thing the platform runs.
 
 The parameter half exists because the route half was not enough. `Range` on
 `GET computers/:id/files` (OPL-3727) is a whole feature — the only way a file
