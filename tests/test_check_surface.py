@@ -140,6 +140,29 @@ def test_a_directory_inside_a_repository_does_not_borrow_its_identity(
     assert check_surface.platform_repo() is None
 
 
+def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``GIT_DIR`` outranks ``-C``, and a git hook exports one.
+
+    Both directions are wrong and both are reachable from a hook or a wrapper
+    that runs this check: an unrelated clone answering with the platform's name,
+    and a platform sibling answering with the SDK's — the second being OPL-3901
+    again, since recognition then falls back to the marker files that a missing
+    ``apidoc.ts`` defeats.
+    """
+    platform = _clone_of(f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "app")
+    other = _clone_of("git@github.com:mandalacomputer/python-sdk.git", tmp_path / "sdk")
+
+    monkeypatch.setenv("GIT_DIR", str(platform / ".git"))
+    assert check_surface.remotes(other) == frozenset({"mandalacomputer/python-sdk"})
+
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    assert check_surface.remotes(platform) == frozenset({check_surface.PLATFORM_REMOTE})
+
+
 def test_a_recognized_checkout_missing_a_constants_module_fails_and_names_it(
     check_surface: ModuleType,
     tmp_path: Path,

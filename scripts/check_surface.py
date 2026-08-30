@@ -80,35 +80,38 @@ CONSTANTS = [
 MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))))
 
 #: The platform repository, as ``owner/name`` on whatever remote it was cloned
-#: from. This is what a checkout *is*, and asking git for it is the only
-#: recognition here that does not depend on which files happen to be present.
+#: from — which is what a checkout *is*, and the one thing about it that does not
+#: depend on which of its files happen to be present.
 #:
-#: Recognizing a checkout by its contents was fail-open by construction
-#: (OPL-3901). Requiring every mirrored source made a checkout that had lost one
-#: of them look absent, so the whole comparison skipped at exit 0; narrowing that
-#: to ``PLATFORM_MARKERS`` left the same hole one file across — a checkout that
-#: still had ``surface.ts`` and every Go constant module but had lost
-#: ``apidoc.ts``, which is the parameter table and exactly the drift this exists
-#: to notice, was still unrecognized and still skipped. Shrinking the marker set
-#: further only moves the hole again. Identity closes it: a clone is the platform
-#: because of where it came from, and a clone that has lost a mirrored file is
-#: then a checkout that drifted rather than a checkout that is not there.
+#: Recognizing a checkout by its contents is fail-open in the case this script
+#: exists for (OPL-3901): the file that has gone missing is the news, and a
+#: recognizer that reads its absence as "no checkout here" reports nothing at all.
+#: Every marker set has that hole somewhere; identity has it nowhere.
 #:
-#: The local directory is routinely called something else — ``gorillacloud``, the
-#: name the product had before the rename — which is why this is the remote's
-#: name rather than the directory's. Forks are covered by their ``upstream``
-#: remote if they have one, and by ``PLATFORM_MARKERS`` if they do not.
+#: The remote's name rather than the directory's, because the working copy is
+#: routinely called something else — ``gorillacloud``, from before the rename.
+#: Forks are covered by their ``upstream`` remote where they have one, since
+#: :func:`remotes` reads all of them, and by ``PLATFORM_MARKERS`` where they
+#: do not.
 PLATFORM_REMOTE = "mandalacomputer/app"
 
 #: The ``owner/name`` tail of a remote URL, in any of the forms git accepts:
 #: ``git@host:owner/name.git``, ``https://host/owner/name``, ``ssh://…/owner/name``.
 REMOTE_TAIL = re.compile(r"[:/](?P<owner>[^/:]+)/(?P<name>[^/:]+?)(?:\.git)?/?$")
 
+#: Environment variables that tell git which repository it is looking at,
+#: regardless of where it was pointed. A git hook exports all three, so a check
+#: run from one would otherwise ask about a candidate directory and be answered
+#: about the repository the hook fired in — the SDK, usually, which is a wrong
+#: answer in both directions and reopens OPL-3901 when it is a platform sibling
+#: being denied its own name.
+GIT_ELSEWHERE = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
 #: The files that identify a platform checkout git cannot vouch for — an export,
 #: a vendored copy, a clone whose remote was removed. A fallback rather than the
-#: primary test since OPL-3901: they are contents, and contents are exactly what
-#: goes missing when the mirror drifts. ``MIRROR_SOURCES`` separately says
-#: whether a recognized checkout is complete enough to compare against.
+#: primary test: they are contents, and contents are what goes missing when the
+#: mirror drifts. ``MIRROR_SOURCES`` separately says whether a recognized
+#: checkout is complete enough to compare against.
 PLATFORM_MARKERS = (SURFACE, APIDOC)
 
 
@@ -130,9 +133,16 @@ def remotes(directory: Path) -> frozenset[str]:
     Empty, too, where git is not installed or the URL is a local path with no
     owner in it: callers fall back to :data:`PLATFORM_MARKERS` rather than read
     an empty answer as "not the platform".
+
+    :data:`GIT_ELSEWHERE` is dropped from the environment because ``-C`` does not
+    win against it. ``GIT_DIR`` and ``GIT_COMMON_DIR`` name a repository outright
+    and outrank both ``-C`` and ``--git-dir``, so under an ambient one — a git
+    hook, a wrapper that exports it — this would report some other repository's
+    remotes for every directory it was asked about.
     """
     if not (directory / ".git").exists():
         return frozenset()
+    env = {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
     try:
         done = subprocess.run(
             ("git", "-C", str(directory), "config", "--get-regexp", r"^remote\..*\.url$"),
@@ -140,6 +150,7 @@ def remotes(directory: Path) -> frozenset[str]:
             text=True,
             timeout=10,
             check=False,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return frozenset()
