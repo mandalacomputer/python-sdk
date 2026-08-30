@@ -1409,7 +1409,11 @@ mirror has never heard of. `scripts/check_surface.py` closes that hole. It
 parses the real table out of the platform repo whenever it happens to be checked
 out next door, or wherever `MANDALA_PLATFORM_REPO` points, and says so and exits
 0 when it is not — the ordinary case in CI here, and failing over it would make
-this a check people learn to ignore.
+this a check people learn to ignore. It recognizes that checkout by asking git
+where it was cloned from rather than by which of its files are present, because
+the second answer is fail-open in the one case that matters: a checkout missing
+the parameter table is drift to report, not evidence that there is no checkout
+to compare against.
 
 The suite runs it too, and that is the part that matters: a script somebody has
 to remember is the same hole one step further back. `pytest` skips it where the
