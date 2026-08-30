@@ -37,6 +37,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -78,9 +79,51 @@ CONSTANTS = [
 #: there is no checkout and therefore permission to skip the comparison.
 MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))))
 
-#: The stable core files that distinguish a platform checkout from an unrelated
-#: directory at one of the candidate locations. They identify the repository;
-#: ``MIRROR_SOURCES`` separately says whether it is complete enough to check.
+#: The platform repository, as ``owner/name`` on whatever remote it was cloned
+#: from — which is what a checkout *is*, and the one thing about it that does not
+#: depend on which of its files happen to be present.
+#:
+#: Recognizing a checkout by its contents is fail-open in the case this script
+#: exists for (OPL-3901): the file that has gone missing is the news, and a
+#: recognizer that reads its absence as "no checkout here" reports nothing at all.
+#: Every marker set has that hole somewhere; identity has it nowhere.
+#:
+#: The remote's name rather than the directory's, because the working copy is
+#: routinely called something else — ``gorillacloud``, from before the rename.
+#: Forks are covered by their ``upstream`` remote where they have one, since
+#: :func:`remotes` reads all of them, and by ``PLATFORM_MARKERS`` where they
+#: do not.
+PLATFORM_REMOTE = "mandalacomputer/app"
+
+#: The ``owner/name`` tail of a remote URL, in any of the forms git accepts:
+#: ``git@host:owner/name.git``, ``https://host/owner/name``, ``ssh://…/owner/name``.
+REMOTE_TAIL = re.compile(r"[:/](?P<owner>[^/:]+)/(?P<name>[^/:]+?)(?:\.git)?/?$")
+
+#: Environment variables that tell git which repository it is looking at,
+#: regardless of where it was pointed. A git hook exports all three, so a check
+#: run from one would otherwise ask about a candidate directory and be answered
+#: about the repository the hook fired in — the SDK, usually, which is a wrong
+#: answer in both directions and reopens OPL-3901 when it is a platform sibling
+#: being denied its own name.
+GIT_ELSEWHERE = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
+
+def git_environment() -> dict[str, str]:
+    """This environment, minus the variables that name a repository of their own.
+
+    A helper rather than a line inside :func:`remotes` because the tests build
+    their fixtures with git too, and ``git init`` under an ambient ``GIT_DIR``
+    does not create the repository it was handed — it re-initializes the one the
+    variable names, and the ``git remote add`` after it writes there as well.
+    """
+    return {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
+
+
+#: The files that identify a platform checkout git cannot vouch for — an export,
+#: a vendored copy, a clone whose remote was removed. A fallback rather than the
+#: primary test: they are contents, and contents are what goes missing when the
+#: mirror drifts. ``MIRROR_SOURCES`` separately says whether a recognized
+#: checkout is complete enough to compare against.
 PLATFORM_MARKERS = (SURFACE, APIDOC)
 
 
@@ -93,6 +136,67 @@ PLATFORM_MARKERS = (SURFACE, APIDOC)
 SIBLINGS = ("mandala-computer", "gorillacloud")
 
 
+def remotes(directory: Path) -> frozenset[str]:
+    """Every remote configured in ``directory``, as ``owner/name``.
+
+    Empty for anything that is not a git repository *root* — the ``.git`` test
+    comes first because ``git -C`` happily answers about an enclosing repository,
+    and a plain directory sitting inside one would otherwise borrow its identity.
+    Empty, too, where git is not installed or the URL is a local path with no
+    owner in it: callers fall back to :data:`PLATFORM_MARKERS` rather than read
+    an empty answer as "not the platform".
+
+    :data:`GIT_ELSEWHERE` is dropped from the environment because ``-C`` does not
+    win against it. ``GIT_DIR`` and ``GIT_COMMON_DIR`` name a repository outright
+    and outrank both ``-C`` and ``--git-dir``, so under an ambient one — a git
+    hook, a wrapper that exports it — this would report some other repository's
+    remotes for every directory it was asked about.
+    """
+    if not (directory / ".git").exists():
+        return frozenset()
+    try:
+        done = subprocess.run(
+            # --local: a remote belongs to a checkout, and the unqualified query
+            # would also read whatever global or system config had to say.
+            (
+                "git",
+                "-C",
+                str(directory),
+                "config",
+                "--local",
+                "--get-regexp",
+                r"^remote\..*\.url$",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=git_environment(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if done.returncode != 0:
+        return frozenset()
+    found = (
+        REMOTE_TAIL.search(line.split(maxsplit=1)[-1]) for line in done.stdout.splitlines() if line
+    )
+    return frozenset(f"{m['owner']}/{m['name']}".lower() for m in found if m)
+
+
+def is_platform_checkout(directory: Path) -> bool:
+    """Whether ``directory`` is the platform repo, by identity first.
+
+    A clone that says it came from :data:`PLATFORM_REMOTE` is the platform
+    whatever state its working tree is in, which is the point: the file that is
+    missing is the news, and a check that reads the same absence as "no checkout
+    here" reports nothing at all. The marker files remain for the copies git
+    cannot speak for.
+    """
+    return PLATFORM_REMOTE in remotes(directory) or all(
+        (directory / marker).is_file() for marker in PLATFORM_MARKERS
+    )
+
+
 def platform_repo() -> Path | None:
     """Where the platform is checked out, if it is."""
     candidates = [
@@ -100,10 +204,7 @@ def platform_repo() -> Path | None:
         for p in (os.environ.get("MANDALA_PLATFORM_REPO"), *(REPO.parent / s for s in SIBLINGS))
         if p
     ]
-    return next(
-        (d for d in candidates if all((d / marker).is_file() for marker in PLATFORM_MARKERS)),
-        None,
-    )
+    return next((d for d in candidates if is_platform_checkout(d)), None)
 
 
 def missing_mirror_sources(platform: Path) -> list[Path]:
@@ -369,7 +470,8 @@ def main() -> int:
     if platform is None:
         print(
             "check-surface — platform repo not found, skipping.\n"
-            f"  Looked in $MANDALA_PLATFORM_REPO and next to {REPO.name}.\n"
+            f"  Looked for a clone of {PLATFORM_REMOTE} in $MANDALA_PLATFORM_REPO\n"
+            f"  and next to {REPO.name}.\n"
             f"  Set MANDALA_PLATFORM_REPO to compare against {SURFACE}."
         )
         return 0
