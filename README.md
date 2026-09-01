@@ -904,6 +904,7 @@ the type actually uses:
 | `window.closed`, `window.blurred` | `window_id`, and nothing else |
 | `process.exited` | `pid` and `exit_code` — or `lost`, when the guest stopped knowing about the command |
 | `clipboard.changed` | `selection`, either `clipboard` or `primary`. Not the contents |
+| `file.changed` | `watch`, and then `path`/`kind`/`is_dir` — or `armed`, or `lost_reason`. See below |
 | `computer.ready` | the desktop session is up and accepting input |
 | `computer.idle` | `idle_seconds`. Holding this socket open is not activity |
 | `computer.started`, `.stopped`, `.suspended` | `status`, and `previous` where there was one |
@@ -932,15 +933,105 @@ carries the state instead, and a stream joining an already-ready desktop yields 
 `computer.ready` marked `synthesized` as its first event. So the `wait_for` above
 returns at once on a computer somebody else already started.
 
+**Watching a directory.** `file.changed` is the one type that never arrives
+unasked. Nominate a tree — one path, or up to four — when you open the stream,
+and you are sent changes under it and nothing else:
+
+```python
+from contextlib import closing
+
+with closing(c.events(watch="/home/user/out")) as stream:
+    for ev in stream:
+        if ev.type == "file.changed" and ev.path:
+            print(ev.kind, ev.path)  # created / modified / deleted
+```
+
+It is an option on the *connection*, not a filter you apply afterwards: without
+a nomination no `file.changed` can reach that socket at all, and `wait_for()`
+refuses rather than waiting out its timeout if you ask for one without a
+`watch=`. The tree is watched all the way down; nothing is announced about what
+is already in it, and a rename inside it is a `deleted` and a `created` rather
+than a move.
+
+```python
+ev = c.wait_for("file.changed", watch="/home/user/out", timeout=120)
+print(ev.kind, ev.path)
+```
+
+That wait ends on a *change* and on nothing else. Two of the three shapes below
+share the `file.changed` name without naming a file, so a wait matched on the
+type alone would return the arming marker on a fresh nomination and a real
+change on a tree somebody else had already armed — the same call meaning two
+different things depending on who got there first. The markers still arrive on
+`events()`, and `stream.watching` folds them into each tree's state. If the wait
+times out and a nominated tree never armed, the error says so.
+
+**Match on what `hello` gives back, not on what you sent.** The host normalises
+a nomination — a trailing slash and a `.` segment are cleaned away — and the
+cleaned form is what every event carries in `ev.watch`. `stream.watching` is
+where the answer is, and it carries the half a client gets wrong:
+
+```python
+with closing(c.events(watch=["/home/user/out", "/srv/build"])) as stream:
+    for tree in stream.watching or []:
+        print(tree.path, tree.armed)
+```
+
+`armed` is whether the tree is *already being watched*. A watch is not live the
+moment the nomination is accepted — the guest has to be asked, and on a computer
+nobody has opened a terminal on the host installs the watcher first — and inotify
+reports changes rather than state, so anything that happens before a watch arms
+is never reported. Until a tree is armed, silence means "not watching yet"
+rather than "nothing has changed".
+
+So `armed: false` means wait for that tree's `file.changed` with `ev.armed` set.
+`armed: true` means live *now*, and no event is coming to say so — somebody else
+nominated it first and the guest answers a nomination once. Same split as
+`ready`: state in the opening frame, transitions on the stream. `stream.watching`
+tracks both, so read it rather than only listening.
+
+Two of the three payload shapes carry no `path` at all, and they are not
+decoded into an event with an empty one:
+
+| shape | what it means |
+| --- | --- |
+| `watch`, `path`, `kind`, `is_dir` | something under the tree changed |
+| `watch`, `armed` | the tree is live from here on. Arrives again after anything that re-arms it |
+| `watch`, `lost_reason` | the picture of this tree is wrong |
+
+`lost_reason` is `"flood"` (transient — re-read the tree and keep listening),
+`"budget"` (the tree does not fit the watch; nominate a narrower path) or
+`"unwatchable"` (not there yet, not a directory, unreadable, or a symlink, which
+is refused rather than followed). Only `unwatchable` means the tree is not being
+watched, and it recovers on its own — nominating the directory a job is about to
+create is a supported thing to do, and the recovery is announced by `armed` and
+by nothing else.
+
+That difference moves `stream.watching`: an `unwatchable` takes the tree back out
+of the armed set and the other two leave it in, because under those the tree *is*
+being watched and merely reported incompletely. So the list keeps answering the
+question `armed` is for — whether silence about this tree means anything — rather
+than the question of whether anything has gone wrong.
+
 **`source` is worth reading.** `daemon` means the platform observed it. `guest`
-means the machine reported it about itself — every `window.*`, `clipboard.changed`
-and `computer.ready` — and anyone with root inside that guest can make those say
-anything. They are your machine describing itself, which is exactly as much as
-they are worth. A window title is content; treat it like one.
+means the machine reported it about itself — every `window.*`,
+`clipboard.changed`, `file.changed` and `computer.ready` — and anyone with root
+inside that guest can make those say anything. They are your machine describing
+itself, which is exactly as much as they are worth. A window title is content;
+treat it like one.
 
 **What a given computer can emit** is on the opening frame, not fixed by the
 platform: a guest with nowhere to run a watcher produces no `window.*` and no
 `computer.ready`.
+
+That half does not go missing all at once, which is the part worth knowing. The
+desktop watcher needs the guest's terminal channel *and* the X bindings; the file
+watcher needs the channel alone, because it is written against libc's own inotify
+calls. So every Linux image the platform has published can emit `file.changed`,
+including the ones that predate the bindings and emit no window events at all — a
+computer whose vocabulary names `file.changed` and no `window.*` is ordinary, not
+broken. `GUEST_EVENT_TYPES` is the provenance question (what `source` says);
+`DESKTOP_EVENT_TYPES` and `CHANNEL_EVENT_TYPES` are the availability one.
 
 ```python
 from contextlib import closing
@@ -968,6 +1059,11 @@ stopped computer for the same reason: this is the one part of the API that does
 c.wait_for("window.opened", timeout=30)
 # MandalaError: vm-1 cannot emit window.opened, so waiting for it would never end.
 ```
+
+A nomination is refused before any of that: a path this host cannot honour is a
+`400` on the upgrade, and a computer already watching all 32 trees it can watch
+at once across every stream open on it is a `409`. Neither is retried — they are
+decisions rather than weather.
 
 `events_url` is absent on a Windows guest and on a watch-only connect surface,
 and the credential in it is rotated by a restart — which is why every reconnect
