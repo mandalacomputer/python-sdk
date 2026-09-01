@@ -228,6 +228,28 @@ async def test_exec_desktop_sends_session_desktop(client: mc.AsyncClient) -> Non
     assert json.loads(route.calls.last.request.content)["session"] == "desktop"
 
 
+@pytest.mark.parametrize(
+    "wait",
+    [
+        lambda c, **kw: c.wait_for_move(**kw),
+        lambda c, **kw: c.wait_until_built(**kw),
+        lambda c, **kw: c.wait_until_running(**kw),
+        lambda c, **kw: c.wait_for_guest(**kw),
+    ],
+    ids=["wait_for_move", "wait_until_built", "wait_until_running", "wait_for_guest"],
+)
+async def test_computer_waits_refuse_a_timeout_or_poll_they_cannot_honour(
+    client: mc.AsyncClient, wait: object
+) -> None:
+    """The two halves diverged here, which is the part that makes it a parity
+    defect as well as a correctness one."""
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="poll must be a finite, non-negative"):
+        await wait(c, timeout=1.0, poll=-1)  # type: ignore[misc]
+    with pytest.raises(ValueError, match="timeout must be a finite, non-negative"):
+        await wait(c, timeout=float("nan"))  # type: ignore[misc]
+
+
 @respx.mock
 async def test_wait_until_running_polls(client: mc.AsyncClient) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(

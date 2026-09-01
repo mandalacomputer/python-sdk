@@ -902,6 +902,14 @@ def test_the_document_guard_canonicalises_before_it_checks() -> None:
         _api.template_document(Sneaky(""))
 
 
+def test_an_unpaired_surrogate_in_a_document_is_a_value_error() -> None:
+    """``encode`` raises ``UnicodeEncodeError``, which a caller wrapping
+    publish in ``except ValueError`` would miss. Clipboard and env already
+    convert it."""
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        _api.template_document("ok\ud800")
+
+
 def test_a_trailing_newline_is_not_a_version() -> None:
     """Python's ``$`` also matches just before a trailing newline.
 
