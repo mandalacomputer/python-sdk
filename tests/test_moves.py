@@ -225,6 +225,71 @@ class TestWaitForMove:
         assert "has not stopped" in str(caught.value)
 
     @respx.mock
+    def test_waits_on_the_live_row_and_not_a_stale_one_listed_first(
+        self, client: mc.Client
+    ) -> None:
+        """``GET /moves`` keeps a finished move for a day, and that day covers
+        this computer's own. A machine moved this morning and moved again now
+        has two rows and nothing orders them, so taking the first match ended
+        the wait on the morning's outcome while the disk copy was still
+        running — with ``moved``, which reads as "the move landed and the
+        resize did not", sending the caller on to resize a machine in flight
+        (adversarial review, OPL-4222)."""
+        c = computer(client)
+        stale = {**DONE, "state": "moved", "ram_mb": 4096}
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [stale, MOVING]}))
+        with pytest.raises(mc.TimeoutError) as caught:
+            c.wait_for_move(timeout=0.05, poll=0.01)
+        assert "state moving" in str(caught.value)
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        "order", ["platform", "reversed"], ids=["newest-first", "oldest-first"]
+    )
+    def test_answers_with_the_newest_finished_row_when_none_is_live(
+        self, client: mc.Client, order: str
+    ) -> None:
+        """Nothing live left to find, so the latest ``started_at`` is the answer
+        — read off the rows and not off their order.
+
+        The platform sends them newest-first (``ORDER BY started_at DESC``), so
+        position would answer this correctly today. Depending on it is how the
+        first version of this fix took the LAST row, guessed oldest-first, and
+        picked exactly the stale outcome it was written to avoid
+        (/code-review, OPL-4222).
+        """
+        c = computer(client)
+        morning = {**DONE, "state": "moved", "ram_mb": 4096, "started_at": "2026-08-23T02:00:12Z"}
+        afternoon = {**DONE, "started_at": "2026-08-23T14:00:00Z"}
+        rows = [afternoon, morning] if order == "platform" else [morning, afternoon]
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": rows}))
+        assert c.wait_for_move(poll=0.01).state == "done"
+
+    @respx.mock
+    def test_falls_back_to_the_platforms_order_when_the_stamps_cannot_decide(
+        self, client: mc.Client
+    ) -> None:
+        """Unreadable or identical stamps leave position, which is newest-first."""
+        c = computer(client)
+        newest = {**DONE, "started_at": ""}
+        older = {**DONE, "state": "moved", "ram_mb": 4096, "started_at": ""}
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [newest, older]}))
+        assert c.wait_for_move(poll=0.01).state == "done"
+
+    @respx.mock
+    def test_a_malformed_envelope_is_not_a_computer_that_was_deleted(
+        self, client: mc.Client
+    ) -> None:
+        """``_my_move`` degraded a non-list ``moves`` to ``None``, and
+        ``wait_for_move`` reads ``None`` as the platform reaping a move along
+        with its computer — the exact misdiagnosis ``move_rows`` was written to
+        prevent, on the one path that polls (/code-review, OPL-4222)."""
+        c = computer(client)
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": "moving"}))
+        with pytest.raises(mc.MandalaError, match="array of objects"):
+            c.wait_for_move(timeout=5, poll=0.01)
+
+    @respx.mock
     def test_stops_when_the_move_stops_being_listed(self, client: mc.Client) -> None:
         # MandalaError and not a timeout: waiting longer cannot bring back a row
         # the platform reaped, and spending the whole deadline to say so is the
@@ -251,6 +316,46 @@ class TestMovesCollection:
         respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": []}))
         assert client.moves.list() == []
 
+    @respx.mock
+    @pytest.mark.parametrize(
+        "moves",
+        [{"computer_id": "vm-1"}, "moving", 7, None],
+        ids=["object", "string", "number", "null"],
+    )
+    def test_refuses_an_envelope_that_is_not_an_array(
+        self, client: mc.Client, moves: object
+    ) -> None:
+        """Every other listing goes through ``json_array``, which insists on an
+        array of objects. This one answered ``[]`` — and an empty moves listing
+        means something specific, since ``wait_for_move`` reads it as a move the
+        platform reaped along with its computer (adversarial review, OPL-4222)."""
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": moves}))
+        with pytest.raises(mc.MandalaError, match="array of objects"):
+            client.moves.list()
+
+    @respx.mock
+    def test_refuses_a_row_that_is_not_an_object(self, client: mc.Client) -> None:
+        """It reached ``Move.from_api`` and came back out as ``AttributeError:
+        'str' object has no attribute 'get'`` — a bare builtin escaping a public
+        method, past the MandalaError this SDK promises."""
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE, "junk"]}))
+        with pytest.raises(mc.MandalaError, match="array of objects"):
+            client.moves.list()
+
+    @pytest.mark.parametrize("bad", ["oops", False, [], float("nan")], ids=str)
+    def test_an_unreadable_size_is_not_a_resize_to_nothing(self, bad: object) -> None:
+        """``None`` on these three means "not being changed" and never "changed
+        to nothing" — the field docstring says so, on the fields this operation
+        exists to grow. ``_num`` answered 0 for anything it could not read, so a
+        caller reading ``move.cpu is not None`` as "this dimension changed" was
+        told a resize to zero CPUs was in flight (adversarial review,
+        OPL-4222)."""
+        move = mc.Move.from_api({**MOVING, "cpu": bad, "ram_mb": bad, "disk_gb": bad})
+        assert (move.cpu, move.ram_mb, move.disk_gb) == (None, None, None)
+        # A real zero is still a real answer, which is why this is `_opt_num`
+        # and not a truthiness test.
+        assert mc.Move.from_api({**MOVING, "cpu": 0}).cpu == 0
+
 
 class TestAsyncHalf:
     """The async client does the same things, not merely the same shapes.
@@ -273,6 +378,26 @@ class TestAsyncHalf:
             respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE]}))
             assert (await c.wait_for_move(poll=0.01)).state == "done"
             assert [m.computer_id for m in await client.moves.list()] == ["vm-1"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_waits_on_the_live_row_and_refuses_a_malformed_envelope(self) -> None:
+        """Both OPL-4222 fixes on the twin. ``_my_move`` is shared, but the two
+        wait loops are not, and this is the call site."""
+        async with mc.AsyncClient("com_test", base_url=BASE) as client:
+            respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+            c = await client.computers.get("vm-1")
+
+            stale = {**DONE, "state": "moved", "ram_mb": 4096}
+            respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [stale, MOVING]}))
+            with pytest.raises(mc.TimeoutError, match="state moving"):
+                await c.wait_for_move(timeout=0.05, poll=0.01)
+
+            respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": "moving"}))
+            with pytest.raises(mc.MandalaError, match="array of objects"):
+                await c.wait_for_move(timeout=5, poll=0.01)
+            with pytest.raises(mc.MandalaError, match="array of objects"):
+                await client.moves.list()
 
     @respx.mock
     @pytest.mark.asyncio

@@ -575,6 +575,53 @@ async def test_wait_for_guest_reports_an_async_failed_start_without_probing(
 
 
 @respx.mock
+async def test_async_wait_until_running_reports_a_failed_start_without_polling(
+    client: mc.AsyncClient,
+) -> None:
+    """The sync half's OPL-4222 fix, proved on the twin that shares none of the
+    body. ``refresh()`` clears ``start_error``, so a wait that refreshed first
+    spent its whole timeout not discovering a reason it already had."""
+    poll = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+    )
+    computer = mc.AsyncComputer(
+        client._t,
+        {**COMPUTER, "status": "stopped", "start_error": "boot allocation failed"},
+    )
+    with pytest.raises(mc.MandalaError, match="did not start: boot allocation failed"):
+        await computer.wait_until_running(timeout=30, poll=0)
+    assert not poll.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_wait_until_running_still_polls_an_ordinary_stopped_computer(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=[
+            httpx.Response(200, json={**COMPUTER, "status": "stopped"}),
+            httpx.Response(200, json=COMPUTER),
+        ]
+    )
+    computer = mc.AsyncComputer(client._t, {**COMPUTER, "status": "stopped"})
+    assert (await computer.wait_until_running(timeout=30, poll=0)).status == "running"
+    await client.aclose()
+
+
+@respx.mock
+async def test_async_wait_for_answers_an_expired_deadline_like_its_siblings(
+    client: mc.AsyncClient,
+) -> None:
+    computer = mc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(mc.TimeoutError, match="did not emit computer.ready within 0s"):
+        await computer.wait_for("computer.ready", timeout=0)
+    with pytest.raises(mc.MandalaError, match="positive finite"):
+        computer.events(timeout=0)
+    await client.aclose()
+
+
+@respx.mock
 async def test_wait_for_guest_refreshes_an_async_stale_running_handle(
     client: mc.AsyncClient,
 ) -> None:
