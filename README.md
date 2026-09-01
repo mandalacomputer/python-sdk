@@ -116,6 +116,33 @@ Publishing a *different* document under the same ref is a `ConflictError`; bump
 `metadata.version`. What counts as different is the digest, so a changed label is
 a change.
 
+**Two digests, and one of them is sometimes a sentence instead.** `doc_digest`
+covers the whole document and changes with any edit; `build_digest` covers only
+what decides the image, so comparing it against a previous run is how you tell
+whether an edit means a rebuild. A document naming a parent in `spec.from` gets
+`build_digest_needs` *instead* of `build_digest` — the two are alternatives, not
+a pair — because a layered document's build digest depends on the contents of
+the base image, which only a host holding it can compute:
+
+```python
+if check.build_digest is None and check.build_digest_needs:
+    print(check.build_digest_needs)
+    # the contents of acme/base's image, which only a host holding it can
+    # supply. Run `gorillad -build-template <file> -dry-run` there to see
+    # this document's build digest
+```
+
+`check.canonical` is the document as `doc_digest` was taken over it — compact
+JSON, key order and whitespace normalised — so you can check the binding rather
+than trust it:
+
+```python
+import hashlib
+
+mine = "sha256:" + hashlib.sha256(check.canonical.encode()).hexdigest()
+assert mine == check.doc_digest
+```
+
 Read one back — yours or `system`, so you can see what you are layering onto:
 
 ```python
