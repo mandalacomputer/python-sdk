@@ -173,6 +173,19 @@ class TestTheWindow:
         assert not route.called
 
     @respx.mock
+    def test_refuses_a_trailing_newline(self, client: mc.Client) -> None:
+        """Python's ``$`` also matches just before a trailing newline.
+
+        A stamp read from a config file with one would have gone out as
+        ``from=...%0A``. Same trap as a template version, same remedy, and on
+        the one call whose output somebody checks against an invoice.
+        """
+        route = answering()
+        with pytest.raises(ValueError, match="RFC 3339"):
+            client.usage.read(since="2026-08-01T00:00:00Z\n")
+        assert not route.called
+
+    @respx.mock
     def test_reports_the_window_that_was_measured(self, client: mc.Client) -> None:
         # A ``until`` in the future is answered as now. The response carries the
         # instant used, so two reads are comparable as windows rather than as

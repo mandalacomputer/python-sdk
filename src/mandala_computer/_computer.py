@@ -78,19 +78,37 @@ SCREEN_HEIGHT = 800
 DEFAULT_RESOLUTION = f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24"
 
 
-def _require_model_key(model_key: str) -> None:
+_NO_MODEL_KEY = (
+    "the agent needs your own Anthropic API key as model_key — "
+    "the platform does not store one, and never bills you for it."
+)
+
+
+def _require_model_key(model_key: str) -> str:
     """The agent routes need the caller's own Anthropic key, and only theirs.
 
     Refused here rather than sent empty because the failure is otherwise a 401
     on a route where a 401 reads as "your Mandala key is wrong" — which is the
     one thing it does not mean. The platform stores no model key and will not
     fall back to one.
+
+    Returns the canonical text, and the caller must send THAT rather than what
+    it was handed: httpx serialises a header value by calling the value's own
+    ``encode``, so a ``str`` subclass checked here and then sent unchanged puts
+    a different key on the wire than the one that passed. Checking in place is
+    what leaves that gap open, which is why this returns instead.
     """
-    if not model_key or not model_key.strip():
-        raise MandalaError(
-            "the agent needs your own Anthropic API key as model_key — "
-            "the platform does not store one, and never bills you for it."
-        )
+    # ``None`` is the case that actually happens — ``os.environ.get`` on an
+    # unset variable — and the message below was written to answer exactly it,
+    # so it keeps both that wording and its class. A non-string is a different
+    # mistake and gets ``canonical``'s ValueError, like every other
+    # caller-controlled string in this SDK.
+    if model_key is None:
+        raise MandalaError(_NO_MODEL_KEY)
+    text = _api.canonical(model_key, "model_key")
+    if not text.strip():
+        raise MandalaError(_NO_MODEL_KEY)
+    return text
 
 
 def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> AgentResult:
@@ -358,6 +376,51 @@ def _require_background_pid(data: Mapping[str, Any]) -> None:
 #: Arbitrary, and any positive number would do; what matters is that a rate
 #: limit never retries instantly.
 RATE_LIMITED_FLOOR = 1.0
+
+
+def check_wait_args(timeout: float, poll: float) -> None:
+    """The two numbers every wait in this SDK is steered by, checked once.
+
+    Shared so the halves cannot diverge, and they had (adversarial review,
+    OPL-3835): ``poll=-1`` reached ``time.sleep(-1)`` and raised a bare
+    ``ValueError`` out of the sync half, while ``asyncio.sleep(-1)`` returned at
+    once and turned the async half into a tight loop against a metered endpoint.
+    ``timeout=float("nan")`` was worse in both — every ``remaining <= 0``
+    comparison is false against a NaN, so the deadline this method's docstring
+    promises never arrived and the wait ran for ever.
+
+    This lived in _resources.py, reached only by the build wait, while the
+    other waits had nothing of the kind. One copy now, for the reason there is
+    one predicate: the same question deserves the same answer wherever it is
+    asked.
+
+    NEGATIVE and non-finite only. Zero was refused too for one commit, and that
+    was a compatibility break wider than the bug it was fixing (second
+    adversarial review, OPL-3835): every sibling wait in this SDK —
+    ``wait_until_built``, ``wait_until_running``, ``wait_for_guest`` — takes
+    ``poll=0``, and this repository's own tests pass it at twenty-odd call
+    sites. ``timeout=0`` is an already-expired deadline, and the sibling waits
+    answer it with the ``TimeoutError`` their callers are catching; raising a
+    ``ValueError`` instead would go past that handler.
+
+    ``poll=0`` DOES mean no delay between polls, and against a live endpoint
+    that is a hammering loop — ``time.sleep(0)`` and ``await asyncio.sleep(0)``
+    both return at once (third adversarial review, OPL-3835). It is allowed
+    anyway because it is not this method's property to fix: all eight sibling
+    wait loops do the same thing with the same argument and there is no poll
+    floor anywhere in the SDK, so refusing it HERE would make the helper
+    stricter than the loops it serves. A floor is worth having; it is worth
+    having everywhere at once, not smuggled in through the one wait a review
+    happened to look at.
+    """
+    for value, what in ((timeout, "timeout"), (poll, "poll")):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{what} must be a finite, non-negative number of seconds")
 
 
 def _poll_delay(err: MandalaError, poll: float) -> float:
@@ -950,6 +1013,7 @@ class Computer(ComputerFields):
         more when the target has to be sent the image this computer was built
         from first.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         last: Move | None = None
         while True:
@@ -1056,6 +1120,7 @@ class Computer(ComputerFields):
         The default timeout is generous because the work is: a compressed
         conversion of a 40 GB Windows disk takes several minutes on a busy host.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         while True:
             if self.build_failed:
@@ -1101,6 +1166,7 @@ class Computer(ComputerFields):
         the timeout for the two states that will not become "running" on their
         own — a failed build, and a suspended session nobody has resumed.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -1169,6 +1235,7 @@ class Computer(ComputerFields):
         :attr:`start_error` from a failed boot. A suspended computer is not:
         running the probe counts as use and resumes its saved session.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         while True:
             # The caller's interval, unless a failure below asks for longer.
@@ -2007,7 +2074,7 @@ class Computer(ComputerFields):
         not guarantee generator cleanup on every Python implementation. The
         standard :func:`contextlib.closing` helper makes that concise.
         """
-        _require_model_key(model_key)
+        model_key = _require_model_key(model_key)
         steps = 0
         with closing(
             self._t.sse(
@@ -2066,10 +2133,13 @@ class Computer(ComputerFields):
                     result = event.result
                 elif isinstance(event, AgentFailed):
                     failure = event
-        except TimeoutError:
+        except (TimeoutError, ConnectionError):
             # The stream deliberately remains open after done so a trailing
             # failure can override it. Silence after done is not itself a
             # failure, however, and must not discard the result already sent.
+            # A dropped connection is the same situation: the result is in
+            # hand, and ConnectionInterruptedError — a ConnectionError, not a
+            # TimeoutError — used to throw it away.
             if result is None and failure is None:
                 raise
         return _agent_outcome(result, failure)
@@ -2103,7 +2173,7 @@ class Computer(ComputerFields):
         and heartbeats every ten seconds, so nothing about it looks idle to the
         hop that would otherwise stop waiting.
         """
-        _require_model_key(model_key)
+        model_key = _require_model_key(model_key)
         data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "agent"),
