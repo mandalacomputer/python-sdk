@@ -713,12 +713,27 @@ def test_a_stream_is_given_up_on_when_it_goes_quiet_not_when_it_runs_long(
 
 
 @respx.mock
-def test_a_client_of_your_own_still_sets_the_stream_budget() -> None:
-    """The budget only ever widens, here as everywhere else."""
+@pytest.mark.parametrize("own", [600.0, None, 5.0], ids=["patient", "none", "impatient"])
+def test_a_client_of_your_own_does_not_move_the_stream_idle_bound(own: float | None) -> None:
+    """A stream's ``read`` is the SILENCE bound, so it is set rather than widened.
+
+    This asserted ``read == 600.0`` — "the budget only ever widens, here as
+    everywhere else". That rule is right for ``exec`` and the file routes, where
+    ``read`` is effectively a total deadline and shortening a patient client
+    would abandon work the platform is still doing. On a stream it is per-chunk
+    idle time, so widening cannot rescue a long run (the sibling test above says
+    why) and only removes the bound: ``timeout=600`` waited ten minutes on a
+    dead socket, and ``timeout=None`` waited for ever — which is exactly the
+    hang that sibling's docstring says ``None`` was (OPL-4232).
+
+    ``connect`` stays the caller's: a patient client is still entitled to be
+    patient about getting the stream open.
+    """
     route = respx.post(AGENT).mock(stream(DONE_FRAME))
-    patient = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=600.0))
-    mc.Computer(patient._t, COMPUTER).agent("do the thing", model_key=KEY)
-    assert _budget(route)["read"] == 600.0
+    own_client = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=own))
+    mc.Computer(own_client._t, COMPUTER).agent("do the thing", model_key=KEY)
+    assert _budget(route)["read"] == mc._client.STREAM_IDLE_TIMEOUT
+    assert _budget(route)["connect"] == own
 
 
 def test_a_mid_stream_rate_limit_says_it_has_no_delay_to_offer(

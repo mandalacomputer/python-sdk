@@ -367,11 +367,86 @@ def test_wait_until_running_polls_until_ready(client: mc.Client) -> None:
 
 @respx.mock
 def test_wait_until_running_times_out(client: mc.Client) -> None:
-    respx.get(f"{BASE}/computers/vm-1").mock(
+    """A computer that never comes up, on a handle that does not already say it did.
+
+    The handle used to be built from ``COMPUTER``, which is ``status:
+    "running"`` — so this passed on the machine being up, raising "still
+    \'running\' after 0s", and its mock was never called once. It would have
+    passed with no respx at all, and it failed the moment the wait started
+    reading its cached state (OPL-4232).
+    """
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "status": "stopped"})
     )
-    c = mc.Computer(client._t, COMPUTER)
-    with pytest.raises(mc.TimeoutError):
+    c = mc.Computer(client._t, {**COMPUTER, "status": "stopped"})
+    with pytest.raises(mc.TimeoutError, match="still 'stopped'"):
+        c.wait_until_running(timeout=0.05, poll=0)
+    assert route.called
+
+
+@respx.mock
+def test_wait_until_running_returns_at_once_for_a_computer_already_running(
+    client: mc.Client,
+) -> None:
+    """``timeout=0`` is an expired budget, not an instruction to fail.
+
+    It is what a computed remaining budget becomes, and the sibling
+    ``wait_until_built`` has always answered one from the state in hand. This
+    one checked the deadline first, so it raised ``TimeoutError: vm-1 was still
+    \'running\' after 0s`` about a machine it had been handed as running
+    (OPL-4232).
+    """
+    route = respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(500))
+    assert mc.Computer(client._t, COMPUTER).wait_until_running(timeout=0, poll=0).status == (
+        "running"
+    )
+    assert not route.called
+
+
+@respx.mock
+def test_a_stale_running_handle_is_still_verified_while_there_is_budget(
+    client: mc.Client,
+) -> None:
+    """The cached read is the EXPIRED-budget branch only, and that is the point.
+
+    `wait_until_built` may read its cached status on every pass because
+    "building" is one-way. "running" is not: a host suspends anything nobody has
+    touched for its idle window, so a handle that once said running goes stale on
+    its own. Trusting it while there is still time to ask would make this wait a
+    no-op — "it is up" about a machine suspended out from under the caller, who
+    then reaches for `screenshot()`, which is documented not to resume one
+    (/code-review, OPL-4232).
+    """
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "suspended"})
+    )
+    c = mc.Computer(client._t, COMPUTER)  # the handle still says "running"
+    with pytest.raises(mc.MandalaError, match="is suspended"):
+        c.wait_until_running(timeout=5, poll=0)
+    assert route.called
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("status", "says"),
+    [
+        ("suspended", "call start\\(\\) to resume it"),
+        ("build-failed", "could not be built"),
+        ("building", "call wait_until_built"),
+    ],
+)
+def test_an_expired_budget_still_names_the_state_that_will_not_start(
+    client: mc.Client, status: str, says: str
+) -> None:
+    """The three the docstring promises, answered from the cached payload too.
+
+    They were only ever reached after a refresh, so an already-expired budget
+    replaced every one of them with a bare timeout — the least useful sentence
+    available about the one case a caller can fix in a line (OPL-4232).
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(500))
+    c = mc.Computer(client._t, {**COMPUTER, "status": status})
+    with pytest.raises(mc.MandalaError, match=says):
         c.wait_until_running(timeout=0, poll=0)
 
 
@@ -776,7 +851,10 @@ def test_wait_until_running_caps_refresh_to_its_remaining_budget(client: mc.Clie
     route = respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "status": "running"})
     )
-    mc.Computer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
+    # A handle that is NOT already running, so the wait actually refreshes: the
+    # cached-state check added in OPL-4232 returns before any request when the
+    # payload in hand already says "running", which is what this used to pass on.
+    mc.Computer(client._t, {**COMPUTER, "status": "stopped"}).wait_until_running(timeout=2, poll=0)
     assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
 
 
@@ -1812,6 +1890,125 @@ def test_a_quiet_server_is_not_reported_as_nothing_destroyed(client: mc.Client) 
 
 
 @respx.mock
+def test_a_proxy_page_is_not_a_successful_delete(client: mc.Client) -> None:
+    """The captive-portal hole `json_object` exists to close, on the one
+    irreversible call.
+
+    `delete` was the last caller of the bare `json()` helper. An HTML login page
+    answered 200 parses to `None`, and `None` on this route is a documented,
+    legitimate answer — "destroyed, and the platform did not name a count" — so
+    a request that never reached the platform read as a computer that is gone.
+    The caller then stops tracking a machine that is still running and still
+    billable (OPL-4232).
+    """
+    respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(
+            200,
+            content=b"<html><body>Sign in</body></html>",
+            headers={"content-type": "text/html"},
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="not a JSON object"):
+        _computer(client).delete()
+
+
+@respx.mock
+@pytest.mark.parametrize("response", [httpx.Response(204), httpx.Response(200, content=b"")])
+def test_an_empty_delete_body_is_still_a_delete(client: mc.Client, response) -> None:
+    """A 204 says "done, and nothing to tell you" and must keep meaning that.
+
+    The refusal above is about a NON-empty body that is not an object; nothing
+    was tightened about the quiet server this route is allowed to be.
+    """
+    respx.delete(f"{BASE}/computers/vm-1").mock(response)
+    assert _computer(client).delete() is None
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("path", "body", "call"),
+    [
+        ("delete count", '{"ok":true,"snapshots_deleted":1e309}', lambda c: c.delete()),
+        ("background pid", '{"pid":1e309}', lambda c: c.start_exec("sleep 1")),
+    ],
+)
+def test_an_infinite_number_stays_inside_the_error_family(
+    client: mc.Client, path: str, body: str, call
+) -> None:
+    """`json.loads("1e309")` is `inf`, and `int(inf)` is an `OverflowError`.
+
+    Which is neither of the two exceptions these guards caught, so a builtin
+    escaped past the `MandalaError` this SDK promises — beside sibling values
+    (`"soon"`, `[]`, `{}`) that were correctly refused. `_num`, `_opt_num` and
+    `_exit_code` all test `math.isfinite` for exactly this reason; these did
+    not (OPL-4232).
+
+    Two of the three raise AFTER the side effect has landed — the computer is
+    already destroyed, the guest command is already running — so a caller with
+    `except MandalaError` saw a builtin and reasonably concluded the call had
+    not happened.
+    """
+    respx.route(host="api.test").mock(
+        httpx.Response(200, content=body.encode(), headers={"content-type": "application/json"})
+    )
+    # Built directly rather than through `_computer()`, whose own GET the
+    # catch-all above would otherwise answer with this body.
+    with pytest.raises(mc.MandalaError):
+        call(mc.Computer(client._t, COMPUTER))
+
+
+@respx.mock
+def test_an_infinite_pointer_coordinate_is_unknown_rather_than_a_crash(
+    client: mc.Client,
+) -> None:
+    """The same `int(inf)` hole, on the one site whose answer is not an error.
+
+    `_cursor` returns `None` for a coordinate it cannot read — "the pointer is
+    somewhere this client cannot state" — which is the whole reason it does not
+    coerce to zero and report the corner of the screen. An `OverflowError`
+    escaped past that (OPL-4232).
+    """
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        httpx.Response(
+            200,
+            content=b'{"known":true,"x":1e309,"y":1}',
+            headers={"content-type": "application/json"},
+        )
+    )
+    assert mc.Computer(client._t, COMPUTER).cursor_position() is None
+
+
+@respx.mock
+def test_wait_for_move_caps_its_poll_to_its_remaining_budget(client: mc.Client) -> None:
+    """The one `wait_*` that never got the cap its siblings all have.
+
+    Every other wait that reads the control plane passes `timeout_cap`;
+    `wait_for_move` sent each poll with the client's own timeout — sixty seconds
+    by default, and nothing at all on a caller-supplied `timeout=None` client —
+    so a five-second wait sat in a single GET far past the deadline it
+    documents, then raised a `TimeoutError` claiming the move was still going
+    after five seconds (OPL-4232).
+    """
+    # Two answers rather than a mock that is live for ever: `poll=0` against an
+    # always-live listing spins for the whole wall-clock timeout and retains
+    # every mocked call, which made this the slowest test in the suite by 2x
+    # (/code-review, OPL-4232). The cap is a property of the FIRST poll, so one
+    # live answer and one finished one is the whole of what this needs.
+    route = respx.get(f"{BASE}/moves").mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"moves": [{"computer_id": "vm-1", "state": "moving", "live": True}]}
+            ),
+            httpx.Response(
+                200, json={"moves": [{"computer_id": "vm-1", "state": "done", "live": False}]}
+            ),
+        ]
+    )
+    assert _computer(client).wait_for_move(timeout=1, poll=0).state == "done"
+    assert max(route.calls[0].request.extensions["timeout"].values()) <= 1
+
+
+@respx.mock
 def test_a_malformed_delete_count_is_an_sdk_error(client: mc.Client) -> None:
     respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json={"snapshots_deleted": []}))
     with pytest.raises(mc.MandalaError, match="invalid snapshots_deleted"):
@@ -2813,7 +3010,16 @@ def test_a_malformed_idle_window_is_an_sdk_error() -> None:
 
 @pytest.mark.parametrize("model", [mc.ExecResult, mc.ExecStatus])
 def test_a_boolean_exit_code_is_rejected(model: type[mc.ExecResult | mc.ExecStatus]) -> None:
-    with pytest.raises(TypeError, match="exit_code.+boolean"):
+    """A `MandalaError`, like every other refusal on this decoder.
+
+    This pinned `TypeError` — the one builtin among them. The README says
+    everything the platform answers with derives from `MandalaError` and scopes
+    its `TypeError` carve-out to arguments refused before anything is sent,
+    naming four; a response field is not one of them. So a JSON `true` left
+    `exec()` past the handler the README tells callers to write, while
+    `{"exit_code": "oops"}` next door was correctly refused (OPL-4232).
+    """
+    with pytest.raises(mc.MandalaError, match="invalid exit_code"):
         model.from_api({"exit_code": False})
 
 

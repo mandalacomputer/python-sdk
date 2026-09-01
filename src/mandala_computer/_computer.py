@@ -259,6 +259,44 @@ def _continues(path: str, asked_from: int, part: FilePart, total_was: int | None
         )
 
 
+def _started_key(stamp: str) -> tuple[int, str]:
+    """``Move.started_at`` as something two of them can be ordered by.
+
+    The raw string is not that, and the failure is narrow but real: RFC 3339
+    with a fractional part sorts BEFORE the same instant without one, because
+    ``'.'`` (46) precedes ``'Z'`` (90) —
+
+        '2026-08-23T02:00:12.999Z' < '2026-08-23T02:00:12Z'   ->  True
+
+    — so the later of two moves inside one second reads as the older. Go's
+    ``RFC3339`` and ``RFC3339Nano`` produce exactly that mix, and
+    :meth:`ComputerFields._my_move` uses this to pick the newest finished move
+    when there is no live one. Picking the stale row there is the same misread
+    OPL-4222 fixed for live-versus-finished: ``moved`` means the machine HAS
+    changed hosts, so acting on an older row sends a resize at a computer that
+    is somewhere else (adversarial review, OPL-4232).
+
+    Normalising the fraction away is enough, because everything to the left of
+    it is fixed-width and everything to the right is a decimal expansion that
+    already compares correctly. A stamp this cannot read sorts oldest rather
+    than raising — this runs on a listing, and one unreadable row must not cost
+    the caller the other one.
+    """
+    # Tier 0 is everything that is not a stamp at all — empty, or text that does
+    # not begin the way one does. It sorts OLDEST, so a row nobody can date never
+    # displaces a row that can be: `max` here is choosing what to hand the
+    # caller, and an unreadable stamp is not evidence of being recent.
+    if not stamp[:1].isdigit():
+        return (0, stamp)
+    head, dot, rest = stamp.partition(".")
+    if not dot:
+        return (1, stamp)
+    # Put the zone back on the whole-second stamp, so a fractional row and a
+    # whole one in the same second differ only by the fraction that follows.
+    zone = rest.lstrip("0123456789")
+    return (1, head + zone + "." + rest[: len(rest) - len(zone)])
+
+
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
     """The pointer position out of an input response, if it is known.
 
@@ -282,7 +320,14 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
         return None
     try:
         return int(x), int(y)
-    except (TypeError, ValueError):
+    # `OverflowError` with the two obvious ones, and it is the one that was
+    # missing here: `json.loads("1e309")` is `inf`, and `int(inf)` raises a
+    # class that is neither a `TypeError` nor a `ValueError` — so an infinite
+    # coordinate left `cursor_position()` as a bare builtin rather than as the
+    # `None` this function exists to answer with. `_num`, `_opt_num` and
+    # `_exit_code` in `_models` all catch it for the same reason
+    # (adversarial review, OPL-4232).
+    except (OverflowError, TypeError, ValueError):
         return None
 
 
@@ -354,7 +399,11 @@ def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
         raise MandalaError("DELETE computer answered with an invalid snapshots_deleted count")
     try:
         return int(deleted)
-    except (TypeError, ValueError) as exc:
+    # `OverflowError` for the reason `_cursor` gives, and this is the site where
+    # it costs the most: the DELETE has already succeeded by the time this runs,
+    # so a builtin escaping here reports a computer that is gone as a call that
+    # failed, and the obvious response to that is to try again (OPL-4232).
+    except (OverflowError, TypeError, ValueError) as exc:
         raise MandalaError(
             "DELETE computer answered with an invalid snapshots_deleted count"
         ) from exc
@@ -373,7 +422,11 @@ def _require_background_pid(data: Mapping[str, Any]) -> None:
     raw = data.get("pid")
     try:
         pid = 0 if raw is None else int(raw)
-    except (TypeError, ValueError):
+    # `OverflowError` for the reason `_cursor` gives. Like the delete count, the
+    # side effect has already happened: the command is running in the guest, so
+    # a builtin here loses the handle to it AND leaves the caller unable to tell
+    # that from a start that never took (OPL-4232).
+    except (OverflowError, TypeError, ValueError):
         pid = 0
     if isinstance(raw, bool) or pid <= 0:
         raise MandalaError("exec start answered without a positive pid")
@@ -595,6 +648,37 @@ class ComputerFields:
         """
         return self.status == "build-failed"
 
+    def _not_starting(self) -> MandalaError | None:
+        """The states that will not become "running" without another call.
+
+        The three :meth:`Computer.wait_until_running` documents, in one place so
+        the sync and async loops cannot word them differently — and so they can
+        be asked of a CACHED payload as readily as of a fresh one, which is what
+        lets that wait answer an already-expired budget with something better
+        than a bare timeout (OPL-4232).
+
+        An ordinary ``stopped`` is deliberately absent: that is exactly what the
+        wait is for, since a caller who has just called ``start()`` holds a
+        handle that still says so.
+        """
+        if self.build_failed:
+            return MandalaError(
+                f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+            )
+        # A suspended computer will not start on its own either. Left to spin it
+        # reports a machine that is one call from running as a timeout — the
+        # least informative answer available about the one case the caller can
+        # fix in a line.
+        if self.is_suspended:
+            return MandalaError(
+                f"{self.id} is suspended and will not start on its own: call start() to resume it"
+            )
+        if self.is_building:
+            return MandalaError(
+                f"{self.id} is still building: call wait_until_built(), then start()"
+            )
+        return None
+
     def _guest_wait_failure(self) -> MandalaError | None:
         """A cached lifecycle state from which a guest probe cannot recover."""
         if self.build_failed:
@@ -703,7 +787,9 @@ class ComputerFields:
             raise MandalaError("computer answered with an invalid idle_suspend_min")
         try:
             return int(value)
-        except (TypeError, ValueError) as exc:
+        # `OverflowError` for the reason `_cursor` gives: `"soon"` was already a
+        # `MandalaError` and `1e309` was not (OPL-4232).
+        except (OverflowError, TypeError, ValueError) as exc:
             raise MandalaError("computer answered with an invalid idle_suspend_min") from exc
 
     @property
@@ -821,7 +907,7 @@ class ComputerFields:
         ]
         if not mine:
             return None
-        newest = max(range(len(mine)), key=lambda i: (mine[i].started_at, -i))
+        newest = max(range(len(mine)), key=lambda i: (_started_key(mine[i].started_at), -i))
         return next((m for m in mine if m.live), mine[newest])
 
     def __repr__(self) -> str:
@@ -1047,8 +1133,29 @@ class Computer(ComputerFields):
         deadline = time.monotonic() + timeout
         last: Move | None = None
         while True:
+            # Capped to what is left, like every other wait that reads the
+            # control plane. This was the one that never got it: the poll went
+            # out with the client's own timeout — sixty seconds by default, and
+            # NOTHING at all on a caller-supplied client built with
+            # `timeout=None` — so `wait_for_move(timeout=5)` sat in a single GET
+            # far past the deadline it documents, and against a client with no
+            # ceiling the `TimeoutError` it promises never arrived
+            # (adversarial review, OPL-4232). `Builds.wait` and `_events_url`
+            # both carry the same cap for the same reason.
+            #
+            # The deadline is consulted BEFORE the poll, which is `Builds.wait`'s
+            # shape too: an already-spent budget has no request worth making, and
+            # sending one anyway would starve it to the 1ms floor `_cap_budget`
+            # imposes and then report the timeout as a failed poll.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self.id} was still moving after {timeout:g}s "
+                    f"(state {last.state if last else 'unknown'}; the move has not "
+                    "stopped, only this wait has)"
+                )
             try:
-                listed = self._t.json_object("GET", _api.MOVES)
+                listed = self._t.json_object("GET", _api.MOVES, timeout_cap=remaining)
             except MandalaError as err:
                 # The poll reads the control plane's own table, and one edge
                 # blip mid-move used to end the wait and report a move that was
@@ -1127,12 +1234,16 @@ class Computer(ComputerFields):
         server was quiet is the one wrong answer worth going out of the way to
         avoid.
         """
-        data = self._t.json(
+        data = self._t.json_object_or_empty(
             "DELETE",
             _api.computer(self.id),
             params=_api.delete_params(purge_snapshots=purge_snapshots, expect=expect),
         )
-        if not isinstance(data, Mapping):
+        # `None` is an empty body — a 204, or a 200 with nothing in it — which is
+        # a real answer here and stays one. What no longer reaches this line is a
+        # NON-empty body that is not an object: that used to arrive as `None` too,
+        # so a proxy's HTML login page read as a successful delete (OPL-4232).
+        if data is None:
             return None
         return _snapshots_deleted(data)
 
@@ -1218,6 +1329,32 @@ class Computer(ComputerFields):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # OUT OF BUDGET, so the payload in hand is the only evidence
+                # there is — and it is better evidence than nothing. Checked
+                # ONLY here, which is the difference from `wait_until_built`
+                # and is deliberate: that wait may read its cached status on
+                # every pass because "building" is one-way, while a RUNNING
+                # computer becomes suspended on its own whenever the host's
+                # idle sweep reaches it. Trusting the cache while there is
+                # still time to ask would turn this into a no-op on any handle
+                # that once said "running" — answering "it is up" about a
+                # machine that has since been suspended out from under the
+                # caller (/code-review, OPL-4232).
+                #
+                # What this fixes is the other end: the deadline used to be
+                # consulted before ANY state, so `wait_until_running(timeout=0)`
+                # on a computer the handle already said was running answered
+                # `TimeoutError: still 'running' after 0s`, and the three
+                # terminal states lost the dedicated errors this method's own
+                # docstring promises. `timeout=0` is an allowed, documented
+                # already-expired deadline and is what a computed remaining
+                # budget becomes, so it deserves the best sentence available
+                # rather than the emptiest (adversarial review, OPL-4232).
+                if self.status == "running":
+                    return self
+                failure = self._not_starting()
+                if failure is not None:
+                    raise failure
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
             try:
                 self._refresh(timeout_cap=remaining)
@@ -1227,30 +1364,20 @@ class Computer(ComputerFields):
                 # what had happened was a single poll not landing (OPL-3724).
                 time.sleep(_ride_out(err, deadline, poll))
                 continue
+            # The FRESHLY READ state, judged by the same two questions the
+            # expired-budget branch above asks of the cached one — written once
+            # each so the two answers cannot drift.
             if self.status == "running":
                 return self
-            # A computer with no disk will never start on its own, and waiting
-            # out the full timeout to say so helps nobody.
-            if self.build_failed:
-                raise MandalaError(
-                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
-                )
-            # Nor will a suspended one. It is a state this wait predates, and
-            # left to spin it reports a machine that is one call from running as
-            # a timeout — the least informative answer available about the one
-            # case the caller can fix in a line.
-            if self.is_suspended:
-                raise MandalaError(
-                    f"{self.id} is suspended and will not start on its own: "
-                    "call start() to resume it"
-                )
-            if self.is_building:
-                raise MandalaError(
-                    f"{self.id} is still building: call wait_until_built(), then start()"
-                )
+            failure = self._not_starting()
+            if failure is not None:
+                raise failure
             remaining = deadline - time.monotonic()
+            # Back to the top, which turns a spent budget into this wait's
+            # timeout — reported against the state just read rather than a
+            # stale one.
             if remaining <= 0:
-                raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
+                continue
             time.sleep(min(poll, remaining))
 
     def wait_for_guest(self, timeout: float = 180.0, poll: float = 3.0) -> Computer:
