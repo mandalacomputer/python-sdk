@@ -336,7 +336,13 @@ def template_document(document: str) -> bytes:
     text = canonical(document, "document")
     if not text.strip():
         raise ValueError("document must be a non-empty template document, as JSON or YAML")
-    return text.encode("utf-8")
+    # Unpaired surrogates are not UTF-8; ``encode`` raises ``UnicodeEncodeError``,
+    # which a caller wrapping this in ``except ValueError`` would miss, so it is
+    # the same refusal as clipboard and env.
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("document must be valid UTF-8") from exc
 
 
 def build(build_id: str) -> str:
@@ -522,7 +528,13 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
 
 #: An RFC 3339 timestamp carrying a time zone, which is the only kind the
 #: platform takes on ``GET /usage``.
-_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$")
+#:
+#: Matched with ``fullmatch``, not ``match``: Python's ``$`` also matches just
+#: before a trailing newline, so ``"2026-08-01T00:00:00Z\n"`` — a stamp read
+#: from a config file — satisfied the anchored pattern and was sent as
+#: ``from=...%0A``. Same trap as :data:`_VERSION`, and on the one call whose
+#: output somebody checks against an invoice.
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})")
 
 
 def _usage_stamp(value: datetime | str, what: str) -> str:
@@ -563,7 +575,7 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
             f"2026-08-01T00:00:00Z (or pass an aware datetime): {value!r}"
         )
     text = canonical(value, what)
-    if not _RFC3339.match(text):
+    if not _RFC3339.fullmatch(text):
         raise ValueError(
             f"{what} must be an RFC 3339 timestamp with a time zone, e.g. "
             f"2026-08-01T00:00:00Z (or pass an aware datetime): {value!r}"
@@ -728,18 +740,25 @@ def create_body(
             "or template/cpu/ram_mb/disk_gb without it"
         )
     name = _require_optional_name(name)
+    # ``name`` came back canonical from the check above; these three never had
+    # a check at all, and go on the wire beside it.
+    size = None if size is None else canonical(size, "size")
+    template = None if template is None else canonical(template, "template")
+    resolution = None if resolution is None else canonical(resolution, "resolution")
     body: dict[str, Any] = {"start": flag(start, "start")}
-    for key, value in (
+    for key, text in (
         ("name", name),
         ("size", size),
         ("template", template),
-        ("cpu", cpu),
-        ("ram_mb", ram_mb),
-        ("disk_gb", disk_gb),
         ("resolution", resolution),
     ):
-        if value is not None:
-            body[key] = value
+        if text is not None:
+            body[key] = text
+    # Bools are ints, so ``cpu=True`` is true and ``json.dumps`` then encodes
+    # it as a boolean. The platform wants a count, not JSON ``true``.
+    for key, count in (("cpu", cpu), ("ram_mb", ram_mb), ("disk_gb", disk_gb)):
+        if count is not None:
+            body[key] = whole(count, key, exc=ValueError)
     return body
 
 
@@ -813,7 +832,7 @@ def exec_body(
     guest agent inherits whatever directory it was started in, so a relative one
     resolves somewhere nobody named.
     """
-    body: dict[str, Any] = {"command": command}
+    body: dict[str, Any] = {"command": canonical(command, "command")}
     # A real bool for the same reason `desktop` is one below: `background="false"`
     # is truthy, and it selects the branch that sends NO timeout at all.
     if not flag(background, "background"):
@@ -985,9 +1004,10 @@ def window_body(
         raise ValueError("width and height are only valid for resize")
     body: dict[str, Any] = {"action": action}
     if x is not None and y is not None:
-        body["x"], body["y"] = x, y
+        body["x"], body["y"] = _coordinate(x, "x"), _coordinate(y, "y")
     if width is not None and height is not None:
-        body["width"], body["height"] = width, height
+        body["width"] = whole(width, "width", exc=ValueError)
+        body["height"] = whole(height, "height", exc=ValueError)
     return body
 
 
@@ -1067,8 +1087,9 @@ def resize_body(*, cpu: int | None, ram_mb: int | None, disk_gb: int | None) -> 
     computer, and guessing at the current size to reject it would be a client
     inventing a limit.
     """
+    # Bools are ints; see :func:`create_body`.
     body = {
-        key: value
+        key: whole(value, key, exc=ValueError)
         for key, value in (("cpu", cpu), ("ram_mb", ram_mb), ("disk_gb", disk_gb))
         if value is not None
     }
@@ -1092,11 +1113,12 @@ def move_body(*, ram_mb: int, cpu: int | None, disk_gb: int | None) -> dict[str,
     would be a rename that copies a multi-gigabyte disk between hosts and then
     does not happen.
     """
-    body: dict[str, Any] = {"ram_mb": ram_mb}
+    # Bools are ints; see :func:`create_body`.
+    body: dict[str, Any] = {"ram_mb": whole(ram_mb, "ram_mb", exc=ValueError)}
     if cpu is not None:
-        body["cpu"] = cpu
+        body["cpu"] = whole(cpu, "cpu", exc=ValueError)
     if disk_gb is not None:
-        body["disk_gb"] = disk_gb
+        body["disk_gb"] = whole(disk_gb, "disk_gb", exc=ValueError)
     return body
 
 
@@ -1282,13 +1304,13 @@ def scroll_body(
 
 
 def type_body(text: str) -> dict[str, Any]:
-    return {"action": "type", "text": text}
+    return {"action": "type", "text": canonical(text, "text")}
 
 
 def key_body(keys: tuple[str, ...]) -> dict[str, Any]:
     if not keys:
         raise ValueError("key() needs at least one key")
-    return {"action": "key", "keys": list(keys)}
+    return {"action": "key", "keys": [canonical(key, "key") for key in keys]}
 
 
 def _positive_seconds(seconds: object, message: str = "seconds must be positive") -> float:
@@ -1308,7 +1330,11 @@ def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
     if not keys:
         raise ValueError("hold_key() needs at least one key")
     seconds = _positive_seconds(seconds)
-    return {"action": "hold_key", "keys": list(keys), "duration": seconds}
+    return {
+        "action": "hold_key",
+        "keys": [canonical(key, "key") for key in keys],
+        "duration": seconds,
+    }
 
 
 def wait_body(seconds: float) -> dict[str, Any]:

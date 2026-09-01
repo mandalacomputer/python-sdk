@@ -52,6 +52,7 @@ from ._computer import (
     _snapshots_deleted,
     _windows_from_response,
     _write_all,
+    check_wait_args,
 )
 from ._events import (
     DEFAULT_MAX_QUEUE,
@@ -302,6 +303,7 @@ class AsyncComputer(ComputerFields):
         more when the target has to be sent the image this computer was built
         from first.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         last: Move | None = None
         while True:
@@ -409,6 +411,7 @@ class AsyncComputer(ComputerFields):
         The default timeout is generous because the work is: a compressed
         conversion of a 40 GB Windows disk takes several minutes on a busy host.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         while True:
             if self.build_failed:
@@ -446,6 +449,7 @@ class AsyncComputer(ComputerFields):
         the timeout for the two states that will not become "running" on their
         own — a failed build, and a suspended session nobody has resumed.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -514,6 +518,7 @@ class AsyncComputer(ComputerFields):
         :attr:`start_error` from a failed boot. A suspended computer is not:
         running the probe counts as use and resumes its saved session.
         """
+        check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         while True:
             # The caller's interval, unless a failure below asks for longer.
@@ -1269,7 +1274,7 @@ class AsyncComputer(ComputerFields):
         this iterator in :func:`contextlib.aclosing`; leaving that context awaits
         cleanup of the HTTP stream before continuing.
         """
-        _require_model_key(model_key)
+        model_key = _require_model_key(model_key)
         steps = 0
         async with aclosing(
             self._t.sse(
@@ -1328,7 +1333,10 @@ class AsyncComputer(ComputerFields):
                     result = event.result
                 elif isinstance(event, AgentFailed):
                     failure = event
-        except TimeoutError:
+        except (TimeoutError, ConnectionError):
+            # The sync twin carries the reasoning: a dropped connection after
+            # done is the same situation as an idle timeout, and must not
+            # discard the result already sent.
             if result is None and failure is None:
                 raise
         return _agent_outcome(result, failure)
@@ -1362,7 +1370,7 @@ class AsyncComputer(ComputerFields):
         and heartbeats every ten seconds, so nothing about it looks idle to the
         hop that would otherwise stop waiting.
         """
-        _require_model_key(model_key)
+        model_key = _require_model_key(model_key)
         data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "agent"),

@@ -1418,6 +1418,26 @@ def test_the_first_backoff_step_is_capped_by_the_ceiling() -> None:
     assert core.wait_out() == 15.0
 
 
+def test_a_delivering_connection_does_not_uncap_the_backoff() -> None:
+    """``worked()`` used to reset ``step`` to the raw ``backoff``, undoing the
+    ``__post_init__`` cap. After a connection that delivered events died, the
+    next ``wait_out()`` slept thirty seconds of a fifteen-second ceiling."""
+    from mandala_computer._events import _Core
+
+    core = _Core(
+        reconnect=True,
+        backoff=30.0,
+        max_backoff=15.0,
+        max_retries=0,
+        connect_timeout=15.0,
+        cursor=None,
+        on_connect=None,
+    )
+    core.worked()
+    assert core.wait_out() == 15.0
+    assert core.wait_out() == 15.0
+
+
 @respx.mock
 def test_the_connect_budget_covers_the_read_that_fetches_the_url(
     computer: mc.Computer, monkeypatch: pytest.MonkeyPatch

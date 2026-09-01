@@ -58,7 +58,7 @@ def _reworded(doc: str | None, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
-from ._computer import _poll_delay
+from ._computer import _poll_delay, check_wait_args
 from ._exceptions import _is_transient_for_poll
 from ._resources import (
     EPHEMERAL_DOC,
@@ -66,7 +66,6 @@ from ._resources import (
     Templates,
     _LastPoll,
     _wait_timed_out,
-    check_wait_args,
     classify_poll_failure,
     warn_cleanup_failed,
 )
