@@ -994,6 +994,12 @@ watched, and it recovers on its own — nominating the directory a job is about 
 create is a supported thing to do, and the recovery is announced by `armed` and
 by nothing else.
 
+That difference moves `stream.watching`: an `unwatchable` takes the tree back out
+of the armed set and the other two leave it in, because under those the tree *is*
+being watched and merely reported incompletely. So the list keeps answering the
+question `armed` is for — whether silence about this tree means anything — rather
+than the question of whether anything has gone wrong.
+
 **`source` is worth reading.** `daemon` means the platform observed it. `guest`
 means the machine reported it about itself — every `window.*`,
 `clipboard.changed`, `file.changed` and `computer.ready` — and anyone with root

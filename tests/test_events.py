@@ -1944,6 +1944,23 @@ def test_a_path_that_is_not_an_absolute_string_is_refused_before_a_socket_opens(
         computer.events(watch=[bad])  # type: ignore[list-item]
 
 
+def test_a_path_this_client_cannot_put_on_a_url_is_refused_as_a_nomination(
+    computer: mc.Computer,
+) -> None:
+    """A lone surrogate is what `os.fsdecode` gives a filename whose bytes are
+    not UTF-8, so this is a real path a real caller can hold.
+
+    `quote` raises `UnicodeEncodeError` on it while the URL is being built —
+    outside the connect path's error handling, and at the first step of the
+    ITERATION rather than at the call that supplied it — so it reached a caller
+    as a bare encoding error rather than the `MandalaError` they were told to
+    catch (Codex review).
+    """
+    bad = "/home/user/" + chr(0xDC80)
+    with pytest.raises(mc.MandalaError, match="encodable as UTF-8"):
+        computer.events(watch=bad)
+
+
 def test_a_nomination_that_is_not_a_sequence_at_all_is_this_sdks_own_error(
     computer: mc.Computer,
 ) -> None:
@@ -1971,13 +1988,98 @@ def test_the_stream_reports_the_trees_and_flips_one_when_it_arms(
             FakeSocket.HANG,
         ]
     ).install(monkeypatch)
-    stream = computer.events(reconnect=False, timeout=0.5)
+    stream = computer.events(reconnect=False, timeout=0.5, watch=["/a", "/b"])
     with stream:
         for ev in stream:
             assert ev.armed is True
             break
         assert stream.watching is not None
         assert [(t.path, t.armed) for t in stream.watching] == [("/a", True), ("/b", False)]
+
+
+@respx.mock
+def test_an_unwatchable_tree_stops_being_reported_as_armed(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one loss that means the tree is not being watched, and therefore the
+    one that has to move this record.
+
+    Left out, a tree that armed and then went unwatchable went on reporting
+    `armed=True` for the life of the stream — while a client connecting at that
+    moment would be told `false` by `hello`, because the platform's own armed set
+    clears on exactly this reason. This SDK answered the question `armed` exists
+    to answer with the opposite of what the platform would have said (Codex
+    review).
+    """
+    route()
+    Dialer(
+        [
+            hello_frame(watching=[{"path": "/a", "armed": True}]),
+            file_frame(watch="/a", lost="unwatchable"),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    stream = computer.events(reconnect=False, timeout=0.5, watch="/a")
+    with stream:
+        for _ in stream:
+            break
+        assert stream.watching is not None
+        assert stream.watching[0].armed is False
+
+
+@respx.mock
+@pytest.mark.parametrize("reason", ["flood", "budget"])
+def test_the_other_two_losses_leave_a_watch_armed(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    """`flood` and `budget` say the tree IS watched and is being reported
+    incompletely, so silence under them still means nothing has changed.
+    Clearing on any loss is the mistake the platform made first and fixed: one
+    `make` in a watched tree would tell every later reader that a tree being
+    watched the whole time was not."""
+    route()
+    Dialer(
+        [
+            hello_frame(watching=[{"path": "/a", "armed": True}]),
+            file_frame(watch="/a", lost=reason),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    stream = computer.events(reconnect=False, timeout=0.5, watch="/a")
+    with stream:
+        for _ in stream:
+            break
+        assert stream.watching is not None
+        assert stream.watching[0].armed is True
+
+
+@respx.mock
+def test_a_tree_that_recovers_reads_as_armed_again(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unwatchable` recovers on its own — nominating the directory a job is
+    about to create is a supported thing to do — and the recovery is announced
+    by `armed` and by nothing else. The platform suppresses a RESTATEMENT of
+    `armed`, so the marker arrives here only because the loss cleared the record
+    on both sides; a disarm this SDK did not apply would have made the recovery
+    a no-op it reported as a change."""
+    route()
+    Dialer(
+        [
+            hello_frame(watching=[{"path": "/a", "armed": True}]),
+            file_frame(watch="/a", lost="unwatchable"),
+            file_frame(watch="/a", armed=True),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    stream = computer.events(reconnect=False, timeout=0.5, watch="/a")
+    seen: list[bool | None] = []
+    with stream:
+        for ev in stream:
+            seen.append(stream.watching[0].armed if stream.watching else None)
+            if len(seen) == 2:
+                break
+    assert seen == [False, True]
 
 
 @respx.mock
@@ -2006,7 +2108,7 @@ def test_an_armed_marker_for_a_tree_nobody_nominated_adds_no_row(
             FakeSocket.HANG,
         ]
     ).install(monkeypatch)
-    stream = computer.events(reconnect=False, timeout=0.5)
+    stream = computer.events(reconnect=False, timeout=0.5, watch="/a")
     with stream:
         for _ in stream:
             break
@@ -2032,7 +2134,7 @@ def test_a_reconnect_reads_armed_afresh_rather_than_carrying_it_forward(
             event_frame("computer.idle", cursor="c2"),
         ],
     ).install(monkeypatch)
-    stream = computer.events(backoff=0.001)
+    stream = computer.events(backoff=0.001, watch="/a")
     with stream:
         for i, _ in enumerate(stream):
             if i == 1:
@@ -2052,7 +2154,7 @@ def test_the_watch_list_handed_out_is_a_copy(
     Dialer(
         [hello_frame(watching=[{"path": "/a", "armed": False}]), event_frame("computer.idle")]
     ).install(monkeypatch)
-    stream = computer.events(reconnect=False)
+    stream = computer.events(reconnect=False, watch="/a")
     list(stream)
     first = stream.watching
     assert first is not None
@@ -2076,7 +2178,10 @@ def test_a_path_this_host_cannot_honour_is_a_decision_rather_than_weather(
         refused(400, b'{"error": "watching / is not a nomination"}'), refused(400)
     ).install(monkeypatch)
     with pytest.raises(mc.MandalaError, match="watching / is not a nomination"):
-        list(computer.events(backoff=0.001, watch="/x"))
+        # `/` and not some innocent path: this SDK leaves that one to the
+        # platform deliberately (see `_watch_paths`), so it is the nomination
+        # that really does produce the sentence being mocked here.
+        list(computer.events(backoff=0.001, watch="/"))
     assert len(dialer.urls) == 1, "a settled refusal is not retried"
 
 

@@ -858,9 +858,10 @@ class _Core:
     types: list[str] | None = None
     #: The nominated trees and whether each is live, as last stated: the
     #: opening frame's list, with an ``armed`` marker applied to it as one
-    #: arrives. State in ``hello``, transitions on the stream — kept in one
-    #: place so a caller reading :attr:`EventStream.watching` gets the current
-    #: answer rather than the one from connect time.
+    #: arrives and an ``unwatchable`` loss taking a tree back out. State in
+    #: ``hello``, transitions on the stream — kept in one place so a caller
+    #: reading :attr:`EventStream.watching` gets the current answer rather than
+    #: the one from connect time.
     watching: list[WatchedTree] | None = None
     #: Consecutive failures to get a working connection.
     failures: int = 0
@@ -1013,23 +1014,42 @@ class _Core:
             return None
         if ev.type == "capabilities" and ev.events is not None:
             self.types = list(ev.events)
-        elif ev.type == WATCH_EVENT_TYPE and ev.armed and ev.watch:
-            self.arm(ev.watch)
+        elif ev.type == WATCH_EVENT_TYPE and ev.watch:
+            if ev.armed:
+                self.record_armed(ev.watch, True)
+            elif ev.lost_reason == "unwatchable":
+                # The ONE loss that means the tree is not being watched, and
+                # therefore the one that moves this record. `flood` and `budget`
+                # say the tree IS watched and is being reported incompletely, so
+                # a client is still right to read silence under them as nothing
+                # having changed — that is the platform's own division, and its
+                # own armed set moves on exactly this reason (see the switch in
+                # `emitFile`, server/fileevents.go).
+                #
+                # Without it a tree that armed and then went unwatchable went on
+                # reporting `armed=True` for the life of the stream, while a
+                # client connecting at that moment would be told `false` by
+                # `hello` — so this SDK answered the question `armed` exists to
+                # answer with the opposite of what the platform would have said
+                # (Codex review, OPL-4220).
+                self.record_armed(ev.watch, False)
         return ev
 
-    def arm(self, tree: str) -> None:
-        """Record that a nominated tree went live.
+    def record_armed(self, tree: str, armed: bool) -> None:
+        """Move one nominated tree between live and not.
 
-        Only for a tree the opening frame named. An ``armed`` marker for
-        anything else is either a host this build does not understand or an
-        event that leaked past the delivery filter, and inventing a row for it
-        would put a path in :attr:`EventStream.watching` that this stream never
-        asked about — which is the one thing that list is relied on to mean.
+        Only for a tree the opening frame named. A marker for anything else is
+        either a host this build does not understand or an event that leaked
+        past the delivery filter, and inventing a row for it would put a path in
+        :attr:`EventStream.watching` that this stream never asked about — which
+        is the one thing that list is relied on to mean.
         """
         if self.watching is None:
             return
         self.watching = [
-            WatchedTree(path=w.path, armed=True, raw=w.raw) if w.path == tree and not w.armed else w
+            WatchedTree(path=w.path, armed=armed, raw=w.raw)
+            if w.path == tree and w.armed != armed
+            else w
             for w in self.watching
         ]
 
@@ -1187,6 +1207,28 @@ def _watch_paths(watch: str | Sequence[str] | None) -> tuple[str, ...]:
             raise MandalaError(
                 f"a watch path must be absolute, naming a directory in the GUEST (got {path!r})"
             )
+        try:
+            path.encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate, which is what `os.fsdecode` hands back for a
+            # filename whose bytes are not UTF-8 — so this is a real path a real
+            # caller can hold, not a synthetic string. Caught HERE because it is
+            # the last place it can be: `quote` raises on it while the URL is
+            # being built, which is outside the connect path's error handling and
+            # several steps after the call that supplied it, so it reached a
+            # caller as a bare `UnicodeEncodeError` at the first step of the
+            # iteration rather than as the `MandalaError` they were told to catch
+            # (Codex review, OPL-4220).
+            #
+            # Not a platform limit duplicated: this is a value this client
+            # cannot put on a query string at all, so there is no refusal to
+            # defer to. The platform refuses invalid UTF-8 as well, which is
+            # what makes rejecting it here a shortcut rather than a divergence.
+            raise MandalaError(
+                f"a watch path must be encodable as UTF-8, and {path!r} is not — which is what "
+                "os.fsdecode() gives a filename whose bytes are not. Nominate a parent directory "
+                "whose name is UTF-8; the platform refuses this one too."
+            ) from None
     return tuple(paths)
 
 
@@ -1534,10 +1576,15 @@ class _StreamBase:
         """The trees this stream nominated, and whether each is live YET.
 
         The opening frame's answer, with an ``armed`` marker applied to it as
-        one arrives — so this is the current state rather than the state at
-        connect time. ``None`` where nothing was nominated, which is a stronger
-        answer than the empty list: no ``file.changed`` can reach this socket at
-        all.
+        one arrives and an ``unwatchable`` loss taking a tree back out — so this
+        is the current state rather than the state at connect time. ``None``
+        where nothing was nominated, which is a stronger answer than the empty
+        list: no ``file.changed`` can reach this socket at all.
+
+        The other two losses do NOT move it. ``flood`` and ``budget`` say the
+        tree is being watched and reported incompletely, so silence under them
+        still means nothing has changed; only ``unwatchable`` says it is not
+        being watched at all.
 
         The paths in it are the host's NORMALISED spelling of what was
         nominated, and they are what every ``file.changed`` carries in
