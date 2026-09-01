@@ -1723,3 +1723,538 @@ def test_a_large_whole_exit_code_is_not_quietly_rounded(wire: int) -> None:
     ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
     assert ev is not None
     assert ev.exit_code == wire
+
+
+# --- file.changed: a stream option, not a type to filter for -----------------
+#
+# The nomination is what makes this half exist at all, so most of what is
+# checked here is about the SUBSCRIPTION rather than about a payload: the paths
+# reach the URL, the opening frame's answer is the one a caller matches on, and
+# a wait for an event nobody asked to receive ends rather than hanging.
+
+
+def file_frame(**data: Any) -> str:
+    return event_frame("file.changed", data=data)
+
+
+def test_a_file_change_carries_the_tree_the_path_and_what_happened() -> None:
+    ev = to_computer_event(
+        {
+            "type": "file.changed",
+            "data": {"watch": "/home/user/out", "path": "/home/user/out/a.txt", "kind": "created"},
+        }
+    )
+    assert ev is not None
+    assert (ev.watch, ev.path, ev.kind) == ("/home/user/out", "/home/user/out/a.txt", "created")
+    # `dir` is omitempty on the wire, so absent beside a path means "not a
+    # directory" rather than "the host did not say".
+    assert ev.is_dir is False
+    assert (ev.armed, ev.lost_reason) == (None, None)
+
+
+def test_a_directory_that_changed_says_so() -> None:
+    ev = to_computer_event(
+        {
+            "type": "file.changed",
+            "data": {"watch": "/w", "path": "/w/sub", "kind": "created", "dir": True},
+        }
+    )
+    assert ev is not None
+    assert ev.is_dir is True
+
+
+def test_an_armed_marker_does_not_decode_as_a_change_to_a_nameless_file() -> None:
+    """The distinction the platform bothered to send, kept.
+
+    `{watch, armed}` says the tree is live from here on and names nothing in it.
+    A dataclass with a defaulted `path` would answer `""` — a change to a file
+    with no name — and a caller writing `if ev.path.endswith(...)` would be
+    reading a marker as an event about a file (OPL-4220).
+    """
+    ev = to_computer_event({"type": "file.changed", "data": {"watch": "/w", "armed": True}})
+    assert ev is not None
+    assert ev.armed is True
+    assert ev.watch == "/w"
+    assert (ev.path, ev.kind, ev.is_dir, ev.lost_reason) == (None, None, None, None)
+
+
+@pytest.mark.parametrize("reason", ["flood", "budget", "unwatchable"])
+def test_a_lost_marker_names_its_reason_and_no_path(reason: str) -> None:
+    """Same shape question as `armed`, and the field a client acts on: only
+    `unwatchable` means the tree is not being watched, and all three mean the
+    picture of it is wrong."""
+    ev = to_computer_event({"type": "file.changed", "data": {"watch": "/w", "lost": reason}})
+    assert ev is not None
+    assert ev.lost_reason == reason
+    assert (ev.path, ev.kind, ev.is_dir, ev.armed) == (None, None, None, None)
+
+
+def test_the_two_losts_on_this_wire_do_not_reach_the_same_field() -> None:
+    """`process.exited` spells `lost` as a flag and `file.changed` as a reason.
+
+    One field could not carry both without a caller having to know the event
+    type before reading it, so a file marker leaves the boolean alone and an
+    exit leaves the reason alone.
+    """
+    a = to_computer_event({"type": "file.changed", "data": {"watch": "/w", "lost": "flood"}})
+    b = to_computer_event({"type": "process.exited", "data": {"pid": 7, "lost": True}})
+    assert a is not None and b is not None
+    assert (a.lost, a.lost_reason) == (None, "flood")
+    assert (b.lost, b.lost_reason) == (True, None)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"watch": "/w", "path": "/w/a", "kind": "modified"},
+        {"watch": "/w", "armed": False},
+        {"watch": "/w", "armed": "maybe"},
+    ],
+)
+def test_armed_is_never_manufactured_false(data: dict[str, Any]) -> None:
+    """`armed` is omitempty, so its absence is every ordinary change event
+    rather than a statement that the watch went away. A `False` here would be a
+    transition nobody reported, on the one field a caller uses to decide whether
+    silence means anything."""
+    ev = to_computer_event({"type": "file.changed", "data": data})
+    assert ev is not None
+    assert ev.armed is None
+
+
+def test_an_unknown_file_payload_still_arrives_whole() -> None:
+    """The vocabulary grows here too, and `data` is what a build that predates a
+    field is read through."""
+    ev = to_computer_event({"type": "file.changed", "data": {"watch": "/w", "since_epoch": 12}})
+    assert ev is not None
+    assert ev.data["since_epoch"] == 12
+
+
+# --- hello.watching ---------------------------------------------------------
+
+
+def test_hello_reports_the_nomination_as_the_host_normalised_it() -> None:
+    hello = to_hello(
+        {
+            "type": "hello",
+            "watching": [
+                {"path": "/home/user/out", "armed": False},
+                {"path": "/srv", "armed": True},
+            ],
+        }
+    )
+    assert hello is not None
+    assert hello.watching is not None
+    assert [(t.path, t.armed) for t in hello.watching] == [
+        ("/home/user/out", False),
+        ("/srv", True),
+    ]
+
+
+def test_a_stream_that_nominated_nothing_says_so_rather_than_saying_nothing_is_armed() -> None:
+    """Absent and empty are different answers, as they are for `windows`: absent
+    means no `file.changed` can reach this socket at all."""
+    hello = to_hello({"type": "hello"})
+    assert hello is not None and hello.watching is None
+    empty = to_hello({"type": "hello", "watching": []})
+    assert empty is not None and empty.watching == []
+
+
+def test_a_watching_row_with_no_path_is_dropped_rather_than_carried_empty() -> None:
+    """`""` matches no `file.changed` ever sent, so a row carried empty would
+    look like a tree this stream is watching and can never be told about."""
+    hello = to_hello({"type": "hello", "watching": [{"armed": True}, "/w", {"path": "/ok"}]})
+    assert hello is not None
+    assert hello.watching is not None
+    assert [t.path for t in hello.watching] == ["/ok"]
+    # Still recoverable: the frame survives whole.
+    assert len(hello.raw["watching"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [(True, True), ("true", True), (1, True), (False, False), ("nonsense", False), (None, False)],
+)
+def test_armed_in_hello_is_classified_rather_than_guessed(wire: object, expected: bool) -> None:
+    """TRUE only, and the recoverable direction is the one that waits: a tree
+    reported unarmed that is in fact live ends at the caller's own timeout,
+    while an unreadable `armed` read as True is a client acting on silence from
+    a watch that was never running."""
+    hello = to_hello({"type": "hello", "watching": [{"path": "/w", "armed": wire}]})
+    assert hello is not None and hello.watching is not None
+    assert hello.watching[0].armed is expected
+
+
+# --- the nomination on the wire ---------------------------------------------
+
+
+def test_with_watches_repeats_the_parameter_and_encodes_the_path() -> None:
+    """Repeated rather than comma-separated, which is the platform's own choice:
+    a directory name may contain a comma, and a list format that cannot
+    represent every value it is a list of is a defect waiting for the first
+    tenant with `a,b` in their home directory."""
+    assert _events.with_watches("wss://h/e?token=abc%2Fd", ["/a b", "/c,d"]) == (
+        "wss://h/e?token=abc%2Fd&watch=%2Fa%20b&watch=%2Fc%2Cd"
+    )
+    assert _events.with_watches("wss://h/e", []) == "wss://h/e"
+    assert _events.with_watches("wss://h/e", ["/a"]) == "wss://h/e?watch=%2Fa"
+
+
+@respx.mock
+def test_a_bare_string_is_one_path_and_not_four_characters(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`str` is a `Sequence[str]` whose members are its own letters, so the
+    obvious implementation turns `watch="/tmp"` into a nomination of `/`, `t`,
+    `m`, `p` — three refusals and a watch on the ROOT, out of the call that is
+    the common case."""
+    route()
+    dialer = Dialer([hello_frame(), event_frame("computer.idle")]).install(monkeypatch)
+    list(computer.events(reconnect=False, watch="/tmp"))
+    assert dialer.urls[0].endswith("&watch=%2Ftmp")
+    assert dialer.urls[0].count("watch=") == 1
+
+
+@respx.mock
+def test_the_nomination_is_repeated_on_every_reconnect_beside_the_cursor(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is an option on the CONNECTION, and a reconnect is a new connection: a
+    stream that dropped its watches on the way back would go quiet about the
+    tree the caller is waiting on and say nothing about having done so."""
+    route()
+    dialer = Dialer(
+        [hello_frame(), event_frame("computer.idle", cursor="c1")],
+        [hello_frame(), event_frame("computer.idle", cursor="c2")],
+    ).install(monkeypatch)
+    take(computer.events(backoff=0.001, watch=["/a", "/b"]), 2)
+    assert dialer.urls[0] == "wss://events.test/?token=control&watch=%2Fa&watch=%2Fb"
+    assert dialer.urls[1] == "wss://events.test/?token=control&since=c1&watch=%2Fa&watch=%2Fb"
+
+
+@pytest.mark.parametrize("bad", ["", "relative/path", "./out", 7, None])
+def test_a_path_that_is_not_an_absolute_string_is_refused_before_a_socket_opens(
+    computer: mc.Computer, bad: object
+) -> None:
+    """The two mistakes a caller can see in their own argument. Everything else
+    — the length cap, control characters, `/` itself, how many trees one stream
+    may name — is the platform's rule, stated in the platform's own refusal;
+    duplicating those here would be a second place for them to be wrong and
+    would refuse a limit a later host has raised."""
+    with pytest.raises(mc.MandalaError, match="watch path"):
+        computer.events(watch=[bad])  # type: ignore[list-item]
+
+
+def test_a_nomination_that_is_not_a_sequence_at_all_is_this_sdks_own_error(
+    computer: mc.Computer,
+) -> None:
+    """`list(7)` raises `TypeError`, which goes straight past the
+    `except MandalaError` this SDK tells callers to write."""
+    with pytest.raises(mc.MandalaError, match="a path or a sequence of paths"):
+        computer.events(watch=7)  # type: ignore[arg-type]
+
+
+# --- what the stream reports about its watches ------------------------------
+
+
+@respx.mock
+def test_the_stream_reports_the_trees_and_flips_one_when_it_arms(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """State in `hello`, transitions on the stream — the same division `ready`
+    and `computer.ready` make, kept in one place so a caller reads the current
+    answer rather than the one from connect time."""
+    route()
+    Dialer(
+        [
+            hello_frame(watching=[{"path": "/a", "armed": False}, {"path": "/b", "armed": False}]),
+            file_frame(watch="/a", armed=True),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    stream = computer.events(reconnect=False, timeout=0.5)
+    with stream:
+        for ev in stream:
+            assert ev.armed is True
+            break
+        assert stream.watching is not None
+        assert [(t.path, t.armed) for t in stream.watching] == [("/a", True), ("/b", False)]
+
+
+@respx.mock
+def test_a_stream_that_nominated_nothing_reports_none_rather_than_an_empty_list(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route()
+    Dialer([hello_frame(), event_frame("computer.idle")]).install(monkeypatch)
+    stream = computer.events(reconnect=False)
+    list(stream)
+    assert stream.watching is None
+
+
+@respx.mock
+def test_an_armed_marker_for_a_tree_nobody_nominated_adds_no_row(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The list means "what this stream asked about". A row invented from a
+    frame that leaked past the delivery filter would put a path in it this
+    stream never nominated, which is the one thing it is relied on to mean."""
+    route()
+    Dialer(
+        [
+            hello_frame(watching=[{"path": "/a", "armed": False}]),
+            file_frame(watch="/elsewhere", armed=True),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    stream = computer.events(reconnect=False, timeout=0.5)
+    with stream:
+        for _ in stream:
+            break
+        assert stream.watching is not None
+        assert [(t.path, t.armed) for t in stream.watching] == [("/a", False)]
+
+
+@respx.mock
+def test_a_reconnect_reads_armed_afresh_rather_than_carrying_it_forward(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tree that was live on the last socket is not necessarily armed on this
+    one — a guest reboot in between disarms it — so a list carried across the
+    reconnect would report a watch that is not running."""
+    route()
+    Dialer(
+        [
+            hello_frame(watching=[{"path": "/a", "armed": True}]),
+            event_frame("computer.idle", cursor="c1"),
+        ],
+        [
+            hello_frame(watching=[{"path": "/a", "armed": False}]),
+            event_frame("computer.idle", cursor="c2"),
+        ],
+    ).install(monkeypatch)
+    stream = computer.events(backoff=0.001)
+    with stream:
+        for i, _ in enumerate(stream):
+            if i == 1:
+                break
+        assert stream.watching is not None
+        assert stream.watching[0].armed is False
+
+
+@respx.mock
+def test_the_watch_list_handed_out_is_a_copy(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """For the reason `event_types` is copied: an accidental `append` on the
+    live list would tell a caller this stream is watching a tree it never
+    nominated."""
+    route()
+    Dialer(
+        [hello_frame(watching=[{"path": "/a", "armed": False}]), event_frame("computer.idle")]
+    ).install(monkeypatch)
+    stream = computer.events(reconnect=False)
+    list(stream)
+    first = stream.watching
+    assert first is not None
+    first.append(mc.WatchedTree(path="/nope", armed=True))
+    assert stream.watching is not None
+    assert [t.path for t in stream.watching] == ["/a"]
+
+
+# --- the refusals a nomination adds -----------------------------------------
+
+
+@respx.mock
+def test_a_path_this_host_cannot_honour_is_a_decision_rather_than_weather(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """400 used to fall through to the weather branch, where a mistyped path
+    became a reconnect loop with no `max_retries` to stop it — the default is to
+    never give up."""
+    route()
+    dialer = Dialer(
+        refused(400, b'{"error": "watching / is not a nomination"}'), refused(400)
+    ).install(monkeypatch)
+    with pytest.raises(mc.MandalaError, match="watching / is not a nomination"):
+        list(computer.events(backoff=0.001, watch="/x"))
+    assert len(dialer.urls) == 1, "a settled refusal is not retried"
+
+
+@respx.mock
+def test_a_409_on_a_nominating_stream_names_both_refusals_it_could_be(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`reason: "unavailable"` covers two different refusals once a stream
+    nominates a tree — a computer that is not running, and one already watching
+    all the trees it can watch at once — and nothing structural separates them.
+    The platform's own sentence is the only thing that does, so it is repeated
+    rather than replaced by a guess."""
+    route()
+    body = b'{"reason": "unavailable", "error": "already watching 32 of the 32 trees"}'
+    Dialer(refused(409, body)).install(monkeypatch)
+    with pytest.raises(mc.MandalaError, match="already watching 32 of the 32 trees") as caught:
+        list(computer.events(backoff=0.001, watch="/x"))
+    assert "closing another stream frees" in str(caught.value)
+
+
+@respx.mock
+def test_a_409_on_a_stream_that_nominated_nothing_still_says_call_start(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """There is no second reading to disclaim there, and the sentence that sends
+    a caller to `start()` is the useful one."""
+    route()
+    Dialer(refused(409, b'{"reason": "unavailable"}')).install(monkeypatch)
+    with pytest.raises(mc.MandalaError, match="is not running"):
+        list(computer.events(backoff=0.001))
+
+
+# --- waiting for something nobody asked to receive --------------------------
+
+
+@respx.mock
+def test_wait_for_a_file_change_with_no_nomination_is_refused(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A computer advertises `file.changed` whenever it COULD report one, which
+    the platform decides off the terminal channel — before anybody has said
+    which directory they care about. So the vocabulary says yes to a wait that
+    can never end, and the advertised list cannot express why."""
+    route()
+    Dialer([hello_frame(events=["file.changed"]), FakeSocket.HANG]).install(monkeypatch)
+    with pytest.raises(mc.MandalaError, match="nominated none"):
+        computer.wait_for("file.changed", timeout=5)
+
+
+@respx.mock
+def test_wait_for_a_file_change_under_a_nominated_tree_waits(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route()
+    dialer = Dialer(
+        [
+            hello_frame(events=["file.changed"], watching=[{"path": "/w", "armed": True}]),
+            file_frame(watch="/w", path="/w/a.txt", kind="modified"),
+        ]
+    ).install(monkeypatch)
+    ev = computer.wait_for("file.changed", watch="/w", timeout=5)
+    assert (ev.watch, ev.path, ev.kind) == ("/w", "/w/a.txt", "modified")
+    assert dialer.urls[0].endswith("&watch=%2Fw")
+
+
+@respx.mock
+def test_wait_for_does_not_refuse_when_a_reachable_type_rides_along(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule is unchanged: refuse only where NONE of the wanted types can
+    arrive. A caller waiting for a file change or an exit is still waiting for
+    something reachable."""
+    route()
+    Dialer(
+        [hello_frame(events=["file.changed", "process.exited"]), event_frame("process.exited")]
+    ).install(monkeypatch)
+    assert computer.wait_for(["file.changed", "process.exited"], timeout=5).type == "process.exited"
+
+
+def test_the_unnominated_refusal_holds_even_where_the_vocabulary_said_nothing() -> None:
+    """A vocabulary nobody stated refuses nothing — that is `advertised=None`,
+    and it is deliberate. But whether THIS stream nominated a tree is not
+    something the host has to have told us: it is a fact about the call."""
+    err = unreachable_types("vm-1", ["file.changed"], None, nominated=False)
+    assert err is not None
+    assert "nominated none" in str(err)
+    assert unreachable_types("vm-1", ["file.changed"], None) is None
+
+
+def test_a_computer_that_cannot_emit_it_at_all_is_still_named_that_way() -> None:
+    """The vocabulary answers first where it has an answer.
+
+    Two different problems share one type here, and only one of them a `watch=`
+    would fix. Telling a caller to nominate a tree on a computer that cannot
+    report a file change at all sends them to write a call that will be refused
+    for a second reason — so an unadvertised type is named as one whatever the
+    nomination was, and the nomination sentence is kept for the case it is the
+    whole story.
+    """
+    for nominated in (True, False):
+        err = unreachable_types("vm-1", ["file.changed"], ["process.exited"], nominated=nominated)
+        assert err is not None
+        assert "cannot emit file.changed" in str(err)
+        assert "It advertises: process.exited." in str(err)
+
+
+# --- the third case in the capability list -----------------------------------
+
+
+def test_the_guest_half_is_provenance_and_the_availability_split_is_two_sets() -> None:
+    """`file.changed` needs the terminal channel and NOT the X bindings, so it is
+    offered on computers that emit no window events at all. Anything modelling
+    "the guest half" as one thing gets that wrong — which is why the availability
+    question is two constants and `GUEST_EVENT_TYPES` answers only `source`."""
+    assert "file.changed" in mc.GUEST_EVENT_TYPES
+    assert set(mc.DESKTOP_EVENT_TYPES) | set(mc.CHANNEL_EVENT_TYPES) == set(mc.GUEST_EVENT_TYPES)
+    assert not set(mc.DESKTOP_EVENT_TYPES) & set(mc.CHANNEL_EVENT_TYPES)
+    assert mc.CHANNEL_EVENT_TYPES == (mc.WATCH_EVENT_TYPE,)
+
+
+@respx.mock
+def test_a_computer_with_no_window_events_can_still_report_file_changes(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An image built before the X bindings is an ordinary computer, not a
+    malformed opening frame."""
+    route()
+    Dialer(
+        [
+            hello_frame(
+                events=["process.exited", "file.changed"],
+                watching=[{"path": "/w", "armed": True}],
+            ),
+            file_frame(watch="/w", path="/w/a", kind="deleted"),
+        ]
+    ).install(monkeypatch)
+    ev = computer.wait_for("file.changed", watch="/w", timeout=5)
+    assert ev.kind == "deleted"
+
+
+# --- the async half ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_carries_the_nomination_and_reports_the_trees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with respx.mock:
+        route()
+        dialer = Dialer(
+            [
+                hello_frame(watching=[{"path": "/w", "armed": False}]),
+                file_frame(watch="/w", armed=True),
+            ],
+            cls=AsyncFakeSocket,
+        ).install(monkeypatch)
+        async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+            c = await client.computers.get("vm-1")
+            stream = c.events(reconnect=False, watch="/w")
+            async for ev in stream:
+                assert ev.armed is True
+                break
+            await stream.aclose()
+            assert stream.watching is not None
+            assert stream.watching[0].armed is True
+        assert dialer.urls[0].endswith("&watch=%2Fw")
+
+
+@pytest.mark.asyncio
+async def test_async_wait_for_a_file_change_with_no_nomination_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with respx.mock:
+        route()
+        Dialer(
+            [hello_frame(events=["file.changed"]), FakeSocket.HANG], cls=AsyncFakeSocket
+        ).install(monkeypatch)
+        async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+            c = await client.computers.get("vm-1")
+            with pytest.raises(mc.MandalaError, match="nominated none"):
+                await c.wait_for("file.changed", timeout=5)

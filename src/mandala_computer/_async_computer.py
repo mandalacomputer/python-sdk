@@ -1446,6 +1446,7 @@ class AsyncComputer(ComputerFields):
         self,
         *,
         since: str | None = None,
+        watch: str | Sequence[str] | None = None,
         reconnect: bool = True,
         backoff: float = 0.5,
         max_backoff: float = 15.0,
@@ -1496,8 +1497,30 @@ class AsyncComputer(ComputerFields):
         URL is rotated by a restart, and a restart is one of the ordinary
         reasons the socket dropped in the first place.
 
+        **Watching a directory.** ``file.changed`` is the one type that never
+        arrives unasked; nominate a tree with ``watch=`` and this socket reports
+        changes under it and nothing else::
+
+            async with c.events(watch="/home/user/out") as stream:
+                async for ev in stream:
+                    if ev.type == "file.changed" and ev.path:
+                        print(ev.kind, ev.path)
+
+        Arming is not instant, and it is asynchronous in a way that makes
+        silence ambiguous: until a tree is armed, "nothing has changed" and "not
+        watching yet" look the same, and inotify reports changes rather than
+        state, so whatever happened in that window is never reported.
+        :attr:`~mandala_computer.AsyncEventStream.watching` is where that answer
+        lives — the trees as the host normalised them, and whether each is live
+        — because a tree somebody else nominated first is already armed and
+        sends no event to say so.
+
         Refused with a ``409`` on a suspended computer — this is the one part of
-        the API that does NOT resume one for you — and on a stopped one.
+        the API that does NOT resume one for you — and on a stopped one. A
+        nomination is refused with a ``400`` for a path this host cannot honour,
+        and with a ``409`` where the computer is already watching all the trees
+        it can watch at once across every stream open on it. None of the three
+        is retried: they are decisions rather than weather.
 
         Not a coroutine, because it makes no request: the socket is opened by
         the first step of the iteration, which is where an ``await`` belongs.
@@ -1507,6 +1530,7 @@ class AsyncComputer(ComputerFields):
             self._events_url,
             self.id,
             since=since,
+            watch=watch,
             reconnect=reconnect,
             backoff=backoff,
             max_backoff=max_backoff,
@@ -1523,6 +1547,7 @@ class AsyncComputer(ComputerFields):
         *,
         timeout: float = 180.0,
         since: str | None = None,
+        watch: str | Sequence[str] | None = None,
         reconnect: bool = True,
         backoff: float = 0.5,
         max_backoff: float = 15.0,
@@ -1542,7 +1567,7 @@ class AsyncComputer(ComputerFields):
         this survives a socket that drops while it waits, and the socket is
         closed on the way out however this returns.
 
-        Two things it refuses rather than waiting out:
+        Three things it refuses rather than waiting out:
 
         * an event type THIS computer cannot emit. The opening frame lists what
           it can — a Windows guest, or an image built without the X bindings the
@@ -1552,6 +1577,10 @@ class AsyncComputer(ComputerFields):
           ``capabilities`` frame revises the list under an open socket.
         * a computer that is suspended or stopped, which is the ``409`` on the
           upgrade rather than anything about the wait.
+        * ``file.changed`` with no ``watch=``. A computer advertises that type
+          whenever it COULD report one, which is decided before anybody has said
+          which directory they care about — so the vocabulary says yes to a
+          wait that can never end. Pass the tree you are waiting on.
 
         Passing several types waits for whichever arrives first, and refuses
         only when NONE of them is possible — a caller waiting for
@@ -1576,6 +1605,11 @@ class AsyncComputer(ComputerFields):
         # at all is a different request from a wait that has run out of it.
         if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout == 0:
             raise TimeoutError(f"{self.id} did not emit {' or '.join(wanted)} within 0s")
+        # Whether this stream nominated a tree at all, which is the other way a
+        # wait cannot end and the one the advertised vocabulary cannot express:
+        # a computer offers `file.changed` whenever it could report one, and
+        # this socket receives one only under a directory it asked about.
+        nominated = bool(watch)
         impossible: MandalaError | None = None
 
         def hello_hook(hello: Hello) -> None:
@@ -1583,7 +1617,7 @@ class AsyncComputer(ComputerFields):
             # Theirs first, for the reason the sync half gives.
             if on_connect is not None:
                 on_connect(hello)
-            impossible = unreachable_types(self.id, wanted, hello.events)
+            impossible = unreachable_types(self.id, wanted, hello.events, nominated=nominated)
             if impossible is not None:
                 # The non-awaiting stop: this runs inside the stream's own
                 # machinery, which is not a place that can await a closing
@@ -1592,6 +1626,7 @@ class AsyncComputer(ComputerFields):
 
         stream = self.events(
             since=since,
+            watch=watch,
             reconnect=reconnect,
             backoff=backoff,
             max_backoff=max_backoff,
@@ -1606,7 +1641,7 @@ class AsyncComputer(ComputerFields):
                 if ev.type in wanted:
                     return ev
                 if ev.type == "capabilities" and ev.events is not None:
-                    impossible = unreachable_types(self.id, wanted, ev.events)
+                    impossible = unreachable_types(self.id, wanted, ev.events, nominated=nominated)
                     if impossible is not None:
                         break
         finally:

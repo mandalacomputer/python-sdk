@@ -40,12 +40,16 @@ from ._exceptions import ConnectionError, MandalaError
 from ._models import Window, _opt_num, _opt_whole, _text, _texts, _Wire, _wire
 
 __all__ = [
+    "CHANNEL_EVENT_TYPES",
+    "DESKTOP_EVENT_TYPES",
     "GUEST_EVENT_TYPES",
     "STREAM_FRAME_TYPES",
+    "WATCH_EVENT_TYPE",
     "AsyncEventStream",
     "ComputerEvent",
     "EventStream",
     "Hello",
+    "WatchedTree",
 ]
 
 
@@ -58,13 +62,39 @@ __all__ = [
 #: opening frame advertises — that list is about what the machine can produce.
 STREAM_FRAME_TYPES: tuple[str, ...] = ("gap", "closed", "capabilities")
 
-#: The event types the platform sends only where the GUEST can produce them.
+#: The event type that never arrives unasked.
 #:
-#: A Windows guest, or a Linux one whose hardware carries no terminal channel,
-#: has nowhere to run the watcher these come from. :attr:`Hello.events` is the
-#: authority for a given computer; this is the shape of the half that goes
-#: missing.
+#: ``file.changed`` is reported only under a directory the STREAM nominated —
+#: see the ``watch`` option on :meth:`~mandala_computer.Computer.events`. A
+#: computer advertises it whenever it could report one, which is not the same
+#: as this socket being able to receive one.
+WATCH_EVENT_TYPE: str = "file.changed"
+
+#: The event types whose ``source`` is ``"guest"``: the machine describing
+#: itself, rather than the platform describing the machine.
+#:
+#: This is a statement about PROVENANCE — how much a payload is worth, since
+#: anyone with root inside the guest can make one of these say anything — and
+#: deliberately not a statement about availability. The two sets below are the
+#: availability question, and they do not move together.
 GUEST_EVENT_TYPES: tuple[str, ...] = (
+    "window.opened",
+    "window.closed",
+    "window.focused",
+    "window.blurred",
+    "clipboard.changed",
+    "file.changed",
+    "computer.ready",
+)
+
+#: The guest half that needs the desktop watcher, and therefore both the
+#: terminal channel it speaks over AND the X bindings it is written against.
+#:
+#: A Windows guest and a Linux one whose hardware carries no channel have
+#: nowhere to run it; so does a Linux image built without ``python3-xlib``,
+#: which the platform cannot know from the record and reports in a
+#: ``capabilities`` frame once it has asked.
+DESKTOP_EVENT_TYPES: tuple[str, ...] = (
     "window.opened",
     "window.closed",
     "window.focused",
@@ -72,6 +102,17 @@ GUEST_EVENT_TYPES: tuple[str, ...] = (
     "clipboard.changed",
     "computer.ready",
 )
+
+#: The guest half that needs the terminal channel and NOTHING else.
+#:
+#: The third case, and the one that catches a client modelling "the guest half"
+#: as a single thing. The file watcher is written against libc's own inotify
+#: calls through :mod:`ctypes`, which is the standard library — so every Linux
+#: image this platform has ever published can emit :data:`WATCH_EVENT_TYPE`,
+#: INCLUDING the ones that predate the X bindings and therefore emit no window
+#: events at all. A computer whose :attr:`Hello.events` names ``file.changed``
+#: and no ``window.*`` is an ordinary computer, not a malformed frame.
+CHANNEL_EVENT_TYPES: tuple[str, ...] = ("file.changed",)
 
 
 def _opt_texts(value: Any) -> list[str] | None:
@@ -132,8 +173,9 @@ class ComputerEvent:
     #: Who is describing this: ``"daemon"`` where the platform observed it,
     #: ``"guest"`` where the machine reported it about itself.
     #:
-    #: Worth reading. Every ``window.*``, ``clipboard.changed`` and
-    #: ``computer.ready`` is the tenant's own machine describing itself, and
+    #: Worth reading. Every ``window.*``, ``clipboard.changed``,
+    #: ``file.changed`` and ``computer.ready`` is the tenant's own machine
+    #: describing itself, and
     #: anyone with root inside that guest can make those say anything — which
     #: is exactly as much as they are worth. The same caller that trusts
     #: ``process.exited`` to end a wait may be putting a window title on a page.
@@ -214,11 +256,92 @@ class ComputerEvent:
     #: answers 404 from here on. The event is sent so that a caller waiting on
     #: it stops waiting, not because anything was learned about how the command
     #: ended.
+    #:
+    #: ``file.changed`` has a ``lost`` of its own on the wire and it is a REASON
+    #: rather than a flag; it decodes to :attr:`lost_reason`.
     lost: bool | None = field(default=None, kw_only=True)
     #: ``clipboard.changed``: ``"clipboard"`` or ``"primary"``. The contents are
     #: not on this stream — read them at
     #: :meth:`~mandala_computer.Computer.clipboard`.
     selection: str | None = field(default=None, kw_only=True)
+    #: ``file.changed``: the nominated tree this is reported under, as the host
+    #: NORMALISED it.
+    #:
+    #: Set on all three shapes of the event, and it is the only field that is —
+    #: a marker is about the tree rather than about anything in it. Match it
+    #: against :attr:`Hello.watching`, never against the string you passed to
+    #: ``watch``: a trailing slash and a ``.`` segment are cleaned away by the
+    #: host, and the cleaned form is what arrives here.
+    watch: str | None = field(default=None, kw_only=True)
+    #: ``file.changed``: the absolute path that changed, always inside
+    #: :attr:`watch`.
+    #:
+    #: ``None`` on the two marker shapes — :attr:`armed` and
+    #: :attr:`lost_reason` — which say something about the tree and name nothing
+    #: in it. It is ``None`` rather than ``""`` for the reason this class
+    #: promotes fields rather than defaulting them: a marker decoded to an empty
+    #: path would read as a change to a file with no name, and the distinction
+    #: the platform bothered to send would be gone.
+    path: str | None = field(default=None, kw_only=True)
+    #: ``file.changed``: ``"created"``, ``"modified"`` or ``"deleted"``.
+    #:
+    #: A rename inside the tree is a ``deleted`` and a ``created``, not a move:
+    #: inotify reports the two ends separately and one of them is usually
+    #: outside the tree, so each event is true about the path it names. Writes
+    #: are coalesced, so a file created and then written reads as ``created``.
+    #:
+    #: ``None`` on the markers, with :attr:`path`.
+    kind: str | None = field(default=None, kw_only=True)
+    #: ``file.changed``: whether the thing that changed is a directory.
+    #:
+    #: ``None`` on the markers, where there is no path for it to be about.
+    #: Spelled out rather than ``dir``, which reads as a listing.
+    is_dir: bool | None = field(default=None, kw_only=True)
+    #: ``file.changed``: the tree is being watched FROM HERE ON.
+    #:
+    #: ``True`` on the arming marker and ``None`` on every other shape, which is
+    #: the same split :attr:`synthesized` draws and not a tri-state to reason
+    #: about: the platform sends this only to say a watch went live.
+    #:
+    #: Until it arrives, silence about a tree means "not watching yet" rather
+    #: than "nothing has changed" — arming is asynchronous, and on a computer
+    #: nobody has opened a terminal on, the host has to install the watcher into
+    #: the guest first. inotify reports changes and not state, so whatever
+    #: happened in that window is never reported and never will be. It arrives
+    #: AGAIN after anything that re-arms the watch — a stop and a start, a guest
+    #: reboot, a broker replaced — and a second one means what the first did:
+    #: reporting starts here, so re-read the tree if the interruption mattered.
+    #:
+    #: :attr:`Hello.watching` is the other half of this, and the half a client
+    #: gets wrong. The guest answers a nomination once, so a stream joining a
+    #: tree somebody else nominated is never sent this event at all; the opening
+    #: frame is where that state is. State in ``hello``, transitions here — the
+    #: same division :attr:`Hello.ready` and ``computer.ready`` make.
+    armed: bool | None = field(default=None, kw_only=True)
+    #: ``file.changed``: this tree is not reporting everything under it, and
+    #: which of the three reasons it is.
+    #:
+    #: * ``"flood"`` — the tree changed faster than the cap allows it to be
+    #:   reported. Transient: re-read the tree and keep listening. A build under
+    #:   a watched path costs one of these rather than thousands of events.
+    #: * ``"budget"`` — the tree is bigger than the directory budget one watch
+    #:   gets, so part of it is not being watched at all. Permanent for this
+    #:   watch; nominate a narrower path.
+    #: * ``"unwatchable"`` — the directory is not there yet, is not a directory,
+    #:   cannot be read, or is a SYMLINK, which is refused rather than followed
+    #:   because inotify pins whatever the link resolved to. This one recovers
+    #:   on its own where it can — nominating the directory a job is about to
+    #:   create is a supported thing to do — and the recovery is announced by
+    #:   :attr:`armed` and by nothing else.
+    #:
+    #: Only ``unwatchable`` means the tree is not being watched. Treat any
+    #: non-empty value as "my picture of this tree is wrong".
+    #:
+    #: Spelled apart from :attr:`lost`, which is ``process.exited``'s boolean:
+    #: the wire calls both of them ``lost`` and they are not the same kind of
+    #: answer, so one field could not carry both without a caller having to know
+    #: the event type before reading it.
+    lost_reason: str | None = field(default=None, kw_only=True)
     #: ``computer.started`` / ``.stopped`` / ``.suspended``: the state it is in
     #: now.
     status: str | None = field(default=None, kw_only=True)
@@ -244,9 +367,10 @@ class ComputerEvent:
     #: the opening frame advertised.
     #:
     #: It goes both ways. A guest that turns out to have no watcher — an image
-    #: built without the X bindings — withdraws the guest half after ``hello``
-    #: promised it, and a computer stopped and started under an open socket can
-    #: ACQUIRE the channel its watcher runs over and get it back.
+    #: built without the X bindings — withdraws the DESKTOP half after ``hello``
+    #: promised it, keeping ``file.changed``, which needs no bindings; and a
+    #: computer stopped and started under an open socket can ACQUIRE the channel
+    #: its watcher runs over and get the whole guest half back.
     events: list[str] | None = field(default=None, kw_only=True)
     #: ``True`` for a ``computer.ready`` this SDK made out of the opening
     #: frame's STATE rather than one the platform sent as an event.
@@ -265,6 +389,41 @@ class ComputerEvent:
     #: caller reconciling against the platform's record wants to know it was
     #: never there.
     synthesized: bool = field(default=False, kw_only=True)
+
+
+@dataclass(frozen=True)
+class WatchedTree:
+    """One tree this stream nominated, as the opening frame reports it back.
+
+    Read off :attr:`Hello.watching` or :attr:`EventStream.watching`. Both halves
+    of it are answers a client cannot get any other way, and both are ones a
+    client gets wrong by assuming.
+    """
+
+    #: The nomination as the host NORMALISED it: a trailing slash and a ``.``
+    #: segment are accepted and cleaned away.
+    #:
+    #: This — not the string you passed to ``watch`` — is what every
+    #: ``file.changed`` carries in :attr:`ComputerEvent.watch`, so a client
+    #: matching on what it sent matches nothing. A path the host cannot honour
+    #: is a refusal on the upgrade rather than an entry here.
+    path: str
+    #: Whether this tree is ALREADY being watched.
+    #:
+    #: ``False`` is the ordinary case on a fresh nomination and means "not live
+    #: yet": wait for this tree's ``file.changed`` with
+    #: :attr:`~ComputerEvent.armed` set before reading silence as "nothing has
+    #: changed".
+    #:
+    #: ``True`` means live NOW, and no event is coming to say so — somebody else
+    #: nominated this tree first and the guest answers a nomination once. A
+    #: client that models only the transition waits forever on a machine that
+    #: has been reporting the whole time, which is the same trap
+    #: :attr:`Hello.ready` takes out of ``computer.ready``.
+    armed: bool
+    #: The entry verbatim. Unknown fields survive here as they do everywhere
+    #: else on this surface.
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -290,6 +449,12 @@ class Hello:
     #: :data:`GUEST_EVENT_TYPES`, and this list says so rather than leaving a
     #: caller waiting for something that cannot arrive.
     #:
+    #: That half does not go missing all at once, which is the case a client
+    #: gets wrong. :data:`DESKTOP_EVENT_TYPES` needs the terminal channel AND
+    #: the X bindings; :data:`CHANNEL_EVENT_TYPES` needs the channel alone, so
+    #: a computer here can name ``file.changed`` and no ``window.*`` at all.
+    #: Read this list rather than inferring the rest of it from one entry.
+    #:
     #: ``None`` where the opening frame did not state one, which is a different
     #: answer from the empty list and is kept apart from it for the same reason
     #: :attr:`ComputerEvent.events` is: an empty vocabulary is a computer that
@@ -313,6 +478,18 @@ class Hello:
     #: ``window.closed`` correlatable.
     windows: list[Window] | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    #: The trees this stream will report file changes under, and whether each is
+    #: live yet. ``None`` where the frame carried no ``watching`` at all.
+    #:
+    #: ``None`` is the honest shape for a stream that nominated nothing, and it
+    #: is a stronger statement than the empty list would be: no ``file.changed``
+    #: can reach that socket AT ALL. Nomination is an option on the connection —
+    #: ``events(watch=...)`` — rather than an event type to wait for, which is
+    #: why this is state on the opening frame rather than something to discover.
+    #:
+    #: Keyword-only and last, like every field added to a released record on
+    #: this surface: the positional order is a promise already made.
+    watching: list[WatchedTree] | None = field(default=None, kw_only=True)
 
 
 def _str(value: Any) -> str:
@@ -376,6 +553,32 @@ def to_computer_event(frame: Any) -> ComputerEvent | None:
         promoted["exit_code"] = None if lost else _opt_whole(data.get("exit_code"))
     elif kind == "clipboard.changed":
         promoted["selection"] = _text(data.get("selection")) or None
+    elif kind == WATCH_EVENT_TYPE:
+        # THREE shapes behind one type, and the fields are what tell them
+        # apart: `{watch, path, kind, dir}` is a change, `{watch, armed}` says
+        # the tree went live, `{watch, lost}` says the picture of it is
+        # incomplete. Only `watch` is on all three.
+        #
+        # Nothing is defaulted into place here. A dataclass field defaulting to
+        # `""` would decode a marker as a change to a file with no name and
+        # swallow a distinction the platform went out of its way to send, so
+        # every field a shape does not carry stays `None` — which is what the
+        # promoted fields mean everywhere else on this class.
+        promoted["watch"] = _text(data.get("watch")) or None
+        promoted["path"] = _text(data.get("path")) or None
+        promoted["kind"] = _text(data.get("kind")) or None
+        promoted["lost_reason"] = _text(data.get("lost")) or None
+        # TRUE only, and never manufactured False. `armed` is `omitempty` on the
+        # wire, so its absence is every ordinary change event rather than a
+        # statement that the tree is not armed — and a client reading a `False`
+        # here as "the watch went away" would act on a transition nobody
+        # reported. The one thing this field ever says is that a watch went live.
+        promoted["armed"] = True if _wire(data, "armed") is _Wire.TRUE else None
+        # Read only where there is a path for it to be about. `dir` is
+        # `omitempty` too, so on a change frame absent means "not a directory";
+        # on a marker it means nothing at all, and `False` there would describe
+        # a file that is not in the event.
+        promoted["is_dir"] = None if promoted["path"] is None else _wire(data, "dir") is _Wire.TRUE
     elif kind in ("computer.started", "computer.stopped", "computer.suspended"):
         promoted["status"] = _text(data.get("status")) or None
         promoted["previous"] = _text(data.get("previous")) or None
@@ -410,6 +613,37 @@ def to_computer_event(frame: Any) -> ComputerEvent | None:
     )
 
 
+def to_watched_tree(row: Any) -> WatchedTree | None:
+    """One ``hello.watching`` entry, or ``None`` for a row with no path in it.
+
+    Dropped rather than carried with an empty path, and this is the one decoder
+    on this module that refuses a row. Everywhere else a field nobody could read
+    costs a caller one attribute; here it would cost them the whole feature —
+    ``""`` matches no ``file.changed`` ever sent, so a stream would look like it
+    was watching a tree it can never be told about. A row that is missing tells
+    a caller to look at :attr:`Hello.raw`; a row that is present and false does
+    not.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    path = _text(row.get("path"))
+    if not path:
+        return None
+    # `_wire`, like every other boolean off this wire, and TRUE only. The
+    # recoverable direction is the one that waits: a tree reported unarmed that
+    # is in fact live ends at the caller's own timeout, while an unreadable
+    # `armed` called True is a client acting on silence from a watch that was
+    # never running — which is the exact failure `armed` exists to prevent.
+    return WatchedTree(path=path, armed=_wire(row, "armed") is _Wire.TRUE, raw=dict(row))
+
+
+def _watching(rows: Any) -> list[WatchedTree] | None:
+    """``hello.watching``, keeping "nominated nothing" apart from "nothing armed"."""
+    if not isinstance(rows, list):
+        return None
+    return [tree for tree in (to_watched_tree(row) for row in rows) if tree is not None]
+
+
 def to_hello(frame: Any) -> Hello | None:
     """The opening frame, or ``None`` for anything that is not one."""
     if not isinstance(frame, Mapping) or frame.get("type") != "hello":
@@ -438,6 +672,11 @@ def to_hello(frame: Any) -> Hello | None:
         events=_opt_texts(frame.get("events")),
         windows=windows,
         raw=dict(frame),
+        # ABSENT and empty are different answers here, as they are for
+        # `windows`: absent is a stream that nominated nothing, on which no
+        # `file.changed` can arrive at all. A list is kept even when every row
+        # in it was unreadable, because the field's presence is the fact.
+        watching=_watching(frame.get("watching")),
     )
 
 
@@ -454,6 +693,27 @@ def with_cursor(url: str, cursor: str | None) -> str:
     from urllib.parse import quote
 
     return f"{url}{'&' if '?' in url else '?'}since={quote(cursor, safe='')}"
+
+
+def with_watches(url: str, paths: Sequence[str]) -> str:
+    """``events_url`` with the trees this stream nominates on it.
+
+    Repeated rather than comma-separated, which is the platform's own choice and
+    the only one that works: a directory name may contain a comma, and a list
+    format that cannot represent every value it is a list of is a defect waiting
+    for the first tenant with a ``a,b`` in their home directory.
+
+    ``/`` is percent-encoded along with everything else. It survives the round
+    trip either way, and encoding it means this function has no opinion about
+    which bytes of a path are structural — the host is the authority on the
+    shape of a path, and this is a credential-bearing URL to leave otherwise
+    alone (see :func:`with_cursor`).
+    """
+    from urllib.parse import quote
+
+    for path in paths:
+        url = f"{url}{'&' if '?' in url else '?'}watch={quote(path, safe='')}"
+    return url
 
 
 # --- refusals that will not clear ------------------------------------------
@@ -484,7 +744,11 @@ def _is_settled(err: BaseException) -> bool:
 
 
 def unreachable_types(
-    computer_id: str, wanted: Sequence[str], advertised: Sequence[str] | None
+    computer_id: str,
+    wanted: Sequence[str],
+    advertised: Sequence[str] | None,
+    *,
+    nominated: bool = True,
 ) -> MandalaError | None:
     """The refusal for a wait whose event cannot arrive, or ``None``.
 
@@ -503,25 +767,59 @@ def unreachable_types(
     can do, so where it said nothing there is no ground to stand on — and the
     alternative, treating silence as the empty list, ends every wait on a
     desktop whose opening frame was merely malformed (OPL-4222).
+
+    ``nominated`` is the second, independent way a wait cannot end, and it is
+    the one the advertised list cannot express. A computer offers
+    ``file.changed`` whenever it COULD report one — the platform decides that
+    off the terminal channel, before anyone has said which directory they care
+    about — so the vocabulary says yes to a stream that nominated nothing and on
+    which no such event can ever arrive. That is a fact about this subscription
+    rather than about the machine, so it is refused even where ``advertised`` is
+    ``None``: silence about the vocabulary is not silence about the nomination.
     """
-    if advertised is None:
-        return None
-    reachable = set(advertised) | set(STREAM_FRAME_TYPES)
     # Deduplicated FIRST. Counting `impossible` with duplicates in it and
     # comparing against the distinct types asked for made the two sides count
     # different things, so `["missing", "missing", "process.exited"]` refused a
     # wait whose second type the computer advertises (Codex review).
-    # `dict.fromkeys` rather than a set, so the sentence below names them in
+    # `dict.fromkeys` rather than a set, so the sentences below name them in
     # the order the caller wrote them.
     asked = list(dict.fromkeys(wanted))
-    impossible = [t for t in asked if t not in reachable]
-    if len(impossible) < len(asked):
+    reachable = None if advertised is None else set(advertised) | set(STREAM_FRAME_TYPES)
+    unadvertised = [] if reachable is None else [t for t in asked if t not in reachable]
+    # The vocabulary answers FIRST where it has an answer. A computer that
+    # cannot emit `file.changed` at all and a stream that did not nominate a
+    # tree are two different problems, and the one to report is the one a
+    # nomination would not fix.
+    unwatched = (
+        [] if nominated else [t for t in asked if t == WATCH_EVENT_TYPE and t not in unadvertised]
+    )
+    if len(unwatched) + len(unadvertised) < len(asked):
         return None
-    can = ", ".join(advertised) or "nothing"
+    if not unadvertised:
+        # The computer can emit it; this socket cannot receive it. Said in those
+        # words rather than folded into the sentence below, because "cannot
+        # emit" would be a false statement about the machine and would send a
+        # caller looking at their image for a problem that is in their call.
+        return _settle(
+            MandalaError(
+                f"{computer_id} reports {' or '.join(unwatched)} only under a directory this "
+                "stream nominated, and it nominated none — so waiting for it would never end. "
+                'Pass watch="/absolute/path" to say which tree you are waiting on.'
+            )
+        )
+    said = "" if advertised is None else f" It advertises: {', '.join(advertised) or 'nothing'}."
+    also = (
+        ""
+        if not unwatched
+        else (
+            f" {' and '.join(unwatched)} needs a watch= nomination as well, and this stream "
+            "made none."
+        )
+    )
     return _settle(
         MandalaError(
-            f"{computer_id} cannot emit {' or '.join(impossible)}, so waiting for it would "
-            f"never end. It advertises: {can}."
+            f"{computer_id} cannot emit {' or '.join(unadvertised)}, so waiting for it would "
+            f"never end.{said}{also}"
         )
     )
 
@@ -558,6 +856,12 @@ class _Core:
 
     hello: Hello | None = None
     types: list[str] | None = None
+    #: The nominated trees and whether each is live, as last stated: the
+    #: opening frame's list, with an ``armed`` marker applied to it as one
+    #: arrives. State in ``hello``, transitions on the stream — kept in one
+    #: place so a caller reading :attr:`EventStream.watching` gets the current
+    #: answer rather than the one from connect time.
+    watching: list[WatchedTree] | None = None
     #: Consecutive failures to get a working connection.
     failures: int = 0
     #: The current backoff step, doubling towards :attr:`max_backoff`.
@@ -585,6 +889,12 @@ class _Core:
         """
         self.hello = hello
         self.types = None if hello.events is None else list(hello.events)
+        # Replaced per connection, like `types` and the desktop. A reconnect
+        # re-nominates the same trees and is answered afresh, and the answer can
+        # differ: a tree that was live on the last socket is not necessarily
+        # armed on this one — a guest reboot in between disarms it — so carrying
+        # the old list forward would report a watch that is not running.
+        self.watching = None if hello.watching is None else list(hello.watching)
         # The cursor a client stores when it disconnects before seeing an
         # event. Adopted only when nothing has been consumed, because it names
         # a position BEFORE the backlog this connection is about to deliver:
@@ -703,7 +1013,25 @@ class _Core:
             return None
         if ev.type == "capabilities" and ev.events is not None:
             self.types = list(ev.events)
+        elif ev.type == WATCH_EVENT_TYPE and ev.armed and ev.watch:
+            self.arm(ev.watch)
         return ev
+
+    def arm(self, tree: str) -> None:
+        """Record that a nominated tree went live.
+
+        Only for a tree the opening frame named. An ``armed`` marker for
+        anything else is either a host this build does not understand or an
+        event that leaked past the delivery filter, and inventing a row for it
+        would put a path in :attr:`EventStream.watching` that this stream never
+        asked about — which is the one thing that list is relied on to mean.
+        """
+        if self.watching is None:
+            return
+        self.watching = [
+            WatchedTree(path=w.path, armed=True, raw=w.raw) if w.path == tree and not w.armed else w
+            for w in self.watching
+        ]
 
     def consumed(self, ev: ComputerEvent) -> None:
         """Move the position, having handed this event to the caller.
@@ -813,6 +1141,55 @@ def _check_numbers(
         raise MandalaError(f"max_retries must be a non-negative integer (got {max_retries!r})")
 
 
+def _watch_paths(watch: str | Sequence[str] | None) -> tuple[str, ...]:
+    """The nomination, checked for the two mistakes worth catching here.
+
+    A bare string is one path, not four characters. ``str`` is a
+    ``Sequence[str]`` whose members are its own letters, so the obvious
+    implementation turns ``watch="/tmp"`` into a nomination of ``/``, ``t``,
+    ``m``, ``p`` — three refusals and a watch on the root, from a call that is
+    the common case.
+
+    Beyond that this checks only what a caller can read off their own argument:
+    that each path is a non-empty string and is absolute. The length cap, the
+    control characters, ``/`` itself and how many trees one stream may name are
+    the platform's rules and the platform states them in its own refusal, which
+    reaches a caller as a settled error carrying that sentence. Duplicating them
+    here would be a second place for them to be wrong, and would refuse a limit
+    a later host has raised.
+
+    NOT normalised, deliberately. The host cleans a trailing slash and a ``.``
+    segment, and the cleaned form is what :attr:`Hello.watching` reports and
+    every event carries — so a client is meant to read the answer back rather
+    than predict it, and a normalisation done here would be a second opinion
+    about a path that only one side is the authority on.
+    """
+    if watch is None:
+        return ()
+    if isinstance(watch, str):
+        paths = [watch]
+    else:
+        try:
+            paths = list(watch)
+        except TypeError:
+            # A number or any other non-iterable, answered in this SDK's own
+            # error rather than as the `TypeError` that `list()` raises. The
+            # handler a caller is told to write is `except MandalaError`, and an
+            # argument check that goes past it is the failure OPL-4222 fixed on
+            # `wait_for`'s own deadline.
+            raise MandalaError(
+                f"watch must be a path or a sequence of paths (got {watch!r})"
+            ) from None
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            raise MandalaError(f"a watch path must be a non-empty string (got {path!r})")
+        if not path.startswith("/"):
+            raise MandalaError(
+                f"a watch path must be absolute, naming a directory in the GUEST (got {path!r})"
+            )
+    return tuple(paths)
+
+
 def _decode(message: Any) -> Any:
     """A frame's JSON, or ``None`` for anything that is not a text frame of it.
 
@@ -829,7 +1206,9 @@ def _decode(message: Any) -> Any:
         return None
 
 
-def _refusal(computer_id: str, status: int, body: bytes | bytearray | None) -> MandalaError:
+def _refusal(
+    computer_id: str, status: int, body: bytes | bytearray | None, *, watching: bool = False
+) -> MandalaError:
     """Why the upgrade was refused, from what the refusal actually said.
 
     This is where the Python half parts company with
@@ -861,6 +1240,25 @@ def _refusal(computer_id: str, status: int, body: bytes | bytearray | None) -> M
                 )
             )
         if said is not None and said.get("reason") == "unavailable":
+            if watching:
+                # TWO refusals share this reason once a stream nominates a tree,
+                # and nothing structural separates them: a computer that is not
+                # running, and one already watching all 32 trees it can watch at
+                # once across every stream open on it. The platform's own
+                # sentence is the only thing that tells them apart, so it is
+                # repeated rather than replaced by a guess between the two.
+                #
+                # Settled either way. A stopped computer is a decision, and a
+                # tree budget is freed by closing another stream rather than by
+                # asking this one again.
+                return _settle(
+                    MandalaError(
+                        f"{computer_id}'s event stream was refused: {detail or 'unavailable'}. "
+                        "Either it is not running — call start() and open it again — or this "
+                        "nomination would take it past the trees it can watch at once, which "
+                        "closing another stream frees."
+                    )
+                )
             return _settle(
                 MandalaError(
                     f"{computer_id} is not running, and only a running computer has an event "
@@ -874,6 +1272,26 @@ def _refusal(computer_id: str, status: int, body: bytes | bytearray | None) -> M
             MandalaError(
                 f"{computer_id}'s event stream was refused with a 409"
                 + (f": {detail}" if detail else "")
+            )
+        )
+    if status == 400:
+        # A refusal about the REQUEST, and every documented one on this route is
+        # about a nominated path: empty, relative, too long, carrying control
+        # characters, `/` itself, or more than four of them. Settled, because
+        # the same URL is refused the same way for ever — and this is the one
+        # status on this route that used to fall through to the weather branch
+        # below, where a mistyped path became a reconnect loop with no
+        # `max_retries` to stop it.
+        return _settle(
+            MandalaError(
+                f"{computer_id}'s event stream refused this request (HTTP 400)"
+                + (f": {detail}" if detail else "")
+                + (
+                    ". A nominated path must be absolute, must not be / itself, and there is a "
+                    "limit on how many one stream may name."
+                    if watching
+                    else ""
+                )
             )
         )
     if status in (401, 403):
@@ -937,7 +1355,9 @@ async def _aconnect(url: str, *, open_timeout: float, max_queue: int) -> Any:
 DEFAULT_MAX_QUEUE = 4096
 
 
-def _connect_failed(computer_id: str, exc: BaseException) -> MandalaError:
+def _connect_failed(
+    computer_id: str, exc: BaseException, *, watching: bool = False
+) -> MandalaError:
     """A websocket that would not open, as this SDK's own error.
 
     Split by whether asking again could answer differently. A refused upgrade
@@ -949,7 +1369,7 @@ def _connect_failed(computer_id: str, exc: BaseException) -> MandalaError:
     from websockets.exceptions import InvalidStatus, InvalidURI, WebSocketException
 
     if isinstance(exc, InvalidStatus):
-        return _refusal(computer_id, exc.response.status_code, exc.response.body)
+        return _refusal(computer_id, exc.response.status_code, exc.response.body, watching=watching)
     if isinstance(exc, InvalidURI):
         return _settle(MandalaError(f"{computer_id}'s events_url is not a websocket URL: {exc}"))
     # ``asyncio.TimeoutError`` alongside the builtin because they are separate
@@ -1030,6 +1450,7 @@ class _StreamBase:
         max_queue: int = DEFAULT_MAX_QUEUE,
         on_connect: Callable[[Hello], None] | None = None,
         timeout: float | None = None,
+        watch: str | Sequence[str] | None = None,
     ) -> None:
         _check_numbers(
             backoff=backoff,
@@ -1056,6 +1477,7 @@ class _StreamBase:
             )
         self._url = url
         self._id = computer_id
+        self._watch = _watch_paths(watch)
         self._max_queue = max_queue
         self._timeout = None if timeout is None else float(timeout)
         self._core = _Core(
@@ -1106,6 +1528,25 @@ class _StreamBase:
         # one would let an accidental `append` talk a wait into hanging on a
         # machine that cannot produce the event.
         return None if self._core.types is None else list(self._core.types)
+
+    @property
+    def watching(self) -> list[WatchedTree] | None:
+        """The trees this stream nominated, and whether each is live YET.
+
+        The opening frame's answer, with an ``armed`` marker applied to it as
+        one arrives — so this is the current state rather than the state at
+        connect time. ``None`` where nothing was nominated, which is a stronger
+        answer than the empty list: no ``file.changed`` can reach this socket at
+        all.
+
+        The paths in it are the host's NORMALISED spelling of what was
+        nominated, and they are what every ``file.changed`` carries in
+        :attr:`ComputerEvent.watch`. Match on these, not on the strings you
+        passed to ``watch``.
+        """
+        # A copy of the list, for the reason `event_types` is copied. The trees
+        # in it are frozen records and are not copied themselves.
+        return None if self._core.watching is None else list(self._core.watching)
 
     @property
     def windows(self) -> list[Window] | None:
@@ -1361,7 +1802,7 @@ class EventStream(_StreamBase):
         if budget <= 0:
             raise _Expired
         started = time.monotonic()
-        url = with_cursor(self._url(budget), self._core.cursor)
+        url = with_watches(with_cursor(self._url(budget), self._core.cursor), self._watch)
         left = budget - (time.monotonic() - started)
         if left <= 0:
             raise ConnectionError(
@@ -1371,7 +1812,7 @@ class EventStream(_StreamBase):
         try:
             sock = _connect(url, open_timeout=left, max_queue=self._max_queue)
         except Exception as exc:
-            raise _connect_failed(self._id, exc) from exc
+            raise _connect_failed(self._id, exc, watching=bool(self._watch)) from exc
         self._sock = sock
         buffered: list[Any] = []
         hello: Hello | None = None
@@ -1582,7 +2023,7 @@ class AsyncEventStream(_StreamBase):
         if budget <= 0:
             raise _Expired
         started = time.monotonic()
-        url = with_cursor(await self._url(budget), self._core.cursor)
+        url = with_watches(with_cursor(await self._url(budget), self._core.cursor), self._watch)
         left = budget - (time.monotonic() - started)
         if left <= 0:
             raise ConnectionError(
@@ -1592,7 +2033,7 @@ class AsyncEventStream(_StreamBase):
         try:
             sock = await _aconnect(url, open_timeout=left, max_queue=self._max_queue)
         except Exception as exc:
-            raise _connect_failed(self._id, exc) from exc
+            raise _connect_failed(self._id, exc, watching=bool(self._watch)) from exc
         self._sock = sock
         buffered: list[Any] = []
         hello: Hello | None = None

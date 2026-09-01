@@ -50,12 +50,16 @@ from ._async_resources import (
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
 from ._events import (
+    CHANNEL_EVENT_TYPES,
+    DESKTOP_EVENT_TYPES,
     GUEST_EVENT_TYPES,
     STREAM_FRAME_TYPES,
+    WATCH_EVENT_TYPE,
     AsyncEventStream,
     ComputerEvent,
     EventStream,
     Hello,
+    WatchedTree,
 )
 from ._exceptions import (
     APIError,
@@ -109,11 +113,14 @@ from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, U
 __version__ = "0.1.0"
 
 __all__ = [
+    "CHANNEL_EVENT_TYPES",
     "DEFAULT_BASE_URL",
+    "DESKTOP_EVENT_TYPES",
     "GUEST_EVENT_TYPES",
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
     "STREAM_FRAME_TYPES",
+    "WATCH_EVENT_TYPE",
     "APIError",
     "AgentDone",
     "AgentEvent",
@@ -172,6 +179,7 @@ __all__ = [
     "UsageReport",
     "UsageTotals",
     "VncConnect",
+    "WatchedTree",
     "Window",
     "WindowResult",
     "__version__",
