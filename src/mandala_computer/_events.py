@@ -280,7 +280,13 @@ class Hello:
     #: A guest with nowhere to run a watcher never produces the half named in
     #: :data:`GUEST_EVENT_TYPES`, and this list says so rather than leaving a
     #: caller waiting for something that cannot arrive.
-    events: list[str]
+    #:
+    #: ``None`` where the opening frame did not state one, which is a different
+    #: answer from the empty list and is kept apart from it for the same reason
+    #: :attr:`ComputerEvent.events` is: an empty vocabulary is a computer that
+    #: emits nothing, and :meth:`EventStream.wait_for` refuses against it. A
+    #: frame nobody could read is not that computer.
+    events: list[str] | None
     #: The desktop as this host last saw it, or ``None``.
     #:
     #: Present — possibly as an empty list — on a connection with no
@@ -407,7 +413,13 @@ def to_hello(frame: Any) -> Hello | None:
         # because a field was malformed hands an agent a screen that is still
         # booting.
         ready=_wire(frame, "ready") is _Wire.TRUE,
-        events=_texts(frame.get("events")),
+        # `_opt_texts`, for the reason it exists: `_texts` answers `[]` for
+        # anything that is not a list, and `[]` here is a computer that can
+        # emit nothing — which `wait_for` refuses outright. A hello that omits
+        # `events`, or spells it as a bare string, would end every wait on a
+        # perfectly healthy desktop. `None` is "did not say", and a vocabulary
+        # nobody stated is not one to refuse a wait against (OPL-4222).
+        events=_opt_texts(frame.get("events")),
         windows=windows,
         raw=dict(frame),
     )
@@ -456,7 +468,7 @@ def _is_settled(err: BaseException) -> bool:
 
 
 def unreachable_types(
-    computer_id: str, wanted: Sequence[str], advertised: Sequence[str]
+    computer_id: str, wanted: Sequence[str], advertised: Sequence[str] | None
 ) -> MandalaError | None:
     """The refusal for a wait whose event cannot arrive, or ``None``.
 
@@ -469,7 +481,15 @@ def unreachable_types(
     advertised list, which is about the COMPUTER. Counting them as impossible
     would refuse ``wait_for("gap")`` — a reasonable thing to wait for, and the
     one this list has no opinion about.
+
+    ``None`` for ``advertised`` is a vocabulary nobody stated, and refuses
+    nothing. This is a refusal built entirely out of what the computer said it
+    can do, so where it said nothing there is no ground to stand on — and the
+    alternative, treating silence as the empty list, ends every wait on a
+    desktop whose opening frame was merely malformed (OPL-4222).
     """
+    if advertised is None:
+        return None
     reachable = set(advertised) | set(STREAM_FRAME_TYPES)
     # Deduplicated FIRST. Counting `impossible` with duplicates in it and
     # comparing against the distinct types asked for made the two sides count
@@ -548,13 +568,24 @@ class _Core:
         the readiness that frame implied.
         """
         self.hello = hello
-        self.types = list(hello.events)
+        self.types = None if hello.events is None else list(hello.events)
         # The cursor a client stores when it disconnects before seeing an
         # event. Adopted only when nothing has been consumed, because it names
         # a position BEFORE the backlog this connection is about to deliver:
         # taken while events were pending it would resume in front of frames
         # the caller has already been given, and they would arrive twice.
-        if self.cursor is None:
+        #
+        # `not self.cursor` rather than `is None`, and the empty string is why
+        # this object's own constructor already writes `cursor=since or None`:
+        # `""` is not a position, but it is not `None` either, so once one was
+        # stored this branch never fired again. `_str` answers `""` for a hello
+        # that omits `cursor` or spells it as a non-string — so the wire could
+        # plant exactly the value the constructor guards against, and every
+        # reconnect for the life of the stream rejoined at the head and
+        # redelivered the same prefix (adversarial review, OPL-4222).
+        # `consumed` only ever stores a non-empty cursor, so "nothing has been
+        # consumed" and "this is falsy" are the same question.
+        if not self.cursor and hello.cursor:
             self.cursor = hello.cursor
         # The readiness a subscriber would otherwise never hear about, and ONLY
         # where it could not arrive as an event.
@@ -1251,7 +1282,17 @@ class EventStream(_StreamBase):
             failed: MandalaError | None = None
             for ev in pending:
                 core.consumed(ev)
-                delivered += 1
+                # NOT counted when this SDK made it up. `delivered` is what
+                # decides whether `worked()` clears the failure count, and a
+                # synthesized `computer.ready` is a reading of the opening
+                # frame rather than something the connection carried — so a
+                # host that says hello and drops the socket in the same breath
+                # produced one every cycle, reset the backoff every cycle, and
+                # never reached `max_retries`. That is precisely the loop
+                # `_Core.worked`'s own docstring says it exists to prevent
+                # (adversarial review, OPL-4222). Still yielded: the readiness
+                # it reports is real, and a caller waiting on it must hear it.
+                delivered += 0 if ev.synthesized else 1
                 yield ev
                 if self._stopped():
                     return
@@ -1474,7 +1515,17 @@ class AsyncEventStream(_StreamBase):
             failed: MandalaError | None = None
             for ev in pending:
                 core.consumed(ev)
-                delivered += 1
+                # NOT counted when this SDK made it up. `delivered` is what
+                # decides whether `worked()` clears the failure count, and a
+                # synthesized `computer.ready` is a reading of the opening
+                # frame rather than something the connection carried — so a
+                # host that says hello and drops the socket in the same breath
+                # produced one every cycle, reset the backoff every cycle, and
+                # never reached `max_retries`. That is precisely the loop
+                # `_Core.worked`'s own docstring says it exists to prevent
+                # (adversarial review, OPL-4222). Still yielded: the readiness
+                # it reports is real, and a caller waiting on it must hear it.
+                delivered += 0 if ev.synthesized else 1
                 yield ev
                 if self._stopped():
                     return

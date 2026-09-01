@@ -250,5 +250,11 @@ def test_a_count_cannot_be_a_bool() -> None:
     # caller rather than owning one.
     with pytest.raises(ValueError):
         A.window_body("move", x=True, y=1)
-    with pytest.raises(TypeError):
-        A.click_body(x=True, y=1, button="left")
+    # POSITIONALLY, with the real signature. Written as
+    # `click_body(x=True, y=1, button="left")` this raised its TypeError on the
+    # keyword — `click_body` is `(action, x, y, modifiers)` and has never taken
+    # a `button` — so it passed without ever reaching `_whole_point`, and would
+    # have gone on passing if the pointer guards started accepting JSON `true`
+    # as a coordinate (adversarial review, OPL-4222).
+    with pytest.raises(TypeError, match="x must be an integer coordinate"):
+        A.click_body("left_click", True, 1, ())

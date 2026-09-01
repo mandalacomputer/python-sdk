@@ -446,10 +446,27 @@ class AsyncComputer(ComputerFields):
         you need something inside the guest to be ready.
 
         Raises :class:`~mandala_computer.MandalaError` rather than waiting out
-        the timeout for the two states that will not become "running" on their
-        own — a failed build, and a suspended session nobody has resumed.
+        the timeout for the three states that will not become "running" on their
+        own — a failed build, a suspended session nobody has resumed, and a
+        create whose machine was made and would not boot.
         """
         check_wait_args(timeout, poll)
+        # BEFORE the first refresh, because the refresh is what destroys the
+        # evidence. `start_error` rides on the create envelope and describes one
+        # start attempt rather than the machine, so `refresh()` clears it — and
+        # a stopped computer with no start_error is not `build_failed`, not
+        # suspended and not building, which left this loop polling a machine
+        # that was never going to move for the whole timeout and then reporting
+        # it as "still 'stopped'". The reason was in hand before the first
+        # request went out. `wait_for_guest` already reads the cached payload
+        # this way; this is the sibling that did not (adversarial review,
+        # OPL-4222).
+        #
+        # `start_error` ALONE, and not the rest of `_guest_wait_failure`: an
+        # ordinary `stopped` is exactly what this wait is for, since a caller
+        # who has just called `start()` holds a handle that still says so.
+        if self.start_error:
+            raise MandalaError(f"{self.id} did not start: {self.start_error}")
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -1506,6 +1523,18 @@ class AsyncComputer(ComputerFields):
         wanted = [types] if isinstance(types, str) else list(types)
         if not wanted:
             raise MandalaError("wait_for needs at least one event type to wait for")
+        # An already-expired deadline, answered the way every sibling wait
+        # answers one. `check_wait_args` takes `timeout=0` deliberately and says
+        # why: the other waits raise the `TimeoutError` their callers are
+        # catching, and going past that handler with a different class is the
+        # failure it was avoiding. This wait routed its `timeout` straight into
+        # `EventStream`, which requires a positive one and complains with a bare
+        # `MandalaError` — so `except TimeoutError` around a computed remaining
+        # budget caught three of these four waits (adversarial review,
+        # OPL-4222). `events()` keeps the stricter rule: a stream with no time
+        # at all is a different request from a wait that has run out of it.
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout == 0:
+            raise TimeoutError(f"{self.id} did not emit {' or '.join(wanted)} within 0s")
         impossible: MandalaError | None = None
 
         def hello_hook(hello: Hello) -> None:

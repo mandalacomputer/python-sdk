@@ -8,6 +8,7 @@ add ports and timing to questions that are about neither.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
@@ -23,6 +24,7 @@ from mandala_computer._events import (
     Hello,
     to_computer_event,
     to_hello,
+    unreachable_types,
     with_cursor,
 )
 
@@ -1416,6 +1418,126 @@ def test_the_first_backoff_step_is_capped_by_the_ceiling() -> None:
     )
     assert core.wait_out() == 15.0
     assert core.wait_out() == 15.0
+
+
+@respx.mock
+def test_a_hello_that_closes_in_the_same_breath_still_runs_out_of_retries(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The synthesized ``computer.ready`` is not evidence the connection worked.
+
+    ``_run`` counted every pending event as delivered, and a hello carrying
+    ``ready`` with a windows list produces one before a single frame comes off
+    the socket. ``worked()`` then cleared the failure count and reset the
+    backoff, so a host that accepts a socket and drops it a millisecond later —
+    which is what shedding a slow subscriber looks like — was reconnected to
+    every half-second for ever, and ``max_retries`` was unreachable. That is
+    the exact loop ``_Core.worked``'s own docstring says it exists to prevent
+    (adversarial review, OPL-4222).
+    """
+    route()
+    # Four sockets scripted against max_retries=2. Reaching the fourth is the
+    # failure: the budget has to run out on the third.
+    dialer = Dialer(*([[hello_frame(ready=True, windows=[])]] * 4)).install(monkeypatch)
+    stream = computer.events(max_retries=2, backoff=0.001, max_backoff=0.001)
+    with stream, pytest.raises(mc.ConnectionError, match="could not be reopened"):
+        # Every cycle yields the readiness it invented, and nothing else.
+        for ev in stream:
+            assert ev.synthesized is True
+    assert len(dialer.sockets) == 3
+
+
+def test_synthesized_tells_an_invented_event_from_a_delivered_one() -> None:
+    """The flag the rule above is built on, pinned from both sides.
+
+    ``_run`` decides whether a connection worked by asking each event it yields
+    whether this SDK made it up, so the flag has to be true for exactly the one
+    the opening frame implies and false for everything off the wire — including
+    a frame that spells ``synthesized`` itself.
+    """
+    from mandala_computer._events import _Core
+
+    core = _Core(
+        reconnect=True,
+        backoff=0.5,
+        max_backoff=15.0,
+        max_retries=2,
+        connect_timeout=15.0,
+        cursor=None,
+        on_connect=None,
+    )
+    hello = to_hello(json.loads(hello_frame(ready=True, windows=[])))
+    assert hello is not None
+    (ready,) = core.opening(hello, [])
+    assert ready.synthesized is True
+
+    off_the_wire = to_computer_event(json.loads(event_frame("computer.ready", synthesized=True)))
+    assert off_the_wire is not None
+    assert off_the_wire.synthesized is False
+
+
+@respx.mock
+def test_wait_for_is_not_refused_by_a_hello_that_named_no_vocabulary(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_texts`` answers ``[]`` for anything that is not a list, and ``[]``
+    here is a computer that can emit nothing — which ``wait_for`` refuses
+    outright. So a hello that omitted ``events``, or spelled it as a bare
+    string, ended every wait on a perfectly healthy desktop (adversarial
+    review, OPL-4222). ``None`` is "did not say", and says nothing about what
+    can arrive."""
+    route()
+    Dialer([resumed_hello(events=None), event_frame("window.opened"), FakeSocket.HANG]).install(
+        monkeypatch
+    )
+    assert computer.wait_for("window.opened", timeout=5).type == "window.opened"
+
+
+@pytest.mark.parametrize("said", [None, "window.opened", 7, {}], ids=["null", "str", "int", "obj"])
+def test_an_unreadable_vocabulary_is_not_an_empty_one(said: object) -> None:
+    frame = json.loads(hello_frame())
+    if said is None:
+        del frame["events"]
+    else:
+        frame["events"] = said
+    hello = to_hello(frame)
+    assert hello is not None
+    assert hello.events is None
+    assert unreachable_types("vm-1", ["window.opened"], hello.events) is None
+    # A vocabulary the computer really did state still refuses.
+    assert unreachable_types("vm-1", ["window.opened"], []) is not None
+
+
+def test_an_empty_hello_cursor_is_not_a_position_to_resume_from() -> None:
+    """Construction already writes ``cursor=since or None`` because ``""`` is
+    not a position but is not ``None`` either — so once one was stored,
+    ``accept_hello`` never adopted a real cursor again and every reconnect
+    rejoined at the head. ``_str`` answers ``""`` for a hello that omits
+    ``cursor``, so the wire could plant exactly that value (adversarial review,
+    OPL-4222)."""
+    from mandala_computer._events import _Core
+
+    core = _Core(
+        reconnect=True,
+        backoff=0.5,
+        max_backoff=15.0,
+        max_retries=0,
+        connect_timeout=15.0,
+        cursor=None,
+        on_connect=None,
+    )
+    empty = json.loads(hello_frame())
+    del empty["cursor"]
+    first = to_hello(empty)
+    assert first is not None
+    core.accept_hello(first)
+    assert core.cursor is None
+
+    later = to_hello(json.loads(hello_frame(cursor="c7")))
+    assert later is not None
+    core.accept_hello(later)
+    assert core.cursor == "c7"
+    assert with_cursor("wss://host/?t=1", core.cursor).endswith("since=c7")
 
 
 def test_a_delivering_connection_does_not_uncap_the_backoff() -> None:
