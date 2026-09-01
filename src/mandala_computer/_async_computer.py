@@ -1533,16 +1533,22 @@ class AsyncComputer(ComputerFields):
         # not elapsed.
         raise MandalaError(f"{self.id}'s event stream ended before {names} arrived")
 
-    async def _events_url(self) -> str:
+    async def _events_url(self, timeout_cap: float | None = None) -> str:
         """A fresh ``events_url``, on every connection and every reconnect.
 
         Re-read rather than cached, because the credential in it is rotated by
         a restart — and a restart is one of the ordinary reasons the socket
         dropped. A reconnect over the old URL is a 401 that looks like a bug in
         the stream.
+
+        ``timeout_cap`` is the stream's own connect budget, and this read is
+        inside it. Without the cap the read ran on the transport's default
+        minute whatever deadline the caller had set, so a
+        ``wait_for(timeout=5)`` against an unresponsive control plane sat here
+        for sixty seconds before anything looked at the five (Codex review).
         """
         try:
-            await self._refresh()
+            await self._refresh(timeout_cap=timeout_cap)
         except MandalaError as err:
             # A read that will answer the same way forever ends the stream
             # rather than being retried behind it. Without this a deleted

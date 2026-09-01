@@ -2147,8 +2147,9 @@ class Computer(ComputerFields):
             reopen; ``0`` never gives up. Consecutive, so a stream that has been
             up for a week and drops twice has not failed twice — one connection
             that delivers an event resets the count.
-        :param connect_timeout: seconds allowed for the handshake and the
-            opening frame together, not each.
+        :param connect_timeout: seconds allowed for getting a usable
+            connection — the read that fetches a fresh ``events_url``, the
+            handshake and the opening frame TOGETHER, not each.
         :param max_queue: frames the receive buffer may hold before the library
             stops reading from the socket. Real backpressure; see
             :data:`~mandala_computer._events.DEFAULT_MAX_QUEUE`.
@@ -2270,16 +2271,22 @@ class Computer(ComputerFields):
         # not elapsed.
         raise MandalaError(f"{self.id}'s event stream ended before {names} arrived")
 
-    def _events_url(self) -> str:
+    def _events_url(self, timeout_cap: float | None = None) -> str:
         """A fresh ``events_url``, on every connection and every reconnect.
 
         Re-read rather than cached, because the credential in it is rotated by
         a restart — and a restart is one of the ordinary reasons the socket
         dropped. A reconnect over the old URL is a 401 that looks like a bug in
         the stream.
+
+        ``timeout_cap`` is the stream's own connect budget, and this read is
+        inside it. Without the cap the read ran on the transport's default
+        minute whatever deadline the caller had set, so a
+        ``wait_for(timeout=5)`` against an unresponsive control plane sat here
+        for sixty seconds before anything looked at the five (Codex review).
         """
         try:
-            self._refresh()
+            self._refresh(timeout_cap=timeout_cap)
         except MandalaError as err:
             # A read that will answer the same way forever ends the stream
             # rather than being retried behind it. Without this a deleted

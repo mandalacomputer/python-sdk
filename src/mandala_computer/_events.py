@@ -471,8 +471,15 @@ def unreachable_types(
     one this list has no opinion about.
     """
     reachable = set(advertised) | set(STREAM_FRAME_TYPES)
-    impossible = [t for t in wanted if t not in reachable]
-    if len(impossible) < len(set(wanted)):
+    # Deduplicated FIRST. Counting `impossible` with duplicates in it and
+    # comparing against the distinct types asked for made the two sides count
+    # different things, so `["missing", "missing", "process.exited"]` refused a
+    # wait whose second type the computer advertises (Codex review).
+    # `dict.fromkeys` rather than a set, so the sentence below names them in
+    # the order the caller wrote them.
+    asked = list(dict.fromkeys(wanted))
+    impossible = [t for t in asked if t not in reachable]
+    if len(impossible) < len(asked):
         return None
     can = ", ".join(advertised) or "nothing"
     return _settle(
@@ -515,17 +522,18 @@ class _Core:
 
     hello: Hello | None = None
     types: list[str] | None = None
-    #: Whether a ``computer.ready`` has reached the caller on this stream, in
-    #: any shape. Survives reconnects, which is what keeps a second connection
-    #: from manufacturing a readiness the first one already delivered.
-    saw_ready: bool = False
     #: Consecutive failures to get a working connection.
     failures: int = 0
     #: The current backoff step, doubling towards :attr:`max_backoff`.
     step: float = 0.0
 
     def __post_init__(self) -> None:
-        self.step = self.backoff
+        # CAPPED at the ceiling, not merely doubled towards it. `backoff` is
+        # the first step and `max_backoff` is documented as the most any step
+        # may be, so a caller who passes `backoff=30, max_backoff=15` was
+        # asking for at most fifteen and used to get thirty once — the one
+        # sleep the ceiling exists to bound, unbounded (Codex review).
+        self.step = min(self.backoff, self.max_backoff)
 
     # -- the opening frame --------------------------------------------------
 
@@ -556,12 +564,33 @@ class _Core:
         # the reason it is read here rather than `since` being remembered. With
         # continuity there is nothing to make up: either this client was
         # already sent the readiness on an earlier connection, or the event
-        # that latched it is in the backlog about to arrive. Manufacturing one
-        # there puts a second `computer.ready` in front of the real one, and
-        # the reference tells a client to read that as a desktop it has not
-        # seen — so the invention would be a session replacement that never
-        # happened.
-        if hello.ready and hello.windows is not None and not self.saw_ready:
+        # that would have carried it is in the backlog about to arrive.
+        # Manufacturing one there puts a second `computer.ready` in front of
+        # the real one, and the reference tells a client to read that as a
+        # desktop it has not seen — so the invention would be a session
+        # replacement that never happened.
+        #
+        # PER CONNECTION, not once per stream, and this is where the Python
+        # half parts company with mandala-computer-typescript's `#sawReady`
+        # (Codex review). That latch survives reconnects, so a stream which
+        # was handed session A's readiness and then reconnected WITHOUT
+        # continuity — the gapped resume, where the backlog is by definition
+        # gone — declined to synthesize for session B. Restarting the display
+        # manager inside a guest destroys the desktop and brings up a new one
+        # without the computer ever leaving `running`, so session B is a real
+        # thing to be waiting for, and its own `computer.ready` is exactly what
+        # the gap says was lost. The latch turned that into a wait that cannot
+        # end, which is the failure this synthesis exists to prevent.
+        #
+        # The cost of the other direction is a duplicate: a second synthesized
+        # readiness for a session the caller had already been told about, which
+        # the reference says to read as a desktop it has not seen and reconcile
+        # with a listing. That is one wasted `windows()` call, next to a
+        # `wait_for("computer.ready")` that never returns — and the duplicate
+        # only ever arrives immediately before the `gap` frame saying the same
+        # thing. It is also flagged `synthesized`, so a caller reconciling
+        # against the platform's own record can see it was never on the wire.
+        if hello.ready and hello.windows is not None:
             return self.ready_from_hello(hello)
         return None
 
@@ -645,15 +674,6 @@ class _Core:
         """
         if ev.cursor:
             self.cursor = ev.cursor
-        # Latched HERE, where the event reaches the caller, and not where the
-        # frame arrived. A connection that fails between the two would take its
-        # unread frames with it, and a latch set on arrival would leave the
-        # stream believing it had delivered a readiness nobody received — after
-        # which the next connection declines to synthesize, and a wait for
-        # `computer.ready` on an already-ready desktop waits for an event that
-        # cannot happen twice.
-        if ev.type == "computer.ready":
-            self.saw_ready = True
 
     # -- retrying -----------------------------------------------------------
 
@@ -943,7 +963,7 @@ class _StreamBase:
 
     def __init__(
         self,
-        url: Callable[[], Any],
+        url: Callable[[float], Any],
         computer_id: str,
         *,
         since: str | None = None,
@@ -989,7 +1009,14 @@ class _StreamBase:
             max_backoff=float(max_backoff),
             max_retries=max_retries,
             connect_timeout=float(connect_timeout),
-            cursor=since,
+            # `or None`, because `""` is not a position. `with_cursor` already
+            # treats it as no cursor and joins at the head — but stored as
+            # `""` it is not `None` either, so `accept_hello` declined to adopt
+            # the opening frame's cursor and a reconnect joined at the head a
+            # SECOND time, skipping whatever happened in between. An empty
+            # string is the shape an unset environment variable arrives in, so
+            # this is the likely way to hold it wrong (Codex review).
+            cursor=since or None,
             on_connect=on_connect,
         )
         self._iterated = False
@@ -1071,13 +1098,18 @@ class _StreamBase:
         return max(self._deadline - time.monotonic(), 0.0)
 
     def _budget(self) -> float:
-        """How long the next handshake may take, deadline included.
+        """How long getting a usable connection may take, deadline included.
 
-        One budget across the handshake AND the opening frame, not one each.
-        ``connect_timeout`` says "how long to wait for the connection to be
-        usable", and two sequential timers of that length mean a caller who set
-        five seconds waits ten — on the one number they set to bound how long a
-        dead connection ties them up.
+        ONE budget across all three phases — the read that fetches a fresh
+        ``events_url``, the handshake, and the opening frame — and not one
+        each. ``connect_timeout`` is the one number a caller sets to bound how
+        long a dead connection ties them up, so three sequential timers of that
+        length would mean five seconds asked for and forty-five waited.
+
+        The URL read is in it because it was the phase nobody was bounding:
+        it goes through the ordinary transport, whose own timeout is a minute,
+        so `wait_for(timeout=5)` could sit in that read for sixty seconds
+        before anything checked the deadline it was given (Codex review).
         """
         left = self._left()
         budget = self._core.connect_timeout
@@ -1260,13 +1292,19 @@ class EventStream(_StreamBase):
         is already ready — is true before the first event of the new connection
         reaches anybody.
         """
-        url = with_cursor(self._url(), self._core.cursor)
         budget = self._budget()
         if budget <= 0:
             raise _Expired
         started = time.monotonic()
+        url = with_cursor(self._url(budget), self._core.cursor)
+        left = budget - (time.monotonic() - started)
+        if left <= 0:
+            raise ConnectionError(
+                f"reading a fresh events_url for {self._id} used the whole {budget:g}s "
+                "connect budget"
+            )
         try:
-            sock = _connect(url, open_timeout=budget, max_queue=self._max_queue)
+            sock = _connect(url, open_timeout=left, max_queue=self._max_queue)
         except Exception as exc:
             raise _connect_failed(self._id, exc) from exc
         self._sock = sock
@@ -1465,13 +1503,19 @@ class AsyncEventStream(_StreamBase):
             await _ashut_quietly(sock)
 
     async def _open(self) -> tuple[Hello, list[ComputerEvent]]:
-        url = with_cursor(await self._url(), self._core.cursor)
         budget = self._budget()
         if budget <= 0:
             raise _Expired
         started = time.monotonic()
+        url = with_cursor(await self._url(budget), self._core.cursor)
+        left = budget - (time.monotonic() - started)
+        if left <= 0:
+            raise ConnectionError(
+                f"reading a fresh events_url for {self._id} used the whole {budget:g}s "
+                "connect budget"
+            )
         try:
-            sock = await _aconnect(url, open_timeout=budget, max_queue=self._max_queue)
+            sock = await _aconnect(url, open_timeout=left, max_queue=self._max_queue)
         except Exception as exc:
             raise _connect_failed(self._id, exc) from exc
         self._sock = sock

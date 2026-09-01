@@ -65,6 +65,20 @@ def hello_frame(**over: Any) -> str:
     return json.dumps(frame)
 
 
+def resumed_hello(**over: Any) -> str:
+    """A hello with no ``windows`` key at all.
+
+    Which is the platform saying "your cursor was honoured, you already hold
+    the desktop" — and is a different answer from an empty list, which says
+    nothing is open.
+    """
+    import json
+
+    payload = json.loads(hello_frame(**over))
+    del payload["windows"]
+    return json.dumps(payload)
+
+
 def event_frame(kind: str, **over: Any) -> str:
     import json
 
@@ -794,36 +808,60 @@ def test_a_resumed_connection_manufactures_no_readiness(
     client was already sent the readiness, or it is in the backlog about to
     arrive. Inventing one there is a session replacement that never happened."""
     route()
-    frame = hello_frame(ready=True)
-    import json
-
-    payload = json.loads(frame)
-    del payload["windows"]
-    Dialer([json.dumps(payload)]).install(monkeypatch)
+    Dialer([resumed_hello(ready=True)]).install(monkeypatch)
     assert list(computer.events(reconnect=False, since="c0")) == []
 
 
 @respx.mock
-def test_a_readiness_is_manufactured_once_per_stream_not_once_per_connection(
+def test_a_reconnect_that_keeps_continuity_manufactures_no_second_readiness(
     computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """With continuity there is nothing to make up: the caller was already sent
+    the readiness, or the event carrying it is in the backlog about to arrive."""
     route()
     Dialer(
-        [hello_frame(ready=True, windows=[])],
-        [hello_frame(ready=True, windows=[]), event_frame("computer.idle")],
+        [hello_frame(ready=True, windows=[]), event_frame("computer.idle", cursor="c1")],
+        [resumed_hello(ready=True), event_frame("window.closed", cursor="c2")],
     ).install(monkeypatch)
-    got = take(computer.events(backoff=0.001), 2)
-    assert [ev.type for ev in got] == ["computer.ready", "computer.idle"]
+    got = take(computer.events(backoff=0.001), 3)
+    assert [ev.type for ev in got] == ["computer.ready", "computer.idle", "window.closed"]
 
 
 @respx.mock
-def test_a_real_readiness_stops_a_later_connection_inventing_one(
+def test_a_reconnect_that_lost_continuity_announces_the_desktop_again(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hole a once-per-STREAM latch left, and why this half does not keep one.
+
+    mandala-computer-typescript's `sawReady` survives reconnects, so a stream
+    handed session A's readiness and then resumed WITHOUT continuity declined
+    to synthesize for session B — and a gapped resume is exactly the case where
+    session B's own `computer.ready` is what the gap says was lost. Restarting
+    the display manager inside a guest makes a new session without the computer
+    leaving `running`, so that is a real desktop to be waiting for, and the
+    latch turned the wait into one that cannot end (Codex review).
+    """
+    route()
+    Dialer(
+        [hello_frame(ready=True, windows=[]), event_frame("computer.idle", cursor="c1")],
+        [
+            hello_frame(ready=True, windows=[]),
+            event_frame("gap", data={"oldest_cursor": "c9"}),
+        ],
+    ).install(monkeypatch)
+    got = take(computer.events(backoff=0.001), 3)
+    assert [ev.type for ev in got] == ["computer.ready", "computer.idle", "computer.ready"]
+    assert got[2].synthesized is True
+
+
+@respx.mock
+def test_a_real_readiness_stops_a_resuming_connection_inventing_one(
     computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     route()
     Dialer(
         [hello_frame(), event_frame("computer.ready", cursor="c1")],
-        [hello_frame(ready=True, windows=[]), event_frame("computer.idle", cursor="c2")],
+        [resumed_hello(ready=True), event_frame("computer.idle", cursor="c2")],
     ).install(monkeypatch)
     got = take(computer.events(backoff=0.001), 2)
     assert [(ev.type, ev.synthesized) for ev in got] == [
@@ -1291,3 +1329,138 @@ def test_a_frame_that_arrives_ahead_of_the_opening_one_is_not_dropped(
         monkeypatch
     )
     assert [ev.type for ev in computer.events(reconnect=False)] == ["computer.idle", "gap"]
+
+
+# --- what a Codex review of PR #43 found ------------------------------------
+
+
+@respx.mock
+def test_an_empty_since_is_no_cursor_rather_than_a_position_that_never_advances(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`""` is the shape an unset environment variable arrives in.
+
+    `with_cursor` already skips it, so the first connection correctly joins at
+    the head — but stored as `""` it is not `None` either, so the opening
+    frame's cursor was never adopted and a reconnect joined at the head a
+    SECOND time, skipping whatever happened in between. Silent loss on the one
+    stream whose whole purpose is not to have any.
+    """
+    route()
+    dialer = Dialer(
+        [hello_frame(cursor="c0"), ConnectionClosedError(None, None)],
+        [hello_frame(cursor="c7"), event_frame("computer.idle", cursor="c1")],
+    ).install(monkeypatch)
+    take(computer.events(since="", backoff=0.001), 1)
+    assert dialer.urls[0] == "wss://events.test/?token=control"
+    assert dialer.urls[1] == "wss://events.test/?token=control&since=c0"
+
+
+@respx.mock
+def test_a_duplicate_wanted_type_does_not_refuse_a_reachable_wait(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counting `impossible` with duplicates in it against the DISTINCT types
+    asked for made the two sides count different things, so a repeated
+    unreachable type outvoted a reachable one."""
+    route()
+    Dialer([hello_frame(events=["process.exited"]), event_frame("process.exited")]).install(
+        monkeypatch
+    )
+    got = computer.wait_for(["window.opened", "window.opened", "process.exited"], timeout=5)
+    assert got.type == "process.exited"
+
+
+@respx.mock
+def test_a_repeated_impossible_type_is_still_refused_and_named_once(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route()
+    Dialer([hello_frame(events=["computer.idle"]), FakeSocket.HANG]).install(monkeypatch)
+    with pytest.raises(mc.MandalaError, match=r"cannot emit window\.opened, so waiting"):
+        computer.wait_for(["window.opened", "window.opened"], timeout=5)
+
+
+def test_the_first_backoff_step_is_capped_by_the_ceiling() -> None:
+    """`max_backoff` is documented as the most any step may be, and the first
+    one used only to be doubled TOWARDS it — so `backoff=30, max_backoff=15`
+    slept for thirty once, which is the sleep the ceiling exists to bound."""
+    from mandala_computer._events import _Core
+
+    core = _Core(
+        reconnect=True,
+        backoff=30.0,
+        max_backoff=15.0,
+        max_retries=0,
+        connect_timeout=15.0,
+        cursor=None,
+        on_connect=None,
+    )
+    assert core.wait_out() == 15.0
+    assert core.wait_out() == 15.0
+
+
+@respx.mock
+def test_the_connect_budget_covers_the_read_that_fetches_the_url(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It was the phase nobody was bounding. The read goes through the ordinary
+    transport, whose own timeout is a minute, so a five-second wait could sit
+    in it for sixty seconds before anything checked the five."""
+    caps: list[float | None] = []
+    real = mc.Computer._refresh
+
+    def capped(self: mc.Computer, *, timeout_cap: float | None = None) -> mc.Computer:
+        caps.append(timeout_cap)
+        return real(self, timeout_cap=timeout_cap)
+
+    monkeypatch.setattr(mc.Computer, "_refresh", capped)
+    route()
+    Dialer([hello_frame(), event_frame("computer.idle")]).install(monkeypatch)
+    list(computer.events(reconnect=False, connect_timeout=4))
+    assert caps == [4.0]
+
+
+@respx.mock
+def test_a_wait_caps_the_url_read_by_whichever_deadline_is_nearer(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One budget across all three phases, so the wait's own deadline wins when
+    it is shorter than `connect_timeout`."""
+    caps: list[float | None] = []
+    real = mc.Computer._refresh
+
+    def capped(self: mc.Computer, *, timeout_cap: float | None = None) -> mc.Computer:
+        caps.append(timeout_cap)
+        return real(self, timeout_cap=timeout_cap)
+
+    monkeypatch.setattr(mc.Computer, "_refresh", capped)
+    route()
+    Dialer([hello_frame(), event_frame("process.exited")]).install(monkeypatch)
+    computer.wait_for("process.exited", timeout=2, connect_timeout=30)
+    assert caps and caps[0] is not None and caps[0] <= 2.0
+
+
+@respx.mock
+async def test_the_async_connect_budget_covers_the_url_read_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caps: list[float | None] = []
+    real = mc.AsyncComputer._refresh
+
+    async def capped(
+        self: mc.AsyncComputer, *, timeout_cap: float | None = None
+    ) -> mc.AsyncComputer:
+        caps.append(timeout_cap)
+        return await real(self, timeout_cap=timeout_cap)
+
+    monkeypatch.setattr(mc.AsyncComputer, "_refresh", capped)
+    route()
+    Dialer([hello_frame(), event_frame("computer.idle")], cls=AsyncFakeSocket).install(monkeypatch)
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = await client.computers.get("vm-1")
+        caps.clear()
+        assert [ev.type async for ev in c.events(reconnect=False, connect_timeout=4)] == [
+            "computer.idle"
+        ]
+    assert caps == [4.0]
