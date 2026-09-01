@@ -1502,3 +1502,17 @@ async def test_the_async_connect_budget_covers_the_url_read_too(
             "computer.idle"
         ]
     assert caps == [4.0]
+
+
+def test_a_connect_timeout_is_this_sdks_error_on_every_supported_python() -> None:
+    """``asyncio.TimeoutError`` and the builtin are separate classes on 3.10,
+    which ``requires-python`` still admits, and ``_connect_failed`` re-raises
+    anything it does not recognise. On 3.11+ the two are aliases and this asserts
+    nothing; on 3.10 it is the difference between a ConnectionError and a bare
+    timeout reaching the caller."""
+    import asyncio
+
+    from mandala_computer._events import _connect_failed
+
+    for exc in (asyncio.TimeoutError("open_timeout"), TimeoutError("open_timeout")):
+        assert isinstance(_connect_failed("vm-1", exc), mc.ConnectionError)
