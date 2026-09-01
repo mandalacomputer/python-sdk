@@ -344,6 +344,42 @@ class _BaseTransport:
         )
 
     @staticmethod
+    def _stream_budget(current: httpx.Timeout) -> httpx.Timeout:
+        """The timeouts a STREAM runs under, where ``read`` is idle time.
+
+        Not :meth:`_budget`, and that is the whole of this method. ``_budget``
+        only ever widens, which is right everywhere it is used: on ``exec`` and
+        the file routes ``read`` is effectively a total deadline, so a caller
+        who handed us a patient client meant to be patient and shortening it
+        would abandon work the platform is still doing.
+
+        On a stream ``read`` is not a deadline at all. httpcore applies it per
+        CHUNK, so it restarts on every frame and a run that keeps arriving
+        outlasts any value here — the platform beats every 10s precisely so a
+        quiet run still ticks. Widening it therefore buys a long run nothing,
+        and costs the one thing this number exists for: bounding the SILENCE
+        after a connection dropped without a FIN, which is a NAT rebind, a load
+        balancer reaping an idle socket, or a laptop suspended mid-run.
+
+        Applied through ``_budget`` it was a FLOOR, so a caller-supplied
+        ``httpx.Client(timeout=600)`` waited ten minutes on a dead socket and
+        ``timeout=None`` waited for ever — restoring exactly the hang
+        :data:`STREAM_IDLE_TIMEOUT`'s own note says ``None`` was, on the clients
+        an agent framework injects to give ``exec`` room (adversarial review,
+        OPL-4232). So this ASSIGNS.
+
+        ``connect`` and ``pool`` are the caller's, untouched: neither is about
+        how long a stream may say nothing, and a patient client is still
+        entitled to be patient about getting one open.
+        """
+        return httpx.Timeout(
+            connect=current.connect,
+            read=STREAM_IDLE_TIMEOUT,
+            write=STREAM_IDLE_TIMEOUT,
+            pool=current.pool,
+        )
+
+    @staticmethod
     def _phase_ceiling(timeout: httpx.Timeout, err: BaseException) -> float | None:
         """The client's own limit for the PHASE that actually timed out.
 
@@ -935,7 +971,7 @@ class Transport(_BaseTransport):
                 self._url(path),
                 json=json,
                 headers=self._sent(sent),
-                timeout=self._budget(self._http.timeout, STREAM_IDLE_TIMEOUT),
+                timeout=self._stream_budget(self._http.timeout),
             ) as resp:
                 if not resp.is_success:
                     # Read first: the body of a streamed response is not there
@@ -993,6 +1029,32 @@ class Transport(_BaseTransport):
         data = self._binary_body(method, path, resp, content_types)
         offset, total, partial = self._served_range(method, path, resp, data, headers["Range"])
         return data, offset, total, partial
+
+    def json_object_or_empty(self, method: str, path: str, **kw: Any) -> Mapping[str, Any] | None:
+        """:meth:`json_object`, for a route whose answer may legitimately be empty.
+
+        ``DELETE`` is the case: a 204, or a 200 with no body, is a perfectly
+        good answer meaning "done, and there is nothing to tell you". So an
+        empty body is ``None`` here rather than the complaint
+        :meth:`json_object` makes.
+
+        Anything NON-empty still has to be an object, and that is the point of
+        this existing at all. :meth:`Computer.delete` reached the bare
+        :meth:`json` helper, which is the captive-portal hole ``json_object``
+        was written to close: a proxy answering 200 with an HTML login page
+        parses to ``None``, and ``delete`` read that as the platform having
+        destroyed the computer without naming a count. On the one irreversible
+        call on this surface, that tells a caller to stop tracking a machine
+        that is still running and still billable (adversarial review,
+        OPL-4232).
+        """
+        resp = self.request(method, path, **kw)
+        if not resp.content:
+            return None
+        data = self._parse(resp)
+        if not isinstance(data, Mapping):
+            raise self._not_an_object(method, path, resp)
+        return data
 
     def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
         """:meth:`json`, for a route whose answer is only useful as an object.
@@ -1111,7 +1173,7 @@ class AsyncTransport(_BaseTransport):
                 self._url(path),
                 json=json,
                 headers=self._sent(sent),
-                timeout=self._budget(self._http.timeout, STREAM_IDLE_TIMEOUT),
+                timeout=self._stream_budget(self._http.timeout),
             ) as resp:
                 if not resp.is_success:
                     await resp.aread()
@@ -1168,6 +1230,34 @@ class AsyncTransport(_BaseTransport):
         data = self._binary_body(method, path, resp, content_types)
         offset, total, partial = self._served_range(method, path, resp, data, headers["Range"])
         return data, offset, total, partial
+
+    async def json_object_or_empty(
+        self, method: str, path: str, **kw: Any
+    ) -> Mapping[str, Any] | None:
+        """:meth:`json_object`, for a route whose answer may legitimately be empty.
+
+        ``DELETE`` is the case: a 204, or a 200 with no body, is a perfectly
+        good answer meaning "done, and there is nothing to tell you". So an
+        empty body is ``None`` here rather than the complaint
+        :meth:`json_object` makes.
+
+        Anything NON-empty still has to be an object, and that is the point of
+        this existing at all. :meth:`AsyncComputer.delete` reached the bare
+        :meth:`json` helper, which is the captive-portal hole ``json_object``
+        was written to close: a proxy answering 200 with an HTML login page
+        parses to ``None``, and ``delete`` read that as the platform having
+        destroyed the computer without naming a count. On the one irreversible
+        call on this surface, that tells a caller to stop tracking a machine
+        that is still running and still billable (adversarial review,
+        OPL-4232).
+        """
+        resp = await self.request(method, path, **kw)
+        if not resp.content:
+            return None
+        data = self._parse(resp)
+        if not isinstance(data, Mapping):
+            raise self._not_an_object(method, path, resp)
+        return data
 
     async def json_object(self, method: str, path: str, **kw: Any) -> Mapping[str, Any]:
         """:meth:`json`, for a route whose answer is only useful as an object.

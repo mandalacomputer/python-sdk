@@ -67,6 +67,7 @@ VERBS = frozenset(
         "sse",
         "json",
         "json_object",
+        "json_object_or_empty",
         "json_array",
         "listing",
         "binary",

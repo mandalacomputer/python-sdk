@@ -409,3 +409,58 @@ class TestAsyncHalf:
             with pytest.raises(mc.MoveRequiredError) as caught:
                 await c.resize(ram_mb=26000)
             assert caught.value.move_possible is True
+
+
+def test_the_newest_finished_move_wins_across_rfc3339_spellings() -> None:
+    """A fractional stamp sorts before a whole one of the same second, as strings.
+
+    ``'.'`` (46) precedes ``'Z'`` (90), so ``02:00:12.999Z < 02:00:12Z`` — the
+    later move reads as the older one. Go's ``RFC3339`` and ``RFC3339Nano``
+    produce exactly that mix, and ``_my_move`` compared the raw strings. With no
+    live row it then returned the stale outcome, which is the misread OPL-4222
+    fixed for live-versus-finished: ``moved`` means the machine HAS changed
+    hosts, so acting on the older row resizes a computer that is elsewhere
+    (OPL-4232).
+    """
+    c = mc.Computer(None, {"id": "vm-1"})  # type: ignore[arg-type]
+    listing = {
+        "moves": [
+            # The LATER move, spelled with a fraction.
+            {
+                "computer_id": "vm-1",
+                "state": "moved",
+                "live": False,
+                "started_at": "2026-08-23T02:00:12.999Z",
+            },
+            # The EARLIER one, spelled without.
+            {
+                "computer_id": "vm-1",
+                "state": "done",
+                "live": False,
+                "started_at": "2026-08-23T02:00:12Z",
+            },
+        ]
+    }
+    picked = c._my_move(listing)
+    assert picked is not None
+    assert picked.state == "moved"
+    assert picked.started_at == "2026-08-23T02:00:12.999Z"
+
+
+def test_an_undateable_row_never_displaces_one_that_can_be_dated() -> None:
+    """`max` is choosing what to hand back; an unreadable stamp is not evidence."""
+    c = mc.Computer(None, {"id": "vm-1"})  # type: ignore[arg-type]
+    listing = {
+        "moves": [
+            {"computer_id": "vm-1", "state": "failed", "live": False, "started_at": "not a stamp"},
+            {
+                "computer_id": "vm-1",
+                "state": "done",
+                "live": False,
+                "started_at": "2026-08-23T02:00:12Z",
+            },
+        ]
+    }
+    picked = c._my_move(listing)
+    assert picked is not None
+    assert picked.state == "done"

@@ -307,8 +307,20 @@ class AsyncComputer(ComputerFields):
         deadline = time.monotonic() + timeout
         last: Move | None = None
         while True:
+            # Capped to what is left, like every other wait that reads the
+            # control plane. This was the one that never got it: the poll went
+            # out with the client's own timeout — sixty seconds by default, and
+            # NOTHING at all on a caller-supplied client built with
+            # `timeout=None` — so `wait_for_move(timeout=5)` sat in a single GET
+            # far past the deadline it documents, and against a client with no
+            # ceiling the `TimeoutError` it promises never arrived
+            # (adversarial review, OPL-4232). `Builds.wait` and `_events_url`
+            # both carry the same cap for the same reason.
+            remaining = deadline - time.monotonic()
             try:
-                listed = await self._t.json_object("GET", _api.MOVES)
+                listed = await self._t.json_object(
+                    "GET", _api.MOVES, timeout_cap=max(remaining, 0.0)
+                )
             except MandalaError as err:
                 # One edge blip mid-move used to end the wait and report a move
                 # that was still running as one that could not be watched.
@@ -388,12 +400,16 @@ class AsyncComputer(ComputerFields):
         server was quiet is the one wrong answer worth going out of the way to
         avoid.
         """
-        data = await self._t.json(
+        data = await self._t.json_object_or_empty(
             "DELETE",
             _api.computer(self.id),
             params=_api.delete_params(purge_snapshots=purge_snapshots, expect=expect),
         )
-        if not isinstance(data, Mapping):
+        # `None` is an empty body — a 204, or a 200 with nothing in it — which is
+        # a real answer here and stays one. What no longer reaches this line is a
+        # NON-empty body that is not an object: that used to arrive as `None` too,
+        # so a proxy's HTML login page read as a successful delete (OPL-4232).
+        if data is None:
             return None
         return _snapshots_deleted(data)
 
@@ -469,6 +485,29 @@ class AsyncComputer(ComputerFields):
             raise MandalaError(f"{self.id} did not start: {self.start_error}")
         deadline = time.monotonic() + timeout
         while True:
+            # THE STATE IN HAND, BEFORE THE DEADLINE. Ordered the other way — as
+            # it was — nothing below was reached on an already-expired budget,
+            # so `wait_until_running(timeout=0)` on a computer this handle
+            # already says is RUNNING answered `TimeoutError: vm-1 was still
+            # 'running' after 0s`, and the three terminal states lost the
+            # dedicated errors this method's own docstring promises for them
+            # (adversarial review, OPL-4232). `timeout=0` is a documented,
+            # allowed already-expired deadline and is what a computed remaining
+            # budget becomes, so the answer to one has to be the best sentence
+            # available rather than the emptiest.
+            #
+            # This is `wait_until_built`'s shape, which reads its cached status
+            # at the top of every pass and refreshes at the bottom — the same
+            # sibling OPL-4222 aligned the `start_error` check above with. It
+            # does mean a stale handle is believed for one pass; that is the
+            # trade `wait_until_built` already makes, and the normal callers
+            # here — `create(start=True)` and `start()` — both hand back a
+            # freshly refreshed computer.
+            if self.status == "running":
+                return self
+            failure = self._not_starting()
+            if failure is not None:
+                raise failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
@@ -480,30 +519,13 @@ class AsyncComputer(ComputerFields):
                 # what had happened was a single poll not landing (OPL-3724).
                 await asyncio.sleep(_ride_out(err, deadline, poll))
                 continue
-            if self.status == "running":
-                return self
-            # A computer with no disk will never start on its own, and waiting
-            # out the full timeout to say so helps nobody.
-            if self.build_failed:
-                raise MandalaError(
-                    f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
-                )
-            # Nor will a suspended one. It is a state this wait predates, and
-            # left to spin it reports a machine that is one call from running as
-            # a timeout — the least informative answer available about the one
-            # case the caller can fix in a line.
-            if self.is_suspended:
-                raise MandalaError(
-                    f"{self.id} is suspended and will not start on its own: "
-                    "call start() to resume it"
-                )
-            if self.is_building:
-                raise MandalaError(
-                    f"{self.id} is still building: call wait_until_built(), then start()"
-                )
+            # The freshly read state is judged at the top of the next pass, by
+            # the same two checks that judged the cached one — so "running" and
+            # the three terminal states are answered in one place rather than
+            # two that can drift.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
+                continue
             await asyncio.sleep(min(poll, remaining))
 
     async def wait_for_guest(self, timeout: float = 180.0, poll: float = 3.0) -> AsyncComputer:

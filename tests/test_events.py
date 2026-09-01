@@ -283,6 +283,36 @@ def test_an_exit_carries_its_code() -> None:
     assert ev.lost is False
 
 
+@pytest.mark.parametrize("wire", [0.9, "0.9", -0.1, 1.5])
+def test_a_fractional_exit_code_is_unknown_rather_than_truncated(wire: object) -> None:
+    """`int(0.9)` is `0`, and `0` is the one value that reads as success.
+
+    OPL-4222 wrote `_exit_code` because that truncation reports a FAILED command
+    as a successful one, and pointed `exec()` and the background poll at it. The
+    event stream was left on `_opt_num`, which truncates — so the same wire value
+    `ExecResult.from_api` refuses outright decoded here to a clean pass, with
+    `lost` false so nothing said it was unreadable (OPL-4232).
+
+    `None` rather than a raise: `to_computer_event` has to stay total, because
+    this module's policy for a frame it cannot read is to hand it over with the
+    field unset rather than end the connection over it.
+    """
+    ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
+    assert ev is not None
+    assert ev.exit_code is None
+    assert ev.lost is False
+    # Still recoverable: what actually arrived survives on `data`.
+    assert ev.data["exit_code"] == wire
+
+
+@pytest.mark.parametrize(("wire", "expected"), [(0, 0), (2, 2), ("3", 3), (1.0, 1), (-1, -1)])
+def test_a_whole_exit_code_still_decodes(wire: object, expected: int) -> None:
+    """The refusal above is about a number that was never whole, not about form."""
+    ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
+    assert ev is not None
+    assert ev.exit_code == expected
+
+
 def test_a_lost_command_has_no_exit_code_rather_than_a_made_up_one() -> None:
     """`-1` is a real exit code on this path, so it cannot also mean "no answer"."""
     ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "lost": True}})
