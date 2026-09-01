@@ -1383,6 +1383,12 @@ def test_force_stop_still_takes_real_bools() -> None:
             False,
             "True steers a restore into a clone, which bills a computer",
         ),
+        (
+            mc.Window,
+            "visible",
+            False,
+            "True puts a click at the coordinates of a window that may be minimised",
+        ),
     ],
 )
 def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
@@ -1565,7 +1571,15 @@ def test_no_wire_boolean_is_left_on_truthiness() -> None:
         )
         offenders = [call for body in bodies for call in re.findall(r"\bbool\([^)]*\)", body)]
         assert not offenders, (name, offenders)
-        for flag in ("unreachable", "orphaned", "degraded", "unmetered", "live", "timed_out"):
+        for flag in (
+            "unreachable",
+            "orphaned",
+            "degraded",
+            "unmetered",
+            "live",
+            "timed_out",
+            "visible",
+        ):
             raw = re.findall(rf'(?<!_wire\()[\w.]*get\("{flag}"[^)]*\)', source)
             assert not raw, (name, flag, raw)
 

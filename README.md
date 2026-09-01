@@ -623,9 +623,9 @@ has not painted yet, without asking a model to find it in a PNG.
 
 ```python
 for w in c.windows():
-    print(w.id, w.wm_class, w.title, w.width, w.height, w.focused)
+    print(w.id, w.wm_class, w.title, w.width, w.height, w.focused, w.visible)
 
-firefox = next(w for w in c.windows() if w.wm_class == "Navigator")
+firefox = next(w for w in c.windows() if w.wm_class == "Navigator" and w.visible)
 c.window_action(firefox.id, "focus")
 c.window_action(firefox.id, "move", x=0, y=0)
 c.window_action(firefox.id, "resize", width=1280, height=760)
@@ -633,6 +633,19 @@ c.window_action(firefox.id, "resize", width=1280, height=760)
 
 Match on `wm_class`, not `title`: the class is the application and is stable,
 the title is whatever page it happens to be showing.
+
+Check `visible` before treating `x`/`y` as somewhere to click. It is the only
+thing that separates a minimised window from one on the screen: a minimised
+window stays on the list, keeps the coordinates it had and can still be the
+`focused` one, so clicking where it says it is sends the click to whatever is
+actually in front. An answer the client cannot read counts as not visible —
+a window skipped, rather than a click somewhere nobody asked for.
+
+`pid` is the guest process that owns the window, or `None` where the window did
+not say — `None` rather than `0`, because a guest may legitimately advertise
+`_NET_WM_PID` 0. It does *not* identify the window: `xfce4-terminal` and every
+browser back several windows with one process, so killing this pid takes windows
+you never asked about.
 
 Prefer `focus` over `raise`. Raising without focusing gives a window that is
 visibly in front and silently not receiving keystrokes — which in a screenshot

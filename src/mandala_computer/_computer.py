@@ -1680,6 +1680,10 @@ class Computer(ComputerFields):
         wallpaper window. Off by default because a stock guest showing one
         terminal has five windows, four of which are not applications.
 
+        Minimised windows are on this list too, so filter on ``w.visible``
+        before treating a row's coordinates as somewhere to click: a minimised
+        window keeps the coordinates it had and can still be the focused one.
+
         Linux only.
         """
         data = self._t.json_object(
