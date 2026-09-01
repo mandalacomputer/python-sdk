@@ -1536,10 +1536,44 @@ class Window:
     wm_class: str
     #: The window manager's own type, e.g. ``"normal"``, ``"dock"``.
     type: str
-    x: int
-    y: int
-    width: int
-    height: int
+    #: Where the window is, and how big it is — or ``None``, where the wire did
+    #: not say.
+    #:
+    #: ``None`` rather than ``0``, for the reason :attr:`pid` is not a
+    #: :func:`_num` either and with more behind it: ``_num``'s floor for an
+    #: absent, null or unreadable field is zero, and zero here is not a missing
+    #: answer but A PLACE. A window really can be at ``x: 0``, so a coordinate
+    #: this client could not read came back indistinguishable from the top-left
+    #: corner of the screen — and the corner is where an agent then clicks.
+    #: ``cursor_position`` refuses exactly this one route along; the window
+    #: decoder went on inventing it until OPL-4200.
+    #:
+    #: **The daemon already refuses it at the origin**, which is what makes the
+    #: floor a divergence rather than a house rule. ``applyWindowGeom``
+    #: (``server/windows.go``) requires all four and says why they are not
+    #: optional: "a window whose position this cannot read is a window a caller
+    #: cannot click, and reporting it at the origin with no size is the
+    #: 'plausible but wrong' answer rather than a missing one." A row that fails
+    #: it is left out of the listing and the answer then carries an error, and
+    #: the guest broker's own decoder drops a window event the same way. So the
+    #: zero was this client putting back the answer the platform declines to
+    #: give.
+    #:
+    #: All four are sent on every window, so ``None`` means something is already
+    #: wrong — schema drift, a truncated body, a proxy answering in the
+    #: platform's place. ``w.x or 0`` is the repair to avoid: there is no
+    #: fallback for a place, and the one this replaced is the bug.
+    #:
+    #: Still POSITIONAL and still required to construct, unlike :attr:`visible`
+    #: and :attr:`pid` below: the type widened, the field order did not. See the
+    #: note under :attr:`raw` for what moving one of these would cost.
+    x: int | None
+    #: As :attr:`x`: ``None`` where the wire did not say.
+    y: int | None
+    #: As :attr:`x`: ``None`` where the wire did not say.
+    width: int | None
+    #: As :attr:`x`: ``None`` where the wire did not say.
+    height: int | None
     focused: bool
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
@@ -1579,16 +1613,35 @@ class Window:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Window:
+        """One window row, decoded and never refused.
+
+        TOTAL, unlike :meth:`TemplateBuild.from_api` next door, which raises on
+        a record whose identity is missing. It cannot join it, and the reason is
+        where it is called from rather than what it decodes: this also runs on
+        the EVENT stream (:func:`_events.to_computer_event`,
+        :func:`_events.to_hello`), whose policy for a frame it cannot read is to
+        skip it and read the next one rather than end the connection over it.
+
+        So a row this cannot make sense of is reported rather than refused, and
+        the refusing is done one layer out by whoever hands a caller something
+        to act on: :func:`_computer._windows_from_response` for the listing, and
+        :func:`window_contradiction` at ``window_action``. The same split
+        :func:`build_contradiction` already draws — the lenient reading here,
+        the raise at the call site that acts on it (OPL-4200).
+        """
         return cls(
             id=_text(d.get("id")),
             title=_text(d.get("title")),
             wm_class=_text(d.get("class")),
             type=_text(d.get("type")),
             pid=_opt_num(d.get("pid")),
-            x=_num(d.get("x")),
-            y=_num(d.get("y")),
-            width=_num(d.get("width")),
-            height=_num(d.get("height")),
+            # `_opt_num` and not `_num`, for the reason the fields' own note
+            # gives: `_num` answers 0, and 0 is an origin a window really has
+            # rather than one it failed to report (OPL-4200).
+            x=_opt_num(d.get("x")),
+            y=_opt_num(d.get("y")),
+            width=_opt_num(d.get("width")),
+            height=_opt_num(d.get("height")),
             focused=_wire(d, "focused") is _Wire.TRUE,
             # TRUE ONLY, and this is the decision OPL-4191 asked for rather than
             # the line above it copied. `_Wire` exists here because every
@@ -1702,6 +1755,45 @@ class WindowResult:
             gone=_wire(d, "gone") is _Wire.TRUE,
             raw=dict(d),
         )
+
+
+def window_contradiction(result: WindowResult) -> str | None:
+    """Why this result cannot be believed, or ``None`` if it can.
+
+    One shape qualifies: a ``gone`` the wire actually said was true, beside a
+    window object describing the window it says is gone. The two halves are read
+    by different callers — one drives ``result.window``, another branches on
+    ``result.gone`` — so a body carrying both is answered differently by two
+    correct programs. The first keeps clicking at a window that is not there;
+    the second throws away a window that is.
+
+    The READING rather than the raw record, unlike :func:`build_contradiction`:
+    ``gone`` is already classified through ``_Wire`` and :attr:`WindowResult.window`
+    is already "a mapping was there", so neither has been through a coercion
+    this could be fooled by.
+
+    Absent, null and unreadable are NOT contradictions, for the same reason they
+    are not on a build: they are a host that said nothing. ``gone`` false with no
+    window is a documented outcome — the action happened and the guest could not
+    describe it.
+
+    A REPORT rather than a refusal, and deliberately: the live close is
+    ``{"gone": true, "ok": true, "window": null}``, so nothing sends this today,
+    and the shape has an obvious legitimate future — "closed, and here is what
+    it was". The day the platform documents that, this stops being a
+    contradiction and the change is deleting one raise at each of the two call
+    sites, not unpicking a rule from the decoder. Until then the caller is told
+    rather than quietly handed the half of the body it happened to read first
+    (OPL-4200). The TypeScript SDK reads it the same way, deliberately.
+    """
+    if not result.gone or result.window is None:
+        return None
+    return (
+        f"the window action reports the window gone and describes window "
+        f"{result.window.id!r} in the same body. The record contradicts itself, "
+        "so neither half of it can be trusted — read windows() for what is on "
+        "the desktop."
+    )
 
 
 @dataclass(frozen=True)
