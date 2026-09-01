@@ -330,6 +330,28 @@ def test_the_key_that_passed_the_check_is_the_key_that_is_sent(
 
 
 @respx.mock
+def test_a_key_out_of_an_env_file_reaches_the_header_trimmed(
+    computer: mc.Computer,
+) -> None:
+    """The emptiness check always read ``strip()``; what was SENT did not. A
+    key with the newline still on it is present and correct, and answering it
+    with a 401 is exactly the reading this route cannot afford."""
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    computer.agent("do the thing", model_key=f"  {KEY}\n")
+    assert route.calls.last.request.headers[MODEL_KEY_HEADER] == KEY
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_an_async_key_out_of_an_env_file_reaches_the_header_trimmed() -> None:
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        await c.agent("do the thing", model_key=f"  {KEY}\n")
+    assert route.calls.last.request.headers[MODEL_KEY_HEADER] == KEY
+
+
+@respx.mock
 @pytest.mark.asyncio
 async def test_the_async_key_that_passed_the_check_is_the_key_that_is_sent() -> None:
     """The async half is its own line of code and its own way to be forgotten:
