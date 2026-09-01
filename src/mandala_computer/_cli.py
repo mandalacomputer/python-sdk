@@ -199,6 +199,62 @@ def _outbound_queue() -> queue.Queue[bytes | str | object]:
     return queue.Queue(maxsize=_OUTBOUND_QUEUE_MAX)
 
 
+#: How long shutdown waits for the sender before it stops being polite.
+#:
+#: Long enough that an ordinary drain finishes inside it, short enough that a
+#: wedged session is not a wedged terminal. See :func:`_abort`.
+_SENDER_JOIN_TIMEOUT = 2.0
+
+
+def _stop_sender(outbound: queue.Queue[Any], sentinel: object) -> None:
+    """Get the stop sentinel into the queue without waiting for room.
+
+    A blocking ``put`` here is a second way to hang. The queue is bounded, and
+    the case that fills it is exactly the case shutdown is running for: a peer
+    that stopped reading, a sender parked in ``send()``, and a paste still
+    draining behind it. Nothing will ever call ``get`` again, so the ``put``
+    that ends the sender waits forever on the sender.
+
+    Room is made by dropping what is queued, which costs nothing: ``closed`` is
+    already set, and the sender skips every message it takes after that. The
+    loop ends because stdin has already stopped and each pass either enqueues
+    the sentinel or removes one item from a bounded queue.
+    """
+    while True:
+        try:
+            outbound.put_nowait(sentinel)
+            return
+        except queue.Full:
+            with suppress(queue.Empty):
+                outbound.get_nowait()
+
+
+def _abort(ws: object) -> None:
+    """Break a send that will never finish, so shutdown can.
+
+    ``websockets``' sync ``send`` has no send timeout: it is ``sendall`` on a
+    blocking socket, so a peer that stops reading blocks it until the peer comes
+    back — which a peer that has just sent ``exit`` and closed its read side
+    never does. Joining the sender then never returns, and ``close()`` is
+    deliberately sequenced AFTER that join so a close frame cannot overlap a
+    send, which means nothing was left that could break the deadlock. The
+    terminal stayed raw, and Ctrl-C in raw mode is a byte to a reader that has
+    already exited (adversarial review, OPL-4222).
+
+    Shutting the socket down at the transport is what unblocks it. Reached only
+    once the polite join has expired, so the ordinary path still closes the
+    connection the ordinary way. Failures are ignored on purpose: this runs
+    while something is already wrong, and every caller below it is cleanup.
+    """
+    sock = getattr(ws, "socket", None)
+    if sock is None:
+        return
+    import socket as _socket
+
+    with suppress(OSError, ValueError, AttributeError):
+        sock.shutdown(_socket.SHUT_RDWR)
+
+
 def _interact(url: str) -> int:
     """Pump the local terminal into the websocket and back, until the shell ends.
 
@@ -393,8 +449,7 @@ def _interact(url: str) -> int:
         # No producer can enqueue after the sentinel. Uninstall SIGWINCH first
         # so a resize cannot land after it. Joining makes the sender the sole
         # websocket writer all the way through its final frame; close() writes
-        # a close frame and must not overlap send(). Blocking put is safe now:
-        # stdin has stopped and the sender is still draining.
+        # a close frame and must not overlap send().
         if winch_installed and sigwinch is not None:
             # getsignal() answers None for a handler that was installed from C
             # rather than from Python — readline and ncurses both do that —
@@ -403,16 +458,26 @@ def _interact(url: str) -> int:
             with suppress(TypeError, ValueError, OSError):
                 signal.signal(sigwinch, saved_winch)
             winch_installed = False
-        outbound.put(stop_sender)
+        # BEFORE anything below that can block. The reader was joined two lines
+        # up, so it still cannot take a keystroke meant for the parent shell —
+        # and everything after this point talks to the websocket, not the
+        # terminal. Left below the sender join, a send the peer had stopped
+        # reading held the terminal in raw mode for as long as the process
+        # lived (adversarial review, OPL-4222).
+        restore_tty()
+        _stop_sender(outbound, stop_sender)
         if sender_thread is not None:
-            sender_thread.join()
+            sender_thread.join(_SENDER_JOIN_TIMEOUT)
+            if sender_thread.is_alive():
+                # Parked in send(). Nothing else will ever end it: close() is
+                # below this join by design, and the thread is a daemon that
+                # would hold the process open through interpreter shutdown.
+                _abort(ws)
+                sender_thread.join(_SENDER_JOIN_TIMEOUT)
         for fd in (stdin_wakeup_read, stdin_wakeup_write):
             if fd is not None:
                 with suppress(OSError):
                     os.close(fd)
-        # The reader is gone before cooked mode returns, so it cannot consume a
-        # keystroke intended for the parent shell after this function exits.
-        restore_tty()
         for signum, previous in saved_exit_handlers.items():
             signal.signal(signum, previous)
         with suppress(ConnectionClosed, OSError, WebSocketException):

@@ -33,6 +33,7 @@ from ._models import (
     TemplateCheck,
     UsageReport,
     build_contradiction,
+    move_rows,
 )
 from ._sse import SSEEvent
 
@@ -776,13 +777,12 @@ class Moves:
         An API key issued against a workspace sees the moves of computers in that
         workspace only.
         """
-        data = self._t.json_object("GET", _api.MOVES)
-        rows = data.get("moves")
         # The platform answers ``{"moves": [...]}``; a caller gets the list. The
         # envelope exists because the route is account-scoped and could grow a
         # sibling field, and unwrapping it here is what keeps that from being
-        # every caller's problem.
-        return [Move.from_api(m) for m in rows] if isinstance(rows, list) else []
+        # every caller's problem. ``move_rows`` is the row-shape check every
+        # other listing gets from ``json_array``.
+        return [Move.from_api(m) for m in move_rows(self._t.json_object("GET", _api.MOVES))]
 
 
 class Sizes:

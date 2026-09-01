@@ -218,15 +218,41 @@ def _text(value: Any) -> str:
 
 
 def _exit_code(value: Any) -> int | None:
-    """An exit code off the wire, preserving null and rejecting JSON booleans."""
+    """An exit code off the wire, preserving null and rejecting JSON booleans.
+
+    A WHOLE number, and nothing that merely survives ``int()``. That call
+    truncates towards zero, so ``0.9`` became ``0`` and a command that failed
+    was reported as one that succeeded — the single outcome this field's own
+    docstring says must never happen. It also raises ``OverflowError`` on an
+    infinity, which JSON produces for ``1e309`` and which is neither of the two
+    exceptions caught below: that escaped ``exec()`` as a bare ``OverflowError``,
+    past the :class:`~mandala_computer.MandalaError` this SDK promises.
+
+    :func:`_num` and :func:`_opt_num` next door both test ``math.isfinite``
+    before converting and both catch ``OverflowError``. This does the same, and
+    then insists the number was an integer to begin with, because unlike those
+    two it has no safe value to degrade to.
+    """
     if value is None:
         return None
     if isinstance(value, bool):
         raise TypeError("exit_code must be an integer or null, not a boolean")
+    # An `int` is already the answer, and going through `float` would stop it
+    # being one: past 2**53 the conversion is lossy and `number != int(number)`
+    # cannot see it, because the float it is comparing is a whole number — so
+    # 9007199254740993 came back as ...992, silently, which is the same class of
+    # wrong code this function exists to refuse (/code-review, OPL-4222). No
+    # exit code is anywhere near that; the point is that the check below is only
+    # sound for values it can represent.
+    if isinstance(value, int):
+        return value
     try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
         raise MandalaError("exec answered with an invalid exit_code") from exc
+    if not math.isfinite(number) or number != int(number):
+        raise MandalaError("exec answered with an invalid exit_code")
+    return int(number)
 
 
 class Listing(list[T]):
@@ -1503,13 +1529,54 @@ class Move:
             state=state,
             detail=_text(d.get("detail")),
             live=live,
-            cpu=_num(d["cpu"]) if d.get("cpu") is not None else None,
-            ram_mb=_num(d["ram_mb"]) if d.get("ram_mb") is not None else None,
-            disk_gb=_num(d["disk_gb"]) if d.get("disk_gb") is not None else None,
+            # `_opt_num`, not `_num`, for the reason the three fields are
+            # optional at all: `_num` answers 0 for anything it cannot read, and
+            # 0 is a real answer here — "resized to nothing" — on the fields
+            # this operation exists to grow. `_opt_num` keeps a genuine 0 and
+            # turns junk back into "not being changed", which is the only thing
+            # an unreadable size can honestly mean.
+            cpu=_opt_num(d.get("cpu")),
+            ram_mb=_opt_num(d.get("ram_mb")),
+            disk_gb=_opt_num(d.get("disk_gb")),
             started_at=_text(d.get("started_at")),
             finished_at=_text(d["finished_at"]) if d.get("finished_at") is not None else None,
             raw=dict(d),
         )
+
+
+def move_rows(data: Any) -> builtins.list[Mapping[str, Any]]:
+    """The rows out of ``GET /moves``, or a refusal naming what arrived instead.
+
+    ``GET /moves`` is the one collection on this surface answered by an envelope
+    — ``{"moves": [...]}`` — because it is account-scoped and could grow a
+    sibling field. Everything else goes through ``json_array`` / ``listing``,
+    which insist on an array of objects and complain by name when they do not
+    get one. This route had no equivalent, and both ways of being wrong were
+    reachable: a non-list ``moves`` silently became ``[]``, and a row that was
+    not an object reached :meth:`Move.from_api` and came back out as
+    ``AttributeError: 'str' object has no attribute 'get'`` — a bare builtin
+    escaping a public method, past the :class:`~mandala_computer.MandalaError`
+    this SDK promises.
+
+    The empty list is the worse of the two, and is why this raises rather than
+    degrading the way the field decoders above do. This is the listing a caller
+    polls to find out whether a machine is still moving, and no rows there means
+    something specific: :meth:`~mandala_computer.Computer.wait_for_move` reads
+    it as a move the platform reaped along with its computer. An envelope
+    nobody could parse is not that.
+
+    A MISSING ``moves`` key is refused with the rest, deliberately (asked at
+    /code-review, OPL-4222). Reading absence as ``[]`` would be forward-
+    compatible with a route that someday omits the key when there is nothing —
+    and would put back exactly the silent empty listing this exists to remove,
+    on the one route where an empty listing is itself a claim. The platform
+    always emits the array, so the trade is a hypothetical break against a
+    misdiagnosis that has to be looked for to be found.
+    """
+    rows = data.get("moves") if isinstance(data, Mapping) else None
+    if not isinstance(rows, builtins.list) or not all(isinstance(row, Mapping) for row in rows):
+        raise MandalaError(f"GET moves did not answer with an array of objects: {rows!r:.200}")
+    return rows
 
 
 @dataclass(frozen=True)

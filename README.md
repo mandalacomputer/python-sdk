@@ -952,6 +952,12 @@ with closing(c.events()) as stream:
         break
 ```
 
+Both `stream.event_types` and `Hello.events` — the same list, read off an
+`on_connect` hook — are `None` where the opening frame named no vocabulary at
+all, which is a different answer from the empty list and is kept apart from it
+on purpose: empty means this computer emits nothing, and `wait_for()` refuses
+against that. Test for `is None` before iterating.
+
 `wait_for()` reads the same list and refuses rather than waiting out its timeout
 when *none* of the types you asked for can arrive — on a Windows guest, or an
 image built without the X bindings the watcher needs. It refuses a suspended or

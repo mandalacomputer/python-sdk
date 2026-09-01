@@ -820,6 +820,61 @@ def test_wait_for_guest_reports_a_failed_start_without_probing(client: mc.Client
 
 
 @respx.mock
+def test_wait_until_running_reports_a_failed_start_without_polling(client: mc.Client) -> None:
+    """``start_error`` rides on the create envelope and ``refresh()`` clears it,
+    so a wait that refreshed before looking at anything destroyed the reason it
+    was about to spend two minutes not discovering: a stopped computer with no
+    start_error is not build-failed, not suspended and not building, so the loop
+    polled to its deadline and reported "still 'stopped'". ``wait_for_guest``
+    read the cached payload and answered at once (adversarial review,
+    OPL-4222)."""
+    poll = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+    )
+    computer = mc.Computer(
+        client._t,
+        {**COMPUTER, "status": "stopped", "start_error": "no host had room"},
+    )
+    with pytest.raises(mc.MandalaError, match="did not start: no host had room"):
+        computer.wait_until_running(timeout=30, poll=0)
+    assert not poll.called
+
+
+@respx.mock
+def test_wait_until_running_still_polls_an_ordinary_stopped_computer(client: mc.Client) -> None:
+    """The half that must not become terminal. A caller who has just called
+    ``start()`` holds a handle that still says stopped, and that is the whole
+    case this wait exists for."""
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=[
+            httpx.Response(200, json={**COMPUTER, "status": "stopped"}),
+            httpx.Response(200, json=COMPUTER),
+        ]
+    )
+    computer = mc.Computer(client._t, {**COMPUTER, "status": "stopped"})
+    assert computer.wait_until_running(timeout=30, poll=0).status == "running"
+
+
+@respx.mock
+def test_wait_for_answers_an_expired_deadline_like_every_sibling_wait(
+    client: mc.Client,
+) -> None:
+    """``check_wait_args`` takes ``timeout=0`` deliberately, and says why: the
+    sibling waits raise the ``TimeoutError`` their callers are catching, and
+    going past that handler with a different class is the failure it was
+    avoiding. This one routed its timeout into ``EventStream``, which requires a
+    positive one and complains with a bare ``MandalaError`` (adversarial review,
+    OPL-4222)."""
+    computer = mc.Computer(client._t, COMPUTER)
+    with pytest.raises(mc.TimeoutError, match="did not emit computer.ready within 0s"):
+        computer.wait_for("computer.ready", timeout=0)
+    # `events()` keeps the stricter rule: a stream with no time at all is a
+    # different request from a wait that has run out of it.
+    with pytest.raises(mc.MandalaError, match="positive finite"):
+        computer.events(timeout=0)
+
+
+@respx.mock
 def test_wait_for_guest_reports_an_already_stopped_computer(client: mc.Client) -> None:
     probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
     with pytest.raises(mc.MandalaError, match=r"stopped.+call start\(\) first"):
@@ -2644,6 +2699,35 @@ def test_exec_result_keeps_the_raw_payload() -> None:
     )
     assert result.raw["duration_ms"] == 12
     assert result.stdout == "hi"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [0.9, -1.5, float("inf"), float("-inf"), float("nan"), "3.5", [], {}],
+    ids=["fraction", "negative-fraction", "inf", "-inf", "nan", "string", "list", "object"],
+)
+def test_a_non_integer_exit_code_is_refused_rather_than_truncated(code: object) -> None:
+    """``int()`` truncates towards zero, so ``0.9`` decoded as ``0`` and a
+    command that failed was reported as one that succeeded — the single outcome
+    this field's docstring exists to prevent. It also raises ``OverflowError``
+    on an infinity, which JSON produces for ``1e309`` and which was not among
+    the two exceptions caught: that escaped ``exec()`` as a bare builtin, past
+    the MandalaError this SDK promises (adversarial review, OPL-4222)."""
+    with pytest.raises(mc.MandalaError, match="invalid exit_code"):
+        mc.ExecResult.from_api({"exit_code": code, "stdout": "", "stderr": ""})
+    with pytest.raises(mc.MandalaError, match="invalid exit_code"):
+        mc.ExecStatus.from_api({"pid": 1, "exit_code": code})
+
+
+def test_a_whole_exit_code_spelled_as_a_float_is_still_that_code() -> None:
+    """JSON has one number type, so a platform serialising ``1`` as ``1.0`` is
+    not sending a malformed code. Degrading that to a refusal would be stricter
+    than the wire."""
+    assert mc.ExecResult.from_api({"exit_code": 1.0}).exit_code == 1
+    assert mc.ExecResult.from_api({"exit_code": 0.0}).ok
+    # And the decimal string that crosses a process, which this SDK takes
+    # everywhere else it takes a number off the wire.
+    assert mc.ExecResult.from_api({"exit_code": "3"}).exit_code == 3
 
 
 def test_exec_result_preserves_a_null_exit_code() -> None:
