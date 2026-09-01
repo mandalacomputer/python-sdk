@@ -247,6 +247,24 @@ def test_a_window_event_carries_the_window() -> None:
     assert ev.window_id is None
 
 
+def test_a_window_frame_it_cannot_read_decodes_rather_than_raising() -> None:
+    """The listing refuses a window with no id and answers None for geometry it
+    could not read (OPL-4200). The refusal deliberately stops at the route.
+
+    `Window.from_api` also runs HERE, on frames arriving off a socket, and this
+    stream's policy for one it cannot read is to skip it and read the next
+    rather than end the connection over it. So the decoder stays total, and the
+    coordinate is absent rather than the corner of the screen on this path too —
+    the two routes decode the same window through the same function.
+    """
+    ev = to_computer_event({"type": "window.opened", "data": {"title": "Terminal", "x": "wide"}})
+    assert ev is not None
+    assert ev.window is not None
+    assert ev.window.id == "", "an unnamed window on the stream is news, not a reason to raise"
+    assert ev.window.title == "Terminal"
+    assert (ev.window.x, ev.window.y) == (None, None)
+
+
 def test_a_close_names_the_window_and_describes_nothing() -> None:
     """A window that is gone has no geometry, and none is invented for it."""
     ev = to_computer_event({"type": "window.closed", "data": {"id": "0x1"}})

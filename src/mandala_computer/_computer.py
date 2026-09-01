@@ -60,6 +60,7 @@ from ._models import (
     _Wire,
     _wire,
     is_unreachable_stub,
+    window_contradiction,
 )
 
 __all__ = ["BackgroundCommand", "Computer"]
@@ -260,7 +261,28 @@ def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
 
 
 def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
-    """Validate the embedded windows collection before building its rows."""
+    """Validate the embedded windows collection before building its rows.
+
+    Every row has to NAME a window. ``id`` is the whole of what a listing is for
+    — every one of the eight window actions takes it — and ``_text`` answers
+    ``""`` for one that is absent, null or unreadable. That row is a window a
+    caller can see and cannot touch: it matches nothing on the desktop, and
+    nothing downstream refuses it either, since ``_api.window`` quotes the id
+    rather than rejecting it.
+
+    Refused WHOLE rather than dropped, because dropping is the failure
+    ``TemplateBuild.from_api`` raises over one surface along (OPL-3835: schema
+    drift as a shorter inventory that looked complete), and because it is the
+    platform's own posture on its side of this route — a window it could not
+    describe is left out and the answer then carries "a window on this desktop
+    could not be described, so this list is missing one that exists", on the
+    reasoning that a prefix of a window list is a complete-looking answer that
+    is wrong (``server/windows.go``).
+
+    The refusal stops here rather than moving into :meth:`Window.from_api`,
+    which also runs on the event stream and has to stay total. See its docstring
+    (OPL-4200).
+    """
     rows = data.get("windows")
     if rows is None:
         return []
@@ -268,7 +290,15 @@ def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
         raise MandalaError(
             "GET windows answered with a windows field that is not an array of objects"
         )
-    return [Window.from_api(row) for row in rows]
+    windows = [Window.from_api(row) for row in rows]
+    for position, window in enumerate(windows):
+        if not window.id:
+            raise MandalaError(
+                f"GET windows answered a window with no id (row {position} of "
+                f"{len(windows)}, title {window.title!r}); every window action takes an id, "
+                "so a listing carrying one that names nothing is drift rather than a desktop"
+            )
+    return windows
 
 
 def _clipboard_text(data: Mapping[str, Any]) -> str:
@@ -1732,7 +1762,16 @@ class Computer(ComputerFields):
             _api.window(self.id, window_id),
             json=_api.window_body(action, x=x, y=y, width=width, height=height),
         )
-        return WindowResult.from_api(data)
+        result = WindowResult.from_api(data)
+        # A body that says the window is gone AND describes it says two things a
+        # caller acts on differently, and this is the layer that has to choose
+        # between them rather than leave the choice to whichever field the
+        # caller read. The same split `wait()` makes over `build_contradiction`:
+        # the reading is in _models, the raise is at the call site (OPL-4200).
+        contradiction = window_contradiction(result)
+        if contradiction is not None:
+            raise MandalaError(contradiction)
+        return result
 
     def clipboard(self) -> str:
         """What is on the desktop's clipboard.

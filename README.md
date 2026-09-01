@@ -674,6 +674,15 @@ not say — `None` rather than `0`, because a guest may legitimately advertise
 browser back several windows with one process, so killing this pid takes windows
 you never asked about.
 
+`x`, `y`, `width` and `height` are `None` on the same rule and for a sharper
+reason: `0` is a place a window really is — the top-left corner — so a
+coordinate this client could not read must not come back as one. All four are
+sent on every window, so `None` means something is already wrong, and `w.x or 0`
+is the wrong repair: there is no fallback for a place. A listing carrying a
+window with **no `id`** is refused outright rather than handed back, because
+every window action takes that id and a row without one names nothing you can
+act on.
+
 Prefer `focus` over `raise`. Raising without focusing gives a window that is
 visibly in front and silently not receiving keystrokes — which in a screenshot
 looks exactly like one that is.
