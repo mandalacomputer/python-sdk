@@ -102,6 +102,12 @@ def test_async_io_methods_are_awaitable_or_iterable() -> None:
         # request — the first poll() is what discovers whether the daemon still
         # knows that pid — so awaiting it would promise IO that never happens.
         "background_command",
+        # Builds the stream object. The socket is opened by the first step of
+        # the iteration, which is where the `await` is and where it belongs —
+        # `async for ev in c.events()` reads correctly and `await c.events()`
+        # would be an await for nothing. The stream itself is held to the rule
+        # this test exists for by `test_the_async_event_stream_is_iterated_not_awaited`.
+        "events",
     }
     for _, async_cls in PAIRS:
         for name in public_names(async_cls):
@@ -128,6 +134,39 @@ def test_a_sync_generator_is_mirrored_by_an_async_one() -> None:
     """
     assert inspect.isgeneratorfunction(mc.Computer.agent_stream)
     assert inspect.isasyncgenfunction(mc.AsyncComputer.agent_stream)
+
+
+def test_the_async_event_stream_is_iterated_not_awaited() -> None:
+    """`events` is exempt above, so the thing it returns carries the rule instead.
+
+    The exemption is about the factory, not about the IO: opening the socket
+    still has to be something a caller awaits. Without this, an `events()` that
+    lost its async iteration and became an ordinary object with a blocking
+    `__iter__` would pass every test here — same name, same parameters, same
+    exemption — while stalling the event loop of everyone who used it.
+    """
+    assert inspect.isasyncgenfunction(mc.AsyncEventStream.__aiter__)
+    assert inspect.iscoroutinefunction(mc.AsyncEventStream.aclose)
+    assert inspect.isgeneratorfunction(mc.EventStream.__iter__)
+
+
+def test_the_two_event_streams_offer_the_same_reading() -> None:
+    """One is the other awaited, so neither may grow a way to look at a stream.
+
+    The halves share `_StreamBase`, so this is cheap to keep true and expensive
+    to discover broken: a property added to one is a fact about a connection
+    that half of this SDK's users cannot read.
+    """
+    sync_names = public_names(mc.EventStream)
+    async_names = public_names(mc.AsyncEventStream)
+    # close/aclose is the one intentional difference, and the async half keeps
+    # BOTH: `close` there is the non-awaiting stop a hook inside the stream's
+    # own machinery uses, which has nowhere to await a closing handshake.
+    async_names.discard("aclose")
+    assert sync_names == async_names, (
+        f"only in sync {sorted(sync_names - async_names)}, "
+        f"only in async {sorted(async_names - sync_names)}"
+    )
 
 
 def test_field_accessors_are_shared_not_copied() -> None:

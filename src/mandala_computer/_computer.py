@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from typing import IO, Any
 
@@ -28,8 +28,17 @@ from ._client import (
     Transport,
     error_for_status,
 )
+from ._events import (
+    DEFAULT_MAX_QUEUE,
+    ComputerEvent,
+    EventStream,
+    Hello,
+    _settle,
+    unreachable_types,
+)
 from ._exceptions import (
     APIError,
+    ConnectionError,
     MandalaError,
     RangeNotSatisfiableError,
     RateLimitError,
@@ -2066,6 +2075,251 @@ class Computer(ComputerFields):
             timeout=NO_DEADLINE,
         )
         return _agent_once_outcome(data)
+
+    # --- events ---------------------------------------------------------
+
+    def events(
+        self,
+        *,
+        since: str | None = None,
+        reconnect: bool = True,
+        backoff: float = 0.5,
+        max_backoff: float = 15.0,
+        max_retries: int = 0,
+        connect_timeout: float = 15.0,
+        max_queue: int = DEFAULT_MAX_QUEUE,
+        on_connect: Callable[[Hello], None] | None = None,
+        timeout: float | None = None,
+    ) -> EventStream:
+        """What this computer is doing, as an iterator.
+
+        The stream exists so that an agent stops paying for a screenshot to
+        find out that nothing has happened. Windows opening, closing and taking
+        focus; the clipboard changing hands; a background command exiting; the
+        desktop becoming ready; every power transition::
+
+            for ev in c.events():
+                if ev.type == "process.exited" and ev.pid == job.pid:
+                    break
+
+        **It reconnects, and it keeps your place.** Every event carries an
+        opaque cursor, and the position after the last event you actually
+        CONSUMED is what a reconnect resumes from — so a socket that drops
+        mid-loop does not lose the ``process.exited`` you were waiting for.
+        Where the host can no longer replay that far you are handed a ``gap``
+        event instead of silence: not an error and not swallowed, because it is
+        the signal to reconcile against :meth:`windows` or
+        :meth:`~mandala_computer.BackgroundCommand.poll` rather than to assume
+        nothing happened.
+
+        Three frames are not about the computer and arrive as events anyway,
+        because a client cannot ignore what it was never handed: ``gap``,
+        ``closed`` (the host ending the stream deliberately, with a sentence
+        saying whether it is worth reopening) and ``capabilities`` (the
+        vocabulary being revised under an open socket). Ignore a ``type`` you do
+        not recognise; the vocabulary grows.
+
+        ``computer.ready`` is the one with a trap in it, and this SDK takes it
+        out. It fires once per desktop SESSION, so a machine that has been up
+        for an hour will never send it again and a raw socket waiting for it
+        waits forever. The opening frame carries the state instead, and a
+        stream that joins an already-ready desktop yields a ``computer.ready``
+        marked :attr:`~mandala_computer.ComputerEvent.synthesized` as its first
+        event.
+
+        Every connection re-reads this computer for a fresh ``events_url``,
+        which also refreshes this handle's own fields — the credential in that
+        URL is rotated by a restart, and a restart is one of the ordinary
+        reasons the socket dropped in the first place.
+
+        Refused with a ``409`` on a suspended computer — this is the one part of
+        the API that does NOT resume one for you — and on a stopped one.
+
+        :param since: resume from a cursor you kept, instead of joining at the
+            head. What survives a process restart.
+        :param reconnect: reopen the socket when it drops. On by default, and
+            most of what this object is for. Turn it off and the iteration ends
+            when the socket does, which is the right shape for a caller running
+            their own supervision.
+        :param backoff: first backoff step in seconds, doubling to
+            ``max_backoff``.
+        :param max_retries: give up after this many CONSECUTIVE failures to
+            reopen; ``0`` never gives up. Consecutive, so a stream that has been
+            up for a week and drops twice has not failed twice — one connection
+            that delivers an event resets the count.
+        :param connect_timeout: seconds allowed for getting a usable
+            connection — the read that fetches a fresh ``events_url``, the
+            handshake and the opening frame TOGETHER, not each.
+        :param max_queue: frames the receive buffer may hold before the library
+            stops reading from the socket. Real backpressure; see
+            :data:`~mandala_computer._events.DEFAULT_MAX_QUEUE`.
+        :param on_connect: called with each connection's opening frame before
+            any of that connection's events are yielded, and again on every
+            reconnect because the answer can change. What it is for is a wait
+            that cannot end — :attr:`~mandala_computer.Hello.events` names the
+            types THIS computer can emit, and that is the one place the answer
+            is available before the first event.
+        :param timeout: stop the stream after this many seconds. The iteration
+            ENDS; it does not raise, which is what makes it composable with a
+            loop that is looking for one thing.
+        """
+        return EventStream(
+            self._events_url,
+            self.id,
+            since=since,
+            reconnect=reconnect,
+            backoff=backoff,
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+            connect_timeout=connect_timeout,
+            max_queue=max_queue,
+            on_connect=on_connect,
+            timeout=timeout,
+        )
+
+    def wait_for(
+        self,
+        types: str | Sequence[str],
+        *,
+        timeout: float = 180.0,
+        since: str | None = None,
+        reconnect: bool = True,
+        backoff: float = 0.5,
+        max_backoff: float = 15.0,
+        max_retries: int = 0,
+        connect_timeout: float = 15.0,
+        max_queue: int = DEFAULT_MAX_QUEUE,
+        on_connect: Callable[[Hello], None] | None = None,
+    ) -> ComputerEvent:
+        """Wait for one event, then stop.
+
+        The call that replaces a polling loop::
+
+            c.wait_for("computer.ready")                    # after a create
+            done = c.wait_for("process.exited")             # after start_exec
+
+        Everything :meth:`events` does about cursors and reconnects applies, so
+        this survives a socket that drops while it waits, and the socket is
+        closed on the way out however this returns.
+
+        Two things it refuses rather than waiting out:
+
+        * an event type THIS computer cannot emit. The opening frame lists what
+          it can — a Windows guest, or an image built without the X bindings the
+          watcher needs, produces no ``window.*`` and no ``computer.ready`` — so
+          waiting for one of those is waiting for something the platform has
+          already said will not arrive. Checked again whenever a
+          ``capabilities`` frame revises the list under an open socket.
+        * a computer that is suspended or stopped, which is the ``409`` on the
+          upgrade rather than anything about the wait.
+
+        Passing several types waits for whichever arrives first, and refuses
+        only when NONE of them is possible — a caller waiting for
+        ``process.exited`` or ``computer.ready`` on a guest with no watcher is
+        still waiting for something reachable.
+
+        ``computer.ready`` returns at once on a desktop that is already up; see
+        :meth:`events` and :attr:`~mandala_computer.ComputerEvent.synthesized`.
+        """
+        wanted = [types] if isinstance(types, str) else list(types)
+        if not wanted:
+            raise MandalaError("wait_for needs at least one event type to wait for")
+        # What the vocabulary said, when it said this wait cannot end. Kept
+        # rather than raised from the hook: a hook that raises ends the stream
+        # with its own traceback, and this wants to end it with a sentence
+        # about the computer.
+        impossible: MandalaError | None = None
+
+        def hello_hook(hello: Hello) -> None:
+            nonlocal impossible
+            # Theirs first. `on_connect` is an ordinary option here, and a
+            # caller's hook that never saw the connection it was promised
+            # because this one closed the stream first would be a defect, not a
+            # smaller version of one.
+            if on_connect is not None:
+                on_connect(hello)
+            impossible = unreachable_types(self.id, wanted, hello.events)
+            if impossible is not None:
+                stream.close()
+
+        stream = self.events(
+            since=since,
+            reconnect=reconnect,
+            backoff=backoff,
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+            connect_timeout=connect_timeout,
+            max_queue=max_queue,
+            on_connect=hello_hook,
+            timeout=timeout,
+        )
+        with closing(stream):
+            for ev in stream:
+                if ev.type in wanted:
+                    return ev
+                if ev.type == "capabilities" and ev.events is not None:
+                    impossible = unreachable_types(self.id, wanted, ev.events)
+                    if impossible is not None:
+                        break
+        if impossible is not None:
+            raise impossible
+        names = " or ".join(wanted)
+        if stream.expired:
+            raise TimeoutError(f"{self.id} did not emit {names} within {timeout:g}s")
+        # Reached with `reconnect=False`, where the socket ending IS the
+        # answer. Reported as what happened rather than as a deadline that has
+        # not elapsed.
+        raise MandalaError(f"{self.id}'s event stream ended before {names} arrived")
+
+    def _events_url(self, timeout_cap: float | None = None) -> str:
+        """A fresh ``events_url``, on every connection and every reconnect.
+
+        Re-read rather than cached, because the credential in it is rotated by
+        a restart — and a restart is one of the ordinary reasons the socket
+        dropped. A reconnect over the old URL is a 401 that looks like a bug in
+        the stream.
+
+        ``timeout_cap`` is the stream's own connect budget, and this read is
+        inside it. Without the cap the read ran on the transport's default
+        minute whatever deadline the caller had set, so a
+        ``wait_for(timeout=5)`` against an unresponsive control plane sat here
+        for sixty seconds before anything looked at the five (Codex review).
+        """
+        try:
+            self._refresh(timeout_cap=timeout_cap)
+        except MandalaError as err:
+            # A read that will answer the same way forever ends the stream
+            # rather than being retried behind it. Without this a deleted
+            # computer or a revoked key is a reconnect loop with no
+            # `max_retries` to stop it — the default is to never give up —
+            # asking a question that has already been answered.
+            if not _is_transient_for_poll(err):
+                _settle(err)
+            raise
+        vnc = self.vnc
+        if vnc is not None and vnc.events_url:
+            return vnc.events_url
+        if vnc is None:
+            # The platform could not reach the host holding this computer, so
+            # it sent no connect surface at all. Weather, and the stream's own
+            # backoff is the right response to it — deliberately not settled.
+            raise ConnectionError(
+                f"the platform did not return a connect surface for {self.id}; "
+                "its host may be unreachable"
+            )
+        if self.os == "windows":
+            raise _settle(
+                MandalaError(
+                    f"{self.id} runs Windows, which has no event stream: there is nowhere in "
+                    "the guest to run the watcher the guest half needs."
+                )
+            )
+        raise _settle(
+            MandalaError(
+                f"{self.id} has no events_url. Its host may predate the event stream, or this "
+                "credential may be a watch-only one, which is not given window titles."
+            )
+        )
 
 
 class BackgroundCommandFields:
