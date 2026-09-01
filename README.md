@@ -855,6 +855,119 @@ The platform also exposes the same engine behind an OpenAI-shaped door at
 that, you already have an OpenAI client — point its `base_url` here, which is
 the whole reason the door is there.
 
+### Events
+
+A computer never tells you anything unless you ask, and the only general way to
+ask is `screenshot()` — which is the most expensive call on the API, paid per
+iteration, forever, to learn that nothing has changed. `events()` is the other
+direction: a socket the platform pushes down, so a loop can wait for something
+to happen instead of paying to find out that nothing has.
+
+```python
+for ev in c.events():
+    if ev.type == "process.exited" and ev.pid == job.pid:
+        print("finished", ev.exit_code)
+        break
+```
+
+Most of the time you want one event, not a loop, and `wait_for()` is that:
+
+```python
+c = client.computers.create(template="base")
+c.wait_for("computer.ready")  # in place of screenshotting until it looks up
+
+job = c.start_exec("apt-get install -y build-essential")
+done = c.wait_for("process.exited")  # in place of polling job.poll()
+print(done.exit_code, job.poll().stdout)
+```
+
+Both close the socket on the way out. `wait_for()` always does; a `for` loop
+does it through the generator's own cleanup, which CPython runs promptly — use
+`contextlib.closing` if you need the guarantee rather than the habit.
+
+**What arrives.** Every event carries `type`, `at`, `computer`, `seq`, `cursor`,
+`source`, and the payload both verbatim in `data` and promoted onto the fields
+the type actually uses:
+
+| `type` | what it carries |
+| --- | --- |
+| `window.opened`, `window.focused` | `window`, the same record `windows()` returns |
+| `window.closed`, `window.blurred` | `window_id`, and nothing else |
+| `process.exited` | `pid` and `exit_code` — or `lost`, when the guest stopped knowing about the command |
+| `clipboard.changed` | `selection`, either `clipboard` or `primary`. Not the contents |
+| `computer.ready` | the desktop session is up and accepting input |
+| `computer.idle` | `idle_seconds`. Holding this socket open is not activity |
+| `computer.started`, `.stopped`, `.suspended` | `status`, and `previous` where there was one |
+
+Ignore a `type` you do not recognise. The vocabulary grows, and one this SDK
+predates still arrives whole, with its payload in `data`.
+
+**It reconnects, and it keeps your place.** The position after the last event you
+actually *consumed* is what a reconnect resumes from, so a socket that drops
+mid-loop does not lose the `process.exited` you were waiting for. Where the host
+can no longer replay that far you get a `gap` event rather than silence — not an
+error and not swallowed, because it is the signal to reconcile against
+`windows()` or `job.poll()` rather than to assume nothing happened. Read
+`stream.cursor` if you want to keep your own place across a process restart, and
+pass it back as `since=`.
+
+Three frames are about the *stream* rather than the computer, and reach you as
+events because a client cannot ignore what it was never handed: `gap`, `closed`
+(the host ending the socket deliberately) and `capabilities` (the vocabulary
+being revised under an open one).
+
+**`computer.ready` has a trap in it, and this SDK takes it out.** It fires once
+per desktop *session*, so a machine that has been up for an hour will never send
+it again — waiting for it over a raw socket waits forever. The opening frame
+carries the state instead, and a stream joining an already-ready desktop yields a
+`computer.ready` marked `synthesized` as its first event. So the `wait_for` above
+returns at once on a computer somebody else already started.
+
+**`source` is worth reading.** `daemon` means the platform observed it. `guest`
+means the machine reported it about itself — every `window.*`, `clipboard.changed`
+and `computer.ready` — and anyone with root inside that guest can make those say
+anything. They are your machine describing itself, which is exactly as much as
+they are worth. A window title is content; treat it like one.
+
+**What a given computer can emit** is on the opening frame, not fixed by the
+platform: a guest with nowhere to run a watcher produces no `window.*` and no
+`computer.ready`.
+
+```python
+from contextlib import closing
+
+with closing(c.events()) as stream:
+    for ev in stream:
+        print(stream.event_types)  # what this computer says it can emit
+        print(stream.windows)  # the desktop this connection joined, or None
+        break
+```
+
+`wait_for()` reads the same list and refuses rather than waiting out its timeout
+when *none* of the types you asked for can arrive — on a Windows guest, or an
+image built without the X bindings the watcher needs. It refuses a suspended or
+stopped computer for the same reason: this is the one part of the API that does
+**not** resume a suspended computer for you.
+
+```python
+c.wait_for("window.opened", timeout=30)
+# MandalaError: vm-1 cannot emit window.opened, so waiting for it would never end.
+```
+
+`events_url` is absent on a Windows guest and on a watch-only connect surface,
+and the credential in it is rotated by a restart — which is why every reconnect
+re-reads the computer rather than reusing a URL that is now a 401 nobody can
+explain.
+
+The async half is the same object awaited:
+
+```python
+async for ev in c.events():
+    ...
+
+await c.wait_for("computer.ready")
+```
+
 ### Readiness
 
 `create()` returns as soon as the API does; the machine is starting, not ready.
@@ -871,8 +984,16 @@ the whole reason the door is there.
 
 The last of those is about the agent, not the desktop, and the agent answers
 first — on Windows by a wide margin, since it runs in session 0 and replies
-before anyone has logged in. To wait for a desktop somebody could use, poll
-`screenshot()` until it looks right.
+before anyone has logged in. To wait for a desktop somebody could *use*, wait for
+the event that says so:
+
+```python
+c.wait_for("computer.ready")
+```
+
+See [Events](#events), including why that returns at once on a computer that has
+been up for an hour rather than waiting for something which has already happened.
+Screenshotting in a loop until the picture looks right is what this replaces.
 
 ### Computers that are still being built
 
