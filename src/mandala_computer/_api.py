@@ -1004,7 +1004,8 @@ def window_body(
         raise ValueError("width and height are only valid for resize")
     body: dict[str, Any] = {"action": action}
     if x is not None and y is not None:
-        body["x"], body["y"] = _coordinate(x, "x"), _coordinate(y, "y")
+        body["x"] = _coordinate(x, "x", exc=ValueError)
+        body["y"] = _coordinate(y, "y", exc=ValueError)
     if width is not None and height is not None:
         body["width"] = whole(width, "width", exc=ValueError)
         body["height"] = whole(height, "height", exc=ValueError)
@@ -1181,9 +1182,16 @@ def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str
 # writing the same seven stubs.
 
 
-def _coordinate(value: Any, name: str) -> int:
-    """Reject values JSON can carry but the guest cannot use as coordinates."""
-    return whole(value, name, message=f"{name} must be an integer coordinate")
+def _coordinate(value: Any, name: str, *, exc: type[Exception] = TypeError) -> int:
+    """Reject values JSON can carry but the guest cannot use as coordinates.
+
+    The TypeError default is what the pointer guards have always raised and what
+    their tests read. ``window_body`` passes ``ValueError`` instead, because its
+    width and height were guarded for the first time in OPL-4210 and took the
+    type the rest of this file uses — one function refusing its two halves
+    differently is worse than either type on its own.
+    """
+    return whole(value, name, exc=exc, message=f"{name} must be an integer coordinate")
 
 
 def pointer_body(action: str, x: int, y: int) -> dict[str, Any]:
