@@ -21,8 +21,9 @@ rather than being screenshotted for; that a second wait on an up desktop returns
 at once instead of forever; that the opening frame carries the vocabulary and
 the desktop; that a background command's exit arrives off the wire with its real
 code; that a window opening is described, in the same coordinates the listing
-gives; that a stored cursor resumes; and that a suspended computer is refused
-with a sentence naming the suspend.
+gives; that a stored cursor resumes; that a nominated directory arms and then
+reports what changed under it, under the name the host normalised it to; and
+that a suspended computer is refused with a sentence naming the suspend.
 """
 
 from __future__ import annotations
@@ -100,6 +101,11 @@ def main() -> int:
             )
             kept = stream.cursor
             check("the stream kept a cursor to resume from", isinstance(kept, str), str(kept))
+            check(
+                "a stream that nominated nothing says so, rather than saying nothing is armed",
+                stream.watching is None,
+                repr(stream.watching),
+            )
 
         job = vm.start_exec("sleep 4; exit 7")
         # Matched on the pid, because a wait returns the first exit on the WHOLE
@@ -166,6 +172,83 @@ def main() -> int:
             "and no manufactured readiness in front of it",
             "computer.ready" not in seen,
             ",".join(seen) or "nothing",
+        )
+
+        # The file half, and the only one that has to be asked for. Everything
+        # above arrives on any stream; a `file.changed` reaches only a socket
+        # that nominated the tree it happened under.
+        tree = "/tmp/sdk-smoke"
+        vm.exec(f"rm -rf {tree}; mkdir -p {tree}")
+        greeting: list[mc.Hello] = []
+        armed = None
+        changed = None
+        # Nominated WITH a trailing slash on purpose. The host cleans it away,
+        # and the cleaned form — not the string sent — is what the opening frame
+        # reports and what every event carries, so a client matching on what it
+        # sent matches nothing.
+        with vm.events(watch=f"{tree}/", timeout=180, on_connect=greeting.append) as stream:
+            reader = iter(stream)
+            # Arming FIRST, and the file written only after it. inotify reports
+            # changes and not state, so anything that happens before the watch
+            # arms is never reported and never will be — a script that wrote
+            # first would be flaky in exactly the way `armed` exists to prevent.
+            #
+            # It arrives as an event here because this computer was created by
+            # this script: nobody else has nominated the tree, so the guest is
+            # being asked for the first time. A stream joining a tree somebody
+            # else nominated is told by `hello.watching` instead, since the guest
+            # answers a nomination once.
+            for ev in reader:
+                if ev.type == "file.changed" and ev.armed:
+                    armed = ev
+                    break
+            check(
+                "the watch arms, and says which tree it armed",
+                armed is not None and armed.watch == tree,
+                f"watch={getattr(armed, 'watch', None)} path={getattr(armed, 'path', None)}",
+            )
+            check(
+                "an armed marker names no file, rather than a file with no name",
+                armed is not None and armed.path is None and armed.kind is None,
+                f"path={getattr(armed, 'path', None)} kind={getattr(armed, 'kind', None)}",
+            )
+            vm.start_exec(f"touch {tree}/a.txt")
+            for ev in reader:
+                if ev.type == "file.changed" and ev.path:
+                    changed = ev
+                    break
+        check(
+            "a change under the nominated tree arrives, with what happened to it",
+            changed is not None
+            and changed.path == f"{tree}/a.txt"
+            and changed.kind in ("created", "modified")
+            and changed.is_dir is False,
+            f"{getattr(changed, 'kind', None)} {getattr(changed, 'path', None)}",
+        )
+        told = greeting[0].watching if greeting else None
+        check(
+            "hello echoes the nomination as the host normalised it",
+            told is not None and [t.path for t in told] == [tree],
+            repr([(t.path, t.armed) for t in told] if told else None),
+        )
+        check(
+            "and the event carries that same spelling",
+            changed is not None and changed.watch == tree,
+            f"watch={getattr(changed, 'watch', None)}",
+        )
+
+        # The wait that could never end, refused rather than waited out. The
+        # computer advertises `file.changed` — it has the channel — so the
+        # vocabulary alone would say yes to this.
+        try:
+            vm.wait_for("file.changed", timeout=20)
+            unasked: BaseException | None = None
+        except mc.MandalaError as err:
+            unasked = err
+        check(
+            "waiting for a file change with no nomination is refused",
+            unasked is not None and "nominated none" in str(unasked),
+            str(unasked)[:90],
         )
 
         # The refusal a websocket carries no status for in a browser, and which
