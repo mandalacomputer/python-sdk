@@ -651,6 +651,12 @@ class TemplateCheck:
     not a failed request — so nothing here raises for :attr:`valid` being False.
     That is the point of validating: :attr:`problems` lists EVERY problem at
     once, where publishing reports the first thing that stops it.
+
+    :attr:`build_digest` and :attr:`build_digest_needs` are ALTERNATIVES. A
+    document with no parent gets the digest; one naming a parent in ``spec.from``
+    gets the sentence saying what could not be computed and where to compute it.
+    Reading only the first leaves a whole class of document looking like a
+    failure with no reason attached, which is what it did here until OPL-4193.
     """
 
     valid: bool
@@ -665,9 +671,55 @@ class TemplateCheck:
     #: A new label or a version bump leaves it alone, so comparing it against a
     #: previous run is how you tell whether an edit means a rebuild. ``None``
     #: for a document naming a parent in ``spec.from``, which cannot be computed
-    #: without the parent's.
+    #: without the parent's — and then :attr:`build_digest_needs` says so in
+    #: words, because the platform sends the two as alternatives.
     build_digest: str | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    # Both keyword-only at the end rather than beside the fields they belong
+    # with: this class is exported, so its field order is its constructor, and
+    # `Template.ref` already cost a release learning what a mid-order insertion
+    # does to every positional construction. Same reasoning as `Window.visible`
+    # (OPL-4191).
+
+    #: Why there is no :attr:`build_digest`, in a sentence meant for a person.
+    #:
+    #: It REPLACES :attr:`build_digest` rather than accompanying it — the
+    #: platform sends one or the other, never both — so this is the field that
+    #: turns "the digest is missing" into an answer::
+    #:
+    #:     check = client.templates.validate(doc)
+    #:     if check.build_digest is None and check.build_digest_needs:
+    #:         print(check.build_digest_needs)
+    #:
+    #: which prints, for a document naming a parent:
+    #:
+    #:     the contents of acme/base's image, which only a host holding it can
+    #:     supply. Run ``gorillad -build-template <file> -dry-run`` there to see
+    #:     this document's build digest
+    #:
+    #: ``None`` on an invalid document, on one with no parent — where
+    #: :attr:`build_digest` is the answer instead — and from a host too old to
+    #: send it, which is every host before OPL-4179 documented the field.
+    build_digest_needs: str | None = field(default=None, kw_only=True)
+    #: The document as the digests were taken over it, as a string of compact
+    #: JSON with no trailing newline.
+    #:
+    #: Key order and whitespace are normalised, which is the whole point: two
+    #: YAML files differing only in comments and key order are the same document
+    #: and hash the same. This is what lets you check :attr:`doc_digest` rather
+    #: than trust it::
+    #:
+    #:     import hashlib
+    #:     mine = "sha256:" + hashlib.sha256(check.canonical.encode()).hexdigest()
+    #:     assert mine == check.doc_digest
+    #:
+    #: A STRING and not a parsed object, and that is what makes the check
+    #: possible — :attr:`PublishedTemplate.document` is the same document as a
+    #: mapping, and a mapping cannot be re-serialised back to the exact bytes
+    #: that were hashed. ``None`` on an invalid document, which has no digests
+    #: to be canonical for.
+    canonical: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> TemplateCheck:
@@ -675,12 +727,24 @@ class TemplateCheck:
             value = d.get(key)
             return None if value is None else _text(value)
 
+        # `template` is deliberately NOT decoded, and this is the note rather
+        # than the oversight it would otherwise read as. It is the seventh key a
+        # valid answer carries, and OPL-4190 is an open question about whether
+        # this route should be sending it at all: it is the daemon's own
+        # catalogue row, which carries `family` — the field `publicTemplate`
+        # drops from every OTHER route that answers with a template. Giving it a
+        # field here would put one name on two shapes, beside this module's real
+        # `Template` class, and make a compatibility promise about the wider one
+        # while the platform is still deciding. It stays reachable as
+        # `check.raw["template"]`.
         return cls(
             valid=_wire(d, "valid") is _Wire.TRUE,
             problems=_texts(d.get("problems")),
             ref=maybe("ref"),
             doc_digest=maybe("doc_digest"),
             build_digest=maybe("build_digest"),
+            build_digest_needs=maybe("build_digest_needs"),
+            canonical=maybe("canonical"),
             raw=dict(d),
         )
 
