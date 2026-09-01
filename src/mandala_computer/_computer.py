@@ -34,6 +34,8 @@ from ._events import (
     EventStream,
     Hello,
     _settle,
+    answers_wait,
+    unarmed_trees,
     unreachable_types,
 )
 from ._exceptions import (
@@ -2365,6 +2367,7 @@ class Computer(ComputerFields):
         self,
         *,
         since: str | None = None,
+        watch: str | Sequence[str] | None = None,
         reconnect: bool = True,
         backoff: float = 0.5,
         max_backoff: float = 15.0,
@@ -2415,11 +2418,45 @@ class Computer(ComputerFields):
         URL is rotated by a restart, and a restart is one of the ordinary
         reasons the socket dropped in the first place.
 
+        **Watching a directory.** ``file.changed`` is the one type that never
+        arrives unasked; nominate a tree with ``watch=`` and this socket reports
+        changes under it and nothing else::
+
+            with closing(c.events(watch="/home/user/out")) as stream:
+                for ev in stream:
+                    if ev.type == "file.changed" and ev.path:
+                        print(ev.kind, ev.path)
+
+        Arming is not instant, and it is asynchronous in a way that makes
+        silence ambiguous: until a tree is armed, "nothing has changed" and "not
+        watching yet" look the same, and inotify reports changes rather than
+        state, so whatever happened in that window is never reported.
+        :attr:`~mandala_computer.EventStream.watching` is where that answer
+        lives — the trees as the host normalised them, and whether each is live
+        — because a tree somebody else nominated first is already armed and
+        sends no event to say so.
+
         Refused with a ``409`` on a suspended computer — this is the one part of
-        the API that does NOT resume one for you — and on a stopped one.
+        the API that does NOT resume one for you — and on a stopped one. A
+        nomination is refused with a ``400`` for a path this host cannot honour,
+        and with a ``409`` where the computer is already watching all the trees
+        it can watch at once across every stream open on it. None of the three
+        is retried: they are decisions rather than weather.
 
         :param since: resume from a cursor you kept, instead of joining at the
             head. What survives a process restart.
+        :param watch: absolute directory paths in the GUEST to report
+            ``file.changed`` under — one string, or up to four. This is the one
+            event type that never arrives unasked, and it is an option on the
+            CONNECTION rather than something to filter for afterwards: without
+            a nomination no ``file.changed`` can reach this socket at all.
+            The tree is watched all the way down, and nothing is announced about
+            what is already in it. Read
+            :attr:`~mandala_computer.EventStream.watching` for the host's
+            normalised spelling of these paths and for whether each is live yet
+            — a tree is not being watched the moment the nomination is accepted,
+            and match a ``file.changed`` against what is reported there rather
+            than against the string you passed here.
         :param reconnect: reopen the socket when it drops. On by default, and
             most of what this object is for. Turn it off and the iteration ends
             when the socket does, which is the right shape for a caller running
@@ -2450,6 +2487,7 @@ class Computer(ComputerFields):
             self._events_url,
             self.id,
             since=since,
+            watch=watch,
             reconnect=reconnect,
             backoff=backoff,
             max_backoff=max_backoff,
@@ -2466,6 +2504,7 @@ class Computer(ComputerFields):
         *,
         timeout: float = 180.0,
         since: str | None = None,
+        watch: str | Sequence[str] | None = None,
         reconnect: bool = True,
         backoff: float = 0.5,
         max_backoff: float = 15.0,
@@ -2485,7 +2524,7 @@ class Computer(ComputerFields):
         this survives a socket that drops while it waits, and the socket is
         closed on the way out however this returns.
 
-        Two things it refuses rather than waiting out:
+        Three things it refuses rather than waiting out:
 
         * an event type THIS computer cannot emit. The opening frame lists what
           it can — a Windows guest, or an image built without the X bindings the
@@ -2495,11 +2534,27 @@ class Computer(ComputerFields):
           ``capabilities`` frame revises the list under an open socket.
         * a computer that is suspended or stopped, which is the ``409`` on the
           upgrade rather than anything about the wait.
+        * ``file.changed`` with no ``watch=``. A computer advertises that type
+          whenever it COULD report one, which is decided before anybody has said
+          which directory they care about — so the vocabulary says yes to a
+          wait that can never end. Pass the tree you are waiting on.
 
         Passing several types waits for whichever arrives first, and refuses
         only when NONE of them is possible — a caller waiting for
         ``process.exited`` or ``computer.ready`` on a guest with no watcher is
         still waiting for something reachable.
+
+        ``file.changed`` ends this wait only where something actually CHANGED.
+        Three shapes share that type and the other two are about the tree — it
+        went live, or the picture of it is incomplete — so a wait matched on the
+        name alone would come back with the arming marker on a fresh nomination
+        and with a real change on a tree somebody else had already armed, which
+        is the same call meaning two different things depending on who got there
+        first. The markers still arrive on :meth:`events`, and
+        :attr:`~mandala_computer.EventStream.watching` folds them into each
+        tree's state; they simply do not answer this question. A timeout says
+        which nominated tree never armed, because a watch that did not arm is
+        silent in exactly the way a tree where nothing happened is.
 
         ``computer.ready`` returns at once on a desktop that is already up; see
         :meth:`events` and :attr:`~mandala_computer.ComputerEvent.synthesized`.
@@ -2519,6 +2574,11 @@ class Computer(ComputerFields):
         # at all is a different request from a wait that has run out of it.
         if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout == 0:
             raise TimeoutError(f"{self.id} did not emit {' or '.join(wanted)} within 0s")
+        # Whether this stream nominated a tree at all, which is the other way a
+        # wait cannot end and the one the advertised vocabulary cannot express:
+        # a computer offers `file.changed` whenever it could report one, and
+        # this socket receives one only under a directory it asked about.
+        nominated = bool(watch)
         # What the vocabulary said, when it said this wait cannot end. Kept
         # rather than raised from the hook: a hook that raises ends the stream
         # with its own traceback, and this wants to end it with a sentence
@@ -2533,12 +2593,13 @@ class Computer(ComputerFields):
             # smaller version of one.
             if on_connect is not None:
                 on_connect(hello)
-            impossible = unreachable_types(self.id, wanted, hello.events)
+            impossible = unreachable_types(self.id, wanted, hello.events, nominated=nominated)
             if impossible is not None:
                 stream.close()
 
         stream = self.events(
             since=since,
+            watch=watch,
             reconnect=reconnect,
             backoff=backoff,
             max_backoff=max_backoff,
@@ -2550,17 +2611,31 @@ class Computer(ComputerFields):
         )
         with closing(stream):
             for ev in stream:
-                if ev.type in wanted:
+                if answers_wait(ev, wanted):
                     return ev
                 if ev.type == "capabilities" and ev.events is not None:
-                    impossible = unreachable_types(self.id, wanted, ev.events)
+                    impossible = unreachable_types(self.id, wanted, ev.events, nominated=nominated)
                     if impossible is not None:
                         break
         if impossible is not None:
             raise impossible
         names = " or ".join(wanted)
         if stream.expired:
-            raise TimeoutError(f"{self.id} did not emit {names} within {timeout:g}s")
+            # The trees that never went live, named. A watch that did not arm
+            # is silent in exactly the way a tree where nothing happened is, and
+            # without this the difference — which is the whole of what `armed`
+            # is for — reaches a caller as an ordinary timeout with nothing in
+            # it to explain the wait (Grok review).
+            never = unarmed_trees(stream.watching)
+            unarmed = (
+                ""
+                if not never
+                else (
+                    f" Its watch on {', '.join(never)} never armed, so nothing under it was "
+                    "being reported."
+                )
+            )
+            raise TimeoutError(f"{self.id} did not emit {names} within {timeout:g}s.{unarmed}")
         # Reached with `reconnect=False`, where the socket ending IS the
         # answer. Reported as what happened rather than as a deadline that has
         # not elapsed.
