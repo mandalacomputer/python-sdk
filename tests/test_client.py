@@ -2021,6 +2021,77 @@ def test_a_window_that_never_said_its_pid_reports_none_rather_than_zero(
     assert junk.pid is None, "unreadable is not a pid either, and must not read as 0"
 
 
+@respx.mock
+def test_geometry_it_could_not_read_is_none_rather_than_the_corner_of_the_screen(
+    client: mc.Client,
+) -> None:
+    """`_num`'s zero is a missing count everywhere else and a PLACE here.
+
+    A window really can be at x 0, so a coordinate this client could not read
+    came back indistinguishable from the top-left corner — and the corner is
+    where an agent then clicks. The daemon refuses the same shape at the origin:
+    `applyWindowGeom` requires all four and leaves out the row that fails it,
+    because "reporting it at the origin with no size is the 'plausible but
+    wrong' answer rather than a missing one" (OPL-4200).
+    """
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(
+            200,
+            json={
+                "windows": [
+                    {"id": "0x1"},
+                    {"id": "0x2", "x": None, "y": "", "width": "wide", "height": True},
+                    {"id": "0x3", "x": 0, "y": 51, "width": 1280, "height": 749},
+                    {"id": "0x4", "x": "10", "y": "20", "width": "1200", "height": "700"},
+                ]
+            },
+        )
+    )
+    absent, junk, real, spelled = _computer(client).windows()
+    assert (absent.x, absent.y, absent.width, absent.height) == (None, None, None, None)
+    assert (junk.x, junk.y, junk.width, junk.height) == (None, None, None, None)
+    # A real 0 survives, which is the whole reason this is not a truthiness
+    # test, and so does the decimal spelling a backend that stringifies its
+    # numbers sends — the guard must not tell such a host every window it
+    # describes is unplaceable.
+    assert (real.x, real.y, real.width, real.height) == (0, 51, 1280, 749)
+    assert (spelled.x, spelled.y, spelled.width, spelled.height) == (10, 20, 1200, 700)
+    # And the row is still a window: the identity half is what tells a browser
+    # that failed to open from one that has not painted, and it is readable
+    # whether or not the geometry was.
+    assert absent.id == "0x1"
+
+
+@respx.mock
+def test_a_listing_carrying_a_window_that_names_nothing_is_refused(client: mc.Client) -> None:
+    """`id` is the whole of what a listing is for, and `_text` answers "" for one
+    that is absent, null or unreadable.
+
+    That row is a window a caller can see and cannot touch: every one of the
+    eight window actions takes the id, and "" matches nothing on the desktop.
+    Refused WHOLE rather than dropped, because dropping is the failure a build
+    listing raises over one surface along — schema drift as a shorter inventory
+    that looked complete — and because the platform takes the same line on its
+    own side of this route (OPL-4200).
+    """
+    # The three shapes both SDKs read the same way. A non-string id is NOT one
+    # of them and is deliberately out of scope: `_text` answers `str(value)`,
+    # so `{"id": []}` decodes here as the two characters "[]" where TypeScript's
+    # `String([])` is empty. That divergence is in the string decoders and
+    # predates this rule; a payload with a list where the id goes is drift
+    # neither client claims to name.
+    for nameless in ({}, {"id": None}, {"id": ""}):
+        respx.get(f"{BASE}/computers/vm-1/windows").mock(
+            httpx.Response(200, json={"windows": [{"id": "0x1"}, nameless]})
+        )
+        with pytest.raises(mc.MandalaError, match=r"window with no id \(row 1 of 2"):
+            _computer(client).windows()
+
+    # The EVENT stream does not share the refusal: a frame is news rather than
+    # an answer, and `Window.from_api` runs there too — see its docstring.
+    assert mc.Window.from_api({"title": "Terminal"}).id == ""
+
+
 def test_a_window_can_still_be_built_the_way_it_could_before_visible() -> None:
     """`Window` is exported, so its field order is its constructor.
 
@@ -2085,6 +2156,43 @@ def test_a_closed_window_is_gone_rather_than_undescribable(client: mc.Client) ->
     res = _computer(client).window_action("0x2600003", "close")
     assert res.window is None
     assert res.gone
+
+
+@respx.mock
+def test_an_action_that_says_gone_and_describes_the_window_is_refused(client: mc.Client) -> None:
+    """Two halves read by two different callers, and they disagree.
+
+    One drives `result.window` and keeps clicking at a window the body calls
+    gone; the other branches on `gone` and throws away a window the body
+    describes. Both are correct programs, so the disagreement is settled at the
+    route rather than by whichever field a caller happened to read (OPL-4200).
+    """
+    respx.post(f"{BASE}/computers/vm-1/windows/0x2600003").mock(
+        httpx.Response(200, json={"ok": True, "gone": True, "window": {"id": "0x2600003", "x": 10}})
+    )
+    with pytest.raises(mc.MandalaError, match="reports the window gone and describes window"):
+        _computer(client).window_action("0x2600003", "close")
+
+
+def test_only_a_gone_the_wire_said_contradicts_a_window() -> None:
+    """Absent, null and unreadable are a host that said nothing, not a
+    contradiction — the line `build_contradiction` already draws.
+
+    And the close the platform really sends is untouched, which is the shape
+    this must never refuse.
+    """
+    described = {"id": "0x2600003"}
+    for gone in (None, "maybe", False, 7):
+        result = mc.WindowResult.from_api({"ok": True, "gone": gone, "window": described})
+        assert mc._models.window_contradiction(result) is None
+    assert (
+        mc._models.window_contradiction(
+            mc.WindowResult.from_api({"ok": True, "gone": True, "window": None})
+        )
+        is None
+    )
+    contradicted = mc.WindowResult.from_api({"ok": True, "gone": True, "window": described})
+    assert mc._models.window_contradiction(contradicted) is not None
 
 
 def test_a_window_id_cannot_add_a_path_segment() -> None:
@@ -2557,7 +2665,12 @@ def test_null_model_fields_are_normalized_without_losing_the_row() -> None:
     assert (size.id, size.label, size.cpu, size.ram_mb, size.disk_gb) == ("", "", 0, 0, 0)
     assert (snapshot.id, snapshot.state, snapshot.size_bytes, snapshot.cpu) == ("", "", 0, 0)
     assert (holdings.count, holdings.size_bytes, holdings.fingerprint) == (0, 0, "")
-    assert (window.id, window.title, window.x, window.y) == ("", "", 0, 0)
+    # The window is the exception on this list, and OPL-4200 is why: a null
+    # `cpu` or `size_bytes` normalises to a zero that reads as "nothing
+    # counted", where a null `x` normalises to the top-left corner of a screen
+    # an agent then clicks at. Its geometry answers None instead, and the row
+    # still survives, which is what this test is about.
+    assert (window.id, window.title, window.x, window.y) == ("", "", None, None)
     assert (status.pid, status.command, status.stdout_offset, status.stderr_offset) == (0, "", 0, 0)
 
 

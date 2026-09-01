@@ -79,6 +79,7 @@ from ._models import (
     Window,
     WindowResult,
     is_unreachable_stub,
+    window_contradiction,
 )
 
 __all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
@@ -1025,7 +1026,16 @@ class AsyncComputer(ComputerFields):
             _api.window(self.id, window_id),
             json=_api.window_body(action, x=x, y=y, width=width, height=height),
         )
-        return WindowResult.from_api(data)
+        result = WindowResult.from_api(data)
+        # A body that says the window is gone AND describes it says two things a
+        # caller acts on differently, and this is the layer that has to choose
+        # between them rather than leave the choice to whichever field the
+        # caller read. The same split `wait()` makes over `build_contradiction`:
+        # the reading is in _models, the raise is at the call site (OPL-4200).
+        contradiction = window_contradiction(result)
+        if contradiction is not None:
+            raise MandalaError(contradiction)
+        return result
 
     async def clipboard(self) -> str:
         """What is on the desktop's clipboard.
