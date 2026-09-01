@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import inspect
 import json
 import pathlib
@@ -184,6 +185,127 @@ def test_validate_carries_both_digests(client: mc.Client) -> None:
     check = client.templates.validate("apiVersion: mandala/v1")
     assert check.doc_digest == "sha256:aaaa"
     assert check.build_digest == "sha256:bbbb"
+    # The unlayered branch, so there is nothing to explain and nothing to say it.
+    assert check.build_digest_needs is None
+
+
+@respx.mock
+def test_a_layered_document_is_told_why_it_has_no_build_digest(client: mc.Client) -> None:
+    """`build_digest_needs` REPLACES `build_digest`; the two never both arrive.
+
+    `server/templateschema.go` is an if/else on `spec.from`. Decoding only the
+    first left every layered document looking like a failure with no reason
+    attached — the platform sends the reason, and this dropped it (OPL-4193).
+
+    The two key sets, read off app.mandala.computer, differ in exactly one
+    place, which is what "alternatives" means here:
+
+        flat     valid ref doc_digest canonical template build_digest
+        layered  valid ref doc_digest canonical template build_digest_needs
+    """
+    needs = (
+        "the contents of acme/base's image, which only a host holding it can supply. "
+        "Run `gorillad -build-template <file> -dry-run` there to see this document's "
+        "build digest"
+    )
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "valid": True,
+                "ref": "acc-1/devbox@1.0.0",
+                "doc_digest": "sha256:aaaa",
+                "build_digest_needs": needs,
+            },
+        )
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert check.valid is True
+    assert check.build_digest is None, "the layered branch, which is why the sentence exists"
+    assert check.build_digest_needs == needs
+    assert "dry-run" in check.build_digest_needs, "it names the command, not just the gap"
+
+
+@respx.mock
+def test_canonical_is_the_bytes_the_doc_digest_was_taken_over(client: mc.Client) -> None:
+    """A string, not a parsed object, and that is what makes it checkable.
+
+    `doc_digest` is `sha256:` + the hex of sha256 over exactly these bytes
+    (`TemplateDoc.Canonical` / `DocDigest`), so a caller can verify the binding
+    rather than trust the platform to have hashed honestly. A mapping could not
+    do this: re-serialising one does not reproduce the bytes that were hashed,
+    which is why `PublishedTemplate.document` cannot be used the same way.
+    """
+    canonical = '{"apiVersion":"mandala/v1","kind":"Template"}'
+    digest = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(
+            200, json={"valid": True, "doc_digest": digest, "canonical": canonical}
+        )
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert check.canonical == canonical
+    assert isinstance(check.canonical, str), "a mapping here would not be re-hashable"
+    mine = "sha256:" + hashlib.sha256(check.canonical.encode()).hexdigest()
+    assert mine == check.doc_digest, "the recipe in the field's own docstring"
+
+
+@respx.mock
+def test_an_invalid_document_carries_none_of_the_success_fields(client: mc.Client) -> None:
+    """The platform returns early with `{valid, problems}` and nothing else.
+
+    Nothing may invent a value for the rest — an empty `canonical` would hash to
+    something, and comparing that to an absent digest is a check that passes by
+    accident.
+    """
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(200, json={"valid": False, "problems": ["spec.os is required"]})
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert check.build_digest_needs is None
+    assert check.canonical is None
+
+
+@respx.mock
+def test_the_daemons_own_template_row_is_left_in_raw(client: mc.Client) -> None:
+    """NOT decoded, and deliberately — see the note in `TemplateCheck.from_api`.
+
+    `template` here is the daemon's catalogue row, which carries `family`. Every
+    other route that answers with a template projects that field away
+    (`publicTemplate`), so decoding this one as `Template` would put one name on
+    two shapes — and OPL-4190 is an open question about whether this route
+    should be sending the wider one at all. It stays reachable meanwhile.
+    """
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "valid": True,
+                "template": {"name": "devbox", "family": "devbox", "os": "linux"},
+            },
+        )
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert not hasattr(check, "template"), "a field here would promise the wider shape"
+    assert check.raw["template"]["family"] == "devbox"
+
+
+def test_template_check_can_still_be_built_the_way_it_could_before() -> None:
+    """`TemplateCheck` is exported, so its field order is its constructor.
+
+    The same trap `Template.ref` sprang and `Window.visible` avoided: both new
+    fields are keyword-only at the end, so the five positions that worked on the
+    previous release still mean what they did — `raw` included, which was the
+    slot `ref` quietly bound a mapping into.
+    """
+    c = mc.TemplateCheck(True, [], "acc-1/devbox@1.0.0", "sha256:aaaa", "sha256:bbbb")
+    assert (c.valid, c.ref, c.build_digest) == (True, "acc-1/devbox@1.0.0", "sha256:bbbb")
+    assert c.raw == {}
+    assert c.build_digest_needs is None
+    assert c.canonical is None
+
+    with_raw = mc.TemplateCheck(True, [], None, None, None, {"valid": True})
+    assert with_raw.raw == {"valid": True}, "raw keeps the sixth positional slot"
 
 
 # --- naming a version -----------------------------------------------------

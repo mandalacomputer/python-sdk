@@ -385,6 +385,12 @@ class Templates:
 
         The document goes as raw bytes, JSON or YAML, exactly as written. There
         is no envelope to build and none to get wrong.
+
+        On a valid document, read
+        :attr:`~mandala_computer.TemplateCheck.build_digest_needs` whenever
+        :attr:`~mandala_computer.TemplateCheck.build_digest` is ``None``: the
+        platform sends the two as alternatives, and a document naming a parent
+        gets the sentence rather than the digest.
         """
         data = self._t.json_object(
             "POST", _api.TEMPLATE_VALIDATE, content=_api.template_document(document)
