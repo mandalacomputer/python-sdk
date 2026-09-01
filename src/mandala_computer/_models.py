@@ -98,6 +98,16 @@ def _opt_whole(value: Any) -> int | None:
     could not read it", which is a thing a caller can branch on, where ``0``
     is a lie.
     """
+    # An `int` is already whole and is answered without going through `float`,
+    # which is `_exit_code`'s own fast path and is there for the same reason:
+    # past 2**53 the conversion is lossy and the comparison below cannot see it,
+    # because the float being compared IS a whole number. Routed through
+    # `_opt_num` alone, 9007199254740993 came back as ...992 — a silently
+    # different exit code, which is the class of wrong answer this function
+    # exists to refuse (/code-review, OPL-4232). No exit code is near that; the
+    # point is that the check below is only sound for values it can represent.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
     number = _opt_num(value)
     if number is None:
         return None

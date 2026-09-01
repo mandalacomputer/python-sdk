@@ -184,7 +184,12 @@ def _exit_code(message: str) -> int | None:
         return None
     try:
         return int(control.get("code") or 0)
-    except (TypeError, ValueError):
+    # `OverflowError` with the two obvious ones: `json.loads("1e309")` is `inf`,
+    # and `int(inf)` raises neither of them. It escapes the pump's own handlers
+    # and `main()`, so one stray frame ends an interactive session in a
+    # traceback — which is the outcome the docstring above says this function
+    # exists to prevent (/code-review, OPL-4232).
+    except (OverflowError, TypeError, ValueError):
         return 0
 
 

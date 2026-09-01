@@ -1327,31 +1327,34 @@ class Computer(ComputerFields):
             raise MandalaError(f"{self.id} did not start: {self.start_error}")
         deadline = time.monotonic() + timeout
         while True:
-            # THE STATE IN HAND, BEFORE THE DEADLINE. Ordered the other way — as
-            # it was — nothing below was reached on an already-expired budget,
-            # so `wait_until_running(timeout=0)` on a computer this handle
-            # already says is RUNNING answered `TimeoutError: vm-1 was still
-            # 'running' after 0s`, and the three terminal states lost the
-            # dedicated errors this method's own docstring promises for them
-            # (adversarial review, OPL-4232). `timeout=0` is a documented,
-            # allowed already-expired deadline and is what a computed remaining
-            # budget becomes, so the answer to one has to be the best sentence
-            # available rather than the emptiest.
-            #
-            # This is `wait_until_built`'s shape, which reads its cached status
-            # at the top of every pass and refreshes at the bottom — the same
-            # sibling OPL-4222 aligned the `start_error` check above with. It
-            # does mean a stale handle is believed for one pass; that is the
-            # trade `wait_until_built` already makes, and the normal callers
-            # here — `create(start=True)` and `start()` — both hand back a
-            # freshly refreshed computer.
-            if self.status == "running":
-                return self
-            failure = self._not_starting()
-            if failure is not None:
-                raise failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # OUT OF BUDGET, so the payload in hand is the only evidence
+                # there is — and it is better evidence than nothing. Checked
+                # ONLY here, which is the difference from `wait_until_built`
+                # and is deliberate: that wait may read its cached status on
+                # every pass because "building" is one-way, while a RUNNING
+                # computer becomes suspended on its own whenever the host's
+                # idle sweep reaches it. Trusting the cache while there is
+                # still time to ask would turn this into a no-op on any handle
+                # that once said "running" — answering "it is up" about a
+                # machine that has since been suspended out from under the
+                # caller (/code-review, OPL-4232).
+                #
+                # What this fixes is the other end: the deadline used to be
+                # consulted before ANY state, so `wait_until_running(timeout=0)`
+                # on a computer the handle already said was running answered
+                # `TimeoutError: still 'running' after 0s`, and the three
+                # terminal states lost the dedicated errors this method's own
+                # docstring promises. `timeout=0` is an allowed, documented
+                # already-expired deadline and is what a computed remaining
+                # budget becomes, so it deserves the best sentence available
+                # rather than the emptiest (adversarial review, OPL-4232).
+                if self.status == "running":
+                    return self
+                failure = self._not_starting()
+                if failure is not None:
+                    raise failure
                 raise TimeoutError(f"{self.id} was still {self.status!r} after {timeout:g}s")
             try:
                 self._refresh(timeout_cap=remaining)
@@ -1361,11 +1364,18 @@ class Computer(ComputerFields):
                 # what had happened was a single poll not landing (OPL-3724).
                 time.sleep(_ride_out(err, deadline, poll))
                 continue
-            # The freshly read state is judged at the top of the next pass, by
-            # the same two checks that judged the cached one — so "running" and
-            # the three terminal states are answered in one place rather than
-            # two that can drift.
+            # The FRESHLY READ state, judged by the same two questions the
+            # expired-budget branch above asks of the cached one — written once
+            # each so the two answers cannot drift.
+            if self.status == "running":
+                return self
+            failure = self._not_starting()
+            if failure is not None:
+                raise failure
             remaining = deadline - time.monotonic()
+            # Back to the top, which turns a spent budget into this wait's
+            # timeout — reported against the state just read rather than a
+            # stale one.
             if remaining <= 0:
                 continue
             time.sleep(min(poll, remaining))

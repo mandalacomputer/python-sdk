@@ -404,6 +404,29 @@ def test_wait_until_running_returns_at_once_for_a_computer_already_running(
 
 
 @respx.mock
+def test_a_stale_running_handle_is_still_verified_while_there_is_budget(
+    client: mc.Client,
+) -> None:
+    """The cached read is the EXPIRED-budget branch only, and that is the point.
+
+    `wait_until_built` may read its cached status on every pass because
+    "building" is one-way. "running" is not: a host suspends anything nobody has
+    touched for its idle window, so a handle that once said running goes stale on
+    its own. Trusting it while there is still time to ask would make this wait a
+    no-op — "it is up" about a machine suspended out from under the caller, who
+    then reaches for `screenshot()`, which is documented not to resume one
+    (/code-review, OPL-4232).
+    """
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "suspended"})
+    )
+    c = mc.Computer(client._t, COMPUTER)  # the handle still says "running"
+    with pytest.raises(mc.MandalaError, match="is suspended"):
+        c.wait_until_running(timeout=5, poll=0)
+    assert route.called
+
+
+@respx.mock
 @pytest.mark.parametrize(
     ("status", "says"),
     [
@@ -1966,14 +1989,23 @@ def test_wait_for_move_caps_its_poll_to_its_remaining_budget(client: mc.Client) 
     documents, then raised a `TimeoutError` claiming the move was still going
     after five seconds (OPL-4232).
     """
+    # Two answers rather than a mock that is live for ever: `poll=0` against an
+    # always-live listing spins for the whole wall-clock timeout and retains
+    # every mocked call, which made this the slowest test in the suite by 2x
+    # (/code-review, OPL-4232). The cap is a property of the FIRST poll, so one
+    # live answer and one finished one is the whole of what this needs.
     route = respx.get(f"{BASE}/moves").mock(
-        httpx.Response(
-            200, json={"moves": [{"computer_id": "vm-1", "state": "moving", "live": True}]}
-        )
+        side_effect=[
+            httpx.Response(
+                200, json={"moves": [{"computer_id": "vm-1", "state": "moving", "live": True}]}
+            ),
+            httpx.Response(
+                200, json={"moves": [{"computer_id": "vm-1", "state": "done", "live": False}]}
+            ),
+        ]
     )
-    with pytest.raises(mc.TimeoutError):
-        _computer(client).wait_for_move(timeout=1, poll=0)
-    assert max(route.calls.last.request.extensions["timeout"].values()) <= 1
+    assert _computer(client).wait_for_move(timeout=1, poll=0).state == "done"
+    assert max(route.calls[0].request.extensions["timeout"].values()) <= 1
 
 
 @respx.mock

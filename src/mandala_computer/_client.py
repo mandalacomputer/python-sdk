@@ -371,6 +371,17 @@ class _BaseTransport:
         ``connect`` and ``pool`` are the caller's, untouched: neither is about
         how long a stream may say nothing, and a patient client is still
         entitled to be patient about getting one open.
+
+        BOTH SSE ROUTES, and that is worth stating rather than leaving to be
+        discovered: this covers ``GET builds/{id}/events`` as well as the agent
+        run. The 10s keepalive above is documented for the agent stream, so a
+        caller who handed us a patient client specifically to sit through a
+        quieter build stream no longer has that as an escape hatch — the
+        default was 60s for them either way, but the option is gone. If a build
+        stream is ever found to go quiet for longer than this,
+        :data:`STREAM_IDLE_TIMEOUT` is the one number to raise, and raising it
+        keeps the bound a bound rather than making it optional again
+        (/code-review, OPL-4232).
         """
         return httpx.Timeout(
             connect=current.connect,

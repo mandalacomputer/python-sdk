@@ -1668,3 +1668,18 @@ def test_a_connect_timeout_is_this_sdks_error_on_every_supported_python() -> Non
 
     for exc in (asyncio.TimeoutError("open_timeout"), TimeoutError("open_timeout")):
         assert isinstance(_connect_failed("vm-1", exc), mc.ConnectionError)
+
+
+@pytest.mark.parametrize("wire", [9007199254740993, -9007199254740993])
+def test_a_large_whole_exit_code_is_not_quietly_rounded(wire: int) -> None:
+    """`float()` is lossy past 2**53, and the whole-number check cannot see it.
+
+    The float being compared IS a whole number, so `number != int(number)`
+    holds and a silently different code came back — the same class of wrong
+    answer `_opt_whole` exists to refuse, just out of range for a real exit
+    code. `_exit_code` next door has carried the `isinstance(value, int)` fast
+    path for this since OPL-4222 (/code-review, OPL-4232).
+    """
+    ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
+    assert ev is not None
+    assert ev.exit_code == wire
