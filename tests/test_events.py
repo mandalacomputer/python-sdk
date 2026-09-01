@@ -167,6 +167,7 @@ class Dialer:
         self.cls = cls
         self.urls: list[str] = []
         self.sockets: list[FakeSocket] = []
+        self.kwargs: list[dict[str, Any]] = []
 
     def _dial(self, url: str) -> FakeSocket:
         self.urls.append(url)
@@ -180,10 +181,16 @@ class Dialer:
         return sock
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> Dialer:
+        # The kwargs are RECORDED, not swallowed. Discarded, every reconnect and
+        # budget test here would keep passing if `_open` stopped handing the
+        # remaining connect budget to the handshake — the one thing that bounds
+        # how long a dead socket ties a caller up (adversarial review, OPL-4232).
         def connect(url: str, **kw: Any) -> FakeSocket:
+            self.kwargs.append(kw)
             return self._dial(url)
 
         async def aconnect(url: str, **kw: Any) -> FakeSocket:
+            self.kwargs.append(kw)
             return self._dial(url)
 
         monkeypatch.setattr(_events, "_connect", connect)
@@ -784,13 +791,43 @@ def test_a_host_that_is_not_ready_is_weather_and_is_retried(
 
 
 @respx.mock
+def test_the_connect_budget_reaches_the_handshake(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`open_timeout` is what bounds a handshake nobody ever answers.
+
+    `_open` computes one budget across the URL read, the handshake and the
+    opening frame, and hands the handshake what is left. Nothing asserted that
+    it arrived: the Dialer discarded its kwargs, so every test here would have
+    kept passing with the argument dropped (adversarial review, OPL-4232).
+    """
+    route()
+    dialer = Dialer([hello_frame(), FakeSocket.HANG]).install(monkeypatch)
+    # A stream deadline too, so the idle socket ends the iteration rather than
+    # blocking the suite; it is wider than nothing and narrower than for ever.
+    take(computer.events(connect_timeout=7, timeout=0.05), 0)
+    assert dialer.kwargs
+    assert 0 < dialer.kwargs[0]["open_timeout"] <= 7
+    assert dialer.kwargs[0]["max_queue"] == _events.DEFAULT_MAX_QUEUE
+
+
+@respx.mock
 def test_a_retry_budget_that_runs_out_says_so(
     computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The budget is what this pins, so the DIALS are what it counts.
+
+    It used to assert only `match="would not open"`, which is a single 503's own
+    message — so giving up after the FIRST refusal passed it just as well, and
+    the name claims the opposite. A fourth dial would mean the budget was not
+    respected either (adversarial review, OPL-4232).
+    """
     route()
-    Dialer(refused(503), refused(503), refused(503)).install(monkeypatch)
+    dialer = Dialer(refused(503), refused(503), refused(503)).install(monkeypatch)
     with pytest.raises(mc.MandalaError, match="would not open"):
         list(computer.events(backoff=0.001, max_retries=2))
+    # The first attempt plus two retries, and not one dial more.
+    assert len(dialer.urls) == 3
 
 
 @respx.mock
@@ -1233,7 +1270,10 @@ async def test_async_wait_for_gives_up_with_a_timeout(monkeypatch: pytest.Monkey
     Dialer([hello_frame(), FakeSocket.HANG], cls=AsyncFakeSocket).install(monkeypatch)
     async with mc.AsyncClient("gck_test", base_url=BASE) as client:
         c = await client.computers.get("vm-1")
-        with pytest.raises(mc.TimeoutError):
+        # `match`, like the sync twin: without it a TimeoutError from the
+        # connect path — or a bare builtin leaking out of the async `_recv` —
+        # passes a test named for the WAIT running out (OPL-4232).
+        with pytest.raises(mc.TimeoutError, match="within 0.05s"):
             await c.wait_for("process.exited", timeout=0.05)
 
 

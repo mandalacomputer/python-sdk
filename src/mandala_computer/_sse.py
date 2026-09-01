@@ -141,4 +141,12 @@ class SSEDecoder:
         """
         self._buffer += self._decoder.decode(b"", final=True)
         tail, self._buffer = self._buffer, ""
+        # The CR-swallow goes with the buffer. This method's own claim is that a
+        # decoder is a thing you feed until it is empty and that this is what
+        # empties it, and a flag left armed here is state the object still holds
+        # — a decoder fed again would eat a leading LF belonging to the next
+        # stream. Nothing in this SDK reuses one, which is why it was never a
+        # live loss; leaving it set made the sentence above false
+        # (adversarial review, OPL-4232).
+        self._swallow_lf = False
         return parse_event(tail)

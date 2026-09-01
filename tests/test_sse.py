@@ -174,3 +174,23 @@ def test_flushing_twice_does_not_hand_over_the_same_event_twice() -> None:
     first = decoder.flush()
     assert first is not None and first.event == "done"
     assert decoder.flush() is None
+
+
+def test_flushing_clears_the_cr_swallow_too() -> None:
+    """`flush` empties the decoder, and the pending CR-swallow is part of it.
+
+    `test_flushing_twice` feeds an LF-framed tail, so it would keep passing with
+    the flag left armed — the half of the state machine it does not reach
+    (adversarial review, OPL-4232).
+    """
+    d = SSEDecoder()
+    d.feed(b"data: one\r")
+    assert d._swallow_lf is True
+    tail = d.flush()
+    assert tail is not None and tail.data == "one"
+    # The invariant is the STATE, not an output difference: SSE ignores a blank
+    # line inside a frame, so a swallowed LF changes no parse this decoder can
+    # currently be given. That is why it is not a live loss — and why the flag
+    # is what has to be asserted for the docstring's claim to mean anything.
+    assert d._swallow_lf is False
+    assert d._buffer == ""
