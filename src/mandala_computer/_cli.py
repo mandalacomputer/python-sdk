@@ -26,7 +26,6 @@ import json
 import os
 import queue
 import select
-import shutil
 import signal
 import sys
 import threading
@@ -58,7 +57,41 @@ def _die(message: str) -> NoReturn:
     raise SystemExit(f"mandala: {message}")
 
 
-def _write_all(fd: int, data: bytes) -> None:
+#: How long a write to stdout may hold the local terminal before it gives it back.
+#:
+#: A consumer that is only slow — a ``tee`` to a busy disk, a pager between
+#: keystrokes — is not an error, and dropping guest output to escape one would
+#: corrupt the stream, so the write itself still waits as long as it takes.
+#: What stops waiting is the *terminal*: past this the tty comes out of raw
+#: mode, so Ctrl-C is a signal again and the session can be ended from the
+#: keyboard that opened it. Same length as :data:`_SENDER_JOIN_TIMEOUT`, for
+#: the same reason — long enough that an ordinary hiccup passes unnoticed,
+#: short enough that a wedged consumer is not a wedged terminal.
+_STDOUT_STALL_GRACE = 2.0
+
+#: What a guarded write is broken into.
+#:
+#: A blocking write larger than a pipe's atomic unit does not come back short
+#: on Linux — it waits for the whole count — which would put the wait back
+#: inside a single ``os.write``, where no timeout can see it.
+_WRITE_CHUNK = getattr(select, "PIPE_BUF", 512)
+
+
+def _writable(fd: int, timeout: float) -> bool:
+    """Whether *fd* will take a byte now, as far as ``select`` can tell.
+
+    An fd ``select`` cannot answer for — a regular file, an odd platform — is
+    called ready, which is what it is: a write to a file does not stall on a
+    reader that stopped reading.
+    """
+    try:
+        _, ready, _ = select.select((), (fd,), (), timeout)
+    except (OSError, ValueError):
+        return True
+    return bool(ready)
+
+
+def _write_all(fd: int, data: bytes, on_stall: Callable[[], None] | None = None) -> None:
     """Write every byte, however many calls that takes.
 
     ``os.write`` is allowed to write less than it was given, and here it will:
@@ -66,13 +99,79 @@ def _write_all(fd: int, data: bytes) -> None:
     whose buffer is a few kilobytes, and a SIGWINCH landing mid-write ends it
     early with a short count rather than being retried. The unwritten tail is
     guest output, and dropping it silently corrupts the terminal.
+
+    *on_stall*, if given, is called once when the fd has refused a byte for
+    :data:`_STDOUT_STALL_GRACE`. The write still finishes afterwards: the
+    caller uses this to stop paying for the stall with something it cares about
+    more, not to give up on the output. Without it this loop is unbounded, and
+    a consumer that read one pipe buffer and stopped —
+    ``mandala ssh dev | head -c 1`` and then nothing — parked the recv pump
+    here forever with the local terminal still raw and ``ISIG`` off, so Ctrl-C
+    was a byte to a guest nobody was reading and recovery meant a ``kill`` from
+    another window (OPL-4246).
     """
     view = memoryview(data)
     while view:
-        written = os.write(fd, view)
+        chunk = view
+        if on_stall is not None:
+            chunk = view[:_WRITE_CHUNK]
+            if not _writable(fd, _STDOUT_STALL_GRACE):
+                on_stall()
+                on_stall = None
+                chunk = view
+        written = os.write(fd, chunk)
         if written == 0:
             raise OSError("write made no progress")
         view = view[written:]
+
+
+def _terminal_fd() -> int | None:
+    """The fd to measure the local terminal on, or ``None`` if there is none.
+
+    stdin first: it is the fd raw mode is set from, and its terminal is the one
+    SIGWINCH reports on. stdout is not the right answer on its own —
+    ``mandala ssh dev | tee session.log`` is still a session in whatever window
+    the user is sitting in, and sizing it from the pipe left the guest PTY at
+    the platform's 80x24 default for the whole session, with ``vim``, ``htop``
+    and ``less`` wrong all the way through (OPL-4246). The other two are tried
+    after it so a redirected stdin (``mandala ssh dev < script``) still reports
+    the window its output is being drawn in.
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        with suppress(AttributeError, ValueError, OSError):
+            if stream is not None and stream.isatty():
+                return stream.fileno()
+    return None
+
+
+def _terminal_size(fd: int) -> tuple[int, int]:
+    """The local terminal's geometry, measured on *fd*.
+
+    Not :func:`shutil.get_terminal_size`, which consults ``COLUMNS``/``LINES``
+    and then ``sys.__stdout__``: with stdout piped that last one is not a
+    terminal, so it answers with its own (80, 24) fallback and the guest is
+    told the window is 80 columns however wide it is. Moving the call is
+    therefore not the fix; the fd has to change too.
+
+    The environment override is kept, because that is how a user tells a
+    program a size no ioctl can report, and each half falls back on its own
+    just as ``shutil`` does.
+    """
+    columns = rows = 0
+    with suppress(KeyError, ValueError):
+        columns = int(os.environ["COLUMNS"])
+    with suppress(KeyError, ValueError):
+        rows = int(os.environ["LINES"])
+    if columns <= 0 or rows <= 0:
+        try:
+            size = os.get_terminal_size(fd)
+        except (OSError, ValueError):
+            size = os.terminal_size((80, 24))
+        if columns <= 0:
+            columns = size.columns
+        if rows <= 0:
+            rows = size.lines
+    return columns, rows
 
 
 def _client() -> Client:
@@ -131,10 +230,23 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
             _die(f"{c.name} is {c.status or 'not running'} — start it, then retry")
         _die(f"{c.name} has no terminal endpoint (server too old?)")
     url = vnc.terminal_url
+    params: list[tuple[str, str]] = []
     if args.session != "main":
-        from urllib.parse import quote
+        params.append(("session", args.session))
+    # The broker sizes the PTY from the upgrade URL — `cols`/`rows`, defaulting
+    # to 80x24 — and only honours a `resize` frame after that. A session opened
+    # without them therefore draws its login prompt, its MOTD and any replayed
+    # scrollback 80 columns wide before the first resize lands, however wide
+    # the window is (OPL-4246). Measured on the terminal fd, not on stdout,
+    # because a piped stdout is still a session someone is watching.
+    tty_fd = _terminal_fd()
+    if tty_fd is not None:
+        cols, rows = _terminal_size(tty_fd)
+        params += [("cols", str(cols)), ("rows", str(rows))]
+    if params:
+        from urllib.parse import quote, urlencode
 
-        url += ("&" if "?" in url else "?") + "session=" + quote(args.session)
+        url += ("&" if "?" in url else "?") + urlencode(params, quote_via=quote)
     return _interact(url)
 
 
@@ -272,6 +384,8 @@ def _interact(url: str) -> int:
     ws = _connect(url)
     stdin = sys.stdin.fileno()
     stdout = sys.stdout.fileno()
+    stdout_is_tty = sys.stdout.isatty()
+    tty_fd = _terminal_fd()
     closed = threading.Event()
     resize = object()
     stop_sender = object()
@@ -323,7 +437,7 @@ def _interact(url: str) -> int:
             # Cleared before the size is read, so a resize arriving during the
             # read is flagged again rather than swallowed by the clear.
             pending_resize.clear()
-            cols, rows = shutil.get_terminal_size()
+            cols, rows = _terminal_size(stdout if tty_fd is None else tty_fd)
             return json.dumps({"type": "resize", "cols": cols, "rows": rows})
 
         # Keep draining until the stop sentinel even after the socket dies, or a
@@ -367,6 +481,29 @@ def _interact(url: str) -> int:
 
         termios.tcsetattr(stdin, termios.TCSADRAIN, saved_tty)
         tty_raw = False
+
+    def stdout_stalled() -> None:
+        """Nothing is reading stdout. Give the terminal back and keep waiting.
+
+        The output is not dropped — it is still the guest's, and the consumer
+        may yet come back — but the user's terminal stops being collateral:
+        out of raw mode ``ISIG`` is on again, so Ctrl-C is a signal that ends
+        the session rather than a byte to a pipe nobody is reading.
+
+        The notice goes out only on a terminal stderr. Anywhere else it is
+        either unread or, under ``2>&1``, the very pipe that is stalled.
+        """
+        if not tty_raw:
+            return
+        restore_tty()
+        with suppress(OSError, ValueError):
+            if sys.stderr is not None and sys.stderr.isatty():
+                print(
+                    "mandala: nothing is reading stdout — the terminal is no "
+                    "longer raw; Ctrl-C ends the session",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def forward_exit_signal(signum: int, frame: FrameType | None) -> None:
         """Put the TTY back before preserving the process's prior signal behavior."""
@@ -416,7 +553,10 @@ def _interact(url: str) -> int:
                     raise
             tty.setraw(stdin)
             tty_raw = True
-        if sys.stdout.isatty():
+        # Not `sys.stdout.isatty()`: raw mode above is set from stdin, and
+        # sizing from stdout meant a piped session never resized at all
+        # (OPL-4246).
+        if tty_fd is not None:
             send_size()
             if sigwinch is not None:
                 saved_winch = signal.getsignal(sigwinch)
@@ -431,7 +571,11 @@ def _interact(url: str) -> int:
         while True:
             message = ws.recv()
             if isinstance(message, bytes):
-                _write_all(stdout, message)
+                # Guard the write only when a stall would cost the terminal:
+                # raw mode on, and a stdout that can stop being read. A tty
+                # stdout only blocks under flow control the user asked for.
+                guarded = tty_raw and not stdout_is_tty
+                _write_all(stdout, message, stdout_stalled if guarded else None)
                 continue
             code = _exit_code(message)
             if code is not None:
@@ -442,7 +586,8 @@ def _interact(url: str) -> int:
     except WebSocketException as e:
         _die(f"terminal connection failed: {e}")
     except KeyboardInterrupt:
-        # Only reachable with a non-tty stdin; raw mode sends ^C to the guest.
+        # Reachable with a non-tty stdin, and once a stalled stdout has handed
+        # the terminal back; while raw, ^C is a byte to the guest.
         exit_code = 130
     finally:
         closed.set()

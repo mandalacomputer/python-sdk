@@ -289,6 +289,20 @@ def _computer(payload: dict) -> None:
     )
 
 
+_TERMINAL_COMPUTER = {
+    "status": "running",
+    "os": "linux",
+    "vnc": {
+        "url": "wss://control.test",
+        "view_url": "wss://view.test",
+        "token": "control",
+        "view_token": "view",
+        "embed_url": "https://embed.test",
+        "terminal_url": "wss://terminal.test",
+    },
+}
+
+
 @respx.mock
 def test_ssh_windows_guest_dies_plainly() -> None:
     _computer({"status": "running", "os": "windows"})
@@ -307,20 +321,10 @@ def test_ssh_stopped_computer_says_start_it() -> None:
 def test_ssh_closes_the_api_client_before_interacting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _computer(
-        {
-            "status": "running",
-            "os": "linux",
-            "vnc": {
-                "url": "wss://control.test",
-                "view_url": "wss://view.test",
-                "token": "control",
-                "view_token": "view",
-                "embed_url": "https://embed.test",
-                "terminal_url": "wss://terminal.test",
-            },
-        }
-    )
+    _computer(_TERMINAL_COMPUTER)
+    # Pinned rather than left to whatever pytest did with the streams: with
+    # `-s` the real terminal is one, and the URL would carry its geometry.
+    monkeypatch.setattr(_cli, "_terminal_fd", lambda: None)
     client = _cli._client()
     closed = False
     original_close = client.close
@@ -340,6 +344,143 @@ def test_ssh_closes_the_api_client_before_interacting(
 
     monkeypatch.setattr(_cli, "_interact", interact)
     assert _cli.main(["ssh", "dev"]) == 7
+
+
+@respx.mock
+def test_ssh_sizes_the_session_from_the_terminal_even_with_stdout_piped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPL-4246: `mandala ssh dev | tee log` used to open the PTY at 80x24.
+
+    The broker takes the PTY's initial geometry from `cols`/`rows` on the
+    upgrade URL and only honours a `resize` frame afterwards, so the login
+    prompt, the MOTD and any replayed scrollback are drawn at whatever the URL
+    said. Nothing put them there, and the size the client would have measured
+    came off stdout, which here is a pipe.
+    """
+    _computer(_TERMINAL_COMPUTER)
+    monkeypatch.setattr(_cli, "_terminal_fd", lambda: 3)
+    monkeypatch.setattr(_cli, "_terminal_size", lambda fd: (203, 51))
+    seen: list[str] = []
+    monkeypatch.setattr(_cli, "_interact", lambda url: seen.append(url) or 0)
+
+    assert _cli.main(["ssh", "dev", "--session", "two"]) == 0
+    assert seen == ["wss://terminal.test?session=two&cols=203&rows=51"]
+
+
+@respx.mock
+def test_ssh_without_a_terminal_anywhere_sizes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fully non-interactive run has no window to report; the broker defaults."""
+    _computer(_TERMINAL_COMPUTER)
+    monkeypatch.setattr(_cli, "_terminal_fd", lambda: None)
+    seen: list[str] = []
+    monkeypatch.setattr(_cli, "_interact", lambda url: seen.append(url) or 0)
+
+    assert _cli.main(["ssh", "dev"]) == 0
+    assert seen == ["wss://terminal.test"]
+
+
+# --- which fd is "the terminal" --------------------------------------------
+
+
+class _Stream:
+    def __init__(self, fd: int, tty: bool) -> None:
+        self.fd = fd
+        self.tty = tty
+
+    def fileno(self) -> int:
+        return self.fd
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+def test_terminal_fd_prefers_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raw mode is set from stdin, so stdin is the terminal being spoken to."""
+    monkeypatch.setattr(_cli.sys, "stdin", _Stream(0, True))
+    monkeypatch.setattr(_cli.sys, "stdout", _Stream(1, True))
+    assert _cli._terminal_fd() == 0
+
+
+def test_terminal_fd_falls_back_past_a_piped_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`mandala ssh dev < script` still draws its output in a real window."""
+    monkeypatch.setattr(_cli.sys, "stdin", _Stream(0, False))
+    monkeypatch.setattr(_cli.sys, "stdout", _Stream(1, False))
+    monkeypatch.setattr(_cli.sys, "stderr", _Stream(2, True))
+    assert _cli._terminal_fd() == 2
+
+
+def test_terminal_fd_is_none_when_nothing_is_a_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("stdin", "stdout", "stderr"):
+        monkeypatch.setattr(_cli.sys, name, _Stream(-1, False))
+    assert _cli._terminal_fd() is None
+
+
+def test_terminal_fd_survives_a_stream_with_no_fileno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pytest's own captured stdout is one of these, and so is a pythonw stdin."""
+
+    class Detached:
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            raise ValueError("underlying buffer detached")
+
+    monkeypatch.setattr(_cli.sys, "stdin", Detached())
+    monkeypatch.setattr(_cli.sys, "stdout", None)
+    monkeypatch.setattr(_cli.sys, "stderr", _Stream(2, True))
+    assert _cli._terminal_fd() == 2
+
+
+def test_terminal_size_measures_the_fd_it_is_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point: not `sys.__stdout__`, which a pipe run does not own."""
+    monkeypatch.delenv("COLUMNS", raising=False)
+    monkeypatch.delenv("LINES", raising=False)
+    sizes = {0: (203, 51), 1: (80, 24)}
+    monkeypatch.setattr(_cli.os, "get_terminal_size", lambda fd: _cli.os.terminal_size(sizes[fd]))
+    assert _cli._terminal_size(0) == (203, 51)
+
+
+def test_terminal_size_falls_back_when_the_fd_cannot_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("COLUMNS", raising=False)
+    monkeypatch.delenv("LINES", raising=False)
+
+    def refuse(fd: int) -> object:
+        raise OSError("not a terminal")
+
+    monkeypatch.setattr(_cli.os, "get_terminal_size", refuse)
+    assert _cli._terminal_size(7) == (80, 24)
+
+
+@pytest.mark.parametrize(
+    ("columns", "lines", "want"),
+    [
+        ("120", "40", (120, 40)),
+        ("120", "", (120, 24)),  # each half falls back on its own, as shutil does
+        ("nonsense", "40", (80, 40)),
+        ("0", "0", (80, 24)),  # a zero is not a window
+    ],
+)
+def test_terminal_size_honours_the_environment_override(
+    monkeypatch: pytest.MonkeyPatch, columns: str, lines: str, want: tuple[int, int]
+) -> None:
+    """COLUMNS/LINES is how a user reports a size no ioctl can."""
+    monkeypatch.setenv("COLUMNS", columns)
+    monkeypatch.setenv("LINES", lines)
+
+    def refuse(fd: int) -> object:
+        raise OSError("not a terminal")
+
+    monkeypatch.setattr(_cli.os, "get_terminal_size", refuse)
+    assert _cli._terminal_size(7) == want
 
 
 def test_ssh_on_a_local_windows_terminal_dies_before_connecting(
@@ -452,6 +593,72 @@ def test_write_all_refuses_a_zero_length_write(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(_cli.os, "write", lambda fd, data: 0)
     with pytest.raises(OSError, match="no progress"):
         _cli._write_all(1, b"guest output")
+
+
+def test_an_unguarded_write_never_asks_select(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ordinary path stays one syscall per frame, not one per 4 KiB."""
+
+    def refuse(fd: int, timeout: float) -> bool:
+        raise AssertionError("select is only for a write that can strand a terminal")
+
+    monkeypatch.setattr(_cli, "_writable", refuse)
+    monkeypatch.setattr(_cli.os, "write", lambda fd, data: len(bytes(data)))
+    _cli._write_all(1, b"guest output")
+
+
+def test_a_stalled_write_calls_back_once_and_still_delivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The callback is a hand-back, not a give-up: no byte of output is lost."""
+    answers = iter([False])
+    monkeypatch.setattr(_cli, "_writable", lambda fd, timeout: next(answers, True))
+    written = bytearray()
+    monkeypatch.setattr(
+        _cli.os, "write", lambda fd, data: written.extend(bytes(data)) or len(bytes(data))
+    )
+    stalls = []
+    payload = b"guest output" * 1000
+    _cli._write_all(1, payload, lambda: stalls.append(1))
+
+    assert len(stalls) == 1
+    assert bytes(written) == payload
+
+
+def test_a_full_pipe_stalls_before_the_write_finishes() -> None:
+    """OPL-4246, reproduced: a consumer that stops reading blocks the pump.
+
+    Filling a real pipe is the whole bug — `_write_all` was an unbounded
+    `os.write` loop on the recv path, so `mandala ssh dev | head -c 1` parked
+    it here for good. What the guard changes is only the terminal: the write
+    is still in progress when the callback runs, and it still completes once
+    somebody drains the pipe.
+    """
+    original = _cli._STDOUT_STALL_GRACE
+    _cli._STDOUT_STALL_GRACE = 0.05
+    read_fd, write_fd = _cli.os.pipe()
+    try:
+        stalled = threading.Event()
+        finished = threading.Event()
+        payload = b"x" * (1 << 20)  # comfortably past any pipe buffer
+
+        def pump() -> None:
+            _cli._write_all(write_fd, payload, stalled.set)
+            finished.set()
+
+        thread = threading.Thread(target=pump, daemon=True)
+        thread.start()
+        assert stalled.wait(5)
+        assert not finished.is_set()  # still mid-write: nothing was dropped
+
+        drained = 0
+        while drained < len(payload):
+            drained += len(_cli.os.read(read_fd, 1 << 16))
+        assert finished.wait(5)
+        thread.join(5)
+    finally:
+        _cli._STDOUT_STALL_GRACE = original
+        _cli.os.close(read_fd)
+        _cli.os.close(write_fd)
 
 
 # --- control frames --------------------------------------------------------
@@ -655,11 +862,164 @@ def test_resize_and_stdin_frames_use_the_sender_thread(
     monkeypatch.setattr(
         _cli.signal, "signal", lambda signum, handler: handlers.setdefault("resize", handler)
     )
-    monkeypatch.setattr(_cli.shutil, "get_terminal_size", lambda: (80, 24))
+    monkeypatch.setattr(_cli, "_terminal_size", lambda fd: (80, 24))
 
     assert _cli._interact("wss://terminal.test") == 0
     assert ws.sent == 3
     assert all(thread is not threading.main_thread() for thread in ws.send_threads)
+
+
+def test_a_piped_stdout_still_sizes_the_guest_pty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPL-4246: the resize used to be gated on stdout being a TTY.
+
+    Raw mode is set from stdin, so `mandala ssh dev | tee log` is an
+    interactive session by every measure the terminal cares about — and it was
+    the one session that never sent a resize at all.
+    """
+    import termios
+    import tty
+
+    class FakeFile:
+        def __init__(self, tty: bool) -> None:
+            self.tty = tty
+
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return self.tty
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent: list[object] = []
+
+        def recv(self) -> str:
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            self.sent.append(message)
+
+        def close(self) -> None:
+            pass
+
+    ws = FakeConnection()
+    monkeypatch.setattr(_cli, "_connect", lambda url: ws)
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile(True))
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile(False))
+    monkeypatch.setattr(_cli.sys, "stderr", FakeFile(False))
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: object())
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, state: None)
+    monkeypatch.setattr(tty, "setraw", lambda fd: None)
+    monkeypatch.setattr(_cli, "_terminal_size", lambda fd: (203, 51))
+    monkeypatch.setattr(_cli.os, "read", lambda fd, size: b"")
+
+    assert _cli._interact("wss://terminal.test") == 0
+    assert ws.sent == ['{"type": "resize", "cols": 203, "rows": 51}']
+
+
+def test_a_wedged_stdout_does_not_keep_the_local_terminal_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPL-4246: the recv path blocked in `os.write` with the tty still raw.
+
+    `ISIG` is off in raw mode, so Ctrl-C was a byte to a pipe nobody was
+    reading and Ctrl-\\ the same; the `finally` that puts the terminal back
+    was never reached, and recovery meant a `kill` from another window. The
+    terminal now comes back while the write is still outstanding — checked
+    here by the count of restores standing at the *next* recv, not merely by
+    the end of the session.
+    """
+    import termios
+    import tty
+
+    class FakeFile:
+        def __init__(self, tty: bool) -> None:
+            self.tty = tty
+
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return self.tty
+
+    saved = object()
+    restored: list[object] = []
+    restores_seen: list[int] = []
+    frames = iter([b"guest output", '{"type": "exit", "code": 0}'])
+
+    class FakeConnection:
+        def recv(self) -> bytes | str:
+            restores_seen.append(len(restored))
+            return next(frames)
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile(True))
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile(False))
+    monkeypatch.setattr(_cli.sys, "stderr", FakeFile(False))
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: saved)
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, state: restored.append(state))
+    monkeypatch.setattr(tty, "setraw", lambda fd: None)
+    monkeypatch.setattr(_cli, "_writable", lambda fd, timeout: False)
+    monkeypatch.setattr(_cli, "_terminal_size", lambda fd: (80, 24))
+    monkeypatch.setattr(_cli.os, "read", lambda fd, size: b"")
+    monkeypatch.setattr(_cli.os, "write", lambda fd, data: len(bytes(data)))
+
+    assert _cli._interact("wss://terminal.test") == 0
+    assert restored == [saved]
+    assert restores_seen == [0, 1]
+
+
+def test_a_tty_stdout_is_written_unguarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminal only stops taking bytes under flow control the user asked for.
+
+    Guarding it would buy nothing and cost a `select` and a chunked write per
+    frame on the path every interactive session takes.
+    """
+    import termios
+    import tty
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return True
+
+    frames = iter([b"guest output", '{"type": "exit", "code": 0}'])
+
+    class FakeConnection:
+        def recv(self) -> bytes | str:
+            return next(frames)
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def refuse(fd: int, timeout: float) -> bool:
+        raise AssertionError("a terminal stdout needs no stall guard")
+
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: object())
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, state: None)
+    monkeypatch.setattr(tty, "setraw", lambda fd: None)
+    monkeypatch.setattr(_cli, "_writable", refuse)
+    monkeypatch.setattr(_cli, "_terminal_size", lambda fd: (80, 24))
+    monkeypatch.setattr(_cli.os, "read", lambda fd, size: b"")
+    monkeypatch.setattr(_cli.os, "write", lambda fd, data: len(bytes(data)))
+
+    assert _cli._interact("wss://terminal.test") == 0
 
 
 def test_stdin_reader_is_woken_and_joined_before_return(monkeypatch: pytest.MonkeyPatch) -> None:
