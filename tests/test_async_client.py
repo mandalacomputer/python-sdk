@@ -264,11 +264,25 @@ async def test_wait_until_running_polls(client: mc.AsyncClient) -> None:
 
 @respx.mock
 async def test_wait_until_running_times_out(client: mc.AsyncClient) -> None:
-    respx.get(f"{BASE}/computers/vm-1").mock(
+    """See the sync twin: the handle must not already say the machine is up."""
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "status": "stopped"})
     )
-    with pytest.raises(mc.TimeoutError):
-        await mc.AsyncComputer(client._t, COMPUTER).wait_until_running(timeout=0, poll=0)
+    c = mc.AsyncComputer(client._t, {**COMPUTER, "status": "stopped"})
+    with pytest.raises(mc.TimeoutError, match="still 'stopped'"):
+        await c.wait_until_running(timeout=0.05, poll=0)
+    assert route.called
+
+
+@respx.mock
+async def test_wait_until_running_returns_at_once_for_a_computer_already_running(
+    client: mc.AsyncClient,
+) -> None:
+    """See the sync twin (OPL-4232)."""
+    route = respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(500))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert (await c.wait_until_running(timeout=0, poll=0)).status == "running"
+    assert not route.called
 
 
 @respx.mock
@@ -278,7 +292,12 @@ async def test_wait_until_running_caps_refresh_to_its_remaining_budget(
     route = respx.get(f"{BASE}/computers/vm-1").mock(
         httpx.Response(200, json={**COMPUTER, "status": "running"})
     )
-    await mc.AsyncComputer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
+    # A handle that is NOT already running, so the wait actually refreshes: the
+    # cached-state check added in OPL-4232 returns before any request when the
+    # payload in hand already says "running", which is what this used to pass on.
+    await mc.AsyncComputer(client._t, {**COMPUTER, "status": "stopped"}).wait_until_running(
+        timeout=2, poll=0
+    )
     assert max(route.calls.last.request.extensions["timeout"].values()) <= 2
     await client.aclose()
 

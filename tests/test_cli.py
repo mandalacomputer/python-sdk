@@ -973,3 +973,21 @@ def test_queued_input_is_discarded_once_the_terminal_has_closed(
 
     assert _cli._interact("wss://terminal.test") == 0
     assert sent == [b"one"]
+
+
+def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> None:
+    """The fifth `int()` site, missed by the sweep that fixed the other four.
+
+    `json.loads("1e309")` is `inf`, and `int(inf)` raises `OverflowError` —
+    neither of the two this caught. It escapes the pump's own handlers and
+    `main()`, so one stray control frame ends an interactive terminal in a
+    traceback, which is what this function's docstring says it exists to
+    prevent: "no code to read is not a reason to invent a failure"
+    (/code-review, OPL-4232).
+    """
+    assert _cli._exit_code('{"type":"exit","code":1e309}') == 0
+    # The frame's ARRIVAL is still the news that the shell ended.
+    assert _cli._exit_code('{"type":"exit"}') == 0
+    assert _cli._exit_code('{"type":"exit","code":3}') == 3
+    # And a frame that is not an exit still says nothing.
+    assert _cli._exit_code('{"type":"resize","cols":80}') is None

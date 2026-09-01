@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ._exceptions import ConnectionError, MandalaError
-from ._models import Window, _opt_num, _text, _texts, _Wire, _wire
+from ._models import Window, _opt_num, _opt_whole, _text, _texts, _Wire, _wire
 
 __all__ = [
     "GUEST_EVENT_TYPES",
@@ -193,10 +193,19 @@ class ComputerEvent:
     pid: int | None = field(default=None, kw_only=True)
     #: ``process.exited``: what the command exited with.
     #:
-    #: ``None`` exactly where :attr:`lost` is true, and the pair is the whole
-    #: point: ``-1`` is already a real exit code on this path, so it could not
-    #: also mean "no answer". Nothing is invented for a command whose outcome
-    #: the platform does not know.
+    #: ``None`` where :attr:`lost` is true, and the pair is the whole point:
+    #: ``-1`` is already a real exit code on this path, so it could not also
+    #: mean "no answer". Nothing is invented for a command whose outcome the
+    #: platform does not know.
+    #:
+    #: Also ``None`` — with :attr:`lost` FALSE — where the platform sent a code
+    #: this client could not read as a whole number. That pair is rarer and
+    #: says something narrower: the guest reported an outcome and the envelope
+    #: carrying it was malformed. It is ``None`` rather than a number because
+    #: the obvious reading of a fractional code truncates, and ``int(0.9)`` is
+    #: ``0`` — a failed command presented as a successful one, which is the
+    #: misread ``_exit_code`` refuses on ``exec()`` (OPL-4232). Read
+    #: :attr:`data` for what actually arrived.
     exit_code: int | None = field(default=None, kw_only=True)
     #: ``process.exited``: the guest stopped knowing about this command — which
     #: is what a restart of the machine underneath it looks like.
@@ -357,7 +366,14 @@ def to_computer_event(frame: Any) -> ComputerEvent | None:
         # carrying neither is a malformed one, and answering it with
         # `lost=True` would be this client asserting the guest lost track of a
         # command nobody said that about.
-        promoted["exit_code"] = None if lost else _opt_num(data.get("exit_code"))
+        # `_opt_whole`, not `_opt_num`: the latter truncates, and `int(0.9)` is
+        # `0` — a failed command reported as a successful one, which is the one
+        # outcome `_exit_code` was written to prevent on `exec()` and the
+        # background poll. This path was left on the truncating decoder, so the
+        # same wire value that `exec()` refuses outright decoded here to a clean
+        # pass with `lost` false (adversarial review, OPL-4232). A code this
+        # client cannot read is now `None`, which is what it is.
+        promoted["exit_code"] = None if lost else _opt_whole(data.get("exit_code"))
     elif kind == "clipboard.changed":
         promoted["selection"] = _text(data.get("selection")) or None
     elif kind in ("computer.started", "computer.stopped", "computer.suspended"):

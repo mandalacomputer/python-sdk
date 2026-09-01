@@ -78,6 +78,44 @@ def _opt_num(value: Any) -> int | None:
     return int(number) if math.isfinite(number) else None
 
 
+def _opt_whole(value: Any) -> int | None:
+    """:func:`_opt_num`, refusing a number that was never a whole one.
+
+    :func:`_opt_num` truncates, which is right for the fields it was written
+    for — a window's geometry is whole on the wire and a fractional one is a
+    rounding to live with. It is wrong for an EXIT CODE, where ``int(0.9)`` is
+    ``0`` and ``0`` is the one value that reads as success. That is the misread
+    :func:`_exit_code` exists to refuse, and the event stream reached it
+    through ``_opt_num`` instead: a ``process.exited`` carrying ``0.9`` decoded
+    to a clean pass, with ``lost`` false, so nothing said the code was
+    unreadable.
+
+    Not :func:`_exit_code` itself, which RAISES. This runs inside
+    :func:`~mandala_computer._events.to_computer_event`, whose policy for a
+    frame it cannot read is to hand it over with the field unset rather than
+    end the connection over it — the same split :meth:`Window.from_api` draws.
+    So an unreadable code is ``None``: "the platform sent one and this client
+    could not read it", which is a thing a caller can branch on, where ``0``
+    is a lie.
+    """
+    # An `int` is already whole and is answered without going through `float`,
+    # which is `_exit_code`'s own fast path and is there for the same reason:
+    # past 2**53 the conversion is lossy and the comparison below cannot see it,
+    # because the float being compared IS a whole number. Routed through
+    # `_opt_num` alone, 9007199254740993 came back as ...992 — a silently
+    # different exit code, which is the class of wrong answer this function
+    # exists to refuse (/code-review, OPL-4232). No exit code is near that; the
+    # point is that the check below is only sound for values it can represent.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    number = _opt_num(value)
+    if number is None:
+        return None
+    # `_opt_num` has already ruled out the non-finite and the unparseable, so
+    # the only thing left to refuse is a finite number that was not whole.
+    return number if float(value) == number else None
+
+
 def _real(value: Any) -> float:
     """A fractional field off the wire, or zero when it is unusable.
 
@@ -236,7 +274,16 @@ def _exit_code(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        raise TypeError("exit_code must be an integer or null, not a boolean")
+        # `MandalaError`, like every other refusal here, and it was the one
+        # `TypeError` among them. The README's promise is that everything the
+        # PLATFORM answers with derives from `MandalaError`, and it scopes its
+        # `TypeError` carve-out to arguments refused before anything is sent —
+        # naming four, none of them a response field. So a JSON `true` here
+        # escaped `exec()` as a bare builtin, past the handler this SDK tells
+        # callers to write, while the malformed value one line down was
+        # correctly refused (adversarial review, OPL-4232). It is the same
+        # argument the paragraph above makes about `OverflowError`.
+        raise MandalaError("exec answered with an invalid exit_code: a boolean is not one")
     # An `int` is already the answer, and going through `float` would stop it
     # being one: past 2**53 the conversion is lossy and `number != int(number)`
     # cannot see it, because the float it is comparing is a whole number — so
