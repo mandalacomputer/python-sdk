@@ -905,7 +905,12 @@ def _connect_failed(computer_id: str, exc: BaseException) -> MandalaError:
         return _refusal(computer_id, exc.response.status_code, exc.response.body)
     if isinstance(exc, InvalidURI):
         return _settle(MandalaError(f"{computer_id}'s events_url is not a websocket URL: {exc}"))
-    if isinstance(exc, (TimeoutError, OSError, WebSocketException)):
+    # ``asyncio.TimeoutError`` alongside the builtin because they are separate
+    # classes on 3.10, which ``requires-python`` still admits: without it an
+    # ``open_timeout`` on that version leaves this function through the
+    # ``raise`` below and reaches the caller as something that is not a
+    # MandalaError at all. ``_sleep`` in this file already spells it this way.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError, WebSocketException)):
         return ConnectionError(f"{computer_id}'s event stream would not open: {exc}")
     raise exc
 

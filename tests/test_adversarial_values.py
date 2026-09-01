@@ -245,9 +245,10 @@ def test_a_count_cannot_be_a_bool() -> None:
         A.move_body(ram_mb=True, cpu=None, disk_gb=None)
     with pytest.raises(ValueError):
         A.window_body("resize", width=True, height=1)
-    # The exception: x/y go through ``_coordinate``, whose TypeError predates
-    # this helper and is pinned by the pointer tests, so it keeps it. That the
-    # two halves of one function refuse differently is real and deliberate --
-    # see OPL-4210.
-    with pytest.raises(TypeError):
+    # Both halves of window_body agree (OPL-4214). The pointer guards keep the
+    # TypeError their own tests read -- `_coordinate` takes the type from its
+    # caller rather than owning one.
+    with pytest.raises(ValueError):
         A.window_body("move", x=True, y=1)
+    with pytest.raises(TypeError):
+        A.click_body(x=True, y=1, button="left")
