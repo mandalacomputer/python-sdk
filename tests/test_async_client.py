@@ -449,6 +449,25 @@ async def test_windows_and_one_window_acted_on(client: mc.AsyncClient) -> None:
 
 
 @respx.mock
+async def test_an_action_that_says_gone_and_describes_the_window_is_refused(
+    client: mc.AsyncClient,
+) -> None:
+    """The same refusal the sync client makes, on the half that shares only the
+    reading and not the call site (OPL-4200).
+
+    `window_contradiction` lives in _models; each `window_action` raises on it
+    itself, so the async one is its own line of code and its own way to be
+    forgotten.
+    """
+    respx.post(f"{BASE}/computers/vm-1/windows/0x26").mock(
+        httpx.Response(200, json={"ok": True, "gone": True, "window": {"id": "0x26"}})
+    )
+    with pytest.raises(mc.MandalaError, match="reports the window gone and describes window"):
+        await mc.AsyncComputer(client._t, COMPUTER).window_action("0x26", "close")
+    await client.aclose()
+
+
+@respx.mock
 async def test_windows_refuses_non_object_rows(client: mc.AsyncClient) -> None:
     respx.get(f"{BASE}/computers/vm-1/windows").mock(httpx.Response(200, json={"windows": [None]}))
     with pytest.raises(mc.MandalaError, match="array of objects"):
