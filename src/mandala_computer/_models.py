@@ -767,11 +767,11 @@ class TemplateCheck:
     build_digest: str | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
-    # Both keyword-only at the end rather than beside the fields they belong
-    # with: this class is exported, so its field order is its constructor, and
-    # `Template.ref` already cost a release learning what a mid-order insertion
-    # does to every positional construction. Same reasoning as `Window.visible`
-    # (OPL-4191).
+    # All three keyword-only at the end rather than beside the fields they
+    # belong with: this class is exported, so its field order is its
+    # constructor, and `Template.ref` already cost a release learning what a
+    # mid-order insertion does to every positional construction. Same reasoning
+    # as `Window.visible` (OPL-4191).
 
     #: Why there is no :attr:`build_digest`, in a sentence meant for a person.
     #:
@@ -811,6 +811,20 @@ class TemplateCheck:
     #: that were hashed. ``None`` on an invalid document, which has no digests
     #: to be canonical for.
     canonical: str | None = field(default=None, kw_only=True)
+    #: The catalogue row this document describes, in the shape
+    #: :meth:`~mandala_computer.Templates.list` answers.
+    #:
+    #: A real :class:`Template`, which it could not be until OPL-4190: this
+    #: route was the one place on the surface where `template` meant the
+    #: daemon's own wider row — the one carrying `family` — rather than the
+    #: projected shape every other route sends. It is projected here now, so
+    #: there is one `Template` shape again and this is it.
+    #:
+    #: ``None`` on an invalid document, which never parsed far enough to
+    #: describe a row. A deployment from before that projector still answers
+    #: with the wider row and still decodes to a :class:`Template` — the extra
+    #: ``family`` lands in ``raw`` there, as any unmodelled key does.
+    template: Template | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> TemplateCheck:
@@ -818,16 +832,13 @@ class TemplateCheck:
             value = d.get(key)
             return None if value is None else _text(value)
 
-        # `template` is deliberately NOT decoded, and this is the note rather
-        # than the oversight it would otherwise read as. It is the seventh key a
-        # valid answer carries, and OPL-4190 is an open question about whether
-        # this route should be sending it at all: it is the daemon's own
-        # catalogue row, which carries `family` — the field `publicTemplate`
-        # drops from every OTHER route that answers with a template. Giving it a
-        # field here would put one name on two shapes, beside this module's real
-        # `Template` class, and make a compatibility promise about the wider one
-        # while the platform is still deciding. It stays reachable as
-        # `check.raw["template"]`.
+        # `template` is the seventh key a valid answer carries, and since
+        # OPL-4190 it is `publicTemplate`'s output — the same row `GET
+        # /templates` lists — so it decodes through the same machinery as
+        # everywhere else. `None` rather than an empty `Template` when it is
+        # absent: an invalid document describes no row, and a row of zeroes
+        # would be a size, an OS and a name asserted about a file that has none.
+        template = d.get("template")
         return cls(
             valid=_wire(d, "valid") is _Wire.TRUE,
             problems=_texts(d.get("problems")),
@@ -836,6 +847,7 @@ class TemplateCheck:
             build_digest=maybe("build_digest"),
             build_digest_needs=maybe("build_digest_needs"),
             canonical=maybe("canonical"),
+            template=Template.from_api(template) if isinstance(template, Mapping) else None,
             raw=dict(d),
         )
 
