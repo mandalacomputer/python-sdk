@@ -19,9 +19,16 @@ classifiers = [
 ]
 # httpx over requests: the SDK needs a sync and an async client from the same
 # surface, and agent frameworks are overwhelmingly async. websockets carries
-# `mandala ssh`; it is pure Python with no dependencies of its own, which is
-# why it rides in the core install instead of an extra nobody would discover.
-dependencies = ["httpx>=0.27", "websockets>=13"]
+# `mandala ssh` and the event stream; it is pure Python with no dependencies of
+# its own, which is why it rides in the core install instead of an extra nobody
+# would discover.
+#
+# 14 rather than 13, which is where cancelling an asyncio `recv()` became safe
+# — it loses no message, and the next call returns it. `AsyncEventStream` bounds
+# every read that way, both for its own deadline and so that `close()` can end
+# one, so on 13 a stopped or timed-out stream could drop the frame it was in
+# the middle of receiving.
+dependencies = ["httpx>=0.27", "websockets>=14"]
 
 [project.scripts]
 mandala = "mandala_computer._cli:main"
