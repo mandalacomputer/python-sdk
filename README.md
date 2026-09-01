@@ -1351,7 +1351,8 @@ a byte count that looks perfectly reasonable.
 
 ### Errors
 
-Everything derives from `MandalaError`.
+Everything the platform answers with derives from `MandalaError`. An argument
+this SDK refuses before it sends anything does not — see [below](#refused-before-it-was-sent).
 
 | Exception | When |
 |---|---|
@@ -1373,6 +1374,18 @@ Everything derives from `MandalaError`.
 | `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
 | `ConnectionInterruptedError` | the request was dispatched and the answer was lost; do not replay a create |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
+
+<a name="refused-before-it-was-sent"></a>
+**An argument refused before it was sent is not a `MandalaError`.** Nothing left
+the process when you get one, and there is no status behind it to name: text
+that is not a string, a `"false"` where a flag takes `True` or `False`, a
+duration that is not a finite number, a count that is not a whole one, a `size`
+that contradicts the `template` beside it. Most of those raise `ValueError`.
+Four whose wording predates that rule raise `TypeError` — a pointer coordinate,
+a schedule's `hour` and `minute`, an idle-suspend minute count, and a download
+window's `offset` and `length` — so `except (ValueError, TypeError)` is the
+catch that covers all of it. It sits outside the table above deliberately: this
+is a mistake in your own code rather than something the platform said.
 
 `PlanLimitError`'s message names the limit that was hit.
 
