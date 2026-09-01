@@ -138,6 +138,7 @@ than trust it:
 
 ```python
 import hashlib
+
 mine = "sha256:" + hashlib.sha256(check.canonical.encode()).hexdigest()
 assert mine == check.doc_digest
 ```
