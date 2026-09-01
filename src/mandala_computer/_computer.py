@@ -92,11 +92,18 @@ def _require_model_key(model_key: str) -> str:
     one thing it does not mean. The platform stores no model key and will not
     fall back to one.
 
-    Returns the canonical text, and the caller must send THAT rather than what
-    it was handed: httpx serialises a header value by calling the value's own
-    ``encode``, so a ``str`` subclass checked here and then sent unchanged puts
-    a different key on the wire than the one that passed. Checking in place is
-    what leaves that gap open, which is why this returns instead.
+    Returns the canonical text, TRIMMED, and the caller must send THAT rather
+    than what it was handed. Two reasons, and both are about the value that is
+    sent differing from the value that was checked:
+
+    * httpx serialises a header value by calling the value's own ``encode``, so
+      a ``str`` subclass checked here and then sent unchanged puts a different
+      key on the wire than the one that passed.
+    * a key out of a ``.env`` file arrives with the newline still on it. The
+      emptiness check has always read ``strip()``; sending the unstripped text
+      meant a present, correct key was answered with a 401 — the one status
+      whose ordinary reading, on this route, is the thing it does not mean.
+      TypeScript's ``requireModelKey`` returns ``trim()`` for the same reason.
     """
     # ``None`` is the case that actually happens — ``os.environ.get`` on an
     # unset variable — and the message below was written to answer exactly it,
@@ -105,8 +112,8 @@ def _require_model_key(model_key: str) -> str:
     # caller-controlled string in this SDK.
     if model_key is None:
         raise MandalaError(_NO_MODEL_KEY)
-    text = _api.canonical(model_key, "model_key")
-    if not text.strip():
+    text = _api.canonical(model_key, "model_key").strip()
+    if not text:
         raise MandalaError(_NO_MODEL_KEY)
     return text
 
