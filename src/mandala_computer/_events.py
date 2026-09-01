@@ -824,6 +824,54 @@ def unreachable_types(
     )
 
 
+def answers_wait(ev: ComputerEvent, wanted: Sequence[str]) -> bool:
+    """Whether this event is the one a :meth:`~mandala_computer.Computer.wait_for` asked for.
+
+    Matching on :attr:`~ComputerEvent.type` alone is right for every type but
+    one. ``file.changed`` carries THREE shapes under a single name and only one
+    of them is a change: the other two say the tree went live and that the
+    picture of it is incomplete. A wait matched on the type returned whichever
+    arrived first, so ``wait_for("file.changed", watch=...)`` on a fresh
+    nomination came back with the arming marker — no file had changed — and
+    closed the socket. Worse, it did that only SOMETIMES: the guest answers a
+    nomination once, so the same call against a tree somebody else had already
+    armed never sees that marker and waits for a real change.
+
+    That is the ``computer.ready`` trap in a new place — state in ``hello``, the
+    transition on the wire, and a wait meaning two different things depending on
+    who got there first — and here there is nothing to synthesize, because the
+    caller did not ask about arming at all (Grok review).
+
+    So a wait for ``file.changed`` ends on a change and nothing else. The
+    markers are still DELIVERED — :meth:`~mandala_computer.Computer.events`
+    yields every frame, and :attr:`EventStream.watching` folds them into the
+    tree's state — they simply do not answer this question.
+    """
+    if ev.type not in wanted:
+        return False
+    # A change is the shape that names a path. `armed` and `lost` name only the
+    # tree, and so does a frame this build could not read — which a wait should
+    # sit through rather than end on, for the same reason.
+    return ev.path is not None if ev.type == WATCH_EVENT_TYPE else True
+
+
+def unarmed_trees(watching: Sequence[WatchedTree] | None) -> list[str]:
+    """The nominated trees that were never live, for a wait that ran out of time.
+
+    A watch that never arms is silent in exactly the way a tree where nothing
+    happened is, and the difference is the whole of what ``armed`` is for. Left
+    unsaid, a nomination the guest could not honour — a directory that is not
+    there, or is a symlink — reaches a caller as an ordinary timeout with
+    nothing in it to explain the wait.
+
+    Not an error, and deliberately: ``unwatchable`` recovers on its own, and
+    nominating the directory a job is about to create is a supported thing to
+    do. So this is a sentence added to the timeout rather than a reason to end
+    the wait early.
+    """
+    return [] if watching is None else [t.path for t in watching if not t.armed]
+
+
 # --- what neither half decides on its own ----------------------------------
 
 
@@ -1564,6 +1612,15 @@ class _StreamBase:
         built without the X bindings the watcher needs emits no ``window.*`` and
         no ``computer.ready``, and waiting on one of those is waiting for
         something the platform has already said will not arrive.
+
+        It is a list rather than a switch, and reading one entry off it tells
+        you nothing about the next. The file watcher needs only the terminal
+        channel, so this can name ``file.changed`` with no ``window.*`` beside
+        it — see :data:`DESKTOP_EVENT_TYPES` and :data:`CHANNEL_EVENT_TYPES`.
+        And it is not the whole of what makes a wait unable to end:
+        ``file.changed`` is advertised whether or not THIS stream nominated a
+        tree, so :meth:`~mandala_computer.Computer.wait_for` refuses that one for
+        a missing nomination rather than for a missing vocabulary.
         """
         # A COPY. The list behind this is what decides whether a wait can end —
         # `wait_for` refuses a type that is not in it — so handing out the live

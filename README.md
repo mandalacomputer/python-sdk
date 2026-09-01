@@ -953,6 +953,19 @@ refuses rather than waiting out its timeout if you ask for one without a
 is already in it, and a rename inside it is a `deleted` and a `created` rather
 than a move.
 
+```python
+ev = c.wait_for("file.changed", watch="/home/user/out", timeout=120)
+print(ev.kind, ev.path)
+```
+
+That wait ends on a *change* and on nothing else. Two of the three shapes below
+share the `file.changed` name without naming a file, so a wait matched on the
+type alone would return the arming marker on a fresh nomination and a real
+change on a tree somebody else had already armed — the same call meaning two
+different things depending on who got there first. The markers still arrive on
+`events()`, and `stream.watching` folds them into each tree's state. If the wait
+times out and a nominated tree never armed, the error says so.
+
 **Match on what `hello` gives back, not on what you sent.** The host normalises
 a nomination — a trailing slash and a `.` segment are cleaned away — and the
 cleaned form is what every event carries in `ev.watch`. `stream.watching` is

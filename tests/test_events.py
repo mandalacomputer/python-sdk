@@ -409,13 +409,28 @@ def test_a_statement_about_the_stream_is_never_a_position_in_it(kind: str) -> No
 
 
 def test_an_unknown_type_arrives_whole() -> None:
-    """The vocabulary grows, and a client cannot ignore what it was never handed."""
-    ev = to_computer_event({"type": "file.changed", "data": {"path": "/tmp/x"}, "cursor": "c2"})
+    """The vocabulary grows, and a client cannot ignore what it was never handed.
+
+    The stand-in has to be a type this build really does not know. It was
+    ``file.changed``, which OPL-4220 made first-class — so the assertions went
+    on passing while covering a decoded type instead of an undecoded one, and
+    nothing here pinned that an unrecognised frame arrives with NONE of the
+    promoted fields set (Grok review).
+    """
+    ev = to_computer_event({"type": "file.moved", "data": {"path": "/tmp/x"}, "cursor": "c2"})
     assert ev is not None
-    assert ev.type == "file.changed"
+    assert ev.type == "file.moved"
     assert ev.data == {"path": "/tmp/x"}
     assert ev.cursor == "c2"
-    assert ev.window is None
+    # Nothing promoted, however familiar the payload's own field names look.
+    assert (ev.window, ev.window_id, ev.path, ev.watch, ev.kind, ev.is_dir) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 def test_hello_is_not_an_event() -> None:
@@ -2245,6 +2260,133 @@ def test_wait_for_a_file_change_under_a_nominated_tree_waits(
     ev = computer.wait_for("file.changed", watch="/w", timeout=5)
     assert (ev.watch, ev.path, ev.kind) == ("/w", "/w/a.txt", "modified")
     assert dialer.urls[0].endswith("&watch=%2Fw")
+
+
+@respx.mock
+def test_a_wait_for_a_file_change_sits_through_the_arming_marker(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fresh-nomination path, which is the one that was silently wrong.
+
+    Three shapes share this type and only one is a change, so a wait matched on
+    the name came back with `{watch, armed}` — no file had changed — and closed
+    the socket. And it did that only SOMETIMES: the guest answers a nomination
+    once, so the same call against a tree somebody else had already armed never
+    sees that marker and waits for a real change. The `computer.ready` trap in a
+    new place (Grok review).
+
+    Deliberately started from `armed: false`, because the only success-path test
+    before this began already armed and therefore never met the marker at all.
+    """
+    route()
+    Dialer(
+        [
+            hello_frame(events=["file.changed"], watching=[{"path": "/w", "armed": False}]),
+            file_frame(watch="/w", armed=True),
+            file_frame(watch="/w", path="/w/a.txt", kind="created"),
+        ]
+    ).install(monkeypatch)
+    ev = computer.wait_for("file.changed", watch="/w", timeout=5)
+    assert ev.path == "/w/a.txt"
+    assert ev.armed is None
+
+
+@respx.mock
+@pytest.mark.parametrize("marker", [{"armed": True}, {"lost": "flood"}, {"lost": "unwatchable"}])
+def test_no_marker_shape_ends_a_wait_for_a_change(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch, marker: dict[str, Any]
+) -> None:
+    """Including the losses. `unwatchable` recovers on its own — nominating the
+    directory a job is about to create is supported — so ending the wait on one
+    would refuse the case the platform documents as ordinary."""
+    route()
+    Dialer(
+        [
+            hello_frame(events=["file.changed"], watching=[{"path": "/w", "armed": False}]),
+            file_frame(watch="/w", **marker),
+            file_frame(watch="/w", path="/w/b", kind="deleted"),
+        ]
+    ).install(monkeypatch)
+    assert computer.wait_for("file.changed", watch="/w", timeout=5).kind == "deleted"
+
+
+@respx.mock
+def test_a_marker_does_not_end_a_wait_that_named_another_type_too(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wait_for(["file.changed", "process.exited"])` had the same split: on a
+    fresh watch it completed on arming, before the process had done anything."""
+    route()
+    Dialer(
+        [
+            hello_frame(events=["file.changed", "process.exited"]),
+            file_frame(watch="/w", armed=True),
+            event_frame("process.exited", data={"pid": 9, "exit_code": 0}),
+        ]
+    ).install(monkeypatch)
+    ev = computer.wait_for(["file.changed", "process.exited"], watch="/w", timeout=5)
+    assert ev.type == "process.exited"
+
+
+@respx.mock
+def test_a_wait_that_timed_out_names_the_tree_that_never_armed(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch that did not arm is silent in exactly the way a tree where
+    nothing happened is, and that difference is the whole of what `armed` is
+    for. It is a sentence rather than an early refusal, because `unwatchable`
+    recovers and this SDK cannot tell a typo from a directory a job is about to
+    create."""
+    route()
+    Dialer(
+        [
+            hello_frame(events=["file.changed"], watching=[{"path": "/gone", "armed": False}]),
+            file_frame(watch="/gone", lost="unwatchable"),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    with pytest.raises(mc.TimeoutError, match=r"/gone never armed"):
+        computer.wait_for("file.changed", watch="/gone", timeout=0.3)
+
+
+@respx.mock
+def test_a_wait_on_a_live_tree_says_nothing_about_arming_when_it_times_out(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sentence is for the case it explains. A tree that armed and simply
+    had nothing happen under it is an ordinary timeout."""
+    route()
+    Dialer(
+        [
+            hello_frame(events=["file.changed"], watching=[{"path": "/w", "armed": True}]),
+            FakeSocket.HANG,
+        ]
+    ).install(monkeypatch)
+    with pytest.raises(mc.TimeoutError) as caught:
+        computer.wait_for("file.changed", watch="/w", timeout=0.3)
+    assert "never armed" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_async_wait_for_a_change_sits_through_the_marker_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One rule, followed by both halves by construction — `answers_wait` is in
+    `_events` for the reason every other shared judgement is."""
+    with respx.mock:
+        route()
+        Dialer(
+            [
+                hello_frame(events=["file.changed"], watching=[{"path": "/w", "armed": False}]),
+                file_frame(watch="/w", armed=True),
+                file_frame(watch="/w", path="/w/a", kind="modified"),
+            ],
+            cls=AsyncFakeSocket,
+        ).install(monkeypatch)
+        async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+            c = await client.computers.get("vm-1")
+            ev = await c.wait_for("file.changed", watch="/w", timeout=5)
+            assert ev.path == "/w/a"
 
 
 @respx.mock

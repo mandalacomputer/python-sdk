@@ -60,6 +60,8 @@ from ._events import (
     ComputerEvent,
     Hello,
     _settle,
+    answers_wait,
+    unarmed_trees,
     unreachable_types,
 )
 from ._exceptions import (
@@ -1587,6 +1589,18 @@ class AsyncComputer(ComputerFields):
         ``process.exited`` or ``computer.ready`` on a guest with no watcher is
         still waiting for something reachable.
 
+        ``file.changed`` ends this wait only where something actually CHANGED.
+        Three shapes share that type and the other two are about the tree — it
+        went live, or the picture of it is incomplete — so a wait matched on the
+        name alone would come back with the arming marker on a fresh nomination
+        and with a real change on a tree somebody else had already armed, which
+        is the same call meaning two different things depending on who got there
+        first. The markers still arrive on :meth:`events`, and
+        :attr:`~mandala_computer.EventStream.watching` folds them into each
+        tree's state; they simply do not answer this question. A timeout says
+        which nominated tree never armed, because a watch that did not arm is
+        silent in exactly the way a tree where nothing happened is.
+
         ``computer.ready`` returns at once on a desktop that is already up; see
         :meth:`events` and :attr:`~mandala_computer.ComputerEvent.synthesized`.
         """
@@ -1638,7 +1652,7 @@ class AsyncComputer(ComputerFields):
         )
         try:
             async for ev in stream:
-                if ev.type in wanted:
+                if answers_wait(ev, wanted):
                     return ev
                 if ev.type == "capabilities" and ev.events is not None:
                     impossible = unreachable_types(self.id, wanted, ev.events, nominated=nominated)
@@ -1650,7 +1664,21 @@ class AsyncComputer(ComputerFields):
             raise impossible
         names = " or ".join(wanted)
         if stream.expired:
-            raise TimeoutError(f"{self.id} did not emit {names} within {timeout:g}s")
+            # The trees that never went live, named. A watch that did not arm
+            # is silent in exactly the way a tree where nothing happened is, and
+            # without this the difference — which is the whole of what `armed`
+            # is for — reaches a caller as an ordinary timeout with nothing in
+            # it to explain the wait (Grok review).
+            never = unarmed_trees(stream.watching)
+            unarmed = (
+                ""
+                if not never
+                else (
+                    f" Its watch on {', '.join(never)} never armed, so nothing under it was "
+                    "being reported."
+                )
+            )
+            raise TimeoutError(f"{self.id} did not emit {names} within {timeout:g}s.{unarmed}")
         # Reached with `reconnect=False`, where the socket ending IS the
         # answer. Reported as what happened rather than as a deadline that has
         # not elapsed.
