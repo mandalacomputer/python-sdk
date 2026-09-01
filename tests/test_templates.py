@@ -256,7 +256,8 @@ def test_an_invalid_document_carries_none_of_the_success_fields(client: mc.Clien
 
     Nothing may invent a value for the rest — an empty `canonical` would hash to
     something, and comparing that to an absent digest is a check that passes by
-    accident.
+    accident, and an empty `template` would be a name, an OS and a size asserted
+    about a file the platform refused to read.
     """
     respx.post(f"{BASE}/templates/validate").mock(
         return_value=httpx.Response(200, json={"valid": False, "problems": ["spec.os is required"]})
@@ -264,17 +265,50 @@ def test_an_invalid_document_carries_none_of_the_success_fields(client: mc.Clien
     check = client.templates.validate("apiVersion: mandala/v1")
     assert check.build_digest_needs is None
     assert check.canonical is None
+    assert check.template is None
 
 
 @respx.mock
-def test_the_daemons_own_template_row_is_left_in_raw(client: mc.Client) -> None:
-    """NOT decoded, and deliberately — see the note in `TemplateCheck.from_api`.
+def test_the_row_a_valid_document_describes_is_a_template(client: mc.Client) -> None:
+    """The same shape `templates.list()` answers, since OPL-4190.
 
-    `template` here is the daemon's catalogue row, which carries `family`. Every
-    other route that answers with a template projects that field away
-    (`publicTemplate`), so decoding this one as `Template` would put one name on
-    two shapes — and OPL-4190 is an open question about whether this route
-    should be sending the wider one at all. It stays reachable meanwhile.
+    This route used to be the one place where `template` meant the daemon's own
+    wider row, so the field was withheld rather than promise a second shape
+    under the name `Template`. The platform projects it now, so there is one
+    shape again and a caller gets it decoded.
+    """
+    respx.post(f"{BASE}/templates/validate").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "valid": True,
+                "template": {
+                    "name": "devbox",
+                    "label": "My desktop",
+                    "os": "linux",
+                    "cpu": 2,
+                    "ram_mb": 4096,
+                    "disk_gb": 30,
+                },
+            },
+        )
+    )
+    check = client.templates.validate("apiVersion: mandala/v1")
+    assert isinstance(check.template, mc.Template)
+    assert (check.template.name, check.template.os, check.template.ram_mb) == (
+        "devbox",
+        "linux",
+        4096,
+    )
+
+
+@respx.mock
+def test_a_pre_projection_hosts_extra_field_still_decodes(client: mc.Client) -> None:
+    """`family` was what made this route's row wider than everywhere else.
+
+    A deployment from before the projector still sends it. That is not a reason
+    to hand back nothing: the six modelled fields are all there and mean what
+    they mean, and the extra key lands in `raw` the way any unmodelled key does.
     """
     respx.post(f"{BASE}/templates/validate").mock(
         return_value=httpx.Response(
@@ -286,23 +320,26 @@ def test_the_daemons_own_template_row_is_left_in_raw(client: mc.Client) -> None:
         )
     )
     check = client.templates.validate("apiVersion: mandala/v1")
-    assert not hasattr(check, "template"), "a field here would promise the wider shape"
+    assert check.template is not None
+    assert check.template.name == "devbox"
+    assert check.template.raw["family"] == "devbox", "reachable, and not through a typed field"
     assert check.raw["template"]["family"] == "devbox"
 
 
 def test_template_check_can_still_be_built_the_way_it_could_before() -> None:
     """`TemplateCheck` is exported, so its field order is its constructor.
 
-    The same trap `Template.ref` sprang and `Window.visible` avoided: both new
-    fields are keyword-only at the end, so the five positions that worked on the
-    previous release still mean what they did — `raw` included, which was the
-    slot `ref` quietly bound a mapping into.
+    The same trap `Template.ref` sprang and `Window.visible` avoided: all three
+    new fields are keyword-only at the end, so the five positions that worked on
+    the previous release still mean what they did — `raw` included, which was
+    the slot `ref` quietly bound a mapping into.
     """
     c = mc.TemplateCheck(True, [], "acc-1/devbox@1.0.0", "sha256:aaaa", "sha256:bbbb")
     assert (c.valid, c.ref, c.build_digest) == (True, "acc-1/devbox@1.0.0", "sha256:bbbb")
     assert c.raw == {}
     assert c.build_digest_needs is None
     assert c.canonical is None
+    assert c.template is None
 
     with_raw = mc.TemplateCheck(True, [], None, None, None, {"valid": True})
     assert with_raw.raw == {"valid": True}, "raw keeps the sixth positional slot"
