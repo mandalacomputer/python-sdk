@@ -237,6 +237,15 @@ def _exit_code(value: Any) -> int | None:
         return None
     if isinstance(value, bool):
         raise TypeError("exit_code must be an integer or null, not a boolean")
+    # An `int` is already the answer, and going through `float` would stop it
+    # being one: past 2**53 the conversion is lossy and `number != int(number)`
+    # cannot see it, because the float it is comparing is a whole number — so
+    # 9007199254740993 came back as ...992, silently, which is the same class of
+    # wrong code this function exists to refuse (/code-review, OPL-4222). No
+    # exit code is anywhere near that; the point is that the check below is only
+    # sound for values it can represent.
+    if isinstance(value, int):
+        return value
     try:
         number = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
@@ -1555,6 +1564,14 @@ def move_rows(data: Any) -> builtins.list[Mapping[str, Any]]:
     something specific: :meth:`~mandala_computer.Computer.wait_for_move` reads
     it as a move the platform reaped along with its computer. An envelope
     nobody could parse is not that.
+
+    A MISSING ``moves`` key is refused with the rest, deliberately (asked at
+    /code-review, OPL-4222). Reading absence as ``[]`` would be forward-
+    compatible with a route that someday omits the key when there is nothing —
+    and would put back exactly the silent empty listing this exists to remove,
+    on the one route where an empty listing is itself a claim. The platform
+    always emits the array, so the trade is a hypothetical break against a
+    misdiagnosis that has to be looked for to be found.
     """
     rows = data.get("moves") if isinstance(data, Mapping) else None
     if not isinstance(rows, builtins.list) or not all(isinstance(row, Mapping) for row in rows):

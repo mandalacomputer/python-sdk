@@ -60,6 +60,7 @@ from ._models import (
     _Wire,
     _wire,
     is_unreachable_stub,
+    move_rows,
     window_contradiction,
 )
 
@@ -803,20 +804,25 @@ class ComputerFields:
         computer that is mid-flight (adversarial review, OPL-4222).
 
         One move runs at a time, so there is at most one live row to find. Where
-        there is none, the LAST finished row is the answer rather than the
-        first: a listing that is ordered at all is ordered oldest-first, and the
-        newest outcome is the one that describes the machine now.
+        there is none, the answer is the row with the LATEST ``started_at``,
+        read off the rows rather than off their order. The platform sends them
+        newest-first — ``ORDER BY started_at DESC`` in ``movesFor`` — so
+        position would answer this correctly today, and it is not what this has
+        to depend on: the first version of this fix guessed oldest-first and
+        picked the stale row it was written to avoid (/code-review, OPL-4222).
+        A stamp is a fact about the move; an index is a fact about the query
+        behind it.
+
+        Ties and unreadable stamps fall back to position, which is the
+        platform's order and therefore still newest-first.
         """
-        rows = listing.get("moves")
-        if not isinstance(rows, list):
-            return None
         mine = [
-            row for row in rows if isinstance(row, Mapping) and row.get("computer_id") == self.id
+            Move.from_api(row) for row in move_rows(listing) if row.get("computer_id") == self.id
         ]
         if not mine:
             return None
-        moves = [Move.from_api(row) for row in mine]
-        return next((m for m in moves if m.live), moves[-1])
+        newest = max(range(len(mine)), key=lambda i: (mine[i].started_at, -i))
+        return next((m for m in mine if m.live), mine[newest])
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.id} {self.name!r} {self.status}>"

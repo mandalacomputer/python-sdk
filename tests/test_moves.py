@@ -243,16 +243,51 @@ class TestWaitForMove:
         assert "state moving" in str(caught.value)
 
     @respx.mock
+    @pytest.mark.parametrize(
+        "order", ["platform", "reversed"], ids=["newest-first", "oldest-first"]
+    )
     def test_answers_with_the_newest_finished_row_when_none_is_live(
+        self, client: mc.Client, order: str
+    ) -> None:
+        """Nothing live left to find, so the latest ``started_at`` is the answer
+        — read off the rows and not off their order.
+
+        The platform sends them newest-first (``ORDER BY started_at DESC``), so
+        position would answer this correctly today. Depending on it is how the
+        first version of this fix took the LAST row, guessed oldest-first, and
+        picked exactly the stale outcome it was written to avoid
+        (/code-review, OPL-4222).
+        """
+        c = computer(client)
+        morning = {**DONE, "state": "moved", "ram_mb": 4096, "started_at": "2026-08-23T02:00:12Z"}
+        afternoon = {**DONE, "started_at": "2026-08-23T14:00:00Z"}
+        rows = [afternoon, morning] if order == "platform" else [morning, afternoon]
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": rows}))
+        assert c.wait_for_move(poll=0.01).state == "done"
+
+    @respx.mock
+    def test_falls_back_to_the_platforms_order_when_the_stamps_cannot_decide(
         self, client: mc.Client
     ) -> None:
-        """Nothing live left to find, so the last row is the answer rather than
-        the first: a listing that is ordered at all is ordered oldest-first, and
-        the newest outcome is the one describing the machine now."""
+        """Unreadable or identical stamps leave position, which is newest-first."""
         c = computer(client)
-        older = {**DONE, "state": "moved", "ram_mb": 4096}
-        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [older, DONE]}))
+        newest = {**DONE, "started_at": ""}
+        older = {**DONE, "state": "moved", "ram_mb": 4096, "started_at": ""}
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [newest, older]}))
         assert c.wait_for_move(poll=0.01).state == "done"
+
+    @respx.mock
+    def test_a_malformed_envelope_is_not_a_computer_that_was_deleted(
+        self, client: mc.Client
+    ) -> None:
+        """``_my_move`` degraded a non-list ``moves`` to ``None``, and
+        ``wait_for_move`` reads ``None`` as the platform reaping a move along
+        with its computer — the exact misdiagnosis ``move_rows`` was written to
+        prevent, on the one path that polls (/code-review, OPL-4222)."""
+        c = computer(client)
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": "moving"}))
+        with pytest.raises(mc.MandalaError, match="array of objects"):
+            c.wait_for_move(timeout=5, poll=0.01)
 
     @respx.mock
     def test_stops_when_the_move_stops_being_listed(self, client: mc.Client) -> None:
@@ -343,6 +378,26 @@ class TestAsyncHalf:
             respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE]}))
             assert (await c.wait_for_move(poll=0.01)).state == "done"
             assert [m.computer_id for m in await client.moves.list()] == ["vm-1"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_waits_on_the_live_row_and_refuses_a_malformed_envelope(self) -> None:
+        """Both OPL-4222 fixes on the twin. ``_my_move`` is shared, but the two
+        wait loops are not, and this is the call site."""
+        async with mc.AsyncClient("com_test", base_url=BASE) as client:
+            respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+            c = await client.computers.get("vm-1")
+
+            stale = {**DONE, "state": "moved", "ram_mb": 4096}
+            respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [stale, MOVING]}))
+            with pytest.raises(mc.TimeoutError, match="state moving"):
+                await c.wait_for_move(timeout=0.05, poll=0.01)
+
+            respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": "moving"}))
+            with pytest.raises(mc.MandalaError, match="array of objects"):
+                await c.wait_for_move(timeout=5, poll=0.01)
+            with pytest.raises(mc.MandalaError, match="array of objects"):
+                await client.moves.list()
 
     @respx.mock
     @pytest.mark.asyncio
