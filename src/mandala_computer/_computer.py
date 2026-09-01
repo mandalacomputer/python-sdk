@@ -792,14 +792,31 @@ class ComputerFields:
         filter is the point: ``GET /moves`` is account-wide, one move runs at a
         time, and a FINISHED row for another computer stays for a day — so "the
         first row" is the wrong answer often enough to matter.
+
+        THE LIVE ONE, and not merely the first one wearing this id. That day of
+        retention applies to this computer's own finished moves too, and nothing
+        orders the listing — so a machine moved this morning and moved again now
+        has two rows, and taking the first meant
+        :meth:`Computer.wait_for_move` could return the morning's outcome while
+        the disk copy was still running. ``moved`` in particular reads as "the
+        move landed and the resize did not", so the caller goes on to resize a
+        computer that is mid-flight (adversarial review, OPL-4222).
+
+        One move runs at a time, so there is at most one live row to find. Where
+        there is none, the LAST finished row is the answer rather than the
+        first: a listing that is ordered at all is ordered oldest-first, and the
+        newest outcome is the one that describes the machine now.
         """
         rows = listing.get("moves")
         if not isinstance(rows, list):
             return None
-        for row in rows:
-            if isinstance(row, Mapping) and row.get("computer_id") == self.id:
-                return Move.from_api(row)
-        return None
+        mine = [
+            row for row in rows if isinstance(row, Mapping) and row.get("computer_id") == self.id
+        ]
+        if not mine:
+            return None
+        moves = [Move.from_api(row) for row in mine]
+        return next((m for m in moves if m.live), moves[-1])
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.id} {self.name!r} {self.status}>"
@@ -1170,10 +1187,27 @@ class Computer(ComputerFields):
         you need something inside the guest to be ready.
 
         Raises :class:`~mandala_computer.MandalaError` rather than waiting out
-        the timeout for the two states that will not become "running" on their
-        own — a failed build, and a suspended session nobody has resumed.
+        the timeout for the three states that will not become "running" on their
+        own — a failed build, a suspended session nobody has resumed, and a
+        create whose machine was made and would not boot.
         """
         check_wait_args(timeout, poll)
+        # BEFORE the first refresh, because the refresh is what destroys the
+        # evidence. `start_error` rides on the create envelope and describes one
+        # start attempt rather than the machine, so `refresh()` clears it — and
+        # a stopped computer with no start_error is not `build_failed`, not
+        # suspended and not building, which left this loop polling a machine
+        # that was never going to move for the whole timeout and then reporting
+        # it as "still 'stopped'". The reason was in hand before the first
+        # request went out. `wait_for_guest` already reads the cached payload
+        # this way; this is the sibling that did not (adversarial review,
+        # OPL-4222).
+        #
+        # `start_error` ALONE, and not the rest of `_guest_wait_failure`: an
+        # ordinary `stopped` is exactly what this wait is for, since a caller
+        # who has just called `start()` holds a handle that still says so.
+        if self.start_error:
+            raise MandalaError(f"{self.id} did not start: {self.start_error}")
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -2340,6 +2374,18 @@ class Computer(ComputerFields):
         wanted = [types] if isinstance(types, str) else list(types)
         if not wanted:
             raise MandalaError("wait_for needs at least one event type to wait for")
+        # An already-expired deadline, answered the way every sibling wait
+        # answers one. `check_wait_args` takes `timeout=0` deliberately and says
+        # why: the other waits raise the `TimeoutError` their callers are
+        # catching, and going past that handler with a different class is the
+        # failure it was avoiding. This wait routed its `timeout` straight into
+        # `EventStream`, which requires a positive one and complains with a bare
+        # `MandalaError` — so `except TimeoutError` around a computed remaining
+        # budget caught three of these four waits (adversarial review,
+        # OPL-4222). `events()` keeps the stricter rule: a stream with no time
+        # at all is a different request from a wait that has run out of it.
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout == 0:
+            raise TimeoutError(f"{self.id} did not emit {' or '.join(wanted)} within 0s")
         # What the vocabulary said, when it said this wait cannot end. Kept
         # rather than raised from the hook: a hook that raises ends the stream
         # with its own traceback, and this wants to end it with a sentence

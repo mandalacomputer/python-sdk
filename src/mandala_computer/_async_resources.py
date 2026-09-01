@@ -28,6 +28,7 @@ from ._models import (
     TemplateCheck,
     UsageReport,
     build_contradiction,
+    move_rows,
 )
 
 #: Every rewrite actually performed at import, as ``(sentence, occurrences)``.
@@ -510,8 +511,7 @@ class AsyncMoves:
         workspace only.
         """
         data = await self._t.json_object("GET", _api.MOVES)
-        rows = data.get("moves")
-        return [Move.from_api(m) for m in rows] if isinstance(rows, list) else []
+        return [Move.from_api(m) for m in move_rows(data)]
 
 
 class AsyncSizes:

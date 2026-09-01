@@ -731,9 +731,12 @@ def test_sender_is_joined_before_the_websocket_is_closed(
         def start(self) -> None:
             self.thread.start()
 
-        def join(self) -> None:
+        def join(self, timeout: float | None = None) -> None:
             self.joined = True
-            self.thread.join()
+            self.thread.join(timeout)
+
+        def is_alive(self) -> bool:
+            return self.thread.is_alive()
 
     class FakeConnection:
         def recv(self) -> str:
@@ -752,6 +755,93 @@ def test_sender_is_joined_before_the_websocket_is_closed(
 
     assert _cli._interact("wss://terminal.test") == 0
     assert tracked["pump_stdin"].joined
+
+
+def test_a_send_the_peer_stopped_reading_does_not_wedge_the_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`websockets`' sync ``send`` is ``sendall`` on a blocking socket, so a
+    peer that stops reading blocks it until the peer comes back — which a peer
+    that has just sent ``exit`` never does. Shutdown then did a blocking
+    ``put`` of the stop sentinel and an unbounded ``join``, both before
+    ``restore_tty()``, and ``close()`` sits after that join by design so a close
+    frame cannot overlap a send. Nothing was left that could break the
+    deadlock: the process hung with the terminal in raw mode, where Ctrl-C is a
+    byte to a reader that has already exited (adversarial review, OPL-4222).
+    """
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    blocked = threading.Event()
+    released = threading.Event()
+    aborted: list[str] = []
+
+    class FakeSocket:
+        def shutdown(self, how: int) -> None:
+            aborted.append("shutdown")
+            released.set()
+
+    class FakeConnection:
+        socket = FakeSocket()
+
+        def recv(self) -> str:
+            assert blocked.wait(2), "the sender never reached send()"
+            return '{"type": "exit", "code": 0}'
+
+        def send(self, message: object) -> None:
+            blocked.set()
+            # Held until something aborts the socket, which is the only thing
+            # that ends a real sendall() the peer has stopped reading.
+            assert released.wait(5), "shutdown never aborted the socket"
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_SENDER_JOIN_TIMEOUT", 0.1)
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    reads = iter((b"paste", b""))
+    monkeypatch.setattr(_cli.os, "read", lambda fd, size: next(reads))
+    monkeypatch.setattr(
+        _cli.select, "select", lambda readers, writers, errors: ([readers[0]], [], [])
+    )
+
+    done: list[int] = []
+    worker = threading.Thread(target=lambda: done.append(_cli._interact("wss://x")), daemon=True)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "_interact never returned"
+    assert done == [0]
+    assert aborted == ["shutdown"]
+
+
+def test_the_stop_sentinel_gets_in_even_when_the_queue_is_full() -> None:
+    """A blocking ``put`` here is a second way to hang: the queue is bounded,
+    and what fills it is exactly the case shutdown runs for. Nothing will ever
+    call ``get`` again, so the put that ends the sender waits on the sender."""
+    outbound = _cli._outbound_queue()
+    for i in range(_cli._OUTBOUND_QUEUE_MAX):
+        outbound.put_nowait(b"x")
+    assert outbound.full()
+    sentinel = object()
+    _cli._stop_sender(outbound, sentinel)
+    # Room was made by dropping queued bytes, which cost nothing: `closed` is
+    # set by then and the sender skips every message it takes after that.
+    drained = [outbound.get_nowait() for _ in range(outbound.qsize())]
+    assert sentinel in drained
+
+
+def test_aborting_a_connection_without_a_socket_is_not_an_error() -> None:
+    """`_abort` runs while something is already wrong and everything after it
+    is cleanup, so a transport that does not expose a socket must not turn a
+    hung shutdown into a raised one."""
+    _cli._abort(object())
 
 
 def test_terminating_signal_restores_raw_tty_before_forwarding(

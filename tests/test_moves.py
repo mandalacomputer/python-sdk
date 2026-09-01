@@ -225,6 +225,36 @@ class TestWaitForMove:
         assert "has not stopped" in str(caught.value)
 
     @respx.mock
+    def test_waits_on_the_live_row_and_not_a_stale_one_listed_first(
+        self, client: mc.Client
+    ) -> None:
+        """``GET /moves`` keeps a finished move for a day, and that day covers
+        this computer's own. A machine moved this morning and moved again now
+        has two rows and nothing orders them, so taking the first match ended
+        the wait on the morning's outcome while the disk copy was still
+        running — with ``moved``, which reads as "the move landed and the
+        resize did not", sending the caller on to resize a machine in flight
+        (adversarial review, OPL-4222)."""
+        c = computer(client)
+        stale = {**DONE, "state": "moved", "ram_mb": 4096}
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [stale, MOVING]}))
+        with pytest.raises(mc.TimeoutError) as caught:
+            c.wait_for_move(timeout=0.05, poll=0.01)
+        assert "state moving" in str(caught.value)
+
+    @respx.mock
+    def test_answers_with_the_newest_finished_row_when_none_is_live(
+        self, client: mc.Client
+    ) -> None:
+        """Nothing live left to find, so the last row is the answer rather than
+        the first: a listing that is ordered at all is ordered oldest-first, and
+        the newest outcome is the one describing the machine now."""
+        c = computer(client)
+        older = {**DONE, "state": "moved", "ram_mb": 4096}
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [older, DONE]}))
+        assert c.wait_for_move(poll=0.01).state == "done"
+
+    @respx.mock
     def test_stops_when_the_move_stops_being_listed(self, client: mc.Client) -> None:
         # MandalaError and not a timeout: waiting longer cannot bring back a row
         # the platform reaped, and spending the whole deadline to say so is the
@@ -250,6 +280,46 @@ class TestMovesCollection:
     def test_answers_an_empty_list_rather_than_raising(self, client: mc.Client) -> None:
         respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": []}))
         assert client.moves.list() == []
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        "moves",
+        [{"computer_id": "vm-1"}, "moving", 7, None],
+        ids=["object", "string", "number", "null"],
+    )
+    def test_refuses_an_envelope_that_is_not_an_array(
+        self, client: mc.Client, moves: object
+    ) -> None:
+        """Every other listing goes through ``json_array``, which insists on an
+        array of objects. This one answered ``[]`` — and an empty moves listing
+        means something specific, since ``wait_for_move`` reads it as a move the
+        platform reaped along with its computer (adversarial review, OPL-4222)."""
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": moves}))
+        with pytest.raises(mc.MandalaError, match="array of objects"):
+            client.moves.list()
+
+    @respx.mock
+    def test_refuses_a_row_that_is_not_an_object(self, client: mc.Client) -> None:
+        """It reached ``Move.from_api`` and came back out as ``AttributeError:
+        'str' object has no attribute 'get'`` — a bare builtin escaping a public
+        method, past the MandalaError this SDK promises."""
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE, "junk"]}))
+        with pytest.raises(mc.MandalaError, match="array of objects"):
+            client.moves.list()
+
+    @pytest.mark.parametrize("bad", ["oops", False, [], float("nan")], ids=str)
+    def test_an_unreadable_size_is_not_a_resize_to_nothing(self, bad: object) -> None:
+        """``None`` on these three means "not being changed" and never "changed
+        to nothing" — the field docstring says so, on the fields this operation
+        exists to grow. ``_num`` answered 0 for anything it could not read, so a
+        caller reading ``move.cpu is not None`` as "this dimension changed" was
+        told a resize to zero CPUs was in flight (adversarial review,
+        OPL-4222)."""
+        move = mc.Move.from_api({**MOVING, "cpu": bad, "ram_mb": bad, "disk_gb": bad})
+        assert (move.cpu, move.ram_mb, move.disk_gb) == (None, None, None)
+        # A real zero is still a real answer, which is why this is `_opt_num`
+        # and not a truthiness test.
+        assert mc.Move.from_api({**MOVING, "cpu": 0}).cpu == 0
 
 
 class TestAsyncHalf:
