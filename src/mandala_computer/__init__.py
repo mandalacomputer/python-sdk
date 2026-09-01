@@ -49,6 +49,14 @@ from ._async_resources import (
 )
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
+from ._events import (
+    GUEST_EVENT_TYPES,
+    STREAM_FRAME_TYPES,
+    AsyncEventStream,
+    ComputerEvent,
+    EventStream,
+    Hello,
+)
 from ._exceptions import (
     APIError,
     AuthenticationError,
@@ -102,8 +110,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "GUEST_EVENT_TYPES",
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
+    "STREAM_FRAME_TYPES",
     "APIError",
     "AgentDone",
     "AgentEvent",
@@ -116,21 +126,25 @@ __all__ = [
     "AsyncBackgroundCommand",
     "AsyncClient",
     "AsyncComputer",
+    "AsyncEventStream",
     "AuthenticationError",
     "BackgroundCommand",
     "BuildProgress",
     "BuildStep",
     "Client",
     "Computer",
+    "ComputerEvent",
     "ComputerUsage",
     "ConflictError",
     "ConnectionError",
     "ConnectionInterruptedError",
+    "EventStream",
     "ExecResult",
     "ExecStatus",
     "FilePart",
     "FileTooLargeError",
     "GatewayTimeoutError",
+    "Hello",
     "Listing",
     "MandalaError",
     "Move",

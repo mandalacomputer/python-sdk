@@ -452,6 +452,22 @@ class VncConnect:
     #: started. A restart will not do it — that resets the same QEMU, and the
     #: command line only changes on a cold boot.
     terminal_url: str = ""
+    #: Websocket URL streaming what this computer does without being asked —
+    #: what :meth:`Computer.events` opens. Carries the same controlling
+    #: credential as :attr:`url`, so treat it as that credential: a window title
+    #: is content, which is why a watch-only connection is given no URL here at
+    #: all. ``""`` on a Windows guest, which has nowhere to run the watcher the
+    #: guest half of the stream needs.
+    #:
+    #: Re-read it rather than keeping it. The credential in it is rotated by a
+    #: restart, and a restart is one of the ordinary reasons the socket dropped
+    #: in the first place — :class:`~mandala_computer.EventStream` asks the
+    #: platform again on every reconnect for exactly that reason.
+    # Keyword-only for the reason `clipboard` below is, and the promise is the
+    # same one `Window` learned to keep on OPL-4191: this class is exported, so
+    # its field order IS its constructor, and `raw` has been the seventh
+    # positional argument since this SDK shipped.
+    events_url: str = field(default="", kw_only=True)
     #: Whether this socket was provisioned with the platform-controlled halves
     #: of the guest clipboard bridge (OPL-3870) — the vdagent channel QEMU was
     #: given at cold boot, and whether the image this computer was built from
@@ -500,6 +516,7 @@ class VncConnect:
             view_token=view_token,
             embed_url=str(d.get("embed_url", "")),
             terminal_url=str(d.get("terminal_url") or ""),
+            events_url=str(d.get("events_url") or ""),
             # `is True` rather than truthiness, and absent lands on False: the
             # platform sends this present-and-false rather than omitting it, so
             # anything that is not a literal true — a missing key on an older
@@ -541,6 +558,7 @@ class VncConnect:
             f"token=<redacted>, view_token=<redacted>, "
             f"embed_url={self._without_credential(self.embed_url)!r}, "
             f"terminal_url={self._without_credential(self.terminal_url)!r}, "
+            f"events_url={self._without_credential(self.events_url)!r}, "
             # Not a credential and not derived from one, so it is printed
             # whole. It is also the field somebody reading a repr to work out
             # why a paste went nowhere is looking for.
