@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import builtins
-import math
 import time
 import warnings
 from collections.abc import Iterator, Mapping
@@ -14,7 +13,7 @@ from typing import Any
 
 from . import _api
 from ._client import Transport
-from ._computer import Computer, _poll_delay
+from ._computer import Computer, _poll_delay, check_wait_args
 from ._exceptions import (
     MandalaError,
     TimeoutError,
@@ -38,47 +37,6 @@ from ._models import (
 from ._sse import SSEEvent
 
 __all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
-
-
-def check_wait_args(timeout: float, poll: float) -> None:
-    """The two numbers :meth:`Builds.wait` is steered by, checked once.
-
-    Shared so the halves cannot diverge, and they had (adversarial review,
-    OPL-3835): ``poll=-1`` reached ``time.sleep(-1)`` and raised a bare
-    ``ValueError`` out of the sync half, while ``asyncio.sleep(-1)`` returned at
-    once and turned the async half into a tight loop against a metered endpoint.
-    ``timeout=float("nan")`` was worse in both — every ``remaining <= 0``
-    comparison is false against a NaN, so the deadline this method's docstring
-    promises never arrived and the wait ran for ever.
-
-    NEGATIVE and non-finite only. Zero was refused too for one commit, and that
-    was a compatibility break wider than the bug it was fixing (second
-    adversarial review, OPL-3835): every sibling wait in this SDK —
-    ``wait_until_built``, ``wait_until_running``, ``wait_for_guest`` — takes
-    ``poll=0``, and this repository's own tests pass it at twenty-odd call
-    sites. ``timeout=0`` is an already-expired deadline, and the sibling waits
-    answer it with the ``TimeoutError`` their callers are catching; raising a
-    ``ValueError`` instead would go past that handler.
-
-    ``poll=0`` DOES mean no delay between polls, and against a live endpoint
-    that is a hammering loop — ``time.sleep(0)`` and ``await asyncio.sleep(0)``
-    both return at once (third adversarial review, OPL-3835). It is allowed
-    anyway because it is not this method's property to fix: all eight sibling
-    wait loops in _computer.py and _async_computer.py do the same thing with the
-    same argument and there is no poll floor anywhere in the SDK, so refusing it
-    HERE would make one wait stricter than the eight beside it while leaving the
-    hammering reachable through any of them. A floor is worth having; it is
-    worth having everywhere at once, not smuggled in through the one wait a
-    review happened to look at.
-    """
-    for value, what in ((timeout, "timeout"), (poll, "poll")):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
-            raise ValueError(f"{what} must be a finite, non-negative number of seconds")
 
 
 #: The least a wait will sleep after a 429, when `poll` and ``Retry-After``

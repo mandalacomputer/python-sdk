@@ -330,6 +330,29 @@ def test_exec_desktop_sends_session_desktop(client: mc.Client) -> None:
 # --- waiting --------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "wait",
+    [
+        lambda c, **kw: c.wait_for_move(**kw),
+        lambda c, **kw: c.wait_until_built(**kw),
+        lambda c, **kw: c.wait_until_running(**kw),
+        lambda c, **kw: c.wait_for_guest(**kw),
+    ],
+    ids=["wait_for_move", "wait_until_built", "wait_until_running", "wait_for_guest"],
+)
+def test_computer_waits_refuse_a_timeout_or_poll_they_cannot_honour(
+    client: mc.Client, wait: object
+) -> None:
+    """``poll=-1`` reached ``time.sleep(-1)`` and raised a bare ValueError;
+    ``timeout=nan`` lost every ``remaining <= 0`` comparison. The build wait
+    already refused both; these four did not."""
+    c = mc.Computer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="poll must be a finite, non-negative"):
+        wait(c, timeout=1.0, poll=-1)  # type: ignore[operator]
+    with pytest.raises(ValueError, match="timeout must be a finite, non-negative"):
+        wait(c, timeout=float("nan"))  # type: ignore[operator]
+
+
 @respx.mock
 def test_wait_until_running_polls_until_ready(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1").mock(

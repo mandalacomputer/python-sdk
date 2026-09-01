@@ -190,6 +190,64 @@ def test_every_guarded_string_refuses_a_non_string() -> None:
         lambda v: A.clipboard_body(v),
         lambda v: A.open_url_command(v),
         lambda v: A.agent_body(prompt=v, system=None, max_steps=None, model=None, stream=False),
+        lambda v: A.exec_body(v, 30),
+        lambda v: A.type_body(v),
+        lambda v: A.key_body((v,)),
+        # The sibling of ``key_body``, and the same tuple: a null in a chord
+        # reaches the guest agent exactly as readily from here.
+        lambda v: A.hold_key_body((v,), 1.0),
     ):
         with pytest.raises(ValueError, match="must be a string"):
             build(None)
+
+
+def test_an_optional_string_that_is_present_is_still_a_string() -> None:
+    """``None`` means omit and cannot be the probe here, so these are fed a
+    number instead. ``name`` is checked by ``_require_optional_name``;
+    ``template``, ``size`` and ``resolution`` sit beside it on the same body
+    and had no check at all."""
+    for build in (
+        lambda v: A.create_body(
+            name=None, template=v, cpu=None, ram_mb=None, disk_gb=None, start=False
+        ),
+        lambda v: A.create_body(
+            name=None,
+            template=None,
+            cpu=None,
+            ram_mb=None,
+            disk_gb=None,
+            start=False,
+            resolution=v,
+        ),
+        lambda v: A.create_body(
+            name=None, template=None, cpu=None, ram_mb=None, disk_gb=None, start=False, size=v
+        ),
+    ):
+        with pytest.raises(ValueError, match="must be a string"):
+            build(123)
+
+
+def test_a_count_cannot_be_a_bool() -> None:
+    """Bools are ints, so ``cpu=True`` passed every numeric check and
+    ``json.dumps`` wrote a boolean. The platform wants a count, not JSON
+    ``true``."""
+    # ValueError, not the TypeError ``whole`` defaults to: these guards were
+    # added with the helper rather than before it, so nothing already reads
+    # their type, and ``canonical``, ``real`` and ``scroll_body`` all refuse a
+    # wrong shape with a ValueError. A caller wrapping ``create()`` in
+    # ``except ValueError`` should not catch the size/template conflict and
+    # miss the bool beside it.
+    with pytest.raises(ValueError):
+        A.create_body(name=None, template=None, cpu=True, ram_mb=None, disk_gb=None, start=False)
+    with pytest.raises(ValueError):
+        A.resize_body(cpu=True, ram_mb=None, disk_gb=None)
+    with pytest.raises(ValueError):
+        A.move_body(ram_mb=True, cpu=None, disk_gb=None)
+    with pytest.raises(ValueError):
+        A.window_body("resize", width=True, height=1)
+    # The exception: x/y go through ``_coordinate``, whose TypeError predates
+    # this helper and is pinned by the pointer tests, so it keeps it. That the
+    # two halves of one function refuse differently is real and deliberate --
+    # see OPL-4210.
+    with pytest.raises(TypeError):
+        A.window_body("move", x=True, y=1)

@@ -687,7 +687,10 @@ class _Core:
         event was a working connection; one that did not was an attempt.
         """
         self.failures = 0
-        self.step = self.backoff
+        # Capped, for the reason __post_init__ is: resetting to backoff after a
+        # delivering connection used to undo that cap, so the next wait_out()
+        # slept the uncapped first step.
+        self.step = min(self.backoff, self.max_backoff)
 
     def after_failure(self, err: MandalaError | None) -> tuple[bool, MandalaError | None]:
         """What to do about a connection that has just ended or failed to start.

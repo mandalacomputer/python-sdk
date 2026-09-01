@@ -83,6 +83,26 @@ def test_a_post_done_idle_timeout_does_not_discard_the_result(
     assert result.finished and result.text == "all set"
 
 
+def test_a_post_done_dropped_connection_does_not_discard_the_result(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A TCP reset after done is the same situation as an idle timeout.
+
+    Silence becomes ``TimeoutError`` and was preserved; a mid-body
+    ``httpx.ReadError`` becomes ``ConnectionInterruptedError`` — a
+    ``ConnectionError``, not a ``TimeoutError`` — and used to throw the
+    already-collected result away.
+    """
+
+    def events() -> Any:
+        yield mc.AgentDone(mc.AgentResult(stop="end_turn", text="all set"))
+        raise mc.ConnectionInterruptedError("stream dropped")
+
+    monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
+    result = computer.agent("do the thing", model_key=KEY)
+    assert result.finished and result.text == "all set"
+
+
 def test_a_post_failure_idle_timeout_preserves_the_agent_error(
     computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -271,6 +291,54 @@ def test_a_run_without_a_model_key_is_refused_here(computer: mc.Computer) -> Non
     wrong", which is the one thing it does not mean."""
     with pytest.raises(mc.MandalaError, match="your own Anthropic API key"):
         computer.agent("do the thing", model_key="")
+
+
+def test_a_non_string_model_key_is_a_value_error(computer: mc.Computer) -> None:
+    """``.strip()`` on a non-string was an ``AttributeError``, not the
+    ``ValueError`` every other caller-controlled string raises."""
+    with pytest.raises(ValueError, match="must be a string"):
+        computer.agent("do the thing", model_key=1)  # type: ignore[arg-type]
+
+
+def test_a_missing_model_key_keeps_the_message_written_for_it(computer: mc.Computer) -> None:
+    """``None`` is the case that actually happens -- ``os.environ.get`` on an
+    unset variable -- and "must be a string" is not an answer to it. It stays a
+    MandalaError carrying the sentence about who is billed."""
+    with pytest.raises(mc.MandalaError, match="your own Anthropic API key"):
+        computer.agent("do the thing", model_key=None)  # type: ignore[arg-type]
+
+
+class _OtherKey(str):
+    """A key that answers the check with one buffer and the wire with another.
+
+    httpx serialises a header value by calling that value's own ``encode``, so
+    a subclass overriding it sends something the guard never saw. Checking
+    ``model_key`` in place and then sending the original left that open.
+    """
+
+    def encode(self, *args: Any, **kwargs: Any) -> bytes:
+        return b"sk-ant-somebody-elses-key"
+
+
+@respx.mock
+def test_the_key_that_passed_the_check_is_the_key_that_is_sent(
+    computer: mc.Computer,
+) -> None:
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    computer.agent("do the thing", model_key=_OtherKey(KEY))
+    assert route.calls.last.request.headers[MODEL_KEY_HEADER] == KEY
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_key_that_passed_the_check_is_the_key_that_is_sent() -> None:
+    """The async half is its own line of code and its own way to be forgotten:
+    ``test_parity`` compares signatures, not what reaches the wire."""
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        await c.agent("do the thing", model_key=_OtherKey(KEY))
+    assert route.calls.last.request.headers[MODEL_KEY_HEADER] == KEY
 
 
 @respx.mock
@@ -683,6 +751,21 @@ async def test_an_async_post_done_idle_timeout_does_not_discard_the_result(
     async def events() -> Any:
         yield mc.AgentDone(mc.AgentResult(stop="end_turn", text="all set"))
         raise mc.TimeoutError("stream went quiet")
+
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        computer = mc.AsyncComputer(client._t, COMPUTER)
+        monkeypatch.setattr(computer, "agent_stream", lambda *args, **kwargs: events())
+        result = await computer.agent("do the thing", model_key=KEY)
+    assert result.finished and result.text == "all set"
+
+
+@pytest.mark.asyncio
+async def test_an_async_post_done_dropped_connection_does_not_discard_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def events() -> Any:
+        yield mc.AgentDone(mc.AgentResult(stop="end_turn", text="all set"))
+        raise mc.ConnectionInterruptedError("stream dropped")
 
     async with mc.AsyncClient("gck_test", base_url=BASE) as client:
         computer = mc.AsyncComputer(client._t, COMPUTER)
