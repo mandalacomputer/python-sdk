@@ -1900,11 +1900,13 @@ def test_listing_windows_reads_the_named_array(client: mc.Client) -> None:
                         "title": "Example — Mozilla Firefox",
                         "class": "Navigator",
                         "type": "normal",
+                        "pid": 4171,
                         "x": 10,
                         "y": 20,
                         "width": 1200,
                         "height": 700,
                         "focused": True,
+                        "visible": True,
                     }
                 ]
             },
@@ -1917,6 +1919,126 @@ def test_listing_windows_reads_the_named_array(client: mc.Client) -> None:
     assert w.title.endswith("Firefox")
     assert (w.x, w.y, w.width, w.height) == (10, 20, 1200, 700)
     assert w.focused
+    # Eleven fields on the wire, and this decoded nine of them until OPL-4191 —
+    # the two it dropped are the two the published reference dropped, which is
+    # where they were copied from.
+    assert w.visible
+    assert w.pid == 4171
+
+
+@respx.mock
+def test_a_minimised_window_is_told_from_one_on_the_screen(client: mc.Client) -> None:
+    """The whole of why `visible` had to be decoded.
+
+    A minimised window stays on the client list keeping the coordinates it had,
+    so nothing else in the row hints at the question. Every field below says "a
+    browser at 10,20 with the keyboard" and only `visible` says it is not on the
+    screen.
+
+    Observed live against app.mandala.computer while OPL-4191 was being written:
+    minimising an `xfce4-terminal` at (5, 56) left `x`, `y`, `width`, `height`,
+    `title` and `pid` byte-identical and flipped `visible` alone. That desktop
+    also dropped `focused`, which is why this payload keeps it True — the two
+    are independent on the wire, the daemon promises nothing about the pair, and
+    a decoder that let one stand in for the other would be reading a window
+    manager's habit as an API.
+    """
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(
+            200,
+            json={
+                "windows": [
+                    {
+                        "id": "0x2600003",
+                        "class": "Navigator",
+                        "x": 10,
+                        "y": 20,
+                        "focused": True,
+                        "visible": False,
+                    }
+                ]
+            },
+        )
+    )
+    (w,) = _computer(client).windows()
+    assert w.focused, "still the focused window, which is why focused cannot answer this"
+    assert (w.x, w.y) == (10, 20), "still the coordinates it had, which is the trap"
+    assert not w.visible
+
+
+@respx.mock
+@pytest.mark.parametrize("said", ["maybe", None, [], "FALSE"])
+def test_a_visible_nobody_could_read_leaves_the_window_alone(
+    client: mc.Client, said: object
+) -> None:
+    """False, and the direction is the decision OPL-4191 asked for.
+
+    A window wrongly called minimised is one a caller skips. A window wrongly
+    called on-screen is a click landing on whatever is really at those
+    coordinates. So the half that costs nothing is the one an unreadable answer
+    gets — the reading the TypeScript SDK settled on in OPL-4176, deliberately
+    the same.
+
+    The classification survives in `raw`, so a caller who has to tell "no" from
+    "did not say" still can.
+    """
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(200, json={"windows": [{"id": "0x1", "visible": said}]})
+    )
+    (w,) = _computer(client).windows()
+    assert w.visible is False
+    assert w.raw["visible"] == said
+
+
+@respx.mock
+def test_a_window_that_never_said_its_pid_reports_none_rather_than_zero(
+    client: mc.Client,
+) -> None:
+    """Absent and zero are different answers, and `_num` would flatten them.
+
+    A guest is free to advertise `_NET_WM_PID` 0 — the daemon carries a pointer
+    so that it can — so a decoder that reads "the window did not say" as `0` has
+    invented a process for it, and one that reads a real 0 as "no pid" has
+    thrown away the only one it was given.
+    """
+    respx.get(f"{BASE}/computers/vm-1/windows").mock(
+        httpx.Response(
+            200,
+            json={
+                "windows": [
+                    {"id": "0x1"},
+                    {"id": "0x2", "pid": 0},
+                    {"id": "0x3", "pid": 4171},
+                    {"id": "0x4", "pid": "not a pid"},
+                ]
+            },
+        )
+    )
+    absent, zero, real, junk = _computer(client).windows()
+    assert absent.pid is None
+    assert zero.pid == 0, "a reported 0 is a reported value"
+    assert real.pid == 4171
+    assert junk.pid is None, "unreadable is not a pid either, and must not read as 0"
+
+
+def test_a_window_can_still_be_built_the_way_it_could_before_visible() -> None:
+    """`Window` is exported, so its field order is its constructor.
+
+    The wire sends `pid` after `type` and `visible` after `focused`. Declaring
+    them there would have moved every field below along, which is what `ref`
+    did to `Template` — so both are keyword-only at the end, and the ten
+    positions that worked on the previous release still mean what they did.
+    """
+    w = mc.Window("0x1", "Example", "Navigator", "normal", 10, 20, 1200, 700, True)
+    assert (w.wm_class, w.width, w.focused) == ("Navigator", 1200, True)
+    assert w.raw == {}
+    assert w.visible is False, "a hand-built window is not claimed to be on screen"
+    assert w.pid is None
+
+    with_raw = mc.Window(
+        "0x1", "Example", "Navigator", "normal", 10, 20, 1200, 700, True, {"id": "0x1"}
+    )
+    assert with_raw.raw == {"id": "0x1"}, "raw keeps the tenth positional slot"
 
 
 @respx.mock

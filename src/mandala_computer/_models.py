@@ -53,6 +53,31 @@ def _num(value: Any) -> int:
     return int(number) if math.isfinite(number) else 0
 
 
+def _opt_num(value: Any) -> int | None:
+    """An integer field whose ABSENCE means something, or ``None``.
+
+    :func:`_num`'s zero is the wrong floor for such a field, and ``Window.pid``
+    is the case it was written for: a guest is free to advertise
+    ``_NET_WM_PID`` 0, so a decoder that turns "the window did not say" into
+    ``0`` has invented a process for it. A value this client cannot read is not
+    a number either, and gets the same ``None`` rather than a zero that would
+    be indistinguishable from a real one.
+
+    Not :func:`_exit_code`, which raises: an unreadable exit code is a failed
+    command mistaken for a successful one, and there is no safe value to carry
+    on with. An unreadable pid is one window out of a listing missing an
+    incidental field, and refusing the whole desktop over it would be the
+    larger loss.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return int(number) if math.isfinite(number) else None
+
+
 def _real(value: Any) -> float:
     """A fractional field off the wire, or zero when it is unusable.
 
@@ -1416,6 +1441,10 @@ class Window:
     Match on :attr:`wm_class` rather than :attr:`title`. The class is the
     application and is stable; the title is whatever page or document it happens
     to be showing.
+
+    Read :attr:`visible` before acting on :attr:`x` and :attr:`y`. A minimised
+    window stays on this list keeping the coordinates it had, so on one of those
+    the pair is a place on the desktop rather than a place the window is.
     """
 
     id: str
@@ -1432,6 +1461,40 @@ class Window:
     focused: bool
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
+    # The wire sends `pid` after `type` and `visible` after `focused`, and both
+    # arrive here at the END instead, keyword-only. This class is exported, so
+    # its field order IS its constructor, and `Template.ref` cost a release
+    # learning what inserting a field into that order does: every positional
+    # construction that worked before binds one argument along and either raises
+    # or, worse, does not. Decoding would never have noticed — `from_api` passes
+    # by keyword. Wire order is the docstrings' job; the positions are a
+    # promise already made.
+
+    #: On the screen rather than minimised, and the only field here that can
+    #: tell the two apart. A minimised window stays on the client list, keeps
+    #: the coordinates it had and can still be the :attr:`focused` one — so an
+    #: agent that reads :attr:`x`/:attr:`y` off one and clicks there is clicking
+    #: at whatever is actually in front.
+    #:
+    #: Defaults to ``False`` on a hand-built window, which is the same direction
+    #: the decoder takes an answer it cannot read, and for the same reason: a
+    #: window wrongly called minimised is one a caller skips.
+    visible: bool = field(default=False, kw_only=True)
+    #: The guest process that owns this window, where the window says so.
+    #:
+    #: ``None`` rather than ``0`` when it does not, which is why this is the one
+    #: optional integer here: a guest is free to advertise ``_NET_WM_PID`` 0, so
+    #: absent and zero have to stay different things. The daemon sends a pointer
+    #: for the same reason.
+    #:
+    #: **It does not identify the window.** An application that keeps one
+    #: process for several windows — ``xfce4-terminal`` is one, and so is every
+    #: browser — reports the same pid on all of them, so killing this pid can
+    #: take windows you never asked about. A stock desktop demonstrates it
+    #: before any application does: the three ``Xfce4-panel`` docks in
+    #: ``windows(include_all=True)`` are three windows on one pid.
+    pid: int | None = field(default=None, kw_only=True)
+
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Window:
         return cls(
@@ -1439,11 +1502,33 @@ class Window:
             title=_text(d.get("title")),
             wm_class=_text(d.get("class")),
             type=_text(d.get("type")),
+            pid=_opt_num(d.get("pid")),
             x=_num(d.get("x")),
             y=_num(d.get("y")),
             width=_num(d.get("width")),
             height=_num(d.get("height")),
             focused=_wire(d, "focused") is _Wire.TRUE,
+            # TRUE ONLY, and this is the decision OPL-4191 asked for rather than
+            # the line above it copied. `_Wire` exists here because every
+            # fallback boolean is wrong somewhere, and the fallback bites on
+            # this field in particular: an answer that did not say decodes as
+            # MINIMISED, so a build that stopped sending `visible` would report
+            # a whole desktop as off the screen.
+            #
+            # That is the harmless half, which is what settles it. A window
+            # wrongly called minimised is one a caller skips; a window wrongly
+            # called on-screen is a click landing on whatever is really at those
+            # coordinates. Loudly conservative beats silently wrong, and the
+            # unreadable case stays legible in `raw` for a caller who needs to
+            # tell "no" from "did not say". The TypeScript SDK reads it the same
+            # way (OPL-4176), deliberately.
+            #
+            # Nothing has ever exercised the fallback: `visible` has been on the
+            # wire since the route shipped and no build has omitted it. It was
+            # missing HERE because the published reference listed nine of the
+            # eleven fields until OPL-4179 — a documentation gap this SDK copied
+            # faithfully, not a decoding bug.
+            visible=_wire(d, "visible") is _Wire.TRUE,
             raw=dict(d),
         )
 
