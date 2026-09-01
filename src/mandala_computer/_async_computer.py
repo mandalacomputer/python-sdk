@@ -316,11 +316,20 @@ class AsyncComputer(ComputerFields):
             # ceiling the `TimeoutError` it promises never arrived
             # (adversarial review, OPL-4232). `Builds.wait` and `_events_url`
             # both carry the same cap for the same reason.
+            #
+            # The deadline is consulted BEFORE the poll, which is `Builds.wait`'s
+            # shape too: an already-spent budget has no request worth making, and
+            # sending one anyway would starve it to the 1ms floor `_cap_budget`
+            # imposes and then report the timeout as a failed poll.
             remaining = deadline - time.monotonic()
-            try:
-                listed = await self._t.json_object(
-                    "GET", _api.MOVES, timeout_cap=max(remaining, 0.0)
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self.id} was still moving after {timeout:g}s "
+                    f"(state {last.state if last else 'unknown'}; the move has not "
+                    "stopped, only this wait has)"
                 )
+            try:
+                listed = await self._t.json_object("GET", _api.MOVES, timeout_cap=remaining)
             except MandalaError as err:
                 # One edge blip mid-move used to end the wait and report a move
                 # that was still running as one that could not be watched.
