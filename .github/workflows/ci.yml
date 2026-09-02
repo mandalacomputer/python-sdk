@@ -13,48 +13,12 @@ jobs:
   # Lint and types are version-independent: running them once keeps the matrix
   # below about what actually differs between interpreters.
   lint:
-    # Self-hosted, not ubuntu-latest -- and this is a cost decision with an
-    # expiry date, not an architecture one.
-    #
-    # This repository is private, so every GitHub-hosted job is metered against
-    # the org's free-plan allowance, and billing rounds each job up to a whole
-    # minute. The matrix below is what makes that bite: seven jobs per run, most
-    # of them far shorter than the minute they are billed at. Moving them to the
-    # pool makes them free.
-    #
-    # `portable` is a capability label carried by runner instances on both an
-    # x64 host and an arm64 host, so a job lands on whichever is idle and either
-    # host can be down without stalling CI. It is not an arch label: `runs-on`
-    # is a strict filter with no priority ordering, so pinning to one
-    # architecture would mean queueing for 24h rather than failing over.
-    #
-    # Floating is safe here because nothing this workflow builds escapes the
-    # runner. There is no publish step -- `twine check` validates metadata, it
-    # does not upload -- and the wheel is py3-none-any anyway, so no artifact
-    # carries the architecture it was built on. Python 3.10 through 3.14 all
-    # have linux-arm64 builds in actions/python-versions, so the matrix resolves
-    # natively on either host.
-    #
-    # REVERT WHEN THIS REPO GOES PUBLIC. GitHub-hosted minutes are free and
-    # unlimited for public repositories, and hosted runners are strictly better
-    # for a matrix this wide: seven jobs run genuinely in parallel there, where
-    # the pool has two instances for this repo and serialises them. Set
-    # `runs-on: ubuntu-latest` back on all three jobs and delete the HOME
-    # isolation step, which only exists because the pool's instances share a
-    # HOME.
-    runs-on: [self-hosted, linux, portable]
+    # Hosted runners: with the repository public, minutes are free and the
+    # matrix runs genuinely in parallel. A runner of our own on a public repo
+    # would execute any fork's pull request on our own machine.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The pool's instances share one `actions` HOME, so they share ~/.cache/pip
-      # with every other repo's runner on the box. Give each instance its own;
-      # RUNNER_NAME is unique per instance and an instance runs one job at a
-      # time, so this serialises access while staying warm across runs. The
-      # `cache: pip` above then fills a directory nothing else is writing to.
-      - name: Isolate HOME per runner instance
-        run: |
-          h="$HOME/runner-home-$RUNNER_NAME"
-          mkdir -p "$h"
-          echo "HOME=$h" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -65,8 +29,7 @@ jobs:
       - run: mypy
 
   test:
-    # See the lint job. Revert to ubuntu-latest when this repo goes public.
-    runs-on: [self-hosted, linux, portable]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -76,16 +39,6 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
-      # The pool's instances share one `actions` HOME, so they share ~/.cache/pip
-      # with every other repo's runner on the box. Give each instance its own;
-      # RUNNER_NAME is unique per instance and an instance runs one job at a
-      # time, so this serialises access while staying warm across runs. The
-      # `cache: pip` above then fills a directory nothing else is writing to.
-      - name: Isolate HOME per runner instance
-        run: |
-          h="$HOME/runner-home-$RUNNER_NAME"
-          mkdir -p "$h"
-          echo "HOME=$h" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -94,20 +47,9 @@ jobs:
       - run: pytest -q
 
   build:
-    # See the lint job. Revert to ubuntu-latest when this repo goes public.
-    runs-on: [self-hosted, linux, portable]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The pool's instances share one `actions` HOME, so they share ~/.cache/pip
-      # with every other repo's runner on the box. Give each instance its own;
-      # RUNNER_NAME is unique per instance and an instance runs one job at a
-      # time, so this serialises access while staying warm across runs. The
-      # `cache: pip` above then fills a directory nothing else is writing to.
-      - name: Isolate HOME per runner instance
-        run: |
-          h="$HOME/runner-home-$RUNNER_NAME"
-          mkdir -p "$h"
-          echo "HOME=$h" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
