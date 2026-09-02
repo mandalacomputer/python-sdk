@@ -53,6 +53,7 @@ from ._computer import (
     _windows_from_response,
     _write_all,
     check_wait_args,
+    check_wait_for_timeout,
 )
 from ._events import (
     DEFAULT_MAX_QUEUE,
@@ -681,7 +682,7 @@ class AsyncComputer(ComputerFields):
         """Click. With no coordinate, clicks wherever the pointer already is.
 
         ``modifiers`` are held down for the click, e.g.
-        ``await click(100, 200, "shift")`` to extend a selection.
+        ``await c.click(100, 200, "shift")`` to extend a selection.
         """
         await self._input(_api.click_body("left_click", x, y, modifiers))
 
@@ -1394,9 +1395,9 @@ class AsyncComputer(ComputerFields):
                 elif isinstance(event, AgentFailed):
                     failure = event
         except (TimeoutError, ConnectionError):
-            # The sync twin carries the reasoning: a dropped connection after
-            # done is the same situation as an idle timeout, and must not
-            # discard the result already sent.
+            # The sync twin carries the reasoning: the SSE reader stops after
+            # a terminal chunk, and a dropped connection after a result must
+            # not discard it.
             if result is None and failure is None:
                 raise
         return _agent_outcome(result, failure)
@@ -1607,6 +1608,7 @@ class AsyncComputer(ComputerFields):
         wanted = [types] if isinstance(types, str) else list(types)
         if not wanted:
             raise MandalaError("wait_for needs at least one event type to wait for")
+        names = " or ".join(wanted)
         # An already-expired deadline, answered the way every sibling wait
         # answers one. `check_wait_args` takes `timeout=0` deliberately and says
         # why: the other waits raise the `TimeoutError` their callers are
@@ -1615,10 +1617,11 @@ class AsyncComputer(ComputerFields):
         # `EventStream`, which requires a positive one and complains with a bare
         # `MandalaError` — so `except TimeoutError` around a computed remaining
         # budget caught three of these four waits (adversarial review,
-        # OPL-4222). `events()` keeps the stricter rule: a stream with no time
-        # at all is a different request from a wait that has run out of it.
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout == 0:
-            raise TimeoutError(f"{self.id} did not emit {' or '.join(wanted)} within 0s")
+        # OPL-4222). `timeout=-1` and `nan` were the same hole, still open after
+        # the zero special case. `events()` keeps the stricter rule: a stream
+        # with no time at all is a different request from a wait that has run
+        # out of it.
+        check_wait_for_timeout(timeout, self.id, names)
         # Whether this stream nominated a tree at all, which is the other way a
         # wait cannot end and the one the advertised vocabulary cannot express:
         # a computer offers `file.changed` whenever it could report one, and
@@ -1662,7 +1665,6 @@ class AsyncComputer(ComputerFields):
             await stream.aclose()
         if impossible is not None:
             raise impossible
-        names = " or ".join(wanted)
         if stream.expired:
             # The trees that never went live, named. A watch that did not arm
             # is silent in exactly the way a tree where nothing happened is, and

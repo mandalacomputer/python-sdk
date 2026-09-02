@@ -635,6 +635,10 @@ async def test_async_wait_for_answers_an_expired_deadline_like_its_siblings(
     computer = mc.AsyncComputer(client._t, COMPUTER)
     with pytest.raises(mc.TimeoutError, match="did not emit computer.ready within 0s"):
         await computer.wait_for("computer.ready", timeout=0)
+    with pytest.raises(mc.TimeoutError, match="did not emit computer.ready within -1s"):
+        await computer.wait_for("computer.ready", timeout=-1)
+    with pytest.raises(ValueError, match="finite"):
+        await computer.wait_for("computer.ready", timeout=float("nan"))
     with pytest.raises(mc.MandalaError, match="positive finite"):
         computer.events(timeout=0)
     await client.aclose()

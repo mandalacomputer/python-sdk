@@ -196,6 +196,7 @@ def test_every_guarded_string_refuses_a_non_string() -> None:
         # The sibling of ``key_body``, and the same tuple: a null in a chord
         # reaches the guest agent exactly as readily from here.
         lambda v: A.hold_key_body((v,), 1.0),
+        lambda v: A.schedule_body(enabled=True, hour=4, minute=0, tz=v),
     ):
         with pytest.raises(ValueError, match="must be a string"):
             build(None)

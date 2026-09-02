@@ -8,7 +8,10 @@ appears when a boundary lands mid-frame, mid-terminator or mid-character.
 
 from __future__ import annotations
 
-from mandala_computer._sse import SSEDecoder
+import pytest
+
+import mandala_computer as mc
+from mandala_computer._sse import MAX_SSE_BUFFER, SSEDecoder, feed_chunk
 
 
 def drain(*chunks: bytes) -> list[tuple[str, object]]:
@@ -194,3 +197,30 @@ def test_flushing_clears_the_cr_swallow_too() -> None:
     # is what has to be asserted for the docstring's claim to mean anything.
     assert d._swallow_lf is False
     assert d._buffer == ""
+
+
+def test_an_unbounded_frame_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stream that never emits a blank line must not grow without bound."""
+    monkeypatch.setattr("mandala_computer._sse.MAX_SSE_BUFFER", 64)
+    decoder = SSEDecoder()
+    with pytest.raises(mc.MandalaError, match="frame limit"):
+        decoder.feed(b"data: " + b"x" * 100)
+    assert MAX_SSE_BUFFER > 0
+
+
+def test_a_terminal_chunk_is_flagged_so_keepalives_are_not_read() -> None:
+    """Post-done keepalives reset the idle timer; the chunk flag is what stops it.
+
+    A trailing failure in the SAME chunk is still in the list, so it can
+    override the result the way `test_a_failure_after_a_result_still_wins`
+    requires.
+    """
+    decoder = SSEDecoder()
+    done = b'event: done\ndata: {"stop": "end_turn"}\n\n'
+    error = b'event: error\ndata: {"error": "lost the host"}\n\n'
+    events, terminal = feed_chunk(decoder, done + error)
+    assert terminal is True
+    assert [e.event for e in events] == ["done", "error"]
+    events, terminal = feed_chunk(decoder, b": keepalive\n\n")
+    assert events == []
+    assert terminal is False

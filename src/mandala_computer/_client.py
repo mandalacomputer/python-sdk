@@ -37,7 +37,7 @@ from ._exceptions import (
     TimeoutError,
     UnavailableError,
 )
-from ._sse import SSEDecoder, SSEEvent
+from ._sse import SSEDecoder, SSEEvent, feed_chunk
 
 DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
 
@@ -994,7 +994,10 @@ class Transport(_BaseTransport):
                     raise self._not_a_stream(method, path, resp)
                 decoder = SSEDecoder()
                 for chunk in resp.iter_bytes():
-                    yield from decoder.feed(chunk)
+                    events, terminal = feed_chunk(decoder, chunk)
+                    yield from events
+                    if terminal:
+                        return
                 tail = decoder.flush()
                 if tail is not None:
                     yield tail
@@ -1194,8 +1197,11 @@ class AsyncTransport(_BaseTransport):
                     raise self._not_a_stream(method, path, resp)
                 decoder = SSEDecoder()
                 async for chunk in resp.aiter_bytes():
-                    for event in decoder.feed(chunk):
+                    events, terminal = feed_chunk(decoder, chunk)
+                    for event in events:
                         yield event
+                    if terminal:
+                        return
                 tail = decoder.flush()
                 if tail is not None:
                     yield tail

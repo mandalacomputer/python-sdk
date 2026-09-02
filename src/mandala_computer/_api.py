@@ -1170,7 +1170,12 @@ def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str
     if not 0 <= minute <= 59:
         raise ValueError("minute must be 0-59")
     # `enabled` ARMS the schedule, so it is a flag rather than anything truthy.
-    return {"enabled": flag(enabled, "enabled"), "hour": hour, "minute": minute, "tz": tz}
+    return {
+        "enabled": flag(enabled, "enabled"),
+        "hour": hour,
+        "minute": minute,
+        "tz": canonical(tz, "tz"),
+    }
 
 
 # --- input ----------------------------------------------------------------
