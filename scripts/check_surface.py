@@ -72,6 +72,8 @@ APIDOC = Path("web/lib/apidoc.ts")
 #: either language, so the note could become true.
 CLIPBOARD = Path("server/clipboard.go")
 EXEC = Path("server/execbg.go")
+WEBHOOKS = Path("web/lib/webhooks.ts")
+WEBHOOKSIGN = Path("web/lib/webhooksign.ts")
 
 CONSTANTS = [
     ("MAX_STEPS", AGENT, "MAX_MAX_STEPS"),
@@ -81,6 +83,11 @@ CONSTANTS = [
     # constants without an entry here.
     ("MAX_ENV_ENTRIES", EXEC, "execMaxEnv"),
     ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
+    # The two webhook caps the SDK refuses at, and the replay window the
+    # verifier defaults to — which is the one number a RECEIVER codes against.
+    ("WEBHOOK_DESCRIPTION_MAX", WEBHOOKS, "DESCRIPTION_MAX"),
+    ("WEBHOOK_COMPUTERS_MAX", WEBHOOKS, "COMPUTERS_MAX"),
+    ("WEBHOOK_REPLAY_WINDOW_S", WEBHOOKSIGN, "REPLAY_WINDOW_S"),
 ]
 
 #: The files whose contents this check mirrors. Kept separately from the

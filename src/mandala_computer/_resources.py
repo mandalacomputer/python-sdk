@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 import time
 import warnings
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from datetime import datetime
 from enum import Enum, auto
@@ -32,6 +32,9 @@ from ._models import (
     TemplateBuild,
     TemplateCheck,
     UsageReport,
+    Webhook,
+    WebhookCreated,
+    WebhookDelivery,
     build_contradiction,
     move_rows,
 )
@@ -837,3 +840,161 @@ class Usage:
         """
         data = self._t.json_object("GET", _api.USAGE, params=_api.usage_params(since, until))
         return UsageReport.from_api(data)
+
+
+class Webhooks:
+    """Account webhooks: signed POSTs of this account's events, to an endpoint
+    you chose (platform OPL-3923, OPL-4300).
+
+    The second transport for events, beside the socket. The socket is for a
+    caller that is attached and waiting; a webhook is for one that wants to be
+    WOKEN — CI, a queue worker, anything that would otherwise poll. What
+    arrives is the event object exactly as the socket frames it, under three
+    Standard Webhooks headers that :func:`mandala_computer.verify` checks.
+
+    A subscription is a standing instruction to make the platform send HTTP to
+    an address you chose, which is why there are ten per account on every paid
+    plan and none without one, and why the endpoint must be ``https://`` and
+    resolve to a public address. The secret is answered ONCE, on
+    :meth:`create` and :meth:`rotate`, and is never readable again.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self) -> builtins.list[Webhook]:
+        """Every subscription on the account, oldest first, with its health.
+
+        No secret is ever in this list. An API key issued against a workspace
+        sees the subscriptions confined to that workspace only.
+        """
+        return [Webhook.from_api(w) for w in self._t.json_array("GET", _api.WEBHOOKS)]
+
+    def create(
+        self,
+        url: str,
+        *,
+        description: str | None = None,
+        events: Sequence[str] | None = None,
+        computers: Sequence[str] | None = None,
+        enabled: bool | None = None,
+    ) -> WebhookCreated:
+        """Subscribe an HTTPS endpoint to this account's events.
+
+        THE ANSWER CARRIES THE SECRET, ONCE. Read
+        :attr:`~mandala_computer.WebhookCreated.secret` off the return value
+        and store it; it is not readable again, and :meth:`rotate` is how you
+        get a new one.
+
+        ``events`` narrows to some types — the socket's vocabulary less
+        ``file.changed``; an unknown one is a 400 that lists them — and
+        ``computers`` to some machines, up to 64, which need not exist yet.
+        Omit either, or pass ``[]``, for everything. Both take a LIST: a bare
+        string is refused rather than read as its letters. ``enabled=False``
+        creates it switched off, to enable later.
+
+        The endpoint is checked upstream at create — ``https://``, no
+        credentials in it, a public address behind the name — and a 400 names
+        the rule it broke. The eleventh subscription on an account is a
+        :class:`~mandala_computer.ConflictError` naming the cap.
+        """
+        body = _api.webhook_body(
+            create=True,
+            url=url,
+            **_named(description=description, events=events, computers=computers, enabled=enabled),
+        )
+        return WebhookCreated.from_api(self._t.json_object("POST", _api.WEBHOOKS, json=body))
+
+    def get(self, webhook_id: str) -> Webhook:
+        """One subscription, with its health: when the endpoint last accepted a
+        delivery, when one last failed, the status of the newest attempt, and
+        whether the platform has disabled it. Never the secret."""
+        return Webhook.from_api(self._t.json_object("GET", _api.webhook(webhook_id)))
+
+    def update(
+        self,
+        webhook_id: str,
+        *,
+        url: str | None = None,
+        description: str | None = None,
+        events: Sequence[str] | None = None,
+        computers: Sequence[str] | None = None,
+        enabled: bool | None = None,
+    ) -> Webhook:
+        """Change the endpoint, the description, the filters, or ``enabled``.
+
+        Only what you name is sent; the rest is left as it is. Naming nothing
+        is refused here, because an update that changes nothing is never what
+        a caller meant. ``events=[]`` or ``computers=[]`` CLEARS that filter
+        back to everything — an empty list is sent, not dropped.
+
+        ``enabled=True`` clears a ``failing`` disable and starts fresh;
+        ``enabled=False`` stops deliveries and records that you chose to. A new
+        ``url`` is checked exactly as on create.
+        """
+        body = _api.webhook_body(
+            create=False,
+            **_named(
+                url=url,
+                description=description,
+                events=events,
+                computers=computers,
+                enabled=enabled,
+            ),
+        )
+        return Webhook.from_api(self._t.json_object("PATCH", _api.webhook(webhook_id), json=body))
+
+    def delete(self, webhook_id: str) -> None:
+        """Remove the subscription and every delivery record it holds, pending
+        ones included. Nothing more is sent to the endpoint."""
+        self._t.request("DELETE", _api.webhook(webhook_id))
+
+    def rotate(self, webhook_id: str) -> WebhookCreated:
+        """Mint a new secret and answer it — once, like a create.
+
+        The old one goes on being honoured for 24 hours: every delivery in
+        that window carries two signatures on the one header, new first, and
+        :func:`mandala_computer.verify` accepts either, so a receiver can be
+        moved to the new secret at any point in the window without refusing a
+        delivery. Rotating again inside the window replaces the previous secret
+        rather than keeping three.
+        """
+        data = self._t.json_object("POST", _api.webhook_action(webhook_id, "rotate"))
+        return WebhookCreated.from_api(data)
+
+    def test(self, webhook_id: str) -> WebhookDelivery:
+        """Queue one signed delivery of a synthetic ``webhook.test`` event.
+
+        Through the ordinary path, so it is signed, retried and recorded
+        exactly as a real one. The answer is the delivery ACCEPTED, not
+        finished: what the endpoint said comes from :meth:`deliveries`, once
+        :attr:`~mandala_computer.WebhookDelivery.is_finished`. A disabled
+        subscription is a :class:`~mandala_computer.ConflictError`; enable it
+        first.
+        """
+        data = self._t.json_object("POST", _api.webhook_action(webhook_id, "test"))
+        return WebhookDelivery.from_api(data)
+
+    def deliveries(self, webhook_id: str) -> builtins.list[WebhookDelivery]:
+        """The newest hundred deliveries, newest first, each with its state,
+        its attempt count and the status or one-line error of its newest
+        attempt.
+
+        Finished deliveries are kept for seven days; pending ones until they
+        finish. This is where an ``exhausted`` delivery shows up — nothing is
+        dropped silently.
+        """
+        data = self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
+        return [WebhookDelivery.from_api(d) for d in data]
+
+
+def _named(**fields: Any) -> dict[str, Any]:
+    """The keyword arguments a caller actually gave, ``None`` meaning omitted.
+
+    ``None`` is the omission marker on every optional here because none of the
+    five fields can mean anything by it: a filter is cleared with ``[]``, a
+    description with ``""``, and ``enabled`` is a bool. Dropping them before
+    :func:`_api.webhook_body` is what lets that builder tell "not mentioned"
+    from a value, and refuse an update that mentions nothing.
+    """
+    return {name: value for name, value in fields.items() if value is not None}

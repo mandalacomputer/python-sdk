@@ -1,6 +1,7 @@
-"""The ``mandala`` command — a computer's shell and files from your own terminal.
+"""The ``mandala`` command — a computer's shell and files from your own terminal,
+and the account's webhooks.
 
-Two subcommands, both addressing a computer by name or id:
+Two subcommands address a computer by name or id:
 
 ``mandala ssh <computer>``
     An interactive shell in the guest, over the platform's terminal websocket —
@@ -14,6 +15,11 @@ Two subcommands, both addressing a computer by name or id:
     shell in the guest at all. A download is paged, so a file larger than the
     64 MiB one request moves copies like any other; an upload is one request,
     and one over the limit is refused before it is read.
+
+``mandala webhooks <list|create|get|update|delete|rotate|test|deliveries>``
+    The account's webhook subscriptions — the CRUD only. The CLI does not
+    receive webhooks; a receiver is a server, and :func:`mandala_computer.verify`
+    is what it calls. ``create`` and ``rotate`` print the secret ONCE.
 
 Authentication is the SDK's: ``MANDALA_API_KEY`` (and optionally
 ``MANDALA_BASE_URL``) in the environment.
@@ -29,7 +35,7 @@ import select
 import signal
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -38,6 +44,7 @@ from ._api import looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
 from ._exceptions import MandalaError
+from ._models import Webhook, WebhookDelivery
 
 if TYPE_CHECKING:
     from websockets.sync.client import ClientConnection
@@ -738,6 +745,213 @@ def _cmd_scp(args: argparse.Namespace) -> int:
 # --- entry -----------------------------------------------------------------
 
 
+# --- webhooks --------------------------------------------------------------
+
+
+def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """Columns padded to their widest cell, the last one unpadded.
+
+    Two spaces between columns and no border, which is what every tool a
+    person pipes into ``awk`` prints, and the last column left ragged so a long
+    URL does not pad every other row out to its width.
+    """
+    table = [list(header), *[list(r) for r in rows]]
+    widths = [max(len(row[i]) for row in table) for i in range(len(header))]
+    lines = []
+    for row in table:
+        cells = [cell.ljust(widths[i]) for i, cell in enumerate(row[:-1])]
+        lines.append("  ".join([*cells, row[-1]]).rstrip())
+    return "\n".join(lines)
+
+
+def _json(value: Any) -> None:
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _webhook_rows(hooks: Sequence[Webhook]) -> str:
+    rows = []
+    for w in hooks:
+        state = "on" if w.enabled else f"off ({w.disabled_reason or 'unknown'})"
+        status = "-" if w.last_status is None else str(w.last_status)
+        events = "*" if not w.events else ",".join(w.events)
+        rows.append((w.id, state, status, events, w.url))
+    return _table(("ID", "ENABLED", "LAST", "EVENTS", "URL"), rows)
+
+
+def _delivery_rows(deliveries: Sequence[WebhookDelivery]) -> str:
+    rows = []
+    for d in deliveries:
+        outcome = d.last_error or ("-" if d.last_status is None else f"status {d.last_status}")
+        rows.append((d.id, d.state, str(d.attempts), d.event_type, d.computer or "-", outcome))
+    return _table(("ID", "STATE", "TRIES", "EVENT", "COMPUTER", "OUTCOME"), rows)
+
+
+def _secret_once(kind: str) -> None:
+    print(
+        f"mandala: the secret above is shown once — store it now. {kind} it is not "
+        "readable again; `mandala webhooks rotate` mints another.",
+        file=sys.stderr,
+    )
+
+
+def _cmd_webhooks_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        hooks = client.webhooks.list()
+    if args.json:
+        _json([w.raw for w in hooks])
+    elif hooks:
+        print(_webhook_rows(hooks))
+    else:
+        print("no webhooks", file=sys.stderr)
+    return 0
+
+
+def _cmd_webhooks_create(args: argparse.Namespace) -> int:
+    with _client() as client:
+        created = client.webhooks.create(
+            args.url,
+            description=args.description,
+            events=args.event,
+            computers=args.computer,
+            enabled=False if args.disabled else None,
+        )
+    _json(created.raw)
+    _secret_once("After")
+    return 0
+
+
+def _cmd_webhooks_get(args: argparse.Namespace) -> int:
+    with _client() as client:
+        _json(client.webhooks.get(args.id).raw)
+    return 0
+
+
+def _cmd_webhooks_update(args: argparse.Namespace) -> int:
+    # `[]` is how a filter is CLEARED — "every type", "every computer in
+    # scope" — and a repeatable flag cannot spell an empty list, so each has a
+    # word for it. Both together is a contradiction and argparse refuses it.
+    events = [] if args.all_events else args.event
+    computers = [] if args.all_computers else args.computer
+    enabled = True if args.enable else (False if args.disable else None)
+    with _client() as client:
+        updated = client.webhooks.update(
+            args.id,
+            url=args.url,
+            description=args.description,
+            events=events,
+            computers=computers,
+            enabled=enabled,
+        )
+    _json(updated.raw)
+    return 0
+
+
+def _cmd_webhooks_delete(args: argparse.Namespace) -> int:
+    with _client() as client:
+        client.webhooks.delete(args.id)
+    print(f"deleted {args.id}")
+    return 0
+
+
+def _cmd_webhooks_rotate(args: argparse.Namespace) -> int:
+    with _client() as client:
+        rotated = client.webhooks.rotate(args.id)
+    _json(rotated.raw)
+    _secret_once("The old secret is honoured for 24 hours;")
+    return 0
+
+
+def _cmd_webhooks_test(args: argparse.Namespace) -> int:
+    with _client() as client:
+        delivery = client.webhooks.test(args.id)
+    _json(delivery.raw)
+    print(
+        f"mandala: queued, not finished — `mandala webhooks deliveries {args.id}` says what "
+        "the endpoint answered.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_webhooks_deliveries(args: argparse.Namespace) -> int:
+    with _client() as client:
+        deliveries = client.webhooks.deliveries(args.id)
+    if args.json:
+        _json([d.raw for d in deliveries])
+    elif deliveries:
+        print(_delivery_rows(deliveries))
+    else:
+        print("no deliveries", file=sys.stderr)
+    return 0
+
+
+def _webhooks_parser(sub: Any) -> None:
+    hooks = sub.add_parser("webhooks", help="the account's webhook subscriptions")
+    verbs = hooks.add_subparsers(dest="verb", required=True)
+
+    listing = verbs.add_parser("list", help="every subscription, with its health")
+    listing.add_argument("--json", action="store_true", help="the rows as JSON")
+    listing.set_defaults(fn=_cmd_webhooks_list)
+
+    create = verbs.add_parser(
+        "create", help="subscribe an https:// endpoint; prints the secret ONCE"
+    )
+    create.add_argument("url", metavar="URL", help="where to POST; https:// and a public address")
+    create.add_argument("--description", help="free text for the listing")
+    create.add_argument(
+        "--event",
+        action="append",
+        metavar="TYPE",
+        help="an event type to deliver; repeat for several. Omit for every type",
+    )
+    create.add_argument(
+        "--computer",
+        action="append",
+        metavar="ID",
+        help="a computer id to deliver for; repeat for several. Omit for every computer",
+    )
+    create.add_argument("--disabled", action="store_true", help="create it switched off")
+    create.set_defaults(fn=_cmd_webhooks_create)
+
+    get = verbs.add_parser("get", help="one subscription, with its health")
+    get.add_argument("id", metavar="ID")
+    get.set_defaults(fn=_cmd_webhooks_get)
+
+    update = verbs.add_parser("update", help="change the endpoint, filters, or enabled")
+    update.add_argument("id", metavar="ID")
+    update.add_argument("--url", help="a new endpoint, checked as on create")
+    update.add_argument("--description")
+    events = update.add_mutually_exclusive_group()
+    events.add_argument("--event", action="append", metavar="TYPE", help="replace the type filter")
+    events.add_argument("--all-events", action="store_true", help="clear the type filter")
+    computers = update.add_mutually_exclusive_group()
+    computers.add_argument(
+        "--computer", action="append", metavar="ID", help="replace the computer filter"
+    )
+    computers.add_argument("--all-computers", action="store_true", help="clear the computer filter")
+    switch = update.add_mutually_exclusive_group()
+    switch.add_argument("--enable", action="store_true", help="resume deliveries")
+    switch.add_argument("--disable", action="store_true", help="stop deliveries")
+    update.set_defaults(fn=_cmd_webhooks_update)
+
+    delete = verbs.add_parser("delete", help="remove it, and every delivery record it holds")
+    delete.add_argument("id", metavar="ID")
+    delete.set_defaults(fn=_cmd_webhooks_delete)
+
+    rotate = verbs.add_parser("rotate", help="mint a new secret; prints it ONCE")
+    rotate.add_argument("id", metavar="ID")
+    rotate.set_defaults(fn=_cmd_webhooks_rotate)
+
+    test = verbs.add_parser("test", help="queue one signed delivery of a synthetic event")
+    test.add_argument("id", metavar="ID")
+    test.set_defaults(fn=_cmd_webhooks_test)
+
+    deliveries = verbs.add_parser("deliveries", help="the newest hundred deliveries, newest first")
+    deliveries.add_argument("id", metavar="ID")
+    deliveries.add_argument("--json", action="store_true", help="the rows as JSON")
+    deliveries.set_defaults(fn=_cmd_webhooks_deliveries)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mandala",
@@ -759,6 +973,8 @@ def _parser() -> argparse.ArgumentParser:
     scp.add_argument("src", metavar="SRC", help="local path, or <computer>:/path")
     scp.add_argument("dst", metavar="DST", help="local path, or <computer>:/path")
     scp.set_defaults(fn=_cmd_scp)
+
+    _webhooks_parser(sub)
     return parser
 
 
