@@ -1079,6 +1079,85 @@ async for ev in c.events():
 await c.wait_for("computer.ready")
 ```
 
+### Webhooks
+
+The other transport for events. The stream is for a caller that is attached and
+waiting; a webhook is for one that wants to be *woken* — CI, a queue worker,
+anything that would otherwise poll. A subscription makes the platform POST this
+account's events, signed, to an `https://` endpoint you chose:
+
+```python
+hook = client.webhooks.create(
+    "https://ci.example.com/mandala",
+    events=["process.exited", "computer.ready"],  # omit for every type
+    computers=["vm-3f9a1c2b7d4e"],  # omit for every computer; need not exist yet
+)
+print(hook.secret)  # whsec_… — shown ONCE. Store it now.
+```
+
+The secret is not readable again. `client.webhooks.rotate(hook.id)` mints
+another and answers it the same way, and the old one goes on being honoured for
+24 hours, during which every delivery carries two signatures.
+
+What arrives at the endpoint is the event object exactly as the stream frames
+it — `type`, `at`, `computer`, `seq`, `cursor`, `source`, `data` — byte for
+byte, with nothing wrapped around it. `cursor` is the bridge back to the stream:
+a job woken by `process.exited` that wants everything since can open
+`c.events(since=event["cursor"])`. The request carries the three
+[Standard Webhooks](https://www.standardwebhooks.com) headers, and `verify` is
+what a receiver calls on them:
+
+```python
+import json
+
+from mandala_computer import verify
+
+secret = hook.secret  # from wherever you stored it
+
+
+# In a request handler. `raw` is the body EXACTLY as it arrived, as bytes —
+# never `json.dumps(request.json)`; the signature covers the bytes on the wire.
+def handle(headers: dict[str, str], raw: bytes) -> int:
+    if not verify(secret, headers, raw):
+        return 401
+    event = json.loads(raw)
+    ...
+    return 200
+```
+
+`verify` checks the signature against the raw bytes and refuses a
+`webhook-timestamp` more than 300 seconds from your clock. What it cannot do
+for you: remember each `webhook-id` you accept for at least that long and
+refuse a repeat. Retries carry the same id and a fresh signature, so that is
+what makes a delivery processed once. A secret of the wrong shape, or a body
+handed over as text, is a `ValueError` rather than a quiet `False` — neither is
+something a forged request can cause.
+
+Acknowledge with a 2xx *before* doing the work. An attempt is cut at ten
+seconds and counted as a failure; anything else is retried, eight attempts over
+about fourteen hours, and then the delivery is `exhausted` — visible, never
+silently dropped:
+
+```python
+for d in client.webhooks.deliveries(hook.id):  # newest hundred, newest first
+    if d.is_finished and not d.is_delivered:
+        print(d.id, d.event_type, d.state, d.attempts, d.last_error or d.last_status)
+```
+
+An endpoint that keeps failing is switched off: once a delivery runs out of
+attempts and nothing has been accepted for a day, the subscription reads
+`enabled=False` with `disabled_reason="failing"` — `hook.is_failing` — and
+pending deliveries are dropped. `client.webhooks.update(hook.id, enabled=True)`
+starts it fresh. An update sends only what you name; `events=[]` or
+`computers=[]` clears that filter back to everything, and naming nothing is
+refused rather than sent. `client.webhooks.test(hook.id)` queues one signed
+delivery of a synthetic `webhook.test` event through the ordinary path, and the
+outcome is read from `deliveries`.
+
+Ten subscriptions per account on every paid plan, none without one; the
+eleventh is a `ConflictError` naming the cap. The endpoint must resolve to a
+public address — a private, loopback or link-local one is a 400 at create.
+
 ### Readiness
 
 `create()` returns as soon as the API does; the machine is starting, not ready.
@@ -1634,6 +1713,7 @@ is the SDK's: `MANDALA_API_KEY` in the environment.
 mandala ssh dev                    # an interactive shell in the guest
 mandala scp .env dev:/home/user/app/.env
 mandala scp dev:/home/user/report.csv .
+mandala webhooks list              # and create, get, update, delete, rotate, test, deliveries
 ```
 
 `ssh` opens the platform's terminal websocket: a PTY the platform keeps alive
@@ -1657,6 +1737,20 @@ Two answers worth recognizing: a computer that predates the terminal feature
 answers 409 until it is stopped and started again (a restart is not enough,
 deliberately — a resumed session must match its saved device topology), and
 Windows guests have no terminal yet.
+
+`webhooks` is the CRUD from the section above, and only that — the CLI does not
+receive webhooks; a receiver is a server, and `verify` is what it calls.
+`create` and `rotate` print the subscription as JSON with its secret, once, and
+say so on stderr. `list` and `deliveries` print a table, or the rows as JSON
+with `--json`. On `update`, `--event`/`--computer` repeat to replace a filter
+and `--all-events`/`--all-computers` clear one; `--enable`/`--disable` switch
+deliveries.
+
+```sh
+mandala webhooks create https://ci.example.com/mandala --event process.exited
+mandala webhooks update whk-2b7d4c809f3c1a7e --all-events --enable
+mandala webhooks test whk-2b7d4c809f3c1a7e && mandala webhooks deliveries whk-2b7d4c809f3c1a7e
+```
 
 ## Design notes
 

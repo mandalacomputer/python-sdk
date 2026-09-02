@@ -36,6 +36,9 @@ __all__ = [
     "UsageReport",
     "UsageTotals",
     "VncConnect",
+    "Webhook",
+    "WebhookCreated",
+    "WebhookDelivery",
     "Window",
     "WindowResult",
 ]
@@ -2143,5 +2146,210 @@ class ExecResult:
             timed_out=_wire(d, "timed_out") in (_Wire.TRUE, _Wire.MALFORMED),
             out_truncated=_wire(d, "out_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
             err_truncated=_wire(d, "err_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
+            raw=dict(d),
+        )
+
+
+def _opt_text(value: Any) -> str | None:
+    """A string field whose JSON ``null`` MEANS something, kept as ``None``.
+
+    :func:`_text` folds null into the empty string, which is right for a name
+    and wrong for ``disabled_reason``, ``last_error`` and the timestamps on a
+    webhook: there, ``null`` is the platform saying "not applicable" — never
+    failed, still enabled, no attempt yet — and a decoder that turned it into
+    ``""`` would leave a caller unable to tell an endpoint that has never
+    answered from one that answered with an empty error line.
+    """
+    return None if value is None else str(value)
+
+
+@dataclass(frozen=True)
+class Webhook:
+    """A subscription: POST this account's events, signed, at :attr:`url`.
+
+    From the ``webhooks`` resource (platform OPL-3923, OPL-4300), and the shape
+    every read answers. The signing secret is NEVER here — :class:`WebhookCreated`
+    is the one shape that carries it, and only from
+    :meth:`~mandala_computer.Webhooks.create` and ``rotate``.
+
+    What arrives at :attr:`url` is the event object exactly as the socket
+    frames it, byte for byte — ``type``, ``at``, ``computer``, ``seq``,
+    ``cursor``, ``source``, ``data`` — under the three Standard Webhooks
+    headers. :func:`mandala_computer.verify` checks them.
+    """
+
+    #: ``whk-`` and sixteen hex characters.
+    id: str
+    #: Where deliveries are POSTed. ``https://`` only.
+    url: str
+    #: Free text, for your listing. Empty when you gave none.
+    description: str
+    #: The event types this subscription receives. EMPTY MEANS EVERY TYPE. The
+    #: vocabulary is the socket's less ``file.changed``.
+    events: builtins.list[str]
+    #: The computer ids it receives events for. Empty means every computer in
+    #: scope. Not checked against your computers when set — a subscription may
+    #: name a computer you are about to create.
+    computers: builtins.list[str]
+    #: Whether deliveries are made. Set ``False`` by the platform when an
+    #: endpoint has failed for a day — see :attr:`disabled_reason` — and back
+    #: to ``True`` by you with an update, which starts fresh.
+    enabled: bool
+    #: Why :attr:`enabled` is false: ``"customer"`` when you disabled it,
+    #: ``"failing"`` when the platform did — a delivery ran out of attempts and
+    #: nothing had been accepted for 24 hours. ``None`` while enabled.
+    disabled_reason: str | None
+    #: RFC 3339, or ``None`` while enabled.
+    disabled_at: str | None
+    #: When the endpoint last answered 2xx to any delivery. ``None`` until it has.
+    last_success_at: str | None
+    #: When a delivery attempt last failed. ``None`` until one has.
+    last_failure_at: str | None
+    #: The HTTP status of the newest attempt, whatever it was. ``None`` before
+    #: any attempt, or when the newest got no answer.
+    last_status: int | None
+    created_at: str
+    updated_at: str
+    #: The workspace this subscription is confined to, when it was created with
+    #: a workspace-scoped API key. Empty on an account-wide subscription — the
+    #: platform omits the field rather than sending null, on the pattern
+    #: :class:`Computer` follows for the same one.
+    workspace_id: str = ""
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def is_failing(self) -> bool:
+        """The platform switched it off because the endpoint kept failing.
+
+        The one disable a caller did not ask for, and the one to alarm on: the
+        endpoint was down for a day, every pending delivery was dropped, and
+        nothing more will be sent until it is re-enabled.
+        """
+        return not self.enabled and self.disabled_reason == "failing"
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> Webhook:
+        return cls(**cls._fields(d))
+
+    @classmethod
+    def _fields(cls, d: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": _text(d.get("id")),
+            "url": _text(d.get("url")),
+            "description": _text(d.get("description")),
+            "events": _texts(d.get("events")),
+            "computers": _texts(d.get("computers")),
+            # Absent decodes as ENABLED, which is the platform's default for a
+            # create that did not say — and the safe reading of a row that did
+            # not either: a subscription read as disabled by mistake is one a
+            # caller stops watching.
+            "enabled": _wire(d, "enabled") is not _Wire.FALSE,
+            "disabled_reason": _opt_text(d.get("disabled_reason")),
+            "disabled_at": _opt_text(d.get("disabled_at")),
+            "last_success_at": _opt_text(d.get("last_success_at")),
+            "last_failure_at": _opt_text(d.get("last_failure_at")),
+            "last_status": _opt_whole(d.get("last_status")),
+            "created_at": _text(d.get("created_at")),
+            "updated_at": _text(d.get("updated_at")),
+            "workspace_id": _text(d.get("workspace_id")),
+            "raw": dict(d),
+        }
+
+
+@dataclass(frozen=True)
+class WebhookCreated(Webhook):
+    """A :class:`Webhook` with its :attr:`secret` — answered ONCE.
+
+    From ``create`` and ``rotate`` and nowhere else. The secret is not readable
+    again: store it now, and if it is lost, rotate. After a rotate the old
+    secret goes on being honoured for 24 hours, during which every delivery
+    carries two signatures, so a receiver moved to the new one at any point
+    in that window never refuses a delivery.
+    """
+
+    #: ``whsec_`` and 44 characters of base64. Hand it to
+    #: :func:`mandala_computer.verify` on the receiving side.
+    secret: str = field(kw_only=True)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> WebhookCreated:
+        return cls(secret=_text(d.get("secret")), **cls._fields(d))
+
+
+#: The states a delivery is finished in. Nothing more will happen to one of these.
+DELIVERY_FINAL_STATES = frozenset({"delivered", "exhausted", "dropped"})
+
+
+@dataclass(frozen=True)
+class WebhookDelivery:
+    """One event to one subscription, and what became of it.
+
+    From ``deliveries`` (the newest hundred, newest first) and from ``test``
+    (the one it queued). A delivery is minted once per event per subscription
+    and keeps its :attr:`id` across every attempt, which is why a receiver can
+    dedupe on it.
+    """
+
+    #: ``whd-`` and sixteen hex characters: the ``webhook-id`` header this
+    #: delivery carried, fixed across attempts.
+    id: str
+    #: The event's ``type``. ``"gap"`` for a gap frame; ``"webhook.test"`` for
+    #: a test delivery.
+    event_type: str
+    #: The computer the event is about. Empty on a test delivery.
+    computer: str
+    #: The event's own ``cursor`` — what to pass as ``since=`` to the socket to
+    #: read on from it.
+    cursor: str
+    #: ``"pending"`` (an attempt is scheduled), ``"in_flight"`` (one is running),
+    #: ``"delivered"`` (a 2xx came back), ``"exhausted"`` (eight attempts
+    #: failed) or ``"dropped"`` (the subscription was disabled or deleted first).
+    state: str
+    #: How many times it has been sent. Eight is the last.
+    attempts: int
+    #: When the next attempt is due, RFC 3339. ``None`` once the delivery is finished.
+    next_at: str | None
+    #: When the newest attempt started. ``None`` before the first.
+    attempted_at: str | None
+    #: The HTTP status of the newest attempt, or ``None`` when it got no answer.
+    last_status: int | None
+    #: One line about the newest failure: ``timeout``, ``dns``, ``refused``,
+    #: ``tls``, ``redirect``, ``address refused``, or ``status NNN``. ``None``
+    #: after a success and before any attempt.
+    last_error: str | None
+    #: When the 2xx came back. ``None`` otherwise.
+    delivered_at: str | None
+    #: When the event reached the queue.
+    created_at: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def is_delivered(self) -> bool:
+        return self.state == "delivered"
+
+    @property
+    def is_finished(self) -> bool:
+        """Nothing more will happen to it — delivered, exhausted or dropped.
+
+        The condition to poll :meth:`~mandala_computer.Webhooks.deliveries`
+        on after a ``test``: a pending or in-flight delivery has not said yet.
+        """
+        return self.state in DELIVERY_FINAL_STATES
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> WebhookDelivery:
+        return cls(
+            id=_text(d.get("id")),
+            event_type=_text(d.get("event_type")),
+            computer=_text(d.get("computer")),
+            cursor=_text(d.get("cursor")),
+            state=_text(d.get("state")),
+            attempts=_num(d.get("attempts")),
+            next_at=_opt_text(d.get("next_at")),
+            attempted_at=_opt_text(d.get("attempted_at")),
+            last_status=_opt_whole(d.get("last_status")),
+            last_error=_opt_text(d.get("last_error")),
+            delivered_at=_opt_text(d.get("delivered_at")),
+            created_at=_text(d.get("created_at")),
             raw=dict(d),
         )

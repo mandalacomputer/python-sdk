@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -27,6 +27,9 @@ from ._models import (
     TemplateBuild,
     TemplateCheck,
     UsageReport,
+    Webhook,
+    WebhookCreated,
+    WebhookDelivery,
     build_contradiction,
     move_rows,
 )
@@ -65,7 +68,9 @@ from ._resources import (
     EPHEMERAL_DOC,
     Builds,
     Templates,
+    Webhooks,
     _LastPoll,
+    _named,
     _wait_timed_out,
     classify_poll_failure,
     warn_cleanup_failed,
@@ -80,6 +85,7 @@ __all__ = [
     "AsyncSnapshots",
     "AsyncTemplates",
     "AsyncUsage",
+    "AsyncWebhooks",
 ]
 
 
@@ -566,3 +572,79 @@ class AsyncUsage:
         """
         data = await self._t.json_object("GET", _api.USAGE, params=_api.usage_params(since, until))
         return UsageReport.from_api(data)
+
+
+class AsyncWebhooks:
+    __doc__ = Webhooks.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self) -> builtins.list[Webhook]:
+        return [Webhook.from_api(w) for w in await self._t.json_array("GET", _api.WEBHOOKS)]
+
+    async def create(
+        self,
+        url: str,
+        *,
+        description: str | None = None,
+        events: Sequence[str] | None = None,
+        computers: Sequence[str] | None = None,
+        enabled: bool | None = None,
+    ) -> WebhookCreated:
+        body = _api.webhook_body(
+            create=True,
+            url=url,
+            **_named(description=description, events=events, computers=computers, enabled=enabled),
+        )
+        return WebhookCreated.from_api(await self._t.json_object("POST", _api.WEBHOOKS, json=body))
+
+    async def get(self, webhook_id: str) -> Webhook:
+        return Webhook.from_api(await self._t.json_object("GET", _api.webhook(webhook_id)))
+
+    async def update(
+        self,
+        webhook_id: str,
+        *,
+        url: str | None = None,
+        description: str | None = None,
+        events: Sequence[str] | None = None,
+        computers: Sequence[str] | None = None,
+        enabled: bool | None = None,
+    ) -> Webhook:
+        body = _api.webhook_body(
+            create=False,
+            **_named(
+                url=url,
+                description=description,
+                events=events,
+                computers=computers,
+                enabled=enabled,
+            ),
+        )
+        data = await self._t.json_object("PATCH", _api.webhook(webhook_id), json=body)
+        return Webhook.from_api(data)
+
+    async def delete(self, webhook_id: str) -> None:
+        await self._t.request("DELETE", _api.webhook(webhook_id))
+
+    async def rotate(self, webhook_id: str) -> WebhookCreated:
+        data = await self._t.json_object("POST", _api.webhook_action(webhook_id, "rotate"))
+        return WebhookCreated.from_api(data)
+
+    async def test(self, webhook_id: str) -> WebhookDelivery:
+        data = await self._t.json_object("POST", _api.webhook_action(webhook_id, "test"))
+        return WebhookDelivery.from_api(data)
+
+    async def deliveries(self, webhook_id: str) -> builtins.list[WebhookDelivery]:
+        data = await self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
+        return [WebhookDelivery.from_api(d) for d in data]
+
+    list.__doc__ = Webhooks.list.__doc__
+    create.__doc__ = Webhooks.create.__doc__
+    get.__doc__ = Webhooks.get.__doc__
+    update.__doc__ = Webhooks.update.__doc__
+    delete.__doc__ = Webhooks.delete.__doc__
+    rotate.__doc__ = Webhooks.rotate.__doc__
+    test.__doc__ = Webhooks.test.__doc__
+    deliveries.__doc__ = Webhooks.deliveries.__doc__
