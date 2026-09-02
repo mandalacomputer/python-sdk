@@ -2269,7 +2269,17 @@ class WebhookCreated(Webhook):
 
     #: ``whsec_`` and 44 characters of base64. Hand it to
     #: :func:`mandala_computer.verify` on the receiving side.
-    secret: str = field(kw_only=True)
+    secret: str = field(kw_only=True, repr=False)
+
+    def __repr__(self) -> str:
+        """The generated repr, with the secret named and not shown.
+
+        A log line or a traceback that carried it would be enough to forge
+        deliveries at the customer's endpoint — the leak :class:`VncConnect`
+        closes for its tokens, and the same answer: say the field is there,
+        never what it holds.
+        """
+        return f"{super().__repr__()[:-1]}, secret=<redacted>)"
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> WebhookCreated:

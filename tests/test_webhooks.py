@@ -405,6 +405,20 @@ def test_created_is_a_webhook_with_its_secret() -> None:
     assert mc.verify(c.secret, headers(), BODY, now=TIMESTAMP)
 
 
+def test_a_created_webhooks_repr_never_shows_the_secret() -> None:
+    """A log line or a traceback is not where a signing secret goes (grok
+    review of #56). Named, so a reader knows it is there; never shown."""
+    c = mc.WebhookCreated.from_api(CREATED)
+    text = repr(c)
+    assert SECRET not in text
+    assert "whsec_" not in text
+    assert "secret=<redacted>" in text
+    assert text.startswith("WebhookCreated(id='whk-2b7d4c809f3c1a7e'")
+    assert SECRET not in str(c)
+    # The value itself is untouched — the CLI prints it on purpose.
+    assert c.secret == SECRET
+
+
 def test_a_delivery_decodes_and_knows_when_it_is_finished() -> None:
     d = mc.WebhookDelivery.from_api(DELIVERY)
     assert d.id == ID
