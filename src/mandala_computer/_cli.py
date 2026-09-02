@@ -269,8 +269,11 @@ def _connect(url: str) -> ClientConnection:
         _die(f"terminal refused: HTTP {status}")
     except OSError as e:
         _die(f"could not reach the terminal: {e}")
-    except WebSocketException as e:
-        _die(f"could not open the terminal: {e}")
+    except WebSocketException:
+        # Not ``str(e)``: ``InvalidURI`` includes the full URI, and
+        # ``terminal_url`` carries a credential with no expiry. The
+        # ``InvalidStatus`` branch above already prints a token-free sentence.
+        _die("could not open the terminal")
 
 
 def _exit_code(message: str) -> int | None:

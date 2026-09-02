@@ -160,7 +160,17 @@ def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
 
 
 def _file_body(data: bytes | str) -> bytes:
-    body = data.encode() if isinstance(data, str) else data
+    if isinstance(data, str):
+        # Unpaired surrogates are not UTF-8; ``encode`` raises
+        # ``UnicodeEncodeError``, which a caller wrapping ``write_file`` in
+        # ``except ValueError`` would miss. Clipboard, env and document already
+        # convert it.
+        try:
+            body = data.encode()
+        except UnicodeEncodeError as exc:
+            raise ValueError("file data must be valid UTF-8") from exc
+    else:
+        body = data
     if len(body) > FILE_SIZE_LIMIT:
         raise ValueError(f"file data may not exceed {FILE_SIZE_LIMIT // (1024 * 1024)} MiB")
     return body
@@ -278,11 +288,14 @@ def _started_key(stamp: str) -> tuple[int, str]:
     changed hosts, so acting on an older row sends a resize at a computer that
     is somewhere else (adversarial review, OPL-4232).
 
-    Normalising the fraction away is enough, because everything to the left of
-    it is fixed-width and everything to the right is a decimal expansion that
-    already compares correctly. A stamp this cannot read sorts oldest rather
-    than raising — this runs on a listing, and one unreadable row must not cost
-    the caller the other one.
+    Normalising the fraction away is enough only once the timezone suffix is
+    the same spelling: RFC 3339 writes UTC as both ``Z`` and ``+00:00``, and
+    ``'+'`` (43) precedes ``'Z'`` (90), so a later ``02:00:12.500+00:00``
+    sorts *before* an earlier ``02:00:12Z``. Everything to the left of the
+    fraction is then fixed-width and everything to the right is a decimal
+    expansion that already compares correctly. A stamp this cannot read sorts
+    oldest rather than raising — this runs on a listing, and one unreadable
+    row must not cost the caller the other one.
     """
     # Tier 0 is everything that is not a stamp at all — empty, or text that does
     # not begin the way one does. It sorts OLDEST, so a row nobody can date never
@@ -290,6 +303,10 @@ def _started_key(stamp: str) -> tuple[int, str]:
     # caller, and an unreadable stamp is not evidence of being recent.
     if not stamp[:1].isdigit():
         return (0, stamp)
+    # ``Z`` and ``+00:00`` are the same instant. Rewrite before the fraction
+    # move so a mixed listing in one second still orders by time.
+    if stamp.endswith("Z"):
+        stamp = stamp[:-1] + "+00:00"
     head, dot, rest = stamp.partition(".")
     if not dot:
         return (1, stamp)
@@ -391,24 +408,40 @@ def _clipboard_text(data: Mapping[str, Any]) -> str:
     return text
 
 
+def _require_whole(value: object, message: str) -> int:
+    """A whole number off the wire, or MandalaError.
+
+    ``int()`` truncates towards zero, and for the fields that call this ``0``
+    is a real answer — never suspend, nothing deleted — so a fraction becoming
+    ``0`` is the misread the call sites exist to refuse.
+    """
+    if isinstance(value, bool):
+        raise MandalaError(message)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            raise MandalaError(message)
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        # `OverflowError` for the reason `_cursor` gives: a builtin escaping
+        # here reports a successful call as a failure, and the obvious
+        # response to that is to try again (OPL-4232).
+        except (OverflowError, ValueError) as exc:
+            raise MandalaError(message) from exc
+    raise MandalaError(message)
+
+
 def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
     """The delete count, with malformed success payloads kept inside the SDK error family."""
     deleted = data.get("snapshots_deleted")
     if deleted is None:
         return None
-    # bool is an int subclass, so int(True) == 1 would report one snapshot gone.
-    if isinstance(deleted, bool):
-        raise MandalaError("DELETE computer answered with an invalid snapshots_deleted count")
-    try:
-        return int(deleted)
-    # `OverflowError` for the reason `_cursor` gives, and this is the site where
-    # it costs the most: the DELETE has already succeeded by the time this runs,
-    # so a builtin escaping here reports a computer that is gone as a call that
-    # failed, and the obvious response to that is to try again (OPL-4232).
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise MandalaError(
-            "DELETE computer answered with an invalid snapshots_deleted count"
-        ) from exc
+    return _require_whole(
+        deleted, "DELETE computer answered with an invalid snapshots_deleted count"
+    )
 
 
 # What wait_for_guest() runs to decide the guest is answering. A builtin of both
@@ -484,6 +517,29 @@ def check_wait_args(timeout: float, poll: float) -> None:
             or value < 0
         ):
             raise ValueError(f"{what} must be a finite, non-negative number of seconds")
+
+
+def check_wait_for_timeout(timeout: object, computer_id: str, names: str) -> None:
+    """``wait_for``'s deadline, as the exception class a sibling wait would raise.
+
+    ``EventStream`` requires a positive finite timeout and complains with a
+    bare ``MandalaError``. A computed remaining budget of ``-0.001`` is an
+    already-expired deadline, and ``except TimeoutError`` around one of the
+    other waits is what callers already write. ``timeout=0`` was special-cased
+    for that reason (OPL-4222); any non-positive finite value is the same
+    situation, and NaN/infinity are ``ValueError`` the way
+    :func:`check_wait_args` answers them.
+    """
+    if timeout is None:
+        return
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+    ):
+        raise ValueError(f"timeout must be a finite number or None, not {timeout!r}")
+    if timeout <= 0:
+        raise TimeoutError(f"{computer_id} did not emit {names} within {timeout:g}s")
 
 
 def _poll_delay(err: MandalaError, poll: float) -> float:
@@ -785,14 +841,7 @@ class ComputerFields:
         if value is None:
             return None
         # 0 is a real setting ("never suspend"); unusable wire must not become 0.
-        if isinstance(value, bool):
-            raise MandalaError("computer answered with an invalid idle_suspend_min")
-        try:
-            return int(value)
-        # `OverflowError` for the reason `_cursor` gives: `"soon"` was already a
-        # `MandalaError` and `1e309` was not (OPL-4232).
-        except (OverflowError, TypeError, ValueError) as exc:
-            raise MandalaError("computer answered with an invalid idle_suspend_min") from exc
+        return _require_whole(value, "computer answered with an invalid idle_suspend_min")
 
     @property
     def workspace_id(self) -> str:
@@ -2310,12 +2359,12 @@ class Computer(ComputerFields):
                 elif isinstance(event, AgentFailed):
                     failure = event
         except (TimeoutError, ConnectionError):
-            # The stream deliberately remains open after done so a trailing
-            # failure can override it. Silence after done is not itself a
-            # failure, however, and must not discard the result already sent.
-            # A dropped connection is the same situation: the result is in
-            # hand, and ConnectionInterruptedError — a ConnectionError, not a
-            # TimeoutError — used to throw it away.
+            # The SSE reader stops after a chunk that carried done/error, so a
+            # trailing failure in that chunk can still override the result and
+            # post-done keepalives cannot reset STREAM_IDLE_TIMEOUT forever.
+            # Silence or a dropped connection after a terminal event must not
+            # discard the result already sent. ConnectionInterruptedError — a
+            # ConnectionError, not a TimeoutError — used to throw it away.
             if result is None and failure is None:
                 raise
         return _agent_outcome(result, failure)
@@ -2562,6 +2611,7 @@ class Computer(ComputerFields):
         wanted = [types] if isinstance(types, str) else list(types)
         if not wanted:
             raise MandalaError("wait_for needs at least one event type to wait for")
+        names = " or ".join(wanted)
         # An already-expired deadline, answered the way every sibling wait
         # answers one. `check_wait_args` takes `timeout=0` deliberately and says
         # why: the other waits raise the `TimeoutError` their callers are
@@ -2570,10 +2620,11 @@ class Computer(ComputerFields):
         # `EventStream`, which requires a positive one and complains with a bare
         # `MandalaError` — so `except TimeoutError` around a computed remaining
         # budget caught three of these four waits (adversarial review,
-        # OPL-4222). `events()` keeps the stricter rule: a stream with no time
-        # at all is a different request from a wait that has run out of it.
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout == 0:
-            raise TimeoutError(f"{self.id} did not emit {' or '.join(wanted)} within 0s")
+        # OPL-4222). `timeout=-1` and `nan` were the same hole, still open after
+        # the zero special case. `events()` keeps the stricter rule: a stream
+        # with no time at all is a different request from a wait that has run
+        # out of it.
+        check_wait_for_timeout(timeout, self.id, names)
         # Whether this stream nominated a tree at all, which is the other way a
         # wait cannot end and the one the advertised vocabulary cannot express:
         # a computer offers `file.changed` whenever it could report one, and
@@ -2619,7 +2670,6 @@ class Computer(ComputerFields):
                         break
         if impossible is not None:
             raise impossible
-        names = " or ".join(wanted)
         if stream.expired:
             # The trees that never went live, named. A watch that did not arm
             # is silent in exactly the way a tree where nothing happened is, and

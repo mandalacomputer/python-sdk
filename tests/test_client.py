@@ -495,6 +495,26 @@ def test_an_unrelated_exception_reason_is_not_api_retry_advice() -> None:
     assert mc.is_transient(ApplicationError({"kind": "contention"})) is False
 
 
+def test_a_clearing_reason_does_not_promote_auth_or_not_found_to_retryable() -> None:
+    """`reason` is the more specific answer on the 409/400 it was written for.
+
+    Honouring it on every APIError made a 401 whose body happened to contain
+    `"reason": "starting"` look safe to replay, including a create.
+    """
+    for err in (
+        mc.AuthenticationError("no", status=401, body={"reason": "starting"}),
+        mc.PlanLimitError("cap", status=402, body={"reason": "starting"}),
+        mc.PermissionDeniedError("no", status=403, body={"reason": "starting"}),
+        mc.NotFoundError("gone", status=404, body={"reason": "starting"}),
+    ):
+        assert mc.is_transient(err) is False
+    # The statuses the word actually classifies stay retryable.
+    assert (
+        mc.is_transient(mc.ConflictError("busy", status=409, body={"reason": "starting"})) is True
+    )
+    assert mc.is_transient(mc.APIError("booting", status=400, body={"reason": "starting"})) is True
+
+
 def test_the_refusal_reason_decides_before_the_type_does() -> None:
     """The 409 that never clears, told apart at last (OPL-3898).
 
@@ -946,6 +966,10 @@ def test_wait_for_answers_an_expired_deadline_like_every_sibling_wait(
     computer = mc.Computer(client._t, COMPUTER)
     with pytest.raises(mc.TimeoutError, match="did not emit computer.ready within 0s"):
         computer.wait_for("computer.ready", timeout=0)
+    with pytest.raises(mc.TimeoutError, match="did not emit computer.ready within -1s"):
+        computer.wait_for("computer.ready", timeout=-1)
+    with pytest.raises(ValueError, match="finite"):
+        computer.wait_for("computer.ready", timeout=float("nan"))
     # `events()` keeps the stricter rule: a stream with no time at all is a
     # different request from a wait that has run out of it.
     with pytest.raises(mc.MandalaError, match="positive finite"):
@@ -1102,6 +1126,8 @@ def test_set_schedule_validates_before_sending(client: mc.Client) -> None:
         c.set_schedule(enabled=True, hour=24)
     with pytest.raises(ValueError, match="minute"):
         c.set_schedule(enabled=True, minute=60)
+    with pytest.raises(ValueError, match="tz"):
+        c.set_schedule(enabled=True, tz=None)  # type: ignore[arg-type]
     assert not route.called, "invalid input must not reach the API"
 
 
@@ -2025,6 +2051,16 @@ def test_a_boolean_delete_count_is_not_one_snapshot(client: mc.Client) -> None:
         _computer(client).delete()
 
 
+@respx.mock
+def test_a_fractional_delete_count_is_an_sdk_error(client: mc.Client) -> None:
+    """int(0.9) is 0, which would report a successful purge as nothing deleted."""
+    respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"snapshots_deleted": 0.9})
+    )
+    with pytest.raises(mc.MandalaError, match="invalid snapshots_deleted"):
+        _computer(client).delete()
+
+
 # --- background exec --------------------------------------------------------
 
 
@@ -2912,8 +2948,11 @@ def test_a_non_integer_exit_code_is_refused_rather_than_truncated(code: object) 
     the MandalaError this SDK promises (adversarial review, OPL-4222)."""
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
         mc.ExecResult.from_api({"exit_code": code, "stdout": "", "stderr": ""})
-    with pytest.raises(mc.MandalaError, match="invalid exit_code"):
-        mc.ExecStatus.from_api({"pid": 1, "exit_code": code})
+    # ExecStatus is a consuming read: raising here would drop stdout that the
+    # daemon cursor has already advanced past. An unreadable code is None.
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": code, "stdout": "KEEPME"})
+    assert status.exit_code is None
+    assert status.stdout == "KEEPME"
 
 
 def test_a_whole_exit_code_spelled_as_a_float_is_still_that_code() -> None:
@@ -3006,10 +3045,13 @@ def test_a_malformed_idle_window_is_an_sdk_error() -> None:
     computer = mc.Computer(None, {"idle_suspend_min": "soon"})  # type: ignore[arg-type]
     with pytest.raises(mc.MandalaError, match="idle_suspend_min"):
         _ = computer.idle_suspend_min
+    # int(0.9) is 0, which is the real "never suspend" setting.
+    computer = mc.Computer(None, {"idle_suspend_min": 0.9})  # type: ignore[arg-type]
+    with pytest.raises(mc.MandalaError, match="idle_suspend_min"):
+        _ = computer.idle_suspend_min
 
 
-@pytest.mark.parametrize("model", [mc.ExecResult, mc.ExecStatus])
-def test_a_boolean_exit_code_is_rejected(model: type[mc.ExecResult | mc.ExecStatus]) -> None:
+def test_a_boolean_exit_code_is_rejected() -> None:
     """A `MandalaError`, like every other refusal on this decoder.
 
     This pinned `TypeError` — the one builtin among them. The README says
@@ -3020,15 +3062,19 @@ def test_a_boolean_exit_code_is_rejected(model: type[mc.ExecResult | mc.ExecStat
     `{"exit_code": "oops"}` next door was correctly refused (OPL-4232).
     """
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
-        model.from_api({"exit_code": False})
+        mc.ExecResult.from_api({"exit_code": False})
+    # Consuming: see test_a_non_integer_exit_code_is_refused_rather_than_truncated.
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": False, "stdout": "KEEPME"})
+    assert status.exit_code is None
+    assert status.stdout == "KEEPME"
 
 
-@pytest.mark.parametrize("model", [mc.ExecResult, mc.ExecStatus])
-def test_a_malformed_exit_code_is_an_sdk_error(
-    model: type[mc.ExecResult | mc.ExecStatus],
-) -> None:
+def test_a_malformed_exit_code_is_an_sdk_error() -> None:
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
-        model.from_api({"exit_code": "oops"})
+        mc.ExecResult.from_api({"exit_code": "oops"})
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": "oops", "stdout": "KEEPME"})
+    assert status.exit_code is None
+    assert status.stdout == "KEEPME"
 
 
 # --- 429 is its own answer -------------------------------------------------
@@ -3301,6 +3347,17 @@ def test_write_file_refuses_an_oversized_body_before_the_request(
     monkeypatch.setattr(mc._computer, "FILE_SIZE_LIMIT", 2)
     with pytest.raises(ValueError, match="may not exceed"):
         _computer(client).write_file("/tmp/a", "€")
+    assert not put.called
+
+
+@respx.mock
+def test_write_file_refuses_an_unpaired_surrogate_as_value_error(client: mc.Client) -> None:
+    """``encode`` raises ``UnicodeEncodeError``, which a caller wrapping
+    write_file in ``except ValueError`` would miss. Clipboard, env and document
+    already convert it."""
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200))
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        _computer(client).write_file("/tmp/a", "\ud800")
     assert not put.called
 
 

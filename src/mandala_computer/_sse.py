@@ -20,7 +20,20 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["SSEDecoder", "SSEEvent"]
+from ._exceptions import MandalaError
+
+__all__ = ["MAX_SSE_BUFFER", "SSE_TERMINAL_EVENTS", "SSEDecoder", "SSEEvent", "feed_chunk"]
+
+#: Event names that end an SSE run. Agent and build streams both use them.
+#: After a chunk that carried one, the reader must not wait for more — a
+#: post-done ``: keepalive`` would reset the idle timeout forever.
+SSE_TERMINAL_EVENTS = frozenset({"done", "error"})
+
+#: An event-stream that never emits a frame boundary, or a single ``data:``
+#: payload bigger than this, is not a run — it is a process growing without
+#: bound. Sibling transports already cap a websocket frame; this is the same
+#: kind of bound for SSE.
+MAX_SSE_BUFFER = 1 << 24  # 16 MiB
 
 
 @dataclass(frozen=True)
@@ -35,6 +48,18 @@ class SSEEvent:
     #: the platform's business, and a client that raised on an unparseable one
     #: would fail a run over a frame it did not need.
     data: Any
+
+
+def feed_chunk(decoder: SSEDecoder, chunk: bytes) -> tuple[list[SSEEvent], bool]:
+    """Events this chunk completed, and whether one of them ends the run.
+
+    The second value is what lets a transport close the HTTP stream after
+    ``done``/``error`` instead of sitting on keepalives that reset the idle
+    timer. Trailing events in the SAME chunk are still in the list, so a
+    failure that arrived with the result still wins.
+    """
+    events = decoder.feed(chunk)
+    return events, any(event.event in SSE_TERMINAL_EVENTS for event in events)
 
 
 def parse_event(chunk: str) -> SSEEvent | None:
@@ -114,6 +139,11 @@ class SSEDecoder:
         if text.endswith("\r"):
             self._swallow_lf = True
         self._buffer += text.replace("\r\n", "\n").replace("\r", "\n")
+        if len(self._buffer) > MAX_SSE_BUFFER:
+            raise MandalaError(
+                f"agent stream event exceeded the {MAX_SSE_BUFFER // (1024 * 1024)} MiB "
+                "client frame limit"
+            )
         events = []
         while True:
             sep = self._buffer.find("\n\n")
