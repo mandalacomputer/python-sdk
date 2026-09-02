@@ -1,24 +1,28 @@
-# mandala-computer-python
+# Mandala Computer Python SDK
 
 Python SDK for [Mandala Computer](https://mandala.computer) — cloud desktops for
 AI agents.
 
-> **Status: alpha, unpublished.** The API surface is settling; expect breaking
-> changes before 1.0.
+> **Status: alpha.** The API surface is settling; expect breaking changes
+> before 1.0.
 
 ## Install
 
 ```sh
-pip install mandala-computer       # not yet published
+pip install mandala-computer
 ```
 
-The install also puts a `mandala` command on your PATH — see
-[The `mandala` CLI](#the-mandala-cli).
+Python 3.10 or newer. The install also puts a `mandala` command on your PATH —
+see [The `mandala` CLI](#the-mandala-cli).
 
 ## Use
 
 Authentication is an API key from the dashboard (Settings → API keys), read from
-`MANDALA_API_KEY` unless you pass one.
+`MANDALA_API_KEY` unless you pass one as `Client(api_key=...)`. Requests go to
+`https://app.mandala.computer/api/v1`; `MANDALA_BASE_URL` or
+`Client(base_url=...)` points them elsewhere. `timeout` is the per-request
+budget, 60 seconds unless a call knows it needs longer, and `http_client` takes
+an `httpx.Client` of your own if you have proxies or certificates to configure.
 
 ```python
 from mandala_computer import Client
@@ -46,6 +50,12 @@ c.wait_until_running()
 ...
 c.stop()
 ```
+
+`start=False` creates it stopped. `resolution="1920x1080"` (or `"WxHxDEPTH"`)
+sets the screen, which defaults to `1280x800x24` and is then fixed for the life
+of the computer — the display is part of the machine QEMU builds, so there is no
+method that changes it later. Pick it deliberately if a model is going to drive
+the desktop: every coordinate it produces is in that space.
 
 ### Sizes
 
@@ -127,9 +137,8 @@ the base image, which only a host holding it can compute:
 ```python
 if check.build_digest is None and check.build_digest_needs:
     print(check.build_digest_needs)
-    # the contents of acme/base's image, which only a host holding it can
-    # supply. Run `gorillad -build-template <file> -dry-run` there to see
-    # this document's build digest
+    # "the contents of acme/base's image, which only a host holding it can
+    # supply. ..." — and then how to get it
 ```
 
 `check.canonical` is the document as `doc_digest` was taken over it — compact
@@ -155,7 +164,10 @@ pinned = client.templates.get(namespace, "devbox", version="1.0.0")
 ```
 
 Without `version` you get the newest, which is also what a create naming the
-unpinned `namespace/name` resolves to.
+unpinned `namespace/name` resolves to. `client.templates.list()` is the
+catalogue of what you can launch — each row's `ref` is what `create()` takes —
+and `client.templates.schema()` is the JSON Schema for a `mandala/v1` document,
+returned as it arrives so an editor or validator can be pointed at it.
 
 #### Retiring one
 
@@ -213,7 +225,15 @@ for p in client.builds.events(build.id):
 Each event is news — the platform sends one only when something moved — and the
 last one is the `done`, **including for a build that failed**. An `error` event
 means the *stream* could not go on and says nothing about the build; it raises,
-and says so. An account may hold eight streams open at once.
+and says so. An account may hold eight streams open at once. To stop reading
+early, close the iterator — `contextlib.closing()` — rather than `break` out of
+it.
+
+`client.builds.list()` is every build on the account, `get(id)` is one, and
+`progress(id)` is the same record `wait()` returns, read once. Identical documents
+normally share an image, which is what makes a repeated build cheap;
+`start(doc, no_reuse=True)` builds again even when an image already carries this
+document's build digest.
 
 **A build that declares its own family is not launchable yet.** The fleet does
 not advertise a family it built rather than shipped, so a create naming such a
@@ -405,7 +425,7 @@ reported in its place, because it is a property of the host and changes when an
 operator changes it.
 
 The screen is not part of this. `resolution` is fixed for the life of a
-computer — see [Sizes](#sizes).
+computer — it is chosen at [create](#use) and nowhere else.
 
 ### Growing past the host
 
@@ -480,19 +500,33 @@ x, y = 640, 480
 
 c.move(x, y)
 c.click(x, y)
+c.click(x, y, "shift")  # modifiers held for the click
 c.right_click(x, y)
+c.middle_click(x, y)
 c.double_click(x, y)
-c.scroll(x, y, direction="up", amount=3)
+c.triple_click(x, y)
+c.drag(900, 480, from_x=x, from_y=y)  # press, move through, release
+c.scroll(x, y, direction="up", amount=3)  # also "left"/"right"
 c.type("some text")
-c.key("ctrl", "c")
+c.key("ctrl", "c")  # SDK names and X11 keysyms both work: "Return", "Page_Down"
+c.hold_key("Down", seconds=2)  # for keys that mean something while held
+c.wait(1.5)  # a pause inside the platform; what a model's `wait` action maps to
+c.cursor_position()  # (x, y), or None before anything has placed the pointer
 
 png = c.screenshot()  # full-resolution PNG
 jpg = c.screenshot(width=320)  # downscaled JPEG — cheap enough to poll
 now = c.screenshot(fresh=True)  # skip the cache; what a drive loop wants
 
 res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
+res = c.exec("make", timeout=90, cwd="/root/src", env={"CC": "clang"})
 res.ok, res.exit_code, res.stdout, res.stderr
 ```
+
+With no coordinate, a click lands wherever the pointer already is, and a `drag`
+with no `from_x`/`from_y` starts there too — refused if nothing has moved it
+yet, rather than guessing at an origin. `mouse_down()`/`mouse_up()` are the two
+halves of a gesture for the cases `drag()` does not cover; between them the
+button is held, so pair them in `try`/`finally`.
 
 **Pass `fresh=True` whenever the image is feeding a decision.** A bare
 `screenshot()` may be answered from a frame up to 1.5 seconds old. That is the
@@ -752,8 +786,8 @@ A read failure raises; an empty clipboard is `""`. That is the distinction the
 
 #### What these replace
 
-Until platform OPL-3768 the only public road was a recipe over `exec` with
-`desktop=True`, documented at length in this README. Do not go back to it.
+Before these endpoints existed the only road was a recipe over `exec` with
+`desktop=True`. Do not go back to it.
 `exec` runs a **login shell**, so the desktop user's profile is sourced and
 anything it prints lands on the same stdout as your command's output, ahead of
 it. That is wanted when you asked to run a command the way the user would, and
@@ -1206,6 +1240,9 @@ c.wait_until_built()  # minutes, for a large disk
 c.start().wait_for_guest()
 ```
 
+`c.clone()` is the other clone — the computer's disk as it is now, which needs
+the source stopped — and comes back `building` the same way.
+
 If the copy fails the computer stays, so you can see it and reclaim the space it
 took. It never becomes usable — delete it and clone again.
 
@@ -1259,7 +1296,8 @@ if last is None:
 ```
 
 `auto` also marks the only snapshots retention will age out — ones you take
-yourself are never removed automatically.
+yourself are never removed automatically. `client.snapshots.delete(snap.id)` is
+how one goes by hand.
 
 #### How long they are kept
 
@@ -1658,7 +1696,7 @@ caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
 `ConflictError` (minus `MoveRequiredError`), `RateLimitError`, `UnavailableError`
 and `ConnectionError` (minus `ConnectionInterruptedError`), and no to everything
 above whose outcome is unknown, 502 and 504 included. The same four classes, and
-only those, answer yes in mandala-computer-typescript and mandala-computer-mcp.
+only those, answer yes in the TypeScript and MCP SDKs.
 
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during
@@ -1754,17 +1792,10 @@ mandala webhooks test whk-2b7d4c809f3c1a7e && mandala webhooks deliveries whk-2b
 
 ## Design notes
 
-**This SDK binds only to the curated `/api/v1` surface, never to the hypervisor
-daemon's own routes.** That boundary is deliberate and load-bearing:
-
-- The daemon's VM representation carries fields that are nobody's business
-  outside the platform — owner ids, VNC tokens and ports, MAC addresses, host
-  image paths. The public surface exposes a deliberately narrower object.
-- The daemon's auth model treats an absent owner header as *administrative*
-  scope. Nothing client-facing should be one bug away from that.
-- Multi-host is on the platform roadmap. The daemon's routes will change shape
-  when the control plane splits from the hypervisor agents; the point of the v1
-  surface is that this SDK does not have to care.
+**This SDK binds only to the public `/api/v1` surface, never to anything behind
+it.** That boundary is deliberate and load-bearing: the public surface exposes a
+deliberately narrower object than the platform holds internally, and the
+internals are free to change shape without this SDK having to care.
 
 Practically: if something the SDK needs isn't in `/api/v1`, the fix is to add it
 there, not to reach past it. `tests/test_surface.py` enforces this — it exercises
@@ -1772,7 +1803,7 @@ every method that makes a request, for **both** clients, and asserts each call
 lands on an allowlisted route, so drift fails here rather than in a user's hands.
 
 Drift has two directions, and that test pins both. `ALLOWED` mirrors the
-platform's `V1_ROUTES` table in full, and `UNIMPLEMENTED` names the part of it
+platform's v1 route table in full, and `UNIMPLEMENTED` names the part of it
 this SDK does not reach — currently just `POST chat/completions`, and that one
 by choice rather than by lag: a caller who wants an OpenAI-shaped door already
 has an OpenAI client to point at it. Without the second set the first proves
@@ -1780,24 +1811,12 @@ nothing over time: "every call lands on an allowlisted route" stays true no
 matter how far behind the client falls, so closing a gap means deleting a line
 from `UNIMPLEMENTED` rather than nobody noticing.
 
-A mirror nobody compares is a comment, though, and that is not hypothetical:
-background exec and the snapshot holdings landed upstream and stayed invisible
-here for exactly as long as there was nothing doing the comparison, with the
-whole suite green throughout — neither of those tests can see a route the
-mirror has never heard of. `scripts/check_surface.py` closes that hole. It
-parses the real table out of the platform repo whenever it happens to be checked
-out next door, or wherever `MANDALA_PLATFORM_REPO` points, and says so and exits
-0 when it is not — the ordinary case in CI here, and failing over it would make
-this a check people learn to ignore. It recognizes that checkout by asking git
-where it was cloned from rather than by which of its files are present, because
-the second answer is fail-open in the one case that matters: a checkout missing
-the parameter table is drift to report, not evidence that there is no checkout
-to compare against.
-
-The suite runs it too, and that is the part that matters: a script somebody has
-to remember is the same hole one step further back. `pytest` skips it where the
-platform is not checked out and fails on drift where it is, which covers every
-machine this mirror actually gets edited on.
+A mirror nobody compares is a comment, though. `scripts/check_surface.py` does
+the comparison against the platform's real route table whenever a checkout of
+the platform is available to it (next door, or wherever `MANDALA_PLATFORM_REPO`
+points — a maintainer's setup, not something a contributor needs), and says so
+and exits 0 when it is not. The suite runs it too: `pytest` skips it where the
+platform is not checked out and fails on drift where it is.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients.
