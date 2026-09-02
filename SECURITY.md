@@ -1,6 +1,6 @@
 # Security
 
-This repository holds the Mandala Computer Python SDK ( on PyPI). It is a client: it
+This repository holds the Mandala Computer Python SDK (`mandala-computer` on PyPI). It is a client: it
 talks to the public API at `https://app.mandala.computer` with an API key the
 caller supplies, and it holds no infrastructure of its own.
 
