@@ -1711,6 +1711,19 @@ async def test_the_async_connect_budget_covers_the_url_read_too(
     assert caps == [4.0]
 
 
+def test_an_invalid_events_url_does_not_print_the_token() -> None:
+    """InvalidURI.__str__ includes the URI, and the URI carries a credential."""
+    from websockets.exceptions import InvalidURI
+
+    from mandala_computer._events import _connect_failed
+
+    uri = "wss://events.test/events?token=SECRET"
+    err = _connect_failed("vm-1", InvalidURI(uri, "scheme isn't ws or wss"))
+    assert "SECRET" not in str(err)
+    assert "token=" not in str(err)
+    assert "not a websocket URL" in str(err)
+
+
 def test_a_connect_timeout_is_this_sdks_error_on_every_supported_python() -> None:
     """``asyncio.TimeoutError`` and the builtin are separate classes on 3.10,
     which ``requires-python`` still admits, and ``_connect_failed`` re-raises
@@ -1738,6 +1751,44 @@ def test_a_large_whole_exit_code_is_not_quietly_rounded(wire: int) -> None:
     ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
     assert ev is not None
     assert ev.exit_code == wire
+
+
+@pytest.mark.parametrize("wire", ["9007199254740993", "-9007199254740993"])
+def test_a_large_whole_exit_code_spelled_as_a_string_is_not_quietly_rounded(wire: str) -> None:
+    """The int fast-path left decimal strings going through ``float()``."""
+    ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
+    assert ev is not None
+    assert ev.exit_code == int(wire)
+    assert mc.ExecResult.from_api({"exit_code": wire}).exit_code == int(wire)
+
+
+@pytest.mark.asyncio
+async def test_async_close_during_handshake_does_not_wait_out_open_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``close()`` only set ``_stop``; ``_open`` awaited ``_aconnect`` un-raced."""
+    started = asyncio.Event()
+
+    async def hang(url: str, **kw: Any) -> Any:
+        started.set()
+        await asyncio.sleep(3600)
+        raise AssertionError("connect was not cancelled")
+
+    monkeypatch.setattr(_events, "_aconnect", hang)
+
+    async def url(budget: float) -> str:
+        return "wss://events.test/?token=SECRET"
+
+    stream = mc.AsyncEventStream(url, "vm-1", reconnect=False, connect_timeout=15)
+
+    async def consume() -> None:
+        async for _ in stream:
+            pass
+
+    task = asyncio.create_task(consume())
+    await started.wait()
+    stream.close()
+    await asyncio.wait_for(task, timeout=1.0)
 
 
 # --- file.changed: a stream option, not a type to filter for -----------------

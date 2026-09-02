@@ -1445,6 +1445,24 @@ async def _aconnect(url: str, *, open_timeout: float, max_queue: int) -> Any:
 DEFAULT_MAX_QUEUE = 4096
 
 
+def _public_exc(exc: BaseException) -> str:
+    """Exception text that cannot carry a desktop token.
+
+    ``InvalidURI.__str__`` includes the full URI, and the URI on this surface
+    carries a credential with no expiry — the leak :meth:`VncConnect.__repr__`
+    was rewritten to prevent. Other ``WebSocketException`` subclasses are
+    named by class rather than interpolated, because several of them echo the
+    URI they were given. OSError and TimeoutError do not.
+    """
+    from websockets.exceptions import InvalidURI, WebSocketException
+
+    if isinstance(exc, InvalidURI):
+        return "not a websocket URL"
+    if isinstance(exc, WebSocketException):
+        return type(exc).__name__
+    return str(exc)
+
+
 def _connect_failed(
     computer_id: str, exc: BaseException, *, watching: bool = False
 ) -> MandalaError:
@@ -1461,20 +1479,22 @@ def _connect_failed(
     if isinstance(exc, InvalidStatus):
         return _refusal(computer_id, exc.response.status_code, exc.response.body, watching=watching)
     if isinstance(exc, InvalidURI):
-        return _settle(MandalaError(f"{computer_id}'s events_url is not a websocket URL: {exc}"))
+        return _settle(MandalaError(f"{computer_id}'s events_url is not a websocket URL"))
     # ``asyncio.TimeoutError`` alongside the builtin because they are separate
     # classes on 3.10, which ``requires-python`` still admits: without it an
     # ``open_timeout`` on that version leaves this function through the
     # ``raise`` below and reaches the caller as something that is not a
     # MandalaError at all. ``_sleep`` in this file already spells it this way.
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError, WebSocketException)):
-        return ConnectionError(f"{computer_id}'s event stream would not open: {exc}")
+        return ConnectionError(
+            f"{computer_id}'s event stream would not open: {_public_exc(exc)}"
+        )
     raise exc
 
 
 def _lost(computer_id: str, exc: BaseException) -> MandalaError:
     """A socket that failed mid-stream, as this SDK's own error."""
-    return ConnectionError(f"{computer_id}'s event stream failed: {exc}")
+    return ConnectionError(f"{computer_id}'s event stream failed: {_public_exc(exc)}")
 
 
 def _shut_quietly(sock: Any) -> None:
@@ -2134,11 +2154,41 @@ class AsyncEventStream(_StreamBase):
                 f"reading a fresh events_url for {self._id} used the whole {budget:g}s "
                 "connect budget"
             )
+        # Raced against the stop the way ``_recv`` is. ``close()`` cannot await
+        # a handshake, and without the race a hook (or another task) that
+        # stopped the stream during connect waited out the remaining
+        # ``open_timeout`` of a socket nobody would read.
+        connecting = asyncio.ensure_future(
+            _aconnect(url, open_timeout=left, max_queue=self._max_queue)
+        )
+        stopping = asyncio.ensure_future(self._stop.wait())
         try:
-            sock = await _aconnect(url, open_timeout=left, max_queue=self._max_queue)
+            done, _ = await asyncio.wait(
+                (connecting, stopping), return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            connecting.cancel()
+            raise
+        finally:
+            stopping.cancel()
+        if connecting not in done:
+            connecting.cancel()
+            sock = None
+            try:
+                sock = await connecting
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                sock = None
+            if sock is not None:
+                await _ashut_quietly(sock)
+            raise _Expired
+        try:
+            sock = connecting.result()
         except Exception as exc:
             raise _connect_failed(self._id, exc, watching=bool(self._watch)) from exc
         self._sock = sock
+        if self._stopped():
+            await self._shut()
+            raise _Expired
         buffered: list[Any] = []
         hello: Hello | None = None
         while hello is None:

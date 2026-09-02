@@ -640,7 +640,15 @@ def is_transient(err: BaseException) -> bool:
     # unhashable value — but that is neither this protocol nor retry advice.
     if isinstance(err, APIError):
         reason = err.reason
-        if reason in _REASON_CLEARS:
+        # The platform puts these words on the 409 that will clear (a guest
+        # agent busy, a computer still booting) and on the 400 that says the
+        # same thing to whoever lost the race to the running check. They are
+        # not retry advice on a 401, a 402, a 403 or a 404, even if the body
+        # happens to carry the word — this predicate is the public "safe to
+        # replay, including a create" answer.
+        if reason in _REASON_CLEARS and (
+            isinstance(err, ConflictError) or err.status in (400, 409)
+        ):
             return True
         if reason in _REASON_PERMANENT:
             return False

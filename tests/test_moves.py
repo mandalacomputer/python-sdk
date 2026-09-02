@@ -447,6 +447,35 @@ def test_the_newest_finished_move_wins_across_rfc3339_spellings() -> None:
     assert picked.started_at == "2026-08-23T02:00:12.999Z"
 
 
+def test_the_newest_finished_move_wins_across_utc_suffix_spellings() -> None:
+    """``Z`` and ``+00:00`` are the same instant; ``'+'`` precedes ``'Z'``.
+
+    A later ``02:00:12.500+00:00`` sorted *before* an earlier ``02:00:12Z``,
+    so ``_my_move`` could pick the stale finished row.
+    """
+    c = mc.Computer(None, {"id": "vm-1"})  # type: ignore[arg-type]
+    listing = {
+        "moves": [
+            {
+                "computer_id": "vm-1",
+                "state": "moved",
+                "live": False,
+                "started_at": "2026-08-23T02:00:12.500+00:00",
+            },
+            {
+                "computer_id": "vm-1",
+                "state": "done",
+                "live": False,
+                "started_at": "2026-08-23T02:00:12Z",
+            },
+        ]
+    }
+    picked = c._my_move(listing)
+    assert picked is not None
+    assert picked.state == "moved"
+    assert picked.started_at == "2026-08-23T02:00:12.500+00:00"
+
+
 def test_an_undateable_row_never_displaces_one_that_can_be_dated() -> None:
     """`max` is choosing what to hand back; an unreadable stamp is not evidence."""
     c = mc.Computer(None, {"id": "vm-1"})  # type: ignore[arg-type]
