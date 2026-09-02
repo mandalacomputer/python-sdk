@@ -105,8 +105,8 @@ MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _
 #: recognizer that reads its absence as "no checkout here" reports nothing at all.
 #: Every marker set has that hole somewhere; identity has it nowhere.
 #:
-#: The remote's name rather than the directory's, because the working copy is
-#: routinely called something else — ``gorillacloud``, from before the rename.
+#: The remote's name rather than the directory's, because a working copy can be
+#: called anything — ``app``, after the repository, is common.
 #: Forks are covered by their ``upstream`` remote where they have one, since
 #: :func:`remotes` reads all of them, and by ``PLATFORM_MARKERS`` where they
 #: do not.
@@ -145,12 +145,9 @@ PLATFORM_MARKERS = (SURFACE, APIDOC)
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
-#:
-#: ``gorillacloud`` is the name it had before the product was renamed, and it is
-#: still what most working copies are called. Kept as a fallback so a machine
-#: that already has one kept working through the rename; ``MANDALA_PLATFORM_REPO``
-#: is the way to point at a checkout that is called neither, or lives elsewhere.
-SIBLINGS = ("mandala-computer", "gorillacloud")
+#: ``MANDALA_PLATFORM_REPO`` is the way to point at a checkout that is called
+#: something else, or lives elsewhere.
+SIBLINGS = ("mandala-computer",)
 
 
 def remotes(directory: Path) -> frozenset[str]:
