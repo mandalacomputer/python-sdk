@@ -57,6 +57,10 @@ of the computer — the display is part of the machine QEMU builds, so there is 
 method that changes it later. Pick it deliberately if a model is going to drive
 the desktop: every coordinate it produces is in that space.
 
+Every computer is a Linux desktop today. Windows guests are not offered on any
+plan; where this README mentions Windows it is describing behaviour the client
+already supports for when they are.
+
 ### Sizes
 
 Rather than inventing numbers, name a size. `client.sizes.list()` is the
