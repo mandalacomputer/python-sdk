@@ -1486,9 +1486,7 @@ def _connect_failed(
     # ``raise`` below and reaches the caller as something that is not a
     # MandalaError at all. ``_sleep`` in this file already spells it this way.
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError, WebSocketException)):
-        return ConnectionError(
-            f"{computer_id}'s event stream would not open: {_public_exc(exc)}"
-        )
+        return ConnectionError(f"{computer_id}'s event stream would not open: {_public_exc(exc)}")
     raise exc
 
 

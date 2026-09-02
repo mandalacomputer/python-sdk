@@ -510,15 +510,9 @@ def test_a_clearing_reason_does_not_promote_auth_or_not_found_to_retryable() -> 
         assert mc.is_transient(err) is False
     # The statuses the word actually classifies stay retryable.
     assert (
-        mc.is_transient(
-            mc.ConflictError("busy", status=409, body={"reason": "starting"})
-        )
-        is True
+        mc.is_transient(mc.ConflictError("busy", status=409, body={"reason": "starting"})) is True
     )
-    assert (
-        mc.is_transient(mc.APIError("booting", status=400, body={"reason": "starting"}))
-        is True
-    )
+    assert mc.is_transient(mc.APIError("booting", status=400, body={"reason": "starting"})) is True
 
 
 def test_the_refusal_reason_decides_before_the_type_does() -> None:
