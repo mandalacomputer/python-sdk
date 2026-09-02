@@ -78,6 +78,23 @@ def _opt_num(value: Any) -> int | None:
     return int(number) if math.isfinite(number) else None
 
 
+def _exact_int(value: Any) -> int | None:
+    """A whole number that ``float()`` would not be needed for, or ``None``.
+
+    ``float`` is lossy past 2**53, so a Python ``int`` or a decimal string in
+    that range must not be routed through it. Callers fall through to ``float``
+    for values this cannot speak for — notably ``1.0`` and ``"3.0"``.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text[:1] in "+-":
+            return int(text, 10) if text[1:].isdigit() else None
+        return int(text, 10) if text.isdigit() else None
+    return None
+
+
 def _opt_whole(value: Any) -> int | None:
     """:func:`_opt_num`, refusing a number that was never a whole one.
 
@@ -104,10 +121,11 @@ def _opt_whole(value: Any) -> int | None:
     # because the float being compared IS a whole number. Routed through
     # `_opt_num` alone, 9007199254740993 came back as ...992 — a silently
     # different exit code, which is the class of wrong answer this function
-    # exists to refuse (/code-review, OPL-4232). No exit code is near that; the
-    # point is that the check below is only sound for values it can represent.
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
+    # exists to refuse (/code-review, OPL-4232). The same hole remained on the
+    # decimal-string path (`"9007199254740993"`), which this SDK accepts.
+    exact = _exact_int(value)
+    if exact is not None:
+        return exact
     number = _opt_num(value)
     if number is None:
         return None
@@ -288,11 +306,13 @@ def _exit_code(value: Any) -> int | None:
     # being one: past 2**53 the conversion is lossy and `number != int(number)`
     # cannot see it, because the float it is comparing is a whole number — so
     # 9007199254740993 came back as ...992, silently, which is the same class of
-    # wrong code this function exists to refuse (/code-review, OPL-4222). No
+    # wrong code this function exists to refuse (/code-review, OPL-4222). The
+    # decimal-string path had the same hole; `_exact_int` closes both. No
     # exit code is anywhere near that; the point is that the check below is only
     # sound for values it can represent.
-    if isinstance(value, int):
-        return value
+    exact = _exact_int(value)
+    if exact is not None:
+        return exact
     try:
         number = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
@@ -2035,15 +2055,26 @@ class ExecStatus:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ExecStatus:
-        code = d.get("exit_code")
+        # stdout/stderr first. `poll`/`kill` have already consumed the daemon
+        # cursor by the time this runs, so raising on a malformed `exit_code`
+        # would drop output that cannot be fetched again — the same loss
+        # `output_uncertain` exists to prevent for `more`. An unreadable code
+        # is None, which this field already uses for "the platform could not
+        # report one".
+        stdout = _text(d.get("stdout"))
+        stderr = _text(d.get("stderr"))
+        try:
+            exit_code = _exit_code(d.get("exit_code"))
+        except MandalaError:
+            exit_code = None
         return cls(
             pid=_num(d.get("pid")),
             command=_text(d.get("command")),
             running=_wire(d, "running") in (_Wire.TRUE, _Wire.MALFORMED),
             exited=_wire(d, "exited") is _Wire.TRUE,
-            exit_code=_exit_code(code),
-            stdout=_text(d.get("stdout")),
-            stderr=_text(d.get("stderr")),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
             stdout_offset=_num(d.get("stdout_offset")),
             stderr_offset=_num(d.get("stderr_offset")),
             more=_wire(d, "more") is _Wire.TRUE,

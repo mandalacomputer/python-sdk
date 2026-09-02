@@ -1267,6 +1267,22 @@ def test_non_status_websocket_failures_are_cli_errors(monkeypatch: pytest.Monkey
         _cli._connect("not-a-websocket")
 
 
+def test_an_invalid_terminal_url_does_not_print_the_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from websockets.exceptions import InvalidURI
+    from websockets.sync import client as ws_client
+
+    def invalid_uri(*args: object, **kwargs: object) -> None:
+        raise InvalidURI("wss://h/term?token=SECRET", "scheme isn't ws or wss")
+
+    monkeypatch.setattr(ws_client, "connect", invalid_uri)
+    with pytest.raises(SystemExit) as caught:
+        _cli._connect("wss://h/term?token=SECRET")
+    message = str(caught.value)
+    assert "could not open the terminal" in message
+    assert "SECRET" not in message
+    assert "token=" not in message
+
+
 def test_outbound_queue_is_bounded() -> None:
     """A stalled websocket must not grow without bound on piped stdin."""
     q = _cli._outbound_queue()
