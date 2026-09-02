@@ -76,6 +76,19 @@ ALLOWED = {
     # like `usage` and `moves`, and read-only on every surface: the plan owns
     # retention.
     ("GET", "retention"),
+    # Account webhooks (platform OPL-3923, OPL-4300): eight local routes, all
+    # answered by the control plane. A subscription is control-plane data the
+    # way a template in the store is, so there is no daemon behind any of them.
+    # The secret is answered by exactly two — the create and the rotate — and
+    # never by a read.
+    ("GET", "webhooks"),
+    ("POST", "webhooks"),
+    ("GET", "webhooks/:id"),
+    ("PATCH", "webhooks/:id"),
+    ("DELETE", "webhooks/:id"),
+    ("POST", "webhooks/:id/rotate"),
+    ("POST", "webhooks/:id/test"),
+    ("GET", "webhooks/:id/deliveries"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -219,4 +232,27 @@ PARAMETERS: dict[str, set[str]] = {
     # `since`/`until` because `from` is a keyword.
     "GET usage": {"query:from", "query:to"},
     "GET retention": set(),
+    # The same five fields on the create and the update. The update sends only
+    # the ones a caller named, so the exercise names every one of them at least
+    # once — a field only ever omitted would read here as never sent.
+    "GET webhooks": set(),
+    "POST webhooks": {
+        "body:url",
+        "body:description",
+        "body:events",
+        "body:computers",
+        "body:enabled",
+    },
+    "GET webhooks/:id": set(),
+    "PATCH webhooks/:id": {
+        "body:url",
+        "body:description",
+        "body:events",
+        "body:computers",
+        "body:enabled",
+    },
+    "DELETE webhooks/:id": set(),
+    "POST webhooks/:id/rotate": set(),
+    "POST webhooks/:id/test": set(),
+    "GET webhooks/:id/deliveries": set(),
 }

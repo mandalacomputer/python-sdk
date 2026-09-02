@@ -46,6 +46,7 @@ from ._async_resources import (
     AsyncSnapshots,
     AsyncTemplates,
     AsyncUsage,
+    AsyncWebhooks,
 )
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
@@ -105,10 +106,14 @@ from ._models import (
     UsageReport,
     UsageTotals,
     VncConnect,
+    Webhook,
+    WebhookCreated,
+    WebhookDelivery,
     Window,
     WindowResult,
 )
-from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, Usage
+from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, Usage, Webhooks
+from ._webhooks import REPLAY_WINDOW_S, verify
 
 __version__ = "0.1.0"
 
@@ -117,6 +122,7 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DESKTOP_EVENT_TYPES",
     "GUEST_EVENT_TYPES",
+    "REPLAY_WINDOW_S",
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
     "STREAM_FRAME_TYPES",
@@ -180,10 +186,14 @@ __all__ = [
     "UsageTotals",
     "VncConnect",
     "WatchedTree",
+    "Webhook",
+    "WebhookCreated",
+    "WebhookDelivery",
     "Window",
     "WindowResult",
     "__version__",
     "is_transient",
+    "verify",
 ]
 
 
@@ -210,6 +220,7 @@ class Client:
         self.templates = Templates(self._t)
         self.sizes = Sizes(self._t)
         self.usage = Usage(self._t)
+        self.webhooks = Webhooks(self._t)
 
     @property
     def base_url(self) -> str:
@@ -252,6 +263,7 @@ class AsyncClient:
         self.templates = AsyncTemplates(self._t)
         self.sizes = AsyncSizes(self._t)
         self.usage = AsyncUsage(self._t)
+        self.webhooks = AsyncWebhooks(self._t)
 
     @property
     def base_url(self) -> str:

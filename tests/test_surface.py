@@ -125,6 +125,39 @@ COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu"
 SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", "state": "durable"}
 HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
 RETENTION = {"daily": 7, "weekly": 4, "monthly": 12}
+# One subscription (platform OPL-4300), and the same one as a create answers
+# it: the secret is on exactly that shape and on no read, so the handler below
+# serves WEBHOOK to the reads and WEBHOOK_CREATED to the create and the rotate.
+WEBHOOK = {
+    "id": "whk-2b7d4c809f3c1a7e",
+    "url": "https://ci.example.com/mandala",
+    "description": "",
+    "events": ["process.exited"],
+    "computers": [],
+    "enabled": True,
+    "disabled_reason": None,
+    "disabled_at": None,
+    "last_success_at": None,
+    "last_failure_at": None,
+    "last_status": None,
+    "created_at": "2026-09-01T12:00:00.000Z",
+    "updated_at": "2026-09-01T12:00:00.000Z",
+}
+WEBHOOK_CREATED = {**WEBHOOK, "secret": "whsec_bWFuZGFsYS13ZWJob29rLXRlc3QtdmVjdG9yLWtleSE="}
+DELIVERY = {
+    "id": "whd-9f3c1a7e5b2d4c80",
+    "event_type": "webhook.test",
+    "computer": "",
+    "cursor": "",
+    "state": "pending",
+    "attempts": 0,
+    "next_at": "2026-09-01T12:00:01.000Z",
+    "attempted_at": None,
+    "last_status": None,
+    "last_error": None,
+    "delivered_at": None,
+    "created_at": "2026-09-01T12:00:00.000Z",
+}
 # One finished move, in the account-wide envelope the route actually answers.
 #
 # Two rows, and only one of them this computer's: `Computer.wait_for_move`
@@ -266,7 +299,7 @@ def pattern_for(path: str) -> str:
     parts = [p for p in path.strip("/").split("/") if p]
 
     def one(i: int, seg: str) -> str:
-        if i and parts[i - 1] in ("computers", "snapshots", "builds"):
+        if i and parts[i - 1] in ("computers", "snapshots", "builds", "webhooks"):
             return ":id"
         if i == 3 and parts[0] == "computers" and parts[2] == "windows":
             return ":window"
@@ -367,6 +400,21 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=MOVES)
     if path.endswith("/retention"):
         return httpx.Response(200, json=RETENTION)
+    # Eight routes, four shapes: the collection lists on GET and answers the
+    # created subscription WITH its secret on POST; a rotate is the other route
+    # carrying the secret; a test answers the one delivery it queued and the
+    # deliveries route lists them; every other read or write on one
+    # subscription answers the subscription, and a delete answers an ack.
+    if path.endswith("/webhooks"):
+        return httpx.Response(200 if get else 201, json=[WEBHOOK] if get else WEBHOOK_CREATED)
+    if path.endswith("/deliveries"):
+        return httpx.Response(200, json=[DELIVERY])
+    if path.endswith("/rotate"):
+        return httpx.Response(200, json=WEBHOOK_CREATED)
+    if path.endswith("/test"):
+        return httpx.Response(202, json=DELIVERY)
+    if "/webhooks/" in path:
+        return httpx.Response(200, json={"ok": True} if request.method == "DELETE" else WEBHOOK)
     if path.endswith("/computers"):
         return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
     return httpx.Response(200, json=COMPUTER)
@@ -553,6 +601,32 @@ def exercise_everything(client: mc.Client) -> None:
     # The other half of the schedule: when they are taken is a computer's, how
     # long they are kept is the account's.
     client.snapshots.retention()
+    # Account webhooks (platform OPL-3923, OPL-4300). Every field on the create
+    # and, separately, on the update — the update sends only what is named, so
+    # one call naming all five is what puts each of them on the wire.
+    client.webhooks.list()
+    client.webhooks.create("https://ci.example.com/mandala")
+    client.webhooks.create(
+        "https://ci.example.com/mandala",
+        description="CI",
+        events=["process.exited"],
+        computers=["vm-1"],
+        enabled=False,
+    )
+    client.webhooks.get("whk-2b7d4c809f3c1a7e")
+    client.webhooks.update("whk-2b7d4c809f3c1a7e", enabled=True)
+    client.webhooks.update(
+        "whk-2b7d4c809f3c1a7e",
+        url="https://ci.example.com/other",
+        description="",
+        events=[],
+        computers=[],
+        enabled=False,
+    )
+    client.webhooks.rotate("whk-2b7d4c809f3c1a7e")
+    client.webhooks.test("whk-2b7d4c809f3c1a7e")
+    client.webhooks.deliveries("whk-2b7d4c809f3c1a7e")
+    client.webhooks.delete("whk-2b7d4c809f3c1a7e")
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -679,6 +753,29 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.snapshots.clone("snap-1", name="from-snap")
     await client.snapshots.delete("snap-1")
     await client.snapshots.retention()
+    await client.webhooks.list()
+    await client.webhooks.create("https://ci.example.com/mandala")
+    await client.webhooks.create(
+        "https://ci.example.com/mandala",
+        description="CI",
+        events=["process.exited"],
+        computers=["vm-1"],
+        enabled=False,
+    )
+    await client.webhooks.get("whk-2b7d4c809f3c1a7e")
+    await client.webhooks.update("whk-2b7d4c809f3c1a7e", enabled=True)
+    await client.webhooks.update(
+        "whk-2b7d4c809f3c1a7e",
+        url="https://ci.example.com/other",
+        description="",
+        events=[],
+        computers=[],
+        enabled=False,
+    )
+    await client.webhooks.rotate("whk-2b7d4c809f3c1a7e")
+    await client.webhooks.test("whk-2b7d4c809f3c1a7e")
+    await client.webhooks.deliveries("whk-2b7d4c809f3c1a7e")
+    await client.webhooks.delete("whk-2b7d4c809f3c1a7e")
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 

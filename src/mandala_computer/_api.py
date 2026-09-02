@@ -49,6 +49,10 @@ USAGE = "usage"
 #: way a fleet listing can. Read-only: the plan owns retention, and there is no
 #: write on any surface.
 RETENTION = "retention"
+#: Account webhooks (platform OPL-3923, OPL-4300): a standing instruction to
+#: POST this account's events, signed, at an address the caller chose.
+#: Account-scoped and answered by the control plane, like :data:`RETENTION`.
+WEBHOOKS = "webhooks"
 
 
 def canonical(value: object, what: str) -> str:
@@ -1452,3 +1456,118 @@ def stop_params(force: bool) -> dict[str, Any] | None:
     whatever the guest had not written to disk.
     """
     return {"force": "true"} if flag(force, "force") else None
+
+
+# --- webhooks -------------------------------------------------------------
+
+
+def webhook(webhook_id: str) -> str:
+    return f"webhooks/{seg(webhook_id)}"
+
+
+def webhook_action(webhook_id: str, action: str) -> str:
+    """rotate | test | deliveries."""
+    return f"webhooks/{seg(webhook_id)}/{action}"
+
+
+#: The platform's ceiling on a subscription's ``description``, mirrored so a
+#: caller is refused here rather than after a round trip — and checked against
+#: ``DESCRIPTION_MAX`` in ``web/lib/webhooks.ts`` by ``scripts/check_surface.py``,
+#: so the copy cannot drift unnoticed.
+WEBHOOK_DESCRIPTION_MAX = 200
+#: The ceiling on ``computers``, mirrored from ``COMPUTERS_MAX`` the same way.
+WEBHOOK_COMPUTERS_MAX = 64
+#: The replay window, mirrored from ``REPLAY_WINDOW_S`` in
+#: ``web/lib/webhooksign.ts``. Lives in ``_webhooks`` as the verifier's default
+#: and is named here so the drift check, which reads every mirrored number off
+#: this module, sees it.
+WEBHOOK_REPLAY_WINDOW_S = 300
+
+
+def _ids(value: object, what: str, *, limit: int | None = None) -> list[str]:
+    """A list of strings for a filter, or a ``ValueError``.
+
+    A bare ``str`` is refused rather than wrapped: ``str`` is a ``Sequence`` of
+    its own characters, so ``events="process.exited"`` would otherwise reach the
+    platform as fourteen one-letter event types and a 400 naming the vocabulary
+    — the same defect ``watch=`` on the event stream had (OPL-4220). Wrapping
+    it would be kinder and would also decide, on the caller's behalf, that a
+    string in a list position was one item rather than a mistake.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
+            f"{what} must be a list of strings, not {type(value).__name__}"
+        )
+    items = [canonical(v, f"{what} entry") for v in value]
+    if any(not item.strip() for item in items):
+        raise ValueError(f"{what} must not contain an empty string")
+    if limit is not None and len(items) > limit:
+        raise ValueError(f"{what} may name at most {limit}, not {len(items)}")
+    return items
+
+
+def _webhook_url(url: object) -> str:
+    """An endpoint, as the platform will accept it: ``https://``, and a host.
+
+    Only the shape that can never pass is refused here. The platform's own
+    checks — no credentials in the URL, a public address behind the name — need
+    a resolver and are its to make; a caller sees those as a 400 naming the
+    rule, exactly as it would have without this SDK.
+    """
+    text = canonical(url, "url")
+    if not text.startswith("https://") or len(text) == len("https://"):
+        raise ValueError(f"url must be https:// and name a host: {text!r}")
+    return text
+
+
+def _description(value: object) -> str:
+    text = canonical(value, "description")
+    if len(text) > WEBHOOK_DESCRIPTION_MAX:
+        raise ValueError(
+            f"description must be at most {WEBHOOK_DESCRIPTION_MAX} characters, not {len(text)}"
+        )
+    return text
+
+
+_OMITTED: Any = object()
+
+
+def webhook_body(
+    *,
+    url: object = _OMITTED,
+    description: object = _OMITTED,
+    events: object = _OMITTED,
+    computers: object = _OMITTED,
+    enabled: object = _OMITTED,
+    create: bool,
+) -> dict[str, Any]:
+    """The create or update payload, with only the fields the caller named.
+
+    One builder for both verbs because the fields are the same five and the
+    platform reads them the same way; the difference is that a create needs
+    ``url`` and an update needs SOMETHING. An update naming nothing is a 400
+    upstream and is refused here for the same reason: it is never what a
+    caller meant, and ``update(id)`` reading as a harmless no-op would hide a
+    call whose keyword got dropped.
+
+    ``events=[]`` and ``computers=[]`` are sent, not dropped: an empty list is
+    how a filter is CLEARED on an update — "every type", "every computer in
+    scope" — and a builder that stripped empties would leave a caller no way to
+    say it.
+    """
+    body: dict[str, Any] = {}
+    if url is not _OMITTED:
+        body["url"] = _webhook_url(url)
+    elif create:
+        raise ValueError("url is required")
+    if description is not _OMITTED:
+        body["description"] = _description(description)
+    if events is not _OMITTED:
+        body["events"] = _ids(events, "events")
+    if computers is not _OMITTED:
+        body["computers"] = _ids(computers, "computers", limit=WEBHOOK_COMPUTERS_MAX)
+    if enabled is not _OMITTED:
+        body["enabled"] = flag(enabled, "enabled")
+    if not body:
+        raise ValueError("an update must name at least one field to change")
+    return body
