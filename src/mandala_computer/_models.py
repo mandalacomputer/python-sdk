@@ -158,12 +158,13 @@ def _exact_int(value: Any) -> int | None:
         digits = text[len(sign) :]
         if not digits.isdecimal():
             return None
-        lead = 0
-        while lead < len(digits) - 1 and int(digits[lead]) == 0:
-            lead += 1
-        digits = digits[lead:]
         if len(digits) > _MAX_EXACT_DIGITS:
-            return None
+            lead = 0
+            while lead < len(digits) - 1 and int(digits[lead]) == 0:
+                lead += 1
+            digits = digits[lead:]
+            if len(digits) > _MAX_EXACT_DIGITS:
+                return None
         return int(sign + digits, 10)
     return None
 

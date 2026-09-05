@@ -239,7 +239,15 @@ def guest_pid(pid: object) -> int:
         digits = str.__str__(pid).strip()
         if not digits.isdecimal():
             raise ValueError(text)
-        number = int(digits)
+        try:
+            number = int(digits)
+        except ValueError:
+            # Past CPython's integer-string limit `int` raises with its own
+            # message about digit counts, which names neither this argument nor
+            # what it should have been. The limit is configurable down to 640,
+            # so the ceiling is the interpreter's rather than a number worth
+            # writing here (second review pass, OPL-4479).
+            raise ValueError(text) from None
     elif isinstance(pid, int):
         number = int.__index__(pid)
     else:

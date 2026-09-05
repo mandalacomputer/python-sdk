@@ -149,6 +149,20 @@ def test_a_pid_still_accepts_the_decimal_string_that_crosses_a_process() -> None
             A.guest_pid(bad)
 
 
+def test_an_oversized_pid_string_says_what_a_pid_should_be() -> None:
+    """The guard's own message, not CPython's about digit counts.
+
+    `isdecimal` admits a string of any length and `int` refuses one past its
+    integer-string limit, so an absurd pid raised out of the conversion with a
+    message naming neither the argument nor what it should have been. The limit
+    is configurable down to 640, so what matters is that the function answers
+    for its own contract, not the exact ceiling.
+    """
+    with pytest.raises(ValueError, match="pid must be a positive integer"):
+        A.guest_pid("0" * 5000)
+    assert A.guest_pid("0000004242") == 4242
+
+
 def test_a_duration_keeps_the_type_it_was_given() -> None:
     """Normalising must not turn ``wait(5)`` into ``5.0`` on the wire."""
     assert A.wait_body(5)["duration"] == 5
