@@ -170,8 +170,9 @@ def test_an_enormous_timestamp_is_false_not_an_exception(digits: int) -> None:
     Nothing here is forgeable — the MAC is never reached — but ``verify`` is
     documented to answer ``False`` for a malformed header, and an unbounded
     ``int()`` over an attacker-controlled string broke that in two places
-    (adversarial review, OPL-4478). At 309 digits the value no longer fits a
-    float and ``abs(clock - sent)`` raises ``OverflowError``; past 4300 the
+    (adversarial review, OPL-4478). From 309 digits the value can exceed what
+    a float holds and from 310 it always does, so ``abs(clock - sent)`` raises
+    ``OverflowError``; past 4300 the
     conversion itself raises ``ValueError`` on CPython's integer-string limit.
     Either one leaves a receiver answering 500 to a delivery it should have
     refused outright, which the platform then retries.
@@ -187,7 +188,7 @@ def test_an_enormous_timestamp_is_false_not_an_exception(digits: int) -> None:
 def test_the_timestamp_bound_is_on_arithmetic_not_on_plausibility() -> None:
     """Both sides of the bound, because the cheap fix is to over-tighten it.
 
-    Unix seconds are ten digits now and stay eleven until the year 33658, so a
+    Unix seconds are ten digits now and stay eleven until the year 5138, so a
     stamp far longer than any the platform will write must still be READ — what
     the bound exists to stop is the conversion that raises, not an implausible
     date, and a verifier that refused a wide clock would fail deliveries that

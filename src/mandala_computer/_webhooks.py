@@ -65,12 +65,13 @@ _SIGNATURE = "webhook-signature"
 
 #: The most digits a ``webhook-timestamp`` may carry and still be converted.
 #:
-#: Unix seconds are ten digits now and stay eleven until the year 33658, so
+#: Unix seconds are ten digits now and stay eleven until the year 5138, so
 #: twenty is room the platform will never need — and the bound is not about
 #: plausibility, it is about arithmetic. ``int()`` builds an integer of any
 #: size from this header, and the header is written by whoever can reach the
-#: receiver's endpoint: at 309 digits the value no longer fits a float, so
-#: ``abs(clock - sent)`` below raises ``OverflowError``, and past
+#: receiver's endpoint: from 309 digits the value can exceed what a float
+#: holds and from 310 it always does, so ``abs(clock - sent)`` below raises
+#: ``OverflowError``, and past
 #: 4300 digits ``int(value, 10)`` itself raises ``ValueError`` on CPython's
 #: integer-string conversion limit. Either one escapes :func:`verify`, whose
 #: whole contract is that a malformed header is ``False`` and never an
@@ -172,6 +173,12 @@ def verify(
     ``now`` is the receiver's clock in Unix seconds, for tests; it defaults to
     :func:`time.time`. ``tolerance`` is the replay window, defaulting to the
     platform's :data:`REPLAY_WINDOW_S`.
+
+    A ``webhook-id`` that is not ASCII is one of the malformed headers this
+    answers ``False`` to. The platform writes ``whd-`` and sixteen hex
+    characters, so nothing it sends is affected; the rule is stated because it
+    is stricter than the hazard it closes, which is only the id that cannot be
+    encoded at all.
 
     What this does not do, and a receiver still must: remember every
     ``webhook-id`` it accepts for at least the window, and refuse a repeat.
