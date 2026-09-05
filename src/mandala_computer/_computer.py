@@ -7,6 +7,7 @@ import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from typing import IO, Any
 
 from . import _api
@@ -282,7 +283,7 @@ def _continues(path: str, asked_from: int, part: FilePart, total_was: int | None
         )
 
 
-def _started_key(stamp: str) -> tuple[int, str]:
+def _started_key(stamp: str) -> tuple[int, float]:
     """``Move.started_at`` as something two of them can be ordered by.
 
     The raw string is not that, and the failure is narrow but real: RFC 3339
@@ -299,32 +300,70 @@ def _started_key(stamp: str) -> tuple[int, str]:
     changed hosts, so acting on an older row sends a resize at a computer that
     is somewhere else (adversarial review, OPL-4232).
 
-    Normalising the fraction away is enough only once the timezone suffix is
-    the same spelling: RFC 3339 writes UTC as both ``Z`` and ``+00:00``, and
-    ``'+'`` (43) precedes ``'Z'`` (90), so a later ``02:00:12.500+00:00``
-    sorts *before* an earlier ``02:00:12Z``. Everything to the left of the
-    fraction is then fixed-width and everything to the right is a decimal
-    expansion that already compares correctly. A stamp this cannot read sorts
-    oldest rather than raising — this runs on a listing, and one unreadable
-    row must not cost the caller the other one.
+    Text cannot carry that comparison, and every repair of the text is a repair
+    of one spelling. Normalising the fraction is enough only once the zone
+    suffix agrees, because RFC 3339 writes UTC as both ``Z`` and ``+00:00`` and
+    ``'+'`` (43) precedes ``'Z'`` (90). Agreeing the suffix is in turn enough
+    only while every stamp is UTC: at two real offsets the text orders by the
+    offset rather than by the instant, so ``09:00+02:00`` sorted after
+    ``08:00-05:00`` when those are 07:00Z and 13:00Z, and ``max`` handed back
+    the older row.
+
+    So the key is the INSTANT. The POSIX timestamp of the parsed stamp orders
+    correctly across every offset and fraction at once, with no spelling left
+    to repair. A stamp carrying no offset is read as UTC, which is what the
+    platform writes and what every other reader of these stamps assumes; the
+    alternative — treating a well-formed local stamp as undateable — would sort
+    a row oldest for a property that says nothing about its age.
+
+    The fraction is padded to microseconds BEFORE parsing, because on 3.10
+    ``fromisoformat`` reads only what ``isoformat`` writes: exactly three or
+    six fractional digits. Go's ``RFC3339Nano`` trims trailing zeros, so
+    ``.5`` and ``.123456789`` both reach this and both raise there — and a
+    stamp that lands in the fallback sorts OLDEST, which on the newest row is
+    worse than the text key this replaces. 3.11 relaxed the parser; the padding
+    is what keeps 3.10 reading the same stamps (second review pass, OPL-4480).
+
+    The key is a pair and stops at the instant: :meth:`ComputerFields._my_move`
+    breaks ties on POSITION, which is the platform's own order, and any third
+    element here would decide before it ever got the chance — putting the raw
+    text there let ``02:00:12Z`` beat ``02:00:12+00:00`` on ``'Z' > '+'`` and
+    hand back the older row, which is this key's whole reason for existing.
+
+    A stamp this cannot read sorts oldest rather than raising: this runs on a
+    listing, and one unreadable row must not cost the caller the other one
+    (adversarial review, OPL-4480).
     """
     # Tier 0 is everything that is not a stamp at all — empty, or text that does
     # not begin the way one does. It sorts OLDEST, so a row nobody can date never
     # displaces a row that can be: `max` here is choosing what to hand the
     # caller, and an unreadable stamp is not evidence of being recent.
     if not stamp[:1].isdigit():
-        return (0, stamp)
-    # ``Z`` and ``+00:00`` are the same instant. Rewrite before the fraction
-    # move so a mixed listing in one second still orders by time.
-    if stamp.endswith("Z"):
-        stamp = stamp[:-1] + "+00:00"
-    head, dot, rest = stamp.partition(".")
-    if not dot:
-        return (1, stamp)
-    # Put the zone back on the whole-second stamp, so a fractional row and a
-    # whole one in the same second differ only by the fraction that follows.
-    zone = rest.lstrip("0123456789")
-    return (1, head + zone + "." + rest[: len(rest) - len(zone)])
+        return (0, 0.0)
+    # `fromisoformat` learned `Z` in 3.11; the rewrite keeps 3.10 reading it.
+    text = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+    head, dot, rest = text.partition(".")
+    digits = rest[: len(rest) - len(rest.lstrip("0123456789"))] if dot else ""
+    if dot and not digits:
+        # A separator with nothing after it is not a fraction, and this refuses
+        # it here rather than leaving it to the parser. `fromisoformat` reads
+        # `…12.+00:00` on 3.10 through 3.12 and rejects it from 3.13, so
+        # delegating would make the same malformed stamp readable on some of
+        # this package's supported versions and unreadable on the rest — which
+        # CI caught across the matrix and no single interpreter could
+        # (third review pass, OPL-4480).
+        return (0, 0.0)
+    if digits:
+        # Padding is gated on the DIGITS: `.000000` for an absent fraction
+        # would promote a malformed stamp to a dated one that can win `max`.
+        text = f"{head}.{(digits + '000000')[:6]}{rest[len(digits) :]}"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return (0, 0.0)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (1, when.timestamp())
 
 
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -419,24 +458,40 @@ def _clipboard_text(data: Mapping[str, Any]) -> str:
     return text
 
 
+def _non_negative(number: int, message: str) -> int:
+    """``number``, or ``MandalaError`` if it is below zero."""
+    if number < 0:
+        raise MandalaError(message)
+    return number
+
+
 def _require_whole(value: object, message: str) -> int:
     """A whole number off the wire, or MandalaError.
 
-    ``int()`` truncates towards zero, and for the fields that call this ``0``
-    is a real answer — never suspend, nothing deleted — so a fraction becoming
-    ``0`` is the misread the call sites exist to refuse.
+    ``int()`` truncates towards zero, and for two of the fields that call this
+    ``0`` is a real answer — never suspend, nothing deleted — so a fraction
+    becoming ``0`` is the misread those call sites exist to refuse. The third,
+    a background command's pid, has no use for ``0`` either way and is guarded
+    before it ever gets here.
+
+    A negative is refused for the same reason and by the same argument. Every
+    caller asks a quantity that has no negative reading — how many snapshots
+    were destroyed, how many minutes a machine may idle — so ``-1`` is not a
+    small answer, it is an unusable one, and reporting it as a count or a
+    duration is the misread this function exists to stop one line short of
+    (adversarial review, OPL-4480).
     """
     if isinstance(value, bool):
         raise MandalaError(message)
     if isinstance(value, int):
-        return value
+        return _non_negative(value, message)
     if isinstance(value, float):
         if not math.isfinite(value) or value != int(value):
             raise MandalaError(message)
-        return int(value)
+        return _non_negative(int(value), message)
     if isinstance(value, str):
         try:
-            return int(value)
+            return _non_negative(int(value), message)
         # `OverflowError` for the reason `_cursor` gives: a builtin escaping
         # here reports a successful call as a failure, and the obvious
         # response to that is to try again (OPL-4232).
@@ -467,6 +522,13 @@ def _require_background_pid(data: Mapping[str, Any]) -> None:
     """Reject a successful start response that cannot identify its command."""
     raw = data.get("pid")
     try:
+        # A fraction is refused rather than truncated. `int(3.9)` is 3, and a
+        # handle built on it addresses a DIFFERENT guest process — so `kill()`
+        # is a side effect on the wrong target, which is worse than the
+        # misreported number `_require_whole` refuses for the sibling field
+        # (adversarial review, OPL-4480).
+        if isinstance(raw, float) and (not math.isfinite(raw) or raw != int(raw)):
+            raise ValueError(raw)
         pid = 0 if raw is None else int(raw)
     # `OverflowError` for the reason `_cursor` gives. Like the delete count, the
     # side effect has already happened: the command is running in the guest, so
@@ -2765,8 +2827,15 @@ class BackgroundCommandFields:
 
     @property
     def pid(self) -> int:
-        """The guest pid, which is this command's identity on the API."""
-        return int(self._data.get("pid", 0))
+        """The guest pid, which is this command's identity on the API.
+
+        `_require_background_pid` has already refused anything this cannot
+        read, so the conversion here is the same one it made rather than a
+        second, looser one: a fraction that reached this point would truncate
+        into a handle addressing another process.
+        """
+        raw = self._data.get("pid", 0)
+        return _require_whole(raw, "exec start answered without a positive pid")
 
     @property
     def command(self) -> str:

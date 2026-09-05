@@ -25,6 +25,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer import _computer
 
 BASE = "https://api.test/api/v1"
 
@@ -493,3 +494,87 @@ def test_an_undateable_row_never_displaces_one_that_can_be_dated() -> None:
     picked = c._my_move(listing)
     assert picked is not None
     assert picked.state == "done"
+
+
+def test_two_moves_at_different_offsets_order_by_instant_not_by_offset() -> None:
+    """The key is the instant, because every repair of the TEXT is one spelling.
+
+    `09:00+02:00` is 07:00Z and `08:00-05:00` is 13:00Z, so the second is an
+    hour of the clock earlier and six hours of the world later. Compared as
+    text the offset decides and `max` hands back the older row — the exact
+    misread `_my_move` uses this key to prevent, since `moved` means the machine
+    HAS changed hosts and acting on a stale row sends a resize somewhere else
+    (adversarial review, OPL-4480).
+    """
+    earlier = "2026-08-23T09:00:00+02:00"  # 07:00Z
+    later = "2026-08-23T08:00:00-05:00"  # 13:00Z
+
+    assert _computer._started_key(later) > _computer._started_key(earlier)
+    assert max((earlier, later), key=_computer._started_key) == later
+
+
+def test_the_instant_key_keeps_every_ordering_the_text_key_earned() -> None:
+    """The spellings the old key was built to reconcile still reconcile."""
+    key = _computer._started_key
+
+    # Z and +00:00 are one instant, however they are written.
+    assert key("2026-08-23T02:00:12Z")[1] == key("2026-08-23T02:00:12+00:00")[1]
+    # A fraction is later than the whole second it follows, not earlier.
+    assert key("2026-08-23T02:00:12.999Z") > key("2026-08-23T02:00:12Z")
+    assert key("2026-08-23T02:00:12.500+00:00") > key("2026-08-23T02:00:12Z")
+    # A stamp nobody can date is not evidence of being recent.
+    assert key("nope")[0] == 0
+    assert key("")[0] == 0
+    assert key("2026-13-45T99:99:99Z")[0] == 0
+    assert key("2026-08-23T02:00:12Z") > key("nope")
+    # No offset reads as UTC rather than as undateable.
+    assert key("2026-08-23T02:00:12")[1] == key("2026-08-23T02:00:12Z")[1]
+
+
+def test_a_fraction_of_any_length_is_still_a_readable_stamp() -> None:
+    """Go's RFC3339Nano trims trailing zeros, so the length is not fixed.
+
+    On 3.10 `fromisoformat` reads only what `isoformat` writes — exactly three
+    or six fractional digits — so `.5` and `.123456789` raise there and fall to
+    the tier that sorts OLDEST, which on the newest row is worse than the text
+    key this replaced. 3.11 relaxed the parser, so it is CI's 3.10 job that
+    makes this test bite; the padding is what keeps the two agreeing
+    (second review pass, OPL-4480).
+    """
+    key = _computer._started_key
+    whole = key("2026-08-23T02:00:12Z")
+
+    for fraction in (".5", ".50", ".500", ".123456", ".123456789"):
+        stamp = f"2026-08-23T02:00:12{fraction}Z"
+        assert key(stamp)[0] == 1, f"{stamp} fell through to the unreadable tier"
+        assert key(stamp) > whole, f"{stamp} did not sort after the whole second"
+
+    # The same instant however its fraction is spelled.
+    assert key("2026-08-23T02:00:12.5Z") == key("2026-08-23T02:00:12.500Z")
+
+    # A separator with nothing after it is not a fraction, and the answer must
+    # not depend on which interpreter is running: `fromisoformat` reads
+    # `…12.+00:00` on 3.10 through 3.12 and rejects it from 3.13, so the same
+    # malformed stamp was readable on half this package's supported versions
+    # until `_started_key` decided it rather than the parser. CI found that
+    # across the matrix; no single interpreter could have.
+    for malformed in (
+        "2026-08-23T02:00:12.",
+        "2026-08-23T02:00:12.Z",
+        "2026-08-23T02:00:12.+00:00",
+    ):
+        assert key(malformed)[0] == 0, f"{malformed} was read as a dated stamp"
+
+
+def test_the_key_leaves_ties_to_position() -> None:
+    """`_my_move` breaks ties on POSITION, and a third element would pre-empt it.
+
+    Two rows at one instant spelled differently must produce ONE key, so the
+    `-i` in `_my_move` decides and the platform's own order stands. Carrying the
+    raw text here let `02:00:12Z` beat `02:00:12+00:00` on `'Z' > '+'` and hand
+    back the older row — this key's whole reason for existing.
+    """
+    key = _computer._started_key
+    assert key("2026-08-23T02:00:12Z") == key("2026-08-23T02:00:12+00:00")
+    assert len(key("2026-08-23T02:00:12Z")) == 2
+    assert key("nope") == key("also nope")
