@@ -158,8 +158,12 @@ def test_an_oversized_pid_string_says_what_a_pid_should_be() -> None:
     is configurable down to 640, so what matters is that the function answers
     for its own contract, not the exact ceiling.
     """
+    # Nines rather than zeros so the guard under test is the only thing that
+    # can refuse this: `int("0" * 5000)` is 0 where the conversion limit is
+    # lifted, and `number <= 0` would reject it without the new handler ever
+    # running, leaving the test green against the old code.
     with pytest.raises(ValueError, match="pid must be a positive integer"):
-        A.guest_pid("0" * 5000)
+        A.guest_pid("9" * 5000)
     assert A.guest_pid("0000004242") == 4242
 
 

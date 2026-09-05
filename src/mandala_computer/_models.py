@@ -135,10 +135,12 @@ def _exact_int(value: Any) -> int | None:
     (adversarial review, OPL-4479). ``isdecimal`` is the predicate that matches
     what ``int()`` accepts, Unicode decimal digits and all.
 
-    Leading zeros go before both the bound and the conversion. They carry no
-    magnitude but they do count against the conversion limit
-    :data:`_MAX_EXACT_DIGITS` exists to stay under, so ``"0" * 5000 + "1"`` is
-    ``1`` here rather than another ``ValueError``.
+    Leading zeros come off before the bound is applied. They carry no magnitude
+    but they do count against the conversion limit :data:`_MAX_EXACT_DIGITS`
+    exists to stay under, so ``"0" * 5000 + "1"`` is ``1`` here rather than
+    another ``ValueError``. Only a string over the bound is stripped at all —
+    below it there is no padding to keep off a limit it already clears, and the
+    conversion reads the same number either way.
 
     They are stripped by VALUE and not by character, because ``isdecimal``
     admits every decimal script and ``str.lstrip("0")`` knows only the ASCII
@@ -159,10 +161,15 @@ def _exact_int(value: Any) -> int | None:
         if not digits.isdecimal():
             return None
         if len(digits) > _MAX_EXACT_DIGITS:
-            lead = 0
-            while lead < len(digits) - 1 and int(digits[lead]) == 0:
-                lead += 1
-            digits = digits[lead:]
+            lean = digits.lstrip("0")
+            if len(lean) == len(digits):
+                # Nothing came off, so any padding here belongs to another
+                # script and has to be measured a character at a time.
+                lead = 0
+                while lead < len(digits) - 1 and int(digits[lead]) == 0:
+                    lead += 1
+                lean = digits[lead:]
+            digits = lean or "0"
             if len(digits) > _MAX_EXACT_DIGITS:
                 return None
         return int(sign + digits, 10)
