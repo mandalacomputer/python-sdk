@@ -481,6 +481,37 @@ def test_agent_once_reads_a_result_that_names_no_error(
     assert result.finished and result.text == "all set"
 
 
+@respx.mock
+@pytest.mark.parametrize("empty", [None, ""], ids=["null", "blank"])
+def test_a_failure_that_names_no_error_still_raises_on_its_status(
+    computer: mc.Computer, empty: str | None
+) -> None:
+    """The other side of reading the value: an empty error is not always success.
+
+    A run that dies behind the platform is reported with a status and, where
+    the last-resort handler cannot name the cause, no error text — which is
+    exactly why `to_agent_event` carries a "the run failed" fallback. A result
+    body never carries a status, so the status is what tells the two empty-error
+    shapes apart. Answering this one with a hollow `AgentResult` would drop a
+    real failure AND the usage it was already billed for.
+    """
+    respx.post(AGENT).mock(
+        httpx.Response(
+            200,
+            json={
+                "error": empty,
+                "status": 429,
+                "usage": {"input_tokens": 900},
+                "steps": [{"n": 1}],
+            },
+        )
+    )
+    with pytest.raises(mc.RateLimitError, match="after 1 step: the run failed") as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is not None
+    assert error.value.agent.usage.input_tokens == 900
+
+
 # --- forward compatibility -------------------------------------------------
 
 

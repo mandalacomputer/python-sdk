@@ -161,8 +161,17 @@ def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
     converter's own last-resort "the run failed", since there is no error text
     to report — and would discard the :class:`AgentResult` that was in the same
     body. A run that names no error did not fail. (OPL-4480)
+
+    ``status`` is the other half of that reading, and the reason an empty
+    ``error`` cannot decide it alone. A run that died behind the platform is
+    reported with a status and, where the last-resort handler cannot name the
+    cause, no error text — the very case ``to_agent_event`` supplies "the run
+    failed" for. A result body never carries a status, so a status is positive
+    evidence of failure: testing only ``error`` would answer a 502 or a 429
+    with a hollow :class:`AgentResult` instead of raising, and lose the usage
+    figure on ``error.agent`` with it.
     """
-    if not data.get("error"):
+    if not data.get("error") and data.get("status") is None:
         return AgentResult.from_api(data)
     failure = to_agent_event("error", data, 0)
     if not isinstance(failure, AgentFailed):  # defensive: the converter owns this shape
