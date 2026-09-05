@@ -218,6 +218,12 @@ def is_platform_checkout(directory: Path) -> bool:
 def named_platform_repo() -> Path | None:
     """The directory ``MANDALA_PLATFORM_REPO`` names, or ``None`` when it is unset.
 
+    Set and empty is not unset. A variable that failed to expand is the case
+    this whole distinction exists for, and in a shell — in the platform's CI
+    workflow especially — that arrives as an empty string rather than an absent
+    key. Reading it as "no variable" would put the failure that motivated
+    OPL-4512 back on the silent path; the caller reports it instead.
+
     Normalized against :data:`REPO` the way the sibling guesses are. Left as
     given, a relative value names a different directory depending on where the
     script was invoked from, and the paths this prints would be one relative
@@ -225,7 +231,16 @@ def named_platform_repo() -> Path | None:
     meant rather than the one that was searched.
     """
     value = os.environ.get("MANDALA_PLATFORM_REPO")
-    return Path(os.path.normpath(REPO / value)) if value else None
+    if value is None:
+        return None
+    named = value.strip()
+    if not named:
+        raise SystemExit(
+            "check-surface — MANDALA_PLATFORM_REPO is set and empty, which names no\n"
+            "  directory: a path that failed to expand looks exactly like this.\n"
+            "  Point it at a platform checkout, or unset it to skip the comparison."
+        )
+    return Path(os.path.normpath(REPO / named))
 
 
 def platform_repo() -> Path | None:

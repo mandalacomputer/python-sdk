@@ -109,7 +109,6 @@ def test_a_clone_of_an_unrelated_repository_is_not_the_platform(
     check_surface: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Identity widens recognition; it does not hand the name to a neighbour."""
     other = _clone_of(
@@ -259,6 +258,28 @@ def test_a_variable_pointing_at_no_checkout_fails_instead_of_looking_elsewhere(
     assert str(absent) in message
     assert str(check_surface.SURFACE) in message
     assert str(sibling) not in message
+
+
+def test_a_variable_set_and_empty_is_not_read_as_no_variable(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failed expansion, which is the case this ticket is actually about.
+
+    `MANDALA_PLATFORM_REPO: ${{ github.workspace }}/platform` that does not
+    expand leaves an empty string, not an absent key — so reading empty as unset
+    would hand exactly that failure back to the sibling search it came from.
+    """
+    sibling = _platform_without(check_surface, tmp_path / "next-door", Path("nothing/is/missing"))
+    monkeypatch.setattr(check_surface, "REPO", sibling.parent / "sdk")
+    monkeypatch.setattr(check_surface, "SIBLINGS", (sibling.name,))
+
+    for value in ("", "  "):
+        monkeypatch.setenv("MANDALA_PLATFORM_REPO", value)
+        with pytest.raises(SystemExit) as exit_info:
+            check_surface.platform_repo()
+        assert str(sibling) not in str(exit_info.value)
 
 
 def test_the_variable_is_read_relative_to_the_repository_not_the_caller(
