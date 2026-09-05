@@ -6,7 +6,10 @@
 exist: a client calling a route the server does not expose fails in a user's
 hands rather than here. But a mirror nobody compares is a comment. This does the
 comparison whenever the platform repo happens to be checked out — next door by
-default, or wherever ``MANDALA_PLATFORM_REPO`` points.
+default, or wherever ``MANDALA_PLATFORM_REPO`` points. That variable is an
+assertion rather than a hint: set to a path that does not hold a checkout, this
+says so and exits 1 instead of quietly comparing against a neighbour or
+skipping (OPL-4512).
 
 Not having the script is how three routes went missing. ``GET`` and ``DELETE
 computers/:id/exec/:pid`` (OPL-3584) and ``GET computers/:id/snapshots``
@@ -145,8 +148,9 @@ PLATFORM_MARKERS = (SURFACE, APIDOC)
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
-#: ``MANDALA_PLATFORM_REPO`` is the way to point at a checkout that is called
-#: something else, or lives elsewhere.
+#: Guesses, which is why they are allowed to miss: ``MANDALA_PLATFORM_REPO`` is
+#: the way to point at a checkout that is called something else or lives
+#: elsewhere, and being told a path is not the same as guessing one.
 SIBLINGS = ("mandala-computer",)
 
 
@@ -211,14 +215,51 @@ def is_platform_checkout(directory: Path) -> bool:
     )
 
 
+def named_platform_repo() -> Path | None:
+    """The directory ``MANDALA_PLATFORM_REPO`` names, or ``None`` when it is unset.
+
+    Normalized against :data:`REPO` the way the sibling guesses are. Left as
+    given, a relative value names a different directory depending on where the
+    script was invoked from, and the paths this prints would be one relative
+    entry beside two absolute ones — which reads as the directory the operator
+    meant rather than the one that was searched.
+    """
+    value = os.environ.get("MANDALA_PLATFORM_REPO")
+    return Path(os.path.normpath(REPO / value)) if value else None
+
+
 def platform_repo() -> Path | None:
-    """Where the platform is checked out, if it is."""
-    candidates = [
-        Path(p)
-        for p in (os.environ.get("MANDALA_PLATFORM_REPO"), *(REPO.parent / s for s in SIBLINGS))
-        if p
-    ]
-    return next((d for d in candidates if is_platform_checkout(d)), None)
+    """Where the platform is checked out, if it is.
+
+    ``MANDALA_PLATFORM_REPO`` is an assertion and the siblings are guesses, so
+    the two get different treatment: a path that turns out not to hold the
+    platform is a mistake to report rather than a repo to go looking for
+    elsewhere. Falling through to the siblings has two outcomes and both are
+    silent — nothing next door, so "not found, skipping" at exit 0; something
+    next door, so a green answer about a checkout nobody named.
+
+    Which matters most where this gate is actually enforced: the platform's own
+    CI sets this variable for three SDKs at once (OPL-3916), so a checkout path
+    that moves or a variable that fails to expand would otherwise be
+    indistinguishable from "no platform here" — three green no-ops over three
+    surface mirrors nobody compared, on the one run that compares them.
+
+    Unset stays a search: the siblings, then a skip at exit 0 when there is
+    none, which is the ordinary case in this repository's CI and not something
+    to fail over.
+    """
+    named = named_platform_repo()
+    if named is not None:
+        if not is_platform_checkout(named):
+            markers = " and ".join(str(marker) for marker in PLATFORM_MARKERS)
+            raise SystemExit(
+                f"check-surface — MANDALA_PLATFORM_REPO is set to {named},\n"
+                f"  which is no checkout of {PLATFORM_REMOTE}: no remote there names it,\n"
+                f"  and it does not hold {markers}.\n"
+                "  Point it at a platform checkout, or unset it to skip the comparison."
+            )
+        return named
+    return next((d for d in (REPO.parent / s for s in SIBLINGS) if is_platform_checkout(d)), None)
 
 
 def missing_mirror_sources(platform: Path) -> list[Path]:
@@ -482,10 +523,13 @@ def parameter_drift(upstream: dict[str, set[str]], mirror: dict[str, set[str]]) 
 def main() -> int:
     platform = platform_repo()
     if platform is None:
+        # Only ever the unset case now: a path that was named and is not a
+        # checkout has already exited 1 from `platform_repo`, so this no longer
+        # claims to have looked somewhere the operator pointed.
+        looked = ", ".join(str(REPO.parent / sibling) for sibling in SIBLINGS)
         print(
             "check-surface — platform repo not found, skipping.\n"
-            f"  Looked for a clone of {PLATFORM_REMOTE} in $MANDALA_PLATFORM_REPO\n"
-            f"  and next to {REPO.name}.\n"
+            f"  Looked for a clone of {PLATFORM_REMOTE} in: {looked or '(nowhere)'}\n"
             f"  Set MANDALA_PLATFORM_REPO to compare against {SURFACE}."
         )
         return 0
