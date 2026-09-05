@@ -3174,6 +3174,25 @@ def test_a_zero_padded_exit_code_is_read_exactly_rather_than_refused() -> None:
     assert mc.ExecResult.from_api({"exit_code": "0" * 5000}).exit_code == 0
 
 
+def test_padding_is_stripped_by_value_so_every_decimal_script_reads_alike() -> None:
+    """`isdecimal` admits every script; `str.lstrip("0")` knows only ASCII.
+
+    Stripping by character left an Arabic-Indic zero-padded number over the
+    digit bound and refused — and a refusal falls through to `float`, which
+    holds a finite `1e20` for it. So the padding alone decided whether a number
+    came back exact or silently rounded, and the same value read two ways
+    depending on which script wrote its zeros. The bound is about magnitude, and
+    a zero has none in any script.
+    """
+    ascii_padded = "0" * 400 + "9" * 20
+    arabic_padded = "\u0660" * 400 + "\u0669" * 20
+    exact = int(ascii_padded)
+
+    assert mc.ExecResult.from_api({"exit_code": ascii_padded}).exit_code == exact
+    assert mc.ExecResult.from_api({"exit_code": arabic_padded}).exit_code == exact
+    assert mc.ExecResult.from_api({"exit_code": "\u0660" * 50}).exit_code == 0
+
+
 # --- 429 is its own answer -------------------------------------------------
 
 

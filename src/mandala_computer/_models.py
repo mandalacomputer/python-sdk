@@ -139,6 +139,16 @@ def _exact_int(value: Any) -> int | None:
     magnitude but they do count against the conversion limit
     :data:`_MAX_EXACT_DIGITS` exists to stay under, so ``"0" * 5000 + "1"`` is
     ``1`` here rather than another ``ValueError``.
+
+    They are stripped by VALUE and not by character, because ``isdecimal``
+    admits every decimal script and ``str.lstrip("0")`` knows only the ASCII
+    one. Stripping by character left an Arabic-Indic ``"٠" * 400 + "٩" * 20``
+    padded, over the bound, and refused — and a refusal here falls through to
+    ``float``, which answers a finite ``1e20`` for it. The bound's whole
+    premise is that what it turns down is too large for ``float`` to hold, so
+    that padding turned an exactly readable number into a silently rounded one,
+    and made the same value decode two ways depending on which script wrote its
+    zeros (second review pass, OPL-4479).
     """
     if isinstance(value, int) and not isinstance(value, bool):
         return value
@@ -148,7 +158,10 @@ def _exact_int(value: Any) -> int | None:
         digits = text[len(sign) :]
         if not digits.isdecimal():
             return None
-        digits = digits.lstrip("0") or "0"
+        lead = 0
+        while lead < len(digits) - 1 and int(digits[lead]) == 0:
+            lead += 1
+        digits = digits[lead:]
         if len(digits) > _MAX_EXACT_DIGITS:
             return None
         return int(sign + digits, 10)
