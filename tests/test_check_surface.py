@@ -109,7 +109,6 @@ def test_a_clone_of_an_unrelated_repository_is_not_the_platform(
     check_surface: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Identity widens recognition; it does not hand the name to a neighbour."""
     other = _clone_of(
@@ -117,9 +116,12 @@ def test_a_clone_of_an_unrelated_repository_is_not_the_platform(
     )
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(other))
 
-    assert check_surface.platform_repo() is None
-    assert check_surface.main() == 0
-    assert "platform repo not found, skipping" in capsys.readouterr().out
+    assert check_surface.is_platform_checkout(other) is False
+    # And, being a directory somebody named rather than one this guessed at, it
+    # is reported rather than passed over.
+    with pytest.raises(SystemExit) as exit_info:
+        check_surface.platform_repo()
+    assert str(other) in str(exit_info.value)
 
 
 def test_a_copy_git_cannot_vouch_for_is_still_recognized_by_its_files(
@@ -149,7 +151,9 @@ def test_a_directory_inside_a_repository_does_not_borrow_its_identity(
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(inside))
 
     assert check_surface.remotes(inside) == frozenset()
-    assert check_surface.platform_repo() is None
+    assert check_surface.is_platform_checkout(inside) is False
+    with pytest.raises(SystemExit):
+        check_surface.platform_repo()
 
 
 def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
@@ -209,14 +213,93 @@ def test_a_recognized_checkout_missing_agent_ts_fails_instead_of_skipping(
 
 def test_a_genuinely_absent_platform_checkout_still_skips_cleanly(
     check_surface: ModuleType,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    absent = tmp_path / "not-a-platform-checkout"
-    absent.mkdir()
-    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(absent))
+    """No variable and no sibling: the ordinary case, and not a failure.
+
+    This is what CI on this repository looks like, and what most laptops look
+    like. Failing over it would make the check something people learn to ignore.
+    """
+    monkeypatch.delenv("MANDALA_PLATFORM_REPO", raising=False)
 
     assert check_surface.platform_repo() is None
     assert check_surface.main() == 0
     assert "platform repo not found, skipping" in capsys.readouterr().out
+
+
+def test_a_variable_pointing_at_no_checkout_fails_instead_of_looking_elsewhere(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPL-4512: the assertion the siblings used to swallow.
+
+    A set-but-wrong value fell through to the sibling search, and both outcomes
+    were silent: nothing next door meant "not found, skipping" at exit 0, and
+    something next door meant a green answer about a repository the operator did
+    not name. The platform's CI sets this variable for three SDKs at once, so a
+    path that moves is otherwise indistinguishable from "no platform here" on
+    the one run where the comparison is enforced.
+    """
+    absent = tmp_path / "not-a-platform-checkout"
+    absent.mkdir()
+    # A sibling that would answer, so the failure is the variable being wrong
+    # rather than there being nothing else to find.
+    sibling = _platform_without(check_surface, tmp_path / "next-door", Path("nothing/is/missing"))
+    monkeypatch.setattr(check_surface, "REPO", sibling.parent / "sdk")
+    monkeypatch.setattr(check_surface, "SIBLINGS", (sibling.name,))
+    assert check_surface.platform_repo() == sibling
+
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(absent))
+    with pytest.raises(SystemExit) as exit_info:
+        check_surface.platform_repo()
+    message = str(exit_info.value)
+    assert str(absent) in message
+    assert str(check_surface.SURFACE) in message
+    assert str(sibling) not in message
+
+
+def test_a_variable_set_and_empty_is_not_read_as_no_variable(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failed expansion, which is the case this ticket is actually about.
+
+    `MANDALA_PLATFORM_REPO: ${{ github.workspace }}/platform` that does not
+    expand leaves an empty string, not an absent key — so reading empty as unset
+    would hand exactly that failure back to the sibling search it came from.
+    """
+    sibling = _platform_without(check_surface, tmp_path / "next-door", Path("nothing/is/missing"))
+    monkeypatch.setattr(check_surface, "REPO", sibling.parent / "sdk")
+    monkeypatch.setattr(check_surface, "SIBLINGS", (sibling.name,))
+
+    for value in ("", "  "):
+        monkeypatch.setenv("MANDALA_PLATFORM_REPO", value)
+        with pytest.raises(SystemExit) as exit_info:
+            check_surface.platform_repo()
+        assert str(sibling) not in str(exit_info.value)
+
+
+def test_the_variable_is_read_relative_to_the_repository_not_the_caller(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative value names one directory, wherever the script was run from.
+
+    The sibling guesses are built from :data:`REPO`; a value left as given would
+    be read against the working directory instead, so the same setting would
+    mean two different checkouts depending on where the check was invoked.
+    """
+    platform = _platform_without(check_surface, tmp_path, missing=Path("nothing/is/missing"))
+    monkeypatch.setattr(check_surface, "REPO", tmp_path / "sdk")
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", "../platform")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert check_surface.named_platform_repo() == platform
+    assert check_surface.platform_repo() == platform
