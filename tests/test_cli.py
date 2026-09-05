@@ -1466,7 +1466,9 @@ def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:
     # reintroducing the print is the regression and it would not fail anything
     # else in this suite.
     assert _cli._exit_code('{"type":"exit"}') == 255
-    assert capsys.readouterr().err == ""
+    # BOTH streams: a reintroduced `print` defaults to stdout, which staircases
+    # in raw mode exactly as stderr does, and `readouterr()` drains the pair.
+    assert capsys.readouterr() == ("", "")
 
 
 def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> None:

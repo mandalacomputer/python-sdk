@@ -2007,10 +2007,23 @@ _orphan_shutdowns: set[asyncio.Task[None]] = set()
 def _shut_orphan(connecting: asyncio.Task[Any]) -> None:
     """Close a socket a connect task handed back after nobody was waiting.
 
-    Only reachable from :func:`_drained`'s re-raise: the task was cancelled,
-    absorbed it, and completed anyway, after the frame that would have shut the
-    socket had already unwound. Best effort by construction — the loop may be
-    closing, and there is no one left to report to.
+    Two call sites reach this, and the task is in a different state at each.
+    From :func:`_drained`'s re-raise it was cancelled, absorbed it, and
+    completed anyway. From ``_open``'s ``except BaseException`` it was never
+    cancelled at all — ``asyncio.wait`` does not cancel its children, so a
+    cancel arriving as the handshake completes finds it already DONE and the
+    ``cancel()`` that follows is a no-op. What the two share is the only thing
+    this needs: a task that will produce a live socket with nobody left to
+    receive it.
+
+    Best effort by construction. If the cancel is the LOOP'S teardown —
+    ``asyncio.run`` cancelling what is left — this runs from ``call_soon``
+    after that gather has finished, so the shutdown task is created and never
+    stepped: the socket stays open, its entry is never discarded, and the
+    interpreter says "Task was destroyed but it is pending". Nothing here can
+    prevent that, because closing a websocket needs a loop that will still run
+    work and there is none; the process is on its way out, which is what makes
+    it bearable rather than what makes it right (third review pass, OPL-4479).
     """
     if connecting.cancelled() or connecting.exception() is not None:
         return

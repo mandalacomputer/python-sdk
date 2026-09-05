@@ -1902,6 +1902,82 @@ async def test_the_connect_drain_absorbs_its_own_cancel_and_no_one_elses() -> No
     assert theirs.callbacks == [_events._shut_orphan]
 
 
+class _LateSock:
+    """A socket whose close SUSPENDS, as the real one does."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        await asyncio.sleep(0)
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_a_late_socket_is_shut_and_the_shutdown_is_held_until_it_finishes() -> None:
+    """Creating the shutdown is not enough; something has to keep it alive.
+
+    The loop holds only a WEAK reference to a running task, so a shutdown
+    suspended inside `close()` — websockets waits for the peer's close frame —
+    can be collected mid-flight, leaving open the socket this exists to shut.
+    The module holds it until it is done, and lets go afterwards so the set
+    cannot grow without bound (third review pass, OPL-4479).
+    """
+    sock = _LateSock()
+
+    async def connected() -> Any:
+        return sock
+
+    task = asyncio.ensure_future(connected())
+    await task
+    assert not _events._orphan_shutdowns
+
+    _events._shut_orphan(task)
+    assert _events._orphan_shutdowns, "the shutdown is only weakly held by the loop"
+
+    await asyncio.sleep(0.05)
+    assert sock.closed
+    assert not _events._orphan_shutdowns, "and is released once it has finished"
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_as_the_handshake_lands_still_shuts_the_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`asyncio.wait` does not cancel its children, so `cancel()` can be a no-op.
+
+    A cancellation arriving just as the connect completes finds the task
+    already DONE: `connecting.cancel()` returns False, `_open` unwinds, and the
+    live socket it produced is never closed and never even retrieved. The
+    reclaim has to be registered before that `raise`, not only in the drain
+    below it (third review pass, OPL-4479).
+    """
+    sock = _LateSock()
+
+    async def aconnect(url: str, **kw: Any) -> Any:
+        return sock
+
+    async def wait_until_it_is_too_late(tasks: Any, **kw: Any) -> Any:
+        # Let the connect finish, so the cancel below lands on a DONE task —
+        # the state in which `cancel()` cannot help.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(_events, "_aconnect", aconnect)
+    monkeypatch.setattr(_events.asyncio, "wait", wait_until_it_is_too_late)
+
+    async def url(budget: float) -> str:
+        return "wss://events.test/?token=SECRET"
+
+    stream = mc.AsyncEventStream(url, "vm-1", reconnect=False, connect_timeout=15)
+    with pytest.raises(asyncio.CancelledError):
+        await stream._open()
+
+    await asyncio.sleep(0.05)
+    assert sock.closed, "the socket the cancelled handshake produced was left open"
+
+
 # --- file.changed: a stream option, not a type to filter for -----------------
 #
 # The nomination is what makes this half exist at all, so most of what is
