@@ -2000,6 +2000,86 @@ class EventStream(_StreamBase):
 _TIMED_OUT = object()
 
 
+#: Strong references to in-flight orphan shutdowns; see :func:`_shut_orphan`.
+_orphan_shutdowns: set[asyncio.Task[None]] = set()
+
+
+def _shut_orphan(connecting: asyncio.Task[Any]) -> None:
+    """Close a socket a connect task handed back after nobody was waiting.
+
+    Two call sites reach this, and the task is in a different state at each.
+    From :func:`_drained`'s re-raise it was cancelled, absorbed it, and
+    completed anyway. From ``_open``'s ``except BaseException`` it was never
+    cancelled at all — ``asyncio.wait`` does not cancel its children, so a
+    cancel arriving as the handshake completes finds it already DONE and the
+    ``cancel()`` that follows is a no-op. What the two share is the only thing
+    this needs: a task that will produce a live socket with nobody left to
+    receive it.
+
+    Best effort by construction. If the cancel is the LOOP'S teardown —
+    ``asyncio.run`` cancelling what is left — this runs from ``call_soon``
+    after that gather has finished, so the shutdown task is created and never
+    stepped: the socket stays open, its entry is never discarded, and the
+    interpreter says "Task was destroyed but it is pending". Nothing here can
+    prevent that, because closing a websocket needs a loop that will still run
+    work and there is none; the process is on its way out, which is what makes
+    it bearable rather than what makes it right (third review pass, OPL-4479).
+    """
+    if connecting.cancelled() or connecting.exception() is not None:
+        return
+    sock = connecting.result()
+    if sock is None:
+        return
+    closing = _ashut_quietly(sock)
+    try:
+        task = asyncio.get_running_loop().create_task(closing)
+    except RuntimeError:
+        # No loop left to run it. Close the coroutine rather than drop it, or a
+        # bare "coroutine was never awaited" warning surfaces in the caller's
+        # application from a path they never wrote.
+        closing.close()
+        return
+    # The loop keeps only a WEAK reference to a running task, so a shutdown
+    # suspended inside `close()` — websockets waits for the peer's close frame
+    # — can be collected mid-flight, leaving open the very socket this exists
+    # to shut. Hold it until it is done.
+    _orphan_shutdowns.add(task)
+    task.add_done_callback(_orphan_shutdowns.discard)
+
+
+async def _drained(connecting: asyncio.Task[Any]) -> Any | None:
+    """The socket a cancelled connect task had already opened, or ``None``.
+
+    Draining a task we just cancelled has to absorb THAT task's
+    ``CancelledError``. It must not absorb one delivered to the ENCLOSING task
+    at the same await: swallowing that leaves the caller finishing normally
+    after a ``cancel()``, so ``task.cancelled()`` is False and an ``async for``
+    ends quietly instead of propagating — precisely what a caller cancels in
+    order not to get. ``connecting.cancelled()`` is what tells the two apart:
+    it is true only once the cancel we asked for is the one that landed. The
+    sibling ``_recv`` keeps the same discipline with
+    ``except BaseException: reading.cancel(); raise``.
+
+    One window is left, and is not closeable from here: if the outer cancel
+    lands while the connect task is itself finishing cancelled, both readings
+    are true at once and this absorbs it. Narrowing that needs
+    ``Task.uncancel``, which is 3.11+, and this package supports 3.10
+    (adversarial review, OPL-4479).
+    """
+    try:
+        return await connecting
+    except asyncio.CancelledError:
+        if not connecting.cancelled():
+            # We stop waiting here, but the task may still hand back a live
+            # socket, and the caller unwinding past this will never see it. The
+            # callback is the only place left that can close it.
+            connecting.add_done_callback(_shut_orphan)
+            raise
+        return None
+    except Exception:  # noqa: BLE001 — any failed connect leaves nothing to shut
+        return None
+
+
 class AsyncEventStream(_StreamBase):
     """:class:`EventStream`, awaited.
 
@@ -2165,17 +2245,20 @@ class AsyncEventStream(_StreamBase):
                 (connecting, stopping), return_when=asyncio.FIRST_COMPLETED
             )
         except BaseException:
+            # `asyncio.wait` does not cancel its children when the awaiting task
+            # is cancelled, so a cancel landing just as the handshake completes
+            # finds `connecting` already DONE — `cancel()` is then a no-op, and
+            # the live socket it produced is never closed or even retrieved.
+            # The same orphan the drain below reclaims, one branch up
+            # (second review pass, OPL-4479).
+            connecting.add_done_callback(_shut_orphan)
             connecting.cancel()
             raise
         finally:
             stopping.cancel()
         if connecting not in done:
             connecting.cancel()
-            sock = None
-            try:
-                sock = await connecting
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                sock = None
+            sock = await _drained(connecting)
             if sock is not None:
                 await _ashut_quietly(sock)
             raise _Expired

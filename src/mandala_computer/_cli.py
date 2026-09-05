@@ -283,7 +283,37 @@ def _connect(url: str) -> ClientConnection:
         _die("could not open the terminal")
 
 
-def _exit_code(message: str) -> int | None:
+#: What ``mandala ssh`` returns when it cannot report the command's status —
+#: an exit frame it could not read a status out of, or a link that dropped
+#: before one arrived. 255 is what ssh itself returns when it cannot report a remote
+#: status, so a wrapper already written against ssh reads this correctly, and it
+#: stays outside the 0-254 a guest command can plausibly answer with.
+#:
+#: The one ambiguity left is a daemon that reports a literal 255. POSIX statuses
+#: are unsigned bytes and a shell returns 255 for "command not found" among
+#: other things, so that collision is real but it is a collision between two
+#: failures, not between a failure and a success — which is the trade this
+#: constant exists to refuse (adversarial review, OPL-4479).
+EXIT_STATUS_UNKNOWN = 255
+
+
+def _unknown_status(why: str, report: Callable[[str], None] | None) -> int:
+    """An ended session whose status is unknown, with the reason handed back.
+
+    The reason is REPORTED rather than printed, because the only caller reads
+    this while the terminal is in raw mode: ``tty.setraw`` clears ``OPOST``, so
+    a bare newline goes out without a carriage return and the message
+    staircases down the screen until ``restore_tty`` runs. Emitting the
+    carriage return here would fix the terminal and put a stray one in a
+    redirected stderr, so the pump holds the reason and prints it once the
+    terminal is its own again (second review pass, OPL-4479).
+    """
+    if report is not None:
+        report(f"mandala: {why}; reporting {EXIT_STATUS_UNKNOWN}")
+    return EXIT_STATUS_UNKNOWN
+
+
+def _exit_code(message: str, report: Callable[[str], None] | None = None) -> int | None:
     """The status carried by a text frame, or ``None`` if it carries none.
 
     Text frames are control, and the only one that ends a session is
@@ -294,9 +324,24 @@ def _exit_code(message: str) -> int | None:
     not an object: ``null``, a number and a list all parse cleanly and then
     have no ``.get``. That reached the pump as an ``AttributeError``, which
     ``main()`` does not catch, so a single stray frame ended an interactive
-    session in a traceback. An unreadable ``code`` is the same story one line
-    down, and is answered the same way — the frame's arrival is the news that
-    the shell ended, and no code to read is not a reason to invent a failure.
+    session in a traceback.
+
+    An exit frame this cannot read a status out of answers
+    :data:`EXIT_STATUS_UNKNOWN`, not ``0``. It used to answer ``0`` on the
+    argument that the frame's arrival is itself the news that the shell ended —
+    true, but the frame's arrival says the session ENDED, not that the command
+    SUCCEEDED, and ``0`` is the one value that claims the second. A caller
+    gating a deploy on this command's status is asking about the COMMAND, and
+    shipping on a status nobody could read is the failure this
+    SDK refuses everywhere else — ``_models._exit_code`` exists for exactly
+    this trade, "a failed command mistaken for a successful one, and there is
+    no safe value to carry on with". Missing and malformed are not
+    distinguished, because to that caller they are the same news: we do not
+    know (adversarial review, OPL-4479).
+
+    A decimal string is still read. That value crosses a process boundary the
+    way ``guest_pid``'s does, and refusing it would be a tightening rather than
+    a correction.
     """
     try:
         control = json.loads(message)
@@ -304,15 +349,29 @@ def _exit_code(message: str) -> int | None:
         return None
     if not isinstance(control, dict) or control.get("type") != "exit":
         return None
+    code = control.get("code")
+    if code is None:
+        return _unknown_status("the shell ended without reporting a status", report)
+    if isinstance(code, bool):
+        return _unknown_status(f"the shell reported {code!r} where a status belongs", report)
     try:
-        return int(control.get("code") or 0)
+        status = int(code)
     # `OverflowError` with the two obvious ones: `json.loads("1e309")` is `inf`,
     # and `int(inf)` raises neither of them. It escapes the pump's own handlers
     # and `main()`, so one stray frame ends an interactive session in a
-    # traceback — which is the outcome the docstring above says this function
-    # exists to prevent (/code-review, OPL-4232).
+    # traceback (/code-review, OPL-4232).
     except (OverflowError, TypeError, ValueError):
-        return 0
+        return _unknown_status(f"the shell reported an unreadable status {code!r}", report)
+    if isinstance(code, float) and status != code:
+        return _unknown_status(f"the shell reported a fractional status {code!r}", report)
+    if not 0 <= status <= 255:
+        # A wait status is an unsigned byte. `SystemExit(256)` exits 0, so a
+        # status outside the range would report a FAILURE AS A SUCCESS through
+        # the same door this function was just taught to shut — and Go's
+        # `ProcessState.ExitCode()` answers -1 for a process killed by a
+        # signal, which is reachable rather than hypothetical.
+        return _unknown_status(f"the shell reported an out-of-range status {code!r}", report)
+    return status
 
 
 # Cap on unread local keystrokes / piped stdin waiting to go out. A stalled
@@ -481,6 +540,7 @@ def _interact(url: str) -> int:
     sender_thread: threading.Thread | None = None
     stdin_thread: threading.Thread | None = None
     exit_code: int | None = None
+    unknown_reason: list[str] = []
     tty_raw = False
 
     def restore_tty() -> None:
@@ -587,7 +647,7 @@ def _interact(url: str) -> int:
                 guarded = tty_raw and not stdout_is_tty
                 _write_all(stdout, message, stdout_stalled if guarded else None)
                 continue
-            code = _exit_code(message)
+            code = _exit_code(message, unknown_reason.append)
             if code is not None:
                 exit_code = code
                 break
@@ -642,11 +702,24 @@ def _interact(url: str) -> int:
             signal.signal(signum, previous)
         with suppress(ConnectionClosed, OSError, WebSocketException):
             ws.close()
+    for line in unknown_reason:
+        print(line, file=sys.stderr)
     if exit_code is None:
-        # The link dropped without the shell ending: the session is still
-        # alive server-side, and saying so is what makes that a feature.
-        print("mandala: detached — run the same command to reattach", file=sys.stderr)
-        return 0
+        # The link dropped without the shell ending. The session IS still alive
+        # server-side and saying so is what makes that a feature — but the
+        # status is unknown, and 0 would claim the command succeeded. The
+        # daemon sends its exit frame precisely "so a client can tell 'your
+        # command exited' from a dropped network" (server/terminal.go), and
+        # answering 0 here throws away the distinction it went out of its way
+        # to draw. A script cannot reattach, and
+        # a wrapper gating on this status must not ship on a build whose end
+        # nobody saw (OPL-4479).
+        print(
+            "mandala: detached — run the same command to reattach; "
+            f"reporting {EXIT_STATUS_UNKNOWN}",
+            file=sys.stderr,
+        )
+        return EXIT_STATUS_UNKNOWN
     return exit_code
 
 

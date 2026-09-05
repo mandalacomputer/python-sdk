@@ -28,6 +28,7 @@ import pytest
 import mandala_computer as mc
 
 A = mc._api
+C = mc._computer
 
 
 class Liar(str):
@@ -280,3 +281,41 @@ def test_a_count_cannot_be_a_bool() -> None:
     # as a coordinate (adversarial review, OPL-4222).
     with pytest.raises(TypeError, match="x must be an integer coordinate"):
         A.click_body("left_click", True, 1, ())
+
+
+def test_a_count_or_a_duration_is_refused_when_it_is_negative() -> None:
+    """`-1` snapshots deleted is not a small answer, it is an unusable one.
+
+    `_require_whole` exists to stop a wire value that cannot be the thing it
+    claims to be from reaching a caller as a real one — it already refuses
+    `0.9`, `True`, `[]` and `1e309` for both of its call sites. A negative is
+    the same failure one line short: neither a count of snapshots destroyed nor
+    a number of idle minutes has a negative reading (adversarial review,
+    OPL-4480).
+    """
+    for bad in (-1, -30, -1.0, "-5"):
+        with pytest.raises(mc.MandalaError):
+            C._require_whole(bad, "bad")
+
+    # Zero is a real answer for both fields and stays one.
+    assert C._require_whole(0, "bad") == 0
+    assert C._require_whole(-0.0, "bad") == 0
+    assert C._require_whole(7, "bad") == 7
+
+
+def test_a_fractional_pid_is_refused_rather_than_truncated() -> None:
+    """`int(3.9)` is 3, and 3 is a DIFFERENT process in the guest.
+
+    The sibling field refuses a fraction because a truncated count is a
+    misreported number. Here the same truncation produces a handle whose
+    `kill()` lands on another process — a side effect on the wrong target, which
+    is strictly worse (adversarial review, OPL-4480).
+    """
+    for bad in (3.9, float("inf"), float("nan")):
+        with pytest.raises(mc.MandalaError):
+            C._require_background_pid({"pid": bad})
+
+    # A pid that IS whole still starts, however it was spelled on the wire.
+    C._require_background_pid({"pid": 3.0})
+    C._require_background_pid({"pid": 4242})
+    C._require_background_pid({"pid": "4242"})
