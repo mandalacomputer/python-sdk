@@ -1823,7 +1823,11 @@ and exits 0 when it is not. The suite runs it too: `pytest` skips it where the
 platform is not checked out and fails on drift where it is.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
-returning more fields does not break older clients.
+returning more fields does not break older clients. `.raw` is evidence rather
+than identity: it is outside `==` and outside `hash()`, so two records this SDK
+reads the same way are equal even when the platform sent one of them a field
+neither models, and a model can go in a set or serve as a mapping key. The
+payload is still there to read.
 
 ### Keeping sync and async honest
 
