@@ -1862,9 +1862,13 @@ class _Drainable:
 
     def __init__(self, *, cancelled: bool) -> None:
         self._cancelled = cancelled
+        self.callbacks: list[Any] = []
 
     def cancelled(self) -> bool:
         return self._cancelled
+
+    def add_done_callback(self, callback: Any) -> None:
+        self.callbacks.append(callback)
 
     def __await__(self) -> Any:
         raise asyncio.CancelledError
@@ -1885,11 +1889,17 @@ async def test_the_connect_drain_absorbs_its_own_cancel_and_no_one_elses() -> No
     cannot be staged. The `_recv` sibling keeps the same discipline.
     """
     # The cancel we asked for landed: absorbed, and the caller gets no socket.
-    assert await _events._drained(_Drainable(cancelled=True)) is None
+    mine = _Drainable(cancelled=True)
+    assert await _events._drained(mine) is None
+    assert mine.callbacks == [], "nothing to reclaim when the task ends cancelled"
 
     # It did not: the cancellation belongs to someone else and must propagate.
+    theirs = _Drainable(cancelled=False)
     with pytest.raises(asyncio.CancelledError):
-        await _events._drained(_Drainable(cancelled=False))
+        await _events._drained(theirs)
+    # And the frame that would have shut a late socket is unwinding, so the
+    # only thing left that can close one is registered before it goes.
+    assert theirs.callbacks == [_events._shut_orphan]
 
 
 # --- file.changed: a stream option, not a type to filter for -----------------

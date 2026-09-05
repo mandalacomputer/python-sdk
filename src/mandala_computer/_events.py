@@ -32,6 +32,7 @@ import json
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -2000,6 +2001,23 @@ class EventStream(_StreamBase):
 _TIMED_OUT = object()
 
 
+def _shut_orphan(connecting: asyncio.Task[Any]) -> None:
+    """Close a socket a connect task handed back after nobody was waiting.
+
+    Only reachable from :func:`_drained`'s re-raise: the task was cancelled,
+    absorbed it, and completed anyway, after the frame that would have shut the
+    socket had already unwound. Best effort by construction — the loop may be
+    closing, and there is no one left to report to.
+    """
+    if connecting.cancelled() or connecting.exception() is not None:
+        return
+    sock = connecting.result()
+    if sock is None:
+        return
+    with suppress(RuntimeError):
+        asyncio.get_running_loop().create_task(_ashut_quietly(sock))
+
+
 async def _drained(connecting: asyncio.Task[Any]) -> Any | None:
     """The socket a cancelled connect task had already opened, or ``None``.
 
@@ -2023,6 +2041,10 @@ async def _drained(connecting: asyncio.Task[Any]) -> Any | None:
         return await connecting
     except asyncio.CancelledError:
         if not connecting.cancelled():
+            # We stop waiting here, but the task may still hand back a live
+            # socket, and the caller unwinding past this will never see it. The
+            # callback is the only place left that can close it.
+            connecting.add_done_callback(_shut_orphan)
             raise
         return None
     except Exception:  # noqa: BLE001 — any failed connect leaves nothing to shut

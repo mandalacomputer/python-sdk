@@ -283,7 +283,7 @@ def _continues(path: str, asked_from: int, part: FilePart, total_was: int | None
         )
 
 
-def _started_key(stamp: str) -> tuple[int, float, str]:
+def _started_key(stamp: str) -> tuple[int, float]:
     """``Move.started_at`` as something two of them can be ordered by.
 
     The raw string is not that, and the failure is narrow but real: RFC 3339
@@ -309,13 +309,26 @@ def _started_key(stamp: str) -> tuple[int, float, str]:
     ``08:00-05:00`` when those are 07:00Z and 13:00Z, and ``max`` handed back
     the older row.
 
-    So the key is the INSTANT. ``datetime.fromisoformat`` reads what the
-    platform writes, and the POSIX timestamp of the result orders correctly
-    across every offset and fraction at once, with no spelling left to repair.
-    A stamp carrying no offset is read as UTC, which is what the platform
-    writes and what every other reader of these stamps assumes; the alternative
-    — treating a well-formed local stamp as undateable — would sort a row
-    oldest for a property that says nothing about its age.
+    So the key is the INSTANT. The POSIX timestamp of the parsed stamp orders
+    correctly across every offset and fraction at once, with no spelling left
+    to repair. A stamp carrying no offset is read as UTC, which is what the
+    platform writes and what every other reader of these stamps assumes; the
+    alternative — treating a well-formed local stamp as undateable — would sort
+    a row oldest for a property that says nothing about its age.
+
+    The fraction is padded to microseconds BEFORE parsing, because on 3.10
+    ``fromisoformat`` reads only what ``isoformat`` writes: exactly three or
+    six fractional digits. Go's ``RFC3339Nano`` trims trailing zeros, so
+    ``.5`` and ``.123456789`` both reach this and both raise there — and a
+    stamp that lands in the fallback sorts OLDEST, which on the newest row is
+    worse than the text key this replaces. 3.11 relaxed the parser; the padding
+    is what keeps 3.10 reading the same stamps (second review pass, OPL-4480).
+
+    The key is a pair and stops at the instant: :meth:`ComputerFields._my_move`
+    breaks ties on POSITION, which is the platform's own order, and any third
+    element here would decide before it ever got the chance — putting the raw
+    text there let ``02:00:12Z`` beat ``02:00:12+00:00`` on ``'Z' > '+'`` and
+    hand back the older row, which is this key's whole reason for existing.
 
     A stamp this cannot read sorts oldest rather than raising: this runs on a
     listing, and one unreadable row must not cost the caller the other one
@@ -326,18 +339,20 @@ def _started_key(stamp: str) -> tuple[int, float, str]:
     # displaces a row that can be: `max` here is choosing what to hand the
     # caller, and an unreadable stamp is not evidence of being recent.
     if not stamp[:1].isdigit():
-        return (0, 0.0, stamp)
+        return (0, 0.0)
     # `fromisoformat` learned `Z` in 3.11; the rewrite keeps 3.10 reading it.
     text = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+    head, dot, rest = text.partition(".")
+    if dot:
+        digits = rest[: len(rest) - len(rest.lstrip("0123456789"))]
+        text = f"{head}.{(digits + '000000')[:6]}{rest[len(digits) :]}"
     try:
         when = datetime.fromisoformat(text)
     except ValueError:
-        return (0, 0.0, stamp)
+        return (0, 0.0)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    # The raw text stays as the last element so two stamps naming the SAME
-    # instant still order deterministically rather than by dict insertion.
-    return (1, when.timestamp(), stamp)
+    return (1, when.timestamp())
 
 
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:

@@ -1390,7 +1390,7 @@ def test_queued_input_is_discarded_once_the_terminal_has_closed(
     assert sent == [b"one"]
 
 
-def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:
+def test_an_unknown_status_is_not_reported_as_success() -> None:
     """`mandala ssh cmd && next` must not run `next` on a status nobody read.
 
     0 is the one value that claims the command succeeded, so it is the one
@@ -1399,15 +1399,30 @@ def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:
     against ssh correct, and the reason goes to stderr so the operator is not
     left guessing why a green command reported a failure (OPL-4479 BUG-29).
     """
-    assert _cli._exit_code('{"type":"exit","code":"nope"}') == 255
-    assert "unreadable status" in capsys.readouterr().err
+    said: list[str] = []
+    assert _cli._exit_code('{"type":"exit","code":"nope"}', said.append) == 255
+    assert "unreadable status" in said[-1]
 
+    assert _cli._exit_code('{"type":"exit"}', said.append) == 255
+    assert "without reporting a status" in said[-1]
+
+    # A wait status is an unsigned byte, and `SystemExit(256)` exits 0 — so an
+    # out-of-range status would report a failure as a success through the very
+    # door this closes. Go answers -1 for a process killed by a signal.
+    assert _cli._exit_code('{"type":"exit","code":256}', said.append) == 255
+    assert "out-of-range" in said[-1]
+    assert _cli._exit_code('{"type":"exit","code":-1}', said.append) == 255
+    assert _cli._exit_code('{"type":"exit","code":255}', said.append) == 255
+
+    # A real status still passes through, 0 included, and says nothing.
+    before = len(said)
+    assert _cli._exit_code('{"type":"exit","code":0}', said.append) == 0
+    assert _cli._exit_code('{"type":"exit","code":3}', said.append) == 3
+    assert len(said) == before
+
+    # The reason is handed back rather than printed: the pump reads this while
+    # the terminal is raw, and prints only once `restore_tty` has run.
     assert _cli._exit_code('{"type":"exit"}') == 255
-    assert "without reporting a status" in capsys.readouterr().err
-
-    # A real status still passes through silently, 0 included.
-    assert _cli._exit_code('{"type":"exit","code":0}') == 0
-    assert capsys.readouterr().err == ""
 
 
 def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> None:

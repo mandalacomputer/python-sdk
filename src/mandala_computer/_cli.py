@@ -296,13 +296,23 @@ def _connect(url: str) -> ClientConnection:
 EXIT_STATUS_UNKNOWN = 255
 
 
-def _unknown_status(why: str) -> int:
-    """Report an ended session whose status is unknown, and say so."""
-    print(f"mandala: {why}; reporting {EXIT_STATUS_UNKNOWN}", file=sys.stderr)
+def _unknown_status(why: str, report: Callable[[str], None] | None) -> int:
+    """An ended session whose status is unknown, with the reason handed back.
+
+    The reason is REPORTED rather than printed, because the only caller reads
+    this while the terminal is in raw mode: ``tty.setraw`` clears ``OPOST``, so
+    a bare newline goes out without a carriage return and the message
+    staircases down the screen until ``restore_tty`` runs. Emitting the
+    carriage return here would fix the terminal and put a stray one in a
+    redirected stderr, so the pump holds the reason and prints it once the
+    terminal is its own again (second review pass, OPL-4479).
+    """
+    if report is not None:
+        report(f"mandala: {why}; reporting {EXIT_STATUS_UNKNOWN}")
     return EXIT_STATUS_UNKNOWN
 
 
-def _exit_code(message: str) -> int | None:
+def _exit_code(message: str, report: Callable[[str], None] | None = None) -> int | None:
     """The status carried by a text frame, or ``None`` if it carries none.
 
     Text frames are control, and the only one that ends a session is
@@ -340,9 +350,9 @@ def _exit_code(message: str) -> int | None:
         return None
     code = control.get("code")
     if code is None:
-        return _unknown_status("the shell ended without reporting a status")
+        return _unknown_status("the shell ended without reporting a status", report)
     if isinstance(code, bool):
-        return _unknown_status(f"the shell reported {code!r} where a status belongs")
+        return _unknown_status(f"the shell reported {code!r} where a status belongs", report)
     try:
         status = int(code)
     # `OverflowError` with the two obvious ones: `json.loads("1e309")` is `inf`,
@@ -350,9 +360,16 @@ def _exit_code(message: str) -> int | None:
     # and `main()`, so one stray frame ends an interactive session in a
     # traceback (/code-review, OPL-4232).
     except (OverflowError, TypeError, ValueError):
-        return _unknown_status(f"the shell reported an unreadable status {code!r}")
+        return _unknown_status(f"the shell reported an unreadable status {code!r}", report)
     if isinstance(code, float) and status != code:
-        return _unknown_status(f"the shell reported a fractional status {code!r}")
+        return _unknown_status(f"the shell reported a fractional status {code!r}", report)
+    if not 0 <= status <= 255:
+        # A wait status is an unsigned byte. `SystemExit(256)` exits 0, so a
+        # status outside the range would report a FAILURE AS A SUCCESS through
+        # the same door this function was just taught to shut — and Go's
+        # `ProcessState.ExitCode()` answers -1 for a process killed by a
+        # signal, which is reachable rather than hypothetical.
+        return _unknown_status(f"the shell reported an out-of-range status {code!r}", report)
     return status
 
 
@@ -522,6 +539,7 @@ def _interact(url: str) -> int:
     sender_thread: threading.Thread | None = None
     stdin_thread: threading.Thread | None = None
     exit_code: int | None = None
+    unknown_reason: list[str] = []
     tty_raw = False
 
     def restore_tty() -> None:
@@ -628,7 +646,7 @@ def _interact(url: str) -> int:
                 guarded = tty_raw and not stdout_is_tty
                 _write_all(stdout, message, stdout_stalled if guarded else None)
                 continue
-            code = _exit_code(message)
+            code = _exit_code(message, unknown_reason.append)
             if code is not None:
                 exit_code = code
                 break
@@ -683,6 +701,8 @@ def _interact(url: str) -> int:
             signal.signal(signum, previous)
         with suppress(ConnectionClosed, OSError, WebSocketException):
             ws.close()
+    for line in unknown_reason:
+        print(line, file=sys.stderr)
     if exit_code is None:
         # The link dropped without the shell ending: the session is still
         # alive server-side, and saying so is what makes that a feature.

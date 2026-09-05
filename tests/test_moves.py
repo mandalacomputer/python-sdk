@@ -529,3 +529,39 @@ def test_the_instant_key_keeps_every_ordering_the_text_key_earned() -> None:
     assert key("2026-08-23T02:00:12Z") > key("nope")
     # No offset reads as UTC rather than as undateable.
     assert key("2026-08-23T02:00:12")[1] == key("2026-08-23T02:00:12Z")[1]
+
+
+def test_a_fraction_of_any_length_is_still_a_readable_stamp() -> None:
+    """Go's RFC3339Nano trims trailing zeros, so the length is not fixed.
+
+    On 3.10 `fromisoformat` reads only what `isoformat` writes — exactly three
+    or six fractional digits — so `.5` and `.123456789` raise there and fall to
+    the tier that sorts OLDEST, which on the newest row is worse than the text
+    key this replaced. 3.11 relaxed the parser, so it is CI's 3.10 job that
+    makes this test bite; the padding is what keeps the two agreeing
+    (second review pass, OPL-4480).
+    """
+    key = _computer._started_key
+    whole = key("2026-08-23T02:00:12Z")
+
+    for fraction in (".5", ".50", ".500", ".123456", ".123456789"):
+        stamp = f"2026-08-23T02:00:12{fraction}Z"
+        assert key(stamp)[0] == 1, f"{stamp} fell through to the unreadable tier"
+        assert key(stamp) > whole, f"{stamp} did not sort after the whole second"
+
+    # The same instant however its fraction is spelled.
+    assert key("2026-08-23T02:00:12.5Z") == key("2026-08-23T02:00:12.500Z")
+
+
+def test_the_key_leaves_ties_to_position() -> None:
+    """`_my_move` breaks ties on POSITION, and a third element would pre-empt it.
+
+    Two rows at one instant spelled differently must produce ONE key, so the
+    `-i` in `_my_move` decides and the platform's own order stands. Carrying the
+    raw text here let `02:00:12Z` beat `02:00:12+00:00` on `'Z' > '+'` and hand
+    back the older row — this key's whole reason for existing.
+    """
+    key = _computer._started_key
+    assert key("2026-08-23T02:00:12Z") == key("2026-08-23T02:00:12+00:00")
+    assert len(key("2026-08-23T02:00:12Z")) == 2
+    assert key("nope") == key("also nope")
