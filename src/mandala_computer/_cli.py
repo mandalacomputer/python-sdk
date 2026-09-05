@@ -283,8 +283,9 @@ def _connect(url: str) -> ClientConnection:
         _die("could not open the terminal")
 
 
-#: What ``mandala ssh`` returns when the session ended and its status could not
-#: be read. 255 is what ssh itself returns when it cannot report a remote
+#: What ``mandala ssh`` returns when it cannot report the command's status —
+#: an exit frame it could not read a status out of, or a link that dropped
+#: before one arrived. 255 is what ssh itself returns when it cannot report a remote
 #: status, so a wrapper already written against ssh reads this correctly, and it
 #: stays outside the 0-254 a guest command can plausibly answer with.
 #:
@@ -704,10 +705,17 @@ def _interact(url: str) -> int:
     for line in unknown_reason:
         print(line, file=sys.stderr)
     if exit_code is None:
-        # The link dropped without the shell ending: the session is still
-        # alive server-side, and saying so is what makes that a feature.
+        # The link dropped without the shell ending. The session IS still alive
+        # server-side and saying so is what makes that a feature — but the
+        # status is unknown, and 0 would claim the command succeeded. The
+        # daemon sends its exit frame precisely "so a client can tell 'your
+        # command exited' from a dropped network" (server/terminal.go), and
+        # answering 0 here throws away the distinction it went out of its way
+        # to draw. A script cannot reattach, and
+        # `mandala ssh box 'make release' && ./deploy.sh` must not ship on a
+        # build whose end nobody saw (OPL-4479).
         print("mandala: detached — run the same command to reattach", file=sys.stderr)
-        return 0
+        return EXIT_STATUS_UNKNOWN
     return exit_code
 
 

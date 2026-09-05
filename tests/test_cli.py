@@ -1390,6 +1390,46 @@ def test_queued_input_is_discarded_once_the_terminal_has_closed(
     assert sent == [b"one"]
 
 
+def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A link that drops before the exit frame leaves the status unknown.
+
+    The session really is still alive server-side and reattaching really does
+    work — that part is a feature and still says so on stderr. What it is not is
+    evidence that the command succeeded. The daemon sends its exit frame
+    precisely "so a client can tell 'your command exited' from a dropped
+    network" (server/terminal.go), and answering 0 here throws away the
+    distinction it drew: a script cannot reattach, and
+    `mandala ssh box 'make release' && ./deploy.sh` would ship on a build whose
+    end nobody saw (OPL-4479 BUG-29).
+    """
+    from websockets.exceptions import ConnectionClosed
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    class DroppedConnection:
+        def recv(self) -> str:
+            raise ConnectionClosed(None, None)
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_connect", lambda url: DroppedConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    monkeypatch.setattr(_cli.signal, "getsignal", lambda signum: _cli.signal.SIG_IGN)
+    monkeypatch.setattr(_cli.signal, "signal", lambda signum, handler: None)
+
+    assert _cli._interact("wss://terminal.test") == _cli.EXIT_STATUS_UNKNOWN
+
+
 def test_an_unknown_status_is_not_reported_as_success() -> None:
     """`mandala ssh cmd && next` must not run `next` on a status nobody read.
 

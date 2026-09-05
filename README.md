@@ -1765,6 +1765,14 @@ same command reattaches with recent output replayed. `--session <name>` keeps
 several; the shell's exit code becomes the command's own. Inside, plain
 `nano`/`vim`/`echo` work as they would over real ssh.
 
+Where the shell's status cannot be had — the link dropped before the exit frame
+arrived, or the frame carried no readable code — `ssh` exits **255** and says
+why on stderr, the same status ssh itself uses for that. It never exits 0 for a
+status it did not read, so `mandala ssh box 'make release' && ./deploy.sh` will
+not ship on a build whose end nobody saw. A detach is one of those cases: the
+session survives and reattaching still works, but the command's fate is
+unknown until you do.
+
 The interactive `ssh` command currently requires a Unix-like local terminal.
 `scp` remains available on Windows, including with drive-letter paths.
 
