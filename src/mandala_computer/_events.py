@@ -32,7 +32,6 @@ import json
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -2001,6 +2000,10 @@ class EventStream(_StreamBase):
 _TIMED_OUT = object()
 
 
+#: Strong references to in-flight orphan shutdowns; see :func:`_shut_orphan`.
+_orphan_shutdowns: set[asyncio.Task[None]] = set()
+
+
 def _shut_orphan(connecting: asyncio.Task[Any]) -> None:
     """Close a socket a connect task handed back after nobody was waiting.
 
@@ -2014,8 +2017,21 @@ def _shut_orphan(connecting: asyncio.Task[Any]) -> None:
     sock = connecting.result()
     if sock is None:
         return
-    with suppress(RuntimeError):
-        asyncio.get_running_loop().create_task(_ashut_quietly(sock))
+    closing = _ashut_quietly(sock)
+    try:
+        task = asyncio.get_running_loop().create_task(closing)
+    except RuntimeError:
+        # No loop left to run it. Close the coroutine rather than drop it, or a
+        # bare "coroutine was never awaited" warning surfaces in the caller's
+        # application from a path they never wrote.
+        closing.close()
+        return
+    # The loop keeps only a WEAK reference to a running task, so a shutdown
+    # suspended inside `close()` — websockets waits for the peer's close frame
+    # — can be collected mid-flight, leaving open the very socket this exists
+    # to shut. Hold it until it is done.
+    _orphan_shutdowns.add(task)
+    task.add_done_callback(_orphan_shutdowns.discard)
 
 
 async def _drained(connecting: asyncio.Task[Any]) -> Any | None:
@@ -2216,6 +2232,13 @@ class AsyncEventStream(_StreamBase):
                 (connecting, stopping), return_when=asyncio.FIRST_COMPLETED
             )
         except BaseException:
+            # `asyncio.wait` does not cancel its children when the awaiting task
+            # is cancelled, so a cancel landing just as the handshake completes
+            # finds `connecting` already DONE — `cancel()` is then a no-op, and
+            # the live socket it produced is never closed or even retrieved.
+            # The same orphan the drain below reclaims, one branch up
+            # (second review pass, OPL-4479).
+            connecting.add_done_callback(_shut_orphan)
             connecting.cancel()
             raise
         finally:

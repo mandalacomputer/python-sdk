@@ -1430,7 +1430,7 @@ def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) ->
     assert _cli._interact("wss://terminal.test") == _cli.EXIT_STATUS_UNKNOWN
 
 
-def test_an_unknown_status_is_not_reported_as_success() -> None:
+def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:
     """`mandala ssh cmd && next` must not run `next` on a status nobody read.
 
     0 is the one value that claims the command succeeded, so it is the one
@@ -1460,9 +1460,13 @@ def test_an_unknown_status_is_not_reported_as_success() -> None:
     assert _cli._exit_code('{"type":"exit","code":3}', said.append) == 3
     assert len(said) == before
 
-    # The reason is handed back rather than printed: the pump reads this while
-    # the terminal is raw, and prints only once `restore_tty` has run.
+    # The reason is handed back rather than PRINTED: the pump reads this while
+    # the terminal is raw, where `tty.setraw` has cleared OPOST and a bare
+    # newline staircases the message down the screen. Pinned, because
+    # reintroducing the print is the regression and it would not fail anything
+    # else in this suite.
     assert _cli._exit_code('{"type":"exit"}') == 255
+    assert capsys.readouterr().err == ""
 
 
 def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> None:

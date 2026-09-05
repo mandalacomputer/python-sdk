@@ -343,8 +343,12 @@ def _started_key(stamp: str) -> tuple[int, float]:
     # `fromisoformat` learned `Z` in 3.11; the rewrite keeps 3.10 reading it.
     text = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
     head, dot, rest = text.partition(".")
-    if dot:
-        digits = rest[: len(rest) - len(rest.lstrip("0123456789"))]
+    digits = rest[: len(rest) - len(rest.lstrip("0123456789"))] if dot else ""
+    if digits:
+        # Gated on the DIGITS, not on the dot: a stamp ending in a bare `.` has
+        # no fraction to pad, and padding it to `.000000` would turn a
+        # malformed stamp into a dated one that can win `max` — where it used
+        # to fall to the tier that sorts oldest (second review pass, OPL-4480).
         text = f"{head}.{(digits + '000000')[:6]}{rest[len(digits) :]}"
     try:
         when = datetime.fromisoformat(text)

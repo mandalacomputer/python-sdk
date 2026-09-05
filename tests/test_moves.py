@@ -552,6 +552,12 @@ def test_a_fraction_of_any_length_is_still_a_readable_stamp() -> None:
     # The same instant however its fraction is spelled.
     assert key("2026-08-23T02:00:12.5Z") == key("2026-08-23T02:00:12.500Z")
 
+    # Padding is gated on the DIGITS, not on the dot. A stamp ending in a bare
+    # `.` has no fraction, and padding it to `.000000` would promote a
+    # malformed stamp to a dated one that can win `max`.
+    assert key("2026-08-23T02:00:12.")[0] == 0
+    assert key("2026-08-23T02:00:12.Z")[0] == 0
+
 
 def test_the_key_leaves_ties_to_position() -> None:
     """`_my_move` breaks ties on POSITION, and a third element would pre-empt it.
