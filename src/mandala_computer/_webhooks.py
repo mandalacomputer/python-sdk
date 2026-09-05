@@ -69,8 +69,8 @@ _SIGNATURE = "webhook-signature"
 #: twenty is room the platform will never need — and the bound is not about
 #: plausibility, it is about arithmetic. ``int()`` builds an integer of any
 #: size from this header, and the header is written by whoever can reach the
-#: receiver's endpoint: at roughly 400 digits the value no longer fits a
-#: float, so ``abs(clock - sent)`` below raises ``OverflowError``, and past
+#: receiver's endpoint: at 309 digits the value no longer fits a float, so
+#: ``abs(clock - sent)`` below raises ``OverflowError``, and past
 #: 4300 digits ``int(value, 10)`` itself raises ``ValueError`` on CPython's
 #: integer-string conversion limit. Either one escapes :func:`verify`, whose
 #: whole contract is that a malformed header is ``False`` and never an
@@ -190,6 +190,17 @@ def verify(
     stamp = _header(headers, _TIMESTAMP)
     signatures = _header(headers, _SIGNATURE)
     if msg_id is None or stamp is None or signatures is None:
+        return False
+    # The id is signed as its own bytes, so it has to survive `.encode()`, and
+    # a header is not guaranteed to. A server that decodes request headers with
+    # `surrogateescape` — aiohttp does — turns a raw 0xFF byte into the lone
+    # surrogate '\udcff', which UTF-8 cannot encode: `msg_id.encode()` below
+    # would raise `UnicodeEncodeError` straight out of a function whose whole
+    # contract is that a malformed header is `False`. The platform writes
+    # `whd-` and sixteen hex characters, so nothing it sends is lost by
+    # refusing the non-ASCII id here, and a forged one fails the MAC anyway
+    # (adversarial review, OPL-4478).
+    if not msg_id.isascii():
         return False
     sent = _timestamp(stamp)
     if sent is None:
