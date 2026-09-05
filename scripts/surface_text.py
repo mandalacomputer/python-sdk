@@ -21,6 +21,7 @@ _REGEX_CAN_FOLLOW = "([{=,:;!?&|~+*%^<>"
 _REGEX_CAN_FOLLOW_WORDS = ("return", "case", "throw", "yield")
 _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
 _KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_IDENT_CHAR = re.compile(r"[\w$]")
 
 
 def quoted_end(text: str, start: int) -> int:
@@ -145,6 +146,59 @@ def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
                 return text[start + 1 : i]
         i += 1
     raise ValueError(f"unbalanced {open_ch} from offset {start}")
+
+
+def top_level_value_at(body: str, name: str) -> int:
+    """Where the value of one top-level key starts, or ``-1`` when it is not there.
+
+    A sibling of :func:`top_level_keys` for the values it cannot read: the shape
+    of a value is what decides how it is read — ``object(...)`` has named fields,
+    a raw ``{ type: 'string' }`` schema has none to name, a bare identifier is a
+    shape this cannot read at all — and telling those apart by searching the
+    whole entry for a spelling answers about whichever one turns up first at any
+    depth. A ``body: { … }`` quoted in a response example then vouches for the
+    entry's own ``body: SHARED_BODY``, the unreadable shape passes as a readable
+    one, and the route is compared against no fields at all.
+
+    Depth-counted rather than found by ``str.find`` for that reason, and by the
+    key rather than by ``key: `` for another: the one space after the colon is a
+    spelling, not a shape, so a list the formatter wrapped over two lines —
+    ``query:\n  [{ name: 'limit' }]`` — is still found here and was silently
+    skipped before.
+
+    Quoted spellings of the key as well: ``'body':`` names the same field as
+    ``body:`` does, and a reader that insists on one of them reports the other
+    as absent.
+    """
+    lit = re.escape(name)
+    key = re.compile(rf"(?:'{lit}'|\"{lit}\"|{lit})\s*:\s*")
+    depth = 0
+    i = 0
+    while i < len(body):
+        # Before the literal skip below, so a quoted key is still seen; and not
+        # mid-identifier, so `subbody:` is not read as `body:`.
+        if depth == 0 and (i == 0 or not _IDENT_CHAR.match(body[i - 1])):
+            m = key.match(body, i)
+            if m:
+                return m.end()
+        ch = body[i]
+        if ch in "{[(":
+            depth += 1
+        elif ch in "}])":
+            depth -= 1
+            if depth < 0:
+                # As in its siblings: a depth that goes negative never comes
+                # back, so the key would be reported missing rather than
+                # unreadable — and missing is an answer this caller acts on.
+                raise ValueError(f"unbalanced {ch} at offset {i}")
+        elif ch in "'\"`":
+            i = quoted_end(body, i)
+            continue
+        elif ch == "/" and regex_can_start(body, i):
+            i = regex_end(body, i)
+            continue
+        i += 1
+    return -1
 
 
 def top_level_keys(body: str) -> list[str]:
