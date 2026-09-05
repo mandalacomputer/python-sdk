@@ -331,8 +331,8 @@ def _exit_code(message: str, report: Callable[[str], None] | None = None) -> int
     argument that the frame's arrival is itself the news that the shell ended —
     true, but the frame's arrival says the session ENDED, not that the command
     SUCCEEDED, and ``0`` is the one value that claims the second. A caller
-    writing ``mandala ssh box 'make release' && ./deploy.sh`` is asking about
-    the command, and shipping on a status nobody could read is the failure this
+    writing ``mandala ssh dev < build.sh && ./deploy.sh`` is asking about the
+    command, and shipping on a status nobody could read is the failure this
     SDK refuses everywhere else — ``_models._exit_code`` exists for exactly
     this trade, "a failed command mistaken for a successful one, and there is
     no safe value to carry on with". Missing and malformed are not
@@ -712,9 +712,13 @@ def _interact(url: str) -> int:
         # command exited' from a dropped network" (server/terminal.go), and
         # answering 0 here throws away the distinction it went out of its way
         # to draw. A script cannot reattach, and
-        # `mandala ssh box 'make release' && ./deploy.sh` must not ship on a
-        # build whose end nobody saw (OPL-4479).
-        print("mandala: detached — run the same command to reattach", file=sys.stderr)
+        # `mandala ssh dev < build.sh && ./deploy.sh` must not ship on a build
+        # whose end nobody saw (OPL-4479).
+        print(
+            "mandala: detached — run the same command to reattach; "
+            f"reporting {EXIT_STATUS_UNKNOWN}",
+            file=sys.stderr,
+        )
         return EXIT_STATUS_UNKNOWN
     return exit_code
 

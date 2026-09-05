@@ -1390,7 +1390,7 @@ def test_queued_input_is_discarded_once_the_terminal_has_closed(
     assert sent == [b"one"]
 
 
-def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     """A link that drops before the exit frame leaves the status unknown.
 
     The session really is still alive server-side and reattaching really does
@@ -1399,8 +1399,8 @@ def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) ->
     precisely "so a client can tell 'your command exited' from a dropped
     network" (server/terminal.go), and answering 0 here throws away the
     distinction it drew: a script cannot reattach, and
-    `mandala ssh box 'make release' && ./deploy.sh` would ship on a build whose
-    end nobody saw (OPL-4479 BUG-29).
+    `mandala ssh dev < build.sh && ./deploy.sh` would ship on a build whose end
+    nobody saw (OPL-4479 BUG-29).
     """
     from websockets.exceptions import ConnectionClosed
 
@@ -1428,6 +1428,10 @@ def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(_cli.signal, "signal", lambda signum, handler: None)
 
     assert _cli._interact("wss://terminal.test") == _cli.EXIT_STATUS_UNKNOWN
+    # The notice has to name the status, or a user sees what reads as a benign
+    # message and then an unexplained 255 from their shell.
+    err = capsys.readouterr().err
+    assert "detached" in err and str(_cli.EXIT_STATUS_UNKNOWN) in err
 
 
 def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:

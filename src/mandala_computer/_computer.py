@@ -465,8 +465,8 @@ def _require_whole(value: object, message: str) -> int:
     is a real answer — never suspend, nothing deleted — so a fraction becoming
     ``0`` is the misread the call sites exist to refuse.
 
-    A negative is refused for the same reason and by the same argument. Both
-    callers ask a quantity that has no negative reading — how many snapshots
+    A negative is refused for the same reason and by the same argument. Every
+    caller asks a quantity that has no negative reading — how many snapshots
     were destroyed, how many minutes a machine may idle — so ``-1`` is not a
     small answer, it is an unusable one, and reporting it as a count or a
     duration is the misread this function exists to stop one line short of

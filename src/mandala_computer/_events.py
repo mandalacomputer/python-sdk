@@ -2258,7 +2258,6 @@ class AsyncEventStream(_StreamBase):
             stopping.cancel()
         if connecting not in done:
             connecting.cancel()
-            sock = None
             sock = await _drained(connecting)
             if sock is not None:
                 await _ashut_quietly(sock)
