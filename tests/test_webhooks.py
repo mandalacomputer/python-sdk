@@ -55,9 +55,13 @@ SIGNATURE_ONE_SECOND_LATER = "v1,nkwCc4sFVT7w35kerNFmS9pxAIFHpB20av8iDbuTP3Y="
 SIGNATURE_TRAILING_SPACE = "v1,8cpgEE8mQ0ngAOh7RdvX/dw74GipMz0nPdoXzLnoWx0="
 
 
-def headers(signature: str = SIGNATURE, timestamp: int | str = TIMESTAMP) -> dict[str, str]:
+def headers(
+    signature: str = SIGNATURE,
+    timestamp: int | str = TIMESTAMP,
+    msg_id: str = ID,
+) -> dict[str, str]:
     return {
-        "webhook-id": ID,
+        "webhook-id": msg_id,
         "webhook-timestamp": str(timestamp),
         "webhook-signature": signature,
     }
@@ -157,6 +161,64 @@ def test_a_missing_header_is_false_not_an_error(missing: str) -> None:
 def test_a_timestamp_that_is_not_decimal_seconds_is_false(stamp: str) -> None:
     """Digits only. ``int()`` takes several of these; a verifier must not."""
     assert mc.verify(SECRET, headers(timestamp=stamp), BODY, now=TIMESTAMP) is False
+
+
+@pytest.mark.parametrize("digits", [400, 5000])
+def test_an_enormous_timestamp_is_false_not_an_exception(digits: int) -> None:
+    """Digits only was not enough: there also has to be a bound on how many.
+
+    Nothing here is forgeable — the MAC is never reached — but ``verify`` is
+    documented to answer ``False`` for a malformed header, and an unbounded
+    ``int()`` over an attacker-controlled string broke that in two places
+    (adversarial review, OPL-4478). From 309 digits the value can exceed what
+    a float holds and from 310 it always does, so ``abs(clock - sent)`` raises
+    ``OverflowError``; past 4300 the
+    conversion itself raises ``ValueError`` on CPython's integer-string limit.
+    Either one leaves a receiver answering 500 to a delivery it should have
+    refused outright, which the platform then retries.
+
+    ``now`` is a float because :func:`time.time` returns one, and that is the
+    clock the first half needs: an ``int`` receiver's clock subtracts exactly
+    and would hide it.
+    """
+    stamp = "9" * digits
+    assert mc.verify(SECRET, headers(timestamp=stamp), BODY, now=float(TIMESTAMP)) is False
+
+
+def test_the_timestamp_bound_is_on_arithmetic_not_on_plausibility() -> None:
+    """Both sides of the bound, because the cheap fix is to over-tighten it.
+
+    Unix seconds are ten digits now and stay eleven until the year 5138, so a
+    stamp far longer than any the platform will write must still be READ — what
+    the bound exists to stop is the conversion that raises, not an implausible
+    date, and a verifier that refused a wide clock would fail deliveries that
+    are perfectly well formed.
+    """
+    from mandala_computer._webhooks import _MAX_TIMESTAMP_DIGITS, _timestamp
+
+    inside = "9" * _MAX_TIMESTAMP_DIGITS
+    assert _timestamp(inside) == int(inside)
+    assert _timestamp("9" * (_MAX_TIMESTAMP_DIGITS + 1)) is None
+
+
+def test_an_id_that_cannot_be_encoded_is_false_not_an_exception() -> None:
+    """The timestamp was not the only header reached before the MAC.
+
+    ``webhook-id`` is signed as its own bytes, so ``verify`` encodes it — and a
+    header does not have to be encodable. A server that decodes request headers
+    with ``surrogateescape``, as aiohttp does, turns a raw ``0xFF`` byte into a
+    lone surrogate (``U+DCFF``), which UTF-8 refuses; the encode then raised
+    ``UnicodeEncodeError`` out of a function documented to answer ``False``
+    (adversarial review, OPL-4478 second pass). Same receiver-side 500, same
+    platform retry, different header.
+
+    The surrogate is built with :func:`chr` rather than written as a literal
+    escape: a lone-surrogate constant anywhere in this module cannot be
+    compiled by pytest's assertion rewriter, and the entire file would fail to
+    collect — which looks exactly like a failing test while testing nothing.
+    """
+    forged = "whd-" + chr(0xDCFF) + "0123456789ab"
+    assert mc.verify(SECRET, headers(msg_id=forged), BODY, now=TIMESTAMP) is False
 
 
 def test_an_unknown_signature_version_is_ignored_not_refused() -> None:
