@@ -150,8 +150,19 @@ def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> A
 
 
 def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
-    """Map a non-streaming body through the streaming failure contract."""
-    if "error" not in data:
+    """Map a non-streaming body through the streaming failure contract.
+
+    What decides is the value under ``error``, not the presence of the key. In
+    a stream the failure is a frame of its own, so arriving at all is the whole
+    signal; here it is one field in the same object that carries the result,
+    and a body is free to serialise it as ``null`` or ``""`` on a run that went
+    well. Reading the key would answer such a run with a fabricated
+    :class:`~mandala_computer.AgentFailed` — whose message would be the
+    converter's own last-resort "the run failed", since there is no error text
+    to report — and would discard the :class:`AgentResult` that was in the same
+    body. A run that names no error did not fail. (OPL-4480)
+    """
+    if not data.get("error"):
         return AgentResult.from_api(data)
     failure = to_agent_event("error", data, 0)
     if not isinstance(failure, AgentFailed):  # defensive: the converter owns this shape
