@@ -2000,6 +2000,35 @@ class EventStream(_StreamBase):
 _TIMED_OUT = object()
 
 
+async def _drained(connecting: asyncio.Task[Any]) -> Any | None:
+    """The socket a cancelled connect task had already opened, or ``None``.
+
+    Draining a task we just cancelled has to absorb THAT task's
+    ``CancelledError``. It must not absorb one delivered to the ENCLOSING task
+    at the same await: swallowing that leaves the caller finishing normally
+    after a ``cancel()``, so ``task.cancelled()`` is False and an ``async for``
+    ends quietly instead of propagating — precisely what a caller cancels in
+    order not to get. ``connecting.cancelled()`` is what tells the two apart:
+    it is true only once the cancel we asked for is the one that landed. The
+    sibling ``_recv`` keeps the same discipline with
+    ``except BaseException: reading.cancel(); raise``.
+
+    One window is left, and is not closeable from here: if the outer cancel
+    lands while the connect task is itself finishing cancelled, both readings
+    are true at once and this absorbs it. Narrowing that needs
+    ``Task.uncancel``, which is 3.11+, and this package supports 3.10
+    (adversarial review, OPL-4479).
+    """
+    try:
+        return await connecting
+    except asyncio.CancelledError:
+        if not connecting.cancelled():
+            raise
+        return None
+    except Exception:  # noqa: BLE001 — any failed connect leaves nothing to shut
+        return None
+
+
 class AsyncEventStream(_StreamBase):
     """:class:`EventStream`, awaited.
 
@@ -2172,23 +2201,7 @@ class AsyncEventStream(_StreamBase):
         if connecting not in done:
             connecting.cancel()
             sock = None
-            try:
-                sock = await connecting
-            except asyncio.CancelledError:
-                # Draining a task we just cancelled has to absorb THAT task's
-                # cancellation. It must not absorb one delivered to US at this
-                # await: swallowing that leaves this task finishing normally
-                # after a `cancel()`, so `task.cancelled()` is False and the
-                # `async for` ends quietly instead of propagating.
-                # `connecting.cancelled()` is what tells the two apart — it is
-                # true only once the cancel we asked for is the one that
-                # landed. The sibling `_recv` keeps the same discipline with
-                # `except BaseException: reading.cancel(); raise`.
-                if not connecting.cancelled():
-                    raise
-                sock = None
-            except Exception:  # noqa: BLE001
-                sock = None
+            sock = await _drained(connecting)
             if sock is not None:
                 await _ashut_quietly(sock)
             raise _Expired

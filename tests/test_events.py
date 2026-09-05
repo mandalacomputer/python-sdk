@@ -1845,6 +1845,53 @@ async def test_async_close_during_handshake_does_not_wait_out_open_timeout(
     await asyncio.wait_for(task, timeout=1.0)
 
 
+class _Drainable:
+    """A stand-in for the connect task, with the two states told apart.
+
+    A real `asyncio.Task` cannot be driven into the state under test: cancelling
+    a task that is awaiting another task propagates the cancel INTO it, so
+    `cancelled()` becomes True, and the case where an outer cancellation arrives
+    while the connect task is NOT cancelled cannot be built from outside. This
+    supplies that state directly, so what is pinned is the DECISION rather than
+    the race that produces it.
+
+    Awaiting it always raises `CancelledError`, because that is the only await
+    outcome the discriminator is consulted for; what varies is the answer to
+    `cancelled()`.
+    """
+
+    def __init__(self, *, cancelled: bool) -> None:
+        self._cancelled = cancelled
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def __await__(self) -> Any:
+        raise asyncio.CancelledError
+        yield  # pragma: no cover — makes this a generator function
+
+
+@pytest.mark.asyncio
+async def test_the_connect_drain_absorbs_its_own_cancel_and_no_one_elses() -> None:
+    """`connecting.cancelled()` is the discriminator, and it decides both ways.
+
+    Draining a task we just cancelled has to absorb THAT task's
+    `CancelledError`. Absorbing one delivered to the enclosing task at the same
+    await left it finishing normally after a `cancel()` — `task.cancelled()`
+    False and the `async for` ending quietly, which is what a caller cancels in
+    order not to get (adversarial review, OPL-4479).
+
+    This covers the branch, not the race: see `_Drainable` for why the race
+    cannot be staged. The `_recv` sibling keeps the same discipline.
+    """
+    # The cancel we asked for landed: absorbed, and the caller gets no socket.
+    assert await _events._drained(_Drainable(cancelled=True)) is None
+
+    # It did not: the cancellation belongs to someone else and must propagate.
+    with pytest.raises(asyncio.CancelledError):
+        await _events._drained(_Drainable(cancelled=False))
+
+
 # --- file.changed: a stream option, not a type to filter for -----------------
 #
 # The nomination is what makes this half exist at all, so most of what is
