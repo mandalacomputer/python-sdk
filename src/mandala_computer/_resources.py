@@ -40,11 +40,18 @@ from ._models import (
 )
 from ._sse import SSEEvent
 
-__all__ = ["Builds", "Computers", "Moves", "Sizes", "Snapshots", "Templates", "Usage"]
+__all__ = [
+    "Builds",
+    "Computers",
+    "Moves",
+    "Sizes",
+    "Snapshots",
+    "Templates",
+    "Usage",
+    "Webhooks",
+]
 
 
-#: The least a wait will sleep after a 429, when `poll` and ``Retry-After``
-#: both fail to supply one. See ``_poll_delay`` in _computer.py.
 class _LastPoll(Enum):
     """What became of the most recent poll, in three states rather than two.
 

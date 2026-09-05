@@ -61,6 +61,45 @@ PAIRS = [
 ]
 
 
+def test_both_halves_declare_the_same_resources() -> None:
+    """``__all__`` is each module's account of its own surface, and one half
+    giving a different account from the other is the drift this file is for.
+
+    Nothing star-imports either module — ``__init__`` names every class it
+    re-exports — so an omission breaks nothing at runtime and is invisible
+    until a documentation build or a ``dir()``-driven tool goes looking. That
+    is exactly how it happened: ``Webhooks`` arrived on both halves with
+    OPL-4302 and was added to only the async list (adversarial review,
+    OPL-4478). PAIRS is the ground truth for what both lists must hold.
+    """
+    pairs = [(s, a) for s, a in PAIRS if s.__module__ == _resources.__name__]
+    assert {s.__name__ for s, _ in pairs} == set(_resources.__all__)
+    assert {a.__name__ for _, a in pairs} == set(_async_resources.__all__)
+
+
+def test_no_sphinx_attribute_comment_is_stranded_on_a_class() -> None:
+    """``#:`` documents the assignment BELOW it, so one landing on a ``class``
+    is describing something that is no longer there.
+
+    A class carries its own docstring and has no use for the syntax, so the
+    only way the two meet is a constant moving out from under its comment and
+    leaving the comment behind — which is what happened to
+    ``RATE_LIMITED_FLOOR``'s, stranded above ``_LastPoll`` in ``_resources``
+    while the constant itself moved to ``_computer`` (adversarial review,
+    OPL-4478). Sphinx renders the orphan against whatever follows it, so the
+    published documentation says a poll-outcome enum is a sleep floor.
+    """
+    package = Path(mc.__file__).resolve().parent
+    stranded = [
+        f"{path.name}:{n}: {lines[n].strip()}"
+        for path in sorted(package.glob("*.py"))
+        for lines in [path.read_text().splitlines()]
+        for n in range(1, len(lines))
+        if lines[n].lstrip().startswith("class ") and lines[n - 1].strip().startswith("#:")
+    ]
+    assert not stranded, stranded
+
+
 def test_same_public_names() -> None:
     for sync_cls, async_cls in PAIRS:
         sync_names = public_names(sync_cls)

@@ -63,6 +63,24 @@ _ID = "webhook-id"
 _TIMESTAMP = "webhook-timestamp"
 _SIGNATURE = "webhook-signature"
 
+#: The most digits a ``webhook-timestamp`` may carry and still be converted.
+#:
+#: Unix seconds are ten digits now and stay eleven until the year 5138, so
+#: twenty is room the platform will never need — and the bound is not about
+#: plausibility, it is about arithmetic. ``int()`` builds an integer of any
+#: size from this header, and the header is written by whoever can reach the
+#: receiver's endpoint: from 309 digits the value can exceed what a float
+#: holds and from 310 it always does, so ``abs(clock - sent)`` below raises
+#: ``OverflowError``, and past
+#: 4300 digits ``int(value, 10)`` itself raises ``ValueError`` on CPython's
+#: integer-string conversion limit. Either one escapes :func:`verify`, whose
+#: whole contract is that a malformed header is ``False`` and never an
+#: exception, and turns every receiver into a 500 that the platform then
+#: retries (adversarial review, OPL-4478). Length is the one property that
+#: can be tested before the conversion that is the hazard, so it is tested
+#: first.
+_MAX_TIMESTAMP_DIGITS = 20
+
 
 def _key(secret: str) -> bytes:
     """The HMAC key a secret carries, or a ``ValueError`` saying why not.
@@ -114,8 +132,15 @@ def _timestamp(value: str) -> int | None:
     ``"+1"``, ``"1_0"`` and the digits of every other script — as would
     ``str.isdigit`` — none of which the platform writes, and a verifier is the
     wrong place to be generous about what it accepts.
+
+    At most :data:`_MAX_TIMESTAMP_DIGITS` of them, and that bound is checked
+    before the conversion rather than after: a longer string is not merely
+    implausible, it is the one input for which ``int()`` and the window
+    arithmetic that follows raise instead of answering.
     """
-    return int(value, 10) if value.isascii() and value.isdigit() else None
+    if not (value.isascii() and value.isdigit()) or len(value) > _MAX_TIMESTAMP_DIGITS:
+        return None
+    return int(value, 10)
 
 
 def verify(
@@ -149,6 +174,12 @@ def verify(
     :func:`time.time`. ``tolerance`` is the replay window, defaulting to the
     platform's :data:`REPLAY_WINDOW_S`.
 
+    A ``webhook-id`` that is not ASCII is one of the malformed headers this
+    answers ``False`` to. The platform writes ``whd-`` and sixteen hex
+    characters, so nothing it sends is affected; the rule is stated because it
+    is stricter than the hazard it closes, which is only the id that cannot be
+    encoded at all.
+
     What this does not do, and a receiver still must: remember every
     ``webhook-id`` it accepts for at least the window, and refuse a repeat.
     Retries carry the same id, so that is what makes a delivery processed
@@ -166,6 +197,17 @@ def verify(
     stamp = _header(headers, _TIMESTAMP)
     signatures = _header(headers, _SIGNATURE)
     if msg_id is None or stamp is None or signatures is None:
+        return False
+    # The id is signed as its own bytes, so it has to survive `.encode()`, and
+    # a header is not guaranteed to. A server that decodes request headers with
+    # `surrogateescape` — aiohttp does — turns a raw 0xFF byte into the lone
+    # surrogate '\udcff', which UTF-8 cannot encode: `msg_id.encode()` below
+    # would raise `UnicodeEncodeError` straight out of a function whose whole
+    # contract is that a malformed header is `False`. The platform writes
+    # `whd-` and sixteen hex characters, so nothing it sends is lost by
+    # refusing the non-ASCII id here, and a forged one fails the MAC anyway
+    # (adversarial review, OPL-4478).
+    if not msg_id.isascii():
         return False
     sent = _timestamp(stamp)
     if sent is None:
