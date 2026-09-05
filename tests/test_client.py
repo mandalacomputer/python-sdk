@@ -2864,6 +2864,32 @@ def test_the_vnc_repr_survives_an_empty_terminal_url() -> None:
     assert "terminal_url=''" in repr(vnc)
 
 
+def test_a_null_vnc_url_is_absent_rather_than_the_string_none() -> None:
+    """`str(None)` is `"None"`, which is neither a URL nor an absent one.
+
+    The `dict.get` default answers a missing key and an explicit null defeats
+    it, so three of the five URLs decoded to a five-character string that a
+    caller would hand to a connect call and watch fail obscurely — from a
+    method whose whole rule is that a URL it cannot vouch for is reported as
+    nothing to connect to (adversarial review, OPL-4479). `terminal_url` and
+    `events_url` were already read the other way.
+    """
+    vnc = mc.VncConnect.from_api(
+        {
+            "url": None,
+            "view_url": None,
+            "embed_url": None,
+            "terminal_url": None,
+            "events_url": None,
+            "token": "a",
+            "view_token": "b",
+        }
+    )
+    assert vnc is not None
+    assert (vnc.url, vnc.view_url, vnc.embed_url) == ("", "", "")
+    assert (vnc.terminal_url, vnc.events_url) == ("", "")
+
+
 def test_the_vnc_clipboard_field_does_not_move_the_positional_raw_slot() -> None:
     """The pre-clipboard seven-argument constructor remains compatible.
 
@@ -3017,6 +3043,39 @@ def test_null_model_fields_are_normalized_without_losing_the_row() -> None:
     assert (status.pid, status.command, status.stdout_offset, status.stderr_offset) == (0, "", 0, 0)
 
 
+def test_a_boolean_where_a_number_belongs_is_unusable_rather_than_one() -> None:
+    """`float(True)` is 1.0, so `"cpu": true` decoded to a one-vCPU machine.
+
+    A number invented out of a value both decoders promise to answer zero for,
+    and plausible enough that nothing downstream can tell it from a real one.
+    `_opt_num` and `_exit_code` next door refuse booleans explicitly and say
+    why, so `_num` and `_real` were the two halves of the same rule left out
+    (adversarial review, OPL-4479). `_real` carries it onto a billing figure:
+    an hour that was never run.
+    """
+    template = mc.Template.from_api({"cpu": True, "ram_mb": True, "disk_gb": True})
+    assert (template.cpu, template.ram_mb, template.disk_gb) == (0, 0, 0)
+    assert mc.Snapshot.from_api({"size_bytes": True}).size_bytes == 0
+    usage = mc.ComputerUsage.from_api({"id": "vm-1", "run_hours": True, "vcpu_hours": True})
+    assert (usage.run_hours, usage.vcpu_hours) == (0.0, 0.0)
+
+
+def test_a_null_snapshot_kind_is_still_a_disk_snapshot() -> None:
+    """The default exists for hosts that predate the field, and a null defeated it.
+
+    `dict.get`'s second argument answers a missing key and nothing else, so the
+    same wire value decoded two ways — `"disk"` when the key was absent and
+    `""` when it was explicitly null, which leaves `is_memory` and every
+    `kind ==` comparison reading an unclassified snapshot (adversarial review,
+    OPL-4479).
+    """
+    for body in ({}, {"kind": None}):
+        snapshot = mc.Snapshot.from_api(body)
+        assert snapshot.kind == "disk", body
+        assert snapshot.is_memory is False, body
+    assert mc.Snapshot.from_api({"kind": "memory"}).is_memory is True
+
+
 def test_null_computer_string_fields_are_empty() -> None:
     computer = mc.Computer(
         None,
@@ -3075,6 +3134,44 @@ def test_a_malformed_exit_code_is_an_sdk_error() -> None:
     status = mc.ExecStatus.from_api({"pid": 1, "exit_code": "oops", "stdout": "KEEPME"})
     assert status.exit_code is None
     assert status.stdout == "KEEPME"
+
+
+@pytest.mark.parametrize(
+    "wire",
+    ["²", "⑤", "1" * 4301, "-" + "1" * 5000],
+    ids=["superscript", "circled", "past-the-conversion-limit", "signed-past-the-limit"],
+)
+def test_a_digit_string_int_refuses_is_an_sdk_error_not_a_valueerror(wire: str) -> None:
+    """`str.isdigit` is a wider grammar than `int()`, and the gap raised.
+
+    `"²"` is a digit by that test and not a literal `int()` will read, so the
+    guard passed and the conversion raised a bare `ValueError` — from a
+    response field, past the `MandalaError` the README says everything the
+    platform answers with derives from. So did a decimal string longer than
+    CPython's integer-string conversion limit, which `int()` refuses outright
+    (adversarial review, OPL-4479).
+
+    The consuming half is the same argument `test_a_boolean_exit_code_is_rejected`
+    makes: `poll` and `kill` have spent the daemon's output cursor by the time
+    this runs, so `ExecStatus` keeps what it read and reports the code unknown.
+    """
+    with pytest.raises(mc.MandalaError, match="invalid exit_code"):
+        mc.ExecResult.from_api({"exit_code": wire})
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": wire, "stdout": "KEEPME"})
+    assert status.exit_code is None
+    assert status.stdout == "KEEPME"
+
+
+def test_a_zero_padded_exit_code_is_read_exactly_rather_than_refused() -> None:
+    """Padding carries no magnitude but does count against the same limit.
+
+    The bound that keeps `int()` from raising is on the digits it will convert,
+    so the zeros come off before both — otherwise a value well inside the range
+    would be refused for the length of its own padding.
+    """
+    padded = "0" * 5000 + "9007199254740993"
+    assert mc.ExecResult.from_api({"exit_code": padded}).exit_code == 9007199254740993
+    assert mc.ExecResult.from_api({"exit_code": "0" * 5000}).exit_code == 0
 
 
 # --- 429 is its own answer -------------------------------------------------

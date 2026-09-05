@@ -24,7 +24,9 @@ __all__ = [
     "ExecStatus",
     "FilePart",
     "Listing",
+    "Move",
     "PublishedTemplate",
+    "Retention",
     "RetiredTemplates",
     "Size",
     "Snapshot",
@@ -48,7 +50,18 @@ S = TypeVar("S")
 
 
 def _num(value: Any) -> int:
-    """An integer field off the wire, or zero when it is unusable."""
+    """An integer field off the wire, or zero when it is unusable.
+
+    A JSON boolean is not one of the usable ones. ``float(True)`` is ``1.0``,
+    so ``"cpu": true`` decoded to a one-vCPU machine — a plausible number
+    invented out of a value this promises to answer zero for, which is the
+    reading a caller can at least see is wrong. :func:`_opt_num` and
+    :func:`_exit_code` both refuse booleans explicitly and say why; this and
+    :func:`_real` were the two that never learned the rule (adversarial review,
+    OPL-4479).
+    """
+    if isinstance(value, bool):
+        return 0
     try:
         number = float(value)
     except (OverflowError, TypeError, ValueError):
@@ -81,20 +94,64 @@ def _opt_num(value: Any) -> int | None:
     return int(number) if math.isfinite(number) else None
 
 
+#: The most digits a decimal string may carry and still be converted here.
+#:
+#: The bound is not about plausibility — every integer field on this surface is
+#: an exit code, a pid, a byte count or an offset, and none of them is twenty
+#: digits — it is about arithmetic. ``int(text, 10)`` builds an integer of any
+#: size out of a value the platform wrote, and past 4300 digits that call
+#: itself raises ``ValueError`` on CPython's integer-string conversion limit:
+#: a bare builtin out of a helper whose two callers promise otherwise, ``None``
+#: from :func:`_opt_whole` and a :class:`~mandala_computer.MandalaError` from
+#: :func:`_exit_code`, and which on the event path ends a live stream rather
+#: than dropping one field (adversarial review, OPL-4479). Length is the one
+#: property that can be tested before the conversion that is the hazard, so it
+#: is tested first.
+#:
+#: 310 rather than something tighter because refusing here must not itself
+#: become a lost value: a string this turns down falls through to ``float()``
+#: in both callers, and only from 310 significant digits is that fall always
+#: ``inf``, which they already refuse. Anything shorter would hand them a
+#: finite float of a number too large to be one, which is the silent rounding
+#: this function exists to prevent. 310 rather than 4300 because the limit is
+#: tunable: ``sys.set_int_max_str_digits`` and ``PYTHONINTMAXSTRDIGITS`` reach
+#: down to ``sys.int_info.str_digits_check_threshold``, 640, so the bound has
+#: to hold under the floor rather than at today's default.
+_MAX_EXACT_DIGITS = 310
+
+
 def _exact_int(value: Any) -> int | None:
     """A whole number that ``float()`` would not be needed for, or ``None``.
 
     ``float`` is lossy past 2**53, so a Python ``int`` or a decimal string in
     that range must not be routed through it. Callers fall through to ``float``
     for values this cannot speak for — notably ``1.0`` and ``"3.0"``.
+
+    ``str.isdecimal`` and not ``str.isdigit``, because the second is a wider
+    grammar than ``int()``'s and the difference is exactly the characters
+    ``int()`` refuses: ``"²"`` is a digit by that test and not a literal
+    ``int()`` will read, so the guard passed and the conversion raised
+    ``ValueError`` — from a decoder reading a field the caller never named
+    (adversarial review, OPL-4479). ``isdecimal`` is the predicate that matches
+    what ``int()`` accepts, Unicode decimal digits and all.
+
+    Leading zeros go before both the bound and the conversion. They carry no
+    magnitude but they do count against the conversion limit
+    :data:`_MAX_EXACT_DIGITS` exists to stay under, so ``"0" * 5000 + "1"`` is
+    ``1`` here rather than another ``ValueError``.
     """
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, str):
         text = value.strip()
-        if text[:1] in "+-":
-            return int(text, 10) if text[1:].isdigit() else None
-        return int(text, 10) if text.isdigit() else None
+        sign = text[:1] if text[:1] in ("+", "-") else ""
+        digits = text[len(sign) :]
+        if not digits.isdecimal():
+            return None
+        digits = digits.lstrip("0") or "0"
+        if len(digits) > _MAX_EXACT_DIGITS:
+            return None
+        return int(sign + digits, 10)
     return None
 
 
@@ -144,7 +201,12 @@ def _real(value: Any) -> float:
     usage figure is fractional — 0.75 hours is a real session, and 0.13
     GB-months is a real charge — so truncating them would round most small
     accounts' usage to nothing.
+
+    Booleans are refused for the reason :func:`_num` gives, and it lands on a
+    billing figure here: ``"run_hours": true`` billed as one hour.
     """
+    if isinstance(value, bool):
+        return 0.0
     try:
         number = float(value)
     except (OverflowError, TypeError, ValueError):
@@ -598,6 +660,15 @@ class VncConnect:
         a missing credential is a string indistinguishable from a working one
         that answers 401 forever. Anything short of both credentials is treated
         as no connect surface at all.
+
+        Which is why every URL here is read as ``or ""`` rather than through a
+        ``dict.get`` default: a default answers a missing key and a JSON
+        ``null`` defeats it, and ``str(None)`` is ``"None"`` — a five-character
+        string that is not a URL and does not read as an absent one either, so
+        it would be handed to a connect call and fail obscurely instead of
+        being reported as nothing to connect to (adversarial review, OPL-4479).
+        ``terminal_url`` and ``events_url`` were already spelled this way; the
+        rule now holds for all five.
         """
         if not isinstance(d, Mapping):
             return None
@@ -606,11 +677,11 @@ class VncConnect:
         if not token or not view_token:
             return None
         return cls(
-            url=str(d.get("url", "")),
-            view_url=str(d.get("view_url", "")),
+            url=str(d.get("url") or ""),
+            view_url=str(d.get("view_url") or ""),
             token=token,
             view_token=view_token,
-            embed_url=str(d.get("embed_url", "")),
+            embed_url=str(d.get("embed_url") or ""),
             terminal_url=str(d.get("terminal_url") or ""),
             events_url=str(d.get("events_url") or ""),
             # `is True` rather than truthiness, and absent lands on False: the
@@ -1262,7 +1333,13 @@ class Snapshot:
             id=_text(d.get("id")),
             computer_id=_text(d.get("computer_id")),
             name=_text(d.get("name")),
-            kind=_text(d.get("kind", "disk")),
+            # `or "disk"` rather than a `dict.get` default, which answers a
+            # missing key and nothing else. The default is there to classify
+            # rows from hosts that predate the field, and an explicit null
+            # defeated it: the same wire value decoded two ways, and the null
+            # left `is_memory` and every `kind ==` comparison reading an
+            # unclassified snapshot (adversarial review, OPL-4479).
+            kind=_text(d.get("kind")) or "disk",
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),

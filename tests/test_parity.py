@@ -7,7 +7,9 @@ user. These tests make the sync client the spec and hold the async one to it.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -240,3 +242,75 @@ def test_wait_for_guest_docstring_renders_as_prose() -> None:
         assert doc is not None
         indented = [line for line in doc.splitlines() if line.strip() and line[0].isspace()]
         assert not indented, f"{cls.__name__}.wait_for_guest: {indented}"
+
+
+def test_no_docstring_body_opens_as_an_indented_block() -> None:
+    """The general form of the test above, which found the same thing again.
+
+    The strip is of the COMMON indent, so a body written one level deeper than
+    its summary keeps that level and renders as a block quote — and any line
+    that happens to sit at the summary's own depth escapes the quote, which is
+    how :class:`OriginUnreachableError` read: twenty-eight lines quoted and one
+    paragraph loose among them (adversarial review, OPL-4479). Every docstring
+    in the package rather than one method, because the defect is invisible in
+    the source: the file looks tidy, and only the render is wrong.
+
+    A literal block is the one legitimate reason to open a body indented, and
+    reST says so with a ``::`` the line before — which is the exemption here.
+    Module docstrings are left out for the same reason from the other end: the
+    package's own opens with the worked example a caller sees from ``help()``
+    rather than with a summary and paragraphs under it.
+    """
+    package = Path(mc.__file__).resolve().parent
+    kinds = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    offenders = []
+    for path in sorted(package.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, kinds):
+                continue
+            doc = ast.get_docstring(node, clean=False)
+            if not doc:
+                continue
+            lines = inspect.cleandoc(doc).splitlines()
+            body = [line for line in lines[1:] if line.strip()]
+            if body and body[0][:1].isspace() and not lines[0].rstrip().endswith("::"):
+                owner = getattr(node, "name", "<module>")
+                offenders.append(f"{path.name}:{owner}: {body[0].strip()[:60]}")
+    assert not offenders, offenders
+
+
+def test_every_module_declares_what_the_package_re_exports() -> None:
+    """``__all__`` is each module's account of its own surface, and the package's
+    export list is the thing to check it against.
+
+    Nothing star-imports these modules, so a name missing from one breaks
+    nothing at runtime and stays invisible until a documentation build or a
+    ``dir()``-driven tool goes looking — which is exactly why it drifts, and
+    why ``Move``, ``Retention`` and ``MoveRequiredError`` were all public,
+    re-exported and undeclared at once (adversarial review, OPL-4479).
+
+    The whole package rather than one module:
+    :func:`tests.test_agent.test_the_module_declares_everything_the_package_re_exports`
+    made this claim for ``_agent`` alone, and the three names above sat in the
+    two modules it does not read.
+    """
+    undeclared, unbound = [], []
+    for name in mc.__all__:
+        # Where the name was DEFINED, which for a type alias is `typing` and
+        # for a constant is nowhere — neither of them a module of this package
+        # with an account to give.
+        home = getattr(getattr(mc, name), "__module__", "")
+        module = sys.modules.get(home) if home.startswith(f"{mc.__name__}.") else None
+        declared = getattr(module, "__all__", None)
+        if declared is not None and name not in declared:
+            undeclared.append(f"{home}.__all__ omits {name}")
+    for module_name, module in sorted(sys.modules.items()):
+        if not module_name.startswith("mandala_computer."):
+            continue
+        unbound += [
+            f"{module_name}.__all__ names {name}, which it does not define"
+            for name in getattr(module, "__all__", ())
+            if not hasattr(module, name)
+        ]
+    assert not undeclared, undeclared
+    assert not unbound, unbound
