@@ -704,7 +704,7 @@ def test_a_full_pipe_stalls_before_the_write_finishes() -> None:
     [
         ('{"type": "exit", "code": 3}', 3),
         ('{"type": "exit", "code": 0}', 0),
-        ('{"type": "exit"}', 0),
+        ('{"type": "exit"}', _cli.EXIT_STATUS_UNKNOWN),
         ('{"type": "resize", "cols": 80}', None),
         ('{"type": "error", "message": "nope"}', None),
         ("not json at all", None),
@@ -717,10 +717,14 @@ def test_a_full_pipe_stalls_before_the_write_finishes() -> None:
         ('"hi"', None),
         ("[1, 2]", None),
         ("true", None),
-        # An exit frame whose code is unreadable is still an exit.
-        ('{"type": "exit", "code": [1]}', 0),
-        ('{"type": "exit", "code": "abc"}', 0),
-        ('{"type": "exit", "code": null}', 0),
+        # An exit frame whose code is unreadable is still an exit — but its
+        # status is UNKNOWN, and 0 is the one answer that would claim success.
+        ('{"type": "exit", "code": [1]}', _cli.EXIT_STATUS_UNKNOWN),
+        ('{"type": "exit", "code": "abc"}', _cli.EXIT_STATUS_UNKNOWN),
+        ('{"type": "exit", "code": null}', _cli.EXIT_STATUS_UNKNOWN),
+        ('{"type": "exit", "code": true}', _cli.EXIT_STATUS_UNKNOWN),
+        ('{"type": "exit", "code": 3.9}', _cli.EXIT_STATUS_UNKNOWN),
+        # A decimal string crosses a process boundary the way a pid does.
         ('{"type": "exit", "code": "7"}', 7),
     ],
 )
@@ -1386,6 +1390,26 @@ def test_queued_input_is_discarded_once_the_terminal_has_closed(
     assert sent == [b"one"]
 
 
+def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:
+    """`mandala ssh cmd && next` must not run `next` on a status nobody read.
+
+    0 is the one value that claims the command succeeded, so it is the one
+    value an unreadable frame must not produce. 255 is what ssh answers when it
+    cannot report a remote status, which keeps a wrapper already written
+    against ssh correct, and the reason goes to stderr so the operator is not
+    left guessing why a green command reported a failure (OPL-4479 BUG-29).
+    """
+    assert _cli._exit_code('{"type":"exit","code":"nope"}') == 255
+    assert "unreadable status" in capsys.readouterr().err
+
+    assert _cli._exit_code('{"type":"exit"}') == 255
+    assert "without reporting a status" in capsys.readouterr().err
+
+    # A real status still passes through silently, 0 included.
+    assert _cli._exit_code('{"type":"exit","code":0}') == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> None:
     """The fifth `int()` site, missed by the sweep that fixed the other four.
 
@@ -1396,9 +1420,11 @@ def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> No
     prevent: "no code to read is not a reason to invent a failure"
     (/code-review, OPL-4232).
     """
-    assert _cli._exit_code('{"type":"exit","code":1e309}') == 0
-    # The frame's ARRIVAL is still the news that the shell ended.
-    assert _cli._exit_code('{"type":"exit"}') == 0
+    assert _cli._exit_code('{"type":"exit","code":1e309}') == _cli.EXIT_STATUS_UNKNOWN
+    # The frame's arrival is the news that the session ENDED. It is not news
+    # that the command SUCCEEDED, and 0 is the one value that claims it.
+    assert _cli._exit_code('{"type":"exit"}') == _cli.EXIT_STATUS_UNKNOWN
     assert _cli._exit_code('{"type":"exit","code":3}') == 3
+    assert _cli._exit_code('{"type":"exit","code":0}') == 0
     # And a frame that is not an exit still says nothing.
     assert _cli._exit_code('{"type":"resize","cols":80}') is None

@@ -283,6 +283,25 @@ def _connect(url: str) -> ClientConnection:
         _die("could not open the terminal")
 
 
+#: What ``mandala ssh`` returns when the session ended and its status could not
+#: be read. 255 is what ssh itself returns when it cannot report a remote
+#: status, so a wrapper already written against ssh reads this correctly, and it
+#: stays outside the 0-254 a guest command can plausibly answer with.
+#:
+#: The one ambiguity left is a daemon that reports a literal 255. POSIX statuses
+#: are unsigned bytes and a shell returns 255 for "command not found" among
+#: other things, so that collision is real but it is a collision between two
+#: failures, not between a failure and a success — which is the trade this
+#: constant exists to refuse (adversarial review, OPL-4479).
+EXIT_STATUS_UNKNOWN = 255
+
+
+def _unknown_status(why: str) -> int:
+    """Report an ended session whose status is unknown, and say so."""
+    print(f"mandala: {why}; reporting {EXIT_STATUS_UNKNOWN}", file=sys.stderr)
+    return EXIT_STATUS_UNKNOWN
+
+
 def _exit_code(message: str) -> int | None:
     """The status carried by a text frame, or ``None`` if it carries none.
 
@@ -294,9 +313,24 @@ def _exit_code(message: str) -> int | None:
     not an object: ``null``, a number and a list all parse cleanly and then
     have no ``.get``. That reached the pump as an ``AttributeError``, which
     ``main()`` does not catch, so a single stray frame ended an interactive
-    session in a traceback. An unreadable ``code`` is the same story one line
-    down, and is answered the same way — the frame's arrival is the news that
-    the shell ended, and no code to read is not a reason to invent a failure.
+    session in a traceback.
+
+    An exit frame this cannot read a status out of answers
+    :data:`EXIT_STATUS_UNKNOWN`, not ``0``. It used to answer ``0`` on the
+    argument that the frame's arrival is itself the news that the shell ended —
+    true, but the frame's arrival says the session ENDED, not that the command
+    SUCCEEDED, and ``0`` is the one value that claims the second. A caller
+    writing ``mandala ssh box 'make release' && ./deploy.sh`` is asking about
+    the command, and shipping on a status nobody could read is the failure this
+    SDK refuses everywhere else — ``_models._exit_code`` exists for exactly
+    this trade, "a failed command mistaken for a successful one, and there is
+    no safe value to carry on with". Missing and malformed are not
+    distinguished, because to that caller they are the same news: we do not
+    know (adversarial review, OPL-4479).
+
+    A decimal string is still read. That value crosses a process boundary the
+    way ``guest_pid``'s does, and refusing it would be a tightening rather than
+    a correction.
     """
     try:
         control = json.loads(message)
@@ -304,15 +338,22 @@ def _exit_code(message: str) -> int | None:
         return None
     if not isinstance(control, dict) or control.get("type") != "exit":
         return None
+    code = control.get("code")
+    if code is None:
+        return _unknown_status("the shell ended without reporting a status")
+    if isinstance(code, bool):
+        return _unknown_status(f"the shell reported {code!r} where a status belongs")
     try:
-        return int(control.get("code") or 0)
+        status = int(code)
     # `OverflowError` with the two obvious ones: `json.loads("1e309")` is `inf`,
     # and `int(inf)` raises neither of them. It escapes the pump's own handlers
     # and `main()`, so one stray frame ends an interactive session in a
-    # traceback — which is the outcome the docstring above says this function
-    # exists to prevent (/code-review, OPL-4232).
+    # traceback (/code-review, OPL-4232).
     except (OverflowError, TypeError, ValueError):
-        return 0
+        return _unknown_status(f"the shell reported an unreadable status {code!r}")
+    if isinstance(code, float) and status != code:
+        return _unknown_status(f"the shell reported a fractional status {code!r}")
+    return status
 
 
 # Cap on unread local keystrokes / piped stdin waiting to go out. A stalled

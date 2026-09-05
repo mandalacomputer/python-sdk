@@ -25,6 +25,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer import _computer
 
 BASE = "https://api.test/api/v1"
 
@@ -493,3 +494,38 @@ def test_an_undateable_row_never_displaces_one_that_can_be_dated() -> None:
     picked = c._my_move(listing)
     assert picked is not None
     assert picked.state == "done"
+
+
+def test_two_moves_at_different_offsets_order_by_instant_not_by_offset() -> None:
+    """The key is the instant, because every repair of the TEXT is one spelling.
+
+    `09:00+02:00` is 07:00Z and `08:00-05:00` is 13:00Z, so the second is an
+    hour of the clock earlier and six hours of the world later. Compared as
+    text the offset decides and `max` hands back the older row — the exact
+    misread `_my_move` uses this key to prevent, since `moved` means the machine
+    HAS changed hosts and acting on a stale row sends a resize somewhere else
+    (adversarial review, OPL-4480).
+    """
+    earlier = "2026-08-23T09:00:00+02:00"  # 07:00Z
+    later = "2026-08-23T08:00:00-05:00"  # 13:00Z
+
+    assert _computer._started_key(later) > _computer._started_key(earlier)
+    assert max((earlier, later), key=_computer._started_key) == later
+
+
+def test_the_instant_key_keeps_every_ordering_the_text_key_earned() -> None:
+    """The spellings the old key was built to reconcile still reconcile."""
+    key = _computer._started_key
+
+    # Z and +00:00 are one instant, however they are written.
+    assert key("2026-08-23T02:00:12Z")[1] == key("2026-08-23T02:00:12+00:00")[1]
+    # A fraction is later than the whole second it follows, not earlier.
+    assert key("2026-08-23T02:00:12.999Z") > key("2026-08-23T02:00:12Z")
+    assert key("2026-08-23T02:00:12.500+00:00") > key("2026-08-23T02:00:12Z")
+    # A stamp nobody can date is not evidence of being recent.
+    assert key("nope")[0] == 0
+    assert key("")[0] == 0
+    assert key("2026-13-45T99:99:99Z")[0] == 0
+    assert key("2026-08-23T02:00:12Z") > key("nope")
+    # No offset reads as UTC rather than as undateable.
+    assert key("2026-08-23T02:00:12")[1] == key("2026-08-23T02:00:12Z")[1]

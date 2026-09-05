@@ -2174,7 +2174,20 @@ class AsyncEventStream(_StreamBase):
             sock = None
             try:
                 sock = await connecting
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except asyncio.CancelledError:
+                # Draining a task we just cancelled has to absorb THAT task's
+                # cancellation. It must not absorb one delivered to US at this
+                # await: swallowing that leaves this task finishing normally
+                # after a `cancel()`, so `task.cancelled()` is False and the
+                # `async for` ends quietly instead of propagating.
+                # `connecting.cancelled()` is what tells the two apart — it is
+                # true only once the cancel we asked for is the one that
+                # landed. The sibling `_recv` keeps the same discipline with
+                # `except BaseException: reading.cancel(); raise`.
+                if not connecting.cancelled():
+                    raise
+                sock = None
+            except Exception:  # noqa: BLE001
                 sock = None
             if sock is not None:
                 await _ashut_quietly(sock)
