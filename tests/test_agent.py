@@ -463,6 +463,24 @@ def test_agent_once_maps_an_in_band_error_like_the_stream(computer: mc.Computer)
     assert error.value.agent.usage.input_tokens == 90
 
 
+@respx.mock
+@pytest.mark.parametrize("empty", [None, ""], ids=["null", "blank"])
+def test_agent_once_reads_a_result_that_names_no_error(
+    computer: mc.Computer, empty: str | None
+) -> None:
+    """A field the platform always serialises is not a failure when it is empty.
+
+    The streaming half gets a frame of its own for a failure, so its arrival is
+    the signal; the non-streaming body carries the error beside the result, and
+    a run that went well may still spell that field out as `null` or `""`.
+    Dispatching on the key would raise a failure with nothing in it and throw
+    away the result sitting in the same object.
+    """
+    respx.post(AGENT).mock(httpx.Response(200, json={**DONE, "error": empty}))
+    result = computer.agent_once("do the thing", model_key=KEY)
+    assert result.finished and result.text == "all set"
+
+
 # --- forward compatibility -------------------------------------------------
 
 
@@ -900,6 +918,19 @@ async def test_the_async_non_streaming_form_maps_an_in_band_error() -> None:
         with pytest.raises(mc.RateLimitError, match="slow down") as error:
             await c.agent_once("do the thing", model_key=KEY)
     assert error.value.status == 429 and error.value.retry_after is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [None, ""], ids=["null", "blank"])
+async def test_the_async_non_streaming_form_reads_a_result_that_names_no_error(
+    empty: str | None,
+) -> None:
+    """Both halves call the one helper, and both must read the value, not the key."""
+    respx.post(AGENT).mock(httpx.Response(200, json={**DONE, "error": empty}))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        assert (await c.agent_once("do the thing", model_key=KEY)).text == "all set"
 
 
 @respx.mock
