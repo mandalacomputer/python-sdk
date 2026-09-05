@@ -988,6 +988,17 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as e:
         print(f"mandala: {e}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Ctrl-C is how a person ends a transfer or a wait, not a fault, and
+        # 130 is the shell's number for it — 128 plus SIGINT, which is what a
+        # caller's `$?` and every wrapper script reads. `_interact` has
+        # answered it that way on the `ssh` path since that path existed, so
+        # the intent was already settled in-tree; `scp` and every `webhooks`
+        # verb run outside that handler and ended in a traceback and a 1
+        # instead (adversarial review, OPL-4479). A `BaseException`, so it
+        # reaches this clause past the three above rather than through them.
+        print("mandala: interrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

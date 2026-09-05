@@ -17,6 +17,7 @@ __all__ = [
     "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
+    "MoveRequiredError",
     "NotFoundError",
     "OriginResponseError",
     "OriginTLSError",
@@ -262,34 +263,34 @@ class OriginResponseError(APIError):
 class OriginUnreachableError(APIError):
     """521-523 — a proxy in front of the platform could not reach it.
 
-        One of four classes for an edge failing rather than the platform refusing,
-        and they are four because a caller asking *did my work happen* needs four
-        answers. :class:`GatewayTimeoutError` is a hop that stopped waiting, usually
-        on a request the platform has. :class:`OriginResponseError` is 520, where the
-        platform was reached and the exchange broke coming back. :class:`OriginTLSError`
-        is a certificate that will never agree. This one is an origin that is down or
-        unreachable — what a platform restart looks like from outside, and it clears.
+    One of four classes for an edge failing rather than the platform refusing,
+    and they are four because a caller asking *did my work happen* needs four
+    answers. :class:`GatewayTimeoutError` is a hop that stopped waiting, usually
+    on a request the platform has. :class:`OriginResponseError` is 520, where the
+    platform was reached and the exchange broke coming back. :class:`OriginTLSError`
+    is a certificate that will never agree. This one is an origin that is down or
+    unreachable — what a platform restart looks like from outside, and it clears.
 
-        Almost always the request was never sent, so nothing was started and there is
-        nothing left running to account for. *Almost*, rather than never: a 522 is a
-        connection that timed out, and the edge can give up after one was
-        established, so bytes already on the wire are not unsent because no
-        acknowledgement came back. Retry a read freely; look before retrying
-        something that creates.
+    Almost always the request was never sent, so nothing was started and there is
+    nothing left running to account for. *Almost*, rather than never: a 522 is a
+    connection that timed out, and the edge can give up after one was
+    established, so bytes already on the wire are not unsent because no
+    acknowledgement came back. Retry a read freely; look before retrying
+    something that creates.
 
     Every ``wait_*`` helper waits one of these out, which is a change: only
-        :meth:`~mandala_computer.Computer.wait_for_guest` used to.
-        :meth:`~mandala_computer.Computer.wait_until_built`,
-        :meth:`~mandala_computer.Computer.wait_until_running` and
-        :meth:`~mandala_computer.Computer.wait_for_move` read the control plane with
-        no retry around it at all, so one of these mid-poll ended the wait and
-        reported a machine that was coming up as one that never did (OPL-3724).
-        :class:`OriginTLSError` is the sibling that is still never waited out, which
-        is the whole reason it stopped sharing this class.
+    :meth:`~mandala_computer.Computer.wait_for_guest` used to.
+    :meth:`~mandala_computer.Computer.wait_until_built`,
+    :meth:`~mandala_computer.Computer.wait_until_running` and
+    :meth:`~mandala_computer.Computer.wait_for_move` read the control plane with
+    no retry around it at all, so one of these mid-poll ended the wait and
+    reported a machine that was coming up as one that never did (OPL-3724).
+    :class:`OriginTLSError` is the sibling that is still never waited out, which
+    is the whole reason it stopped sharing this class.
 
-        Not in :func:`is_transient`, though, and that is the other half of the same
-        change: *almost* never sent is not never, so an application replaying a
-        create through one of these can end up paying for two computers.
+    Not in :func:`is_transient`, though, and that is the other half of the same
+    change: *almost* never sent is not never, so an application replaying a
+    create through one of these can end up paying for two computers.
     """
 
 

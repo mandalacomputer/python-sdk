@@ -312,6 +312,33 @@ def test_a_fractional_exit_code_is_unknown_rather_than_truncated(wire: object) -
     assert ev.data["exit_code"] == wire
 
 
+@pytest.mark.parametrize(
+    "wire",
+    ["²", "⑤", "1" * 4301, "9" * 311],
+    ids=["superscript", "circled", "past-the-conversion-limit", "past-what-a-float-holds"],
+)
+def test_an_exit_code_no_int_can_read_is_unknown_rather_than_a_raise(wire: str) -> None:
+    """`str.isdigit` accepts what `int()` refuses, and the gap raised.
+
+    `"²"` is a digit by that test and not a literal `int()` will read, so the
+    guard passed and the conversion raised a bare `ValueError` out of a helper
+    whose docstring is an argument for why it never raises — on the one path
+    where raising ends a live connection (adversarial review, OPL-4479). A
+    decimal string past CPython's integer-string conversion limit raised the
+    same way.
+
+    The last case is the one the length bound must not answer wrongly: refused
+    for length, it falls through to `float()`, and only because 311 digits is
+    always an infinity does that fall answer unknown rather than a rounded
+    number the caller cannot tell from a real code.
+    """
+    ev = to_computer_event({"type": "process.exited", "data": {"pid": 7, "exit_code": wire}})
+    assert ev is not None
+    assert ev.exit_code is None
+    assert ev.lost is False
+    assert ev.data["exit_code"] == wire
+
+
 @pytest.mark.parametrize(("wire", "expected"), [(0, 0), (2, 2), ("3", 3), (1.0, 1), (-1, -1)])
 def test_a_whole_exit_code_still_decodes(wire: object, expected: int) -> None:
     """The refusal above is about a number that was never whole, not about form."""
@@ -537,6 +564,33 @@ def test_events_arrive_in_order(computer: mc.Computer, monkeypatch: pytest.Monke
     )
     got = [ev.type for ev in computer.events(reconnect=False)]
     assert got == ["computer.idle", "window.closed"]
+
+
+@respx.mock
+def test_a_frame_whose_exit_code_cannot_be_read_does_not_end_the_stream(
+    computer: mc.Computer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One unreadable field costs the field, never the connection.
+
+    `to_computer_event` is called bare from the run loop and every `except` on
+    the path names `_Ended`, `OSError`, `WebSocketException`, `MandalaError` or
+    `TimeoutError` — the only `except ValueError` sits inside the refusal
+    parser. So the `ValueError` a `"²"` used to raise out of the decoder left
+    through the caller's own `for` loop as a builtin traceback, and every event
+    after it was lost with the socket (adversarial review, OPL-4479).
+    """
+    route()
+    Dialer(
+        [
+            hello_frame(),
+            event_frame("process.exited", data={"pid": 7, "exit_code": "²"}),
+            event_frame("window.closed"),
+        ]
+    ).install(monkeypatch)
+    events = list(computer.events(reconnect=False))
+    assert [ev.type for ev in events] == ["process.exited", "window.closed"]
+    assert events[0].exit_code is None
+    assert events[0].lost is False
 
 
 @respx.mock
