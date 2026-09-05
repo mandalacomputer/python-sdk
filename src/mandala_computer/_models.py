@@ -162,13 +162,16 @@ def _exact_int(value: Any) -> int | None:
             return None
         if len(digits) > _MAX_EXACT_DIGITS:
             lean = digits.lstrip("0")
-            if len(lean) == len(digits):
-                # Nothing came off, so any padding here belongs to another
-                # script and has to be measured a character at a time.
+            if not lean.isascii():
+                # ASCII zeros came off above; what is left may still open with
+                # another script's, and those have to be measured one at a
+                # time. The test is on what REMAINS, not on whether `lstrip`
+                # found anything: a single "0" in front of Arabic-Indic padding
+                # takes the fast path away from the padding it exists for.
                 lead = 0
-                while lead < len(digits) - 1 and int(digits[lead]) == 0:
+                while lead < len(lean) - 1 and int(lean[lead]) == 0:
                     lead += 1
-                lean = digits[lead:]
+                lean = lean[lead:]
             digits = lean or "0"
             if len(digits) > _MAX_EXACT_DIGITS:
                 return None

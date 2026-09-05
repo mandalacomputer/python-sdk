@@ -1824,10 +1824,12 @@ platform is not checked out and fails on drift where it is.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients. `.raw` is evidence rather
-than identity: it is outside `==` and outside `hash()`, so two records this SDK
-reads the same way are equal even when the platform sent one of them a field
-neither models, and a model can go in a set or serve as a mapping key. The
-payload is still there to read.
+than identity: it takes no part in `==`, so two records this SDK reads the same
+way are equal even when the platform sent one of them a field neither models.
+The payload is still there to read. It is out of `hash()` for the same reason,
+which makes most models usable in a set or as a mapping key — though one whose
+own content is a list, like a `Webhook`'s `events`, stays unhashable because a
+list is.
 
 ### Keeping sync and async honest
 
