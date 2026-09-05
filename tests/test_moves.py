@@ -552,11 +552,18 @@ def test_a_fraction_of_any_length_is_still_a_readable_stamp() -> None:
     # The same instant however its fraction is spelled.
     assert key("2026-08-23T02:00:12.5Z") == key("2026-08-23T02:00:12.500Z")
 
-    # Padding is gated on the DIGITS, not on the dot. A stamp ending in a bare
-    # `.` has no fraction, and padding it to `.000000` would promote a
-    # malformed stamp to a dated one that can win `max`.
-    assert key("2026-08-23T02:00:12.")[0] == 0
-    assert key("2026-08-23T02:00:12.Z")[0] == 0
+    # A separator with nothing after it is not a fraction, and the answer must
+    # not depend on which interpreter is running: `fromisoformat` reads
+    # `…12.+00:00` on 3.10 through 3.12 and rejects it from 3.13, so the same
+    # malformed stamp was readable on half this package's supported versions
+    # until `_started_key` decided it rather than the parser. CI found that
+    # across the matrix; no single interpreter could have.
+    for malformed in (
+        "2026-08-23T02:00:12.",
+        "2026-08-23T02:00:12.Z",
+        "2026-08-23T02:00:12.+00:00",
+    ):
+        assert key(malformed)[0] == 0, f"{malformed} was read as a dated stamp"
 
 
 def test_the_key_leaves_ties_to_position() -> None:

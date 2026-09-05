@@ -344,11 +344,18 @@ def _started_key(stamp: str) -> tuple[int, float]:
     text = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
     head, dot, rest = text.partition(".")
     digits = rest[: len(rest) - len(rest.lstrip("0123456789"))] if dot else ""
+    if dot and not digits:
+        # A separator with nothing after it is not a fraction, and this refuses
+        # it here rather than leaving it to the parser. `fromisoformat` reads
+        # `…12.+00:00` on 3.10 through 3.12 and rejects it from 3.13, so
+        # delegating would make the same malformed stamp readable on some of
+        # this package's supported versions and unreadable on the rest — which
+        # CI caught across the matrix and no single interpreter could
+        # (third review pass, OPL-4480).
+        return (0, 0.0)
     if digits:
-        # Gated on the DIGITS, not on the dot: a stamp ending in a bare `.` has
-        # no fraction to pad, and padding it to `.000000` would turn a
-        # malformed stamp into a dated one that can win `max` — where it used
-        # to fall to the tier that sorts oldest (second review pass, OPL-4480).
+        # Padding is gated on the DIGITS: `.000000` for an absent fraction
+        # would promote a malformed stamp to a dated one that can win `max`.
         text = f"{head}.{(digits + '000000')[:6]}{rest[len(digits) :]}"
     try:
         when = datetime.fromisoformat(text)
