@@ -55,7 +55,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from surface_text import balanced, strip_comments, top_level_keys
+from surface_text import balanced, strip_comments, top_level_keys, top_level_value_at
 
 REPO = Path(__file__).resolve().parent.parent
 SURFACE = Path("web/lib/surface.ts")
@@ -368,26 +368,64 @@ def parameters(platform: Path) -> dict[str, set[str]]:
         at = m.end() + len(clean)
         found: set[str] = set()
         for key, kind in (("query", "query"), ("headers", "header")):
-            listed = clean.find(f"{key}: [")
-            if listed == -1:
+            # At the entry's own depth, and by the key rather than by the exact
+            # spelling `key: [`. Both halves of that were bugs: a list the
+            # formatter wrapped — `query:\n  [{ name: 'limit' }]` — was skipped
+            # entirely, and a `query: [` nested in a description or a response
+            # example answered for the entry, so the route's real list further
+            # down was never read. Neither says anything: the guard for a scan
+            # that counted nothing stays quiet because the other routes counted,
+            # and the route's genuine parameters surface as ones the mirror
+            # invented — which sends whoever reads the report to the wrong file,
+            # to delete entries that are correct.
+            # Not `at`: that name is the entry scan's own cursor, a few lines up.
+            listed = top_level_value_at(clean, key)
+            if listed == -1 or clean[listed : listed + 1] != "[":
                 continue
-            listing = balanced(clean, clean.index("[", listed), "[", "]")
+            listing = balanced(clean, listed, "[", "]")
             for name in re.finditer(r"name:\s*'([^']+)'", listing):
                 found.add(f"{kind}:{name.group(1)}")
             # An identifier standing in for a whole entry. Bounded by a
             # separator on each side rather than by a trailing comma: `query:
             # [ALLOW_PARTIAL]` on one line has nothing after the identifier at
             # all, and demanding one read GET computers as taking no parameters.
+            #
+            # Under `kind`, which the loop bound and then ignored. `Query` is the
+            # type of both lists upstream — `headers?: Query[]` — so a shared
+            # constant cited in a `headers` list is a header, and recording it as
+            # a query is one missing parameter and one extra, both naming the
+            # same thing and neither of them true.
             for ident in re.finditer(r"(?:^|[\[,\s])([A-Z_]{2,})(?=[,\s\]]|$)", listing):
                 if ident.group(1) in shared:
-                    found.add(f"query:{shared[ident.group(1)]}")
+                    found.add(f"{kind}:{shared[ident.group(1)]}")
+
         # Only an `object(...)` body has named fields. A raw one — the file
-        # upload's own bytes — has none to name.
-        body_at = clean.find("body: object(")
+        # upload's own bytes — has none to name. Anything else spelled where a
+        # body goes is a shape this cannot read, and reading it as no fields
+        # would say the route documents no body at all: the mirror lists none
+        # for such a route either, so the two agree over a body neither of them
+        # looked at.
+        #
+        # All three cases are decided at the entry's own depth, or a nested body
+        # answers for the entry's own: a `body: { … }` in a response example
+        # vouches for a `body: SHARED_BODY`, the refusal is skipped, and the
+        # route reports no fields — the vacuous all-clear this guard exists to
+        # refuse, arriving by way of the guard.
+        body_at = top_level_value_at(clean, "body")
         if body_at != -1:
-            args = balanced(clean, clean.index("(", body_at), "(", ")")
-            fields = balanced(args, args.index("{"), "{", "}")
-            found.update(f"body:{k}" for k in top_level_keys(fields))
+            call = re.match(r"object\s*\(", clean[body_at:])
+            args = balanced(clean, body_at + call.end() - 1, "(", ")") if call else None
+            # `object(SHARED_FIELDS)` is as unreadable as a bare identifier, and
+            # belongs in the message that names the route: fed to `balanced`
+            # unchecked, its missing `{` came back as `ValueError: substring not
+            # found`, naming neither the route nor the file it is in.
+            if args is not None and (brace := args.find("{")) != -1:
+                found.update(f"body:{k}" for k in top_level_keys(balanced(args, brace, "{", "}")))
+            elif clean[body_at : body_at + 1] != "{":
+                raise SystemExit(
+                    f"'{m.group(1)} {m.group(2)}' in {APIDOC} documents a body in a form this\n"
+                    "  reader does not know — neither object(...) nor a raw schema literal."
+                )
         table[f"{m.group(1)} {m.group(2)}"] = found
     if not table:
         raise SystemExit(f"parsed DOCS but found no routes in {APIDOC} — has its shape changed?")
