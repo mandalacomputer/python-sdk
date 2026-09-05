@@ -191,7 +191,7 @@ class ComputerEvent:
     data: Mapping[str, Any] = field(default_factory=dict)
     #: The whole frame, envelope included. Unknown and malformed fields survive
     #: here as they do everywhere else on this surface.
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     # --- promoted payloads ------------------------------------------------
     #
@@ -423,7 +423,7 @@ class WatchedTree:
     armed: bool
     #: The entry verbatim. Unknown fields survive here as they do everywhere
     #: else on this surface.
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -477,7 +477,7 @@ class Hello:
     #: the authority on the present; this is what makes a later
     #: ``window.closed`` correlatable.
     windows: list[Window] | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
     #: The trees this stream will report file changes under, and whether each is
     #: live yet. ``None`` where the frame carried no ``watching`` at all.
     #:

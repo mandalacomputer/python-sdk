@@ -162,13 +162,16 @@ def _exact_int(value: Any) -> int | None:
             return None
         if len(digits) > _MAX_EXACT_DIGITS:
             lean = digits.lstrip("0")
-            if len(lean) == len(digits):
-                # Nothing came off, so any padding here belongs to another
-                # script and has to be measured a character at a time.
+            if not lean.isascii():
+                # ASCII zeros came off above; what is left may still open with
+                # another script's, and those have to be measured one at a
+                # time. The test is on what REMAINS, not on whether `lstrip`
+                # found anything: a single "0" in front of Arabic-Indic padding
+                # takes the fast path away from the padding it exists for.
                 lead = 0
-                while lead < len(digits) - 1 and int(digits[lead]) == 0:
+                while lead < len(lean) - 1 and int(lean[lead]) == 0:
                     lead += 1
-                lean = digits[lead:]
+                lean = lean[lead:]
             digits = lean or "0"
             if len(digits) > _MAX_EXACT_DIGITS:
                 return None
@@ -671,7 +674,7 @@ class VncConnect:
     # old positional ``raw`` value here would make the hand-written repr render
     # that payload (and any credentials in it) as ``clipboard``.
     clipboard: bool = field(default=False, kw_only=True)
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any] | None) -> VncConnect | None:
@@ -762,7 +765,7 @@ class Template:
     cpu: int
     ram_mb: int
     disk_gb: int
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
     #: The pinned ``namespace/name@version``, when the platform sent one.
     #:
     #: ``None`` only from a host too old to advertise refs. It matters more than
@@ -828,7 +831,7 @@ class PublishedTemplate:
     versions: builtins.list[str]
     #: ``None`` on a template the platform publishes — nobody published it.
     published_at: str | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> PublishedTemplate:
@@ -880,7 +883,7 @@ class TemplateCheck:
     #: without the parent's — and then :attr:`build_digest_needs` says so in
     #: words, because the platform sends the two as alternatives.
     build_digest: str | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     # All three keyword-only at the end rather than beside the fields they
     # belong with: this class is exported, so its field order is its
@@ -999,7 +1002,7 @@ class RetiredTemplates:
     #: on it than on :attr:`templates`. The two move differently, and somebody
     #: watching only the first would conclude that retiring is free.
     refs_claimed: int
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> RetiredTemplates:
@@ -1034,7 +1037,7 @@ class TemplateBuild:
     started_at: str
     #: ``None`` while it is still running.
     finished_at: str | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> TemplateBuild:
@@ -1067,7 +1070,7 @@ class BuildStep:
     status: str
     started_at: str | None
     finished_at: str | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> BuildStep:
@@ -1208,7 +1211,7 @@ class BuildProgress:
     #: output, so the per-step position is unavailable. The build itself is
     #: unaffected and :attr:`status` is still the answer.
     unmatched: bool
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> BuildProgress:
@@ -1252,7 +1255,7 @@ class Size:
     disk_gb: int
     allowed: bool
     cheapest_plan: str | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Size:
@@ -1327,7 +1330,7 @@ class Snapshot:
     ram_mb: int = 0
     disk_gb: int = 0
     resolution: str = ""
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def is_memory(self) -> bool:
@@ -1413,7 +1416,7 @@ class SnapshotHoldings:
     count: int
     size_bytes: int
     fingerprint: str
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SnapshotHoldings:
@@ -1455,7 +1458,7 @@ class Retention:
     daily: int
     weekly: int
     monthly: int
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Retention:
@@ -1606,7 +1609,7 @@ class UsageReport:
     #: through :attr:`to`. It answers the other question, and it is the one to
     #: check before comparing these numbers against an invoice.
     reported_through: str | None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> UsageReport:
@@ -1678,7 +1681,7 @@ class Move:
     started_at: str = ""
     #: ``None`` while :attr:`live`.
     finished_at: str | None = None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     #: The states this model's own docstring calls live. Consulted ONLY when the
     #: wire did not give a readable ``live`` — the flag stays the thing to poll
@@ -1822,7 +1825,7 @@ class Window:
     #: As :attr:`x`: ``None`` where the wire did not say.
     height: int | None
     focused: bool
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     # The wire sends `pid` after `type` and `visible` after `focused`, and both
     # arrive here at the END instead, keyword-only. This class is exported, so
@@ -1992,7 +1995,7 @@ class WindowResult:
 
     window: Window | None
     gone: bool
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> WindowResult:
@@ -2079,7 +2082,7 @@ class ExecStatus:
     #: than ending on its own.
     killed: bool
     started_at: str = ""
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
     #: Whether this came off the wire. Keyword-only, so it changes no existing
     #: construction and stays out of ``__match_args__``.
     #:
@@ -2313,7 +2316,7 @@ class Webhook:
     #: platform omits the field rather than sending null, on the pattern
     #: :class:`Computer` follows for the same one.
     workspace_id: str = ""
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def is_failing(self) -> bool:
@@ -2429,7 +2432,7 @@ class WebhookDelivery:
     delivered_at: str | None
     #: When the event reached the queue.
     created_at: str
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def is_delivered(self) -> bool:

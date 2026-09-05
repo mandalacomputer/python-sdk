@@ -239,6 +239,10 @@ def guest_pid(pid: object) -> int:
         digits = str.__str__(pid).strip()
         if not digits.isdecimal():
             raise ValueError(text)
+        # Padding carries no magnitude, and refusing a zero-padded pid that
+        # `_exact_int` reads exactly would have the two helpers disagree about
+        # the same string.
+        digits = digits.lstrip("0") or "0"
         try:
             number = int(digits)
         except ValueError:

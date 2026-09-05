@@ -165,6 +165,9 @@ def test_an_oversized_pid_string_says_what_a_pid_should_be() -> None:
     with pytest.raises(ValueError, match="pid must be a positive integer"):
         A.guest_pid("9" * 5000)
     assert A.guest_pid("0000004242") == 4242
+    # Padding carries no magnitude at any length, and `_exact_int` reads this
+    # string exactly — the two helpers must not disagree about it.
+    assert A.guest_pid("0" * 5000 + "4242") == 4242
 
 
 def test_a_duration_keeps_the_type_it_was_given() -> None:

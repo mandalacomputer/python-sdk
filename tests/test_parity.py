@@ -8,6 +8,7 @@ user. These tests make the sync client the spec and hold the async one to it.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import sys
 from pathlib import Path
@@ -314,3 +315,42 @@ def test_every_module_declares_what_the_package_re_exports() -> None:
         ]
     assert not undeclared, undeclared
     assert not unbound, unbound
+
+
+def test_no_model_is_compared_on_the_payload_it_did_not_model() -> None:
+    """`raw` is evidence, not identity.
+
+    Every model keeps the unparsed body in `raw` so a server that starts
+    sending more fields does not break an older client. While `raw` counted
+    toward equality that promise stopped at the field: two records the SDK
+    reads identically compared unequal the moment the platform added a key
+    neither of them models, and the synthesised `__hash__` over a `dict` made
+    them unusable in a set or as a mapping key besides. What a caller means by
+    "the same record" is the record as this SDK reads it (OPL-4479 BUG-20,
+    OPL-4480 BUG-27).
+    """
+    carrying = [
+        c
+        for c in vars(mc).values()
+        if isinstance(c, type)
+        and dataclasses.is_dataclass(c)
+        and any(f.name == "raw" for f in dataclasses.fields(c))
+    ]
+    assert carrying, "no model carries raw; this test is watching nothing"
+    compared = [
+        f"{c.__name__}.raw is compared"
+        for c in carrying
+        for f in dataclasses.fields(c)
+        if f.name == "raw" and f.compare
+    ]
+    assert not compared, compared
+
+
+def test_an_unmodelled_server_field_does_not_split_a_record_in_two() -> None:
+    """The behaviour the field exclusion exists for, at one concrete model."""
+    lean = mc.Window.from_api({"id": "w1", "title": "Terminal"})
+    fuller = mc.Window.from_api({"id": "w1", "title": "Terminal", "z_order": 3})
+
+    assert lean == fuller
+    assert len({lean, fuller}) == 1
+    assert fuller.raw["z_order"] == 3, "the payload is still there to read"
