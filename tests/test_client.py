@@ -3186,10 +3186,17 @@ def test_padding_is_stripped_by_value_so_every_decimal_script_reads_alike() -> N
     """
     ascii_padded = "0" * 400 + "9" * 20
     arabic_padded = "\u0660" * 400 + "\u0669" * 20
+    # A single ASCII zero in front of another script's padding: `lstrip` finds
+    # something, so a fast path that asks whether it stripped ANYTHING skips the
+    # per-character scan and refuses a number it can read exactly. That is the
+    # same defect one character over, and it is why the test below is on what
+    # `lstrip` LEAVES rather than on what it took.
+    mixed_padded = "0" + arabic_padded
     exact = int(ascii_padded)
 
     assert mc.ExecResult.from_api({"exit_code": ascii_padded}).exit_code == exact
     assert mc.ExecResult.from_api({"exit_code": arabic_padded}).exit_code == exact
+    assert mc.ExecResult.from_api({"exit_code": mixed_padded}).exit_code == exact
     assert mc.ExecResult.from_api({"exit_code": "\u0660" * 50}).exit_code == 0
 
 

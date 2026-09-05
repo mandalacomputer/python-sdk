@@ -76,7 +76,7 @@ class AgentStep:
     #: Set when the action was refused. The loop continues and the model adapts,
     #: so this is a step that did not work rather than a run that failed.
     error: str = ""
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Any, fallback_n: int) -> AgentStep:
@@ -139,7 +139,7 @@ class AgentResult:
     #: The model's closing text — its answer, or why it could not get there.
     text: str = ""
     usage: AgentUsage = field(default_factory=AgentUsage)
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def finished(self) -> bool:
