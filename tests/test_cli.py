@@ -1399,7 +1399,7 @@ def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch, ca
     precisely "so a client can tell 'your command exited' from a dropped
     network" (server/terminal.go), and answering 0 here throws away the
     distinction it drew: a script cannot reattach, and
-    `mandala ssh dev < build.sh && ./deploy.sh` would ship on a build whose end
+    a wrapper gating a deploy on this status would ship on a build whose end
     nobody saw (OPL-4479 BUG-29).
     """
     from websockets.exceptions import ConnectionClosed

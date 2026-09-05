@@ -468,9 +468,11 @@ def _non_negative(number: int, message: str) -> int:
 def _require_whole(value: object, message: str) -> int:
     """A whole number off the wire, or MandalaError.
 
-    ``int()`` truncates towards zero, and for the fields that call this ``0``
-    is a real answer — never suspend, nothing deleted — so a fraction becoming
-    ``0`` is the misread the call sites exist to refuse.
+    ``int()`` truncates towards zero, and for two of the fields that call this
+    ``0`` is a real answer — never suspend, nothing deleted — so a fraction
+    becoming ``0`` is the misread those call sites exist to refuse. The third,
+    a background command's pid, has no use for ``0`` either way and is guarded
+    before it ever gets here.
 
     A negative is refused for the same reason and by the same argument. Every
     caller asks a quantity that has no negative reading — how many snapshots
