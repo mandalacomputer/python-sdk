@@ -63,6 +63,23 @@ _ID = "webhook-id"
 _TIMESTAMP = "webhook-timestamp"
 _SIGNATURE = "webhook-signature"
 
+#: The most digits a ``webhook-timestamp`` may carry and still be converted.
+#:
+#: Unix seconds are ten digits now and stay eleven until the year 33658, so
+#: twenty is room the platform will never need — and the bound is not about
+#: plausibility, it is about arithmetic. ``int()`` builds an integer of any
+#: size from this header, and the header is written by whoever can reach the
+#: receiver's endpoint: at roughly 400 digits the value no longer fits a
+#: float, so ``abs(clock - sent)`` below raises ``OverflowError``, and past
+#: 4300 digits ``int(value, 10)`` itself raises ``ValueError`` on CPython's
+#: integer-string conversion limit. Either one escapes :func:`verify`, whose
+#: whole contract is that a malformed header is ``False`` and never an
+#: exception, and turns every receiver into a 500 that the platform then
+#: retries (adversarial review, OPL-4478). Length is the one property that
+#: can be tested before the conversion that is the hazard, so it is tested
+#: first.
+_MAX_TIMESTAMP_DIGITS = 20
+
 
 def _key(secret: str) -> bytes:
     """The HMAC key a secret carries, or a ``ValueError`` saying why not.
@@ -114,8 +131,15 @@ def _timestamp(value: str) -> int | None:
     ``"+1"``, ``"1_0"`` and the digits of every other script — as would
     ``str.isdigit`` — none of which the platform writes, and a verifier is the
     wrong place to be generous about what it accepts.
+
+    At most :data:`_MAX_TIMESTAMP_DIGITS` of them, and that bound is checked
+    before the conversion rather than after: a longer string is not merely
+    implausible, it is the one input for which ``int()`` and the window
+    arithmetic that follows raise instead of answering.
     """
-    return int(value, 10) if value.isascii() and value.isdigit() else None
+    if not (value.isascii() and value.isdigit()) or len(value) > _MAX_TIMESTAMP_DIGITS:
+        return None
+    return int(value, 10)
 
 
 def verify(

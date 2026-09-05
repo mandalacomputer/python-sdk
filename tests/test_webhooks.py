@@ -159,6 +159,43 @@ def test_a_timestamp_that_is_not_decimal_seconds_is_false(stamp: str) -> None:
     assert mc.verify(SECRET, headers(timestamp=stamp), BODY, now=TIMESTAMP) is False
 
 
+@pytest.mark.parametrize("digits", [400, 5000])
+def test_an_enormous_timestamp_is_false_not_an_exception(digits: int) -> None:
+    """Digits only was not enough: there also has to be a bound on how many.
+
+    Nothing here is forgeable — the MAC is never reached — but ``verify`` is
+    documented to answer ``False`` for a malformed header, and an unbounded
+    ``int()`` over an attacker-controlled string broke that in two places
+    (adversarial review, OPL-4478). Around 400 digits the value no longer fits
+    a float and ``abs(clock - sent)`` raises ``OverflowError``; past 4300 the
+    conversion itself raises ``ValueError`` on CPython's integer-string limit.
+    Either one leaves a receiver answering 500 to a delivery it should have
+    refused outright, which the platform then retries.
+
+    ``now`` is a float because :func:`time.time` returns one, and that is the
+    clock the first half needs: an ``int`` receiver's clock subtracts exactly
+    and would hide it.
+    """
+    stamp = "9" * digits
+    assert mc.verify(SECRET, headers(timestamp=stamp), BODY, now=float(TIMESTAMP)) is False
+
+
+def test_the_timestamp_bound_is_on_arithmetic_not_on_plausibility() -> None:
+    """Both sides of the bound, because the cheap fix is to over-tighten it.
+
+    Unix seconds are ten digits now and stay eleven until the year 33658, so a
+    stamp far longer than any the platform will write must still be READ — what
+    the bound exists to stop is the conversion that raises, not an implausible
+    date, and a verifier that refused a wide clock would fail deliveries that
+    are perfectly well formed.
+    """
+    from mandala_computer._webhooks import _MAX_TIMESTAMP_DIGITS, _timestamp
+
+    inside = "9" * _MAX_TIMESTAMP_DIGITS
+    assert _timestamp(inside) == int(inside)
+    assert _timestamp("9" * (_MAX_TIMESTAMP_DIGITS + 1)) is None
+
+
 def test_an_unknown_signature_version_is_ignored_not_refused() -> None:
     """The spec's growth path: a ``v1a`` entry beside a good ``v1`` still passes,
     and an unknown version ALONE fails rather than passing by accident."""
