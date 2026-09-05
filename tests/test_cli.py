@@ -277,6 +277,41 @@ def test_api_error_is_a_message_not_a_traceback(tmp_path, capsys) -> None:
     assert "no such file" in capsys.readouterr().err
 
 
+@respx.mock
+@pytest.mark.parametrize("argv", [["scp", "dev:/big.bin", "OUT"], ["webhooks", "list"]])
+def test_ctrl_c_ends_a_command_with_a_message_rather_than_a_traceback(
+    argv: list[str], tmp_path, capsys
+) -> None:
+    """Interrupting a transfer is a normal thing to do, not a crash.
+
+    `_interact` has answered Ctrl-C with 130 on the `ssh` path since that path
+    existed, so what the CLI owes a person pressing it was already settled;
+    `scp` and every `webhooks` verb run outside that handler, and `main` caught
+    `MandalaError`, `ValueError` and `OSError` — none of which a
+    `KeyboardInterrupt` is — so they ended in a traceback and a 1 instead
+    (adversarial review, OPL-4479). 130 is 128 plus SIGINT, which is what a
+    calling script reads.
+    """
+
+    def interrupt(request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    # A callable rather than the class: respx refuses a side effect that is not
+    # an `Exception`, and a `KeyboardInterrupt` is deliberately not one.
+    respx.get(f"{BASE}/computers").mock(side_effect=interrupt)
+    respx.get(f"{BASE}/webhooks").mock(side_effect=interrupt)
+
+    # Caught here rather than left to propagate, because an interrupt reaching
+    # pytest ends the whole session — the failure this pins would take the rest
+    # of the suite with it and report as an abort rather than as itself.
+    try:
+        code = _cli.main([str(tmp_path / "out") if a == "OUT" else a for a in argv])
+    except KeyboardInterrupt:
+        pytest.fail(f"{argv[0]} let the interrupt through to a traceback")
+    assert code == 130
+    assert "interrupted" in capsys.readouterr().err
+
+
 # --- ssh preflight ---------------------------------------------------------
 
 
