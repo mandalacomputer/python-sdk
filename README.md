@@ -525,6 +525,7 @@ res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
 res = c.exec("make", timeout=90, cwd="/root/src", env={"CC": "clang"})
 res.ok, res.exit_code, res.stdout, res.stderr  # output is bytes
 res.stdout_text  # ...and this is the text reading of it
+res.output_unreadable  # check before believing an empty output
 ```
 
 With no coordinate, a click lands wherever the pointer already is, and a `drag`
@@ -650,13 +651,16 @@ slower — and for anything slower than a few seconds, which is a lower bar —
 start it instead:
 
 ```python
+import sys
 import time
 
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
 
 while True:
     status = job.poll()
-    print(status.stdout_text, end="")
+    if status.output_unreadable:
+        raise RuntimeError("output was lost — this read consumed it")
+    sys.stdout.buffer.write(status.stdout)
     if status.drained:
         break
     if not status.more:
@@ -674,6 +678,19 @@ drop is gone, and two pollers on one pid split the stream between them rather
 than each seeing all of it — so keep one handle per command. `status.more`
 means there is output waiting right now, which is why the loop above only sleeps
 when it is clear.
+
+**Write the bytes, not the per-chunk text.** A poll is cut at 1 MiB on a byte
+offset, so a multi-byte character lands across two reads and decoding each one
+on its own replaces both halves — the corruption the wire format exists to stop,
+put back one layer up. Bytes join and text does not, so a loop assembling a log
+appends `status.stdout` and decodes once at the end. `.stdout_text` is for a
+whole output small enough to have arrived in one read.
+
+**`drained` is about `more`, not about this read's output.** It says the command
+stopped and nothing is queued; a chunk that could not be decoded is
+`output_unreadable`, which is deliberately separate, because re-polling cannot
+recover bytes the daemon's cursor has already passed. A loop that must not
+continue past lost output checks that flag itself, as the one above does.
 
 **Output is `bytes`, on both shapes.** `ExecResult.stdout`, `ExecResult.stderr`
 and the same two on `ExecStatus` carry what the command printed, unmodified;

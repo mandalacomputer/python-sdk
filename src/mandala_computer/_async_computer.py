@@ -890,11 +890,17 @@ class AsyncComputer(ComputerFields):
             job = await c.start_exec("apt-get install -y build-essential")
             while True:
                 status = await job.poll()
-                print(status.stdout_text, end="")
+                if status.output_unreadable:
+                    raise RuntimeError("output was lost — this read consumed it")
+                sys.stdout.buffer.write(status.stdout)
                 if status.drained:
                     break
                 if not status.more:
                     await asyncio.sleep(2)
+
+        Bytes rather than :attr:`~mandala_computer.ExecStatus.stdout_text`, and
+        the flag checked because the read is consuming — see
+        :meth:`~mandala_computer.Computer.start_exec` for why both matter.
 
         The handle is the guest pid. It survives this process — a later session
         can rebuild one with :meth:`background_command` — but not a restart of

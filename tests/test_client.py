@@ -3097,6 +3097,27 @@ def test_the_offsets_count_decoded_bytes_not_the_base64_that_carried_them() -> N
     assert len(status.raw["stdout_b64"]) == 4000, "the wire field is longer, and is not the count"
 
 
+def test_a_character_split_across_two_polls_joins_back_up_in_the_bytes() -> None:
+    """What the documented loop appends, and why it is not `stdout_text`.
+
+    A poll is cut at 1 MiB on a BYTE offset, so a multi-byte character lands
+    across two reads. That is the corruption the base64 wire format exists to
+    stop, and decoding each chunk on its own puts it straight back one layer up
+    (/grok-review, OPL-4544): bytes join, text does not.
+    """
+    rune = "€".encode()  # three bytes
+    first, second = rune[:1], rune[1:]
+
+    a = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": b64(b"cost: " + first), "more": True})
+    b = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": b64(second + b"\n"), "exited": True})
+
+    assert (a.stdout + b.stdout).decode() == "cost: \u20ac\n", "the bytes join"
+    # Three replacements from one character: the lead byte on its own, then each
+    # continuation byte, none of which is a character by itself.
+    joined = a.stdout_text + b.stdout_text
+    assert joined == "cost: \ufffd\ufffd\ufffd\n", "the per-chunk text does not"
+
+
 def test_output_that_cannot_be_decoded_is_reported_rather_than_read_as_empty() -> None:
     """Empty bytes and lost bytes are the same value and opposite facts, and on
     a consuming read the difference cannot be recovered by asking again.

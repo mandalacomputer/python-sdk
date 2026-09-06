@@ -1850,11 +1850,26 @@ class Computer(ComputerFields):
             job = c.start_exec("apt-get install -y build-essential")
             while True:
                 status = job.poll()
-                print(status.stdout_text, end="")
+                if status.output_unreadable:
+                    raise RuntimeError("output was lost — this read consumed it")
+                sys.stdout.buffer.write(status.stdout)
                 if status.drained:
                     break
                 if not status.more:
                     time.sleep(2)
+
+        BYTES rather than :attr:`~mandala_computer.ExecStatus.stdout_text`, and
+        that is not a style preference. A poll is cut at 1 MiB on a BYTE offset,
+        so a multi-byte character lands across two reads — the exact corruption
+        the base64 wire format exists to stop — and decoding each chunk on its
+        own puts it straight back as two ``U+FFFD``. The bytes join; the text
+        does not. Anything assembling a log wants ``log += status.stdout`` and
+        one ``decode`` at the end. ``stdout_text`` is for a whole small output.
+
+        :attr:`~mandala_computer.ExecStatus.output_unreadable` is checked
+        because this read is consuming: a chunk this client could not decode has
+        already advanced the daemon's cursor, and everything else about that
+        status says a command that printed nothing.
 
         The handle is the guest pid. It survives this process — a later session
         can rebuild one with :meth:`background_command` — but not a restart of

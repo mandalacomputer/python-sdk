@@ -2224,6 +2224,15 @@ class ExecStatus:
         producing is fine HERE, where the bytes are still on the object beside
         it and the caller chose the lossy reading. What was not fine was the
         wire doing it before anything reached this SDK, with no way back.
+
+        PER CHUNK, and that is the one place it is the wrong accessor. A poll is
+        cut at 1 MiB on a BYTE offset, so a multi-byte character lands across
+        two reads, and decoding each one on its own replaces both halves —
+        exactly the corruption the base64 format exists to stop, put back one
+        layer up (/grok-review, OPL-4544). Bytes join and text does not, so a
+        loop assembling a log appends :attr:`stdout` and decodes once at the
+        end. This is for a whole output small enough to have arrived in one
+        read, and for printing a chunk you are not keeping.
         """
         return self.stdout.decode("utf-8", "replace")
 
@@ -2275,12 +2284,21 @@ class ExecStatus:
 
     @property
     def drained(self) -> bool:
-        """Safe to stop reading: stopped, nothing queued, nothing unreadable.
+        """Safe to stop reading: stopped, nothing queued, and ``more`` readable.
 
         What a polling loop actually wants, and the reason it is a property
         rather than two conditions a caller has to remember to write. Spelled as
         ``done and not more`` it silently dropped queued output whenever ``more``
         could not be read (adversarial review, OPL-3835).
+
+        ABOUT ``more`` ALONE. It says nothing about whether the output this read
+        carried was readable — :attr:`output_unreadable` is that, and it is
+        deliberately not folded in here: re-polling cannot recover a chunk the
+        daemon's cursor has already passed, so refusing to drain would spin one
+        more empty read and still have lost the bytes. A loop that must not
+        continue past lost output checks that flag itself (/grok-review,
+        OPL-4544). The word "unreadable" in this docstring used to imply
+        otherwise, before there was a field by that name to confuse it with.
         """
         return self.done and not self.more and not self.output_uncertain
 
