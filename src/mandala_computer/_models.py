@@ -368,7 +368,14 @@ def _text(value: Any) -> str:
 #: Whitespace inside a base64 field, which carries nothing and is stripped
 #: before decoding. Line-wrapped base64 is ordinary; every other character
 #: outside the alphabet is not, and is refused rather than discarded.
-_SPACE = re.compile(r"\s+")
+#:
+#: ASCII SPELLED OUT rather than ``\s``, which is Unicode on a ``str`` pattern:
+#: that stripped U+00A0, U+2028 and U+3000 as well, so a field mangled by an
+#: entity-rewriting proxy or a mojibake round trip decoded to confident bytes
+#: with nothing said about it (/code-review, OPL-4544) — the one outcome this
+#: function is written to prevent. The platform encodes with Go's
+#: ``base64.StdEncoding``, which never wraps at all, so narrowing costs nothing.
+_SPACE = re.compile(r"[ \t\r\n\f\v]+")
 
 
 def _b64(value: Any) -> bytes | None:
@@ -422,10 +429,28 @@ def _output(d: Mapping[str, Any]) -> tuple[bytes, bytes, bool]:
     because the pair is one decision made twice otherwise, and the four routes
     that answer these two shapes must not disagree about what an undecodable
     field means.
+
+    A BODY IN THE OLD SHAPE counts as unreadable, and that is the second half of
+    the case for not falling back to ``stdout``/``stderr``. Reading them would
+    put back the ``U+FFFD`` rewriting they were renamed to end; not reading them
+    and saying nothing was no better, because empty bytes beside ``ok`` is a
+    clean successful run that printed nothing, which is what a caller parsing
+    build output would have believed (/code-review, OPL-4544). The rename is
+    supposed to fail loudly on a missing field and this decoder is what has to
+    do the failing. The evidence is in the payload: neither ``*_b64`` key
+    present and an old one that is, which is a host whose daemon predates
+    platform OPL-4403 — reachable during a fleet rollout or a rollback, since
+    exec has no projector in front of it and the daemon's shape is the public
+    one.
+
+    Absent everything is NOT that. ``ExecStatus.from_api({"pid": 1})`` is a
+    sparse object, and a body that mentions no output at all is not a body
+    claiming there was none.
     """
     out = _b64(d.get("stdout_b64"))
     err = _b64(d.get("stderr_b64"))
-    return out or b"", err or b"", out is None or err is None
+    old_shape = not ("stdout_b64" in d or "stderr_b64" in d) and ("stdout" in d or "stderr" in d)
+    return out or b"", err or b"", out is None or err is None or old_shape
 
 
 def _exit_code(value: Any) -> int | None:
@@ -2179,7 +2204,7 @@ class ExecStatus:
     #: each other and behaviourally different is the wrong thing for an
     #: expected-value assertion or a change check to be handed.
     decoded: bool = field(default=False, kw_only=True)
-    #: The host sent output on this read that this client could not decode. See
+    #: The output on this read could not be read. See
     #: :attr:`ExecResult.output_unreadable`, which means the same thing, and
     #: means it more sharply here: this read consumed the daemon's cursor, so
     #: whatever was in that field is gone rather than fetchable again.
@@ -2326,15 +2351,17 @@ class ExecResult:
     #: ``compare=False``, unlike the other models here. An ``ExecResult`` is a
     #: value, not a handle: callers assert on one against a result they built
     #: themselves, and put them in sets. Comparing the unknown fields the
-    #: server happened to send would make ``res == ExecResult(0, "hi", "",
+    #: server happened to send would make ``res == ExecResult(0, b"hi", b"",
     #: False)`` false for a command that did exactly that, and comparing a
     #: ``dict`` at all makes the frozen dataclass unhashable.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
-    #: The platform sent output this client could not decode, and empty bytes
-    #: are standing in for it. Read it before concluding a command printed
-    #: nothing: the two are the same value and opposite facts. Keyword-only with
-    #: a default, so it changes no existing construction and stays out of
-    #: ``__match_args__``.
+    #: The output on this response could not be read, and empty bytes are
+    #: standing in for it — either a ``*_b64`` field this client could not
+    #: decode, or a body in the pre-OPL-4403 shape, whose ``stdout``/``stderr``
+    #: this SDK deliberately does not read. Check it before concluding a command
+    #: printed nothing: the two are the same value and opposite facts.
+    #: Keyword-only with a default, so it changes no existing construction and
+    #: stays out of ``__match_args__``.
     output_unreadable: bool = field(default=False, kw_only=True)
 
     @property

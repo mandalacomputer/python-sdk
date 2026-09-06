@@ -687,6 +687,13 @@ offsets count decoded bytes, which is what makes them line up across polls;
 `len(status.stdout)` is the number they are counting, not the length of the
 base64 that carried it.
 
+**`output_unreadable` is worth checking before you believe an empty output.**
+It is set when the platform sent output this client could not read — a field
+that would not decode, or a body still in the pre-rename shape, which is what a
+host answers with until its own daemon is redeployed. Empty bytes stand in
+either way, and on a `poll()` the difference cannot be recovered by asking
+again: that read consumed the daemon's cursor.
+
 `job.kill()` stops the command and everything it started, and answers with its
 final state including whatever it printed that you had not read — so it collects
 the tail as well as ending the job. `job.pid` survives the process: a later run

@@ -3132,19 +3132,52 @@ def test_noise_outside_the_alphabet_is_refused_and_whitespace_is_not() -> None:
     status = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": wrapped})
     assert status.stdout == b"a" * 120 and not status.output_unreadable
 
+    # ASCII whitespace only. `\s` on a `str` pattern is Unicode, so a NO-BREAK
+    # SPACE or a LINE SEPARATOR came out of the field before decoding and the
+    # corrupt value answered with confident bytes and no flag (/code-review,
+    # OPL-4544) — the outcome the strict alphabet exists to prevent. Go's
+    # `base64.StdEncoding`, which is what the platform encodes with, emits no
+    # whitespace at all, so nothing legitimate is refused by narrowing.
+    for exotic in ("\xa0", "\u2028", "\u3000"):
+        mangled = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": f"YWJj{exotic}ZGVm"})
+        assert mangled.stdout == b"", exotic
+        assert mangled.output_unreadable is True, exotic
 
-def test_the_old_stdout_field_is_not_read_as_a_fallback() -> None:
+
+def test_a_body_in_the_old_shape_is_reported_rather_than_read_as_no_output() -> None:
     """The platform renamed rather than adding an `encoding` discriminator so
     that a client which has not been updated fails on a missing field instead of
     reading base64 as text. Reading the old names here would put that silence
-    back — and put back the U+FFFD rewriting they were renamed to end — so a
-    body in the old shape decodes to no output rather than to text this SDK has
-    no way to know is text.
+    back, and put back the U+FFFD rewriting they were renamed to end — but
+    reading nothing and saying nothing was no better, because empty bytes beside
+    `ok` is a clean successful run that printed nothing, which is what a caller
+    parsing build output would have believed (/code-review, OPL-4544). The
+    rename is meant to fail loudly and this decoder is what has to do it.
+
+    Reachable rather than hypothetical: exec has no projector in front of it, so
+    the daemon's shape is the public one and an old body is what a host answers
+    with until its own daemon is redeployed — during a fleet rollout, or a
+    rollback.
     """
     result = mc.ExecResult.from_api({"exit_code": 0, "stdout": "hi", "stderr": "boom"})
     assert result.stdout == b"" and result.stderr == b""
-    assert result.output_unreadable is False, "absent is not unreadable"
+    assert result.output_unreadable is True, "an old body is not a command that printed nothing"
     assert result.raw["stdout"] == "hi", "and it is still in raw for anyone who needs it"
+
+    status = mc.ExecStatus.from_api({"pid": 1, "stdout": "compiling\n"})
+    assert status.stdout == b"" and status.output_unreadable is True
+
+    # A body that mentions no output at all is NOT that: it is sparse, not a
+    # claim that there was none.
+    assert mc.ExecStatus.from_api({"pid": 1}).output_unreadable is False
+    assert mc.ExecResult.from_api({"exit_code": 0}).output_unreadable is False
+
+    # And a transitional body carrying both is read by the new name, which is
+    # the one that carries the bytes.
+    both = mc.ExecResult.from_api(
+        {"exit_code": 0, "stdout": "hi", "stdout_b64": b64(b"hi"), "stderr_b64": ""}
+    )
+    assert both.stdout == b"hi" and both.output_unreadable is False
 
 
 def test_output_unreadable_breaks_no_existing_construction() -> None:
