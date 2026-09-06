@@ -523,7 +523,8 @@ now = c.screenshot(fresh=True)  # skip the cache; what a drive loop wants
 
 res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
 res = c.exec("make", timeout=90, cwd="/root/src", env={"CC": "clang"})
-res.ok, res.exit_code, res.stdout, res.stderr
+res.ok, res.exit_code, res.stdout, res.stderr  # output is bytes
+res.stdout_text  # ...and this is the text reading of it
 ```
 
 With no coordinate, a click lands wherever the pointer already is, and a `drag`
@@ -655,7 +656,7 @@ job = c.start_exec("apt-get install -y build-essential", cwd="/root")
 
 while True:
     status = job.poll()
-    print(status.stdout, end="")
+    print(status.stdout_text, end="")
     if status.drained:
         break
     if not status.more:
@@ -673,6 +674,18 @@ drop is gone, and two pollers on one pid split the stream between them rather
 than each seeing all of it — so keep one handle per command. `status.more`
 means there is output waiting right now, which is why the loop above only sleeps
 when it is clear.
+
+**Output is `bytes`, on both shapes.** `ExecResult.stdout`, `ExecResult.stderr`
+and the same two on `ExecStatus` carry what the command printed, unmodified;
+`.stdout_text`/`.stderr_text` decode UTF-8 with replacement when you want text.
+The wire carries them base64 (`stdout_b64`, `stderr_b64`) because a JSON string
+is UTF-8 by definition and a command's output is not — the fields that used to
+carry the bytes directly rewrote everything else into `U+FFFD`, and not only for
+tarballs: a poll is cut at 1 MiB on a byte offset, so an ordinary text log longer
+than that had a character split across the cut and both halves destroyed. The
+offsets count decoded bytes, which is what makes them line up across polls;
+`len(status.stdout)` is the number they are counting, not the length of the
+base64 that carried it.
 
 `job.kill()` stops the command and everything it started, and answers with its
 final state including whatever it printed that you had not read — so it collects
@@ -925,7 +938,7 @@ c.wait_for("computer.ready")  # in place of screenshotting until it looks up
 
 job = c.start_exec("apt-get install -y build-essential")
 done = c.wait_for("process.exited")  # in place of polling job.poll()
-print(done.exit_code, job.poll().stdout)
+print(done.exit_code, job.poll().stdout_text)
 ```
 
 Both close the socket on the way out. `wait_for()` always does; a `for` loop

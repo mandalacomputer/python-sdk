@@ -6,8 +6,11 @@ rejected, so a server that starts returning more does not break older clients.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import builtins
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -360,6 +363,69 @@ def _texts(value: Any) -> builtins.list[str]:
 def _text(value: Any) -> str:
     """A string field off the wire, with JSON null represented as empty."""
     return "" if value is None else str(value)
+
+
+#: Whitespace inside a base64 field, which carries nothing and is stripped
+#: before decoding. Line-wrapped base64 is ordinary; every other character
+#: outside the alphabet is not, and is refused rather than discarded.
+_SPACE = re.compile(r"\s+")
+
+
+def _b64(value: Any) -> bytes | None:
+    """One base64 output field as bytes, or ``None`` when it cannot be read.
+
+    ``stdout_b64`` and ``stderr_b64`` carry a command's output on every exec
+    response and are base64 on all of them, never conditionally (platform
+    OPL-4403). A JSON string is UTF-8 by definition and a command's output is
+    bytes, so the ``stdout``/``stderr`` these replaced could only carry the
+    bytes that happened to be valid UTF-8 and rewrote every other one into
+    ``U+FFFD``, irreversibly. The obvious casualty is a tarball or a PNG; the
+    reachable one is plainer, because a poll is cut at 1 MiB on a BYTE offset,
+    so an ordinary UTF-8 build log longer than that had a multi-byte character
+    split across the cut and both halves replaced.
+
+    ``None`` rather than ``b""`` for a value this cannot decode, because on a
+    consuming read those are opposite facts: empty means the command printed
+    nothing, and unreadable means it printed something this client has just
+    consumed and thrown away. The models keep the empty bytes and report the
+    difference through ``output_unreadable``, the same way :attr:`ExecStatus.
+    output_uncertain` reports a ``more`` that could not be read.
+
+    STRICT about the alphabet, unlike the stdlib default, and TOLERANT of
+    whitespace, unlike ``validate=True`` on its own. Whitespace carries nothing
+    in base64 and encoders that wrap their output at a column are ordinary, so a
+    newline must not cost a caller a megabyte of build log. Every OTHER
+    character outside the alphabet says this field is not what this client
+    thinks it is — and the stdlib default DISCARDS those and decodes what is
+    left, which answers a corrupt field with confident bytes rather than
+    admitting it could not read one. ``b64decode("YWJj!ZGVm")`` is ``b"abcdef"``
+    with no complaint.
+    """
+    if value is None:
+        return b""
+    if not isinstance(value, str):
+        return None
+    if not value:
+        return b""
+    try:
+        # `binascii.Error` subclasses `ValueError`; both are named because a
+        # non-ASCII input raises the plain one on some interpreters.
+        return base64.b64decode(_SPACE.sub("", value), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _output(d: Mapping[str, Any]) -> tuple[bytes, bytes, bool]:
+    """Both output fields, decoded, and whether either was unreadable.
+
+    Shared by :meth:`ExecResult.from_api` and :meth:`ExecStatus.from_api`
+    because the pair is one decision made twice otherwise, and the four routes
+    that answer these two shapes must not disagree about what an undecodable
+    field means.
+    """
+    out = _b64(d.get("stdout_b64"))
+    err = _b64(d.get("stderr_b64"))
+    return out or b"", err or b"", out is None or err is None
 
 
 def _exit_code(value: Any) -> int | None:
@@ -2059,6 +2125,14 @@ class ExecStatus:
 
     :attr:`more` is the flag to poll on: it says there is further output waiting
     right now.
+
+    :attr:`stdout` and :attr:`stderr` are **bytes**, decoded from the wire's
+    ``stdout_b64``/``stderr_b64``. :attr:`stdout_text` is the text reading when
+    you want one. The offsets count DECODED bytes — they line up with
+    ``len(status.stdout)``, never with the length of the base64 that carried it,
+    which is about four thirds as long. Nothing here asks you to do that
+    arithmetic; the note is for anyone tempted to keep a cursor of their own
+    beside the daemon's.
     """
 
     pid: int
@@ -2069,9 +2143,10 @@ class ExecStatus:
     #: ``None`` until it has exited — ``None`` rather than ``0``, which is the
     #: one value that would be read as success by anything not checking first.
     exit_code: int | None
-    #: What it has printed since the previous read. This read consumed it.
-    stdout: str
-    stderr: str
+    #: What it has printed since the previous read, as bytes. This read consumed
+    #: it. See :attr:`stdout_text` for the text reading.
+    stdout: bytes
+    stderr: bytes
     #: How far the daemon has now read, reported rather than requested.
     stdout_offset: int
     stderr_offset: int
@@ -2104,6 +2179,33 @@ class ExecStatus:
     #: each other and behaviourally different is the wrong thing for an
     #: expected-value assertion or a change check to be handed.
     decoded: bool = field(default=False, kw_only=True)
+    #: The host sent output on this read that this client could not decode. See
+    #: :attr:`ExecResult.output_unreadable`, which means the same thing, and
+    #: means it more sharply here: this read consumed the daemon's cursor, so
+    #: whatever was in that field is gone rather than fetchable again.
+    #:
+    #: NOT :attr:`output_uncertain`, which is about ``more`` — that one says
+    #: this client cannot tell whether there is FURTHER output; this one says
+    #: output it already had was lost. Keyword-only with a default, so it
+    #: changes no existing construction.
+    output_unreadable: bool = field(default=False, kw_only=True)
+
+    @property
+    def stdout_text(self) -> str:
+        """:attr:`stdout` as text, with undecodable bytes replaced.
+
+        ``errors="replace"``, so this never raises on the binary a command is
+        entitled to print — the U+FFFD the wire format was changed to stop
+        producing is fine HERE, where the bytes are still on the object beside
+        it and the caller chose the lossy reading. What was not fine was the
+        wire doing it before anything reached this SDK, with no way back.
+        """
+        return self.stdout.decode("utf-8", "replace")
+
+    @property
+    def stderr_text(self) -> str:
+        """:attr:`stderr` as text, on the same terms as :attr:`stdout_text`."""
+        return self.stderr.decode("utf-8", "replace")
 
     @property
     def done(self) -> bool:
@@ -2165,8 +2267,15 @@ class ExecStatus:
         # `output_uncertain` exists to prevent for `more`. An unreadable code
         # is None, which this field already uses for "the platform could not
         # report one".
-        stdout = _text(d.get("stdout"))
-        stderr = _text(d.get("stderr"))
+        #
+        # `stdout_b64`/`stderr_b64`, and the old `stdout`/`stderr` are NOT read
+        # as a fallback. The platform renamed them rather than adding an
+        # `encoding` discriminator precisely so a client that has not been
+        # updated fails on a missing field instead of silently reading base64
+        # as text (platform OPL-4403); reading the old names here would put
+        # that silence back, and would put back the U+FFFD rewriting they were
+        # renamed to end.
+        stdout, stderr, unreadable = _output(d)
         try:
             exit_code = _exit_code(d.get("exit_code"))
         except MandalaError:
@@ -2186,18 +2295,28 @@ class ExecStatus:
             started_at=_text(d.get("started_at")),
             raw=dict(d),
             decoded=True,
+            output_unreadable=unreadable,
         )
 
 
 @dataclass(frozen=True)
 class ExecResult:
-    """The outcome of a shell command run inside the guest."""
+    """The outcome of a shell command run inside the guest.
+
+    :attr:`stdout` and :attr:`stderr` are **bytes**, because a command's output
+    is bytes: ``tar``, ``convert`` and a latin-1 build log are all things a
+    guest is entitled to print, and a ``str`` surface here would decide for you
+    that they are not. The wire carries them base64 for the same reason
+    (platform OPL-4403). :attr:`stdout_text` is the text reading, which is what
+    you want for anything you were going to ``strip()`` or compare.
+    """
 
     #: ``None`` when the platform could not report an exit code, such as a
     #: timed-out command. It must not be coerced to zero and mistaken for success.
     exit_code: int | None
-    stdout: str
-    stderr: str
+    #: What the command printed, as bytes. See :attr:`stdout_text`.
+    stdout: bytes
+    stderr: bytes
     timed_out: bool
     #: True when the guest agent stopped capturing stdout before the command
     #: stopped producing it. See :attr:`truncated`.
@@ -2211,6 +2330,28 @@ class ExecResult:
     #: False)`` false for a command that did exactly that, and comparing a
     #: ``dict`` at all makes the frozen dataclass unhashable.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: The platform sent output this client could not decode, and empty bytes
+    #: are standing in for it. Read it before concluding a command printed
+    #: nothing: the two are the same value and opposite facts. Keyword-only with
+    #: a default, so it changes no existing construction and stays out of
+    #: ``__match_args__``.
+    output_unreadable: bool = field(default=False, kw_only=True)
+
+    @property
+    def stdout_text(self) -> str:
+        """:attr:`stdout` as text, with undecodable bytes replaced.
+
+        ``errors="replace"``, so this never raises on the binary a command is
+        entitled to print. The lossy reading is fine here, where the bytes are
+        still on the object beside it and the caller asked for text; what was
+        not fine was the wire format doing it before anything reached this SDK.
+        """
+        return self.stdout.decode("utf-8", "replace")
+
+    @property
+    def stderr_text(self) -> str:
+        """:attr:`stderr` as text, on the same terms as :attr:`stdout_text`."""
+        return self.stderr.decode("utf-8", "replace")
 
     @property
     def ok(self) -> bool:
@@ -2240,14 +2381,18 @@ class ExecResult:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ExecResult:
         code = d.get("exit_code")
+        # The old `stdout`/`stderr` are deliberately not read as a fallback —
+        # see the note in `ExecStatus.from_api`.
+        stdout, stderr, unreadable = _output(d)
         return cls(
             exit_code=_exit_code(code),
-            stdout=_text(d.get("stdout")),
-            stderr=_text(d.get("stderr")),
+            stdout=stdout,
+            stderr=stderr,
             timed_out=_wire(d, "timed_out") in (_Wire.TRUE, _Wire.MALFORMED),
             out_truncated=_wire(d, "out_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
             err_truncated=_wire(d, "err_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
             raw=dict(d),
+            output_unreadable=unreadable,
         )
 
 

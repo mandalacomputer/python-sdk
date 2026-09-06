@@ -890,7 +890,7 @@ class AsyncComputer(ComputerFields):
             job = await c.start_exec("apt-get install -y build-essential")
             while True:
                 status = await job.poll()
-                print(status.stdout, end="")
+                print(status.stdout_text, end="")
                 if status.drained:
                     break
                 if not status.more:

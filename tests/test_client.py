@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import builtins
 import io
 import json
@@ -29,6 +30,16 @@ COMPUTER = {
     "disk_gb": 20,
     "created_at": "2026-07-31T00:00:00Z",
 }
+
+
+def b64(data: bytes) -> str:
+    """Encode an output field the way the platform does.
+
+    `exec` and the background-exec routes answer `stdout_b64`/`stderr_b64`, base64
+    on every response and never conditionally (platform OPL-4403), so a fixture
+    that spells the output as plain text is testing a shape the API does not send.
+    """
+    return base64.b64encode(data).decode()
 
 
 @pytest.fixture
@@ -300,11 +311,12 @@ def test_stop_asks_the_guest_by_default(client: mc.Client) -> None:
 def test_exec_nonzero_exit_is_returned_not_raised(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
-            200, json={"exit_code": 1, "stdout": "", "stderr": "boom", "timed_out": False}
+            200,
+            json={"exit_code": 1, "stdout_b64": "", "stderr_b64": b64(b"boom"), "timed_out": False},
         )
     )
     res = mc.Computer(client._t, COMPUTER).exec("false")
-    assert res.exit_code == 1 and res.stderr == "boom" and not res.ok
+    assert res.exit_code == 1 and res.stderr == b"boom" and not res.ok
 
 
 @respx.mock
@@ -312,7 +324,9 @@ def test_exec_omits_session_unless_desktop_requested(client: mc.Client) -> None:
     """The server defaults to the system context; an empty session is not the same
     as an absent one, so the key stays off the wire until it is asked for."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     mc.Computer(client._t, COMPUTER).exec("whoami")
     assert "session" not in json.loads(route.calls.last.request.content)
@@ -321,7 +335,9 @@ def test_exec_omits_session_unless_desktop_requested(client: mc.Client) -> None:
 @respx.mock
 def test_exec_desktop_sends_session_desktop(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     mc.Computer(client._t, COMPUTER).exec("whoami", desktop=True)
     assert json.loads(route.calls.last.request.content)["session"] == "desktop"
@@ -767,7 +783,7 @@ def test_a_rate_limit_on_the_nested_guest_refresh_is_honoured(
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
             httpx.Response(409, json={"error": "the guest agent is not answering yet"}),
-            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+            httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}),
         ]
     )
     respx.get(f"{BASE}/computers/vm-1").mock(
@@ -884,7 +900,7 @@ def test_wait_for_guest_ignores_errors_while_booting(client: mc.Client) -> None:
         side_effect=[
             httpx.Response(400, json={"error": "not running"}),
             httpx.Response(
-                200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+                200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
             ),
         ]
     )
@@ -987,7 +1003,7 @@ def test_wait_for_guest_reports_an_already_stopped_computer(client: mc.Client) -
 @respx.mock
 def test_wait_for_guest_still_resumes_a_suspended_computer(client: mc.Client) -> None:
     probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     computer = mc.Computer(client._t, {**COMPUTER, "status": "suspended"})
     assert computer.wait_for_guest(timeout=5, poll=0) is computer
@@ -1168,7 +1184,9 @@ def test_create_does_not_delete(client: mc.Client) -> None:
 def test_open_runs_in_the_desktop_session(client: mc.Client) -> None:
     """A browser with no DISPLAY is the bug open() exists to stop anyone hitting."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     mc.Computer(client._t, COMPUTER).open("https://example.com")
     body = json.loads(route.calls.last.request.content)
@@ -1180,7 +1198,9 @@ def test_open_detaches_the_launch(client: mc.Client) -> None:
     """A foreground browser blocks until the timeout kills it, then reports a
     failure it did not have — having opened the window anyway."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     mc.Computer(client._t, COMPUTER).open("https://example.com")
     command = json.loads(route.calls.last.request.content)["command"]
@@ -1193,7 +1213,9 @@ def test_open_does_not_ask_for_the_default_handler(client: mc.Client) -> None:
     """Naming the browser is the whole point of this method: the choice lives
     here rather than in whatever the guest's default handler resolves to."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     mc.Computer(client._t, COMPUTER).open("https://example.com")
     command = json.loads(route.calls.last.request.content)["command"]
@@ -1579,8 +1601,8 @@ def test_exec_reports_output_the_guest_agent_stopped_capturing(client: mc.Client
             200,
             json={
                 "exit_code": 0,
-                "stdout": "half a file",
-                "stderr": "",
+                "stdout_b64": b64(b"half a file"),
+                "stderr_b64": "",
                 "timed_out": False,
                 "out_truncated": True,
             },
@@ -1599,7 +1621,7 @@ def test_an_ordinary_exec_is_not_truncated(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
             200,
-            json={"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False},
+            json={"exit_code": 0, "stdout_b64": b64(b"ok"), "stderr_b64": "", "timed_out": False},
         )
     )
     assert not _computer(client).exec("echo ok").truncated
@@ -2091,7 +2113,7 @@ def test_a_background_exec_requires_a_positive_pid(client: mc.Client) -> None:
 @respx.mock
 def test_a_foreground_exec_still_carries_its_deadline(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     _computer(client).exec("true", timeout=5, env={"CI": "1"})
     body = json.loads(route.calls.last.request.content)
@@ -2150,14 +2172,14 @@ def test_polling_reads_the_new_output_and_whether_more_is_waiting(client: mc.Cli
             json={
                 "pid": 4242,
                 "running": True,
-                "stdout": "compiling\n",
+                "stdout_b64": b64(b"compiling\n"),
                 "stdout_offset": 10,
                 "more": True,
             },
         )
     )
     status = _computer(client).start_exec("make").poll()
-    assert status.stdout == "compiling\n"
+    assert status.stdout == b"compiling\n"
     assert status.more and not status.done
     # Absent rather than 0 until it has exited: 0 is the one value that reads as
     # success to anything not checking `done` first.
@@ -2178,11 +2200,11 @@ def test_a_finished_command_reports_its_exit_code(client: mc.Client) -> None:
 def test_killing_answers_with_the_tail_nobody_had_read(client: mc.Client) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={"pid": 4242}))
     route = respx.delete(f"{BASE}/computers/vm-1/exec/4242").mock(
-        httpx.Response(200, json={"pid": 4242, "killed": True, "stdout": "last line\n"})
+        httpx.Response(200, json={"pid": 4242, "killed": True, "stdout_b64": b64(b"last line\n")})
     )
     status = _computer(client).start_exec("tail -f /var/log/syslog").kill()
     assert route.called
-    assert status.killed and status.stdout == "last line\n"
+    assert status.killed and status.stdout == b"last line\n"
 
 
 @respx.mock
@@ -2954,10 +2976,10 @@ def test_exec_result_keeps_the_raw_payload() -> None:
     caller to reach it, and `exec` is the most-used route on the surface.
     """
     result = mc.ExecResult.from_api(
-        {"exit_code": 0, "stdout": "hi", "stderr": "", "duration_ms": 12}
+        {"exit_code": 0, "stdout_b64": b64(b"hi"), "stderr_b64": "", "duration_ms": 12}
     )
     assert result.raw["duration_ms"] == 12
-    assert result.stdout == "hi"
+    assert result.stdout == b"hi"
 
 
 @pytest.mark.parametrize(
@@ -2973,12 +2995,12 @@ def test_a_non_integer_exit_code_is_refused_rather_than_truncated(code: object) 
     the two exceptions caught: that escaped ``exec()`` as a bare builtin, past
     the MandalaError this SDK promises (adversarial review, OPL-4222)."""
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
-        mc.ExecResult.from_api({"exit_code": code, "stdout": "", "stderr": ""})
+        mc.ExecResult.from_api({"exit_code": code, "stdout_b64": "", "stderr_b64": ""})
     # ExecStatus is a consuming read: raising here would drop stdout that the
     # daemon cursor has already advanced past. An unreadable code is None.
-    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": code, "stdout": "KEEPME"})
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": code, "stdout_b64": b64(b"KEEPME")})
     assert status.exit_code is None
-    assert status.stdout == "KEEPME"
+    assert status.stdout == b"KEEPME"
 
 
 def test_a_whole_exit_code_spelled_as_a_float_is_still_that_code() -> None:
@@ -2994,10 +3016,156 @@ def test_a_whole_exit_code_spelled_as_a_float_is_still_that_code() -> None:
 
 def test_exec_result_preserves_a_null_exit_code() -> None:
     result = mc.ExecResult.from_api(
-        {"exit_code": None, "stdout": "partial", "stderr": "", "timed_out": True}
+        {"exit_code": None, "stdout_b64": b64(b"partial"), "stderr_b64": "", "timed_out": True}
     )
     assert result.exit_code is None
     assert not result.ok
+
+
+# --- exec output is base64 (OPL-4544) --------------------------------------
+
+
+def test_output_that_is_not_valid_utf8_survives_the_round_trip() -> None:
+    """The defect the wire change closes, and the one a test that runs `echo`
+    cannot see.
+
+    `stdout`/`stderr` were JSON strings, so every byte that was not valid UTF-8
+    arrived as U+FFFD, irreversibly. Both shapes now carry the bytes.
+    """
+    blob = bytes(range(256)) + b"\xff\xfe not utf-8 \xc3(\x80"
+    result = mc.ExecResult.from_api(
+        {"exit_code": 0, "stdout_b64": b64(blob), "stderr_b64": b64(b"\x80\x81")}
+    )
+    assert result.stdout == blob
+    assert result.stderr == b"\x80\x81"
+    assert not result.output_unreadable
+
+    status = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": b64(blob)})
+    assert status.stdout == blob
+
+
+@respx.mock
+def test_exec_carries_binary_output_all_the_way_out_of_the_client(client: mc.Client) -> None:
+    """End to end rather than on the model alone: the transport, the decoder and
+    the public attribute all have to keep the bytes."""
+    blob = b"\x1f\x8b\x08\x00tarball\xff\x00\xfe"
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(
+            200,
+            json={
+                "exit_code": 0,
+                "stdout_b64": b64(blob),
+                "stderr_b64": "",
+                "timed_out": False,
+            },
+        )
+    )
+    res = mc.Computer(client._t, COMPUTER).exec("cat /tmp/x.tgz")
+    assert res.stdout == blob and res.ok
+
+
+@respx.mock
+def test_polling_carries_binary_output_too(client: mc.Client) -> None:
+    blob = b"\x00\x01\x02\xfe\xff"
+    respx.get(f"{BASE}/computers/vm-1/exec/4242").mock(
+        httpx.Response(200, json={"pid": 4242, "running": True, "stdout_b64": b64(blob)})
+    )
+    job = mc.Computer(client._t, COMPUTER).background_command(4242)
+    assert job.poll().stdout == blob
+
+
+def test_the_text_accessor_is_the_lossy_reading_and_never_raises() -> None:
+    """`stdout_text` is the U+FFFD the wire format was changed to stop making —
+    and that is fine HERE, where the bytes are on the object beside it and the
+    caller asked for text. What was not fine was the wire doing it first."""
+    status = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": b64(b"ok \xff\n")})
+    assert status.stdout == b"ok \xff\n"
+    assert status.stdout_text == "ok \ufffd\n"
+    assert status.stderr_text == ""
+    result = mc.ExecResult.from_api({"exit_code": 0, "stderr_b64": b64(b"\xc3(")})
+    assert result.stderr_text == "\ufffd("
+
+
+def test_the_offsets_count_decoded_bytes_not_the_base64_that_carried_them() -> None:
+    """The subtle half of the change. A cursor advanced by the length of the
+    base64 runs about four thirds too far and silently skips output; the
+    offsets the daemon reports count what `len(status.stdout)` counts.
+    """
+    payload = b"x" * 3000
+    status = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": b64(payload), "stdout_offset": 3000})
+    assert len(status.stdout) == status.stdout_offset == 3000
+    assert len(status.raw["stdout_b64"]) == 4000, "the wire field is longer, and is not the count"
+
+
+def test_output_that_cannot_be_decoded_is_reported_rather_than_read_as_empty() -> None:
+    """Empty bytes and lost bytes are the same value and opposite facts, and on
+    a consuming read the difference cannot be recovered by asking again.
+    """
+    for wire in ("not base64!!", 12, ["a"], {"b": 1}):
+        status = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": wire})
+        assert status.stdout == b"", wire
+        assert status.output_unreadable is True, wire
+
+    result = mc.ExecResult.from_api({"exit_code": 0, "stderr_b64": "%%%%"})
+    assert result.stderr == b"" and result.output_unreadable is True
+
+    # An honest empty is not confused with one, and neither is a null, which is
+    # the platform saying nothing rather than sending something unreadable.
+    assert mc.ExecStatus.from_api({"pid": 1, "stdout_b64": ""}).output_unreadable is False
+    assert mc.ExecStatus.from_api({"pid": 1, "stdout_b64": None}).output_unreadable is False
+    assert mc.ExecStatus.from_api({"pid": 1}).output_unreadable is False
+
+
+def test_noise_outside_the_alphabet_is_refused_and_whitespace_is_not() -> None:
+    """`validate=False` — the stdlib default — discards every character outside
+    the base64 alphabet and decodes what is left, so a field this client cannot
+    read comes back as confident bytes: `b64decode("YWJj!ZGVm")` is `b"abcdef"`
+    with no complaint. Whitespace is the exception, because it carries nothing
+    and wrapping base64 at a column is an ordinary thing for an encoder to do —
+    a newline must not cost a caller a megabyte of build log.
+    """
+    assert base64.b64decode("YWJj!ZGVm") == b"abcdef", "what the lenient reading answers"
+    assert mc.ExecStatus.from_api({"pid": 1, "stdout_b64": "YWJj!ZGVm"}).output_unreadable
+
+    wrapped = b64(b"a" * 120)
+    wrapped = "\n".join(wrapped[i : i + 64] for i in range(0, len(wrapped), 64))
+    status = mc.ExecStatus.from_api({"pid": 1, "stdout_b64": wrapped})
+    assert status.stdout == b"a" * 120 and not status.output_unreadable
+
+
+def test_the_old_stdout_field_is_not_read_as_a_fallback() -> None:
+    """The platform renamed rather than adding an `encoding` discriminator so
+    that a client which has not been updated fails on a missing field instead of
+    reading base64 as text. Reading the old names here would put that silence
+    back — and put back the U+FFFD rewriting they were renamed to end — so a
+    body in the old shape decodes to no output rather than to text this SDK has
+    no way to know is text.
+    """
+    result = mc.ExecResult.from_api({"exit_code": 0, "stdout": "hi", "stderr": "boom"})
+    assert result.stdout == b"" and result.stderr == b""
+    assert result.output_unreadable is False, "absent is not unreadable"
+    assert result.raw["stdout"] == "hi", "and it is still in raw for anyone who needs it"
+
+
+def test_output_unreadable_breaks_no_existing_construction() -> None:
+    """Every previously-valid positional slot on both shapes still binds where it
+    did, including `raw` — the check `Template.ref` earned (OPL-4191)."""
+    import dataclasses
+
+    res = mc.ExecResult(0, b"out", b"err", False, True, True, {"raw": 1})
+    assert (res.exit_code, res.stdout, res.stderr, res.timed_out) == (0, b"out", b"err", False)
+    assert (res.out_truncated, res.err_truncated, res.raw) == (True, True, {"raw": 1})
+    assert res.output_unreadable is False
+    assert "output_unreadable" not in mc.ExecResult.__match_args__, "kw_only keeps it out"
+    assert "output_unreadable" not in mc.ExecStatus.__match_args__
+
+    off_wire = mc.ExecResult.from_api({"exit_code": 0, "stdout_b64": "!"})
+    assert off_wire.output_unreadable is True
+    assert dataclasses.replace(off_wire, exit_code=1).output_unreadable is True
+
+    status = mc.ExecStatus(1, "c", True, False, None, b"o", b"e", 1, 1, False, False, "t", {"r": 1})
+    assert (status.stdout, status.stderr, status.raw) == (b"o", b"e", {"r": 1})
+    assert status.output_unreadable is False
 
 
 def test_null_model_fields_are_normalized_without_losing_the_row() -> None:
@@ -3123,17 +3291,17 @@ def test_a_boolean_exit_code_is_rejected() -> None:
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
         mc.ExecResult.from_api({"exit_code": False})
     # Consuming: see test_a_non_integer_exit_code_is_refused_rather_than_truncated.
-    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": False, "stdout": "KEEPME"})
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": False, "stdout_b64": b64(b"KEEPME")})
     assert status.exit_code is None
-    assert status.stdout == "KEEPME"
+    assert status.stdout == b"KEEPME"
 
 
 def test_a_malformed_exit_code_is_an_sdk_error() -> None:
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
         mc.ExecResult.from_api({"exit_code": "oops"})
-    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": "oops", "stdout": "KEEPME"})
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": "oops", "stdout_b64": b64(b"KEEPME")})
     assert status.exit_code is None
-    assert status.stdout == "KEEPME"
+    assert status.stdout == b"KEEPME"
 
 
 @pytest.mark.parametrize(
@@ -3157,9 +3325,9 @@ def test_a_digit_string_int_refuses_is_an_sdk_error_not_a_valueerror(wire: str) 
     """
     with pytest.raises(mc.MandalaError, match="invalid exit_code"):
         mc.ExecResult.from_api({"exit_code": wire})
-    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": wire, "stdout": "KEEPME"})
+    status = mc.ExecStatus.from_api({"pid": 1, "exit_code": wire, "stdout_b64": b64(b"KEEPME")})
     assert status.exit_code is None
-    assert status.stdout == "KEEPME"
+    assert status.stdout == b"KEEPME"
 
 
 def test_a_zero_padded_exit_code_is_read_exactly_rather_than_refused() -> None:
@@ -3254,7 +3422,7 @@ def test_wait_for_guest_still_waits_through_a_booting_agent(client: mc.Client) -
     route = respx.post(f"{BASE}/computers/vm-1/exec")
     route.side_effect = [
         httpx.Response(409, json={"error": "guest agent not ready"}),
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}),
     ]
     c = _computer(client)
     assert c.wait_for_guest(timeout=30, poll=0.01) is c
@@ -3279,7 +3447,7 @@ def test_wait_for_guest_polls_through_a_rate_limit_on_the_platform_cadence(
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "12"}, json={"error": "slow down"}),
-            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+            httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}),
         ]
     )
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
@@ -3321,7 +3489,7 @@ def test_wait_for_guest_still_gives_up_on_a_refusal_that_will_not_clear(
 @respx.mock
 def test_wait_for_guest_caps_the_probe_to_its_remaining_budget(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     _computer(client).wait_for_guest(timeout=2, poll=0)
     assert json.loads(route.calls.last.request.content)["timeout_s"] == 2
@@ -3398,10 +3566,16 @@ def test_exec_result_equality_ignores_the_raw_payload() -> None:
     made the frozen dataclass unhashable.
     """
     got = mc.ExecResult.from_api(
-        {"exit_code": 0, "stdout": "hi", "stderr": "", "timed_out": False, "unknown": 1}
+        {
+            "exit_code": 0,
+            "stdout_b64": b64(b"hi"),
+            "stderr_b64": "",
+            "timed_out": False,
+            "unknown": 1,
+        }
     )
-    assert got == mc.ExecResult(0, "hi", "", False)
-    assert len({got, mc.ExecResult(0, "hi", "", False)}) == 1
+    assert got == mc.ExecResult(0, b"hi", b"", False)
+    assert len({got, mc.ExecResult(0, b"hi", b"", False)}) == 1
     assert got.raw["unknown"] == 1
 
 
@@ -3436,7 +3610,7 @@ def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.Client) -> None:
     for; see test_a_proxy_giving_up_is_not_reported_as_a_bare_status.
     """
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     c = _computer(client)
 
@@ -4007,7 +4181,7 @@ def test_a_ranged_read_gets_the_file_routes_budget(client: mc.Client) -> None:
 def test_a_client_of_your_own_is_never_shortened() -> None:
     """Widening is the only thing this does, so a patient client stays patient."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     patient = mc.Client("gck_test", base_url=BASE, http_client=httpx.Client(timeout=600.0))
     mc.Computer(patient._t, COMPUTER).exec("true", timeout=30)
