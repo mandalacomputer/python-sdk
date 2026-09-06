@@ -347,7 +347,14 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=AGENT_RESULT)
     if path.endswith("/exec"):
         return httpx.Response(
-            200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False, "pid": 4242}
+            200,
+            json={
+                "exit_code": 0,
+                "stdout_b64": "",
+                "stderr_b64": "",
+                "timed_out": False,
+                "pid": 4242,
+            },
         )
     if "/exec/" in path:
         return httpx.Response(200, json=EXEC_STATUS)

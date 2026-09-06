@@ -523,7 +523,9 @@ now = c.screenshot(fresh=True)  # skip the cache; what a drive loop wants
 
 res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
 res = c.exec("make", timeout=90, cwd="/root/src", env={"CC": "clang"})
-res.ok, res.exit_code, res.stdout, res.stderr
+res.ok, res.exit_code, res.stdout, res.stderr  # output is bytes
+res.stdout_text  # ...and this is the text reading of it
+res.output_unreadable  # check before believing an empty output
 ```
 
 With no coordinate, a click lands wherever the pointer already is, and a `drag`
@@ -649,13 +651,16 @@ slower — and for anything slower than a few seconds, which is a lower bar —
 start it instead:
 
 ```python
+import sys
 import time
 
 job = c.start_exec("apt-get install -y build-essential", cwd="/root")
 
 while True:
     status = job.poll()
-    print(status.stdout, end="")
+    if status.output_unreadable:
+        raise RuntimeError("output was lost — this read consumed it")
+    sys.stdout.buffer.write(status.stdout)
     if status.drained:
         break
     if not status.more:
@@ -673,6 +678,38 @@ drop is gone, and two pollers on one pid split the stream between them rather
 than each seeing all of it — so keep one handle per command. `status.more`
 means there is output waiting right now, which is why the loop above only sleeps
 when it is clear.
+
+**Write the bytes, not the per-chunk text.** A poll is cut at 1 MiB on a byte
+offset, so a multi-byte character lands across two reads and decoding each one
+on its own replaces both halves — the corruption the wire format exists to stop,
+put back one layer up. Bytes join and text does not, so a loop assembling a log
+appends `status.stdout` and decodes once at the end. `.stdout_text` is for a
+whole output small enough to have arrived in one read.
+
+**`drained` is about `more`, not about this read's output.** It says the command
+stopped and nothing is queued; a chunk that could not be decoded is
+`output_unreadable`, which is deliberately separate, because re-polling cannot
+recover bytes the daemon's cursor has already passed. A loop that must not
+continue past lost output checks that flag itself, as the one above does.
+
+**Output is `bytes`, on both shapes.** `ExecResult.stdout`, `ExecResult.stderr`
+and the same two on `ExecStatus` carry what the command printed, unmodified;
+`.stdout_text`/`.stderr_text` decode UTF-8 with replacement when you want text.
+The wire carries them base64 (`stdout_b64`, `stderr_b64`) because a JSON string
+is UTF-8 by definition and a command's output is not — the fields that used to
+carry the bytes directly rewrote everything else into `U+FFFD`, and not only for
+tarballs: a poll is cut at 1 MiB on a byte offset, so an ordinary text log longer
+than that had a character split across the cut and both halves destroyed. The
+offsets count decoded bytes, which is what makes them line up across polls;
+`len(status.stdout)` is the number they are counting, not the length of the
+base64 that carried it.
+
+**`output_unreadable` is worth checking before you believe an empty output.**
+It is set when the platform sent output this client could not read — a field
+that would not decode, or a body still in the pre-rename shape, which is what a
+host answers with until its own daemon is redeployed. Empty bytes stand in
+either way, and on a `poll()` the difference cannot be recovered by asking
+again: that read consumed the daemon's cursor.
 
 `job.kill()` stops the command and everything it started, and answers with its
 final state including whatever it printed that you had not read — so it collects
@@ -925,7 +962,7 @@ c.wait_for("computer.ready")  # in place of screenshotting until it looks up
 
 job = c.start_exec("apt-get install -y build-essential")
 done = c.wait_for("process.exited")  # in place of polling job.poll()
-print(done.exit_code, job.poll().stdout)
+print(done.exit_code, job.poll().stdout_text)
 ```
 
 Both close the socket on the way out. `wait_for()` always does; a `for` loop

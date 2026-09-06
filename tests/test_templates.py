@@ -1669,8 +1669,8 @@ def test_a_null_running_does_not_by_itself_declare_a_command_finished() -> None:
         running=False,
         exited=False,
         exit_code=0,
-        stdout="",
-        stderr="",
+        stdout=b"",
+        stderr=b"",
         stdout_offset=0,
         stderr_offset=0,
         more=False,
@@ -2196,8 +2196,8 @@ def test_a_decoded_empty_body_is_not_a_finished_command() -> None:
         running=False,
         exited=False,
         exit_code=0,
-        stdout="",
-        stderr="",
+        stdout=b"",
+        stderr=b"",
         stdout_offset=0,
         stderr_offset=0,
         more=False,
@@ -2221,8 +2221,8 @@ def test_the_decoded_flag_is_in_equality_because_it_changes_done() -> None:
         "running": False,
         "exited": False,
         "exit_code": None,
-        "stdout": "",
-        "stderr": "",
+        "stdout": b"",
+        "stderr": b"",
         "stdout_offset": 0,
         "stderr_offset": 0,
         "more": False,
@@ -2243,7 +2243,7 @@ def test_the_decoded_flag_breaks_no_existing_construction() -> None:
     import pickle
 
     assert "decoded" not in mc.ExecStatus.__match_args__, "kw_only keeps it out"
-    built = mc.ExecStatus(1, "c", True, False, None, "", "", 0, 0, False, False)
+    built = mc.ExecStatus(1, "c", True, False, None, b"", b"", 0, 0, False, False)
     assert built.decoded is False
     # IN the repr, because it is in `==` and flips `done`: a failed
     # `assert status == ExecStatus(...)` printing two identical reprs with no
