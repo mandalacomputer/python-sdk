@@ -7,6 +7,7 @@ lifecycle.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 
@@ -29,6 +30,16 @@ COMPUTER = {
     "disk_gb": 20,
     "created_at": "2026-07-31T00:00:00Z",
 }
+
+
+def b64(data: bytes) -> str:
+    """Encode an output field the way the platform does.
+
+    `exec` and the background-exec routes answer `stdout_b64`/`stderr_b64`, base64
+    on every response and never conditionally (platform OPL-4403), so a fixture
+    that spells the output as plain text is testing a shape the API does not send.
+    """
+    return base64.b64encode(data).decode()
 
 
 @pytest.fixture
@@ -201,7 +212,8 @@ async def test_screenshot_returns_bytes(client: mc.AsyncClient) -> None:
 async def test_exec_nonzero_exit_is_returned_not_raised(client: mc.AsyncClient) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
-            200, json={"exit_code": 1, "stdout": "", "stderr": "boom", "timed_out": False}
+            200,
+            json={"exit_code": 1, "stdout_b64": "", "stderr_b64": b64(b"boom"), "timed_out": False},
         )
     )
     res = await mc.AsyncComputer(client._t, COMPUTER).exec("false")
@@ -212,7 +224,9 @@ async def test_exec_nonzero_exit_is_returned_not_raised(client: mc.AsyncClient) 
 @pytest.mark.asyncio
 async def test_exec_omits_session_unless_desktop_requested(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     await mc.AsyncComputer(client._t, COMPUTER).exec("whoami")
     assert "session" not in json.loads(route.calls.last.request.content)
@@ -222,7 +236,9 @@ async def test_exec_omits_session_unless_desktop_requested(client: mc.AsyncClien
 @pytest.mark.asyncio
 async def test_exec_desktop_sends_session_desktop(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     await mc.AsyncComputer(client._t, COMPUTER).exec("whoami", desktop=True)
     assert json.loads(route.calls.last.request.content)["session"] == "desktop"
@@ -368,7 +384,9 @@ async def test_open_sends_the_same_command_as_the_sync_client(
     """Both build it in _api, so the only way they diverge is one of them
     stopping calling it — which a shape-only parity test would not catch."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False})
+        httpx.Response(
+            200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": "", "timed_out": False}
+        )
     )
     await mc.AsyncComputer(client._t, COMPUTER).open("https://example.com")
     body = json.loads(route.calls.last.request.content)
@@ -447,20 +465,22 @@ async def test_a_background_command_polls_and_is_killed(client: mc.AsyncClient) 
         httpx.Response(200, json={"pid": 4242, "command": "make", "running": True})
     )
     respx.get(f"{BASE}/computers/vm-1/exec/4242").mock(
-        httpx.Response(200, json={"pid": 4242, "running": True, "stdout": "cc\n", "more": True})
+        httpx.Response(
+            200, json={"pid": 4242, "running": True, "stdout_b64": b64(b"cc\n"), "more": True}
+        )
     )
     respx.delete(f"{BASE}/computers/vm-1/exec/4242").mock(
-        httpx.Response(200, json={"pid": 4242, "killed": True, "stdout": "tail\n"})
+        httpx.Response(200, json={"pid": 4242, "killed": True, "stdout_b64": b64(b"tail\n")})
     )
     c = await client.computers.get("vm-1")
     job = await c.start_exec("make")
     assert job.pid == 4242
 
     status = await job.poll()
-    assert status.stdout == "cc\n" and status.more and not status.done
+    assert status.stdout == b"cc\n" and status.more and not status.done
 
     final = await job.kill()
-    assert final.killed and final.stdout == "tail\n"
+    assert final.killed and final.stdout == b"tail\n"
 
 
 @respx.mock
@@ -549,7 +569,7 @@ async def test_wait_for_guest_polls_through_a_rate_limit_on_the_platform_cadence
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "8"}, json={"error": "slow down"}),
-            httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""}),
+            httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}),
         ]
     )
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
@@ -570,7 +590,7 @@ async def test_wait_for_guest_caps_the_probe_to_its_remaining_budget(
     client: mc.AsyncClient,
 ) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=2, poll=0)
     assert json.loads(route.calls.last.request.content)["timeout_s"] == 2
@@ -876,7 +896,7 @@ async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) 
     abandon a long command while the sync half waited it out.
     """
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
-        httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
+        httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
     )
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     c = await client.computers.get("vm-1")
