@@ -1310,6 +1310,59 @@ c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the ti
 c.clear_schedule()  # removed entirely
 ```
 
+**`snapshot()` waits for the capture, and the request does not.** A capture is
+minutes, and scales with how much has been written to the disk — longer than any
+HTTP request survives, so the platform answers `202` the moment it accepts one
+and copies the disk afterwards. What comes back at that point is a placeholder
+row in state `capturing`, carrying the id the snapshot will keep. `snapshot()`
+polls the snapshot listing for that id and returns when it reads `pending`,
+which is the point the snapshot can be restored, cloned or deleted. It does not
+wait for `durable` — that is backup replication, and nothing is gated on it.
+
+Every refusal is still immediate and still the exception it always was: a
+`ConflictError` for a capture already running or a disk still being copied, a
+`PlanLimitError` for an allowance that will not stretch, a `MandalaError` for a
+memory snapshot of a computer that is not running.
+
+**Returning is the snapshot being usable, not the computer being free.** The
+capture's claim on the *computer* is released only after the snapshot has been
+pushed to backup storage — the step that turns `pending` into `durable` — so for
+as long as that push runs, a second `c.snapshot()` and a
+`c.delete(purge_snapshots=True)` are both still `ConflictError`. Restoring,
+cloning and deleting the snapshot itself work from `pending`.
+
+Pass `wait=False` to hold the id and poll on your own schedule:
+
+```python
+held = c.snapshot(name="before-upgrade", wait=False)
+held.is_capturing  # True — and held.id is already the final id
+
+while True:
+    row = next((s for s in c.snapshots() if s.id == held.id), None)
+    if row is None:
+        raise RuntimeError("the capture failed: no snapshot and no row")
+    if not row.is_capturing:
+        break
+    time.sleep(5)
+```
+
+That loop's `None` is a capture that failed: it leaves no snapshot and no row,
+and the row's absence is the only thing there is to tell it from one still
+running.
+
+`snapshot()`'s two failures read differently for the same reason. A
+`TimeoutError` means the *wait* stopped and not the capture — the id is in the
+message and the snapshot is still coming. A `MandalaError` saying the capture
+failed means the row went and nothing took its place; there is nothing to find
+and nothing being billed.
+
+```python
+try:
+    snap = c.snapshot(name="before-upgrade", timeout=600)
+except mc.TimeoutError:
+    pass  # still capturing; poll c.snapshots() for the id in the message
+```
+
 A snapshot carries the shape it was captured at — `snap.os`, `snap.template`,
 `snap.cpu`, `snap.ram_mb`, `snap.disk_gb`, `snap.resolution` — which is what a
 `clone()` of it comes up as. That is the capture's shape and not the source
