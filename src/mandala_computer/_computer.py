@@ -2360,6 +2360,30 @@ class Computer(ComputerFields):
         job to poll. It runs on :data:`~mandala_computer._client.SNAPSHOT_TIMEOUT`
         for that reason — the ordinary budget abandoned every capture this SDK
         ever made, while the platform went on to finish each one (OPL-4561).
+
+        A capture slower than about two minutes cannot be delivered at all on
+        ``app.mandala.computer``, whatever budget it is given: the proxy there
+        gives up first and it arrives as
+        :class:`~mandala_computer.GatewayTimeoutError` (OPL-4563). Capture time
+        follows how much the disk holds, so a computer that has been used for
+        anything is the case that meets it.
+
+        THE SNAPSHOT IS STILL COMING when that happens — nothing was cancelled,
+        and it is not lost, only unnamed. Find it rather than taking a second
+        one::
+
+            try:
+                snap = c.snapshot(name="before-upgrade")
+            except mc.GatewayTimeoutError:
+                held = c.snapshot_holdings()      # the count and the fingerprint
+                snap = c.snapshots()[0]           # once it leaves `capturing`
+
+        A capture in flight shows up in :meth:`snapshots` as a placeholder in
+        state ``capturing`` whose id is ``cap-`` and this computer's own — only
+        one capture runs per computer, so a second call is refused with
+        :class:`~mandala_computer.ConflictError` until it finishes. Poll until
+        that placeholder is replaced; ``pending`` is the point at which the
+        snapshot is a thing you can act on.
         """
         data = self._t.json_object(
             "POST",
