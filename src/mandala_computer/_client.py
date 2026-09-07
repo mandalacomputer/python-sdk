@@ -84,6 +84,40 @@ FILE_SIZE_LIMIT = 64 * 1024 * 1024
 #: worth of round trips, which is a cheap price for both.
 FILE_PART_SIZE = 8 * 1024 * 1024
 
+#: Read and write budget for a snapshot capture.
+#:
+#: ``POST computers/:id/snapshots`` is synchronous — it holds the request open
+#: for the whole ``qemu-img convert`` and the push to backup storage, and
+#: answers with the finished snapshot — so this is the same argument
+#: :data:`FILE_TIMEOUT` makes, with a bigger number behind it. Nothing on the
+#: platform side bounds it either: the daemon sets a ``ReadHeaderTimeout`` and
+#: no ``WriteTimeout`` at all, which makes the client's budget the only
+#: deadline in the system and :data:`DEFAULT_TIMEOUT` the wrong one. Measured
+#: three times on the smallest thing this platform will capture — a 20 GB disk
+#: that came back as 1.88 GB — it took 119.3s, 119.6s and 123.6s, so the
+#: default abandoned every one of them (OPL-4561).
+#:
+#: The capture is not cancelled by the client giving up on it. It finishes, and
+#: the caller never learns the id — a snapshot they are billed to store and can
+#: reach only by listing the account and guessing which one it is. That is what
+#: makes this a budget rather than a nicety.
+#:
+#: 1800, matching :meth:`Builds.wait`'s default: this SDK's existing figure for
+#: as long as a platform-side image operation takes. Derived rather than picked
+#: — 1.88 GB in ~120s is about 16 MB/s end to end, and the largest disk on
+#: offer is 40 GB, to which ``memory=True`` adds up to 8 GB of RAM.
+#:
+#: NOT :data:`NO_DEADLINE`. A capture is bounded by disk bytes, so there is a
+#: real ceiling to name — unlike an agent run, where any finite guess ends
+#: every longer run at the same place — and a snapshot is the call that sits
+#: unattended in a script, where a socket dropped without a FIN would otherwise
+#: hang for ever.
+#:
+#: Only this route. Its siblings were measured on the same fleet and are
+#: nowhere near it: clone is copy-on-write (0.1s), restore is a disk swap
+#: (2.4s), delete is 0.7s. They stay on the default.
+SNAPSHOT_TIMEOUT = 1800.0
+
 #: A request with no deadline at all, for the non-streaming agent loop.
 #:
 #: Not a very large number: a run is minutes of clicking with no upper bound
