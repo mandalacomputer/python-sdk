@@ -326,14 +326,28 @@ def table(source: str, name: str) -> set[tuple[str, str]]:
 def shared_query(source: str) -> dict[str, str]:
     """Module-level ``const NAME: Query = {...}`` entries, by identifier.
 
-    A route's ``query`` list can name one of these instead of spelling it out —
-    ``ALLOW_PARTIAL`` is shared by two routes — so the identifier has to resolve
-    to a parameter name or those routes read as taking none.
+    A route's ``query`` or ``headers`` list can name one of these instead of
+    spelling it out — ``ALLOW_PARTIAL`` is shared by two routes — so the
+    identifier has to resolve to a parameter name or those routes read as taking
+    none.
+
+    ``export``, a leading indent, and the whitespace around the colon and the
+    ``=`` are all allowed for, because none of them changes what the declaration
+    means and a reader that insists on one spelling reports every route citing a
+    re-spelled constant as taking no parameters at all.
+
+    ``source`` must be comment-blanked, and allowing the indent is why: a
+    superseded copy of a declaration quoted in a block comment is indented under
+    its ``*``, so the relaxed pattern reaches it, and the quoted copy comes last
+    and wins the map. Every route citing the identifier then reports one missing
+    parameter and one extra, both naming a name nobody serves.
     """
     found = {}
-    for m in re.finditer(r"^const ([A-Z_]+): Query = \{", source, re.MULTILINE):
+    for m in re.finditer(
+        r"^\s*(?:export\s+)?const ([A-Z_]+):\s*Query\s*=\s*\{", source, re.MULTILINE
+    ):
         body = balanced(source, m.end() - 1, "{", "}")
-        named = re.search(r"name:\s*'([^']+)'", strip_comments(body))
+        named = re.search(r"name:\s*'([^']+)'", body)
         if named:
             found[m.group(1)] = named.group(1)
     return found
@@ -346,15 +360,19 @@ def parameters(platform: Path) -> dict[str, set[str]]:
     route table has no parameters in it — which is the whole reason a route
     comparison could not see the one that prompted this.
     """
-    source = (platform / APIDOC).read_text()
+    # Comments blanked once, over the whole file: `strip_comments` replaces them
+    # with spaces rather than deleting them, so every offset still names the same
+    # character and one pass serves every scan below and the bracket matching.
+    # `shared_query` reads this rather than the raw file because it allows an
+    # indent, which is what puts its scan inside block comments — and this is how
+    # apidoc.ts explains itself, with a superseded declaration quoted under a
+    # comment's `*` right where the live one is.
+    source = strip_comments((platform / APIDOC).read_text())
     shared = shared_query(source)
     start = source.find("export const DOCS: Record<string, Doc> = {")
     if start == -1:
         raise SystemExit(f"DOCS not found in {APIDOC} — has its shape changed?")
-    # Comments blanked once, over the whole table: `strip_comments` replaces
-    # them with spaces rather than deleting them, so every offset still names the
-    # same character and one pass serves both the scan and the bracket matching.
-    docs = strip_comments(balanced(source, source.index("{", start + 40), "{", "}"))
+    docs = balanced(source, source.index("{", start + 40), "{", "}")
 
     table: dict[str, set[str]] = {}
     entry = re.compile(r"'([A-Z]+) ([^']+)':\s*\{")

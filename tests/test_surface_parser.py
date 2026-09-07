@@ -8,7 +8,7 @@ mirror invented, which sends whoever reads the report to the wrong file to
 delete entries that are correct.
 
 A port of the TypeScript SDK's ``test/surface-parser.test.ts`` cases for the
-same four fixes (OPL-4483, OPL-4511, OPL-4513), against this reader instead:
+same fixes (OPL-4483, OPL-4511, OPL-4513, OPL-4514), against this reader instead:
 ``parameters()`` is called directly rather than through a subprocess, so what
 each test asserts is the reader's answer rather than a diff line about it.
 """
@@ -55,16 +55,63 @@ def test_a_shared_constant_is_recorded_under_the_list_that_cites_it(
     found = scan(
         check_surface,
         tmp_path,
-        # Flush left: `shared_query` reads a declaration only at the start of a
-        # line, which is how it is spelled upstream and is not what this test is
-        # about. That it is a spelling — `export const`, or an indent — is a
-        # divergence from the TypeScript reader that this ticket left alone.
         "const X_KEY: Query = { name: 'X-Model-Key', description: 'x' };\n"
         "export const DOCS: Record<string, Doc> = {\n"
         "  'GET sizes': { headers: [X_KEY] },\n"
         "};\n",
     )
     assert found == {"header:X-Model-Key"}
+
+
+def test_a_shared_constant_is_resolved_however_it_is_declared(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    """``export``, an indent and the whitespace around ``:`` and ``=`` are spellings.
+
+    None of them changes what the declaration means, and each one made the
+    constant invisible. A route citing it then read as taking no parameters at
+    all — so the parameters go missing from the upstream side, and the report
+    tells whoever reads it to delete mirror entries that are correct.
+    """
+    for decl in (
+        "export const PARTIAL: Query = {",
+        "  const PARTIAL: Query = {",
+        "const PARTIAL:Query = {",
+        "const PARTIAL: Query =\n{",
+    ):
+        found = scan(
+            check_surface,
+            tmp_path,
+            f"{decl} name: 'allow_partial', description: 'x' }};\n"
+            "export const DOCS: Record<string, Doc> = {\n"
+            "  'GET sizes': { query: [PARTIAL] },\n"
+            "};\n",
+        )
+        assert found == {"query:allow_partial"}, decl
+
+
+def test_a_shared_constant_does_not_resolve_to_a_copy_quoted_in_a_comment(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    """Allowing an indent is what puts the scan inside block comments.
+
+    A superseded copy of a declaration is indented under its ``*``, which is how
+    ``apidoc.ts`` explains itself. The quoted copy comes last and wins the map,
+    so every route citing the identifier reports one missing parameter and one
+    extra, both naming a name nobody serves. The live declaration wins.
+    """
+    found = scan(
+        check_surface,
+        tmp_path,
+        "const PARTIAL: Query = { name: 'allow_partial', description: 'x' };\n"
+        "/* Superseded, kept for the reader:\n"
+        "  const PARTIAL: Query = { name: 'stale_old_name', description: 'x' };\n"
+        "*/\n"
+        "export const DOCS: Record<string, Doc> = {\n"
+        "  'GET sizes': { query: [PARTIAL] },\n"
+        "};\n",
+    )
+    assert found == {"query:allow_partial"}
 
 
 def test_a_query_list_whose_bracket_the_formatter_wrapped_is_still_read(
