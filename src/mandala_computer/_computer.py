@@ -539,11 +539,18 @@ def capture_failed(computer_id: str, snapshot_id: str) -> str:
 def capture_accepted_without_id() -> str:
     """A 202 with no id in it, which there is no waiting on.
 
-    The id is the whole content of an accepted capture: it is what the poll
+    The id is the whole content of an accepted capture: it is what a poll
     matches, and there is no route that answers "the capture you just started".
     Reported as the malformed success payload it is, rather than being polled
     for and reported as a capture that failed — which is what an empty id would
     otherwise become on the first pass through :meth:`ComputerFields._captured`.
+
+    Raised under ``wait=False`` too, and that is the case it matters most in.
+    A caller who waits at least gets an exception; one who asked to hold the id
+    was handed a placeholder that looks like a handle, cannot be polled, and
+    leaves a running capture with nobody holding its id — a snapshot billed for
+    and reachable only by guessing, which is the OPL-4561 failure this ticket
+    exists to remove (Codex review).
     """
     return "the capture was accepted but the response carried no snapshot id"
 
@@ -2517,10 +2524,16 @@ class Computer(ComputerFields):
         # answers — it did the whole capture inside the request — so this half
         # keeps working against one, and it is also the honest reading of any
         # future answer that arrives already landed.
+        # BEFORE the `wait=False` return, not after it. An accepted capture with
+        # no id is unusable to EITHER caller, and the one who asked not to wait
+        # is the worse off: this half would raise, while that half was handed a
+        # placeholder that looks like a handle, cannot be polled, and strands a
+        # running capture with nobody holding its id — the OPL-4561 shape this
+        # whole change exists to remove (Codex review, OPL-4568).
+        if snap.state == CAPTURING and not snap.id:
+            raise MandalaError(capture_accepted_without_id())
         if not wait or snap.state != CAPTURING:
             return snap
-        if not snap.id:
-            raise MandalaError(capture_accepted_without_id())
         return self._await_capture(snap.id, timeout, poll)
 
     def _await_capture(self, snapshot_id: str, timeout: float, poll: float) -> Snapshot:

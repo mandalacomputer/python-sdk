@@ -4091,6 +4091,13 @@ def test_a_202_with_no_id_is_a_malformed_answer_not_a_failed_capture(client: mc.
         c.snapshot()
     assert not listing.called
 
+    # AND under `wait=False`, which is the case it matters most in: that caller
+    # would otherwise be handed a placeholder that looks like a handle, cannot
+    # be polled, and leaves the capture running with nobody holding its id
+    # (Codex review). The check sat after this early return for one commit.
+    with pytest.raises(mc.MandalaError, match="carried no snapshot id"):
+        c.snapshot(wait=False)
+
 
 @respx.mock
 def test_wait_false_hands_back_the_placeholder_and_asks_nothing_else(client: mc.Client) -> None:

@@ -1281,10 +1281,13 @@ class AsyncComputer(ComputerFields):
         # A row that is not `capturing` is a stored snapshot, and there is
         # nothing to wait for — which is what a platform predating OPL-4562
         # answers, having done the whole capture inside the request.
+        # BEFORE the `wait=False` return, for the reason the sync half gives:
+        # the id is the whole content of a placeholder, and returning one
+        # without it strands a running capture (Codex review, OPL-4568).
+        if snap.state == CAPTURING and not snap.id:
+            raise MandalaError(capture_accepted_without_id())
         if not wait or snap.state != CAPTURING:
             return snap
-        if not snap.id:
-            raise MandalaError(capture_accepted_without_id())
         return await self._await_capture(snap.id, timeout, poll)
 
     async def _await_capture(self, snapshot_id: str, timeout: float, poll: float) -> Snapshot:
