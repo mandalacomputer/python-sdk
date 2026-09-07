@@ -93,7 +93,9 @@ class AsyncComputers:
     def __init__(self, transport: AsyncTransport) -> None:
         self._t = transport
 
-    async def list(self, *, allow_partial: bool = False) -> Listing[AsyncComputer]:
+    async def list(
+        self, *, allow_partial: bool = False, state: str | None = None
+    ) -> Listing[AsyncComputer]:
         """Every computer on the account, or every one in the key's workspace.
 
         No ``vnc`` on these rows — fetch one computer to get its desktop
@@ -107,10 +109,21 @@ class AsyncComputers:
         with a computer that has disappeared is tidy up after it. With it, the
         returned :class:`~mandala_computer.Listing` says so —
         ``is_complete`` — and the rows that could not be read carry
-        :attr:`AsyncComputer.unreachable` and nothing else.
+        :attr:`AsyncComputer.unreachable` and the identity the platform has on
+        record, with nothing on them their host alone would know.
+
+        ``state`` narrows to one :attr:`AsyncComputer.state`. Without it the
+        listing is every computer that exists or may exist — ``live``,
+        ``unreachable`` and ``deleting``. ``deleted`` and ``lost`` are terminal,
+        are answered from the platform's record alone since no host has them to
+        list, and this is the ONLY way they are ever shown: a delete that was
+        answered and a computer written off with its host are both invisible to
+        the plain listing, which is why "it is not in the list" has never been
+        the same statement as "it was deleted".
         """
         data, incomplete = await self._t.listing(
-            _api.COMPUTERS, params=_api.partial_params(allow_partial)
+            _api.COMPUTERS,
+            params=_api.computer_listing_params(allow_partial=allow_partial, state=state),
         )
         return Listing.of([AsyncComputer(self._t, c) for c in data or []], incomplete)
 

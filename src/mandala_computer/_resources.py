@@ -118,7 +118,7 @@ class Computers:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
 
-    def list(self, *, allow_partial: bool = False) -> Listing[Computer]:
+    def list(self, *, allow_partial: bool = False, state: str | None = None) -> Listing[Computer]:
         """Every computer on the account, or every one in the key's workspace.
 
         No ``vnc`` on these rows — fetch one computer to get its desktop
@@ -132,10 +132,21 @@ class Computers:
         with a computer that has disappeared is tidy up after it. With it, the
         returned :class:`~mandala_computer.Listing` says so —
         ``is_complete`` — and the rows that could not be read carry
-        :attr:`Computer.unreachable` and nothing else.
+        :attr:`Computer.unreachable` and the identity the platform has on
+        record, with nothing on them their host alone would know.
+
+        ``state`` narrows to one :attr:`Computer.state`. Without it the listing
+        is every computer that exists or may exist — ``live``, ``unreachable``
+        and ``deleting``. ``deleted`` and ``lost`` are terminal, are answered
+        from the platform's record alone since no host has them to list, and
+        this is the ONLY way they are ever shown: a delete that was answered and
+        a computer written off with its host are both invisible to the plain
+        listing, which is why "it is not in the list" has never been the same
+        statement as "it was deleted".
         """
         data, incomplete = self._t.listing(
-            _api.COMPUTERS, params=_api.partial_params(allow_partial)
+            _api.COMPUTERS,
+            params=_api.computer_listing_params(allow_partial=allow_partial, state=state),
         )
         return Listing.of([Computer(self._t, c) for c in data or []], incomplete)
 

@@ -942,14 +942,72 @@ class ComputerFields:
         return dict(value)
 
     @property
+    def state(self) -> str:
+        """Whether this computer exists, as the platform's own record has it.
+
+        A different question from :attr:`status`, which is what its HOST says it
+        is doing. One of:
+
+        * ``"live"`` — a host lists it.
+        * ``"unreachable"`` — no host answered for it. Per-request rather than a
+          property of the machine: it says THIS listing could not reach the host,
+          and the computer is most likely fine and has had nothing done to it.
+        * ``"deleting"`` — a delete was sent and has not been answered.
+        * ``"deleted"`` — a delete that was answered. Terminal.
+        * ``"lost"`` — an operator wrote off the host while this computer was
+          unreachable. Terminal.
+
+        ``""`` on a single computer — a fetch, a create, a
+        :meth:`Computer.refresh` — and that is the platform's answer rather than
+        an omission: those are served by the machine's own host, so a response at
+        all means live. This is a listing row's field. It is also ``""`` from a
+        server that predates the record (platform OPL-4554).
+
+        The two terminal states are only ever listed when asked for by name —
+        see ``state`` on :meth:`Computers.list`.
+        """
+        # A real string or nothing. Stricter than the fields either side of it
+        # because this one DECIDES something: `unreachable` reads it to tell a
+        # placeholder from a row the record has finished with, so a number or a
+        # `None` off a malformed wire must fall through to the older test rather
+        # than coerce into a state nobody named.
+        value = self._data.get("state")
+        return value.strip() if isinstance(value, str) else ""
+
+    @property
+    def deleted_at(self) -> str:
+        """When the delete of this computer was answered, or ``""``.
+
+        Set once :attr:`state` has been ``"deleted"``, and only ever seen on a
+        row from ``Computers.list(state="deleted")``.
+        """
+        return str(self._data.get("deleted_at") or "")
+
+    @property
+    def lost_at(self) -> str:
+        """When this computer was written off with its host, or ``""``.
+
+        Set once :attr:`state` has been ``"lost"``, and only ever seen on a row
+        from ``Computers.list(state="lost")``. A write-off is an operator's
+        judgement that a silent host is not coming back; it is not a delete, and
+        nothing was necessarily destroyed on the caller's behalf.
+        """
+        return str(self._data.get("lost_at") or "")
+
+    @property
     def unreachable(self) -> bool:
-        """True on a row served from the placement cache, with nothing else on it.
+        """True on a row the platform served from its own record.
 
         Only ever seen in a listing taken with ``allow_partial=True``: the host
-        holding this computer could not be reached, so what came back is its id
-        and this flag. Every other field on such a row is absent, which means
-        :attr:`status` reads ``""`` rather than anything true — check this
-        before believing anything else here.
+        holding this computer could not be reached, so the row was answered from
+        what the platform has on record. That is the computer's identity —
+        :attr:`name`, :attr:`os`, :attr:`template`, its size, :attr:`workspace_id`,
+        :attr:`created_at`, :attr:`state` — and nothing only its host knows, so
+        :attr:`status` and :attr:`resolution` read ``""`` rather than anything
+        true. Check this before believing either of those.
+
+        Says nothing about the computer's health. The host did not answer this
+        request; the machine is most likely running exactly as it was.
         """
         # Row shape decides an unreadable flag, the same way it does for a
         # snapshot stub (adversarial review, OPL-3835). A stub has an id and this
@@ -961,11 +1019,22 @@ class ComputerFields:
         said = _wire(self._data, "unreachable")
         if said in (_Wire.TRUE, _Wire.FALSE):
             return said is _Wire.TRUE
-        # Present and unreadable: believe it only on a row that could not be
-        # anything else. Key PRESENCE, not truthiness — a full payload carrying
-        # `"status": null` made every healthy computer report itself a
-        # placeholder, and callers told to check this "before believing anything
-        # else here" then stopped believing valid data (adversarial review).
+        # `state` outranks the shape test, and has to (OPL-4555). A `deleted` or
+        # `lost` row is served from the record with no `status` and NO
+        # `unreachable` key — the platform omits the flag on a row it has
+        # finished with — so the shape test alone reported every terminal row as
+        # a placeholder whose identity should not be believed, which is the
+        # opposite of true: the record is the only thing that ever knew those
+        # rows, and what it says about them is all there is. A row is a
+        # placeholder because it says `unreachable`, not because it is short.
+        state = self.state
+        if state:
+            return state == "unreachable"
+        # No state at all: a server predating the record, where the shape is
+        # still the only evidence. Key PRESENCE, not truthiness — a full payload
+        # carrying `"status": null` made every healthy computer report itself a
+        # placeholder, and callers told to check this before believing anything
+        # else here then stopped believing valid data (adversarial review).
         return "status" not in self._data
 
     @property

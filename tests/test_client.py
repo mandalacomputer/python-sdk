@@ -1743,6 +1743,183 @@ def test_unreachable_rows_are_marked_rather_than_believed(client: mc.Client) -> 
 
 
 @respx.mock
+def test_an_unreachable_row_carries_the_identity_the_platform_has_on_record(
+    client: mc.Client,
+) -> None:
+    """It stopped being a bare id and flag (platform OPL-4554).
+
+    What is absent is what only the HOST knows — status, resolution — and that
+    is still the thing to check :attr:`unreachable` before believing. The name,
+    size and workspace on such a row come from the control plane's own record
+    and are as true as they ever were, which is what makes a short listing
+    something a caller can report rather than only count.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[
+                COMPUTER,
+                {
+                    "id": "vm-2",
+                    "name": "batch",
+                    "os": "linux",
+                    "template": "base",
+                    "cpu": 4,
+                    "ram_mb": 4096,
+                    "disk_gb": 40,
+                    "workspace_id": "ws-1",
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "state": "unreachable",
+                    "unreachable": True,
+                },
+            ],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    _, missing = client.computers.list(allow_partial=True)
+    assert missing.unreachable
+    assert missing.state == "unreachable"
+    assert (missing.name, missing.cpu, missing.workspace_id) == ("batch", 4, "ws-1")
+    # The host's own answers, and the row carries neither.
+    assert missing.status == ""
+    assert "resolution" not in missing.raw
+
+
+@respx.mock
+def test_a_terminal_row_is_a_record_rather_than_a_placeholder(client: mc.Client) -> None:
+    """The regression the lifecycle states would otherwise have introduced.
+
+    `deleted` and `lost` rows are served from the record with no `status` and,
+    unlike an unreachable row, NO `unreachable` key — the platform omits the
+    flag on a row it has finished with (`describeRow` in web/lib/computers.ts).
+    The shape test alone read that as a placeholder and told callers not to
+    believe the only description of the computer that will ever exist again.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "vm-9",
+                    "name": "gone",
+                    "os": "linux",
+                    "template": "base",
+                    "cpu": 2,
+                    "ram_mb": 2048,
+                    "disk_gb": 20,
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "state": "deleted",
+                    "deleted_at": "2026-09-01T12:00:00Z",
+                },
+                {
+                    "id": "vm-10",
+                    "name": "written-off",
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "state": "lost",
+                    "lost_at": "2026-09-02T12:00:00Z",
+                },
+            ],
+        )
+    )
+    deleted, lost = client.computers.list(state="deleted")
+    assert not deleted.unreachable and not lost.unreachable
+    assert deleted.state == "deleted" and deleted.deleted_at == "2026-09-01T12:00:00Z"
+    assert lost.state == "lost" and lost.lost_at == "2026-09-02T12:00:00Z"
+    # The identity on them is the point of listing them at all.
+    assert deleted.name == "gone" and lost.name == "written-off"
+    # Neither timestamp is invented for the state that did not happen.
+    assert deleted.lost_at == "" and lost.deleted_at == ""
+
+
+@respx.mock
+def test_a_server_with_no_state_still_reads_a_stub_by_its_shape(client: mc.Client) -> None:
+    """The fallback stays, for the servers it was written for.
+
+    A row with no `state` is one from before the record existed, where the shape
+    is the only evidence there is. An unreadable flag on such a row is still
+    believed on a row that could not be anything but a placeholder, and still
+    refused on a full payload.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[
+                {"id": "vm-2", "unreachable": None},
+                {**COMPUTER, "unreachable": None},
+            ],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    stub, full = client.computers.list(allow_partial=True)
+    assert stub.unreachable
+    assert not full.unreachable
+    assert stub.state == "" and full.state == ""
+
+
+@respx.mock
+def test_a_malformed_state_does_not_decide_anything(client: mc.Client) -> None:
+    """A state that is not a string falls through to the older test.
+
+    `state` is the one field on this payload that decides how another is read,
+    so it gets the strict decode the fields either side of it do not: coercing a
+    number into `"7"` would make an unreadable wire silently outrank the shape
+    evidence rather than defer to it.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[{"id": "vm-2", "state": 7, "unreachable": None}],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    (stub,) = client.computers.list(allow_partial=True)
+    assert stub.state == ""
+    assert stub.unreachable
+
+
+@respx.mock
+def test_computer_listing_sends_state_only_when_it_is_named(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[]))
+    client.computers.list()
+    assert not route.calls.last.request.url.params
+    client.computers.list(state="lost")
+    assert route.calls.last.request.url.params["state"] == "lost"
+    client.computers.list(allow_partial=True, state="unreachable")
+    params = route.calls.last.request.url.params
+    assert params["allow_partial"] == "1" and params["state"] == "unreachable"
+
+
+@pytest.mark.parametrize("state", ["", "   ", 7])
+@respx.mock
+def test_a_state_that_cannot_be_one_is_refused_before_the_request(
+    client: mc.Client, state: object
+) -> None:
+    """`?state=` is the accident this refuses, and it refuses it locally.
+
+    The platform owns the vocabulary — it answers 400 naming all five states, so
+    a value added upstream reaches a caller as its refusal rather than as a
+    ValueError from an SDK that shipped first. The empty string is the exception
+    because the platform's answer would be the wrong one: it is what most
+    clients serialise for an unset optional, and a caller who got here by
+    forwarding an absent argument meant every computer rather than a failure.
+    """
+    route = respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[]))
+    with pytest.raises(ValueError, match="state"):
+        client.computers.list(state=state)  # type: ignore[arg-type]
+    assert not route.called
+
+
+@respx.mock
+def test_a_state_this_sdk_has_never_heard_of_is_the_platforms_to_refuse(
+    client: mc.Client,
+) -> None:
+    """No local whitelist. An SDK that shipped first must not be the ceiling."""
+    route = respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[]))
+    client.computers.list(state="archived")
+    assert route.calls.last.request.url.params["state"] == "archived"
+
+
+@respx.mock
 def test_snapshot_listing_carries_include_and_partial(client: mc.Client) -> None:
     route = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
     client.snapshots.list()
