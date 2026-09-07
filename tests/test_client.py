@@ -3929,6 +3929,72 @@ def test_the_file_routes_get_a_budget_of_their_own(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_a_capture_gets_a_budget_of_its_own(client: mc.Client) -> None:
+    """The route the default budget abandoned every time (OPL-4561).
+
+    ``POST computers/:id/snapshots`` answers with the finished snapshot rather
+    than with a job to poll, and the capture behind it is minutes: measured at
+    119.3s, 119.6s and 123.6s on the SMALLEST disk this platform will take,
+    against a 60s default. Every one of those raised ``TimeoutError`` while the
+    platform went on to finish the capture, so the caller was billed to store a
+    snapshot whose id they never learned.
+
+    Discriminates: this asserts the recorded request's own budget, which is
+    exactly what no mocked snapshot test could ever notice — a mock answers
+    instantly whatever deadline it was given.
+    """
+    post = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(201, json={"id": "snap-1", "computer_id": "vm-1", "state": "durable"})
+    )
+    c = _computer(client)
+
+    c.snapshot(name="before-upgrade")
+    assert _budget(post)["read"] == mc._client.SNAPSHOT_TIMEOUT
+    assert _budget(post)["write"] == mc._client.SNAPSHOT_TIMEOUT
+    assert mc._client.SNAPSHOT_TIMEOUT > mc._client.DEFAULT_TIMEOUT
+
+
+@respx.mock
+def test_the_capture_siblings_stay_on_the_default(client: mc.Client) -> None:
+    """Only the capture is slow, so only the capture is widened (OPL-4561).
+
+    Clone is copy-on-write, restore is a disk swap and delete is a row: 0.1s,
+    2.4s and 0.7s measured on the same fleet as the 120s capture. Widening them
+    too would be a deadline nothing asked for, and would make the constant's
+    scope a guess rather than a measurement.
+    """
+    clone = respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
+        httpx.Response(200, json={"id": "vm-2", "status": "running"})
+    )
+    restore = respx.post(f"{BASE}/snapshots/snap-1/restore").mock(httpx.Response(204))
+    delete = respx.delete(f"{BASE}/snapshots/snap-1").mock(httpx.Response(204))
+
+    client.snapshots.clone("snap-1")
+    client.snapshots.restore("snap-1")
+    client.snapshots.delete("snap-1")
+    for route in (clone, restore, delete):
+        assert route.calls.last.request.extensions["timeout"]["read"] == mc._client.DEFAULT_TIMEOUT
+
+
+@respx.mock
+def test_a_patient_client_of_the_callers_own_survives_a_capture(client: mc.Client) -> None:
+    """`_budget` only ever widens, and the capture must not be the exception.
+
+    Somebody who handed us an hour-long client did so on purpose. Asserted here
+    rather than left to `_budget`'s own tests because this is the first caller
+    to name a budget large enough that clamping to it would look reasonable.
+    """
+    patient = mc.Client("com_x", base_url=BASE, timeout=mc._client.SNAPSHOT_TIMEOUT * 2)
+    post = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(201, json={"id": "snap-1", "computer_id": "vm-1", "state": "durable"})
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+
+    patient.computers.get("vm-1").snapshot()
+    assert _budget(post)["read"] == mc._client.SNAPSHOT_TIMEOUT * 2
+
+
+@respx.mock
 def test_write_file_refuses_an_oversized_body_before_the_request(
     client: mc.Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
