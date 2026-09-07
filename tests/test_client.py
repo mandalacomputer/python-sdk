@@ -1919,9 +1919,7 @@ def test_a_host_answer_with_no_resolution_still_means_the_legacy_default(
     on the row. Reading `state` as the discriminator would have made this row
     screenless; the discriminator is whether a HOST answered at all.
     """
-    respx.get(f"{BASE}/computers").mock(
-        httpx.Response(200, json=[{k: v for k, v in COMPUTER.items()} | {"state": "live"}])
-    )
+    respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[{**COMPUTER, "state": "live"}]))
     (c,) = client.computers.list()
     assert c.resolution == DEFAULT_RESOLUTION
     assert c.screen == (1280, 800)
