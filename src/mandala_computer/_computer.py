@@ -26,7 +26,8 @@ from ._client import (
     FILE_TIMEOUT,
     MODEL_KEY_HEADER,
     NO_DEADLINE,
-    SNAPSHOT_TIMEOUT,
+    SNAPSHOT_POLL,
+    SNAPSHOT_WAIT_TIMEOUT,
     Transport,
     error_for_status,
 )
@@ -508,6 +509,61 @@ def _snapshots_deleted(data: Mapping[str, Any]) -> int | None:
         return None
     return _require_whole(
         deleted, "DELETE computer answered with an invalid snapshots_deleted count"
+    )
+
+
+#: The one snapshot state that is not a snapshot.
+#:
+#: A capture registers its row before any bytes move and the row becomes
+#: ``pending`` in place, under the id it was allocated (platform OPL-4562). So
+#: "still going" is a state to read and not an id to recognise — it used to be
+#: both, when the placeholder was called ``cap-`` plus the computer's own id.
+CAPTURING = "capturing"
+
+
+def capture_failed(computer_id: str, snapshot_id: str) -> str:
+    """What a capture's row disappearing means, which is the only thing it can mean.
+
+    A failure after the 202 has no response left to fail in: the platform logs
+    it on the host, drops the ``capturing`` row and puts nothing in its place,
+    and that absence is the whole signal (platform OPL-4562). Said as a failed
+    capture rather than as a missing snapshot, because a caller who reads the
+    latter goes looking for a row that was never stored.
+    """
+    return (
+        f"the capture of {computer_id} failed: {snapshot_id} stopped being listed "
+        "before it landed, and a capture that fails leaves no snapshot and no row"
+    )
+
+
+def capture_accepted_without_id() -> str:
+    """A 202 with no id in it, which there is no waiting on.
+
+    The id is the whole content of an accepted capture: it is what a poll
+    matches, and there is no route that answers "the capture you just started".
+    Reported as the malformed success payload it is, rather than being polled
+    for and reported as a capture that failed — which is what an empty id would
+    otherwise become on the first pass through :meth:`ComputerFields._captured`.
+
+    Raised under ``wait=False`` too, and that is the case it matters most in.
+    A caller who waits at least gets an exception; one who asked to hold the id
+    was handed a placeholder that looks like a handle, cannot be polled, and
+    leaves a running capture with nobody holding its id — a snapshot billed for
+    and reachable only by guessing, which is the OPL-4561 failure this ticket
+    exists to remove (Codex review).
+    """
+    return "the capture was accepted but the response carried no snapshot id"
+
+
+def capture_timed_out(snapshot_id: str, timeout: float) -> str:
+    """A wait that ran out, which is not a capture that did.
+
+    Names the id, because that is what the caller needs to pick the wait back
+    up — the same id the 202 handed over, and the id the snapshot will keep.
+    """
+    return (
+        f"{snapshot_id} was still capturing after {timeout:g}s (the capture has not "
+        "stopped, only this wait has; it is in snapshots() under that id)"
     )
 
 
@@ -1140,6 +1196,40 @@ class ComputerFields:
             return None
         newest = max(range(len(mine)), key=lambda i: (_started_key(mine[i].started_at), -i))
         return next((m for m in mine if m.live), mine[newest])
+
+    def _captured(self, rows: Sequence[Mapping[str, Any]], snapshot_id: str) -> Snapshot | None:
+        """The capture's row out of a snapshot listing, once it is a snapshot.
+
+        ``None`` while it still reads ``capturing``, the row itself once it does
+        not, and a :class:`~mandala_computer.MandalaError` if it is not there at
+        all — the three outcomes a poll on a capture has. On ``ComputerFields``
+        for the reason :meth:`_my_move` is: both halves need exactly this and
+        only the fetch differs.
+
+        MATCHED ON THE ID, never on "the newest snapshot of this computer". The
+        202 hands over the id the snapshot will keep, so there is something
+        exact to match — and the guess it replaces is wrong precisely where it
+        matters, since a scheduled capture landing during a long manual one puts
+        a stranger at the front of the listing (platform OPL-4562).
+
+        Not filtered to this computer first. The id is unique across the
+        account, so the filter could only ever remove the row that was asked
+        for — and a partial listing carries stubs with no ``computer_id`` at
+        all, which is exactly the shape that would then read as a failed
+        capture.
+        """
+        for row in rows:
+            if row.get("id") != snapshot_id:
+                continue
+            snap = Snapshot.from_api(row)
+            return None if snap.state == CAPTURING else snap
+        # ABSENT means failed, and it is the only thing absent can mean here: the
+        # row is registered before the copy starts, so there is no window where a
+        # running capture is unlisted. What makes this safe to read that way is
+        # the poll asking WITHOUT `allow_partial` — a host that did not answer
+        # is then a 503 the loop rides out, rather than a short listing this
+        # would report as a capture that failed.
+        raise MandalaError(capture_failed(self.id, snapshot_id))
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.id} {self.name!r} {self.status}>"
@@ -2347,51 +2437,140 @@ class Computer(ComputerFields):
 
     # --- snapshots ------------------------------------------------------
 
-    def snapshot(self, *, memory: bool = False, name: str | None = None) -> Snapshot:
-        """Capture a snapshot of this computer.
+    def snapshot(
+        self,
+        *,
+        memory: bool = False,
+        name: str | None = None,
+        wait: bool = True,
+        timeout: float = SNAPSHOT_WAIT_TIMEOUT,
+        poll: float = SNAPSHOT_POLL,
+    ) -> Snapshot:
+        """Capture a snapshot of this computer, and wait for it.
 
         Works while it is running. ``memory=True`` also captures live RAM and
         device state, so a restore or fork resumes exactly where it was instead
         of booting — the computer must be running for that. An omitted ``name``
         asks the platform to generate one.
 
-        BLOCKS FOR THE WHOLE CAPTURE, which is minutes rather than seconds: the
-        platform answers this one with the finished snapshot rather than with a
-        job to poll. It runs on :data:`~mandala_computer._client.SNAPSHOT_TIMEOUT`
-        for that reason — the ordinary budget abandoned every capture this SDK
-        ever made, while the platform went on to finish each one (OPL-4561).
+        THE REQUEST NO LONGER WAITS FOR THE CAPTURE; this method does. ``POST
+        computers/:id/snapshots`` answers **202** the moment the capture is
+        accepted, with a placeholder row in state ``capturing`` carrying the id
+        the snapshot will keep (platform OPL-4562). A capture is minutes and
+        scales with how much has been written to the disk, which is longer than
+        an HTTP request survives — the proxy in front of ``app.mandala.computer``
+        abandons one at about two minutes whatever budget the client sets, and
+        that is what a blocking call ran into (OPL-4561, OPL-4563).
 
-        A capture slower than about two minutes cannot be delivered at all on
-        ``app.mandala.computer``, whatever budget it is given: the proxy there
-        gives up first and it arrives as
-        :class:`~mandala_computer.GatewayTimeoutError` (OPL-4563). Capture time
-        follows how much the disk holds, so a computer that has been used for
-        anything is the case that meets it.
+        So this polls the account's snapshot listing for that id and returns
+        when the row reaches ``pending``, which is the point the snapshot can be
+        restored, cloned or deleted. It does not wait for ``durable`` — that is
+        backup replication, it happens on its own, and nothing you can do with a
+        snapshot is gated on it.
 
-        THE SNAPSHOT IS STILL COMING when that happens — nothing was cancelled,
-        and it is not lost, only unnamed. Find it rather than taking a second
-        one::
+        RETURNING IS THE SNAPSHOT BEING USABLE, NOT THE COMPUTER BEING FREE.
+        ``pending`` is the point a restore, a clone or a delete of the SNAPSHOT
+        works, and that is what this waits for. The capture's claim on the
+        COMPUTER outlives it: the platform releases it only after the push to
+        backup storage, which is the step that makes the row ``durable``. So a
+        second capture of the same computer, and a :meth:`delete` with
+        ``purge_snapshots=True``, are still refused with
+        :class:`~mandala_computer.ConflictError` until that push finishes —
+        which is as long as the snapshot is large, not a fixed moment. Measured
+        on the dev fleet: 131.5s to ``pending``, a clone taken there built
+        clean, and a second capture refused until the 2.43 GB row read
+        ``durable`` about ten seconds later.
 
-            try:
-                snap = c.snapshot(name="before-upgrade")
-            except mc.GatewayTimeoutError:
-                held = c.snapshot_holdings()      # the count and the fingerprint
-                snap = c.snapshots()[0]           # once it leaves `capturing`
+        ``wait=False`` returns the placeholder instead, for a caller who would
+        rather hold the id and poll on their own schedule::
 
-        A capture in flight shows up in :meth:`snapshots` as a placeholder in
-        state ``capturing`` whose id is ``cap-`` and this computer's own — only
-        one capture runs per computer, so a second call is refused with
-        :class:`~mandala_computer.ConflictError` until it finishes. Poll until
-        that placeholder is replaced; ``pending`` is the point at which the
-        snapshot is a thing you can act on.
+            snap = c.snapshot(name="before-upgrade", wait=False)
+            snap.is_capturing  # True; snap.id is already the final id
+
+        EVERY REFUSAL IS STILL SYNCHRONOUS and still carries the status it did
+        before — 404 for no such computer,
+        :class:`~mandala_computer.ConflictError` for a capture already running or
+        a disk still being copied,
+        :class:`~mandala_computer.PlanLimitError` for an allowance that will not
+        stretch, 400 for a memory snapshot of a computer that is not running. A
+        202 means the capture started.
+
+        Raises :class:`~mandala_computer.MandalaError` if the capture fails.
+        There is no response left to carry that news by then, so the platform
+        drops the ``capturing`` row and stores nothing; the row disappearing is
+        the signal, and it is the one thing that tells a failed capture from a
+        running one.
+
+        Raises :class:`~mandala_computer.TimeoutError` if the capture is still
+        going when ``timeout`` runs out. The capture is not stopped by that;
+        only the waiting is, and the id in the message is the one to poll on.
+        ``timeout`` and ``poll`` are checked before anything is captured, and
+        whether or not ``wait`` is going to use them — see
+        :func:`check_wait_args`.
         """
+        # BEFORE the POST. Checked even under `wait=False`, where they are
+        # unused: a number this refuses is a mistake in the call, and finding it
+        # after a capture has been started is finding it too late to be worth
+        # anything.
+        check_wait_args(timeout, poll)
         data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "snapshots"),
             json=_api.snapshot_body(memory, name),
-            timeout=SNAPSHOT_TIMEOUT,
         )
-        return Snapshot.from_api(data)
+        snap = Snapshot.from_api(data)
+        # A row that is not `capturing` is a stored snapshot, and there is
+        # nothing to wait for. That is what a platform predating OPL-4562
+        # answers — it did the whole capture inside the request — so this half
+        # keeps working against one, and it is also the honest reading of any
+        # future answer that arrives already landed.
+        # BEFORE the `wait=False` return, not after it. An accepted capture with
+        # no id is unusable to EITHER caller, and the one who asked not to wait
+        # is the worse off: this half would raise, while that half was handed a
+        # placeholder that looks like a handle, cannot be polled, and strands a
+        # running capture with nobody holding its id — the OPL-4561 shape this
+        # whole change exists to remove (Codex review, OPL-4568).
+        if snap.state == CAPTURING and not snap.id:
+            raise MandalaError(capture_accepted_without_id())
+        if not wait or snap.state != CAPTURING:
+            return snap
+        return self._await_capture(snap.id, timeout, poll)
+
+    def _await_capture(self, snapshot_id: str, timeout: float, poll: float) -> Snapshot:
+        """Poll the account's snapshots until this capture lands, fails, or runs out.
+
+        The listing rather than a per-capture route, because there is no
+        per-capture route: ``GET /snapshots`` is where a capture in flight is
+        visible, and the dashboard's own panel polls exactly this.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            # The deadline before the poll, which is `wait_for_move`'s shape and
+            # `Builds.wait`'s: an already-spent budget has no request worth
+            # making, and one sent anyway is starved to the 1ms floor
+            # `_cap_budget` imposes and then reported as a failed poll.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(capture_timed_out(snapshot_id, timeout))
+            try:
+                rows, _ = self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
+            except MandalaError as err:
+                # A capture is minutes of one host's disk, and a hypervisor
+                # briefly out of reach during it is ordinary — the same reason
+                # every other wait in this file rides one out rather than
+                # ending on it (OPL-3724).
+                time.sleep(_ride_out(err, deadline, poll))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(capture_timed_out(snapshot_id, timeout)) from err
+                continue
+            landed = self._captured(rows, snapshot_id)
+            if landed is not None:
+                return landed
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(capture_timed_out(snapshot_id, timeout))
+            time.sleep(min(poll, remaining))
 
     def snapshots(
         self, *, include_unfinished: bool = False, allow_partial: bool = False
@@ -2403,6 +2582,11 @@ class Computer(ComputerFields):
         narrower version of this. It answers a count, a byte total and a
         fingerprint, and never the snapshots themselves; see
         :meth:`snapshot_holdings`.
+
+        A CAPTURE IN FLIGHT APPEARS HERE, in state ``capturing`` and under the
+        id the finished snapshot will keep — which is how a caller who passed
+        ``wait=False`` to :meth:`snapshot` polls for their own capture, and how
+        one who did not can watch somebody else's.
 
         ``allow_partial`` matters more here than it looks. Without it a short
         inventory is a 503, so this filter can never quietly narrow one; with

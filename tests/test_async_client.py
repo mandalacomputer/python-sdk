@@ -936,14 +936,48 @@ async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) 
     assert files.calls.last.request.extensions["timeout"]["read"] == mc._client.FILE_TIMEOUT
     assert files.calls.last.request.headers["Accept"] == "application/octet-stream"
 
-    # The capture, which the default budget abandoned every time it was ever
-    # made (OPL-4561). Here because the async half wires its own request and so
-    # can lose the budget on its own; the sync assertion cannot notice that.
+    # The capture, which is back on the ordinary budget now that the request no
+    # longer waits for it (OPL-4568). Here because the async half wires its own
+    # request and so can drift on its own; the sync assertion cannot notice that.
     snaps = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
         httpx.Response(201, json={"id": "snap-1", "computer_id": "vm-1", "state": "durable"})
     )
     await c.snapshot()
-    assert snaps.calls.last.request.extensions["timeout"]["read"] == mc._client.SNAPSHOT_TIMEOUT
+    assert snaps.calls.last.request.extensions["timeout"]["read"] == mc._client.DEFAULT_TIMEOUT
+    await client.aclose()
+
+
+@respx.mock
+async def test_a_capture_is_waited_out_on_the_async_half_too(client: mc.AsyncClient) -> None:
+    """The whole poll loop is written twice, so it can be wrong twice (OPL-4568).
+
+    The 202, the match on the id rather than on the newest row, the landed row
+    coming back and the failed capture reading as a failure — the four claims
+    the sync tests make, against the half that has its own copy of the loop.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    capturing = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "state": "capturing"}
+    nightly = {"id": "snap-nightly", "computer_id": "vm-1", "state": "pending", "auto": True}
+    landed = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "state": "pending"}
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(httpx.Response(202, json=capturing))
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[nightly, capturing]),
+            httpx.Response(200, json=[nightly, landed]),
+        ]
+    )
+    c = await client.computers.get("vm-1")
+
+    snap = await c.snapshot(poll=0)
+    assert (snap.id, snap.state) == ("snap-1", "pending")
+    assert listing.call_count == 2
+
+    held = await c.snapshot(wait=False)
+    assert held.is_capturing and listing.call_count == 2
+
+    listing.mock(httpx.Response(200, json=[nightly]))
+    with pytest.raises(mc.MandalaError, match="the capture of vm-1 failed"):
+        await c.snapshot(poll=0)
     await client.aclose()
 
 

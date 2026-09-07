@@ -1373,10 +1373,18 @@ class Snapshot:
     #: Where these bytes have got to, and what may be done with them.
     #:
     #: ``"capturing"``
-    #:     Still being taken, and NOT a snapshot yet. A listing puts these
-    #:     first, their ids begin ``cap-``, and restore, clone and delete all
-    #:     answer 404 on one. Acting on the newest row of a fresh listing is
-    #:     exactly how this is met.
+    #:     Still being taken, and NOT a snapshot yet: restore, clone and delete
+    #:     all answer 404 on one, and a listing puts these first. THE ID IS
+    #:     ALREADY THE SNAPSHOT'S OWN — allocated before the copy starts, kept
+    #:     when it lands — so this is the row to poll rather than a stand-in
+    #:     that gets replaced by another (platform OPL-4562). It used to be
+    #:     ``cap-`` and the computer's id, which named the work and not the
+    #:     thing, leaving a caller nothing to match on but "the newest row of a
+    #:     fresh listing" — a guess a scheduled capture landing in the same
+    #:     window gets wrong.
+    #:
+    #:     A capture that FAILS leaves nothing: this row disappears and no
+    #:     snapshot takes its place, which is the only signal there is.
     #: ``"pending"``
     #:     On its host and usable. This is the point to act from.
     #: ``"durable"``
@@ -1427,6 +1435,17 @@ class Snapshot:
     def is_memory(self) -> bool:
         """True for a live RAM+disk capture, which forks/restores without booting."""
         return self.kind == "memory"
+
+    @property
+    def is_capturing(self) -> bool:
+        """True while this is a capture in flight rather than a snapshot.
+
+        What :meth:`~mandala_computer.Computer.snapshot` hands back under
+        ``wait=False``, and what a listing shows for a capture somebody else
+        started. Restore, clone and delete all 404 on one; :attr:`id` is
+        nonetheless the id the snapshot will keep, so it is what to poll on.
+        """
+        return self.state == "capturing"
 
     @property
     def is_durable(self) -> bool:
