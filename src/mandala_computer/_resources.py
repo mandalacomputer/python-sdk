@@ -284,11 +284,14 @@ def still_listed(rows: Sequence[Mapping[str, Any]], snapshot_id: str) -> Snapsho
     failure, and a deletion that succeeds drops its row, so an absence here is
     the success. Getting one of those backwards is silent in both directions.
 
-    What makes an absence safe to read at all is the poll asking WITHOUT
-    ``allow_partial``. A host that cannot be reached is then a 503 the loop
-    rides out; with the flag it would be a short listing, and a short listing
-    is a row that is missing because nobody could look — reported here as a
-    snapshot that has been destroyed.
+    A SHORT LISTING MUST NEVER REACH THIS. A row missing because nobody could
+    look is indistinguishable here from a row that has gone, so the caller is
+    the one that decides: the poll asks without ``allow_partial``, which buys a
+    503 it rides out, AND it refuses to read an absence off any answer carrying
+    ``X-GC-Incomplete``. The second half is not redundant — the first is a
+    promise the public API makes, the transport reads that header off any 200 it
+    is handed, and the platform's own rule is that a reader tests for its
+    presence (Codex adversarial review, OPL-4576).
     """
     for row in rows:
         if row.get("id") == snapshot_id:
@@ -296,7 +299,9 @@ def still_listed(rows: Sequence[Mapping[str, Any]], snapshot_id: str) -> Snapsho
     return None
 
 
-def deletion_timed_out(snapshot_id: str, timeout: float, state: str | None) -> str:
+def deletion_timed_out(
+    snapshot_id: str, timeout: float, state: str | None, *, short: bool = False
+) -> str:
     """A row that outlasted the wait, said as the different things it can be.
 
     None of them is "the deletion timed out": nothing about the deletion stops
@@ -313,7 +318,20 @@ def deletion_timed_out(snapshot_id: str, timeout: float, state: str | None) -> s
     make one request in produces. Saying nothing about how far the deletion got
     is the honest answer there; guessing a state would put a remedy in front of
     a caller that this wait has no evidence for.
+
+    ``short`` is the same admission about a different failure: the last listing
+    came back MARKED INCOMPLETE, so this wait was never able to ask its question
+    at all — see :func:`still_listed`. It is neither of the two stalls, and it
+    is not evidence that anything is stuck.
     """
+    if short:
+        return (
+            f"{snapshot_id} could not be confirmed deleted within {timeout:g}s: the "
+            "snapshot listing came back marked incomplete — a hypervisor could not be "
+            "reached — and a short listing cannot say a row is gone, only that nobody "
+            "looked. Nothing here says the deletion failed; retry once the fleet "
+            "answers whole"
+        )
     if state is None:
         return (
             f"{snapshot_id} was still being deleted after {timeout:g}s, and this wait "
@@ -503,15 +521,16 @@ class Snapshots:
         """
         deadline = time.monotonic() + timeout
         last: str | None = None
+        short = False
         while True:
             # The deadline before the poll, which is `_await_capture`'s shape
             # and `Builds.wait`'s: an already-spent budget has no request worth
             # making.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last))
+                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last, short=short))
             try:
-                rows, _ = self._t.listing(
+                rows, incomplete = self._t.listing(
                     _api.SNAPSHOTS,
                     params=_api.snapshot_listing_params(
                         include_unfinished=True, allow_partial=False
@@ -527,19 +546,35 @@ class Snapshots:
                 time.sleep(_ride_out(err, deadline, poll))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last)) from err
+                    raise TimeoutError(
+                        deletion_timed_out(snapshot_id, timeout, last, short=short)
+                    ) from err
                 continue
+            # THE MARK, not the flag that asks for one. `allow_partial=False`
+            # buys the 503 the public API answers a short listing with, and that
+            # is a promise made by one deployment rather than a property of this
+            # loop: the transport reads `X-GC-Incomplete` off any 200 it is
+            # handed, the platform's own rule is that a reader tests for the
+            # header's PRESENCE, and a listing that carried it would be read
+            # here as the row having gone — the one wrong answer this wait must
+            # never give (Codex adversarial review, OPL-4576).
             row = still_listed(rows, snapshot_id)
-            if row is None:
+            # Only the ABSENCE is unreadable. A row that is there is a fact
+            # whatever else the answer was short by, so `short` is exactly "this
+            # poll could not answer the question" rather than "this listing was
+            # imperfect".
+            short = row is None and incomplete is not None
+            if row is None and not short:
                 return
             # Carried out of the loop so the timeout can say which of the two
             # stalls this was, and read from the LAST poll rather than the
             # first: the row starts in the state it had and moves to `deleting`
             # once the dependents are off it.
-            last = row.state
+            if row is not None:
+                last = row.state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last))
+                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last, short=short))
             time.sleep(min(poll, remaining))
 
     def retention(self) -> Retention:

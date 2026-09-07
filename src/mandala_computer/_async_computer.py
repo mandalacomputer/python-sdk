@@ -1303,7 +1303,7 @@ class AsyncComputer(ComputerFields):
             if remaining <= 0:
                 raise TimeoutError(capture_timed_out(snapshot_id, timeout))
             try:
-                rows, _ = await self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
+                rows, incomplete = await self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
             except MandalaError as err:
                 # A hypervisor briefly out of reach during a capture is ordinary,
                 # and is what this loop is for (OPL-3724).
@@ -1312,7 +1312,7 @@ class AsyncComputer(ComputerFields):
                 if remaining <= 0:
                     raise TimeoutError(capture_timed_out(snapshot_id, timeout)) from err
                 continue
-            landed = self._captured(rows, snapshot_id)
+            landed = self._captured(rows, snapshot_id, complete=incomplete is None)
             if landed is not None:
                 return landed
             remaining = deadline - time.monotonic()

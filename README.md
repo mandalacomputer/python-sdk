@@ -1422,6 +1422,12 @@ already running. That last one is an answer about progress rather than a fault â
 the first deletion is still working, and a second `delete()` against a row whose
 deletion stalled is accepted and finishes the job.
 
+A listing the platform marks incomplete is not read at all, in either
+direction: a row missing because a hypervisor could not be reached looks exactly
+like a row that has gone, so the poll keeps asking rather than calling that a
+deletion. If the wait runs out having only ever seen short answers, the
+`TimeoutError` says so instead of guessing.
+
 **A row that stays is one that stalled**, which is the opposite polarity to a
 capture, where a failure leaves no row at all. `TimeoutError` names the state
 the row was left in, because the two stalls have different remedies:

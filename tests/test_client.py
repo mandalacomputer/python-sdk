@@ -4418,6 +4418,102 @@ def test_the_deletion_wait_rides_out_a_poll_that_fails(client: mc.Client) -> Non
 
 
 @respx.mock
+def test_a_short_listing_is_not_a_deletion(client: mc.Client) -> None:
+    """The mark, not the flag that asks for one (Codex adversarial review).
+
+    `allow_partial=False` buys the 503 the public API answers a short listing
+    with, and that is a promise ONE deployment makes: the transport reads
+    ``X-GC-Incomplete`` off any 200 it is handed, and the platform's own rule is
+    that a reader tests for the header's presence rather than for a count. A
+    poll that ignored it would return from a listing whose rows are short
+    precisely because the snapshot's own host did not answer — reporting a
+    snapshot as destroyed while it is still stored and still billed, which is
+    the one wrong answer this wait exists to avoid.
+
+    ``0`` deliberately, which is the value that shows the header is presence
+    and not a count: a tenant whose only rows are on the host that went is
+    short by an amount the platform cannot state.
+    """
+    respx.delete(f"{BASE}/snapshots/snap-1").mock(httpx.Response(202, json=_landed("snap-1")))
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[], headers={"X-GC-Incomplete": "0"}),
+            httpx.Response(200, json=[], headers={"X-GC-Incomplete": "2"}),
+            httpx.Response(200, json=[]),
+        ]
+    )
+
+    client.snapshots.delete("snap-1", poll=0)
+    # Three: the first two could not answer, the third could.
+    assert listing.call_count == 3
+
+
+@respx.mock
+def test_a_wait_that_only_saw_short_listings_says_that_and_not_a_stall(
+    client: mc.Client,
+) -> None:
+    """The third thing a deadline can mean, and it is neither of the stalls.
+
+    "Still listed in state X" would be a claim about a snapshot this wait never
+    managed to look for, and "deleted" would be worse. What it says instead is
+    that nobody could look.
+    """
+    respx.delete(f"{BASE}/snapshots/snap-1").mock(httpx.Response(202, json=_landed("snap-1")))
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(200, json=[], headers={"X-GC-Incomplete": "1"})
+    )
+
+    with pytest.raises(mc.TimeoutError, match="marked incomplete") as caught:
+        client.snapshots.delete("snap-1", timeout=0.01, poll=0)
+    assert "could not be confirmed deleted" in str(caught.value)
+    assert "was still listed" not in str(caught.value)
+
+
+@respx.mock
+def test_a_row_seen_in_a_short_listing_is_still_a_row(client: mc.Client) -> None:
+    """Only the ABSENCE is unreadable.
+
+    A snapshot that IS in the answer is there whatever else the fleet could not
+    account for, so the wait keeps reading its state and the timeout still says
+    which stall it was — rather than falling back to "nobody looked" and losing
+    the one fact the poll did establish.
+    """
+    respx.delete(f"{BASE}/snapshots/snap-1").mock(httpx.Response(202, json=_landed("snap-1")))
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(200, json=[_deleting("snap-1")], headers={"X-GC-Incomplete": "1"})
+    )
+
+    with pytest.raises(mc.TimeoutError, match="was still listed") as caught:
+        client.snapshots.delete("snap-1", timeout=0.01, poll=0)
+    assert "fifteen minutes" in str(caught.value)
+
+
+@respx.mock
+def test_a_short_listing_is_not_a_failed_capture_either(client: mc.Client) -> None:
+    """The same defect one file over, in the wait this one was modelled on.
+
+    `_captured` reads "no row with this id" as a capture that failed and says
+    so with a MandalaError, which tells a caller to start again. Off a listing
+    the platform marked short that is a caller re-capturing a computer whose
+    first capture is still running — and the second is a ConflictError, so they
+    are left with an error about the error (OPL-4568, found reviewing OPL-4576).
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[], headers={"X-GC-Incomplete": "0"}),
+            httpx.Response(200, json=[_landed("snap-1")]),
+        ]
+    )
+    c = _computer(client)
+
+    assert c.snapshot(poll=0).state == "pending"
+    assert listing.call_count == 2
+
+
+@respx.mock
 def test_a_refused_deletion_is_still_refused_synchronously(client: mc.Client) -> None:
     """Every refusal is settled before the 202, and none of them moved.
 

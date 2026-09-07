@@ -387,12 +387,13 @@ class AsyncSnapshots:
         """
         deadline = time.monotonic() + timeout
         last: str | None = None
+        short = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last))
+                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last, short=short))
             try:
-                rows, _ = await self._t.listing(
+                rows, incomplete = await self._t.listing(
                     _api.SNAPSHOTS,
                     params=_api.snapshot_listing_params(
                         include_unfinished=True, allow_partial=False
@@ -406,15 +407,23 @@ class AsyncSnapshots:
                 await asyncio.sleep(_ride_out(err, deadline, poll))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last)) from err
+                    raise TimeoutError(
+                        deletion_timed_out(snapshot_id, timeout, last, short=short)
+                    ) from err
                 continue
+            # See the sync half: an answer marked `X-GC-Incomplete` cannot say a
+            # row is gone, only that nobody looked, and `allow_partial=False` is
+            # a promise about one deployment rather than a property of this loop
+            # (Codex adversarial review, OPL-4576).
             row = still_listed(rows, snapshot_id)
-            if row is None:
+            short = row is None and incomplete is not None
+            if row is None and not short:
                 return
-            last = row.state
+            if row is not None:
+                last = row.state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last))
+                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last, short=short))
             await asyncio.sleep(min(poll, remaining))
 
     async def retention(self) -> Retention:

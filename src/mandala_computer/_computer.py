@@ -1197,7 +1197,9 @@ class ComputerFields:
         newest = max(range(len(mine)), key=lambda i: (_started_key(mine[i].started_at), -i))
         return next((m for m in mine if m.live), mine[newest])
 
-    def _captured(self, rows: Sequence[Mapping[str, Any]], snapshot_id: str) -> Snapshot | None:
+    def _captured(
+        self, rows: Sequence[Mapping[str, Any]], snapshot_id: str, *, complete: bool = True
+    ) -> Snapshot | None:
         """The capture's row out of a snapshot listing, once it is a snapshot.
 
         ``None`` while it still reads ``capturing``, the row itself once it does
@@ -1223,12 +1225,21 @@ class ComputerFields:
                 continue
             snap = Snapshot.from_api(row)
             return None if snap.state == CAPTURING else snap
-        # ABSENT means failed, and it is the only thing absent can mean here: the
-        # row is registered before the copy starts, so there is no window where a
-        # running capture is unlisted. What makes this safe to read that way is
-        # the poll asking WITHOUT `allow_partial` — a host that did not answer
-        # is then a 503 the loop rides out, rather than a short listing this
-        # would report as a capture that failed.
+        # ABSENT means failed, and it is the only thing absent can mean in a
+        # WHOLE listing: the row is registered before the copy starts, so there
+        # is no window where a running capture is unlisted.
+        #
+        # `complete` is what makes that reading safe, and asking without
+        # `allow_partial` is only half of it. That buys the 503 the public API
+        # answers a short listing with — a promise one deployment makes — while
+        # the transport reads `X-GC-Incomplete` off any 200 it is handed and the
+        # platform's own rule is that a reader tests for the header's presence.
+        # A capture reported as FAILED off a listing nobody could complete is a
+        # caller told to start again while the first capture is still running
+        # (Codex adversarial review, OPL-4576; the same defect the deletion wait
+        # was found to have, in the code it was modelled on).
+        if not complete:
+            return None
         raise MandalaError(capture_failed(self.id, snapshot_id))
 
     def __repr__(self) -> str:
@@ -2553,7 +2564,7 @@ class Computer(ComputerFields):
             if remaining <= 0:
                 raise TimeoutError(capture_timed_out(snapshot_id, timeout))
             try:
-                rows, _ = self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
+                rows, incomplete = self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
             except MandalaError as err:
                 # A capture is minutes of one host's disk, and a hypervisor
                 # briefly out of reach during it is ordinary — the same reason
@@ -2564,7 +2575,7 @@ class Computer(ComputerFields):
                 if remaining <= 0:
                     raise TimeoutError(capture_timed_out(snapshot_id, timeout)) from err
                 continue
-            landed = self._captured(rows, snapshot_id)
+            landed = self._captured(rows, snapshot_id, complete=incomplete is None)
             if landed is not None:
                 return landed
             remaining = deadline - time.monotonic()

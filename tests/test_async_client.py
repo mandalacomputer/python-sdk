@@ -1014,6 +1014,19 @@ async def test_a_deletion_is_waited_out_on_the_async_half_too(client: mc.AsyncCl
     with pytest.raises(mc.TimeoutError, match="snap-1 was still listed") as caught:
         await client.snapshots.delete("snap-1", timeout=0.01, poll=0)
     assert "fifteen minutes" in str(caught.value)
+
+    # And the fifth: an answer the platform marked short cannot say a row is
+    # gone, only that nobody looked. The async loop is its own copy, and this is
+    # the claim where a copy being wrong is silent (Codex adversarial review).
+    listing.mock(
+        side_effect=[
+            httpx.Response(200, json=[nightly], headers={"X-GC-Incomplete": "0"}),
+            httpx.Response(200, json=[nightly]),
+        ]
+    )
+    before = listing.call_count
+    await client.snapshots.delete("snap-1", poll=0)
+    assert listing.call_count == before + 2
     await client.aclose()
 
 
