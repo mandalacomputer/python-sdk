@@ -413,6 +413,31 @@ async def test_a_short_listing_says_so(client: mc.AsyncClient) -> None:
 
 
 @respx.mock
+async def test_a_terminal_listing_reads_the_same_on_the_async_client(
+    client: mc.AsyncClient,
+) -> None:
+    """`state=` narrows here too, and its rows are records rather than stubs."""
+    route = respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "vm-9",
+                    "name": "gone",
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "state": "deleted",
+                    "deleted_at": "2026-09-01T12:00:00Z",
+                }
+            ],
+        )
+    )
+    (deleted,) = await client.computers.list(state="deleted")
+    assert route.calls.last.request.url.params["state"] == "deleted"
+    assert not deleted.unreachable
+    assert deleted.state == "deleted" and deleted.deleted_at == "2026-09-01T12:00:00Z"
+
+
+@respx.mock
 async def test_a_listing_that_would_be_short_is_refused_by_default(
     client: mc.AsyncClient,
 ) -> None:

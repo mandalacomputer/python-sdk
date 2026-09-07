@@ -600,6 +600,10 @@ def exercise_everything(client: mc.Client) -> None:
         for _ in events:
             break
     client.computers.list(allow_partial=True)
+    # The listing narrowed to one lifecycle state, and narrowed to a TERMINAL
+    # one: `deleted` and `lost` are answered from the platform's record alone
+    # and are the only rows this parameter is the sole way to see.
+    client.computers.list(state="deleted")
     client.snapshots.list()
     client.snapshots.list(include_unfinished=True, allow_partial=True)
     client.snapshots.restore("snap-1")
@@ -754,6 +758,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         async for _ in events:
             break
     await client.computers.list(allow_partial=True)
+    await client.computers.list(state="deleted")
     await client.snapshots.list()
     await client.snapshots.list(include_unfinished=True, allow_partial=True)
     await client.snapshots.restore("snap-1")
