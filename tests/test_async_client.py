@@ -935,6 +935,15 @@ async def test_a_long_exec_waits_as_long_as_it_asked_to(client: mc.AsyncClient) 
     await c.read_file("/tmp/a")
     assert files.calls.last.request.extensions["timeout"]["read"] == mc._client.FILE_TIMEOUT
     assert files.calls.last.request.headers["Accept"] == "application/octet-stream"
+
+    # The capture, which the default budget abandoned every time it was ever
+    # made (OPL-4561). Here because the async half wires its own request and so
+    # can lose the budget on its own; the sync assertion cannot notice that.
+    snaps = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(201, json={"id": "snap-1", "computer_id": "vm-1", "state": "durable"})
+    )
+    await c.snapshot()
+    assert snaps.calls.last.request.extensions["timeout"]["read"] == mc._client.SNAPSHOT_TIMEOUT
     await client.aclose()
 
 

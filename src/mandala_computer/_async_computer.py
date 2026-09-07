@@ -30,6 +30,7 @@ from ._client import (
     FILE_TIMEOUT,
     MODEL_KEY_HEADER,
     NO_DEADLINE,
+    SNAPSHOT_TIMEOUT,
     AsyncTransport,
 )
 from ._computer import (
@@ -1203,11 +1204,18 @@ class AsyncComputer(ComputerFields):
         device state, so a restore or fork resumes exactly where it was instead
         of booting — the computer must be running for that. An omitted ``name``
         asks the platform to generate one.
+
+        BLOCKS FOR THE WHOLE CAPTURE, which is minutes rather than seconds: the
+        platform answers this one with the finished snapshot rather than with a
+        job to poll. It runs on :data:`~mandala_computer._client.SNAPSHOT_TIMEOUT`
+        for that reason — the ordinary budget abandoned every capture this SDK
+        ever made, while the platform went on to finish each one (OPL-4561).
         """
         data = await self._t.json_object(
             "POST",
             _api.computer_action(self.id, "snapshots"),
             json=_api.snapshot_body(memory, name),
+            timeout=SNAPSHOT_TIMEOUT,
         )
         return Snapshot.from_api(data)
 
