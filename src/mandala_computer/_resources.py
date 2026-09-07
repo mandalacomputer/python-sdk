@@ -12,8 +12,8 @@ from enum import Enum, auto
 from typing import Any
 
 from . import _api
-from ._client import Transport
-from ._computer import Computer, _poll_delay, check_wait_args
+from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport
+from ._computer import Computer, _poll_delay, _ride_out, check_wait_args
 from ._exceptions import (
     MandalaError,
     TimeoutError,
@@ -261,6 +261,87 @@ def warn_cleanup_failed(computer_id: str, error: Exception) -> None:
     )
 
 
+#: The state a deletion writes onto the row once it has detached the dependents.
+#:
+#: Left out of a bare listing, because a half-deleted snapshot is not one
+#: anything can be restored or cloned from — which is the whole reason the wait
+#: for a deletion polls with ``include=unfinished`` and the wait for a capture
+#: does not. A poll that asked the plain listing would read a row that had got
+#: this far as a row that had gone, and call a stalled deletion a finished one.
+DELETING = "deleting"
+
+
+def still_listed(rows: Sequence[Mapping[str, Any]], snapshot_id: str) -> Snapshot | None:
+    """The row of the snapshot being deleted, while there still is one.
+
+    ``None`` is the answer the wait is looking for: THE DELETION HAS NO STATE
+    THAT MEANS DELETED, so the row leaving the listing is the deletion having
+    finished, and that is the only thing that says so (platform OPL-4572).
+
+    The exact opposite reading to :meth:`ComputerFields._captured`, on the same
+    listing and the same id, which is why the two are written separately rather
+    than shared: a capture that fails drops its row, so an absence there is a
+    failure, and a deletion that succeeds drops its row, so an absence here is
+    the success. Getting one of those backwards is silent in both directions.
+
+    What makes an absence safe to read at all is the poll asking WITHOUT
+    ``allow_partial``. A host that cannot be reached is then a 503 the loop
+    rides out; with the flag it would be a short listing, and a short listing
+    is a row that is missing because nobody could look — reported here as a
+    snapshot that has been destroyed.
+    """
+    for row in rows:
+        if row.get("id") == snapshot_id:
+            return Snapshot.from_api(row)
+    return None
+
+
+def deletion_timed_out(snapshot_id: str, timeout: float, state: str | None) -> str:
+    """A row that outlasted the wait, said as the different things it can be.
+
+    None of them is "the deletion timed out": nothing about the deletion stops
+    when this wait does, and the remedy differs by which state the row was left
+    in — which is why the state is in the sentence rather than only the id.
+
+    ``state`` is the LAST STATE A POLL ANSWERED WITH, and the message says so
+    rather than asserting what the row reads now: the poll that ended this wait
+    may have been one that failed, and a state carried over from before it is
+    evidence rather than a current fact — the distinction ``Builds.wait`` needed
+    three states of its own to make (OPL-3835).
+
+    It is ``None`` when no poll ever answered, which a ``timeout`` too small to
+    make one request in produces. Saying nothing about how far the deletion got
+    is the honest answer there; guessing a state would put a remedy in front of
+    a caller that this wait has no evidence for.
+    """
+    if state is None:
+        return (
+            f"{snapshot_id} was still being deleted after {timeout:g}s, and this wait "
+            "ended without reading the listing, so it cannot say how far the deletion "
+            "got. It has not stopped — only this wait has. Poll "
+            "snapshots.list(include_unfinished=True) for the id: it is deleted when "
+            "the row is gone"
+        )
+    if state == DELETING:
+        return (
+            f"{snapshot_id} was still listed after {timeout:g}s, last seen in state "
+            "'deleting' (the dependents are detached and the stored objects are still going; "
+            "the deletion has not stopped, only this wait has). The platform "
+            "retries a deletion that stalled about every fifteen minutes, and "
+            "deleting the id again asks for the same work by hand — a stalled "
+            "deletion is picked up rather than refused"
+        )
+    return (
+        f"{snapshot_id} was still listed after {timeout:g}s, last seen in state "
+        f"{state or 'unknown'!r} — the state it had before the delete, so the deletion "
+        "never reached the point where it marks the row: it is either still detaching "
+        "dependent snapshots or it stopped before it could, which is what a dependent "
+        "that is ITSELF being deleted does to it. The snapshot is intact either way, "
+        "and this stall is not on the platform's own sweep, which looks for 'deleting' "
+        "— so delete the id again, once any dependent's deletion has finished"
+    )
+
+
 class Snapshots:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
@@ -322,8 +403,144 @@ class Snapshots:
         )
         return Computer(self._t, _api.computer_payload(data))
 
-    def delete(self, snapshot_id: str) -> None:
+    def delete(
+        self,
+        snapshot_id: str,
+        *,
+        wait: bool = True,
+        timeout: float = SNAPSHOT_DELETE_TIMEOUT,
+        poll: float = SNAPSHOT_POLL,
+    ) -> None:
+        """Destroy a snapshot, and wait for it to be gone.
+
+        Later snapshots in the same chain are unaffected: a deletion detaches
+        every dependent from this one before anything is removed, so deleting a
+        link does not cost you the snapshots that were built on it.
+
+        THE REQUEST NO LONGER WAITS FOR THE DELETION; this method does. ``DELETE
+        snapshots/:id`` answers **202** with the snapshot's row the moment the
+        deletion is accepted and destroys it afterwards (platform OPL-4572).
+        Detaching those dependents, committing the index and walking both the
+        local files and the bucket objects scales with the chain and with how
+        much is stored — the same length that took the capture off its request
+        in OPL-4562, and longer than an HTTP request survives.
+
+        WHAT IS POLLED IS THE ROW'S ABSENCE. There is no state that means
+        deleted: the snapshot no longer being listed is the deletion having
+        finished, and that is the only thing that says so. The listing is read
+        with ``include=unfinished``, because a deletion that has detached the
+        dependents marks the row ``deleting`` and a bare listing leaves those
+        out — polling without it would read a stalled deletion as a finished
+        one.
+
+        A ROW THAT STAYS IS ONE THAT STALLED, which is the opposite polarity to
+        a capture: a capture that fails leaves no row at all, and a deletion
+        that succeeds is what removes one. So this raises
+        :class:`~mandala_computer.TimeoutError` naming the state the row was
+        left in, rather than reporting a deletion that failed — the platform
+        retries a ``deleting`` row on its own sweep, about every fifteen
+        minutes, and sending the delete again picks one up by hand.
+
+        ``wait=False`` returns as soon as the 202 lands, for a caller who would
+        rather hold the id and poll on their own schedule — the shape
+        :meth:`Computer.snapshot` has::
+
+            client.snapshots.delete(snap.id, wait=False)
+            gone = not any(
+                s.id == snap.id
+                for s in client.snapshots.list(include_unfinished=True)
+            )
+
+        EVERY REFUSAL IS STILL SYNCHRONOUS and still carries the status it did
+        before — 404 for no such snapshot,
+        :class:`~mandala_computer.ConflictError` for a capture reading through
+        it, for a clone or a migration holding it, and for a deletion of this id
+        already running. A 202 means the deletion started.
+
+        ONE CONFLICT ARRIVES AFTER THE 202 and cannot be raised here: a
+        dependent that is itself being deleted cannot be detached, so a delete
+        that meets one fails once the work starts, having destroyed nothing.
+        That is a row left in its ordinary state, which is what the timeout
+        message distinguishes. Deleting a chain one link at a time — waiting for
+        each row to go before starting the next, which is what this method does
+        by default — never meets it.
+
+        A SECOND DELETE IS NOT FATAL. While the first is working it is a
+        ``ConflictError`` saying the snapshot is already being deleted, which is
+        an answer about progress rather than a fault; against a row whose
+        deletion stalled it is accepted and finishes the job.
+
+        ``timeout`` and ``poll`` are checked before anything is deleted, and
+        whether or not ``wait`` is going to use them — see
+        :func:`check_wait_args`.
+
+        Returns nothing under either ``wait``. The 202 carries the row, and the
+        row is the thing that is on its way out: handing it back would be
+        offering a record of a snapshot as the answer to destroying it, and the
+        id it holds is the one that was passed in.
+        """
+        # BEFORE the DELETE, for the reason the capture gives: a number this
+        # refuses is a mistake in the call, and finding it after a deletion has
+        # started is finding it too late to be worth anything.
+        check_wait_args(timeout, poll)
         self._t.request("DELETE", _api.snapshot(snapshot_id))
+        if not wait:
+            return
+        self._await_deletion(snapshot_id, timeout, poll)
+
+    def _await_deletion(self, snapshot_id: str, timeout: float, poll: float) -> None:
+        """Poll the account's snapshots until this id stops being listed.
+
+        The listing rather than a read of the snapshot, because a read is the
+        one thing that cannot answer this: ``GET /snapshots/:id`` hides a row
+        marked ``deleting``, so it would report the deletion as finished at the
+        moment it committed its intent rather than at the moment it finished the
+        work.
+
+        A platform predating the 202 needs nothing special here, unlike the
+        capture: it did the whole deletion inside the request, so the first poll
+        finds no row and this returns after one listing.
+        """
+        deadline = time.monotonic() + timeout
+        last: str | None = None
+        while True:
+            # The deadline before the poll, which is `_await_capture`'s shape
+            # and `Builds.wait`'s: an already-spent budget has no request worth
+            # making.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last))
+            try:
+                rows, _ = self._t.listing(
+                    _api.SNAPSHOTS,
+                    params=_api.snapshot_listing_params(
+                        include_unfinished=True, allow_partial=False
+                    ),
+                    timeout_cap=remaining,
+                )
+            except MandalaError as err:
+                # A deletion is minutes of one host's storage, and a hypervisor
+                # briefly out of reach during it is ordinary (OPL-3724). It
+                # matters more here than in any other wait: this is the loop
+                # where a failure to read is one keystroke away from being read
+                # as the row having gone.
+                time.sleep(_ride_out(err, deadline, poll))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last)) from err
+                continue
+            row = still_listed(rows, snapshot_id)
+            if row is None:
+                return
+            # Carried out of the loop so the timeout can say which of the two
+            # stalls this was, and read from the LAST poll rather than the
+            # first: the row starts in the state it had and moves to `deleting`
+            # once the dependents are off it.
+            last = row.state
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(deletion_timed_out(snapshot_id, timeout, last))
+            time.sleep(min(poll, remaining))
 
     def retention(self) -> Retention:
         """How long the automatic ones are kept — your plan's retention window.

@@ -1393,6 +1393,57 @@ if last is None:
 yourself are never removed automatically. `client.snapshots.delete(snap.id)` is
 how one goes by hand.
 
+#### Deleting one
+
+**`delete()` waits for the snapshot to be gone, and the request does not.**
+`DELETE /snapshots/{id}` answers `202` with the snapshot's row the moment the
+deletion is accepted and destroys it afterwards — detaching every dependent
+snapshot, committing the index and walking both the local files and the bucket
+objects scales with the chain and with how much is stored, which is the same
+reason a capture no longer happens inside its request.
+
+What `delete()` polls is the row's **absence**. There is no state that means
+deleted, so the id leaving the listing is the deletion having finished, and it
+is the only thing that says so. Later snapshots in the same chain are
+unaffected either way.
+
+```python
+client.snapshots.delete(snap.id)  # returns when the row is gone
+```
+
+The poll asks with `include_unfinished=True`, and that is load-bearing: once the
+dependents are detached the row is marked `deleting`, and a bare listing leaves
+those out — polling without it would call a stalled deletion a finished one.
+
+Every refusal is still immediate and still the exception it always was: a
+`NotFoundError` for no such snapshot, a `ConflictError` for a capture reading
+through it, for a clone or a migration holding it, and for a deletion of this id
+already running. That last one is an answer about progress rather than a fault —
+the first deletion is still working, and a second `delete()` against a row whose
+deletion stalled is accepted and finishes the job.
+
+**A row that stays is one that stalled**, which is the opposite polarity to a
+capture, where a failure leaves no row at all. `TimeoutError` names the state
+the row was left in, because the two stalls have different remedies:
+
+* `deleting` — the dependents are off and the stored objects are still going, or
+  stopped. The platform retries these itself, about every fifteen minutes, and
+  deleting the id again asks for the same work by hand.
+* the state it had before — the deletion never reached the point where it marks
+  the row. The snapshot is intact, and this one is *not* on that sweep: it is
+  what a dependent that is itself being deleted does, since it cannot be
+  detached, so the delete fails after the `202`. Deleting a chain one link at a
+  time — which is what waiting for each row does — never meets it.
+
+Pass `wait=False` to hold the id and poll on your own schedule:
+
+```python
+client.snapshots.delete(snap.id, wait=False)
+
+while any(s.id == snap.id for s in client.snapshots.list(include_unfinished=True)):
+    time.sleep(5)
+```
+
 #### How long they are kept
 
 A schedule says when snapshots are taken and not how long they survive. That is

@@ -608,7 +608,13 @@ def exercise_everything(client: mc.Client) -> None:
     client.snapshots.list(include_unfinished=True, allow_partial=True)
     client.snapshots.restore("snap-1")
     client.snapshots.clone("snap-1", name="from-snap")
-    client.snapshots.delete("snap-1")
+    # Both waits on the deletion (OPL-4576). The default polls the listing for
+    # the row's absence, so it is sent against an id the mock does not list —
+    # SNAPSHOT is `snap-1`, and a deletion of that one would poll until its
+    # half-hour deadline. `wait=False` is the escape, and neither sends a
+    # parameter the other does not.
+    client.snapshots.delete("snap-2")
+    client.snapshots.delete("snap-1", wait=False)
     # The other half of the schedule: when they are taken is a computer's, how
     # long they are kept is the account's.
     client.snapshots.retention()
@@ -763,7 +769,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.snapshots.list(include_unfinished=True, allow_partial=True)
     await client.snapshots.restore("snap-1")
     await client.snapshots.clone("snap-1", name="from-snap")
-    await client.snapshots.delete("snap-1")
+    # See the sync exercise: the waiting delete is sent against an id the mock
+    # does not list, and the other is the `wait=False` escape.
+    await client.snapshots.delete("snap-2")
+    await client.snapshots.delete("snap-1", wait=False)
     await client.snapshots.retention()
     await client.webhooks.list()
     await client.webhooks.create("https://ci.example.com/mandala")
