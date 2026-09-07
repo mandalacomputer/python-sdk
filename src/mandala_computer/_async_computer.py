@@ -1298,10 +1298,16 @@ class AsyncComputer(ComputerFields):
         visible.
         """
         deadline = time.monotonic() + timeout
+        # See the sync half: whether any poll ever answered about this id is
+        # what decides between the two timeout messages.
+        seen = False
+        short = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(capture_timed_out(snapshot_id, timeout))
+                raise TimeoutError(
+                    capture_timed_out(snapshot_id, timeout, short=short and not seen)
+                )
             try:
                 rows, incomplete = await self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
             except MandalaError as err:
@@ -1310,14 +1316,22 @@ class AsyncComputer(ComputerFields):
                 await asyncio.sleep(_ride_out(err, deadline, poll))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(capture_timed_out(snapshot_id, timeout)) from err
+                    raise TimeoutError(
+                        capture_timed_out(snapshot_id, timeout, short=short and not seen)
+                    ) from err
                 continue
-            landed = self._captured(rows, snapshot_id, complete=incomplete is None)
+            # See the sync half: absent from an answer that was short is the one
+            # reading `_captured` must not make.
+            short = incomplete is not None and not any(row.get("id") == snapshot_id for row in rows)
+            seen = seen or not short
+            landed = self._captured(rows, snapshot_id, complete=not short)
             if landed is not None:
                 return landed
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(capture_timed_out(snapshot_id, timeout))
+                raise TimeoutError(
+                    capture_timed_out(snapshot_id, timeout, short=short and not seen)
+                )
             await asyncio.sleep(min(poll, remaining))
 
     async def snapshots(

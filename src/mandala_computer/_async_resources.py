@@ -333,7 +333,9 @@ class AsyncSnapshots:
 
             await client.snapshots.delete(snap.id, wait=False)
             listed = await client.snapshots.list(include_unfinished=True)
-            gone = not any(s.id == snap.id for s in listed)
+            # `is_complete` first: an absence read off a short listing is a row
+            # nobody could look for, not a row that has gone.
+            gone = listed.is_complete and not any(s.id == snap.id for s in listed)
 
         EVERY REFUSAL IS STILL SYNCHRONOUS and still carries the status it did
         before — 404 for no such snapshot,

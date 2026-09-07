@@ -1338,17 +1338,20 @@ held = c.snapshot(name="before-upgrade", wait=False)
 held.is_capturing  # True — and held.id is already the final id
 
 while True:
-    row = next((s for s in c.snapshots() if s.id == held.id), None)
-    if row is None:
-        raise RuntimeError("the capture failed: no snapshot and no row")
-    if not row.is_capturing:
+    listed = c.snapshots()
+    row = next((s for s in listed if s.id == held.id), None)
+    if row is not None and not row.is_capturing:
         break
+    if row is None and listed.is_complete:
+        raise RuntimeError("the capture failed: no snapshot and no row")
     time.sleep(5)
 ```
 
 That loop's `None` is a capture that failed: it leaves no snapshot and no row,
 and the row's absence is the only thing there is to tell it from one still
-running.
+running. Which is why `is_complete` is checked beside it — an absence read off
+a listing the platform marked short is a row nobody could look for, and the
+SDK's own waits refuse that reading for the same reason.
 
 `snapshot()`'s two failures read differently for the same reason. A
 `TimeoutError` means the *wait* stopped and not the capture — the id is in the
@@ -1446,7 +1449,12 @@ Pass `wait=False` to hold the id and poll on your own schedule:
 ```python
 client.snapshots.delete(snap.id, wait=False)
 
-while any(s.id == snap.id for s in client.snapshots.list(include_unfinished=True)):
+while True:
+    listed = client.snapshots.list(include_unfinished=True)
+    # `is_complete` before the absence, for the reason above: a row missing from
+    # a listing the platform marked short is a row nobody could look for.
+    if listed.is_complete and not any(s.id == snap.id for s in listed):
+        break
     time.sleep(5)
 ```
 

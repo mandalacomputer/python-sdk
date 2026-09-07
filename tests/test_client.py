@@ -4245,6 +4245,21 @@ def test_each_capture_poll_carries_what_is_left_of_the_wait(client: mc.Client) -
 # --- the deletion, which outlives its request too (OPL-4576) ----------------
 
 
+def _then(first: httpx.Response, rest: httpx.Response) -> object:
+    """One answer, then the same answer for as long as the wait keeps asking.
+
+    A `side_effect` list runs out, and a wait whose deadline is what ends it
+    polls an unknown number of times — the two tests about which poll's evidence
+    wins would otherwise be pinned to a poll count they do not care about.
+    """
+    answers = iter([first])
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return next(answers, rest)
+
+    return responder
+
+
 def _deleting(snapshot_id: str) -> dict[str, object]:
     """The row once the deletion has detached the dependents and marked it.
 
@@ -4511,6 +4526,67 @@ def test_a_short_listing_is_not_a_failed_capture_either(client: mc.Client) -> No
 
     assert c.snapshot(poll=0).state == "pending"
     assert listing.call_count == 2
+
+
+@respx.mock
+def test_a_row_once_seen_deleting_outranks_a_later_short_answer(client: mc.Client) -> None:
+    """`short` is the last poll; the state is every poll (/code-review).
+
+    A wait that watched the row reach `deleting` and then lost the fleet knows
+    more than its final answer does. Reporting "nobody looked" there throws away
+    both the observation and the remedy attached to it — the platform's own
+    fifteen-minute retry — and tells the caller to try again when what they
+    should do is wait or re-send the delete.
+    """
+    respx.delete(f"{BASE}/snapshots/snap-1").mock(httpx.Response(202, json=_landed("snap-1")))
+    # One good answer, then short ones for as long as the wait keeps asking.
+    respx.get(f"{BASE}/snapshots").mock(
+        side_effect=_then(
+            httpx.Response(200, json=[_deleting("snap-1")]),
+            httpx.Response(200, json=[], headers={"X-GC-Incomplete": "1"}),
+        )
+    )
+
+    with pytest.raises(mc.TimeoutError, match="was still listed") as caught:
+        client.snapshots.delete("snap-1", timeout=0.2, poll=0)
+    assert "fifteen minutes" in str(caught.value)
+    assert "marked incomplete" not in str(caught.value)
+
+
+@respx.mock
+def test_a_capture_only_ever_seen_short_does_not_claim_to_be_running(
+    client: mc.Client,
+) -> None:
+    """Refusing to read a short absence created a message that could lie twice.
+
+    A capture that really failed is now waited out to the deadline, and the
+    ordinary sentence — "the capture has not stopped ... it is in snapshots()
+    under that id" — would be wrong in both halves: it has stopped, and there is
+    no row. So the wait says what it actually knows, which is nothing
+    (/code-review, OPL-4576).
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    respx.get(f"{BASE}/snapshots").mock(
+        httpx.Response(200, json=[], headers={"X-GC-Incomplete": "0"})
+    )
+    c = _computer(client)
+
+    with pytest.raises(mc.TimeoutError, match="could not be read") as caught:
+        c.snapshot(timeout=0.01, poll=0)
+    assert "still capturing" not in str(caught.value)
+
+    # But a poll that DID see the row is the better evidence, and the ordinary
+    # sentence is true again — even if the fleet goes short afterwards.
+    respx.get(f"{BASE}/snapshots").mock(
+        side_effect=_then(
+            httpx.Response(200, json=[_capturing("snap-1")]),
+            httpx.Response(200, json=[], headers={"X-GC-Incomplete": "0"}),
+        )
+    )
+    with pytest.raises(mc.TimeoutError, match="was still capturing"):
+        c.snapshot(timeout=0.2, poll=0)
 
 
 @respx.mock

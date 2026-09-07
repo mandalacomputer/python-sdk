@@ -320,11 +320,18 @@ def deletion_timed_out(
     a caller that this wait has no evidence for.
 
     ``short`` is the same admission about a different failure: the last listing
-    came back MARKED INCOMPLETE, so this wait was never able to ask its question
+    came back MARKED INCOMPLETE, so that poll was not able to ask its question
     at all — see :func:`still_listed`. It is neither of the two stalls, and it
     is not evidence that anything is stuck.
+
+    IT ONLY WINS WHEN THERE IS NOTHING BETTER. ``short`` is the last poll,
+    ``state`` is every poll: a wait that saw the row in ``deleting`` and then
+    lost the fleet knows more than its final answer does, and letting the short
+    sentence win there drops both the observation and the remedy that goes with
+    it — "the platform retries about every fifteen minutes" — in favour of
+    saying nobody looked (/code-review, OPL-4576).
     """
-    if short:
+    if short and state is None:
         return (
             f"{snapshot_id} could not be confirmed deleted within {timeout:g}s: the "
             "snapshot listing came back marked incomplete — a hypervisor could not be "
@@ -464,10 +471,10 @@ class Snapshots:
         :meth:`Computer.snapshot` has::
 
             client.snapshots.delete(snap.id, wait=False)
-            gone = not any(
-                s.id == snap.id
-                for s in client.snapshots.list(include_unfinished=True)
-            )
+            listed = client.snapshots.list(include_unfinished=True)
+            # `is_complete` first: an absence read off a short listing is a row
+            # nobody could look for, not a row that has gone.
+            gone = listed.is_complete and not any(s.id == snap.id for s in listed)
 
         EVERY REFUSAL IS STILL SYNCHRONOUS and still carries the status it did
         before — 404 for no such snapshot,
