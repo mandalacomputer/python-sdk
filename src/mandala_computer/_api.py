@@ -631,6 +631,51 @@ def partial_params(allow_partial: bool) -> dict[str, str] | None:
     return {"allow_partial": "1"} if allow_partial else None
 
 
+def computer_listing_params(*, allow_partial: bool, state: str | None) -> dict[str, str] | None:
+    """The query on ``GET /computers``.
+
+    ``state`` narrows the listing to one lifecycle state — the control plane's
+    own record of whether a computer exists, which is a different question from
+    the ``status`` its host reports. It is read by the control plane and
+    stripped before anything is forwarded to a host, so it is on the same
+    footing as ``allow_partial`` rather than being a filter a hypervisor
+    applies.
+
+    THE VOCABULARY IS THE PLATFORM'S, not this table's. ``live``,
+    ``unreachable``, ``deleting``, ``deleted`` and ``lost`` are what it accepts
+    today, and it answers 400 naming all five for anything else — so a value
+    this SDK has never heard of reaches a caller as the platform's own refusal
+    rather than as a ``ValueError`` from a client that shipped before the state
+    existed. Nothing is silently dropped either way: the platform validates
+    before it filters, so a typo cannot come back as an unnarrowed listing
+    wearing the caller's assumption that it was narrowed.
+
+    An EMPTY string is refused here, because that is the one spelling the
+    platform's refusal would be the wrong answer to. ``?state=`` is what most
+    clients serialise for an unset optional string, and a caller who reaches
+    this by forwarding an absent CLI argument meant ``None`` — "every computer
+    that exists or may exist" — rather than a request that fails.
+
+    ``None`` rather than an empty dict when neither is asked for, so the default
+    listing builds a bare URL, the same way :func:`usage_params` does.
+    """
+    params = dict(partial_params(allow_partial) or {})
+    if state is not None:
+        # Canonical BEFORE the emptiness check, for the reason `canonical`
+        # documents: httpx serialises a query value with `str(value)`, so a str
+        # subclass answering non-empty here and "" there would put `?state=` on
+        # the wire past a check that had just accepted it.
+        text = canonical(state, "state").strip()
+        if not text:
+            raise ValueError(
+                "state must name a lifecycle state — live, unreachable, deleting, "
+                "deleted or lost — or be None for every computer that exists or "
+                "may exist. An empty string is neither."
+            )
+        params["state"] = text
+    return params or None
+
+
 def snapshot_listing_params(*, include_unfinished: bool, allow_partial: bool) -> dict[str, str]:
     """The query on ``GET /snapshots``.
 

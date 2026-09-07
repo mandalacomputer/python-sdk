@@ -1507,12 +1507,23 @@ because a computer created during the outage was never cached against the host
 now holding it.
 
 Rows the platform could not read come back marked rather than omitted —
-`c.unreachable` on a computer, `s.unreachable` on a snapshot — carrying an id
-and nothing else. Everything else on such a row is absent, so `status` reads
-`""` rather than anything true. `c.snapshots()` keeps them for that reason even
-though they cannot be attributed to a computer: dropping them would remove
+`c.unreachable` on a computer, `s.unreachable` on a snapshot. A marked computer
+carries the identity the platform has on record — `name`, `os`, `template`, its
+size, `workspace_id`, `created_at`, `state` — and nothing only its host knows,
+so `status` and `resolution` read `""` rather than anything true. A marked
+snapshot is still an id and the flag. `c.snapshots()` keeps them for that reason
+even though they cannot be attributed to a computer: dropping them would remove
 precisely the markers saying the answer is short, and then report a confident
 count.
+
+A marked row says the host did not answer *this request*. It is not a statement
+about the machine, which is most likely running exactly as it was.
+
+`c.screen` raises on such a row rather than deriving numbers from an absent
+resolution. The default this SDK falls back to elsewhere is a claim about what
+an older server's computers actually render at; here no server answered, and a
+coordinate space for a desktop nobody read is the one wrong answer worth
+refusing to give.
 
 Builds are the exception, and the reason to read `is_complete` there rather than
 the rows. A short build listing has no marked rows at all — the platform keeps
@@ -1521,11 +1532,53 @@ absent and `incomplete` is `0` rather than a count. An outage and an account
 that has never built anything are the same rows; only the `Listing` tells them
 apart.
 
-The marked rows above are also an account-wide key's alone. A key scoped to one
-workspace gets none, on any of the three listings: naming the missing ids means
+Marked *snapshot* rows are an account-wide key's alone. A key scoped to one
+workspace gets none, on snapshots or on builds: naming the missing ids means
 reading them out of a placement cache with no workspace column, which would hand
 a confined credential ids from the workspaces it is confined away from. With
-such a key, `is_complete` is the only signal everywhere.
+such a key, `is_complete` is the only signal on those two. Computers are the
+exception since the platform started keeping its own record of them — that
+record has the workspace column the cache lacks, so it can name a scoped key's
+missing computers without crossing the scope.
+
+### Lifecycle states
+
+`c.state` is the platform's own record of whether a computer exists, which is a
+different question from `c.status` — what its host says it is doing. It reads
+`""` on a single computer, because a fetch is served by the machine's own host
+and a response at all means live; it is a listing row's field.
+
+| `state` | |
+| --- | --- |
+| `live` | a host lists it |
+| `unreachable` | no host answered for it, *this request* |
+| `deleting` | a delete was sent and has not been answered |
+| `deleted` | a delete that was answered — terminal, with `c.deleted_at` |
+| `lost` | an operator wrote off the host while the computer was unreachable — terminal, with `c.lost_at` |
+
+`state=` narrows the listing to one of them:
+
+```python
+for c in client.computers.list(state="deleted"):
+    print(c.name, c.deleted_at)
+```
+
+The two terminal states are the reason this parameter exists. A plain listing is
+every computer that exists or may exist — `live`, `unreachable` and `deleting` —
+so a computer that was deleted a week ago is simply not in it, and "it is not in
+the list" has never been the same statement as "it was deleted". `deleted` and
+`lost` rows are answered from the platform's record alone, since no host has
+them to list, and naming the state is the only way they are ever shown.
+
+`state="unreachable"` needs `allow_partial=True` beside it. The platform marks
+any listing holding one of those rows short, and this surface fails closed on
+that mark whatever was asked for — so the one narrowing that looks like it
+should not need the flag is the one that cannot do without it. The two terminal
+states need nothing: no host was asked, so there is no outage to acknowledge.
+
+The vocabulary is the platform's rather than this SDK's: a state added upstream
+is sent as given, and one that does not exist comes back as the platform's own
+400 naming the ones that do.
 
 ### Files
 

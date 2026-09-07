@@ -869,8 +869,25 @@ class ComputerFields:
 
         Falls back to the default for a server old enough not to report one,
         which is what such a server's computers actually render at.
+
+        ``""`` on a row no host answered for — one served from the platform's
+        own record, so ``unreachable``, ``deleted`` or ``lost``. The legacy
+        default is a statement about what a MACHINE renders at, and there is no
+        machine's answer here to be old: the platform sends the identity it has
+        on record and nothing only a host would know (``status`` and this).
+        Answering 1280x800x24 for one invented a desktop nobody reported, on
+        exactly the rows whose documentation tells callers those fields are
+        empty (/grok-review, OPL-4555).
         """
-        return str(self._data.get("resolution") or DEFAULT_RESOLUTION)
+        value = self._data.get("resolution")
+        if value:
+            return str(value)
+        # `status` is the evidence, because it is the other field the record
+        # cannot fill in: a host's answer always carries one, and a row served
+        # from the record never does. Reading `state` instead would be wrong the
+        # other way — a `live` row from a daemon too old to report a resolution
+        # has a state and still renders at the default.
+        return DEFAULT_RESOLUTION if "status" in self._data else ""
 
     @property
     def screen(self) -> tuple[int, int]:
@@ -881,9 +898,18 @@ class ComputerFields:
         what screenshots actually are or the model's coordinates are wrong.
 
         Raises :class:`ValueError` if a server reports a malformed resolution;
-        only an absent resolution means the legacy default.
+        only an absent resolution on a HOST's answer means the legacy default.
+        Raises for a row served from the platform's record, which has no screen
+        to report — a guess there is a coordinate space for a desktop nobody
+        read, and every click computed from it lands somewhere arbitrary.
         """
         resolution = self.resolution
+        if not resolution:
+            raise ValueError(
+                f"{self.id} was served from the platform's record rather than by its "
+                "host, so it reports no resolution: check unreachable/state before "
+                "reading a screen off it"
+            )
         parts = resolution.lower().split("x")
         try:
             if len(parts) not in (2, 3) or any(not part for part in parts):
@@ -942,14 +968,83 @@ class ComputerFields:
         return dict(value)
 
     @property
-    def unreachable(self) -> bool:
-        """True on a row served from the placement cache, with nothing else on it.
+    def state(self) -> str:
+        """Whether this computer exists, as the platform's own record has it.
 
-        Only ever seen in a listing taken with ``allow_partial=True``: the host
-        holding this computer could not be reached, so what came back is its id
-        and this flag. Every other field on such a row is absent, which means
-        :attr:`status` reads ``""`` rather than anything true — check this
-        before believing anything else here.
+        A different question from :attr:`status`, which is what its HOST says it
+        is doing. One of:
+
+        * ``"live"`` — a host lists it.
+        * ``"unreachable"`` — no host answered for it. Per-request rather than a
+          property of the machine: it says THIS listing could not reach the host,
+          and the computer is most likely fine and has had nothing done to it.
+        * ``"deleting"`` — a delete was sent and has not been answered.
+        * ``"deleted"`` — a delete that was answered. Terminal.
+        * ``"lost"`` — an operator wrote off the host while this computer was
+          unreachable. Terminal.
+
+        ``""`` on a single computer — a fetch, a create, a
+        :meth:`Computer.refresh` — and that is the platform's answer rather than
+        an omission: those are served by the machine's own host, so a response at
+        all means live. This is a listing row's field. It is also ``""`` from a
+        server that predates the record (platform OPL-4554).
+
+        The two terminal states are only ever listed when asked for by name —
+        see ``state`` on :meth:`Computers.list`.
+        """
+        # A real string or nothing. Stricter than the fields either side of it
+        # because this one DECIDES something: `unreachable` reads it to tell a
+        # placeholder from a row the record has finished with, so a number or a
+        # `None` off a malformed wire must fall through to the older test rather
+        # than coerce into a state nobody named.
+        value = self._data.get("state")
+        return value.strip() if isinstance(value, str) else ""
+
+    @property
+    def deleted_at(self) -> str:
+        """When the delete of this computer was answered, or ``""``.
+
+        Set once :attr:`state` has been ``"deleted"``, and only ever seen on a
+        row from ``Computers.list(state="deleted")``.
+        """
+        return str(self._data.get("deleted_at") or "")
+
+    @property
+    def lost_at(self) -> str:
+        """When this computer was written off with its host, or ``""``.
+
+        Set once :attr:`state` has been ``"lost"``, and only ever seen on a row
+        from ``Computers.list(state="lost")``. A write-off is an operator's
+        judgement that a silent host is not coming back; it is not a delete, and
+        nothing was necessarily destroyed on the caller's behalf.
+        """
+        return str(self._data.get("lost_at") or "")
+
+    @property
+    def unreachable(self) -> bool:
+        """True when the host holding this computer did not answer THIS request.
+
+        Not "served from the record", which a ``deleted`` or ``lost`` row also
+        is and neither of those is this: it is the narrower claim that a
+        computer which should have been listed by a host was not, so what came
+        back is what the platform has on record. That is the computer's
+        identity — :attr:`name`, :attr:`os`, :attr:`template`, its size,
+        :attr:`workspace_id`, :attr:`created_at`, :attr:`state` — and nothing
+        only its host knows, so :attr:`status` and :attr:`resolution` read
+        ``""`` rather than anything true. Check this before believing either of
+        those.
+
+        Says nothing about the computer's health. The machine is most likely
+        running exactly as it was; it is the host's answer that went missing,
+        for as long as this one request took.
+
+        Only ever seen in a listing taken with ``allow_partial=True``, and that
+        holds even for ``list(state="unreachable", allow_partial=True)``, which
+        asks for nothing else: the platform marks any listing containing one of
+        these rows short, and the programmatic surface fails closed on that mark
+        whatever was asked for. So the flag is not about the rows you wanted —
+        it is the acknowledgement that a host went quiet, and asking only for
+        the casualties does not make the outage not have happened.
         """
         # Row shape decides an unreadable flag, the same way it does for a
         # snapshot stub (adversarial review, OPL-3835). A stub has an id and this
@@ -961,11 +1056,22 @@ class ComputerFields:
         said = _wire(self._data, "unreachable")
         if said in (_Wire.TRUE, _Wire.FALSE):
             return said is _Wire.TRUE
-        # Present and unreadable: believe it only on a row that could not be
-        # anything else. Key PRESENCE, not truthiness — a full payload carrying
-        # `"status": null` made every healthy computer report itself a
-        # placeholder, and callers told to check this "before believing anything
-        # else here" then stopped believing valid data (adversarial review).
+        # `state` outranks the shape test, and has to (OPL-4555). A `deleted` or
+        # `lost` row is served from the record with no `status` and NO
+        # `unreachable` key — the platform omits the flag on a row it has
+        # finished with — so the shape test alone reported every terminal row as
+        # a placeholder whose identity should not be believed, which is the
+        # opposite of true: the record is the only thing that ever knew those
+        # rows, and what it says about them is all there is. A row is a
+        # placeholder because it says `unreachable`, not because it is short.
+        state = self.state
+        if state:
+            return state == "unreachable"
+        # No state at all: a server predating the record, where the shape is
+        # still the only evidence. Key PRESENCE, not truthiness — a full payload
+        # carrying `"status": null` made every healthy computer report itself a
+        # placeholder, and callers told to check this before believing anything
+        # else here then stopped believing valid data (adversarial review).
         return "status" not in self._data
 
     @property

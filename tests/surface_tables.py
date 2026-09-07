@@ -130,7 +130,11 @@ PARAMETERS: dict[str, set[str]] = {
     "GET builds/:id/progress": set(),
     "GET builds/:id/events": set(),
     "GET sizes": set(),
-    "GET computers": {"query:allow_partial"},
+    # `state` is the control plane's own record of whether a computer exists,
+    # not a question any one hypervisor could answer — it is read here and
+    # stripped before the forward, on the same footing as `allow_partial`. It is
+    # also the only way the two terminal states are ever listed.
+    "GET computers": {"query:allow_partial", "query:state"},
     "POST computers": {
         "body:name",
         "body:size",
