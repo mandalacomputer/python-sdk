@@ -3874,6 +3874,28 @@ def test_exec_result_equality_ignores_the_raw_payload() -> None:
 # --- request deadlines ------------------------------------------------------
 
 
+def _capturing(snapshot_id: str) -> dict[str, object]:
+    """The placeholder a 202 answers with — the id, and a state that is not one.
+
+    The id is the snapshot's own, allocated before the copy and kept when it
+    lands (platform OPL-4562), which is what makes these two helpers the same
+    row twice rather than two rows.
+    """
+    return {"id": snapshot_id, "computer_id": "vm-1", "name": "s", "state": "capturing"}
+
+
+def _landed(snapshot_id: str, *, state: str = "pending", auto: bool = False) -> dict[str, object]:
+    """The same row once the capture has finished."""
+    return {
+        "id": snapshot_id,
+        "computer_id": "vm-1",
+        "name": "s",
+        "kind": "disk",
+        "state": state,
+        "auto": auto,
+    }
+
+
 def _budget(route: respx.Route) -> dict[str, float | None]:
     """The timeout httpx was actually handed for the last call on this route."""
     return dict(route.calls.last.request.extensions["timeout"])
@@ -3929,39 +3951,40 @@ def test_the_file_routes_get_a_budget_of_their_own(client: mc.Client) -> None:
 
 
 @respx.mock
-def test_a_capture_gets_a_budget_of_its_own(client: mc.Client) -> None:
-    """The route the default budget abandoned every time (OPL-4561).
+def test_the_capture_post_is_back_on_the_ordinary_budget(client: mc.Client) -> None:
+    """The 1800s was on the request; the request stopped being the slow part.
 
-    ``POST computers/:id/snapshots`` answers with the finished snapshot rather
-    than with a job to poll, and the capture behind it is minutes: measured at
-    119.3s, 119.6s and 123.6s on the SMALLEST disk this platform will take,
-    against a 60s default. Every one of those raised ``TimeoutError`` while the
-    platform went on to finish the capture, so the caller was billed to store a
-    snapshot whose id they never learned.
+    ``POST computers/:id/snapshots`` answers 202 the moment the capture is
+    accepted (platform OPL-4562), so the budget OPL-4561 widened has nothing
+    left to cover — and a wide budget on a route that should answer in
+    milliseconds only means a wedged daemon holds the caller for half an hour.
+    The number moved onto the poll loop, which is what SNAPSHOT_WAIT_TIMEOUT
+    now names.
 
-    Discriminates: this asserts the recorded request's own budget, which is
-    exactly what no mocked snapshot test could ever notice — a mock answers
+    Discriminates: asserts the recorded request's own budget, which is exactly
+    what no mocked snapshot test could otherwise notice — a mock answers
     instantly whatever deadline it was given.
     """
     post = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
-        httpx.Response(201, json={"id": "snap-1", "computer_id": "vm-1", "state": "durable"})
+        httpx.Response(202, json=_capturing("snap-1"))
     )
+    respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[_landed("snap-1")]))
     c = _computer(client)
 
-    c.snapshot(name="before-upgrade")
-    assert _budget(post)["read"] == mc._client.SNAPSHOT_TIMEOUT
-    assert _budget(post)["write"] == mc._client.SNAPSHOT_TIMEOUT
-    assert mc._client.SNAPSHOT_TIMEOUT > mc._client.DEFAULT_TIMEOUT
+    c.snapshot(name="before-upgrade", poll=0)
+    assert _budget(post)["read"] == mc._client.DEFAULT_TIMEOUT
+    assert _budget(post)["write"] == mc._client.DEFAULT_TIMEOUT
+    assert mc._client.SNAPSHOT_WAIT_TIMEOUT > mc._client.DEFAULT_TIMEOUT
 
 
 @respx.mock
 def test_the_capture_siblings_stay_on_the_default(client: mc.Client) -> None:
-    """Only the capture is slow, so only the capture is widened (OPL-4561).
+    """Only the capture was ever slow, and now not even it holds a request.
 
     Clone is copy-on-write, restore is a disk swap and delete is a row: 0.1s,
-    2.4s and 0.7s measured on the same fleet as the 120s capture. Widening them
-    too would be a deadline nothing asked for, and would make the constant's
-    scope a guess rather than a measurement.
+    2.4s and 0.7s measured on the same fleet as the 120s capture. They were
+    never widened; this pins that they were not quietly widened on the way
+    past either.
     """
     clone = respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
         httpx.Response(200, json={"id": "vm-2", "status": "running"})
@@ -3977,21 +4000,220 @@ def test_the_capture_siblings_stay_on_the_default(client: mc.Client) -> None:
 
 
 @respx.mock
-def test_a_patient_client_of_the_callers_own_survives_a_capture(client: mc.Client) -> None:
-    """`_budget` only ever widens, and the capture must not be the exception.
+def test_a_capture_is_waited_out_by_polling_the_listing(client: mc.Client) -> None:
+    """The 202 is a placeholder; what comes back is the snapshot (OPL-4568).
 
-    Somebody who handed us an hour-long client did so on purpose. Asserted here
-    rather than left to `_budget`'s own tests because this is the first caller
-    to name a budget large enough that clamping to it would look reasonable.
+    The row becomes `pending` in place under the id the 202 handed over, so the
+    wait is a poll on that id and the answer is the same row, landed.
     """
-    patient = mc.Client("com_x", base_url=BASE, timeout=mc._client.SNAPSHOT_TIMEOUT * 2)
-    post = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
-        httpx.Response(201, json={"id": "snap-1", "computer_id": "vm-1", "state": "durable"})
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
     )
-    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[_capturing("snap-1")]),
+            httpx.Response(200, json=[_capturing("snap-1")]),
+            httpx.Response(200, json=[_landed("snap-1")]),
+        ]
+    )
+    c = _computer(client)
 
-    patient.computers.get("vm-1").snapshot()
-    assert _budget(post)["read"] == mc._client.SNAPSHOT_TIMEOUT * 2
+    snap = c.snapshot(poll=0)
+    assert (snap.id, snap.state) == ("snap-1", "pending")
+    assert not snap.is_capturing
+    assert listing.call_count == 3
+    # Without allow_partial, so a host that did not answer is a 503 this rides
+    # out rather than a short listing read as a capture that failed.
+    assert not listing.calls.last.request.url.params
+
+
+@respx.mock
+def test_the_wait_matches_the_id_and_not_the_newest_row(client: mc.Client) -> None:
+    """A scheduled capture landing mid-wait is the reason the id exists.
+
+    "The newest snapshot of this computer" is the guess the platform allocated
+    a stable id to remove, and it is wrong on exactly the long captures where
+    a wait matters: the nightly snapshot finishes first and sorts first.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-mine"))
+    )
+    respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[_landed("snap-nightly", auto=True), _capturing("snap-mine")]),
+            httpx.Response(200, json=[_landed("snap-nightly", auto=True), _landed("snap-mine")]),
+        ]
+    )
+    c = _computer(client)
+
+    # The state as well as the id: without it a placeholder handed straight back
+    # would satisfy this, since the placeholder wears the right id too.
+    snap = c.snapshot(poll=0)
+    assert (snap.id, snap.state) == ("snap-mine", "pending")
+
+
+@respx.mock
+def test_a_row_that_disappears_is_a_failed_capture_and_says_so(client: mc.Client) -> None:
+    """The only signal a failed capture has (platform OPL-4562).
+
+    A failure after the 202 has no response left to fail in: the row is dropped
+    and nothing is stored. Reported as a failed capture rather than as a
+    timeout, which is the distinction the ticket asks for — one means try
+    again, the other means the capture is still running.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
+    c = _computer(client)
+
+    with pytest.raises(mc.MandalaError, match="the capture of vm-1 failed") as caught:
+        c.snapshot(poll=0)
+    assert not isinstance(caught.value, mc.TimeoutError)
+    assert "snap-1" in str(caught.value)
+
+
+@respx.mock
+def test_a_202_with_no_id_is_a_malformed_answer_not_a_failed_capture(client: mc.Client) -> None:
+    """An empty id has nothing to poll on, and would poll as an absence.
+
+    `_captured` reads "no row with this id" as a capture that failed, which is
+    right for a real id and badly wrong for a missing one — it would report a
+    capture that had just been accepted as one that had already died.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json={"computer_id": "vm-1", "state": "capturing"})
+    )
+    listing = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
+    c = _computer(client)
+
+    with pytest.raises(mc.MandalaError, match="carried no snapshot id"):
+        c.snapshot()
+    assert not listing.called
+
+
+@respx.mock
+def test_wait_false_hands_back_the_placeholder_and_asks_nothing_else(client: mc.Client) -> None:
+    """The id is the whole point of the placeholder.
+
+    A caller who wants to poll on their own schedule gets the row as it stands,
+    and no listing is read on their behalf.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    listing = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
+    c = _computer(client)
+
+    snap = c.snapshot(wait=False)
+    assert (snap.id, snap.is_capturing) == ("snap-1", True)
+    assert not listing.called
+
+
+@respx.mock
+def test_a_snapshot_that_arrives_finished_is_not_polled_for(client: mc.Client) -> None:
+    """A platform predating the 202 did the capture inside the request.
+
+    Only `capturing` means there is anything to wait for, so this half keeps
+    working against a daemon that answers 201 with the stored snapshot.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(201, json=_landed("snap-1", state="durable"))
+    )
+    listing = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
+    c = _computer(client)
+
+    assert c.snapshot().state == "durable"
+    assert not listing.called
+
+
+@respx.mock
+def test_a_capture_still_running_at_the_deadline_names_its_id(client: mc.Client) -> None:
+    """The timeout stops the wait and not the capture, so it says where to look."""
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[_capturing("snap-1")]))
+    c = _computer(client)
+
+    with pytest.raises(mc.TimeoutError, match="snap-1 was still capturing"):
+        c.snapshot(timeout=0.01, poll=0)
+
+
+@respx.mock
+def test_the_capture_wait_rides_out_a_poll_that_fails(client: mc.Client) -> None:
+    """A hypervisor briefly away mid-capture is ordinary, not the end of the wait.
+
+    Two minutes of one host's disk is exactly the window a 503 lands in, and
+    ending the wait on it reports a capture that is still running as one that
+    could not be watched (the OPL-3724 rule, applied to the newest wait).
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "host did not answer"}),
+            httpx.Response(200, json=[_landed("snap-1")]),
+        ]
+    )
+    c = _computer(client)
+
+    assert c.snapshot(poll=0).state == "pending"
+
+
+@respx.mock
+def test_a_refused_capture_is_still_refused_synchronously(client: mc.Client) -> None:
+    """Everything that can refuse a capture is settled before the 202.
+
+    The statuses did not move with the work, so `except ConflictError` around a
+    second capture still catches what it always caught.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(409, json={"error": "a capture of vm-1 is already running"})
+    )
+    listing = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[]))
+    c = _computer(client)
+
+    with pytest.raises(mc.ConflictError):
+        c.snapshot()
+    assert not listing.called
+
+
+@respx.mock
+def test_the_wait_numbers_are_checked_before_anything_is_captured(client: mc.Client) -> None:
+    """A bad interval found after the capture has started is found too late.
+
+    Checked under `wait=False` too, where they are unused: the numbers being
+    ignored is not a reason to accept a call that cannot mean what it says.
+    """
+    post = respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    c = _computer(client)
+
+    for kwargs in ({"poll": -1}, {"timeout": float("nan")}, {"wait": False, "poll": -1}):
+        with pytest.raises(ValueError, match="finite, non-negative"):
+            c.snapshot(**kwargs)  # type: ignore[arg-type]
+    assert not post.called
+
+
+@respx.mock
+def test_each_capture_poll_carries_what_is_left_of_the_wait(client: mc.Client) -> None:
+    """A poll inheriting the client's own budget outlives the wait it serves.
+
+    `wait_for_move` was the wait that never got this cap, and against a
+    caller-supplied client with no timeout at all the TimeoutError this
+    documents would never arrive. The newest wait carries it from the start.
+    """
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    listing = respx.get(f"{BASE}/snapshots").mock(httpx.Response(200, json=[_landed("snap-1")]))
+    c = _computer(client)
+
+    c.snapshot(timeout=5, poll=0)
+    assert 0 < _budget(listing)["read"] <= 5
 
 
 @respx.mock

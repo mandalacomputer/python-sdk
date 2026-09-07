@@ -84,52 +84,48 @@ FILE_SIZE_LIMIT = 64 * 1024 * 1024
 #: worth of round trips, which is a cheap price for both.
 FILE_PART_SIZE = 8 * 1024 * 1024
 
-#: Read and write budget for a snapshot capture.
+#: How long :meth:`Computer.snapshot` will wait for a capture to land.
 #:
-#: ``POST computers/:id/snapshots`` is synchronous — it holds the request open
-#: for the whole ``qemu-img convert`` and the push to backup storage, and
-#: answers with the finished snapshot — so this is the same argument
-#: :data:`FILE_TIMEOUT` makes, with a bigger number behind it. Measured three
-#: times on the smallest thing this platform will capture — a 20 GB disk that
-#: came back as 1.88 GB — it took 119.3s, 119.6s and 123.6s, so
-#: :data:`DEFAULT_TIMEOUT` abandoned every one of them (OPL-4561).
-#:
-#: The capture is not cancelled by the client giving up on it. It finishes, and
-#: the caller never learns the id — a snapshot they are billed to store and can
-#: reach only by listing the account and guessing which one it is. That is what
-#: makes this a budget rather than a nicety.
+#: A POLL DEADLINE, not a request budget, and it was the second of those until
+#: OPL-4568. ``POST computers/:id/snapshots`` no longer holds the request open
+#: for the ``qemu-img convert``: it settles every refusal, registers the
+#: capture and answers **202** with a placeholder row in state ``capturing``
+#: (platform OPL-4562). The copying happens afterwards, so the POST goes back
+#: to :data:`DEFAULT_TIMEOUT` with everything else, and this number moved onto
+#: the loop that polls ``GET /snapshots`` for the id it was handed.
 #:
 #: 1800 because that is what the PLATFORM allows a capture: its ``snapCtx`` is
 #: a 30-minute context, and this is that number rather than an estimate of it.
 #: It also matches :meth:`Builds.wait`'s default, this SDK's existing figure for
 #: how long a platform-side image operation takes.
 #:
-#: NOT THE ONLY DEADLINE, and the note here said it was (OPL-4563). The daemon
-#: sets a ``ReadHeaderTimeout`` and no ``WriteTimeout``, but the proxy in front
-#: of ``app.mandala.computer`` gives up at about two minutes — the same ceiling
-#: :meth:`Computer.agent_once` documents — so on that deployment a capture
-#: slower than that arrives as
-#: :class:`~mandala_computer.GatewayTimeoutError` however patient this budget
-#: is. Widening it is still what makes the sub-ceiling captures work, which is
-#: every capture that previously failed at 60s; it is not what makes the route
-#: reliable. A 2.43 GB capture of a computer that had been used for a test run
-#: hit the proxy at ~125s, where the same template freshly booted succeeds.
-#: The route not blocking at all is OPL-4562, on the platform.
+#: What it is worth is now different in kind. As a request budget it bought
+#: nothing past the first two minutes on ``app.mandala.computer``, because the
+#: proxy in front of it gives up there whatever the client's deadline says
+#: (OPL-4563) — a 2.43 GB capture of a computer that had been used for a test
+#: run arrived as :class:`~mandala_computer.GatewayTimeoutError` at ~125s, where
+#: the same template freshly booted captures 1.88 GB in 92-124s and succeeds.
+#: A proxy has nothing to abandon here: each poll is a listing that answers in
+#: milliseconds, and the wait is made of many short requests rather than one
+#: long one. So the full half-hour is reachable now, on every deployment.
 #:
-#: The number is right for a deployment with no proxy in front of it, which
-#: ``MANDALA_BASE_URL`` makes reachable, and the client budget should not be
-#: the thing that fails first in either case.
+#: Measured captures for scale: 119.3s, 119.6s and 123.6s on the smallest disk
+#: this platform will take. The 60s default abandoned every one of them, which
+#: is the bug that started this — and abandoning the POST no longer loses a
+#: capture in any case, since the id is allocated before the work and the row
+#: is in the listing.
 #:
-#: NOT :data:`NO_DEADLINE`. A capture is bounded by disk bytes, so there is a
-#: real ceiling to name — unlike an agent run, where any finite guess ends
-#: every longer run at the same place — and a snapshot is the call that sits
-#: unattended in a script, where a socket dropped without a FIN would otherwise
-#: hang for ever.
+#: Its siblings were measured on the same fleet and are nowhere near it: clone
+#: is copy-on-write (0.1s), restore is a disk swap (2.4s), delete is 0.7s. They
+#: were never widened and are not waits.
+SNAPSHOT_WAIT_TIMEOUT = 1800.0
+
+#: How often that wait asks the listing again.
 #:
-#: Only this route. Its siblings were measured on the same fleet and are
-#: nowhere near it: clone is copy-on-write (0.1s), restore is a disk swap
-#: (2.4s), delete is 0.7s. They stay on the default.
-SNAPSHOT_TIMEOUT = 1800.0
+#: :meth:`Builds.wait`'s interval, for the same reason: a capture is minutes, so
+#: five seconds is a poll every 3% of the wait and the answer is a listing the
+#: dashboard reads on a timer anyway.
+SNAPSHOT_POLL = 5.0
 
 #: A request with no deadline at all, for the non-streaming agent loop.
 #:

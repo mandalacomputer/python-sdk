@@ -245,6 +245,15 @@ class AsyncSnapshots:
         objects and are still billed, so it is the flag for a question about
         storage rather than about what can be used.
 
+        CAPTURES IN FLIGHT ARE LISTED TOO, and they are not snapshots yet: a
+        row in state ``capturing`` is a placeholder that restore, clone and
+        delete all 404 on. Its id is nonetheless the id the snapshot will keep,
+        which is what makes this listing the thing to poll after
+        :meth:`AsyncComputer.snapshot` — see :attr:`Snapshot.is_capturing`.
+        Check ``state`` on every row rather than on the newest one: this is one
+        answer per host concatenated in a fixed host order, so it carries no
+        account-wide ordering to read anything from.
+
         ``allow_partial`` is :meth:`AsyncComputers.list`'s, with the same warning.
         """
         data, incomplete = await self._t.listing(
