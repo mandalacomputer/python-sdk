@@ -127,6 +127,28 @@ SNAPSHOT_WAIT_TIMEOUT = 1800.0
 #: dashboard reads on a timer anyway.
 SNAPSHOT_POLL = 5.0
 
+#: How long :meth:`~mandala_computer.Snapshots.delete` will wait for the row to
+#: go.
+#:
+#: A POLL DEADLINE, like :data:`SNAPSHOT_WAIT_TIMEOUT` and for the same reason.
+#: ``DELETE snapshots/:id`` answers **202** with the snapshot's row and destroys
+#: it afterwards (platform OPL-4572), because flattening every dependent
+#: snapshot, committing the index and then walking both the local files and the
+#: bucket objects scales with the chain and with what is stored — the same
+#: length that took the capture off its request. So the DELETE stays on
+#: :data:`DEFAULT_TIMEOUT` with everything else and the waiting is a loop of
+#: short listings, which is what a proxy has nothing to abandon in.
+#:
+#: The same 1800 as a capture because it is the same budget on the platform:
+#: ``snapCtx`` is a thirty-minute context, and its own comment says what it
+#: covers — "one capture, one restore, one delete".
+#:
+#: A NAME OF ITS OWN rather than the capture's, though the number is identical.
+#: The two waits have opposite polarity — one waits for a row to arrive, this
+#: one waits for a row to go — so they are not one setting that happens to be
+#: read twice, and either could move without the other.
+SNAPSHOT_DELETE_TIMEOUT = 1800.0
+
 #: A request with no deadline at all, for the non-streaming agent loop.
 #:
 #: Not a very large number: a run is minutes of clicking with no upper bound

@@ -555,12 +555,27 @@ def capture_accepted_without_id() -> str:
     return "the capture was accepted but the response carried no snapshot id"
 
 
-def capture_timed_out(snapshot_id: str, timeout: float) -> str:
+def capture_timed_out(snapshot_id: str, timeout: float, *, short: bool = False) -> str:
     """A wait that ran out, which is not a capture that did.
 
     Names the id, because that is what the caller needs to pick the wait back
     up — the same id the 202 handed over, and the id the snapshot will keep.
+
+    ``short`` is the case that sentence would be WRONG in, and it exists because
+    refusing to read an absence off an incomplete listing created it: a capture
+    that really did fail is then waited out to the deadline, and the ordinary
+    message would tell the caller the capture is still going and the id is in
+    ``snapshots()`` when neither is true (/code-review, OPL-4576). Passed only
+    when no poll ever managed to answer about this id — one that did is the
+    better evidence, and the ordinary sentence is right again.
     """
+    if short:
+        return (
+            f"{snapshot_id} could not be read within {timeout:g}s: the snapshot listing "
+            "came back marked incomplete — a hypervisor could not be reached — and a "
+            "short listing cannot tell a capture still running from one that failed and "
+            "left no row. Retry once the fleet answers whole"
+        )
     return (
         f"{snapshot_id} was still capturing after {timeout:g}s (the capture has not "
         "stopped, only this wait has; it is in snapshots() under that id)"
@@ -1197,7 +1212,9 @@ class ComputerFields:
         newest = max(range(len(mine)), key=lambda i: (_started_key(mine[i].started_at), -i))
         return next((m for m in mine if m.live), mine[newest])
 
-    def _captured(self, rows: Sequence[Mapping[str, Any]], snapshot_id: str) -> Snapshot | None:
+    def _captured(
+        self, rows: Sequence[Mapping[str, Any]], snapshot_id: str, *, complete: bool = True
+    ) -> Snapshot | None:
         """The capture's row out of a snapshot listing, once it is a snapshot.
 
         ``None`` while it still reads ``capturing``, the row itself once it does
@@ -1223,12 +1240,21 @@ class ComputerFields:
                 continue
             snap = Snapshot.from_api(row)
             return None if snap.state == CAPTURING else snap
-        # ABSENT means failed, and it is the only thing absent can mean here: the
-        # row is registered before the copy starts, so there is no window where a
-        # running capture is unlisted. What makes this safe to read that way is
-        # the poll asking WITHOUT `allow_partial` — a host that did not answer
-        # is then a 503 the loop rides out, rather than a short listing this
-        # would report as a capture that failed.
+        # ABSENT means failed, and it is the only thing absent can mean in a
+        # WHOLE listing: the row is registered before the copy starts, so there
+        # is no window where a running capture is unlisted.
+        #
+        # `complete` is what makes that reading safe, and asking without
+        # `allow_partial` is only half of it. That buys the 503 the public API
+        # answers a short listing with — a promise one deployment makes — while
+        # the transport reads `X-GC-Incomplete` off any 200 it is handed and the
+        # platform's own rule is that a reader tests for the header's presence.
+        # A capture reported as FAILED off a listing nobody could complete is a
+        # caller told to start again while the first capture is still running
+        # (Codex adversarial review, OPL-4576; the same defect the deletion wait
+        # was found to have, in the code it was modelled on).
+        if not complete:
+            return None
         raise MandalaError(capture_failed(self.id, snapshot_id))
 
     def __repr__(self) -> str:
@@ -2544,6 +2570,12 @@ class Computer(ComputerFields):
         visible, and the dashboard's own panel polls exactly this.
         """
         deadline = time.monotonic() + timeout
+        # Whether any poll ever answered ABOUT THIS ID, which is what decides
+        # between the two timeout messages. A short listing the row was missing
+        # from says nothing either way; one it was present in says the capture
+        # was running, and that is the sentence to end on.
+        seen = False
+        short = False
         while True:
             # The deadline before the poll, which is `wait_for_move`'s shape and
             # `Builds.wait`'s: an already-spent budget has no request worth
@@ -2551,9 +2583,11 @@ class Computer(ComputerFields):
             # `_cap_budget` imposes and then reported as a failed poll.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(capture_timed_out(snapshot_id, timeout))
+                raise TimeoutError(
+                    capture_timed_out(snapshot_id, timeout, short=short and not seen)
+                )
             try:
-                rows, _ = self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
+                rows, incomplete = self._t.listing(_api.SNAPSHOTS, timeout_cap=remaining)
             except MandalaError as err:
                 # A capture is minutes of one host's disk, and a hypervisor
                 # briefly out of reach during it is ordinary — the same reason
@@ -2562,14 +2596,24 @@ class Computer(ComputerFields):
                 time.sleep(_ride_out(err, deadline, poll))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(capture_timed_out(snapshot_id, timeout)) from err
+                    raise TimeoutError(
+                        capture_timed_out(snapshot_id, timeout, short=short and not seen)
+                    ) from err
                 continue
-            landed = self._captured(rows, snapshot_id)
+            # ABSENT FROM AN ANSWER THAT WAS SHORT, which is the one reading
+            # `_captured` must not make. `complete` is that question and not
+            # "was this listing perfect": a row that IS there is a fact whatever
+            # else the fleet could not account for.
+            short = incomplete is not None and not any(row.get("id") == snapshot_id for row in rows)
+            seen = seen or not short
+            landed = self._captured(rows, snapshot_id, complete=not short)
             if landed is not None:
                 return landed
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(capture_timed_out(snapshot_id, timeout))
+                raise TimeoutError(
+                    capture_timed_out(snapshot_id, timeout, short=short and not seen)
+                )
             time.sleep(min(poll, remaining))
 
     def snapshots(

@@ -982,6 +982,55 @@ async def test_a_capture_is_waited_out_on_the_async_half_too(client: mc.AsyncCli
 
 
 @respx.mock
+async def test_a_deletion_is_waited_out_on_the_async_half_too(client: mc.AsyncClient) -> None:
+    """The deletion's poll loop is written twice as well (OPL-4576).
+
+    Four claims against the half with its own copy: the 202 is not the end, the
+    row's ABSENCE is, the poll asks for the rows a bare listing hides, and
+    `wait=False` reads no listing at all.
+    """
+    ordinary = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "state": "durable"}
+    deleting = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "state": "deleting"}
+    nightly = {"id": "snap-nightly", "computer_id": "vm-1", "state": "pending", "auto": True}
+    respx.delete(f"{BASE}/snapshots/snap-1").mock(httpx.Response(202, json=ordinary))
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[nightly, ordinary]),
+            httpx.Response(200, json=[nightly, deleting]),
+            httpx.Response(200, json=[nightly]),
+        ]
+    )
+
+    assert await client.snapshots.delete("snap-1", poll=0) is None
+    assert listing.call_count == 3
+    assert dict(listing.calls.last.request.url.params) == {"include": "unfinished"}
+
+    await client.snapshots.delete("snap-1", wait=False)
+    assert listing.call_count == 3
+
+    # And the row that outlasts the wait, which is a stall rather than a
+    # deletion that failed — said with the state it was left in.
+    listing.mock(httpx.Response(200, json=[deleting]))
+    with pytest.raises(mc.TimeoutError, match="snap-1 was still listed") as caught:
+        await client.snapshots.delete("snap-1", timeout=0.01, poll=0)
+    assert "fifteen minutes" in str(caught.value)
+
+    # And the fifth: an answer the platform marked short cannot say a row is
+    # gone, only that nobody looked. The async loop is its own copy, and this is
+    # the claim where a copy being wrong is silent (Codex adversarial review).
+    listing.mock(
+        side_effect=[
+            httpx.Response(200, json=[nightly], headers={"X-GC-Incomplete": "0"}),
+            httpx.Response(200, json=[nightly]),
+        ]
+    )
+    before = listing.call_count
+    await client.snapshots.delete("snap-1", poll=0)
+    assert listing.call_count == before + 2
+    await client.aclose()
+
+
+@respx.mock
 async def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.AsyncClient) -> None:
     """A timeout is the SDK's own error on both halves."""
     respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=httpx.ReadTimeout("too slow"))

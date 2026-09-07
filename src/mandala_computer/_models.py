@@ -1390,7 +1390,12 @@ class Snapshot:
     #: ``"durable"``
     #:     In backup storage as well. See :attr:`is_durable`.
     #: ``"deleting"``
-    #:     A deletion that began and did not finish; only listed when asked for.
+    #:     A deletion got as far as detaching this snapshot's dependents and
+    #:     did not finish. ONLY LISTED WHEN ASKED FOR —
+    #:     ``include_unfinished=True`` — because a half-deleted snapshot is not
+    #:     one anything can be restored or cloned from; it is still holding
+    #:     objects and still billed, which is why it is askable at all. See
+    #:     :attr:`is_deleting`.
     state: str
     size_bytes: int
     created_at: str
@@ -1446,6 +1451,23 @@ class Snapshot:
         nonetheless the id the snapshot will keep, so it is what to poll on.
         """
         return self.state == "capturing"
+
+    @property
+    def is_deleting(self) -> bool:
+        """True while a deletion of this snapshot is under way, or stalled.
+
+        The opposite polarity to :attr:`is_capturing`, and the trap in it: a
+        capture that fails leaves NO row, so absence is failure there, while a
+        deletion that finishes is what removes the row, so absence is success
+        here. A row in this state is the deletion still working or the deletion
+        stopped, and nothing distinguishes those two from outside — the platform
+        retries a stalled one on its own sweep, and
+        :meth:`~mandala_computer.Snapshots.delete` sent again picks it up rather
+        than being refused.
+
+        Seen only in a listing taken with ``include_unfinished=True``.
+        """
+        return self.state == "deleting"
 
     @property
     def is_durable(self) -> bool:
