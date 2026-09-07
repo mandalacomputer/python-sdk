@@ -1338,17 +1338,20 @@ held = c.snapshot(name="before-upgrade", wait=False)
 held.is_capturing  # True — and held.id is already the final id
 
 while True:
-    row = next((s for s in c.snapshots() if s.id == held.id), None)
-    if row is None:
-        raise RuntimeError("the capture failed: no snapshot and no row")
-    if not row.is_capturing:
+    listed = c.snapshots()
+    row = next((s for s in listed if s.id == held.id), None)
+    if row is not None and not row.is_capturing:
         break
+    if row is None and listed.is_complete:
+        raise RuntimeError("the capture failed: no snapshot and no row")
     time.sleep(5)
 ```
 
 That loop's `None` is a capture that failed: it leaves no snapshot and no row,
 and the row's absence is the only thing there is to tell it from one still
-running.
+running. Which is why `is_complete` is checked beside it — an absence read off
+a listing the platform marked short is a row nobody could look for, and the
+SDK's own waits refuse that reading for the same reason.
 
 `snapshot()`'s two failures read differently for the same reason. A
 `TimeoutError` means the *wait* stopped and not the capture — the id is in the
@@ -1392,6 +1395,68 @@ if last is None:
 `auto` also marks the only snapshots retention will age out — ones you take
 yourself are never removed automatically. `client.snapshots.delete(snap.id)` is
 how one goes by hand.
+
+#### Deleting one
+
+**`delete()` waits for the snapshot to be gone, and the request does not.**
+`DELETE /snapshots/{id}` answers `202` with the snapshot's row the moment the
+deletion is accepted and destroys it afterwards — detaching every dependent
+snapshot, committing the index and walking both the local files and the bucket
+objects scales with the chain and with how much is stored, which is the same
+reason a capture no longer happens inside its request.
+
+What `delete()` polls is the row's **absence**. There is no state that means
+deleted, so the id leaving the listing is the deletion having finished, and it
+is the only thing that says so. Later snapshots in the same chain are
+unaffected either way.
+
+```python
+client.snapshots.delete(snap.id)  # returns when the row is gone
+```
+
+The poll asks with `include_unfinished=True`, and that is load-bearing: once the
+dependents are detached the row is marked `deleting`, and a bare listing leaves
+those out — polling without it would call a stalled deletion a finished one.
+
+Every refusal is still immediate and still the exception it always was: a
+`NotFoundError` for no such snapshot, a `ConflictError` for a capture reading
+through it, for a clone or a migration holding it, and for a deletion of this id
+already running. That last one is an answer about progress rather than a fault —
+the first deletion is still working, and a second `delete()` against a row whose
+deletion stalled is accepted and finishes the job.
+
+A listing the platform marks incomplete is not read at all, in either
+direction: a row missing because a hypervisor could not be reached looks exactly
+like a row that has gone, so the poll keeps asking rather than calling that a
+deletion. If the wait runs out having only ever seen short answers, the
+`TimeoutError` says so instead of guessing.
+
+**A row that stays is one that stalled**, which is the opposite polarity to a
+capture, where a failure leaves no row at all. `TimeoutError` names the state
+the row was left in, because the two stalls have different remedies:
+
+* `deleting` — the dependents are off and the stored objects are still going, or
+  stopped. The platform retries these itself, about every fifteen minutes, and
+  deleting the id again asks for the same work by hand.
+* the state it had before — the deletion never reached the point where it marks
+  the row. The snapshot is intact, and this one is *not* on that sweep: it is
+  what a dependent that is itself being deleted does, since it cannot be
+  detached, so the delete fails after the `202`. Deleting a chain one link at a
+  time — which is what waiting for each row does — never meets it.
+
+Pass `wait=False` to hold the id and poll on your own schedule:
+
+```python
+client.snapshots.delete(snap.id, wait=False)
+
+while True:
+    listed = client.snapshots.list(include_unfinished=True)
+    # `is_complete` before the absence, for the reason above: a row missing from
+    # a listing the platform marked short is a row nobody could look for.
+    if listed.is_complete and not any(s.id == snap.id for s in listed):
+        break
+    time.sleep(5)
+```
 
 #### How long they are kept
 
