@@ -143,6 +143,14 @@ class Computers:
         a computer written off with its host are both invisible to the plain
         listing, which is why "it is not in the list" has never been the same
         statement as "it was deleted".
+
+        ``state="unreachable"`` still needs ``allow_partial=True`` beside it.
+        The platform marks any listing holding one of those rows short, and this
+        method fails closed on that mark whatever was asked for — so the one
+        narrowing that looks like it should not need the flag is the one that
+        cannot do without it. The two terminal states need nothing: they are
+        answered from the record alone and no host was asked, so there is no
+        outage to acknowledge.
         """
         data, incomplete = self._t.listing(
             _api.COMPUTERS,

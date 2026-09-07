@@ -1519,6 +1519,12 @@ count.
 A marked row says the host did not answer *this request*. It is not a statement
 about the machine, which is most likely running exactly as it was.
 
+`c.screen` raises on such a row rather than deriving numbers from an absent
+resolution. The default this SDK falls back to elsewhere is a claim about what
+an older server's computers actually render at; here no server answered, and a
+coordinate space for a desktop nobody read is the one wrong answer worth
+refusing to give.
+
 Builds are the exception, and the reason to read `is_complete` there rather than
 the rows. A short build listing has no marked rows at all — the platform keeps
 no record of which hypervisor ran which build, so the missing ones are simply
@@ -1563,6 +1569,12 @@ so a computer that was deleted a week ago is simply not in it, and "it is not in
 the list" has never been the same statement as "it was deleted". `deleted` and
 `lost` rows are answered from the platform's record alone, since no host has
 them to list, and naming the state is the only way they are ever shown.
+
+`state="unreachable"` needs `allow_partial=True` beside it. The platform marks
+any listing holding one of those rows short, and this surface fails closed on
+that mark whatever was asked for — so the one narrowing that looks like it
+should not need the flag is the one that cannot do without it. The two terminal
+states need nothing: no host was asked, so there is no outage to acknowledge.
 
 The vocabulary is the platform's rather than this SDK's: a state added upstream
 is sent as given, and one that does not exist comes back as the platform's own

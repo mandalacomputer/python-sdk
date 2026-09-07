@@ -15,6 +15,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer._computer import DEFAULT_RESOLUTION
 from mandala_computer._exceptions import _is_transient_for_poll
 
 BASE = "https://api.test/api/v1"
@@ -1875,6 +1876,68 @@ def test_a_malformed_state_does_not_decide_anything(client: mc.Client) -> None:
     (stub,) = client.computers.list(allow_partial=True)
     assert stub.state == ""
     assert stub.unreachable
+
+
+@respx.mock
+def test_a_record_served_row_reports_no_screen_rather_than_a_plausible_one(
+    client: mc.Client,
+) -> None:
+    """The default resolution is a claim about a MACHINE, and these have none.
+
+    `resolution` falls back to 1280x800x24 for a server too old to report one,
+    which is what such a server's computers actually render at. A row served
+    from the platform's record is not that: no host answered, so there is no
+    old answer to stand in for — and inventing a desktop here hands a caller a
+    coordinate space for a screen nobody read (/grok-review, OPL-4555).
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(
+            200,
+            json=[
+                {"id": "vm-9", "name": "gone", "state": "deleted"},
+                {"id": "vm-2", "state": "unreachable", "unreachable": True},
+            ],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    deleted, missing = client.computers.list(allow_partial=True)
+    assert deleted.resolution == "" and missing.resolution == ""
+    # And `screen` refuses rather than deriving numbers from the emptiness.
+    for c in (deleted, missing):
+        with pytest.raises(ValueError, match="served from the platform's record"):
+            _ = c.screen
+
+
+@respx.mock
+def test_a_host_answer_with_no_resolution_still_means_the_legacy_default(
+    client: mc.Client,
+) -> None:
+    """The fallback the property was written for, unchanged.
+
+    A daemon too old to report a resolution still answers with a `status`, and
+    the control plane in front of it may well be new enough to stamp a `state`
+    on the row. Reading `state` as the discriminator would have made this row
+    screenless; the discriminator is whether a HOST answered at all.
+    """
+    respx.get(f"{BASE}/computers").mock(
+        httpx.Response(200, json=[{k: v for k, v in COMPUTER.items()} | {"state": "live"}])
+    )
+    (c,) = client.computers.list()
+    assert c.resolution == DEFAULT_RESOLUTION
+    assert c.screen == (1280, 800)
+
+
+@respx.mock
+def test_asking_only_for_unreachable_rows_still_fails_closed(client: mc.Client) -> None:
+    """The narrowing that looks like it should not need the flag needs it most.
+
+    The platform marks any listing holding an unreachable row short, whatever
+    was asked for, and this surface fails closed on that mark. Asking only for
+    the casualties does not make the outage not have happened.
+    """
+    respx.get(f"{BASE}/computers").mock(httpx.Response(503, json={"error": "host unreachable"}))
+    with pytest.raises(mc.UnavailableError):
+        client.computers.list(state="unreachable")
 
 
 @respx.mock

@@ -869,8 +869,25 @@ class ComputerFields:
 
         Falls back to the default for a server old enough not to report one,
         which is what such a server's computers actually render at.
+
+        ``""`` on a row no host answered for — one served from the platform's
+        own record, so ``unreachable``, ``deleted`` or ``lost``. The legacy
+        default is a statement about what a MACHINE renders at, and there is no
+        machine's answer here to be old: the platform sends the identity it has
+        on record and nothing only a host would know (``status`` and this).
+        Answering 1280x800x24 for one invented a desktop nobody reported, on
+        exactly the rows whose documentation tells callers those fields are
+        empty (/grok-review, OPL-4555).
         """
-        return str(self._data.get("resolution") or DEFAULT_RESOLUTION)
+        value = self._data.get("resolution")
+        if value:
+            return str(value)
+        # `status` is the evidence, because it is the other field the record
+        # cannot fill in: a host's answer always carries one, and a row served
+        # from the record never does. Reading `state` instead would be wrong the
+        # other way — a `live` row from a daemon too old to report a resolution
+        # has a state and still renders at the default.
+        return DEFAULT_RESOLUTION if "status" in self._data else ""
 
     @property
     def screen(self) -> tuple[int, int]:
@@ -881,9 +898,18 @@ class ComputerFields:
         what screenshots actually are or the model's coordinates are wrong.
 
         Raises :class:`ValueError` if a server reports a malformed resolution;
-        only an absent resolution means the legacy default.
+        only an absent resolution on a HOST's answer means the legacy default.
+        Raises for a row served from the platform's record, which has no screen
+        to report — a guess there is a coordinate space for a desktop nobody
+        read, and every click computed from it lands somewhere arbitrary.
         """
         resolution = self.resolution
+        if not resolution:
+            raise ValueError(
+                f"{self.id} was served from the platform's record rather than by its "
+                "host, so it reports no resolution: check unreachable/state before "
+                "reading a screen off it"
+            )
         parts = resolution.lower().split("x")
         try:
             if len(parts) not in (2, 3) or any(not part for part in parts):
@@ -996,18 +1022,29 @@ class ComputerFields:
 
     @property
     def unreachable(self) -> bool:
-        """True on a row the platform served from its own record.
+        """True when the host holding this computer did not answer THIS request.
 
-        Only ever seen in a listing taken with ``allow_partial=True``: the host
-        holding this computer could not be reached, so the row was answered from
-        what the platform has on record. That is the computer's identity —
-        :attr:`name`, :attr:`os`, :attr:`template`, its size, :attr:`workspace_id`,
-        :attr:`created_at`, :attr:`state` — and nothing only its host knows, so
-        :attr:`status` and :attr:`resolution` read ``""`` rather than anything
-        true. Check this before believing either of those.
+        Not "served from the record", which a ``deleted`` or ``lost`` row also
+        is and neither of those is this: it is the narrower claim that a
+        computer which should have been listed by a host was not, so what came
+        back is what the platform has on record. That is the computer's
+        identity — :attr:`name`, :attr:`os`, :attr:`template`, its size,
+        :attr:`workspace_id`, :attr:`created_at`, :attr:`state` — and nothing
+        only its host knows, so :attr:`status` and :attr:`resolution` read
+        ``""`` rather than anything true. Check this before believing either of
+        those.
 
-        Says nothing about the computer's health. The host did not answer this
-        request; the machine is most likely running exactly as it was.
+        Says nothing about the computer's health. The machine is most likely
+        running exactly as it was; it is the host's answer that went missing,
+        for as long as this one request took.
+
+        Only ever seen in a listing taken with ``allow_partial=True``, and that
+        holds even for ``list(state="unreachable", allow_partial=True)``, which
+        asks for nothing else: the platform marks any listing containing one of
+        these rows short, and the programmatic surface fails closed on that mark
+        whatever was asked for. So the flag is not about the rows you wanted —
+        it is the acknowledgement that a host went quiet, and asking only for
+        the casualties does not make the outage not have happened.
         """
         # Row shape decides an unreadable flag, the same way it does for a
         # snapshot stub (adversarial review, OPL-3835). A stub has an id and this
