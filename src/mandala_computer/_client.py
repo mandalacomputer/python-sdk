@@ -89,23 +89,36 @@ FILE_PART_SIZE = 8 * 1024 * 1024
 #: ``POST computers/:id/snapshots`` is synchronous — it holds the request open
 #: for the whole ``qemu-img convert`` and the push to backup storage, and
 #: answers with the finished snapshot — so this is the same argument
-#: :data:`FILE_TIMEOUT` makes, with a bigger number behind it. Nothing on the
-#: platform side bounds it either: the daemon sets a ``ReadHeaderTimeout`` and
-#: no ``WriteTimeout`` at all, which makes the client's budget the only
-#: deadline in the system and :data:`DEFAULT_TIMEOUT` the wrong one. Measured
-#: three times on the smallest thing this platform will capture — a 20 GB disk
-#: that came back as 1.88 GB — it took 119.3s, 119.6s and 123.6s, so the
-#: default abandoned every one of them (OPL-4561).
+#: :data:`FILE_TIMEOUT` makes, with a bigger number behind it. Measured three
+#: times on the smallest thing this platform will capture — a 20 GB disk that
+#: came back as 1.88 GB — it took 119.3s, 119.6s and 123.6s, so
+#: :data:`DEFAULT_TIMEOUT` abandoned every one of them (OPL-4561).
 #:
 #: The capture is not cancelled by the client giving up on it. It finishes, and
 #: the caller never learns the id — a snapshot they are billed to store and can
 #: reach only by listing the account and guessing which one it is. That is what
 #: makes this a budget rather than a nicety.
 #:
-#: 1800, matching :meth:`Builds.wait`'s default: this SDK's existing figure for
-#: as long as a platform-side image operation takes. Derived rather than picked
-#: — 1.88 GB in ~120s is about 16 MB/s end to end, and the largest disk on
-#: offer is 40 GB, to which ``memory=True`` adds up to 8 GB of RAM.
+#: 1800 because that is what the PLATFORM allows a capture: its ``snapCtx`` is
+#: a 30-minute context, and this is that number rather than an estimate of it.
+#: It also matches :meth:`Builds.wait`'s default, this SDK's existing figure for
+#: how long a platform-side image operation takes.
+#:
+#: NOT THE ONLY DEADLINE, and the note here said it was (OPL-4563). The daemon
+#: sets a ``ReadHeaderTimeout`` and no ``WriteTimeout``, but the proxy in front
+#: of ``app.mandala.computer`` gives up at about two minutes — the same ceiling
+#: :meth:`Computer.agent_once` documents — so on that deployment a capture
+#: slower than that arrives as
+#: :class:`~mandala_computer.GatewayTimeoutError` however patient this budget
+#: is. Widening it is still what makes the sub-ceiling captures work, which is
+#: every capture that previously failed at 60s; it is not what makes the route
+#: reliable. A 2.43 GB capture of a computer that had been used for a test run
+#: hit the proxy at ~125s, where the same template freshly booted succeeds.
+#: The route not blocking at all is OPL-4562, on the platform.
+#:
+#: The number is right for a deployment with no proxy in front of it, which
+#: ``MANDALA_BASE_URL`` makes reachable, and the client budget should not be
+#: the thing that fails first in either case.
 #:
 #: NOT :data:`NO_DEADLINE`. A capture is bounded by disk bytes, so there is a
 #: real ceiling to name — unlike an agent run, where any finite guess ends
