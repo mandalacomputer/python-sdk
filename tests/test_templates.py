@@ -2864,3 +2864,48 @@ def test_a_str_subclass_cannot_smuggle_a_terminal_status() -> None:
     from mandala_computer._models import build_contradiction
 
     assert build_contradiction(progress) is not None
+
+
+def test_exec_status_equality_distinguishes_completion_evidence() -> None:
+    unknown = mc.ExecStatus.from_api({})
+    stopped = mc.ExecStatus.from_api({"running": False})
+    assert unknown.done is False and stopped.done is True
+    assert unknown != stopped
+
+
+def test_exec_status_equality_distinguishes_output_uncertainty() -> None:
+    stopped = mc.ExecStatus.from_api({"running": False})
+    unreadable = mc.ExecStatus.from_api({"running": False, "more": []})
+    assert stopped.drained is True and unreadable.drained is False
+    assert stopped != unreadable
+
+
+def test_exec_status_normalized_equality_and_dataclass_compatibility() -> None:
+    import dataclasses
+    import pickle
+
+    stopped = mc.ExecStatus.from_api({"running": False, "more": False})
+    assert stopped == mc.ExecStatus.from_api({"running": "false", "more": 0, "extra": 3})
+    assert mc.ExecStatus.from_api({"more": []}) == mc.ExecStatus.from_api({"more": {}})
+    assert dataclasses.replace(stopped) == stopped
+    assert pickle.loads(pickle.dumps(stopped)) == stopped
+    unreadable = dataclasses.replace(stopped, raw={"running": False, "more": []})
+    assert not unreadable.drained and unreadable != stopped
+    direct = mc.ExecStatus(1, "c", False, False, None, b"", b"", 0, 0, False, False, "", {})
+    assert direct.done and direct.drained
+    assert not dataclasses.replace(direct, running=True).done
+    assert mc.ExecStatus.__match_args__ == (
+        "pid",
+        "command",
+        "running",
+        "exited",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "stdout_offset",
+        "stderr_offset",
+        "more",
+        "killed",
+        "started_at",
+        "raw",
+    )

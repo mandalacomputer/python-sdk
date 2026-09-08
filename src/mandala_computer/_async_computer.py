@@ -504,29 +504,15 @@ class AsyncComputer(ComputerFields):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                # OUT OF BUDGET, so the payload in hand is the only evidence
-                # there is — and it is better evidence than nothing. Checked
-                # ONLY here, which is the difference from `wait_until_built`
-                # and is deliberate: that wait may read its cached status on
-                # every pass because "building" is one-way, while a RUNNING
-                # computer becomes suspended on its own whenever the host's
-                # idle sweep reaches it. Trusting the cache while there is
-                # still time to ask would turn this into a no-op on any handle
-                # that once said "running" — answering "it is up" about a
-                # machine that has since been suspended out from under the
-                # caller (/code-review, OPL-4232).
-                #
-                # What this fixes is the other end: the deadline used to be
-                # consulted before ANY state, so `wait_until_running(timeout=0)`
-                # on a computer the handle already said was running answered
-                # `TimeoutError: still 'running' after 0s`, and the three
-                # terminal states lost the dedicated errors this method's own
-                # docstring promises. `timeout=0` is an allowed, documented
-                # already-expired deadline and is what a computed remaining
-                # budget becomes, so it deserves the best sentence available
-                # rather than the emptiest (adversarial review, OPL-4232).
+                # A zero budget deliberately reads the cached state. With a
+                # positive budget, success requires a fresh observation: failed
+                # refreshes cannot establish that a formerly running VM is up.
                 if self.status == "running":
-                    return self
+                    if timeout == 0:
+                        return self
+                    raise TimeoutError(
+                        f"{self.id} could not be confirmed running after {timeout:g}s"
+                    )
                 failure = self._not_starting()
                 if failure is not None:
                     raise failure
@@ -1321,9 +1307,15 @@ class AsyncComputer(ComputerFields):
                     ) from err
                 continue
             # See the sync half: absent from an answer that was short is the one
-            # reading `_captured` must not make.
-            short = incomplete is not None and not any(row.get("id") == snapshot_id for row in rows)
-            seen = seen or not short
+            # reading `_captured` must not make. A matching unreachable stub
+            # also leaves this capture unresolved; only informative rows count.
+            observed = any(
+                row.get("id") == snapshot_id and not is_unreachable_stub(row) for row in rows
+            )
+            short = not observed and (
+                incomplete is not None or any(is_unreachable_stub(row) for row in rows)
+            )
+            seen = seen or observed
             landed = self._captured(rows, snapshot_id, complete=not short)
             if landed is not None:
                 return landed
@@ -1698,7 +1690,11 @@ class AsyncComputer(ComputerFields):
         The call that replaces a polling loop::
 
             await c.wait_for("computer.ready")              # after a create
-            done = await c.wait_for("process.exited")       # after start_exec
+
+        ``process.exited`` events cover every command on the computer. To wait
+        for a particular job and collect its output, poll that job until
+        :attr:`~mandala_computer.ExecStatus.drained` is true. Event-based waits
+        require matching its PID and a cursor established before starting it.
 
         Everything :meth:`events` does about cursors and reconnects applies, so
         this survives a socket that drops while it waits, and the socket is

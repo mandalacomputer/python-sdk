@@ -1136,3 +1136,67 @@ async def test_a_520_does_not_claim_the_work_never_happened(
     assert e.value.status == 520
     assert not isinstance(e.value, mc.OriginUnreachableError)
     assert "never arrived" not in str(e.value)
+
+
+@respx.mock
+@pytest.mark.parametrize("incomplete", [False, True])
+async def test_capture_placeholder_remains_unresolved(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch, incomplete: bool
+) -> None:
+    from tests.test_client import _capturing, _landed, _LifecycleClock
+
+    _LifecycleClock(monkeypatch)
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    headers = {"X-GC-Incomplete": "1"} if incomplete else {}
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[{"id": "snap-1", "unreachable": True}], headers=headers),
+            httpx.Response(200, json=[_landed("snap-1")]),
+        ]
+    )
+    snap = await mc.AsyncComputer(client._t, COMPUTER).snapshot(timeout=2, poll=0)
+    assert snap.state == "pending"
+    assert listing.call_count == 2
+
+
+@respx.mock
+@pytest.mark.parametrize("observed", [False, True])
+async def test_capture_placeholder_timeout_preserves_observation(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch, observed: bool
+) -> None:
+    from tests.test_client import _capturing, _LifecycleClock
+
+    clock = _LifecycleClock(monkeypatch)
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+
+    def listing(request: httpx.Request) -> httpx.Response:
+        row = (
+            _capturing("snap-1")
+            if observed and clock.now == 0
+            else {"id": "snap-1", "unreachable": True}
+        )
+        return clock.response([row])
+
+    respx.get(f"{BASE}/snapshots").mock(side_effect=listing)
+    message = "was still capturing" if observed else "could not be read"
+    with pytest.raises(mc.TimeoutError, match=message):
+        await mc.AsyncComputer(client._t, COMPUTER).snapshot(timeout=2, poll=0)
+
+
+@respx.mock
+async def test_running_wait_does_not_accept_cache_after_failed_refreshes(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_client import _LifecycleClock
+
+    clock = _LifecycleClock(monkeypatch)
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=lambda request: clock.response({"error": "host unavailable"}, status=503)
+    )
+    with pytest.raises(mc.TimeoutError, match="could not be confirmed running"):
+        await mc.AsyncComputer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
+    assert route.call_count == 2
