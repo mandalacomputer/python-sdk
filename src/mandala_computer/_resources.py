@@ -611,9 +611,15 @@ class Templates:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
 
-    def list(self) -> builtins.list[Template]:
-        data = self._t.json_array("GET", _api.TEMPLATES)
-        return [Template.from_api(t) for t in data]
+    def list(self) -> Listing[Template]:
+        """The launch catalogue, with completeness metadata.
+
+        A host outage can return a partial catalogue with HTTP 200. Check
+        ``is_complete`` before treating an absent template as unavailable;
+        ``incomplete=0`` still means partial. No ``allow_partial`` is needed.
+        """
+        data, incomplete = self._t.listing(_api.TEMPLATES)
+        return Listing.of([Template.from_api(t) for t in data], incomplete)
 
     def schema(self) -> Mapping[str, Any]:
         """The JSON Schema for a ``mandala/v1`` document.

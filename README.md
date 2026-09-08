@@ -173,6 +173,13 @@ catalogue of what you can launch — each row's `ref` is what `create()` takes �
 and `client.templates.schema()` is the JSON Schema for a `mandala/v1` document,
 returned as it arrives so an editor or validator can be pointed at it.
 
+The catalogue is a list-compatible `Listing[Template]`. Check `is_complete`
+before treating a missing template as unavailable: a host outage can return
+HTTP 200 with a partial or empty catalogue. `incomplete=0` still means partial;
+only `incomplete=None` means complete. This route needs no `allow_partial` flag.
+Each `Template` exposes optional `desktop` and `icon` fields alongside `ref`.
+Missing fields remain `None`, and `raw` preserves the original response.
+
 #### Retiring one
 
 ```python
@@ -575,7 +582,7 @@ c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 ```
 
 The `nohup … &` is still yours to write. A GUI program does not exit on its own,
-so a foreground launch blocks until `timeout` kills it and comes back as a
+so a foreground launch blocks until `timeout` ends the wait and comes back as a
 failure — having opened the window anyway, which is a confusing pair of outcomes.
 Detach it and the call returns in well under a second.
 
@@ -624,31 +631,25 @@ Until that lands, drive the Windows desktop through `click()`, `type()` and
 command keeps running inside the guest, and its output and exit code are lost
 with the request.
 
-**`exec()` has a ceiling of about two minutes, and it is not `timeout`'s.** The
-HTTP budget is derived from `timeout` and the platform stretches its own
-deadline to match, so neither this client nor the platform is what stops a long
-command. A proxy in front of the platform is: it abandons a request that has
-produced no response for about two minutes and answers 524, which arrives as
-`GatewayTimeoutError`. Measured against `app.mandala.computer`:
+`timeout` must be a whole number of seconds from **1 through 600**, inclusive.
+The SDK rejects invalid values with `ValueError` before sending a request. The
+platform also rejects foreground waits above 600 seconds with HTTP 400 before
+execution. Background commands started with `start_exec()` omit this timeout.
 
-| command | `timeout` | result | wall clock |
-|---|---|---|---|
-| `sleep 110` | 230 | ok | 110.6s |
-| `sleep 130` | 300 | `GatewayTimeoutError` | 125.2s |
-| `sleep 130` | 3600 | `GatewayTimeoutError` | 125.3s |
-
-The last two rows are the whole point: `timeout` differs by an order of
-magnitude and the failure lands in the same place, because the ceiling belongs
-to a hop that never saw it. Raising `timeout` cannot buy time from it.
+**The hosted proxy can stop waiting earlier.** At `app.mandala.computer`, a
+request with no response for about two minutes can receive HTTP 524, raised as
+`GatewayTimeoutError`, even when `timeout` is 300 or 600. Increasing `timeout`
+cannot extend that proxy limit. Self-hosted deployments depend on their own
+proxy configuration, within the platform's 600-second foreground limit.
 
 The command also survives the request that abandoned it, so the call *after* a
 `GatewayTimeoutError` commonly raises `ConflictError` — the guest agent is still
 busy with the command that timed out. That is the first failure still happening,
 not a second one.
 
-So `exec()` is for commands that finish in well under two minutes. For anything
-slower — and for anything slower than a few seconds, which is a lower bar —
-start it instead:
+On the hosted service, use `exec()` for commands that finish in well under two
+minutes. For anything slower — and for anything slower than a few seconds,
+which is a lower bar — start it instead:
 
 ```python
 import sys

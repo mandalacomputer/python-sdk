@@ -897,9 +897,15 @@ def exec_body(
     # A real bool for the same reason `desktop` is one below: `background="false"`
     # is truthy, and it selects the branch that sends NO timeout at all.
     if not flag(background, "background"):
-        body["timeout_s"] = _positive_seconds(
-            timeout, "timeout must be positive for a foreground exec"
+        message = "timeout must be positive whole seconds from 1 to 600 for a foreground exec"
+        seconds = (
+            whole(timeout, "timeout", exc=ValueError, message=message)
+            if isinstance(timeout, int)
+            else real(timeout, "timeout", message=message)
         )
+        if not 0 < seconds <= 600 or int(seconds) != seconds:
+            raise ValueError(message)
+        body["timeout_s"] = int(seconds)
     # A real bool, not anything truthy: this is the switch from the system
     # context to the logged-in session, and ``desktop="false"`` selected it.
     if flag(desktop, "desktop"):
