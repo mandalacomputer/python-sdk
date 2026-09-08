@@ -532,6 +532,11 @@ class Listing(list[T]):
     builds, so the platform has neither a count to give nor a marked row to
     append. A whole one is ``None`` like any other.
 
+    Template catalogues also carry this metadata, but return a partial answer
+    with HTTP 200 without requiring ``allow_partial``. As with builds, a zero
+    count still means incomplete: templates on an unreachable host cannot be
+    counted.
+
     The same is true of the other two whenever the key is scoped to one
     workspace: the platform withholds the marked rows from such a credential
     rather than name it ids from workspaces it cannot see, so this object is
@@ -867,7 +872,7 @@ class Template:
     #: lib/projection publishes it for exactly that reason, and this model was
     #: dropping it on the floor.
     #:
-    #: KEYWORD-ONLY, and last, rather than second where it reads best. This
+    #: KEYWORD-ONLY, after the original slots, rather than second where it reads best. This
     #: class is exported, so its field order is its constructor: added ahead of
     #: ``label`` it broke every ``Template("ubuntu", "Ubuntu", ...)`` that worked
     #: on the previous release, in fixtures and downstream code alike
@@ -880,13 +885,21 @@ class Template:
     #: to the one above it (/code-review). Decoding never noticed any of it —
     #: ``from_api`` passes by keyword.
     ref: str | None = field(default=None, kw_only=True)
+    #: Desktop protocol advertised by the template, or ``None`` when absent.
+    desktop: str | None = field(default=None, kw_only=True)
+    #: Icon advertised by the template, or ``None`` when absent.
+    icon: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Template:
         ref = d.get("ref")
+        desktop = d.get("desktop")
+        icon = d.get("icon")
         return cls(
             name=_text(d.get("name")),
             ref=None if ref is None else _text(ref),
+            desktop=None if desktop is None else _text(desktop),
+            icon=None if icon is None else _text(icon),
             label=_text(d.get("label")),
             os=_text(d.get("os")),
             cpu=_num(d.get("cpu")),

@@ -812,7 +812,7 @@ class AsyncComputer(ComputerFields):
         and ``XAUTHORITY`` set — which is what anything with a window needs.
 
         A GUI program does not exit on its own, so launch it detached or the call
-        blocks until ``timeout`` kills it::
+        blocks until ``timeout`` ends the wait, while the program may keep running::
 
             await c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
 
@@ -824,16 +824,18 @@ class AsyncComputer(ComputerFields):
         stopped waiting, not that the work was destroyed, and the output and the
         exit code are lost with the request.
 
-        The transport waits out whatever ``timeout`` asks for, and the platform
-        extends its own deadline to match — but neither is what ends a long
-        command. A proxy in front of the platform abandons a request that has
-        produced no response for about two minutes and answers 524, which
-        arrives here as :class:`~mandala_computer.GatewayTimeoutError`; measured
-        against ``app.mandala.computer``, an ``exec`` slower than that dies at
-        ~125s whether ``timeout`` said 300 or 3600. The command survives the
-        request that abandoned it, so the next call on this computer may well
-        report the guest agent as busy with it. Past a couple of minutes,
-        :meth:`start_exec` is the only thing that works.
+        ``timeout`` must be a whole number of seconds from 1 through 600.
+        Invalid values raise ``ValueError`` before sending a request; the
+        platform also rejects waits above 600 seconds before execution.
+
+        The hosted proxy at ``app.mandala.computer`` can stop waiting earlier:
+        after about two minutes without a response it answers 524, raised as
+        :class:`~mandala_computer.GatewayTimeoutError`. Increasing ``timeout``
+        cannot extend that proxy limit. Self-hosted deployments depend on their
+        own proxy configuration, within the platform's 600-second limit.
+        The command can survive an abandoned request, so the next call may
+        report the guest agent as busy. Use :meth:`start_exec` and poll its
+        handle for longer commands or to retain their output and exit code.
         """
         return await self._exec(
             command,

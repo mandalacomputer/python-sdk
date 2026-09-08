@@ -1196,7 +1196,7 @@ def test_open_runs_in_the_desktop_session(client: mc.Client) -> None:
 
 @respx.mock
 def test_open_detaches_the_launch(client: mc.Client) -> None:
-    """A foreground browser blocks until the timeout kills it, then reports a
+    """A foreground browser blocks until the wait times out, then reports a
     failure it did not have — having opened the window anyway."""
     route = respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
@@ -5244,8 +5244,8 @@ def test_a_proxy_giving_up_is_not_reported_as_a_bare_status(client: mc.Client) -
 
     Measured against app.mandala.computer on 2026-08-20: `sleep 110` with
     timeout=230 returned normally at 110.6s, while `sleep 130` died at 125.2s
-    with timeout=300 and at 125.3s with timeout=3600 — a 12x difference in what
-    was asked for, and 0.1s in where it ended. Cloudflare content-negotiates that
+    with timeout=300. The hosted proxy can end the wait before the requested
+    timeout. Cloudflare content-negotiates that
     error page, so a client asking for JSON (which every request here does) gets
     an EMPTY body, which left `str(e)` reading "HTTP 524" and named nothing a
     caller could act on.
