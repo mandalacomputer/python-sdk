@@ -799,7 +799,9 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     # The guest's separator, not this machine's: `win:C:\Users\me\` names a
     # directory just as `box:/tmp/` does, and appending to a path that already
     # ends in a separator joins with whichever one the caller wrote.
-    if remote_path.endswith(("/", "\\")):
+    if remote_path.endswith("/") or (
+        looks_windows_guest_path(remote_path) and remote_path.endswith("\\")
+    ):
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
         if os.fstat(f.fileno()).st_size > FILE_SIZE_LIMIT:
