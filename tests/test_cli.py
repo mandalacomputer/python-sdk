@@ -1493,3 +1493,16 @@ def test_an_unreadable_exit_code_does_not_end_the_session_in_a_traceback() -> No
     assert _cli._exit_code('{"type":"exit","code":0}') == 0
     # And a frame that is not an exit still says nothing.
     assert _cli._exit_code('{"type":"resize","cols":80}') is None
+
+
+@respx.mock
+@pytest.mark.parametrize("remote_path", ["/tmp/filename\\", "/tmp/a:b\\", "/tmp/back\\slash\\"])
+def test_scp_upload_preserves_linux_filename_ending_in_backslash(tmp_path, remote_path) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(return_value=httpx.Response(200))
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"payload")
+
+    assert _cli.main(["scp", str(src), f"dev:{remote_path}"]) == 0
+    assert put.calls.last.request.url.params["path"] == remote_path
+    assert put.calls.last.request.content == b"payload"

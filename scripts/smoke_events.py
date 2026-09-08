@@ -124,14 +124,20 @@ def main() -> int:
             f"pid={getattr(exited, 'pid', None)} code={getattr(exited, 'exit_code', None)}",
         )
 
-        # The window half. `open()` is what causes it, so the stream is opened
-        # BEFORE the call — one opened afterwards joins at the head and misses
-        # the event it is waiting for.
-        with vm.events(timeout=120) as stream:
-            reader = iter(stream)
-            vm.open("https://example.com")
+        # Iteration connects lazily. Trigger the action only after the hello
+        # confirms this subscription, without replaying older window events.
+        # The hook also runs on reconnect, so guard the action against repeats.
+        browser_requested = False
+
+        def open_browser(hello: mc.Hello) -> None:
+            nonlocal browser_requested
+            if not browser_requested:
+                browser_requested = True
+                vm.open("https://example.com")
+
+        with vm.events(timeout=120, on_connect=open_browser) as stream:
             opened = None
-            for ev in reader:
+            for ev in stream:
                 if ev.type == "window.opened" and ev.window is not None:
                     opened = ev
                     break
@@ -271,7 +277,7 @@ def main() -> int:
             vm.delete()
             print(f"  deleted {vm.id} {el()}")
         except mc.MandalaError as err:
-            print(f"  delete failed: {err}")
+            check("computer deletion", False, f"delete failed for {vm.id}: {err}")
 
     print(f"\nsmoke_events — all checks passed {el()}" if not FAILURES else f"\n{FAILURES} FAILED")
     return 0 if not FAILURES else 1
