@@ -13,16 +13,11 @@ htmlcov/
 .env
 .DS_Store
 
-# Everything under .claude/ is local — settings.local.json is per-machine — with
-# one exception. linear-sync.json is repo configuration, not preference: it is
-# what says this repo belongs to the OPL team and the Mandala Computer project,
-# and both sibling SDKs carry theirs.
-#
-# `.claude/*` rather than `.claude/`, and the difference matters: git will not
-# re-include a file whose parent DIRECTORY is excluded, so a negation under a
-# bare `.claude/` does nothing at all and the file below stays invisible.
-.claude/*
-!.claude/linear-sync.json
+# Everything under .claude/ is local. That includes the issue-tracker config:
+# it is repo configuration rather than preference, but it names an internal
+# workspace, team and project, and this repository is public. It stays on the
+# machines that need it and out of every clone.
+.claude/
 
 # Reports written by the /grok-bug-hunt skill.
 .grok-bug-hunt/
