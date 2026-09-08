@@ -886,6 +886,10 @@ class Template:
     #: ``from_api`` passes by keyword.
     ref: str | None = field(default=None, kw_only=True)
     #: Desktop protocol advertised by the template, or ``None`` when absent.
+    #: ``raw`` preserves the response; the SDK does not synthesize a protocol.
+    #: For Linux, the server uses X11 when the value is omitted or empty;
+    #: only explicit ``wayland`` selects Wayland. The SDK uses the same public
+    #: window and clipboard routes for both protocols.
     desktop: str | None = field(default=None, kw_only=True)
     #: Icon advertised by the template, or ``None`` when absent.
     icon: str | None = field(default=None, kw_only=True)

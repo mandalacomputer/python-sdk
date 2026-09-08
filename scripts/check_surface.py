@@ -68,13 +68,10 @@ APIDOC = Path("web/lib/apidoc.ts")
 #: refuses a value early to save the caller a round trip, and a ceiling that has
 #: drifted turns that favour into a refusal of a run the platform would have
 #: taken — with nothing failing here to say so.
-#: ``clipboardWriteMax`` is the one entry that is not TypeScript. The platform
-#: states that ceiling in its daemon rather than in ``web/lib``, and the first
-#: version of this SDK's mirror wrote "NOT machine-checked" in a docstring and
-#: left it there — which is an admission, not a check. The reader below takes
-#: either language, so the note could become true.
+#: The reader supports both TypeScript and Go constants.
 CLIPBOARD = Path("server/clipboard.go")
 EXEC = Path("server/execbg.go")
+API = Path("server/api.go")
 WEBHOOKS = Path("web/lib/webhooks.ts")
 WEBHOOKSIGN = Path("web/lib/webhooksign.ts")
 
@@ -86,6 +83,7 @@ CONSTANTS = [
     # constants without an entry here.
     ("MAX_ENV_ENTRIES", EXEC, "execMaxEnv"),
     ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
+    ("MAX_EXEC_TIMEOUT_SECONDS", API, "execMaxTimeoutSec"),
     # The two webhook caps the SDK refuses at, and the replay window the
     # verifier defaults to — which is the one number a RECEIVER codes against.
     ("WEBHOOK_DESCRIPTION_MAX", WEBHOOKS, "DESCRIPTION_MAX"),
@@ -453,10 +451,9 @@ def parameters(platform: Path) -> dict[str, set[str]]:
 def constant(source: str, name: str, module: Path) -> int:
     """One integer constant out of a platform module, TypeScript or Go.
 
-    Two declaration forms because the platform states these numbers in two
-    languages: ``export const NAME = <expr>`` in ``web/lib``, and a bare
-    ``name = <expr>`` inside a Go ``const`` block in ``server/``. BOTH forms are
-    matched at the start of a line, and over source whose comments have been
+    Supports TypeScript ``export const NAME = <expr>``, standalone Go
+    ``const name = <expr>``, and ``name = <expr>`` inside a Go ``const`` block.
+    Declarations are matched at the start of a line over source whose comments have been
     blanked first, so that a mention of the name in a comment or in another
     expression is not read as its declaration — the Go form always was, and the
     TypeScript one was not, which made a commented-out declaration upstream a
@@ -477,7 +474,7 @@ def constant(source: str, name: str, module: Path) -> int:
     """
     blanked = strip_comments(source)
     pattern = (
-        rf"^\s*{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
+        rf"^\s*(?:const[ \t]+)?{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
         if module.suffix == ".go"
         else rf"^\s*export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
     )

@@ -27,6 +27,16 @@ TEMPLATE = {
 RESULT = {"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}
 
 
+def test_foreground_timeout_enforcement_uses_mirrored_constant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_api, "MAX_EXEC_TIMEOUT_SECONDS", 2)
+    assert _api.exec_body("true", 2)["timeout_s"] == 2
+    with pytest.raises(ValueError, match="from 1 to 2"):
+        _api.exec_body("true", 3)
+    assert "timeout_s" not in _api.exec_body("true", 3, background=True)
+
+
 @pytest.fixture(params=[False, True], ids=["sync", "async"])
 async def client(request: pytest.FixtureRequest) -> Any:
     if request.param:
