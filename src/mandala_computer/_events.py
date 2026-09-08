@@ -1453,6 +1453,8 @@ def _public_exc(exc: BaseException) -> str:
     was rewritten to prevent. Other ``WebSocketException`` subclasses are
     named by class rather than interpolated, because several of them echo the
     URI they were given. OSError and TimeoutError do not.
+    Callers must also suppress the original exception chain when raising the
+    public error, or a formatted traceback would expose that same URI.
     """
     from websockets.exceptions import InvalidURI, WebSocketException
 
@@ -1933,9 +1935,12 @@ class EventStream(_StreamBase):
             )
         try:
             sock = _connect(url, open_timeout=left, max_queue=self._max_queue)
-        except Exception as exc:
-            raise _connect_failed(self._id, exc, watching=bool(self._watch)) from exc
+        except Exception as exc:  # noqa: BLE001 — _connect_failed re-raises unknown errors
+            raise _connect_failed(self._id, exc, watching=bool(self._watch)) from None
         self._sock = sock
+        if self._stopped():
+            self._shut()
+            raise _Expired
         buffered: list[Any] = []
         hello: Hello | None = None
         while hello is None:
@@ -1990,7 +1995,7 @@ class EventStream(_StreamBase):
         except ConnectionClosed:
             raise _Ended from None
         except (OSError, WebSocketException) as exc:
-            raise _lost(self._id, exc) from exc
+            raise _lost(self._id, exc) from None
         return _decode(message)
 
 
@@ -2264,8 +2269,8 @@ class AsyncEventStream(_StreamBase):
             raise _Expired
         try:
             sock = connecting.result()
-        except Exception as exc:
-            raise _connect_failed(self._id, exc, watching=bool(self._watch)) from exc
+        except Exception as exc:  # noqa: BLE001 — _connect_failed re-raises unknown errors
+            raise _connect_failed(self._id, exc, watching=bool(self._watch)) from None
         self._sock = sock
         if self._stopped():
             await self._shut()
@@ -2346,5 +2351,5 @@ class AsyncEventStream(_StreamBase):
         except ConnectionClosed:
             raise _Ended from None
         except (OSError, WebSocketException) as exc:
-            raise _lost(self._id, exc) from exc
+            raise _lost(self._id, exc) from None
         return _decode(message)
