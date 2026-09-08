@@ -303,3 +303,43 @@ def test_the_variable_is_read_relative_to_the_repository_not_the_caller(
 
     assert check_surface.named_platform_repo() == platform
     assert check_surface.platform_repo() == platform
+
+
+def test_foreground_timeout_constant_drift_is_detected(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    from mandala_computer import _api
+
+    platform = tmp_path / "platform"
+    for ours, module, theirs in check_surface.CONSTANTS:
+        path = platform / module
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as source:
+            value = getattr(_api, ours)
+            if module.suffix == ".go":
+                source.write(f"const (\n{theirs} = {value}\n)\n")
+            else:
+                source.write(f"export const {theirs} = {value};\n")
+    api = platform / "server/api.go"
+    api.write_text("package server\nconst execMaxTimeoutSec = 600\n")
+    assert check_surface.constant_drift(platform) == []
+
+    api.write_text("package server\nconst execMaxTimeoutSec = 601\n")
+    assert check_surface.constant_drift(platform) == [
+        "  ! MAX_EXEC_TIMEOUT_SECONDS is 600, but server/api.go's execMaxTimeoutSec is 601"
+    ]
+
+
+def test_missing_foreground_timeout_module_is_reported(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = Path("server/api.go")
+    platform = _platform_without(check_surface, tmp_path, module)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.missing_mirror_sources(platform) == [module]
+    assert check_surface.main() == 1
+    assert str(platform / module) in capsys.readouterr().out

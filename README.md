@@ -179,6 +179,9 @@ HTTP 200 with a partial or empty catalogue. `incomplete=0` still means partial;
 only `incomplete=None` means complete. This route needs no `allow_partial` flag.
 Each `Template` exposes optional `desktop` and `icon` fields alongside `ref`.
 Missing fields remain `None`, and `raw` preserves the original response.
+For Linux templates, the server uses X11 when `desktop` is omitted or empty;
+only explicit `wayland` selects Wayland. The SDK preserves the advertised value
+and uses the same public window and clipboard routes for both protocols.
 
 #### Retiring one
 
@@ -1604,6 +1607,12 @@ u = await client.usage.read()
 ```
 
 ### Partial listings
+
+`client.templates.list()` returns a `Listing[Template]` with an HTTP 200 warning
+when its catalogue is incomplete. It takes no `allow_partial` flag and includes
+no stub rows for missing templates. Check `is_complete`: `incomplete=0` still
+means partial, including an empty catalogue. See the
+[template catalogue documentation](#your-own-templates).
 
 `client.computers.list()`, `client.snapshots.list()` and `client.builds.list()`
 fan out across every hypervisor holding something of yours, so one that cannot
