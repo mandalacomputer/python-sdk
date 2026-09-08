@@ -2256,6 +2256,18 @@ class ExecStatus:
     #: changes no existing construction.
     output_unreadable: bool = field(default=False, kw_only=True)
 
+    # Normalize only the wire evidence that changes completion or draining.
+    # init=False preserves positional construction and pattern matching;
+    # __post_init__ recomputes it when dataclasses.replace changes raw/decoded.
+    _running_stopped: bool = field(init=False)
+    _more_unreadable: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_running_stopped", self.decoded and _wire(self.raw, "running") is _Wire.FALSE
+        )
+        object.__setattr__(self, "_more_unreadable", _wire(self.raw, "more") is _Wire.MALFORMED)
+
     @property
     def stdout_text(self) -> str:
         """:attr:`stdout` as text, with undecodable bytes replaced.
@@ -2307,7 +2319,7 @@ class ExecStatus:
         # An object built directly rather than decoded has no payload to
         # consult, and then its fields ARE the evidence: a caller who wrote
         # `running=False` has said it stopped.
-        if self.decoded and _wire(self.raw, "running") is not _Wire.FALSE:
+        if self.decoded and not self._running_stopped:
             return self.exited or self.killed
         return self.exited or self.killed or not self.running
 
@@ -2321,7 +2333,7 @@ class ExecStatus:
         drops output that a consuming read can never fetch again. It reads False
         so the loop sleeps, and this says why, so the loop can decline to stop.
         """
-        return _wire(self.raw, "more") is _Wire.MALFORMED
+        return self._more_unreadable
 
     @property
     def drained(self) -> bool:
