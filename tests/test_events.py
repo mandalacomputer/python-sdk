@@ -9,13 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from typing import Any
 
 import httpx
 import pytest
 import respx
 from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK, InvalidStatus
+from websockets.exceptions import (
+    ConnectionClosedError,
+    ConnectionClosedOK,
+    InvalidStatus,
+    InvalidURI,
+    WebSocketException,
+)
 from websockets.http11 import Response
 
 import mandala_computer as mc
@@ -1790,6 +1797,81 @@ def test_a_connect_timeout_is_this_sdks_error_on_every_supported_python() -> Non
 
     for exc in (asyncio.TimeoutError("open_timeout"), TimeoutError("open_timeout")):
         assert isinstance(_connect_failed("vm-1", exc), mc.ConnectionError)
+
+
+@pytest.mark.parametrize("stage", ["connect", "opening", "stream"])
+@pytest.mark.parametrize("invalid_uri", [False, True])
+def test_sync_event_error_tracebacks_do_not_expose_credentials(
+    monkeypatch: pytest.MonkeyPatch, stage: str, invalid_uri: bool
+) -> None:
+    token = "synthetic-desktop-credential"
+    url = f"wss://events.test/?token={token}"
+    failure = InvalidURI(url, "bad URL") if invalid_uri else WebSocketException(url)
+    script: Any = failure if stage == "connect" else [failure]
+    if stage == "stream":
+        script.insert(0, hello_frame())
+    Dialer(script).install(monkeypatch)
+    stream = mc.EventStream(lambda budget: url, "vm-1", reconnect=False)
+
+    with pytest.raises(mc.MandalaError) as caught:
+        list(stream)
+
+    expected = mc.MandalaError if invalid_uri and stage == "connect" else mc.ConnectionError
+    assert type(caught.value) is expected
+    rendered = "".join(traceback.format_exception(caught.type, caught.value, caught.tb))
+    assert token not in rendered
+    assert "token=" not in rendered
+    assert "vm-1" in rendered
+    assert ("not a websocket URL" if invalid_uri else "WebSocketException") in rendered
+
+
+@pytest.mark.parametrize("stage", ["connect", "opening", "stream"])
+@pytest.mark.parametrize("invalid_uri", [False, True])
+async def test_async_event_error_tracebacks_do_not_expose_credentials(
+    monkeypatch: pytest.MonkeyPatch, stage: str, invalid_uri: bool
+) -> None:
+    token = "synthetic-desktop-credential"
+    url = f"wss://events.test/?token={token}"
+    failure = InvalidURI(url, "bad URL") if invalid_uri else WebSocketException(url)
+    script: Any = failure if stage == "connect" else [failure]
+    if stage == "stream":
+        script.insert(0, hello_frame())
+    Dialer(script, cls=AsyncFakeSocket).install(monkeypatch)
+
+    async def events_url(budget: float) -> str:
+        return url
+
+    stream = mc.AsyncEventStream(events_url, "vm-1", reconnect=False)
+    with pytest.raises(mc.MandalaError) as caught:
+        _ = [event async for event in stream]
+
+    expected = mc.MandalaError if invalid_uri and stage == "connect" else mc.ConnectionError
+    assert type(caught.value) is expected
+    rendered = "".join(traceback.format_exception(caught.type, caught.value, caught.tb))
+    assert token not in rendered
+    assert "token=" not in rendered
+    assert "vm-1" in rendered
+    assert ("not a websocket URL" if invalid_uri else "WebSocketException") in rendered
+
+
+def test_sync_close_during_handshake_closes_late_socket_without_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock = FakeSocket([hello_frame()])
+    connected: list[_events.Hello] = []
+    stream = mc.EventStream(
+        lambda budget: "wss://events.test/", "vm-1", reconnect=False, on_connect=connected.append
+    )
+
+    def connect(url: str, **kw: Any) -> FakeSocket:
+        stream.close()
+        return sock
+
+    monkeypatch.setattr(_events, "_connect", connect)
+    assert list(stream) == []
+    assert sock.closed
+    assert sock.reads == 0
+    assert connected == []
 
 
 @pytest.mark.parametrize("wire", [9007199254740993, -9007199254740993])
