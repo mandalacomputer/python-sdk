@@ -959,11 +959,12 @@ Most of the time you want one event, not a loop, and `wait_for()` is that:
 ```python
 c = client.computers.create(template="base")
 c.wait_for("computer.ready")  # in place of screenshotting until it looks up
-
-job = c.start_exec("apt-get install -y build-essential")
-done = c.wait_for("process.exited")  # in place of polling job.poll()
-print(done.exit_code, job.poll().stdout_text)
 ```
+
+`process.exited` covers every command on the computer. To wait for a particular
+job and collect its output, use the [background-command polling loop](#long-running-commands)
+until `status.drained` is true. An event-based wait must match the job's PID and
+use a cursor established before starting the job, so a fast exit is not missed.
 
 Both close the socket on the way out. `wait_for()` always does; a `for` loop
 does it through the generator's own cleanup, which CPython runs promptly — use

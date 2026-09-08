@@ -5529,3 +5529,104 @@ def test_a_message_the_platform_wrote_is_not_stamped_with_a_status(
     with pytest.raises(mc.GatewayTimeoutError) as e:
         client.computers.get("vm-1")
     assert str(e.value) == "upstream unavailable before dispatch"
+
+
+class _LifecycleClock:
+    """Advance only when a mocked observation completes; never sleep."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from types import SimpleNamespace
+
+        from mandala_computer import _async_computer, _computer
+
+        self.now = 0.0
+        clock = SimpleNamespace(monotonic=lambda: self.now, sleep=lambda delay: None)
+        monkeypatch.setattr(_computer, "time", clock)
+        monkeypatch.setattr(_async_computer, "time", clock)
+
+        async def sleep(delay: float) -> None:
+            pass
+
+        monkeypatch.setattr(_async_computer, "asyncio", SimpleNamespace(sleep=sleep))
+
+    def response(self, payload: object, *, status: int = 200) -> httpx.Response:
+        self.now += 1
+        return httpx.Response(status, json=payload)
+
+
+@respx.mock
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_capture_placeholder_remains_unresolved(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch, incomplete: bool
+) -> None:
+    _LifecycleClock(monkeypatch)
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+    headers = {"X-GC-Incomplete": "1"} if incomplete else {}
+    listing = respx.get(f"{BASE}/snapshots").mock(
+        side_effect=[
+            httpx.Response(200, json=[{"id": "snap-1", "unreachable": True}], headers=headers),
+            httpx.Response(200, json=[_landed("snap-1")]),
+        ]
+    )
+    assert _computer(client).snapshot(timeout=2, poll=0).state == "pending"
+    assert listing.call_count == 2
+
+
+@respx.mock
+@pytest.mark.parametrize("observed", [False, True])
+def test_capture_placeholder_timeout_preserves_observation(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch, observed: bool
+) -> None:
+    clock = _LifecycleClock(monkeypatch)
+    respx.post(f"{BASE}/computers/vm-1/snapshots").mock(
+        httpx.Response(202, json=_capturing("snap-1"))
+    )
+
+    def listing(request: httpx.Request) -> httpx.Response:
+        row = (
+            _capturing("snap-1")
+            if observed and clock.now == 0
+            else {"id": "snap-1", "unreachable": True}
+        )
+        return clock.response([row])
+
+    respx.get(f"{BASE}/snapshots").mock(side_effect=listing)
+    message = "was still capturing" if observed else "could not be read"
+    with pytest.raises(mc.TimeoutError, match=message):
+        _computer(client).snapshot(timeout=2, poll=0)
+
+
+@respx.mock
+def test_running_wait_does_not_accept_cache_after_failed_refreshes(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _LifecycleClock(monkeypatch)
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=lambda request: clock.response({"error": "host unavailable"}, status=503)
+    )
+    with pytest.raises(mc.TimeoutError, match="could not be confirmed running"):
+        mc.Computer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
+    assert route.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"id": "snap-1", "state": "durable", "unreachable": True},
+        {"id": "snap-1", "computer_id": "vm-1", "size_bytes": 5},
+        {"id": "snap-1", "state": "legacy-ready"},
+    ],
+)
+def test_capture_accepts_informative_and_legacy_rows(client: mc.Client, row: dict) -> None:
+    snap = mc.Computer(client._t, COMPUTER)._captured([row], "snap-1")
+    assert snap is not None and snap.id == "snap-1"
+
+
+@pytest.mark.parametrize("flag", [True, None, "unreadable"])
+def test_capture_does_not_complete_from_an_unreachable_stub(
+    client: mc.Client, flag: object
+) -> None:
+    row = {"id": "snap-1", "unreachable": flag, "created_at": "yesterday", "kind": "manual"}
+    assert mc.Computer(client._t, COMPUTER)._captured([row], "snap-1") is None
