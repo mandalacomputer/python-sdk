@@ -594,9 +594,8 @@ def test_a_text_frame_that_said_nothing_is_not_an_event(computer: mc.Computer) -
 
 @respx.mock
 def test_a_step_cap_that_is_not_a_whole_number_is_refused(computer: mc.Computer) -> None:
-    """The platform's `stepCap` requires `Number.isInteger`. Sending 2.5 buys a
-    400 on a route where the round trip is the thing this check exists to
-    save."""
+    """The platform requires a whole number here. Sending 2.5 buys a 400 on a
+    route where the round trip is the thing this check exists to save."""
     with pytest.raises(ValueError, match="whole number"):
         computer.agent("do the thing", model_key=KEY, max_steps=2.5)  # type: ignore[arg-type]
 

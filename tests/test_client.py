@@ -604,7 +604,7 @@ def test_the_reason_rides_on_the_base_class_not_on_the_conflict() -> None:
 def test_a_move_offer_still_outranks_its_reason() -> None:
     """`MoveRequiredError` is a decision, and it is checked before the word.
 
-    The platform deliberately gives `errResumeNeeded` and the move refusals no
+    The platform deliberately gives the resume-needed and move refusals no
     `reason` — but if one ever gained a transient-looking word, this ordering is
     what stops a resize past what a host can run becoming retry advice again.
     """
@@ -1797,7 +1797,7 @@ def test_a_terminal_row_is_a_record_rather_than_a_placeholder(client: mc.Client)
 
     `deleted` and `lost` rows are served from the record with no `status` and,
     unlike an unreachable row, NO `unreachable` key — the platform omits the
-    flag on a row it has finished with (`describeRow` in web/lib/computers.ts).
+    flag on a row it has finished with.
     The shape test alone read that as a placeholder and told callers not to
     believe the only description of the computer that will ever exist again.
     """
@@ -2622,9 +2622,9 @@ def test_geometry_it_could_not_read_is_none_rather_than_the_corner_of_the_screen
     A window really can be at x 0, so a coordinate this client could not read
     came back indistinguishable from the top-left corner — and the corner is
     where an agent then clicks. The daemon refuses the same shape at the origin:
-    `applyWindowGeom` requires all four and leaves out the row that fails it,
-    because "reporting it at the origin with no size is the 'plausible but
-    wrong' answer rather than a missing one" (OPL-4200).
+    it requires all four and leaves out the row that fails it, because
+    reporting a window at the origin with no size is the plausible-but-wrong
+    answer rather than a missing one (OPL-4200).
     """
     respx.get(f"{BASE}/computers/vm-1/windows").mock(
         httpx.Response(

@@ -63,7 +63,7 @@ DEADLINE_SLACK = 15.0
 #: large one the platform is still willing to finish.
 FILE_TIMEOUT = 300.0
 
-#: The most one file request moves, mirroring the platform's ``guestFileMax``.
+#: The most one file request moves, mirroring the platform's own ceiling.
 #:
 #: A limit on the *request*, not on the file. The bytes cross the guest agent's
 #: one connection in chunks and a transfer holds it for as long as it takes, so
@@ -94,8 +94,8 @@ FILE_PART_SIZE = 8 * 1024 * 1024
 #: to :data:`DEFAULT_TIMEOUT` with everything else, and this number moved onto
 #: the loop that polls ``GET /snapshots`` for the id it was handed.
 #:
-#: 1800 because that is what the PLATFORM allows a capture: its ``snapCtx`` is
-#: a 30-minute context, and this is that number rather than an estimate of it.
+#: 1800 because that is what the PLATFORM allows a capture — a thirty-minute
+#: budget, and this is that number rather than an estimate of it.
 #: It also matches :meth:`Builds.wait`'s default, this SDK's existing figure for
 #: how long a platform-side image operation takes.
 #:
@@ -139,9 +139,9 @@ SNAPSHOT_POLL = 5.0
 #: :data:`DEFAULT_TIMEOUT` with everything else and the waiting is a loop of
 #: short listings, which is what a proxy has nothing to abandon in.
 #:
-#: The same 1800 as a capture because it is the same budget on the platform:
-#: ``snapCtx`` is a thirty-minute context, and its own comment says what it
-#: covers — "one capture, one restore, one delete".
+#: The same 1800 as a capture because it is the same thirty-minute budget on
+#: the platform, and that budget covers one capture, one restore or one
+#: delete.
 #:
 #: A NAME OF ITS OWN rather than the capture's, though the number is identical.
 #: The two waits have opposite polarity — one waits for a row to arrive, this
@@ -662,8 +662,8 @@ class _BaseTransport:
         are, and every mistake available without it is silent: a window taken for
         the start of the file writes the middle of a download over its beginning
         and reports success. A proxy that drops the header on the way back is the
-        way this happens — see ``passThrough`` in the platform's ``lib/hvproxy``,
-        where it is forwarded by name.
+        way this happens: the platform forwards the header by name, and a proxy
+        in front of it need not.
 
         An empty window is refused with it, and that one is not fussiness. The
         length check below passes an ``A-B`` whose ``B`` is before its ``A`` when

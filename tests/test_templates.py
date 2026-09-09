@@ -193,7 +193,7 @@ def test_validate_carries_both_digests(client: mc.Client) -> None:
 def test_a_layered_document_is_told_why_it_has_no_build_digest(client: mc.Client) -> None:
     """`build_digest_needs` REPLACES `build_digest`; the two never both arrive.
 
-    `server/templateschema.go` is an if/else on `spec.from`. Decoding only the
+    The platform decides between them on `spec.from`. Decoding only the
     first left every layered document looking like a failure with no reason
     attached — the platform sends the reason, and this dropped it (OPL-4193).
 
@@ -231,7 +231,8 @@ def test_canonical_is_the_bytes_the_doc_digest_was_taken_over(client: mc.Client)
     """A string, not a parsed object, and that is what makes it checkable.
 
     `doc_digest` is `sha256:` + the hex of sha256 over exactly these bytes
-    (`TemplateDoc.Canonical` / `DocDigest`), so a caller can verify the binding
+    (the canonical serialisation the platform hashes), so a caller can verify
+    the binding
     rather than trust the platform to have hashed honestly. A mapping could not
     do this: re-serialising one does not reproduce the bytes that were hashed,
     which is why `PublishedTemplate.document` cannot be used the same way.
@@ -472,7 +473,7 @@ def test_build_start_sends_bytes_and_reads_the_job(client: mc.Client) -> None:
 def test_no_reuse_is_sent_only_when_asked_for(client: mc.Client) -> None:
     """``no_reuse=true`` is the only spelling the platform acts on.
 
-    ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` and ``lib/apidoc``
+    The platform compares the value against ``"true"`` and the API reference
     gives the parameter ``enum: ['true']``, so the key is omitted rather than
     sent as ``false``. This docstring used to say the platform read the key's
     PRESENCE and that ``no_reuse=false`` forced a rebuild — the claim the fix
@@ -808,8 +809,8 @@ def _fleet_partly_down(rows: list[dict[str, str]] | None = None) -> respx.Route:
     """A build listing the fleet could only half answer.
 
     Strict without ``allow_partial`` and short with it, which is the platform's
-    own behaviour: ``forward`` in lib/surface turns any response carrying
-    ``X-GC-Incomplete`` into a 503 unless the request opted in.
+    own behaviour: it turns any response carrying ``X-GC-Incomplete`` into a 503
+    unless the request opted in.
 
     ``rows`` is what short LOOKS like for builds — fewer rows and nothing
     marking what is gone. The platform keeps no record of which hypervisor ran
@@ -1016,7 +1017,7 @@ def test_a_template_row_carries_its_ref() -> None:
     """Since OPL-3789 a published template is named by its ref and nothing else.
 
     A listing that drops it cannot tell a caller how to launch their own
-    template, which is what the platform's publicTemplate publishes it for.
+    template, which is what the platform publishes it for.
     """
     t = mc.Template.from_api({"name": "devbox", "ref": "acc-1/devbox@1.0.0"})
     assert t.ref == "acc-1/devbox@1.0.0"
@@ -1045,8 +1046,8 @@ def test_the_purge_interlock_cannot_be_disarmed_by_a_str_subclass() -> None:
 
     ``delete_params`` still tested ``if not expect`` on the caller's object and
     sent that object, so a subclass answering True here and "" to ``str()`` put
-    ``?expect=`` on the wire — and ``checkExpectation`` in server/vm.go reads an
-    empty expectation as NO expectation. The interlock was silently disarmed on
+    ``?expect=`` on the wire — and the platform reads an empty expectation as
+    NO expectation. The interlock was silently disarmed on
     the one route that destroys a computer and its snapshots together.
     """
     sent = _api.delete_params(purge_snapshots=True, expect=Disarming("abc"))

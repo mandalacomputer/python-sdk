@@ -14,7 +14,7 @@ So this module is the part in between — the reconnect, the cursor, the opening
 frame's state, and the three frames that are not events about the computer.
 
 Everything here is written against the ``events_url`` entry in the platform's
-``web/lib/apidoc.ts``, which is the reference this must not contradict.
+API reference, which is what this must not contradict.
 
 **Two halves, one set of decisions.** The sync and async streams differ only in
 how they wait; every judgement either of them makes — which frame is an event,
@@ -1070,9 +1070,8 @@ class _Core:
                 # therefore the one that moves this record. `flood` and `budget`
                 # say the tree IS watched and is being reported incompletely, so
                 # a client is still right to read silence under them as nothing
-                # having changed — that is the platform's own division, and its
-                # own armed set moves on exactly this reason (see the switch in
-                # `emitFile`, server/fileevents.go).
+                # having changed — that is the platform's own division, and
+                # its own armed set moves for exactly this reason.
                 #
                 # Without it a tree that armed and then went unwatchable went on
                 # reporting `armed=True` for the life of the stream, while a

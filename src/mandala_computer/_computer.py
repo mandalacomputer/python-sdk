@@ -419,7 +419,7 @@ def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
     describe is left out and the answer then carries "a window on this desktop
     could not be described, so this list is missing one that exists", on the
     reasoning that a prefix of a window list is a complete-looking answer that
-    is wrong (``server/windows.go``).
+    is wrong.
 
     The refusal stops here rather than moving into :meth:`Window.from_api`,
     which also runs on the event stream and has to stay total. See its docstring
@@ -1250,8 +1250,8 @@ class ComputerFields:
         One move runs at a time, so there is at most one live row to find. Where
         there is none, the answer is the row with the LATEST ``started_at``,
         read off the rows rather than off their order. The platform sends them
-        newest-first — ``ORDER BY started_at DESC`` in ``movesFor`` — so
-        position would answer this correctly today, and it is not what this has
+        newest-first, so position would answer this correctly today — and it
+        is not what this has
         to depend on: the first version of this fix guessed oldest-first and
         picked the stale row it was written to avoid (/code-review, OPL-4222).
         A stamp is a fact about the move; an index is a fact about the query
