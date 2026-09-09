@@ -492,9 +492,17 @@ class AsyncComputer(ComputerFields):
         you need something inside the guest to be ready.
 
         Raises :class:`~mandala_computer.MandalaError` rather than waiting out
-        the timeout for the three states that will not become "running" on their
-        own — a failed build, a suspended session nobody has resumed, and a
-        create whose machine was made and would not boot.
+        the timeout for the states that will not become "running" on their own —
+        a failed build, a suspended session nobody has resumed, a stopped
+        computer nobody is starting, and a create whose machine was made and
+        would not boot.
+
+        "Nobody is" is the platform's word rather than an inference from
+        :attr:`status`, which is read from the guest process: a start that has
+        been admitted holds its memory before that process exists, and reads as
+        stopped or suspended meanwhile. This waits for one of those. A host that
+        does not report ``running_ram_mb`` at all is waited on too — see
+        :meth:`Computer._nothing_admitted`.
         """
         check_wait_args(timeout, poll)
         # BEFORE the first refresh, because the refresh is what destroys the
@@ -514,6 +522,10 @@ class AsyncComputer(ComputerFields):
         if self.start_error:
             raise MandalaError(f"{self.id} did not start: {self.start_error}")
         deadline = time.monotonic() + timeout
+        # The sync loop's flag, for its reason: a refusal built on a snapshot
+        # from before this call is a claim about a machine nobody looked at.
+        # See Computer.wait_until_running.
+        observed = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -525,6 +537,12 @@ class AsyncComputer(ComputerFields):
                         return self
                     raise TimeoutError(
                         f"{self.id} could not be confirmed running after {timeout:g}s"
+                    )
+                # And nor can they establish the opposite.
+                if timeout != 0 and not observed:
+                    raise TimeoutError(
+                        f"{self.id} could not be read in {timeout:g}s; when it last answered it "
+                        f"was {self.status!r}"
                     )
                 failure = self._not_starting()
                 if failure is not None:
@@ -538,6 +556,7 @@ class AsyncComputer(ComputerFields):
                 # what had happened was a single poll not landing (OPL-3724).
                 await asyncio.sleep(_ride_out(err, deadline, poll))
                 continue
+            observed = True
             # The FRESHLY READ state, judged by the same two questions the
             # expired-budget branch above asks of the cached one — written once
             # each so the two answers cannot drift.
@@ -579,8 +598,11 @@ class AsyncComputer(ComputerFields):
         when the platform named an interval, and a short floor when it did not
         (OPL-3724).
 
-        A stopped computer is also refused immediately, including one carrying
-        :attr:`start_error` from a failed boot. A suspended computer is not:
+        A stopped computer that the platform is holding nothing for is also
+        refused immediately, including one carrying :attr:`start_error` from a
+        failed boot — but one whose start has been admitted is waited for, since
+        it reads as stopped for the whole of its load. A suspended computer is
+        not refused either:
         running the probe counts as use and resumes its saved session.
         """
         check_wait_args(timeout, poll)
