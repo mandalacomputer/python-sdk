@@ -868,9 +868,8 @@ class Template:
     #: it looks: since OPL-3789 a template an account PUBLISHED is named by its
     #: ref and by nothing else — the short ``name`` still resolves to the
     #: platform's own catalogue — so a listing without this cannot tell a caller
-    #: how to launch their own template. ``publicTemplate`` in the platform's
-    #: lib/projection publishes it for exactly that reason, and this model was
-    #: dropping it on the floor.
+    #: how to launch their own template. The platform publishes it for exactly
+    #: that reason, and this model was dropping it on the floor.
     #:
     #: KEYWORD-ONLY, after the original slots, rather than second where it reads best. This
     #: class is exported, so its field order is its constructor: added ahead of
@@ -1059,9 +1058,8 @@ class TemplateCheck:
             return None if value is None else _text(value)
 
         # `template` is the seventh key a valid answer carries, and since
-        # OPL-4190 it is `publicTemplate`'s output — the same row `GET
-        # /templates` lists — so it decodes through the same machinery as
-        # everywhere else. `None` rather than an empty `Template` when it is
+        # OPL-4190 it is the same row `GET /templates` lists — so it decodes
+        # through the same machinery as everywhere else. `None` rather than an empty `Template` when it is
         # absent: an invalid document describes no row, and a row of zeroes
         # would be a size, an OS and a name asserted about a file that has none.
         template = d.get("template")
@@ -1948,12 +1946,12 @@ class Window:
     #: decoder went on inventing it until OPL-4200.
     #:
     #: **The daemon already refuses it at the origin**, which is what makes the
-    #: floor a divergence rather than a house rule. ``applyWindowGeom``
-    #: (``server/windows.go``) requires all four and says why they are not
-    #: optional: "a window whose position this cannot read is a window a caller
-    #: cannot click, and reporting it at the origin with no size is the
-    #: 'plausible but wrong' answer rather than a missing one." A row that fails
-    #: it is left out of the listing and the answer then carries an error, and
+    #: floor a divergence rather than a house rule. The platform requires all
+    #: four for the same reason this does: a window whose position cannot be
+    #: read is a window a caller cannot click, and reporting it at the origin
+    #: with no size is the plausible-but-wrong answer rather than a missing one.
+    #: A row that fails it is left out of the listing and the answer then
+    #: carries an error, and
     #: the guest broker's own decoder drops a window event the same way. So the
     #: zero was this client putting back the answer the platform declines to
     #: give.
