@@ -434,8 +434,11 @@ def test_a_stale_running_handle_is_still_verified_while_there_is_budget(
     then reaches for `screenshot()`, which is documented not to resume one
     (/code-review, OPL-4232).
     """
+    # `running_ram_mb: 0` is the platform saying it is holding nothing, which is
+    # what "nobody has resumed it" means since OPL-4630 — a resume in flight
+    # reads as suspended too, and is waited for rather than refused.
     route = respx.get(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(200, json={**COMPUTER, "status": "suspended"})
+        httpx.Response(200, json={**COMPUTER, "status": "suspended", "running_ram_mb": 0})
     )
     c = mc.Computer(client._t, COMPUTER)  # the handle still says "running"
     with pytest.raises(mc.MandalaError, match="is suspended"):
@@ -462,7 +465,7 @@ def test_an_expired_budget_still_names_the_state_that_will_not_start(
     available about the one case a caller can fix in a line (OPL-4232).
     """
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(500))
-    c = mc.Computer(client._t, {**COMPUTER, "status": status})
+    c = mc.Computer(client._t, {**COMPUTER, "status": status, "running_ram_mb": 0})
     with pytest.raises(mc.MandalaError, match=says):
         c.wait_until_running(timeout=0, poll=0)
 
@@ -915,7 +918,7 @@ def test_wait_for_guest_refreshes_a_stale_running_handle(client: mc.Client) -> N
         httpx.Response(400, json={"error": "not running"})
     )
     refresh = respx.get(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+        httpx.Response(200, json={**COMPUTER, "status": "stopped", "running_ram_mb": 0})
     )
     with pytest.raises(mc.MandalaError, match="stopped.+call start"):
         mc.Computer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)
@@ -997,7 +1000,9 @@ def test_wait_for_answers_an_expired_deadline_like_every_sibling_wait(
 def test_wait_for_guest_reports_an_already_stopped_computer(client: mc.Client) -> None:
     probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json={}))
     with pytest.raises(mc.MandalaError, match=r"stopped.+call start\(\) first"):
-        mc.Computer(client._t, {**COMPUTER, "status": "stopped"}).wait_for_guest()
+        mc.Computer(
+            client._t, {**COMPUTER, "status": "stopped", "running_ram_mb": 0}
+        ).wait_for_guest()
     assert not probe.called
 
 

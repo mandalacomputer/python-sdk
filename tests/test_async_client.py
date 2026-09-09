@@ -697,7 +697,7 @@ async def test_wait_for_guest_refreshes_an_async_stale_running_handle(
         httpx.Response(400, json={"error": "not running"})
     )
     refresh = respx.get(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+        httpx.Response(200, json={**COMPUTER, "status": "stopped", "running_ram_mb": 0})
     )
     with pytest.raises(mc.MandalaError, match="stopped.+call start"):
         await mc.AsyncComputer(client._t, COMPUTER).wait_for_guest(timeout=30, poll=0)

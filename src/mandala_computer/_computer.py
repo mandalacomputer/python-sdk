@@ -851,18 +851,48 @@ class ComputerFields:
         """
         return self.status == "build-failed"
 
+    def _nothing_admitted(self) -> bool:
+        """Whether the platform has SAID it is holding nothing for this computer.
+
+        ``status`` cannot answer this, which is the whole of OPL-4630. It is
+        read from the guest process, and a start that has been ADMITTED has no
+        process yet: the memory is taken, the plan is checked, and the load is
+        running. For the whole of that window ``status`` reports what the
+        computer was — ``stopped`` for a cold boot, and ``suspended`` for a
+        resume, whose session record is spent only on the way out of a start
+        that worked.
+
+        ``running_ram_mb`` is what the account's running pool is charged, and it
+        is non-zero from admission rather than from boot. So a zero here is the
+        platform saying nothing has been admitted — as against an ordinary
+        ``stopped``, which says only that no process is up yet.
+
+        Three states, not two. Absent is a host that did not say: one too old to
+        report the field, one that could not be reached, or a response written
+        before the computer was read back. Absence is not a zero, and reading it
+        as one would refuse a wait on a sentence nobody uttered — so "cannot
+        tell" waits, which costs a timeout rather than a machine.
+        """
+        held = self._data.get("running_ram_mb")
+        return isinstance(held, (int, float)) and not isinstance(held, bool) and held == 0
+
     def _not_starting(self) -> MandalaError | None:
         """The states that will not become "running" without another call.
 
-        The three :meth:`Computer.wait_until_running` documents, in one place so
-        the sync and async loops cannot word them differently — and so they can
-        be asked of a CACHED payload as readily as of a fresh one, which is what
-        lets that wait answer an already-expired budget with something better
-        than a bare timeout (OPL-4232).
+        The states :meth:`Computer.wait_until_running` documents, in one place
+        so the sync and async loops cannot word them differently — and so they
+        can be asked of a CACHED payload as readily as of a fresh one, which is
+        what lets that wait answer an already-expired budget with something
+        better than a bare timeout (OPL-4232).
 
-        An ordinary ``stopped`` is deliberately absent: that is exactly what the
-        wait is for, since a caller who has just called ``start()`` holds a
-        handle that still says so.
+        Every lifecycle state here is qualified by :meth:`_nothing_admitted`,
+        because "will not become running without another call" is a claim about
+        an admission that has not happened rather than about a process that is
+        not up. An ordinary ``stopped`` used to be absent from this list for a
+        version of that reason — the wait is FOR a computer somebody is starting
+        — but absent it also spent the full budget on a computer nobody was, and
+        reported "still stopped" as though it had learned something. It is here
+        now, and it is the platform's word that lets it be (OPL-4629).
         """
         if self.build_failed:
             return MandalaError(
@@ -872,9 +902,21 @@ class ComputerFields:
         # reports a machine that is one call from running as a timeout — the
         # least informative answer available about the one case the caller can
         # fix in a line.
-        if self.is_suspended:
+        #
+        # Unless its resume is already loading, which reads as `suspended` for
+        # the whole of that load: telling that caller to call start() names a
+        # call they have already made.
+        if self.is_suspended and self._nothing_admitted():
             return MandalaError(
                 f"{self.id} is suspended and will not start on its own: call start() to resume it"
+            )
+        # And a stopped one, on the same terms. Nothing is said about
+        # `start_error` here: wait_until_running raises on that BEFORE its first
+        # refresh, because a refresh clears it, so a handle that still carries
+        # one never reaches this — see the note over that check.
+        if self.status == "stopped" and self._nothing_admitted():
+            return MandalaError(
+                f"{self.id} is stopped and will not start on its own: call start() to start it"
             )
         if self.is_building:
             return MandalaError(
@@ -890,7 +932,10 @@ class ComputerFields:
             )
         if self.start_error:
             return MandalaError(f"{self.id} did not start: {self.start_error}")
-        if self.status == "stopped":
+        # Qualified since OPL-4630: a start that has been admitted reads as
+        # stopped for its whole load, and its guest WILL answer shortly. Only a
+        # computer the platform says it is holding nothing for is refused.
+        if self.status == "stopped" and self._nothing_admitted():
             return MandalaError(
                 f"{self.id} is stopped and its guest cannot answer: call start() first"
             )
@@ -1667,9 +1712,17 @@ class Computer(ComputerFields):
         you need something inside the guest to be ready.
 
         Raises :class:`~mandala_computer.MandalaError` rather than waiting out
-        the timeout for the three states that will not become "running" on their
-        own — a failed build, a suspended session nobody has resumed, and a
-        create whose machine was made and would not boot.
+        the timeout for the states that will not become "running" on their own —
+        a failed build, a suspended session nobody has resumed, a stopped
+        computer nobody is starting, and a create whose machine was made and
+        would not boot.
+
+        "Nobody is" is the platform's word rather than an inference from
+        :attr:`status`, which is read from the guest process: a start that has
+        been admitted holds its memory before that process exists, and reads as
+        stopped or suspended meanwhile. This waits for one of those. A host that
+        does not report ``running_ram_mb`` at all is waited on too — see
+        :meth:`_nothing_admitted`.
         """
         check_wait_args(timeout, poll)
         # BEFORE the first refresh, because the refresh is what destroys the
@@ -1754,8 +1807,11 @@ class Computer(ComputerFields):
         when the platform named an interval, and a short floor when it did not
         (OPL-3724).
 
-        A stopped computer is also refused immediately, including one carrying
-        :attr:`start_error` from a failed boot. A suspended computer is not:
+        A stopped computer that the platform is holding nothing for is also
+        refused immediately, including one carrying :attr:`start_error` from a
+        failed boot — but one whose start has been admitted is waited for, since
+        it reads as stopped for the whole of its load. A suspended computer is
+        not refused either:
         running the probe counts as use and resumes its saved session.
         """
         check_wait_args(timeout, poll)

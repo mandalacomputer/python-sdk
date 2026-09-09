@@ -82,3 +82,97 @@ async def test_resume_failure_does_not_refresh_or_change_cached_state(asynchrono
                 computer.start(resume_only=True)
     assert computer.status == "suspended"
     assert start.call_count == len(respx.calls) == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("before", ["stopped", "suspended"])
+async def test_wait_until_running_waits_for_a_start_already_admitted(before) -> None:
+    """OPL-4629. A start that has been admitted holds its memory before QEMU
+    exists, and `status` reports what the computer WAS for the whole of that
+    load — stopped for a cold boot, suspended for a resume, whose session record
+    is spent only on the way out of a start that worked.
+
+    Refusing there tells a caller to make a call they have already made. The
+    long timeout is the test: it must not be reached either, since the machine
+    does come up.
+    """
+    polls = {"n": 0}
+
+    def read(request):
+        polls["n"] += 1
+        if polls["n"] < 3:
+            return httpx.Response(
+                200,
+                json={**COMPUTER, "status": before, "running_ram_mb": COMPUTER["ram_mb"]},
+            )
+        return httpx.Response(200, json=COMPUTER)
+
+    respx.get(f"{BASE}/computers/vm-1").mock(side_effect=read)
+    with mc.Client("gck_test", base_url=BASE) as client:
+        computer = mc.Computer(client._t, {**COMPUTER, "status": before})
+        assert computer.wait_until_running(timeout=30, poll=0).status == "running"
+
+
+@respx.mock
+async def test_wait_until_running_waits_when_the_platform_did_not_say() -> None:
+    """A host that could not be reached, or one too old to report the field, has
+    not said nothing is coming — it has said nothing. Refusing on that would be
+    inventing the sentence, so it waits, which costs a timeout rather than a
+    machine.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+    )
+    with mc.Client("gck_test", base_url=BASE) as client:
+        computer = mc.Computer(client._t, {**COMPUTER, "status": "stopped"})
+        with pytest.raises(mc.TimeoutError):
+            computer.wait_until_running(timeout=0.05, poll=0)
+
+
+@respx.mock
+async def test_wait_for_guest_probes_a_start_already_admitted() -> None:
+    """The guest of a machine that is coming up answers shortly; the refusal is
+    only for one the platform says it is holding nothing for.
+    """
+    probes = {"n": 0}
+
+    def probe(request):
+        probes["n"] += 1
+        if probes["n"] < 2:
+            return httpx.Response(409, json={"error": "the agent is not up yet"})
+        return httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
+
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=probe)
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(
+            200, json={**COMPUTER, "status": "stopped", "running_ram_mb": COMPUTER["ram_mb"]}
+        )
+    )
+    with mc.Client("gck_test", base_url=BASE) as client:
+        computer = mc.Computer(
+            client._t, {**COMPUTER, "status": "stopped", "running_ram_mb": COMPUTER["ram_mb"]}
+        )
+        assert computer.wait_for_guest(timeout=30, poll=0) is computer
+        assert probes["n"] == 2
+
+
+@respx.mock
+async def test_wait_until_running_refuses_a_computer_nobody_is_starting() -> None:
+    """The change OPL-4629 is actually for.
+
+    A stopped computer the platform says it is holding nothing for will not
+    become running on its own, and this wait used to spend its whole budget
+    discovering that before reporting "still 'stopped'" — a sentence that names
+    the state the caller already passed in. The long timeout is the test: it
+    must not be reached.
+    """
+    route = respx.get(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={**COMPUTER, "status": "stopped", "running_ram_mb": 0})
+    )
+    with mc.Client("gck_test", base_url=BASE) as client:
+        computer = mc.Computer(client._t, {**COMPUTER, "status": "stopped", "running_ram_mb": 0})
+        with pytest.raises(mc.MandalaError, match=r"stopped and will not start on its own"):
+            computer.wait_until_running(timeout=300, poll=0)
+    # One read, not a budget's worth: the refusal comes off the first fresh
+    # state rather than after repeated confirmation of the same one.
+    assert route.call_count == 1
