@@ -709,7 +709,7 @@ def _interact(url: str) -> int:
         # server-side and saying so is what makes that a feature — but the
         # status is unknown, and 0 would claim the command succeeded. The
         # daemon sends its exit frame precisely "so a client can tell 'your
-        # command exited' from a dropped network" (server/terminal.go), and
+        # command exited' from a dropped network", and
         # answering 0 here throws away the distinction it went out of its way
         # to draw. A script cannot reattach, and
         # a wrapper gating on this status must not ship on a build whose end

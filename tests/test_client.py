@@ -1792,7 +1792,7 @@ def test_a_terminal_row_is_a_record_rather_than_a_placeholder(client: mc.Client)
 
     `deleted` and `lost` rows are served from the record with no `status` and,
     unlike an unreachable row, NO `unreachable` key — the platform omits the
-    flag on a row it has finished with (`describeRow` in web/lib/computers.ts).
+    flag on a row it has finished with.
     The shape test alone read that as a placeholder and told callers not to
     believe the only description of the computer that will ever exist again.
     """
@@ -2617,9 +2617,9 @@ def test_geometry_it_could_not_read_is_none_rather_than_the_corner_of_the_screen
     A window really can be at x 0, so a coordinate this client could not read
     came back indistinguishable from the top-left corner — and the corner is
     where an agent then clicks. The daemon refuses the same shape at the origin:
-    `applyWindowGeom` requires all four and leaves out the row that fails it,
-    because "reporting it at the origin with no size is the 'plausible but
-    wrong' answer rather than a missing one" (OPL-4200).
+    it requires all four and leaves out the row that fails it, because
+    reporting a window at the origin with no size is the plausible-but-wrong
+    answer rather than a missing one (OPL-4200).
     """
     respx.get(f"{BASE}/computers/vm-1/windows").mock(
         httpx.Response(

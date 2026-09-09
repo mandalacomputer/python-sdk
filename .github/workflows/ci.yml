@@ -27,6 +27,12 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
+      # This repo is public and the platform it speaks to is not. Every batch of
+      # client fixes is written by reading that platform, and the reading leaves
+      # fingerprints — file names, internal function names — in comments that
+      # SHIP. OPL-4613 and OPL-4617 scrubbed two of these repos by hand and left
+      # nothing behind to catch the next one; this is that (OPL-4635).
+      - run: python3 scripts/check_internals.py
 
   test:
     runs-on: ubuntu-latest

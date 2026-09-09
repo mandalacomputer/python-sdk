@@ -419,7 +419,7 @@ def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
     describe is left out and the answer then carries "a window on this desktop
     could not be described, so this list is missing one that exists", on the
     reasoning that a prefix of a window list is a complete-looking answer that
-    is wrong (``server/windows.go``).
+    is wrong.
 
     The refusal stops here rather than moving into :meth:`Window.from_api`,
     which also runs on the event stream and has to stay total. See its docstring

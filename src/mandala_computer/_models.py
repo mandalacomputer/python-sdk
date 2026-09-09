@@ -1948,10 +1948,10 @@ class Window:
     #: decoder went on inventing it until OPL-4200.
     #:
     #: **The daemon already refuses it at the origin**, which is what makes the
-    #: floor a divergence rather than a house rule. ``applyWindowGeom``
-    #: (``server/windows.go``) requires all four and says why they are not
-    #: optional: "a window whose position this cannot read is a window a caller
-    #: cannot click, and reporting it at the origin with no size is the
+    #: floor a divergence rather than a house rule. The platform requires all
+    #: four for the same reason this does: a window whose position cannot be
+    #: read is a window a caller cannot click, and reporting it at the origin
+    #: with no size is the
     #: 'plausible but wrong' answer rather than a missing one." A row that fails
     #: it is left out of the listing and the answer then carries an error, and
     #: the guest broker's own decoder drops a window event the same way. So the

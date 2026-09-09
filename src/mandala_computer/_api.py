@@ -379,7 +379,7 @@ def build_params(no_reuse: bool) -> dict[str, str]:
     admits and a client sending ``false`` is sending something undocumented.
 
     An earlier comment here said the platform reads the key's PRESENCE, which is
-    false — ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` — and the
+    false — the platform compares the value against ``"true"`` — and the
     same false claim was repeated in the other two clients and pinned as a test
     docstring. The emitted request was right either way; the stated reason was
     not.
@@ -723,8 +723,8 @@ def delete_params(*, purge_snapshots: bool, expect: str | None) -> dict[str, str
     # Canonical BEFORE the emptiness check, and this is the guard where that
     # ordering matters most (/code-review, OPL-3835). ``__bool__`` is overridable
     # too, so a str subclass answering True here and "" to ``str()`` passed the
-    # check and put ``?expect=`` on the wire — and ``checkExpectation`` in
-    # server/vm.go reads an empty expectation as NO expectation, so the interlock
+    # check and put ``?expect=`` on the wire — and the platform reads an empty
+    # expectation as NO expectation, so the interlock
     # this function exists to enforce was silently disarmed on the one route that
     # destroys a computer and its snapshots together.
     text = canonical(expect, "expect") if expect is not None else ""
@@ -864,8 +864,8 @@ def rename_body(name: str) -> dict[str, Any]:
     return {"name": checked}
 
 
-#: Foreground wait ceiling, mirrored from ``execMaxTimeoutSec`` in
-#: ``server/api.go`` and checked by ``scripts/check_surface.py``.
+#: Foreground wait ceiling, mirrored from the platform's own bound and checked
+#: by ``scripts/check_surface.py``.
 MAX_EXEC_TIMEOUT_SECONDS = 600
 
 
@@ -934,9 +934,8 @@ def exec_body(
 
 
 #: The most environment entries an exec may carry, and the longest one entry
-#: may be. Both are the platform's bounds (``execMaxEnv`` / ``execMaxEnvLen`` in
-#: ``server/execbg.go``), and a value past either is a request the guest agent
-#: would refuse after the round trip.
+#: may be. Both are the platform's own bounds, and a value past either is a
+#: request the guest agent would refuse after the round trip.
 MAX_ENV_ENTRIES = 64
 MAX_ENV_ENTRY_BYTES = 4096
 
@@ -1091,10 +1090,11 @@ def window_body(
 #:
 #: Mirrored rather than left to the server, so a request that can only fail is
 #: not made, and kept in step by ``scripts/check_surface.py`` like
-#: :data:`MAX_STEPS`. The platform states this one in Go — ``clipboardWriteMax``
-#: in its ``server/clipboard.go`` — which the checker refused to read at first;
-#: the docstring here said "NOT machine-checked" instead, which is an admission
-#: rather than a check, so the reader learned Go and the sentence became true.
+#: :data:`MAX_STEPS`. The platform states this one on the host side rather than
+#: in the API reference, which the checker refused to read at first; the
+#: docstring here said "NOT machine-checked" instead, which is an admission
+#: rather than a check, so the checker learned to read it and the sentence
+#: became true.
 #: The number is not ours and is not arbitrary: the
 #: platform puts the text inside one argument of one command, Linux caps a single
 #: argv string at 128 KiB, and two layers of base64 stand between the text and
@@ -1460,7 +1460,7 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
 
 #: The platform's ceiling on ``max_steps``, mirrored.
 #:
-#: ``MAX_MAX_STEPS`` in the platform's ``web/lib/agent.ts``, and kept in step by
+#: The platform's own ceiling, kept in step by
 #: ``scripts/check_surface.py`` — a mirror nobody compares is a comment, and one
 #: that drifts refuses a run the platform would have taken.
 #:
@@ -1548,13 +1548,13 @@ def webhook_action(webhook_id: str, action: str) -> str:
 
 #: The platform's ceiling on a subscription's ``description``, mirrored so a
 #: caller is refused here rather than after a round trip — and checked against
-#: ``DESCRIPTION_MAX`` in ``web/lib/webhooks.ts`` by ``scripts/check_surface.py``,
-#: so the copy cannot drift unnoticed.
+#: the platform's own number by ``scripts/check_surface.py``, so the copy cannot
+#: drift unnoticed.
 WEBHOOK_DESCRIPTION_MAX = 200
-#: The ceiling on ``computers``, mirrored from ``COMPUTERS_MAX`` the same way.
+#: The ceiling on ``computers``, mirrored from the platform's own the same way.
 WEBHOOK_COMPUTERS_MAX = 64
-#: The replay window, mirrored from ``REPLAY_WINDOW_S`` in
-#: ``web/lib/webhooksign.ts``. Lives in ``_webhooks`` as the verifier's default
+#: The replay window, mirrored from the platform's own number. Lives in
+#: ``_webhooks`` as the verifier's default
 #: and is named here so the drift check, which reads every mirrored number off
 #: this module, sees it.
 WEBHOOK_REPLAY_WINDOW_S = 300

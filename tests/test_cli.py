@@ -1397,7 +1397,7 @@ def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch, ca
     work — that part is a feature and still says so on stderr. What it is not is
     evidence that the command succeeded. The daemon sends its exit frame
     precisely "so a client can tell 'your command exited' from a dropped
-    network" (server/terminal.go), and answering 0 here throws away the
+    network", and answering 0 here throws away the
     distinction it drew: a script cannot reattach, and
     a wrapper gating a deploy on this status would ship on a build whose end
     nobody saw (OPL-4479 BUG-29).

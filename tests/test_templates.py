@@ -193,7 +193,7 @@ def test_validate_carries_both_digests(client: mc.Client) -> None:
 def test_a_layered_document_is_told_why_it_has_no_build_digest(client: mc.Client) -> None:
     """`build_digest_needs` REPLACES `build_digest`; the two never both arrive.
 
-    `server/templateschema.go` is an if/else on `spec.from`. Decoding only the
+    The platform decides between them on `spec.from`. Decoding only the
     first left every layered document looking like a failure with no reason
     attached — the platform sends the reason, and this dropped it (OPL-4193).
 
@@ -472,7 +472,7 @@ def test_build_start_sends_bytes_and_reads_the_job(client: mc.Client) -> None:
 def test_no_reuse_is_sent_only_when_asked_for(client: mc.Client) -> None:
     """``no_reuse=true`` is the only spelling the platform acts on.
 
-    ``server/buildjob.go`` reads ``Get("no_reuse") == "true"`` and ``lib/apidoc``
+    The platform compares the value against ``"true"`` and the API reference
     gives the parameter ``enum: ['true']``, so the key is omitted rather than
     sent as ``false``. This docstring used to say the platform read the key's
     PRESENCE and that ``no_reuse=false`` forced a rebuild — the claim the fix
@@ -1045,8 +1045,8 @@ def test_the_purge_interlock_cannot_be_disarmed_by_a_str_subclass() -> None:
 
     ``delete_params`` still tested ``if not expect`` on the caller's object and
     sent that object, so a subclass answering True here and "" to ``str()`` put
-    ``?expect=`` on the wire — and ``checkExpectation`` in server/vm.go reads an
-    empty expectation as NO expectation. The interlock was silently disarmed on
+    ``?expect=`` on the wire — and the platform reads an empty expectation as
+    NO expectation. The interlock was silently disarmed on
     the one route that destroys a computer and its snapshots together.
     """
     sent = _api.delete_params(purge_snapshots=True, expect=Disarming("abc"))
