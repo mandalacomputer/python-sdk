@@ -122,14 +122,27 @@ class AsyncComputer(ComputerFields):
         )
         return self
 
-    async def start(self) -> AsyncComputer:
+    async def start(self, *, resume_only: bool = False) -> AsyncComputer:
         """Start this computer, or resume it if its session was suspended.
 
         A suspended computer does not boot: its saved RAM is read back and the
         same processes and windows come up roughly a second later. An ordinary
         stopped computer boots as usual.
+
+        With ``resume_only=True``, resume only if a saved session still exists.
+        A stopped computer without one stays stopped even when the request
+        succeeds. This method refreshes and returns the computer; inspect its
+        state rather than treating success as proof that it is running.
+        Do not chain a wait after a stopped no-op: ``wait_until_running()``
+        can time out, and ``wait_for_guest()`` rejects the stopped state. Call
+        ordinary ``start()`` first if you intend to boot it.
+
+        Requires a platform version that supports ``resume_only``. Older
+        servers may ignore the parameter and cold-boot a stopped computer.
         """
-        await self._t.request("POST", _api.computer_action(self.id, "start"))
+        await self._t.request(
+            "POST", _api.computer_action(self.id, "start"), params=_api.start_params(resume_only)
+        )
         return await self.refresh()
 
     async def stop(self, *, force: bool = False) -> AsyncComputer:
