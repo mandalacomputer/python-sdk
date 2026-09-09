@@ -1,4 +1,4 @@
-"""Start requests preserve the platform's resume-only no-op contract (OPL-4624)."""
+"""Start serialization and refresh against a resume-aware platform fake (OPL-4624)."""
 
 from __future__ import annotations
 
@@ -13,14 +13,21 @@ import mandala_computer as mc
 @respx.mock
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("options", [{}, {"resume_only": False}, {"resume_only": True}])
-@pytest.mark.parametrize(
-    ("before", "after"),
-    [("suspended", "running"), ("stopped", "stopped"), ("running", "running")],
-)
-async def test_start_query_and_refreshed_state(asynchronous, options, before, after):
-    start = respx.post(f"{BASE}/computers/vm-1/start").mock(httpx.Response(200, json={"ok": True}))
+@pytest.mark.parametrize("before", ["suspended", "stopped", "running"])
+async def test_start_query_and_refreshed_state(asynchronous, options, before):
+    # Model the supported server contract, not evidence of deployed support.
+    # Read the actual request so dropping the flag also changes the observed
+    # state: a stopped computer cold-boots unless resume_only=true was sent.
+    state = {**COMPUTER, "status": before}
+
+    def start_computer(request):
+        if request.url.params.get("resume_only") != "true" or state["status"] == "suspended":
+            state["status"] = "running"
+        return httpx.Response(200, json={"ok": True})
+
+    start = respx.post(f"{BASE}/computers/vm-1/start").mock(side_effect=start_computer)
     refresh = respx.get(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(200, json={**COMPUTER, "status": after})
+        side_effect=lambda request: httpx.Response(200, json=state)
     )
     if asynchronous:
         async with mc.AsyncClient("gck_test", base_url=BASE) as client:
@@ -32,7 +39,9 @@ async def test_start_query_and_refreshed_state(asynchronous, options, before, af
             result = computer.start(**options)
 
     assert result is computer
-    assert computer.status == after
+    assert computer.status == (
+        "stopped" if before == "stopped" and options.get("resume_only") else "running"
+    )
     assert start.call_count == refresh.call_count == 1
     request = start.calls.last.request
     assert dict(request.url.params) == (

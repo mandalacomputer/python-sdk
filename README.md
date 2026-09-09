@@ -282,6 +282,14 @@ stays stopped. The method refreshes and returns the computer; check its state
 when you need to know whether it is running. The async client accepts the same
 keyword. Omit it (or pass `False`) for the ordinary start behavior.
 
+After a stopped no-op, do not chain `wait_until_running()` or `wait_for_guest()`:
+the former can poll until its timeout, and the latter rejects the stopped state.
+Call ordinary `start()` first if you intend to boot the computer.
+
+This option requires platform support for `resume_only`. Older servers may
+ignore the parameter and cold-boot a stopped computer; the SDK cannot infer
+support from a successful response.
+
 `stop()` asks the guest to shut down and gives it time to. `stop(force=True)`
 skips the asking and pulls the power — the equivalent of holding the button in.
 It is what to reach for when a guest will not come down on its own, and it loses

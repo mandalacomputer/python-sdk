@@ -133,6 +133,12 @@ class AsyncComputer(ComputerFields):
         A stopped computer without one stays stopped even when the request
         succeeds. This method refreshes and returns the computer; inspect its
         state rather than treating success as proof that it is running.
+        Do not chain a wait after a stopped no-op: ``wait_until_running()``
+        can time out, and ``wait_for_guest()`` rejects the stopped state. Call
+        ordinary ``start()`` first if you intend to boot it.
+
+        Requires a platform version that supports ``resume_only``. Older
+        servers may ignore the parameter and cold-boot a stopped computer.
         """
         await self._t.request(
             "POST", _api.computer_action(self.id, "start"), params=_api.start_params(resume_only)
