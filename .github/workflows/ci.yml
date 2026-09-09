@@ -19,6 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The commit-message half of check_internals needs the base branch to
+          # diff against; the default shallow clone has no origin/main.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -32,7 +36,14 @@ jobs:
       # fingerprints — file names, internal function names — in comments that
       # SHIP. OPL-4613 and OPL-4617 scrubbed two of these repos by hand and left
       # nothing behind to catch the next one; this is that (OPL-4635).
+      #
+      # Both halves. A commit message is public the moment it is pushed, and
+      # three of the five references found in the batch that prompted this were
+      # in messages and PR descriptions rather than in files — which the file
+      # scan cannot see. Needs the full history, hence fetch-depth above.
       - run: python3 scripts/check_internals.py
+      - run: python3 scripts/check_internals.py --messages origin/${{ github.event.pull_request.base.ref || 'main' }}..HEAD
+        if: github.event_name == 'pull_request'
 
   test:
     runs-on: ubuntu-latest

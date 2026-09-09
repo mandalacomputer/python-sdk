@@ -47,8 +47,8 @@ __all__ = ["REPLAY_WINDOW_S", "SECRET_PREFIX", "verify"]
 #: How far, in seconds either side of the receiver's clock, a delivery's
 #: ``webhook-timestamp`` may lie and still be accepted. The platform's own
 #: number, which is also what the specification recommends and what Stripe's
-#: verifier defaults to,
-#: so every library a receiver might reach for already enforces it. Together
+#: verifier defaults to, so every library a receiver might reach for already
+#: enforces it. Together
 #: with a receiver that remembers each accepted ``webhook-id`` for this long,
 #: it closes every replay there is: a captured request older than the window
 #: is refused on the timestamp before the id is consulted, so the memory a

@@ -231,7 +231,8 @@ def test_canonical_is_the_bytes_the_doc_digest_was_taken_over(client: mc.Client)
     """A string, not a parsed object, and that is what makes it checkable.
 
     `doc_digest` is `sha256:` + the hex of sha256 over exactly these bytes
-    (`TemplateDoc.Canonical` / `DocDigest`), so a caller can verify the binding
+    (the canonical serialisation the platform hashes), so a caller can verify
+    the binding
     rather than trust the platform to have hashed honestly. A mapping could not
     do this: re-serialising one does not reproduce the bytes that were hashed,
     which is why `PublishedTemplate.document` cannot be used the same way.
@@ -808,8 +809,8 @@ def _fleet_partly_down(rows: list[dict[str, str]] | None = None) -> respx.Route:
     """A build listing the fleet could only half answer.
 
     Strict without ``allow_partial`` and short with it, which is the platform's
-    own behaviour: ``forward`` in lib/surface turns any response carrying
-    ``X-GC-Incomplete`` into a 503 unless the request opted in.
+    own behaviour: it turns any response carrying ``X-GC-Incomplete`` into a 503
+    unless the request opted in.
 
     ``rows`` is what short LOOKS like for builds — fewer rows and nothing
     marking what is gone. The platform keeps no record of which hypervisor ran
@@ -1016,7 +1017,7 @@ def test_a_template_row_carries_its_ref() -> None:
     """Since OPL-3789 a published template is named by its ref and nothing else.
 
     A listing that drops it cannot tell a caller how to launch their own
-    template, which is what the platform's publicTemplate publishes it for.
+    template, which is what the platform publishes it for.
     """
     t = mc.Template.from_api({"name": "devbox", "ref": "acc-1/devbox@1.0.0"})
     assert t.ref == "acc-1/devbox@1.0.0"

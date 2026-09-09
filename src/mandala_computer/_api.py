@@ -264,9 +264,9 @@ def guest_pid(pid: object) -> int:
 def exec_handle(computer_id: str, pid: int) -> str:
     """A backgrounded command, addressed by the guest pid ``exec`` answered with.
 
-    Not ``computer_action``: the pid is a second path segment, and the platform's
-    own ``patternFor`` reduces it to ``:pid`` rather than to ``:id`` — it names
-    something inside a computer rather than a thing the platform owns.
+    Not ``computer_action``: the pid is a second path segment, and the platform
+    reduces it to ``:pid`` rather than to ``:id`` — it names something inside a
+    computer rather than a thing the platform owns.
     """
     return f"computers/{seg(computer_id)}/exec/{guest_pid(pid)}"
 
@@ -300,8 +300,8 @@ def template_ref(namespace: str, name: str) -> str:
 #:
 #: Matched with ``fullmatch``, not ``match``: Python's ``$`` also matches just
 #: before a trailing newline, so ``"1.0.0\n"`` satisfied the anchored pattern and
-#: was sent as ``?version=1.0.0%0A``. The platform's own ``wellFormedVersion``
-#: uses a JavaScript regex, where ``$`` is end-of-input, so it answers 400 — the
+#: was sent as ``?version=1.0.0%0A``. The platform anchors the same grammar in
+#: JavaScript, where ``$`` is end-of-input, so it answers 400 — the
 #: exact round trip this guard exists to save. Two languages, one grammar, and
 #: the anchors are not the same.
 _VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
@@ -374,8 +374,8 @@ def build_params(no_reuse: bool) -> dict[str, str]:
     """``no_reuse``, sent only when it is asked for.
 
     Omitted rather than sent as ``false``, and the reason is the documented
-    schema rather than a claim about the parser: ``lib/apidoc`` gives this
-    parameter ``enum: ['true']``, so ``true`` is the only value the reference
+    schema rather than a claim about the parser: the API reference gives this
+    parameter ``enum: ['true']``, so ``true`` is the only value it
     admits and a client sending ``false`` is sending something undocumented.
 
     An earlier comment here said the platform reads the key's PRESENCE, which is
@@ -441,8 +441,8 @@ def is_absolute_guest_path(path: str) -> bool:
 
     Nothing here knows which OS the guest runs — a ``Computer`` does not say —
     and the two families disagree about what absolute means. A leading ``/`` is
-    absolute on Linux and *drive-relative* on Windows, where the daemon's own
-    ``validGuestPath`` refuses it and wants ``C:\...`` or a ``\\`` UNC share. So
+    absolute on Linux and *drive-relative* on Windows, where the daemon refuses
+    it and wants ``C:\...`` or a ``\\`` UNC share. So
     both spellings pass here and the server, which does know which guest it is
     talking to, keeps the final say.
 
@@ -948,7 +948,7 @@ def _env_object(env: Mapping[str, str]) -> dict[str, str]:
     the agent never asked for, an empty name or a ``=`` inside one splits the
     entry at the wrong place, and a NUL is dropped rather than refused. Both
     produce a command that runs with an environment nobody asked for and reports
-    success. Mirrored from the platform's ``execEnvList``, for the same reason
+    success. Mirrored from the platform's own rule, for the same reason
     :func:`canonical` is.
 
     A copy because the body is built once and sent later: a caller that mutates
@@ -1460,9 +1460,8 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
 
 #: The platform's ceiling on ``max_steps``, mirrored.
 #:
-#: The platform's own ceiling, kept in step by
-#: ``scripts/check_surface.py`` — a mirror nobody compares is a comment, and one
-#: that drifts refuses a run the platform would have taken.
+#: Kept in step by ``scripts/check_surface.py`` — a mirror nobody compares is a
+#: comment, and one that drifts refuses a run the platform would have taken.
 #:
 #: Capped rather than obeyed for the reason the platform gives: each step is a
 #: model call plus a screenshot on the caller's own key, so a ``max_steps`` of
@@ -1548,15 +1547,14 @@ def webhook_action(webhook_id: str, action: str) -> str:
 
 #: The platform's ceiling on a subscription's ``description``, mirrored so a
 #: caller is refused here rather than after a round trip — and checked against
-#: the platform's own number by ``scripts/check_surface.py``, so the copy cannot
-#: drift unnoticed.
+#: the platform's own number by ``scripts/check_surface.py``, so the copy
+#: cannot drift unnoticed.
 WEBHOOK_DESCRIPTION_MAX = 200
 #: The ceiling on ``computers``, mirrored from the platform's own the same way.
 WEBHOOK_COMPUTERS_MAX = 64
 #: The replay window, mirrored from the platform's own number. Lives in
-#: ``_webhooks`` as the verifier's default
-#: and is named here so the drift check, which reads every mirrored number off
-#: this module, sees it.
+#: ``_webhooks`` as the verifier's default and is named here so the drift check,
+#: which reads every mirrored number off this module, sees it.
 WEBHOOK_REPLAY_WINDOW_S = 300
 
 

@@ -601,7 +601,7 @@ def test_the_reason_rides_on_the_base_class_not_on_the_conflict() -> None:
 def test_a_move_offer_still_outranks_its_reason() -> None:
     """`MoveRequiredError` is a decision, and it is checked before the word.
 
-    The platform deliberately gives `errResumeNeeded` and the move refusals no
+    The platform deliberately gives the resume-needed and move refusals no
     `reason` — but if one ever gained a transient-looking word, this ordering is
     what stops a resize past what a host can run becoming retry advice again.
     """
