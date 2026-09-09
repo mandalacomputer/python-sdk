@@ -282,9 +282,11 @@ stays stopped. The method refreshes and returns the computer; check its state
 when you need to know whether it is running. The async client accepts the same
 keyword. Omit it (or pass `False`) for the ordinary start behavior.
 
-After a stopped no-op, do not chain `wait_until_running()` or `wait_for_guest()`:
-the former can poll until its timeout, and the latter rejects the stopped state.
-Call ordinary `start()` first if you intend to boot the computer.
+After a stopped no-op, do not chain `wait_until_running()` or `wait_for_guest()`.
+Both reject a stopped computer the platform reports it is holding nothing for,
+which is the ordinary case here; where it reports nothing at all they wait
+instead, and spend the whole timeout. Call ordinary `start()` if you intend to
+boot the computer.
 
 This option requires platform support for `resume_only`. Older servers may
 ignore the parameter and cold-boot a stopped computer; the SDK cannot infer
@@ -1263,10 +1265,13 @@ public address — a private, loopback or link-local one is a 400 at create.
 - `wait_until_built()` — a cloned computer's disk has been copied. Only clones
   need this; it returns at once for anything else.
 - `wait_until_running()` — the VM is up. The guest OS is still booting. Raises
-  rather than waiting out the timeout on a failed build, or on a suspended or
-  stopped computer the platform is holding nothing for — none of which becomes
-  "running" on its own. A start it HAS admitted is waited for, since a boot
-  reads as stopped and a resume as suspended until the guest process exists.
+  rather than waiting out the timeout on a failed build, or on a suspended,
+  stopped or still-building computer the platform is holding nothing for — none
+  of which becomes "running" on its own. A start it HAS admitted is waited for,
+  since a boot reads as stopped and a resume as suspended until the guest
+  process exists; so is a memory-snapshot fork, which reserves its RAM at the
+  start of its disk copy and resumes itself at the end of it while reporting
+  `building` throughout.
 - `wait_for_guest()` — the guest agent answers. Linux and Windows both; the probe
   is `exit 0`, which bash and cmd.exe both have as a builtin. A failed start, or
   a stopped computer nobody is starting, is reported immediately. A suspended

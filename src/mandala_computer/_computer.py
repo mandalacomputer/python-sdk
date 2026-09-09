@@ -885,12 +885,21 @@ class ComputerFields:
         what lets that wait answer an already-expired budget with something
         better than a bare timeout (OPL-4232).
 
-        The two POWER states here are qualified by :meth:`_nothing_admitted`,
-        because "will not become running without another call" is a claim about
-        an admission that has not happened rather than about a process that is
-        not up. A failed build and a build still running are not: neither is a
-        machine anybody can admit a start for, so no reservation can exist to
-        change the answer. An ordinary ``stopped`` used to be absent from this list for a
+        Every state here except a FAILED build is qualified by
+        :meth:`_nothing_admitted`, because "will not become running without
+        another call" is a claim about an admission that has not happened rather
+        than about a process that is not up.
+
+        Including ``building``, which is not the special case it looks like. A
+        memory-snapshot fork reserves its RAM at the START of its disk copy and
+        resumes itself at the end of it — ``reserveBuild`` takes the hold and
+        publishes ``building`` over the top of it — so a fork mid-copy reports
+        exactly this state with a live reservation, and telling that caller to
+        call ``start()`` names a call the platform is already making for them.
+        A plain clone reserves nothing and still gets the answer it always did.
+
+        A failed build is the one absolute: its disk copy is over and nothing
+        will start it, so no reservation could change the answer. An ordinary ``stopped`` used to be absent from this list for a
         version of that reason — the wait is FOR a computer somebody is starting
         — but absent it also spent the full budget on a computer nobody was, and
         reported "still stopped" as though it had learned something. It is here
@@ -920,7 +929,7 @@ class ComputerFields:
             return MandalaError(
                 f"{self.id} is stopped and will not start on its own: call start() to start it"
             )
-        if self.is_building:
+        if self.is_building and self._nothing_admitted():
             return MandalaError(
                 f"{self.id} is still building: call wait_until_built(), then start()"
             )

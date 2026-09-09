@@ -25,6 +25,10 @@ BUILDING = {
     "id": "vm-new",
     "name": "from-snap",
     "status": "building",
+    # A plain clone: nothing is reserved for it, so it will not start itself and
+    # the caller is the one who has to (OPL-4629). A memory fork reports the
+    # same status with a live reservation and is waited for instead.
+    "running_ram_mb": 0,
     "os": "windows",
     "template": "windows",
     "cpu": 4,
@@ -247,3 +251,26 @@ def test_conflict_is_distinct_from_a_plan_limit_and_a_plain_error(
     # And a ConflictError is not mistaken for one by an except clause upstream.
     assert not issubclass(mc.ConflictError, mc.PlanLimitError)
     assert issubclass(mc.ConflictError, mc.APIError)
+
+
+@respx.mock
+def test_wait_until_running_waits_for_a_memory_fork_that_resumes_itself(
+    client: mc.Client,
+) -> None:
+    """A memory-snapshot fork reserves its RAM at the START of its disk copy and
+    resumes itself at the end of it — the platform's reserveBuild takes the hold
+    and publishes `building` over the top of it. So a fork mid-copy reports this
+    state with a live reservation, and "call wait_until_built(), then start()"
+    named a call the platform was already making (Codex review of #81).
+    """
+    fork = {**BUILDING, "running_ram_mb": BUILDING["ram_mb"]}
+    reads = {"n": 0}
+
+    def read(request: httpx.Request) -> httpx.Response:
+        reads["n"] += 1
+        if reads["n"] < 3:
+            return httpx.Response(200, json=fork)
+        return httpx.Response(200, json={**fork, "status": "running"})
+
+    respx.get(f"{BASE}/computers/vm-new").mock(side_effect=read)
+    assert mc.Computer(client._t, fork).wait_until_running(timeout=30, poll=0).status == "running"
