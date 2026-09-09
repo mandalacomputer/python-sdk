@@ -885,10 +885,12 @@ class ComputerFields:
         what lets that wait answer an already-expired budget with something
         better than a bare timeout (OPL-4232).
 
-        Every lifecycle state here is qualified by :meth:`_nothing_admitted`,
+        The two POWER states here are qualified by :meth:`_nothing_admitted`,
         because "will not become running without another call" is a claim about
         an admission that has not happened rather than about a process that is
-        not up. An ordinary ``stopped`` used to be absent from this list for a
+        not up. A failed build and a build still running are not: neither is a
+        machine anybody can admit a start for, so no reservation can exist to
+        change the answer. An ordinary ``stopped`` used to be absent from this list for a
         version of that reason — the wait is FOR a computer somebody is starting
         — but absent it also spent the full budget on a computer nobody was, and
         reported "still stopped" as though it had learned something. It is here

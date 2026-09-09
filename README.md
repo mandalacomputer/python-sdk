@@ -308,8 +308,12 @@ next: `screenshot()` keeps answering, while `clipboard()` starts raising
 `ConflictError`, because a suspended computer has no clipboard to read. Drive
 the desktop, or accept the resume.
 
-`wait_until_running()` raises rather than spinning if it finds a suspended
-computer, because that state does not resolve on its own — `start()` is the fix.
+`wait_until_running()` raises rather than spinning if it finds a suspended or
+stopped computer **that nobody is starting**, because that state does not
+resolve on its own — `start()` is the fix. One whose start the platform has
+already admitted is waited for: a boot reads as stopped and a resume as
+suspended until the guest process exists, so those two statuses do not say on
+their own whether anything is coming.
 
 ### Showing somebody the desktop
 
@@ -1259,12 +1263,20 @@ public address — a private, loopback or link-local one is a 400 at create.
 - `wait_until_built()` — a cloned computer's disk has been copied. Only clones
   need this; it returns at once for anything else.
 - `wait_until_running()` — the VM is up. The guest OS is still booting. Raises
-  rather than waiting out the timeout on a failed build or a suspended session,
-  neither of which becomes "running" on its own.
+  rather than waiting out the timeout on a failed build, or on a suspended or
+  stopped computer the platform is holding nothing for — none of which becomes
+  "running" on its own. A start it HAS admitted is waited for, since a boot
+  reads as stopped and a resume as suspended until the guest process exists.
 - `wait_for_guest()` — the guest agent answers. Linux and Windows both; the probe
-  is `exit 0`, which bash and cmd.exe both have as a builtin. A failed start or
-  stopped computer is reported immediately. A suspended computer is different:
-  the probe is an `exec()`, so it resumes the session as use normally does.
+  is `exit 0`, which bash and cmd.exe both have as a builtin. A failed start, or
+  a stopped computer nobody is starting, is reported immediately. A suspended
+  computer is different: the probe is an `exec()`, so it resumes the session as
+  use normally does.
+
+Both waits read `running_ram_mb` to tell those apart, and treat its ABSENCE as
+unknown rather than as zero: a host too old to report it, or one that could not
+be reached, has not said nothing is coming. Waiting there costs a timeout;
+refusing would cost a machine.
 
 The last of those is about the agent, not the desktop, and the agent answers
 first — on Windows by a wide margin, since it runs in session 0 and replies
