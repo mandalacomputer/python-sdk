@@ -1512,6 +1512,11 @@ def agent_body(
     return body
 
 
+def start_params(resume_only: bool) -> dict[str, Any] | None:
+    """Only resume a saved session; never cold-boot when the flag is set."""
+    return {"resume_only": "true"} if flag(resume_only, "resume_only") else None
+
+
 def stop_params(force: bool) -> dict[str, Any] | None:
     """``force=true`` pulls the power instead of asking the guest to shut down.
 

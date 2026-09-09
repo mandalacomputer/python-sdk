@@ -154,7 +154,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:idle_suspend_min",
     },
     "DELETE computers/:id": {"query:snapshots", "query:expect"},
-    "POST computers/:id/start": set(),
+    "POST computers/:id/start": {"query:resume_only"},
     "POST computers/:id/stop": {"query:force"},
     "POST computers/:id/suspend": set(),
     "POST computers/:id/restart": set(),

@@ -276,6 +276,12 @@ c.start()  # resumes it; ~1s, not a boot
 c.stop()  # discards the session instead
 ```
 
+`start(resume_only=True)` resumes a saved session without cold-booting a stopped
+computer. If no saved session remains, the request succeeds and the computer
+stays stopped. The method refreshes and returns the computer; check its state
+when you need to know whether it is running. The async client accepts the same
+keyword. Omit it (or pass `False`) for the ordinary start behavior.
+
 `stop()` asks the guest to shut down and gives it time to. `stop(force=True)`
 skips the asking and pulls the power — the equivalent of holding the button in.
 It is what to reach for when a guest will not come down on its own, and it loses
