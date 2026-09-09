@@ -176,3 +176,39 @@ async def test_wait_until_running_refuses_a_computer_nobody_is_starting() -> Non
     # One read, not a budget's worth: the refusal comes off the first fresh
     # state rather than after repeated confirmation of the same one.
     assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_budget_spent_on_failed_reads_times_out_rather_than_refusing(
+    asynchronous,
+) -> None:
+    """Codex review of #81. The refusal is a claim about what the platform is
+    doing NOW, and a wait whose every refresh failed has learned nothing: the
+    cached `running_ram_mb: 0` it would refuse on may predate a start another
+    caller has since made.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(503, json={"error": "host is down"}))
+    stale = {**COMPUTER, "status": "stopped", "running_ram_mb": 0}
+    if asynchronous:
+        async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+            computer = mc.AsyncComputer(client._t, stale)
+            with pytest.raises(mc.TimeoutError, match="could not be read"):
+                await computer.wait_until_running(timeout=0.05, poll=0)
+    else:
+        with mc.Client("gck_test", base_url=BASE) as client:
+            computer = mc.Computer(client._t, stale)
+            with pytest.raises(mc.TimeoutError, match="could not be read"):
+                computer.wait_until_running(timeout=0.05, poll=0)
+
+
+@respx.mock
+async def test_a_zero_budget_still_answers_from_the_cached_payload() -> None:
+    """The documented exception the fix must not take away (OPL-4232): with no
+    budget at all there is nothing to read, so the snapshot the caller passed in
+    is the only thing that can answer, and naming the state beats a bare timeout.
+    """
+    with mc.Client("gck_test", base_url=BASE) as client:
+        computer = mc.Computer(client._t, {**COMPUTER, "status": "stopped", "running_ram_mb": 0})
+        with pytest.raises(mc.MandalaError, match="will not start on its own"):
+            computer.wait_until_running(timeout=0, poll=0)

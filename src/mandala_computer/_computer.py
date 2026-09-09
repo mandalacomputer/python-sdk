@@ -1742,6 +1742,19 @@ class Computer(ComputerFields):
         if self.start_error:
             raise MandalaError(f"{self.id} did not start: {self.start_error}")
         deadline = time.monotonic() + timeout
+        # Whether any refresh in THIS call answered. The cached-payload branch
+        # below is written for an already-expired budget, where the snapshot the
+        # caller passed in is all there is (OPL-4232) — but it is also reached
+        # after a positive budget has been spent on refreshes that all failed,
+        # and there the snapshot can be arbitrarily old.
+        #
+        # That mattered once `stopped` became refusable (Codex review of #81).
+        # A handle cached at `running_ram_mb: 0`, a host answering 503 for the
+        # whole wait, and another caller starting the machine in the meantime
+        # produced "it is stopped, call start()" — a refusal built on a reading
+        # from before the start, about a computer that is coming up. A timeout
+        # is the honest answer there: nothing was learned.
+        observed = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1753,6 +1766,14 @@ class Computer(ComputerFields):
                         return self
                     raise TimeoutError(
                         f"{self.id} could not be confirmed running after {timeout:g}s"
+                    )
+                # And nor can they establish the opposite. The refusals below
+                # are about what the platform is doing now; on a budget that was
+                # spent without one landing, this call knows nothing new.
+                if timeout != 0 and not observed:
+                    raise TimeoutError(
+                        f"{self.id} could not be read in {timeout:g}s; when it last answered it "
+                        f"was {self.status!r}"
                     )
                 failure = self._not_starting()
                 if failure is not None:
@@ -1766,6 +1787,7 @@ class Computer(ComputerFields):
                 # what had happened was a single poll not landing (OPL-3724).
                 time.sleep(_ride_out(err, deadline, poll))
                 continue
+            observed = True
             # The FRESHLY READ state, judged by the same two questions the
             # expired-budget branch above asks of the cached one — written once
             # each so the two answers cannot drift.
