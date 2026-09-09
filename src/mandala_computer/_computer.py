@@ -892,11 +892,11 @@ class ComputerFields:
 
         Including ``building``, which is not the special case it looks like. A
         memory-snapshot fork reserves its RAM at the START of its disk copy and
-        resumes itself at the end of it — ``reserveBuild`` takes the hold and
-        publishes ``building`` over the top of it — so a fork mid-copy reports
-        exactly this state with a live reservation, and telling that caller to
-        call ``start()`` names a call the platform is already making for them.
-        A plain clone reserves nothing and still gets the answer it always did.
+        resumes itself at the end of it, reporting ``building`` throughout — so
+        a fork mid-copy is this state with a live reservation, and telling that
+        caller to call ``start()`` names a call the platform is already making
+        for them. A plain clone reserves nothing and still gets the answer it
+        always did.
 
         A failed build is the one absolute: its disk copy is over and nothing
         will start it, so no reservation could change the answer. An ordinary ``stopped`` used to be absent from this list for a

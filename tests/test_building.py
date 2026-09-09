@@ -257,11 +257,11 @@ def test_conflict_is_distinct_from_a_plan_limit_and_a_plain_error(
 def test_wait_until_running_waits_for_a_memory_fork_that_resumes_itself(
     client: mc.Client,
 ) -> None:
-    """A memory-snapshot fork reserves its RAM at the START of its disk copy and
-    resumes itself at the end of it — the platform's reserveBuild takes the hold
-    and publishes `building` over the top of it. So a fork mid-copy reports this
-    state with a live reservation, and "call wait_until_built(), then start()"
-    named a call the platform was already making (Codex review of #81).
+    """A memory-snapshot fork reserves its RAM at the START of its disk
+    copy and resumes itself at the end of it, reporting `building` throughout.
+    So a fork mid-copy is this state with a live reservation, and "call
+    wait_until_built(), then start()" named a call the platform was already
+    making.
     """
     fork = {**BUILDING, "running_ram_mb": BUILDING["ram_mb"]}
     reads = {"n": 0}
