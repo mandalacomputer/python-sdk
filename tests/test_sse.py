@@ -208,6 +208,70 @@ def test_an_unbounded_frame_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     assert MAX_SSE_BUFFER > 0
 
 
+def test_complete_frames_and_tail_do_not_share_the_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mandala_computer._sse.MAX_SSE_BUFFER", 16)
+    decoder = SSEDecoder()
+    events = decoder.feed(b"data: one\n\ndata: two\n\ndata: three")
+    assert [event.data for event in events] == ["one", "two"]
+    tail = decoder.flush()
+    assert tail is not None and tail.data == "three"
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"])
+def test_exact_frame_limit_is_independent_of_every_byte_split(
+    monkeypatch: pytest.MonkeyPatch, ending: str, bom: bytes
+) -> None:
+    # The allowance includes both normalized terminating newlines and counts
+    # decoded characters, so UTF-8 bytes and CRLF bytes do not spend extra.
+    text = "é" * 8
+    monkeypatch.setattr("mandala_computer._sse.MAX_SSE_BUFFER", len(f"data: {text}\n\n"))
+    wire = bom + f"data: {text}{ending}{ending}".encode()
+    for split in range(len(wire) + 1):
+        assert drain(wire[:split], wire[split:]) == [("message", text)]
+    assert drain(*(wire[i : i + 1] for i in range(len(wire)))) == [("message", text)]
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("terminated", [False, True])
+def test_oversized_frame_is_refused_at_every_byte_split(
+    monkeypatch: pytest.MonkeyPatch, ending: str, terminated: bool
+) -> None:
+    wire = ("data: " + "é" * 9 + (ending * 2 if terminated else "")).encode()
+    normalized_size = 15 + (2 if terminated else 0)
+    monkeypatch.setattr("mandala_computer._sse.MAX_SSE_BUFFER", normalized_size - 1)
+    for split in range(len(wire) + 1):
+        with pytest.raises(mc.MandalaError, match="frame limit"):
+            drain(wire[:split], wire[split:])
+
+
+@pytest.mark.parametrize("terminated", [False, True])
+def test_valid_prefix_does_not_hide_an_oversized_frame(
+    monkeypatch: pytest.MonkeyPatch, terminated: bool
+) -> None:
+    monkeypatch.setattr("mandala_computer._sse.MAX_SSE_BUFFER", 16)
+    oversized = b"data: " + b"x" * 17 + (b"\n\n" if terminated else b"")
+    with pytest.raises(mc.MandalaError, match="frame limit"):
+        SSEDecoder().feed(b"data: ok\n\n" + oversized)
+
+
+@pytest.mark.parametrize("limit", [8, 9])
+def test_final_utf8_replacement_counts_towards_the_tail_limit(
+    monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    monkeypatch.setattr("mandala_computer._sse.MAX_SSE_BUFFER", limit)
+    decoder = SSEDecoder()
+    assert decoder.feed(b"data: xx\xe2") == []
+    if limit == 8:
+        with pytest.raises(mc.MandalaError, match="frame limit"):
+            decoder.flush()
+    else:
+        tail = decoder.flush()
+        assert tail is not None and tail.data == "xx�"
+
+
 def test_a_terminal_chunk_is_flagged_so_keepalives_are_not_read() -> None:
     """Post-done keepalives reset the idle timer; the chunk flag is what stops it.
 

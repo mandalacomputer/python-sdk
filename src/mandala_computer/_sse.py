@@ -33,6 +33,9 @@ SSE_TERMINAL_EVENTS = frozenset({"done", "error"})
 #: payload bigger than this, is not a run — it is a process growing without
 #: bound. Sibling transports already cap a websocket frame; this is the same
 #: kind of bound for SSE.
+#: Counts decoded characters after newline normalization, including the blank
+#: line that terminates a complete frame. Each frame and the incomplete tail
+#: have their own allowance, independent of HTTP chunk boundaries.
 MAX_SSE_BUFFER = 1 << 24  # 16 MiB
 
 
@@ -60,6 +63,14 @@ def feed_chunk(decoder: SSEDecoder, chunk: bytes) -> tuple[list[SSEEvent], bool]
     """
     events = decoder.feed(chunk)
     return events, any(event.event in SSE_TERMINAL_EVENTS for event in events)
+
+
+def _check_frame_size(size: int) -> None:
+    if size > MAX_SSE_BUFFER:
+        raise MandalaError(
+            f"agent stream event exceeded the {MAX_SSE_BUFFER // (1024 * 1024)} MiB "
+            "client frame limit"
+        )
 
 
 def parse_event(chunk: str) -> SSEEvent | None:
@@ -139,20 +150,22 @@ class SSEDecoder:
         if text.endswith("\r"):
             self._swallow_lf = True
         self._buffer += text.replace("\r\n", "\n").replace("\r", "\n")
-        if len(self._buffer) > MAX_SSE_BUFFER:
-            raise MandalaError(
-                f"agent stream event exceeded the {MAX_SSE_BUFFER // (1024 * 1024)} MiB "
-                "client frame limit"
-            )
         events = []
+        start = 0
         while True:
-            sep = self._buffer.find("\n\n")
+            sep = self._buffer.find("\n\n", start)
+            end = len(self._buffer) if sep == -1 else sep + 2
+            _check_frame_size(end - start)
             if sep == -1:
                 break
-            frame, self._buffer = self._buffer[:sep], self._buffer[sep + 2 :]
-            event = parse_event(frame)
+            event = parse_event(self._buffer[start:sep])
             if event is not None:
                 events.append(event)
+            start = end
+        # Keep only the tail, once: a decompressed chunk may contain many
+        # complete frames, and copying every remaining suffix would make a
+        # burst increasingly expensive as its event count grows.
+        self._buffer = self._buffer[start:]
         return events
 
     def flush(self) -> SSEEvent | None:
@@ -170,6 +183,7 @@ class SSEDecoder:
         until it is empty, and this is what empties it.
         """
         self._buffer += self._decoder.decode(b"", final=True)
+        _check_frame_size(len(self._buffer))
         tail, self._buffer = self._buffer, ""
         # The CR-swallow goes with the buffer. This method's own claim is that a
         # decoder is a thing you feed until it is empty and that this is what
