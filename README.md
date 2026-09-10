@@ -15,6 +15,28 @@ pip install mandala-computer
 Python 3.10 or newer. The install also puts a `mandala` command on your PATH —
 see [The `mandala` CLI](#the-mandala-cli).
 
+If that command answers `error: externally-managed-environment`, nothing is
+wrong: the Python you are asking is managed by something else — Homebrew on a
+Mac, the distribution's package manager on Linux — and refuses to install into
+itself ([PEP 668](https://peps.python.org/pep-0668/)). Install into a virtual
+environment instead:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate   # fish: source .venv/bin/activate.fish
+pip install mandala-computer
+```
+
+For the `mandala` command on your PATH rather than the library in a project,
+let a tool manager own the environment:
+
+```sh
+pipx install mandala-computer   # or: uv tool install mandala-computer
+```
+
+Do not reach for `--break-system-packages`. It does what it says to the Python
+the rest of your system is depending on.
+
 ## Use
 
 Authentication is an API key from the dashboard (Settings → API keys), read from
