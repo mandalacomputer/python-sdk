@@ -85,10 +85,20 @@ def _refusal_reason(body: object) -> str | None:
 class APIError(MandalaError):
     """The API returned an unsuccessful response."""
 
-    def __init__(self, message: str, *, status: int, body: object = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        body: object = None,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
+        #: Seconds indicated by ``Retry-After``, or ``None`` if absent or malformed.
+        #: A delay alone does not mean that replaying the request is safe.
+        self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
         #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"`` or
         #: ``"unsupported"`` (OPL-3898). ``None`` where it sent nothing, which
@@ -189,8 +199,9 @@ class RangeNotSatisfiableError(APIError):
         status: int,
         body: object = None,
         size: int | None = None,
+        retry_after: float | None = None,
     ) -> None:
-        super().__init__(message, status=status, body=body)
+        super().__init__(message, status=status, body=body, retry_after=retry_after)
         #: The file's length in bytes, or ``None`` if the refusal did not carry it.
         self.size = size
 
@@ -322,8 +333,8 @@ class RateLimitError(APIError):
     bottom of the range), which is why hitting this usually means a loop with no
     sleep in it rather than real load.
 
-    Its own class rather than a bare :class:`APIError` because it is the one
-    refusal on this surface that says exactly how long to wait:
+    Its own class rather than a bare :class:`APIError` because the remedy is to
+    slow the request cadence:
     :attr:`retry_after` carries the ``Retry-After`` header in seconds. Sleeping
     that long and repeating the request is the whole remedy.
 
@@ -376,6 +387,14 @@ class ConflictError(APIError):
     - something is driving the guest at the moment a suspend was asked for, or
       a suspend has committed to the computer a request just arrived for — the
       retry resumes it, which is what the caller wanted
+
+    A ``template_image_preparing`` body requires an explicit continuation:
+    inspect ``body["preparation"]`` for state and error, then wait
+    :attr:`retry_after` seconds and repeat the original create arguments,
+    including the same template, with the returned ``template_transfer`` token
+    when appropriate. Failed preparation needs diagnosis first. The token is
+    not create idempotency; stop after success and do not replay lost responses.
+    :func:`is_transient` returns ``False`` for this refusal.
 
     Distinct from :class:`PlanLimitError`, which will not clear on its own, and
     from a plain :class:`APIError`, which usually will not either. A guest agent
@@ -439,8 +458,9 @@ class MoveRequiredError(ConflictError):
         status: int,
         body: object = None,
         move_possible: bool,
+        retry_after: float | None = None,
     ) -> None:
-        super().__init__(message, status=status, body=body)
+        super().__init__(message, status=status, body=body, retry_after=retry_after)
         #: Whether a host in this region could run the size that was asked for.
         self.move_possible = move_possible
 
@@ -578,6 +598,7 @@ def is_transient(err: BaseException) -> bool:
 
     * :class:`ConflictError` — something in flight this cannot run alongside,
       minus :class:`MoveRequiredError`, which is a decision rather than a moment
+      and ``template_image_preparing``, which requires an explicit continuation
     * :class:`RateLimitError` — a cadence, and the response usually says how long
     * :class:`UnavailableError` — a hypervisor briefly out of reach
     * :class:`ConnectionError` — the request never left
@@ -640,6 +661,10 @@ def is_transient(err: BaseException) -> bool:
     # Arbitrary exceptions may also happen to expose ``reason`` — including an
     # unhashable value — but that is neither this protocol nor retry advice.
     if isinstance(err, APIError):
+        if isinstance(err.body, dict) and err.body.get("code") == "template_image_preparing":
+            # Continuation requires the returned token and original create arguments.
+            # The same code can also describe failed preparation; inspect its body.
+            return False
         reason = err.reason
         # The platform puts these words on the 409 that will clear (a guest
         # agent busy, a computer still booting) and on the 400 that says the

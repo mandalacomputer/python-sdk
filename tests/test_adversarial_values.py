@@ -245,9 +245,47 @@ def test_an_optional_string_that_is_present_is_still_a_string() -> None:
         lambda v: A.create_body(
             name=None, template=None, cpu=None, ram_mb=None, disk_gb=None, start=False, size=v
         ),
+        lambda v: A.create_body(
+            name=None,
+            template="base",
+            cpu=None,
+            ram_mb=None,
+            disk_gb=None,
+            start=False,
+            template_transfer=v,
+        ),
     ):
         with pytest.raises(ValueError, match="must be a string"):
             build(123)
+
+
+@pytest.mark.parametrize("field", ["template", "template_transfer"])
+def test_transfer_checks_and_serializes_the_same_string(field) -> None:
+    import json
+
+    class Misleading(str):
+        def strip(self, chars=None):
+            return "token"
+
+        def __str__(self):
+            return "different-token"
+
+    arguments = {
+        "name": None,
+        "template": "base",
+        "template_transfer": "token",
+        "cpu": None,
+        "ram_mb": None,
+        "disk_gb": None,
+        "start": False,
+    }
+    arguments[field] = Misleading(" \t")
+    with pytest.raises(ValueError):
+        A.create_body(**arguments)
+    arguments[field] = Misleading(" original ")
+    body = A.create_body(**arguments)
+    assert type(body[field]) is str
+    assert json.loads(json.dumps(body))[field] == " original "
 
 
 def test_a_count_cannot_be_a_bool() -> None:

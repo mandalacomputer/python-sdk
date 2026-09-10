@@ -3703,11 +3703,7 @@ def test_rate_limit_is_its_own_error_carrying_the_wait(client: mc.Client) -> Non
 
 @respx.mock
 def test_a_rate_limit_without_a_usable_header_still_classifies(client: mc.Client) -> None:
-    # The HTTP-date form is legal and this surface does not send it; guessing at
-    # it against a clock that may disagree is worse than saying nothing.
-    respx.get(f"{BASE}/computers").mock(
-        httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
-    )
+    respx.get(f"{BASE}/computers").mock(httpx.Response(429, headers={"Retry-After": "not a delay"}))
     with pytest.raises(mc.RateLimitError) as caught:
         client.computers.list()
     assert caught.value.retry_after is None

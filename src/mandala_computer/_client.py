@@ -11,7 +11,10 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 from collections.abc import AsyncGenerator, Generator, Mapping
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -781,6 +784,10 @@ class _BaseTransport:
             # would be this client overwriting the platform with a guess.
             message = substituted(GATEWAY_TIMEOUT_MESSAGE)
         if cls is ConflictError:
+            if isinstance(body, dict) and body.get("code") == "template_image_preparing":
+                return ConflictError(
+                    message, status=resp.status_code, body=body, retry_after=_retry_after(resp)
+                )
             # The 409 that is an offer, told apart by its body — see
             # MoveRequiredError. Never given a substituted message: the
             # platform's sentence here is the whole account of what will not fit
@@ -792,6 +799,7 @@ class _BaseTransport:
                     status=resp.status_code,
                     body=body,
                     move_possible=offer,
+                    retry_after=_retry_after(resp),
                 )
         if cls is RateLimitError:
             return RateLimitError(
@@ -809,8 +817,9 @@ class _BaseTransport:
                 status=resp.status_code,
                 body=body,
                 size=_refused_size(resp),
+                retry_after=_retry_after(resp),
             )
-        return cls(message, status=resp.status_code, body=body)
+        return cls(message, status=resp.status_code, body=body, retry_after=_retry_after(resp))
 
 
 def _move_offer(body: object) -> bool | None:
@@ -950,9 +959,8 @@ def _request_failed(method: str, path: str, exc: httpx.RequestError) -> Connecti
 def _retry_after(resp: httpx.Response) -> float | None:
     """``Retry-After`` in seconds, or ``None`` if it was not usable.
 
-    Only the delta-seconds form is read. The HTTP-date form is legal and this
-    surface does not send it, and guessing at a date against a clock that may
-    disagree with the server's is worse than saying nothing.
+    Delta-seconds are used directly. HTTP dates are converted to a delay using
+    the local clock; a date already passed is a zero delay.
 
     ``nan`` and ``inf`` parse as floats but are not delays: this value is handed
     to ``time.sleep``, where an infinity blocks forever and a ``nan`` raises. A
@@ -966,7 +974,14 @@ def _retry_after(resp: httpx.Response) -> float | None:
     try:
         seconds = float(raw.strip())
     except ValueError:
-        return None
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                # The legacy asctime HTTP-date spelling omits its GMT zone.
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = when.timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return None
     if not math.isfinite(seconds):
         return None
     return max(seconds, 0.0)
