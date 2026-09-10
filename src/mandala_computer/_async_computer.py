@@ -626,17 +626,19 @@ class AsyncComputer(ComputerFields):
                 if res.ok:
                     return self
             except MandalaError as err:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"{self.id} guest did not respond within {timeout:g}s"
-                    ) from err
                 # The sync twin carries the reasoning: the guest routes answer
                 # 400 for a moment where the control plane answers 400 for a
                 # defect, so this one method names it and the shared predicate
                 # does not (OPL-3724).
                 if not (_is_transient_for_poll(err) or _guest_not_running(err)):
                     raise
+                # Preserve permanent refusals even at the deadline, as the
+                # sync loop does; only transient failures become timeouts.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"{self.id} guest did not respond within {timeout:g}s"
+                    ) from err
                 # The failure is being waited out, so it gets to say how long:
                 # a 429 carries the platform's own answer to that.
                 delay = _poll_delay(err, poll)

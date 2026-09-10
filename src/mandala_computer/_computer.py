@@ -1867,11 +1867,6 @@ class Computer(ComputerFields):
                 ).ok:
                     return self
             except MandalaError as err:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"{self.id} guest did not respond within {timeout:g}s"
-                    ) from err
                 # _is_transient_for_poll, plus the one status this probe knows
                 # about and a predicate taking an error cannot: the GUEST routes
                 # answer 400 while the machine is not running yet, which is a
@@ -1881,6 +1876,14 @@ class Computer(ComputerFields):
                 # method that talks to the guest agent (OPL-3724).
                 if not (_is_transient_for_poll(err) or _guest_not_running(err)):
                     raise
+                # A permanent refusal remains the cause even when its response
+                # arrives at the deadline. Only a transient failure can become
+                # this wait's timeout (OPL-4648).
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"{self.id} guest did not respond within {timeout:g}s"
+                    ) from err
                 # From here the failure is being waited out, so it gets to say
                 # how long. A 429 carries the platform's own answer to that, and
                 # ignoring it is how a short rate limit becomes a longer one —
