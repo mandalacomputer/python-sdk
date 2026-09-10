@@ -147,6 +147,7 @@ class AsyncComputers:
         name: str | None = None,
         size: str | None = None,
         template: str | None = None,
+        template_transfer: str | None = None,
         cpu: int | None = None,
         ram_mb: int | None = None,
         disk_gb: int | None = None,
@@ -154,6 +155,10 @@ class AsyncComputers:
         resolution: str | None = None,
     ) -> AsyncComputer:
         """Provision a computer.
+
+        ``template_transfer`` preserves the selected build when retrying a
+        ``template_image_preparing`` refusal. Read the token from the error body
+        and retry after its delay. It is not a create idempotency key.
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -187,6 +192,7 @@ class AsyncComputers:
         body = _api.create_body(
             name=name,
             template=template,
+            template_transfer=template_transfer,
             cpu=cpu,
             ram_mb=ram_mb,
             disk_gb=disk_gb,

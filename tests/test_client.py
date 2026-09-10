@@ -5635,3 +5635,10 @@ def test_capture_does_not_complete_from_an_unreachable_stub(
 ) -> None:
     row = {"id": "snap-1", "unreachable": flag, "created_at": "yesterday", "kind": "manual"}
     assert mc.Computer(client._t, COMPUTER)._captured([row], "snap-1") is None
+
+
+@respx.mock
+def test_create_preserves_template_transfer_token(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    client.computers.create(template="acc-1/tool@1.0.0", template_transfer="prepare-token")
+    assert json.loads(route.calls.last.request.content)["template_transfer"] == "prepare-token"

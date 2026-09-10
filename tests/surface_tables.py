@@ -139,6 +139,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:name",
         "body:size",
         "body:template",
+        "body:template_transfer",
         "body:cpu",
         "body:ram_mb",
         "body:disk_gb",

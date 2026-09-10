@@ -784,6 +784,7 @@ def create_body(
     start: bool,
     resolution: str | None = None,
     size: str | None = None,
+    template_transfer: str | None = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -805,12 +806,16 @@ def create_body(
     # a check at all, and go on the wire beside it.
     size = None if size is None else canonical(size, "size")
     template = None if template is None else canonical(template, "template")
+    template_transfer = (
+        None if template_transfer is None else canonical(template_transfer, "template_transfer")
+    )
     resolution = None if resolution is None else canonical(resolution, "resolution")
     body: dict[str, Any] = {"start": flag(start, "start")}
     for key, text in (
         ("name", name),
         ("size", size),
         ("template", template),
+        ("template_transfer", template_transfer),
         ("resolution", resolution),
     ):
         if text is not None:
