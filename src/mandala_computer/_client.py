@@ -962,18 +962,30 @@ def _retry_after(resp: httpx.Response) -> float | None:
     Delta-seconds are used directly. HTTP dates are converted to a delay using
     the local clock; a date already passed is a zero delay.
 
-    ``nan`` and ``inf`` parse as floats but are not delays: this value is handed
-    to ``time.sleep``, where an infinity blocks forever and a ``nan`` raises. A
-    negative is a delay that has already passed, which is ``0``. So anything
-    that is not a finite number becomes ``None`` — the header was there, and it
-    was not usable, which is exactly what this returns ``None`` to say.
+    Delay-seconds contain ASCII digits only. Dates must use one of the three
+    HTTP-date spellings, with GMT explicit or implicit in the asctime form.
+    A permissive numeric or email-date parser alone would invent delays for
+    malformed headers. Nonfinite results are also refused because callers may
+    pass the result directly to ``time.sleep``.
     """
     raw = resp.headers.get("retry-after")
     if raw is None:
         return None
-    try:
-        seconds = float(raw.strip())
-    except ValueError:
+    raw = raw.strip(" \t")
+    if re.fullmatch(r"[0-9]+", raw):
+        seconds = float(raw)
+    else:
+        day = r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+        weekday = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+        month = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        clock = r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        formats = (
+            rf"{day}, [0-9]{{2}} {month} [0-9]{{4}} {clock} GMT",
+            rf"{weekday}, [0-9]{{2}}-{month}-[0-9]{{2}} {clock} GMT",
+            rf"{day} {month} (?:[0-9]{{2}}| [0-9]) {clock} [0-9]{{4}}",
+        )
+        if not any(re.fullmatch(pattern, raw) for pattern in formats):
+            return None
         try:
             when = parsedate_to_datetime(raw)
             if when.tzinfo is None:

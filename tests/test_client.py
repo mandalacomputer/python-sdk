@@ -5201,15 +5201,15 @@ def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.Client) -> No
 @respx.mock
 @pytest.mark.parametrize(
     ("header", "expected"),
-    [("inf", None), ("-inf", None), ("nan", None), ("-5", 0.0), ("2.5", 2.5)],
+    [("inf", None), ("-inf", None), ("nan", None), ("-5", None), ("2.5", None), ("5", 5.0)],
 )
 def test_retry_after_survives_only_as_a_usable_delay(
     client: mc.Client, header: str, expected: float | None
 ) -> None:
     """The value is handed to time.sleep, where inf blocks forever and nan raises.
 
-    Both parse as floats, so guarding on ValueError alone let them through. A
-    negative delay is one that has already passed, which is zero.
+    Float parsing alone also accepts signs and fractions, which are not valid
+    delay-seconds. Malformed metadata must not become retry advice.
     """
     respx.get(f"{BASE}/computers").mock(
         httpx.Response(429, headers={"Retry-After": header}, json={"error": "slow down"})
