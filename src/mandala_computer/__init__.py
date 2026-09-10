@@ -115,7 +115,7 @@ from ._models import (
 from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, Usage, Webhooks
 from ._webhooks import REPLAY_WINDOW_S, verify
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "CHANNEL_EVENT_TYPES",
