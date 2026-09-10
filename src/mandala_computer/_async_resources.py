@@ -147,6 +147,7 @@ class AsyncComputers:
         name: str | None = None,
         size: str | None = None,
         template: str | None = None,
+        template_transfer: str | None = None,
         cpu: int | None = None,
         ram_mb: int | None = None,
         disk_gb: int | None = None,
@@ -154,6 +155,21 @@ class AsyncComputers:
         resolution: str | None = None,
     ) -> AsyncComputer:
         """Provision a computer.
+
+        When a ``template_image_preparing`` refusal supplies a token, inspect
+        ``error.body["preparation"]`` for its state and error first. After the
+        returned ``error.retry_after`` delay (seconds), repeat every original
+        create argument, including the same ``template``, and add the opaque
+        ``template_transfer`` token from the body. A failed preparation needs
+        diagnosis before any deliberate retry. Missing or malformed delay
+        metadata is ``None``; it does not authorize an immediate retry.
+
+        The token must be a nonempty string, requires a nonempty ``template``,
+        and cannot be combined with ``size``. Its contents are sent unchanged.
+        It preserves the selected build; it is not a create idempotency key.
+        Stop after success and never blindly replay an ambiguous or lost
+        response. ``is_transient`` returns ``False`` for this refusal because
+        continuation requires an explicit decision and the returned token.
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -163,7 +179,8 @@ class AsyncComputers:
         CPU/RAM/disk shape together, and the shapes the platform keeps
         pre-booted, so naming one is the likeliest way to get a computer in
         about a second rather than a cold boot. It cannot be combined with
-        ``template``, ``cpu``, ``ram_mb`` or ``disk_gb``; sending both raises
+        ``template``, ``template_transfer``, ``cpu``, ``ram_mb`` or ``disk_gb``;
+        sending both raises
         :class:`ValueError` before any request is made.
 
         ``resolution`` is ``"WIDTHxHEIGHT"`` or ``"WIDTHxHEIGHTxDEPTH"`` and
@@ -187,6 +204,7 @@ class AsyncComputers:
         body = _api.create_body(
             name=name,
             template=template,
+            template_transfer=template_transfer,
             cpu=cpu,
             ram_mb=ram_mb,
             disk_gb=disk_gb,

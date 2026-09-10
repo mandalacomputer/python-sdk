@@ -784,6 +784,7 @@ def create_body(
     start: bool,
     resolution: str | None = None,
     size: str | None = None,
+    template_transfer: str | None = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -795,22 +796,33 @@ def create_body(
     but this mistake is knowable without the round trip, and the server's
     refusal exists for callers who are not this SDK.
     """
-    if size is not None and any(v is not None for v in (template, cpu, ram_mb, disk_gb)):
+    if size is not None and any(
+        v is not None for v in (template, template_transfer, cpu, ram_mb, disk_gb)
+    ):
         raise ValueError(
             "size already names a template and a shape; send size alone, "
-            "or template/cpu/ram_mb/disk_gb without it"
+            "or template/template_transfer/cpu/ram_mb/disk_gb without it"
         )
     name = _require_optional_name(name)
     # ``name`` came back canonical from the check above; these three never had
     # a check at all, and go on the wire beside it.
     size = None if size is None else canonical(size, "size")
     template = None if template is None else canonical(template, "template")
+    template_transfer = (
+        None if template_transfer is None else canonical(template_transfer, "template_transfer")
+    )
+    if template_transfer is not None:
+        if not template_transfer.strip():
+            raise ValueError("template_transfer must be a nonempty string")
+        if template is None or not template.strip():
+            raise ValueError("template_transfer requires the original nonempty template")
     resolution = None if resolution is None else canonical(resolution, "resolution")
     body: dict[str, Any] = {"start": flag(start, "start")}
     for key, text in (
         ("name", name),
         ("size", size),
         ("template", template),
+        ("template_transfer", template_transfer),
         ("resolution", resolution),
     ):
         if text is not None:

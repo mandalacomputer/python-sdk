@@ -498,6 +498,7 @@ def exercise_everything(client: mc.Client) -> None:
     client.computers.create(
         name="dev",
         template="base",
+        template_transfer="prepare-token",
         cpu=2,
         ram_mb=4096,
         disk_gb=40,
@@ -675,6 +676,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.computers.create(
         name="dev",
         template="base",
+        template_transfer="prepare-token",
         cpu=2,
         ram_mb=4096,
         disk_gb=40,

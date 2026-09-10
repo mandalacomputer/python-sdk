@@ -3703,11 +3703,7 @@ def test_rate_limit_is_its_own_error_carrying_the_wait(client: mc.Client) -> Non
 
 @respx.mock
 def test_a_rate_limit_without_a_usable_header_still_classifies(client: mc.Client) -> None:
-    # The HTTP-date form is legal and this surface does not send it; guessing at
-    # it against a clock that may disagree is worse than saying nothing.
-    respx.get(f"{BASE}/computers").mock(
-        httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
-    )
+    respx.get(f"{BASE}/computers").mock(httpx.Response(429, headers={"Retry-After": "not a delay"}))
     with pytest.raises(mc.RateLimitError) as caught:
         client.computers.list()
     assert caught.value.retry_after is None
@@ -5205,15 +5201,15 @@ def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.Client) -> No
 @respx.mock
 @pytest.mark.parametrize(
     ("header", "expected"),
-    [("inf", None), ("-inf", None), ("nan", None), ("-5", 0.0), ("2.5", 2.5)],
+    [("inf", None), ("-inf", None), ("nan", None), ("-5", None), ("2.5", None), ("5", 5.0)],
 )
 def test_retry_after_survives_only_as_a_usable_delay(
     client: mc.Client, header: str, expected: float | None
 ) -> None:
     """The value is handed to time.sleep, where inf blocks forever and nan raises.
 
-    Both parse as floats, so guarding on ValueError alone let them through. A
-    negative delay is one that has already passed, which is zero.
+    Float parsing alone also accepts signs and fractions, which are not valid
+    delay-seconds. Malformed metadata must not become retry advice.
     """
     respx.get(f"{BASE}/computers").mock(
         httpx.Response(429, headers={"Retry-After": header}, json={"error": "slow down"})
@@ -5635,3 +5631,10 @@ def test_capture_does_not_complete_from_an_unreachable_stub(
 ) -> None:
     row = {"id": "snap-1", "unreachable": flag, "created_at": "yesterday", "kind": "manual"}
     assert mc.Computer(client._t, COMPUTER)._captured([row], "snap-1") is None
+
+
+@respx.mock
+def test_create_preserves_template_transfer_token(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    client.computers.create(template="acc-1/tool@1.0.0", template_transfer="prepare-token")
+    assert json.loads(route.calls.last.request.content)["template_transfer"] == "prepare-token"

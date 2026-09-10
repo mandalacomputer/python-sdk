@@ -119,6 +119,76 @@ t = client.templates.publish(doc)
 c = client.computers.create(template=t.ref)
 ```
 
+When `create()` returns a 409 with `body["code"] == "template_image_preparing"`,
+inspect `body["preparation"]`: it retains the server's `state` and `error`,
+including failed preparation. A failure needs diagnosis before a deliberate
+retry. `APIError.retry_after` preserves the `Retry-After` header as seconds,
+including HTTP dates; absent or malformed metadata is `None`.
+
+For an explicit continuation, wait the returned delay, repeat **all original
+create arguments, including the same template**, and add the returned
+`template_transfer` token. The token and template must be nonempty strings;
+`size` cannot be combined with a token. An opaque token is sent unchanged,
+including surrounding whitespace. A missing or different template can produce
+`NotFoundError`. The token preserves the selected build, **not create
+idempotency**: stop after success and never blindly retry an ambiguous or lost
+response. `is_transient()` returns `False` for this preparation refusal,
+including preparation still in progress.
+
+This helper accepts only a preparation response with usable continuation
+metadata. It surfaces failed preparation for diagnosis:
+
+```python
+def preparation_retry(error):
+    body = error.body
+    if not isinstance(body, dict) or body.get("code") != "template_image_preparing":
+        raise error
+    preparation = body.get("preparation")
+    token = body.get("template_transfer")
+    if (
+        not isinstance(preparation, dict)
+        or preparation.get("state") not in ("preparing", "copying", "ready")
+        or not isinstance(token, str)
+        or not token.strip()
+        or error.retry_after is None
+    ):
+        raise error
+    return error.retry_after, token
+```
+
+A synchronous caller can make one deliberate continuation attempt:
+
+```python
+import time
+from mandala_computer import ConflictError
+
+original = {"template": t.ref, "name": "dev", "cpu": 4, "ram_mb": 8192}
+try:
+    c = client.computers.create(**original)
+except ConflictError as error:
+    delay, token = preparation_retry(error)
+    time.sleep(delay)
+    c = client.computers.create(**original, template_transfer=token)
+```
+
+The async equivalent uses the same original arguments and validation:
+
+```python
+import asyncio
+from mandala_computer import ConflictError
+
+original = {"template": t.ref, "name": "dev", "cpu": 4, "ram_mb": 8192}
+try:
+    c = await client.computers.create(**original)
+except ConflictError as error:
+    delay, token = preparation_retry(error)
+    await asyncio.sleep(delay)
+    c = await client.computers.create(**original, template_transfer=token)
+```
+
+A second refusal is surfaced in both examples so the caller can inspect the
+new state and decide whether another bounded continuation is appropriate.
+
 **The namespace is your account.** `metadata.namespace` has to be your account
 id — anything else is a `PermissionDeniedError`, `system` included — and this SDK
 does not rewrite it, because publishing a ref that is not the one in your file
@@ -1947,10 +2017,10 @@ that creates deserves a look first.
 
 `is_transient(err)` is that rule as a function, and it answers for the riskiest
 caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
-`ConflictError` (minus `MoveRequiredError`), `RateLimitError`, `UnavailableError`
-and `ConnectionError` (minus `ConnectionInterruptedError`), and no to everything
-above whose outcome is unknown, 502 and 504 included. The same four classes, and
-only those, answer yes in the TypeScript and MCP SDKs.
+`ConflictError` (except `MoveRequiredError` and `template_image_preparing`),
+`RateLimitError`, `UnavailableError` and `ConnectionError` (except
+`ConnectionInterruptedError`), and no to everything above whose outcome is
+unknown, 502 and 504 included.
 
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during
@@ -1970,7 +2040,9 @@ clears itself: something is in flight that the operation cannot run alongside �
 a disk still being copied, a snapshot being taken, a delete already under way, a
 guest agent that has not finished coming up, or a suspend committed to the
 computer a moment before your call. Waiting and retrying is the fix; changing
-the request is not.
+the request is not. Template preparation is an exception: inspect its state
+and error, then deliberately continue with the returned token and the original
+create arguments when appropriate, as shown above.
 
 Two do not clear. `MoveRequiredError` is one, and it has a class you can catch.
 The other is a clipboard refusal on a stopped or suspended computer: waiting
