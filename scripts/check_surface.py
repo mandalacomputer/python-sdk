@@ -55,7 +55,15 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from surface_text import balanced, strip_comments, top_level_keys, top_level_value_at
+from surface_text import (
+    balanced,
+    literal_contents,
+    literal_string,
+    object_entries,
+    split_items,
+    strip_comments,
+    top_level_keys,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 SURFACE = Path("web/lib/surface.ts")
@@ -289,163 +297,122 @@ def missing_mirror_sources(platform: Path) -> list[Path]:
 
 
 def table(source: str, name: str) -> set[tuple[str, str]]:
-    """Pull one ``export const NAME: Route[] = [...]`` table out, by bracket depth.
-
-    Balanced rather than a regex to the next ``]``: the entries contain arrays
-    of their own, and the first closing bracket is nowhere near the end of the
-    table.
-    """
-    decl = f"export const {name}: Route[] = ["
-    start = source.find(decl)
-    if start == -1:
-        raise SystemExit(f"{name} not found in {SURFACE} — has its shape changed?")
-    # The opening bracket of the table, not the one in `Route[]` a few
-    # characters earlier, which closes immediately.
-    i = start + len(decl) - 1
-    depth = 0
-    for i in range(i, len(source)):  # noqa: B020
-        if source[i] == "[":
-            depth += 1
-        elif source[i] == "]":
-            depth -= 1
-            if depth == 0:
-                break
-    body = source[start + len(decl) : i]
-    routes = {
-        (m.group(1), m.group(2))
-        for entry in re.finditer(r"\{[^{}]*\}", body)
-        if (m := re.search(r"method:\s*'([^']+)'[\s\S]*?pattern:\s*'([^']+)'", entry.group(0)))
-    }
-    if not routes:
-        raise SystemExit(f"parsed {name} but found no routes — has its shape changed?")
-    return routes
+    """Read every route literal, or refuse a table this reader cannot compare."""
+    try:
+        source = strip_comments(source)
+        declaration = re.search(
+            rf"^\s*export\s+const\s+{re.escape(name)}\s*:\s*Route\[\]\s*=\s*\[",
+            source,
+            re.MULTILINE,
+        )
+        if declaration is None:
+            raise ValueError("declaration not found or unsupported")
+        body = balanced(source, declaration.end() - 1, "[", "]")
+        routes = set()
+        for entry in split_items(body):
+            fields = object_entries(literal_contents(entry, "{", "}"))
+            if "method" not in fields or "pattern" not in fields:
+                raise ValueError("route needs literal method and pattern fields")
+            routes.add((literal_string(fields["method"]), literal_string(fields["pattern"])))
+        if not routes:
+            raise ValueError("found no routes")
+        return routes
+    except ValueError as err:
+        raise SystemExit(f"cannot read {name} in {SURFACE}: {err}") from None
 
 
 def shared_query(source: str) -> dict[str, str]:
-    """Module-level ``const NAME: Query = {...}`` entries, by identifier.
+    """Read named parameter-entry literals from comment-blanked source.
 
-    A route's ``query`` or ``headers`` list can name one of these instead of
-    spelling it out — ``ALLOW_PARTIAL`` is shared by two routes — so the
-    identifier has to resolve to a parameter name or those routes read as taking
-    none.
-
-    ``export``, a leading indent, and the whitespace around the colon and the
-    ``=`` are all allowed for, because none of them changes what the declaration
-    means and a reader that insists on one spelling reports every route citing a
-    re-spelled constant as taking no parameters at all.
-
-    ``source`` must be comment-blanked, and allowing the indent is why: a
-    superseded copy of a declaration quoted in a block comment is indented under
-    its ``*``, so the relaxed pattern reaches it, and the quoted copy comes last
-    and wins the map. Every route citing the identifier then reports one missing
-    parameter and one extra, both naming a name nobody serves.
+    Unknown references are refused at their use site; shared arrays and
+    arbitrary expressions are deliberately outside this reader's grammar.
     """
     found = {}
-    for m in re.finditer(
-        r"^\s*(?:export\s+)?const ([A-Z_]+):\s*Query\s*=\s*\{", source, re.MULTILINE
+    for match in re.finditer(
+        r"^\s*(?:export\s+)?const ([A-Za-z_$][\w$]*):\s*Query\s*=\s*\{",
+        source,
+        re.MULTILINE,
     ):
-        body = balanced(source, m.end() - 1, "{", "}")
-        named = re.search(r"name:\s*'([^']+)'", body)
-        if named:
-            found[m.group(1)] = named.group(1)
+        fields = object_entries(balanced(source, match.end() - 1, "{", "}"))
+        if "name" not in fields:
+            raise ValueError("shared parameter entry has no name")
+        found[match.group(1)] = literal_string(fields["name"])
     return found
 
 
+def _parameter_names(value: str, shared: dict[str, str]) -> set[str]:
+    """Account for every entry in a query/header array, including named entries."""
+    names = set()
+    for entry in split_items(literal_contents(value, "[", "]")):
+        if entry.startswith("{"):
+            fields = object_entries(literal_contents(entry, "{", "}"))
+            if "name" not in fields:
+                raise ValueError("parameter entry has no name")
+            names.add(literal_string(fields["name"]))
+        elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry) and entry in shared:
+            names.add(shared[entry])
+        else:
+            raise ValueError("unsupported or unresolved parameter entry")
+    return names
+
+
 def parameters(platform: Path) -> dict[str, set[str]]:
-    """Every query, header and body field the platform documents, by route.
-
-    Read out of ``apidoc.ts``'s ``DOCS`` rather than ``surface.ts``, because the
-    route table has no parameters in it — which is the whole reason a route
-    comparison could not see the one that prompted this.
-    """
-    # Comments blanked once, over the whole file: `strip_comments` replaces them
-    # with spaces rather than deleting them, so every offset still names the same
-    # character and one pass serves every scan below and the bracket matching.
-    # `shared_query` reads this rather than the raw file because it allows an
-    # indent, which is what puts its scan inside block comments — and this is how
-    # apidoc.ts explains itself, with a superseded declaration quoted under a
-    # comment's `*` right where the live one is.
-    source = strip_comments((platform / APIDOC).read_text())
-    shared = shared_query(source)
-    start = source.find("export const DOCS: Record<string, Doc> = {")
-    if start == -1:
-        raise SystemExit(f"DOCS not found in {APIDOC} — has its shape changed?")
-    docs = balanced(source, source.index("{", start + 40), "{", "}")
-
-    table: dict[str, set[str]] = {}
-    entry = re.compile(r"'([A-Z]+) ([^']+)':\s*\{")
-    at = 0
-    while (m := entry.search(docs, at)) is not None:
-        clean = balanced(docs, m.end() - 1, "{", "}")
-        # Past this entry rather than into it. A description is prose in quotes,
-        # and prose about this API quotes routes — `'GET computers/:id/files'`
-        # inside one would otherwise open a route of its own, nested inside the
-        # entry that is still being read.
-        at = m.end() + len(clean)
-        found: set[str] = set()
-        for key, kind in (("query", "query"), ("headers", "header")):
-            # At the entry's own depth, and by the key rather than by the exact
-            # spelling `key: [`. Both halves of that were bugs: a list the
-            # formatter wrapped — `query:\n  [{ name: 'limit' }]` — was skipped
-            # entirely, and a `query: [` nested in a description or a response
-            # example answered for the entry, so the route's real list further
-            # down was never read. Neither says anything: the guard for a scan
-            # that counted nothing stays quiet because the other routes counted,
-            # and the route's genuine parameters surface as ones the mirror
-            # invented — which sends whoever reads the report to the wrong file,
-            # to delete entries that are correct.
-            # Not `at`: that name is the entry scan's own cursor, a few lines up.
-            listed = top_level_value_at(clean, key)
-            if listed == -1 or clean[listed : listed + 1] != "[":
-                continue
-            listing = balanced(clean, listed, "[", "]")
-            for name in re.finditer(r"name:\s*'([^']+)'", listing):
-                found.add(f"{kind}:{name.group(1)}")
-            # An identifier standing in for a whole entry. Bounded by a
-            # separator on each side rather than by a trailing comma: `query:
-            # [ALLOW_PARTIAL]` on one line has nothing after the identifier at
-            # all, and demanding one read GET computers as taking no parameters.
-            #
-            # Under `kind`, which the loop bound and then ignored. `Query` is the
-            # type of both lists upstream — `headers?: Query[]` — so a shared
-            # constant cited in a `headers` list is a header, and recording it as
-            # a query is one missing parameter and one extra, both naming the
-            # same thing and neither of them true.
-            for ident in re.finditer(r"(?:^|[\[,\s])([A-Z_]{2,})(?=[,\s\]]|$)", listing):
-                if ident.group(1) in shared:
-                    found.add(f"{kind}:{shared[ident.group(1)]}")
-
-        # Only an `object(...)` body has named fields. A raw one — the file
-        # upload's own bytes — has none to name. Anything else spelled where a
-        # body goes is a shape this cannot read, and reading it as no fields
-        # would say the route documents no body at all: the mirror lists none
-        # for such a route either, so the two agree over a body neither of them
-        # looked at.
-        #
-        # All three cases are decided at the entry's own depth, or a nested body
-        # answers for the entry's own: a `body: { … }` in a response example
-        # vouches for a `body: SHARED_BODY`, the refusal is skipped, and the
-        # route reports no fields — the vacuous all-clear this guard exists to
-        # refuse, arriving by way of the guard.
-        body_at = top_level_value_at(clean, "body")
-        if body_at != -1:
-            call = re.match(r"object\s*\(", clean[body_at:])
-            args = balanced(clean, body_at + call.end() - 1, "(", ")") if call else None
-            # `object(SHARED_FIELDS)` is as unreadable as a bare identifier, and
-            # belongs in the message that names the route: fed to `balanced`
-            # unchecked, its missing `{` came back as `ValueError: substring not
-            # found`, naming neither the route nor the file it is in.
-            if args is not None and (brace := args.find("{")) != -1:
-                found.update(f"body:{k}" for k in top_level_keys(balanced(args, brace, "{", "}")))
-            elif clean[body_at : body_at + 1] != "{":
-                raise SystemExit(
-                    f"'{m.group(1)} {m.group(2)}' in {APIDOC} documents a body in a form this\n"
-                    "  reader does not know — neither object(...) nor a raw schema literal."
-                )
-        table[f"{m.group(1)} {m.group(2)}"] = found
-    if not table:
-        raise SystemExit(f"parsed DOCS but found no routes in {APIDOC} — has its shape changed?")
-    return table
+    """Read all documented route parameters, refusing unknown declarations."""
+    try:
+        source = strip_comments((platform / APIDOC).read_text())
+        shared = shared_query(source)
+        declaration = re.search(
+            r"^\s*export\s+const\s+DOCS\s*:\s*Record<string,\s*Doc>\s*=\s*\{",
+            source,
+            re.MULTILINE,
+        )
+        if declaration is None:
+            raise ValueError("DOCS declaration not found or unsupported")
+        docs = object_entries(balanced(source, declaration.end() - 1, "{", "}"))
+        table: dict[str, set[str]] = {}
+        for route, value in docs.items():
+            if re.fullmatch(r"[A-Z]+ .+", route) is None:
+                raise ValueError("unsupported route key in DOCS")
+            try:
+                fields = object_entries(literal_contents(value, "{", "}"))
+                found: set[str] = set()
+                for key, kind in (("query", "query"), ("headers", "header")):
+                    if key in fields:
+                        try:
+                            found.update(
+                                f"{kind}:{name}" for name in _parameter_names(fields[key], shared)
+                            )
+                        except ValueError as err:
+                            raise ValueError(f"{key}: {err}") from None
+                if "body" in fields:
+                    body = fields["body"]
+                    call = re.match(r"object\s*(?=\()", body)
+                    if call:
+                        args = split_items(literal_contents(body[call.end() :], "(", ")"))
+                        if not args or not args[0].startswith("{"):
+                            raise ValueError("unreadable body fields")
+                        found.update(
+                            f"body:{key}"
+                            for key in top_level_keys(literal_contents(args[0], "{", "}"))
+                        )
+                    elif body.startswith("{"):
+                        # Raw schemas describe binary bodies, with no named fields.
+                        object_entries(literal_contents(body, "{", "}"))
+                    else:
+                        raise ValueError("unreadable body fields")
+                table[route] = found
+            except ValueError as err:
+                if str(err) == "unreadable body fields":
+                    raise SystemExit(
+                        f"'{route}' in {APIDOC} documents a body in a form this\n"
+                        "  reader does not know — neither object(...) nor a raw schema literal."
+                    ) from None
+                raise SystemExit(f"cannot read '{route}' in {APIDOC}: {err}") from None
+        if not table:
+            raise ValueError("found no routes in DOCS")
+        return table
+    except ValueError as err:
+        raise SystemExit(f"cannot read DOCS in {APIDOC}: {err}") from None
 
 
 def constant(source: str, name: str, module: Path) -> int:

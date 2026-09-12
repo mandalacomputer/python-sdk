@@ -256,3 +256,163 @@ def test_a_raw_schema_body_is_no_fields_rather_than_a_refusal(
         "{ 'GET sizes': { body: { type: 'string', format: 'binary' } } };\n",
     )
     assert found == set()
+
+
+def test_route_comments_do_not_contribute_entries(check_surface: ModuleType) -> None:
+    source = """export const ROUTES: Route[] = [
+      { method: 'GET', pattern: 'widgets' },
+      // { method: 'POST', pattern: 'retired' },
+    ];"""
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "// ] } a comment must not close the list\n{ method: 'POST', pattern: 'widgets' },",
+        '/* ] } */ { method: "POST", pattern: "widgets" },',
+        '{ pattern: "widgets", method: "POST" },',
+        (
+            "{ method: 'POST', pattern: 'widgets', roles: ['reader', 'writer'], "
+            "description: 'keep ] and } inside this string' },"
+        ),
+    ],
+)
+def test_every_literal_route_is_compared(check_surface: ModuleType, extra: str) -> None:
+    source = (
+        "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' },\n" + extra + "\n];"
+    )
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets"), ("POST", "widgets")}
+
+
+def test_a_commented_declaration_cannot_replace_the_live_table(check_surface: ModuleType) -> None:
+    source = """/* export const ROUTES: Route[] = [
+      { method: 'POST', pattern: 'retired' },
+    ]; */
+    export const ROUTES: Route[] = [
+      { 'pattern': "widgets", "method": 'GET' },
+    ];"""
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "OTHER_ROUTE];",
+        "...OTHER_ROUTES];",
+        "{ method: METHOD, pattern: 'widgets' }];",
+        "{ method: 'POST' }];",
+        "{ method: 'POST', method: 'DELETE', pattern: 'widgets' }];",
+        "{ method: 'POST', pattern: 'widgets' ];",
+        "{ method: 'POST', pattern: 'widgets' }",
+        "{ method: 'POST', pattern: 'unterminated }];",
+        "{ method: 'POST', pattern: 'widgets', roles: [) }];",
+        ",];",
+    ],
+)
+def test_a_supported_route_does_not_hide_an_unreadable_entry(
+    check_surface: ModuleType, tail: str
+) -> None:
+    source = "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' },\n" + tail
+    with pytest.raises(SystemExit, match="cannot read ROUTES"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_quoted_body_keys_are_fields_but_nested_keys_are_not(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    found = scan(
+        check_surface,
+        tmp_path,
+        """export const DOCS: Record<string, Doc> = {
+          'GET sizes': { 'body': object({
+            'name': str('Name'), "size": str('Size'),
+            nested: object({ 'child': str('Child') }),
+          }) },
+        };""",
+    )
+    assert found == {"body:name", "body:size", "body:nested"}
+
+
+def test_double_quoted_routes_and_parameter_names_are_inventoried(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    path = tmp_path / check_surface.APIDOC
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        """const SHARED: Query = { "name": "shared", description: 'Example' };
+        export const DOCS: Record<string, Doc> = {
+          'GET widgets': { query: [] },
+          "POST widgets": {
+            "query": [{ 'name': "limit", description: "ignore name: 'ghost'" }, SHARED],
+            'headers': [SHARED, { name: 'X-Example' }],
+          },
+        };"""
+    )
+    assert check_surface.parameters(tmp_path) == {
+        "GET widgets": set(),
+        "POST widgets": {"query:limit", "query:shared", "header:shared", "header:X-Example"},
+    }
+
+
+@pytest.mark.parametrize("key", ["query", "headers"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "SHARED_ARRAY",
+        "[UNKNOWN_ENTRY]",
+        "[{ name: 'known' }, UNKNOWN_ENTRY]",
+        "[...SHARED_ARRAY]",
+        "[makeEntry()]",
+        "[{ description: 'name omitted' }]",
+        "[{ name: NAME }]",
+        "[{ name: 'known' }] || SHARED_ARRAY",
+    ],
+)
+def test_unreadable_parameter_declarations_do_not_become_empty_inventories(
+    check_surface: ModuleType, tmp_path: Path, key: str, value: str
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        scan(
+            check_surface,
+            tmp_path,
+            f"export const DOCS: Record<string, Doc> = {{ 'GET sizes': {{ {key}: {value} }} }};",
+        )
+    assert "GET sizes" in str(exc.value)
+    assert key in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "object(SHARED_FIELDS, { title: 'This is not the schema' })",
+        "object({ known: str('Known'), ...SHARED_FIELDS })",
+        "object({ [FIELD]: str('Name') })",
+        "object({ 'unterminated: str('Name') })",
+        "object({ known: str('Known') }) || SHARED_BODY",
+    ],
+)
+def test_unreadable_body_fields_are_not_a_partial_inventory(
+    check_surface: ModuleType, tmp_path: Path, body: str
+) -> None:
+    with pytest.raises(SystemExit):
+        scan(
+            check_surface,
+            tmp_path,
+            f"export const DOCS: Record<string, Doc> = {{ 'GET sizes': {{ body: {body} }} }};",
+        )
+
+
+def test_empty_lists_and_a_raw_body_schema_remain_valid(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    assert (
+        scan(
+            check_surface,
+            tmp_path,
+            """export const DOCS: Record<string, Doc> = {
+          'GET sizes': { query: [], headers: [], body: { type: 'string' } },
+        };""",
+        )
+        == set()
+    )

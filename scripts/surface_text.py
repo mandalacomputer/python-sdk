@@ -20,7 +20,7 @@ import re
 _REGEX_CAN_FOLLOW = "([{=,:;!?&|~+*%^<>"
 _REGEX_CAN_FOLLOW_WORDS = ("return", "case", "throw", "yield")
 _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
-_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_KEY = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
 _IDENT_CHAR = re.compile(r"[\w$]")
 
 
@@ -35,7 +35,7 @@ def quoted_end(text: str, start: int) -> int:
         if text[i] == quote:
             return i + 1
         i += 1
-    return len(text)
+    raise ValueError("unterminated quoted literal")
 
 
 def regex_can_start(text: str, at: int) -> bool:
@@ -201,32 +201,107 @@ def top_level_value_at(body: str, name: str) -> int:
     return -1
 
 
-def top_level_keys(body: str) -> list[str]:
-    """The keys of an object literal, at its own depth only.
+def split_items(body: str) -> list[str]:
+    """Split comma-separated entries, refusing incomplete or mismatched syntax.
 
-    A nested schema has keys of its own — ``type``, ``description``, ``items`` —
-    and every one of them would otherwise read as a field of the body.
+    Literals and nested collections belong to an entry; their commas do not
+    separate entries. A trailing comma is allowed, but a hole is unreadable.
     """
-    keys: list[str] = []
-    depth = 0
-    i = 0
+    items: list[str] = []
+    stack: list[str] = []
+    start = i = 0
     while i < len(body):
         ch = body[i]
         if ch in "'\"`":
-            i = quoted_end(body, i)
+            end = quoted_end(body, i)
+            i = end
             continue
         if ch == "/" and regex_can_start(body, i):
             i = regex_end(body, i)
             continue
         if ch in "{[(":
-            depth += 1
+            stack.append(ch)
         elif ch in "}])":
-            depth -= 1
-        elif depth == 0:
-            m = _KEY.match(body, i)
-            if m:
-                keys.append(m.group(1))
-                i = m.end()
-                continue
+            if not stack or stack.pop() != {"}": "{", "]": "[", ")": "("}[ch]:
+                raise ValueError(f"unbalanced {ch} at offset {i}")
+        elif ch == "," and not stack:
+            item = body[start:i].strip()
+            if not item:
+                raise ValueError("empty entry between separators")
+            items.append(item)
+            start = i + 1
         i += 1
-    return keys
+    if stack:
+        raise ValueError("unbalanced entry")
+    tail = body[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def literal_string(value: str) -> str:
+    """Read a quoted name, without evaluating expressions or escape languages.
+
+    Quotes, slashes and backslashes may be escaped. Other escapes in names
+    require an explicit reader update instead of being guessed at.
+    """
+    value = value.strip()
+    if not value or value[0] not in "'\"" or quoted_end(value, 0) != len(value):
+        raise ValueError("expected a single- or double-quoted literal")
+    quote = value[0]
+    if len(value) < 2 or value[-1] != quote:
+        raise ValueError("unterminated literal")
+    out: list[str] = []
+    i = 1
+    while i < len(value) - 1:
+        ch = value[i]
+        if ch == "\\":
+            i += 1
+            if i >= len(value) - 1 or value[i] not in "'\"/\\":
+                raise ValueError("unsupported escape in a name")
+            ch = value[i]
+        if ord(ch) < 32:
+            raise ValueError("control character in a name")
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def object_entries(body: str) -> dict[str, str]:
+    """Read every object's own key/value pair, or refuse an unknown entry."""
+    entries: dict[str, str] = {}
+    for item in split_items(body):
+        if item[0] in "'\"":
+            end = quoted_end(item, 0)
+            key = literal_string(item[:end])
+            rest = item[end:].lstrip()
+            if not rest.startswith(":"):
+                raise ValueError("expected a colon after a quoted key")
+            value = rest[1:].strip()
+        else:
+            match = _KEY.match(item)
+            if match is None:
+                raise ValueError("unsupported object entry")
+            key, value = match.group(1), item[match.end() :].strip()
+        if not value or key in entries:
+            raise ValueError("missing value or duplicate object key")
+        entries[key] = value
+    return entries
+
+
+def literal_contents(value: str, opening: str, closing: str) -> str:
+    """Read one complete collection literal, with no trailing expression."""
+    value = value.strip()
+    if not value.startswith(opening):
+        raise ValueError(f"expected a {opening}{closing} literal")
+    body = balanced(value, 0, opening, closing)
+    if value[len(body) + 2 :].strip():
+        raise ValueError("unsupported expression after a literal")
+    # Validate all delimiter kinds, not only the one the outer literal uses.
+    split_items(body)
+    return body
+
+
+def top_level_keys(body: str) -> list[str]:
+    """Every key at the object's own depth, including quoted spellings."""
+    return list(object_entries(body))
