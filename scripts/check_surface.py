@@ -441,7 +441,7 @@ def constant(source: str, name: str, module: Path) -> int:
     rule the rest of this file follows — "could not tell" and "they agree" must
     never be the same answer.
     """
-    blanked = strip_comments(source)
+    blanked = strip_comments(source, language="go" if module.suffix == ".go" else "typescript")
     pattern = (
         rf"^\s*(?:const[ \t]+)?{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
         if module.suffix == ".go"

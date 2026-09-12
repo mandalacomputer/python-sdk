@@ -611,3 +611,121 @@ def test_an_unreadable_regex_cannot_supply_a_declaration(check_surface: ModuleTy
     """
     with pytest.raises(SystemExit, match="cannot read ROUTES.*regex"):
         check_surface.table(source, "ROUTES")
+
+
+def _interpolated_regex_prose(declaration: str) -> str:
+    return (
+        "const prose = `${(() => { if (enabled) /}}`; " + declaration + " `/.test(text); })()}`;\n"
+    )
+
+
+def test_an_interpolated_regex_cannot_supply_routes(check_surface: ModuleType) -> None:
+    source = (
+        _interpolated_regex_prose("export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];")
+        + "export const ROUTES: Route[] = buildRoutes();"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_an_interpolated_regex_cannot_supply_documentation(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    source = (
+        _interpolated_regex_prose(
+            "export const DOCS: Record<string, Doc> = {'GET sizes': {query: []}};"
+        )
+        + "export const DOCS: Record<string, Doc> = buildDocs();"
+    )
+    with pytest.raises(SystemExit, match="cannot read DOCS.*slash"):
+        scan(check_surface, tmp_path, source)
+
+
+def test_an_interpolated_regex_cannot_supply_a_shared_entry(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    source = _interpolated_regex_prose("const SHARED: Query = {name: 'fake'};") + (
+        "export const DOCS: Record<string, Doc> = {'GET sizes': {query: [SHARED]}};"
+    )
+    with pytest.raises(SystemExit, match="cannot read DOCS.*slash"):
+        scan(check_surface, tmp_path, source)
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "quoted_end",
+        "strip_comments",
+        "balanced",
+        "split_items",
+        "top_level_keys",
+        "top_level_value_at",
+        "literal_contents",
+    ],
+)
+def test_interpolation_boundaries_are_checked_through_each_reader(
+    check_surface: ModuleType, reader: str
+) -> None:
+    surface_text = sys.modules["surface_text"]
+    template = (
+        _interpolated_regex_prose("const HIDDEN = {}; ")
+        .removeprefix("const prose = ")
+        .removesuffix(";\n")
+    )
+    with pytest.raises(ValueError, match="ambiguous slash"):
+        if reader == "quoted_end":
+            surface_text.quoted_end(template, 0)
+        elif reader == "balanced":
+            surface_text.balanced("{value: " + template + "}", 0, "{", "}")
+        elif reader == "top_level_value_at":
+            surface_text.top_level_value_at("value: " + template, "absent")
+        elif reader == "literal_contents":
+            surface_text.literal_contents("[" + template + "]", "[", "]")
+        else:
+            getattr(surface_text, reader)("value: " + template)
+
+
+def test_a_recognized_interpolation_regex_hides_its_delimiters(check_surface: ModuleType) -> None:
+    source = _interpolated_regex_prose(
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];"
+    ).replace("if (enabled)", "return")
+    source += "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize("property_name", ["delay", "return"])
+def test_member_division_inside_interpolation_preserves_the_inventory(
+    check_surface: ModuleType, property_name: str
+) -> None:
+    source = "const prose = `${Math.ceil(result." + property_name + " / 1000)}`;\n"
+    source += "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_an_interpolation_comment_cannot_supply_a_division_operand(
+    check_surface: ModuleType, line_ending: str
+) -> None:
+    source = _interpolated_regex_prose(
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];"
+    ).replace("if (enabled) /", "if (enabled) // prose.member" + line_ending + "/")
+    source += "export const ROUTES: Route[] = buildRoutes();"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+@pytest.mark.parametrize("contents", ["echo ${value/path}", "echo ${unfinished", "echo \\"])
+def test_go_raw_strings_do_not_invoke_template_interpolation(
+    check_surface: ModuleType, contents: str
+) -> None:
+    source = "package example\nconst script = `" + contents + "`\nconst sampleLimit = 12 * 3\n"
+    assert check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go")) == 36
+
+
+def test_typescript_constant_scanning_keeps_strict_interpolation_boundaries(
+    check_surface: ModuleType,
+) -> None:
+    source = _interpolated_regex_prose("export const SAMPLE_LIMIT = 99;")
+    source += "export const SAMPLE_LIMIT = 36;"
+    with pytest.raises(ValueError, match="ambiguous slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))

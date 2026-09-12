@@ -16,12 +16,14 @@ empty parameter inventory.
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 _REGEX_CAN_FOLLOW = "([{=,:;!?&|~+*%^<>"
 _REGEX_CAN_FOLLOW_WORDS = ("return", "case", "throw", "yield")
 _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
 _KEY = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
 _IDENT_CHAR = re.compile(r"[\w$]")
+_MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 
 
 def quoted_end(text: str, start: int) -> int:
@@ -35,7 +37,7 @@ def quoted_end(text: str, start: int) -> int:
         if quote == "`" and text[i : i + 2] == "${":
             # Interpolations may contain strings or nested templates of their
             # own. Their quotes cannot terminate the surrounding template.
-            contents = balanced(text, i + 1, "{", "}")
+            contents = balanced(text, i + 1, "{", "}", strict_slashes=True)
             i += len(contents) + 3
             continue
         if text[i] == quote:
@@ -83,19 +85,46 @@ def regex_end(text: str, start: int) -> int:
     return start + 1
 
 
-def strip_comments(text: str) -> str:
+def checked_slash_end(text: str, start: int) -> int:
+    """Skip a known regex or division operator, refusing undecidable slash roles.
+
+    Use before interpreting delimiters in code, including template
+    interpolations: regex braces and backticks must never alter lexical scope.
+    """
+    # A same-line member access is an operand, even with a keyword property.
+    # Never borrow a member-looking suffix from a preceding line comment.
+    # Other division forms need an explicit reader update; in particular a
+    # closing parenthesis may instead end a regex-leading control condition.
+    if _MEMBER_OPERAND.search(text[:start]):
+        return start + 1
+    if not regex_can_start(text, start):
+        raise ValueError(f"ambiguous slash at offset {start}")
+    end = regex_end(text, start)
+    if end == start + 1:
+        raise ValueError(f"unreadable regex literal at offset {start}")
+    return end
+
+
+def strip_comments(text: str, *, language: Literal["typescript", "go"] = "typescript") -> str:
     """Blank out comments without touching comment markers inside literals.
 
     Replaced with spaces rather than deleted, so every offset in the result still
     names the same character in the original — which is what lets a match here be
-    used against the source it came from.
+    used against the source it came from. Go raw backticks have neither escapes
+    nor template interpolation, and Go has no regex literal syntax.
     """
     out: list[str] = []
     i = 0
     while i < len(text):
         ch = text[i]
         if ch in "'\"`":
-            end = quoted_end(text, i)
+            if language == "go" and ch == "`":
+                closing = text.find("`", i + 1)
+                if closing == -1:
+                    raise ValueError("unterminated raw string")
+                end = closing + 1
+            else:
+                end = quoted_end(text, i)
             out.append(text[i:end])
             i = end
         elif ch == "/" and text[i : i + 2] == "//":
@@ -109,7 +138,7 @@ def strip_comments(text: str) -> str:
             # Newlines kept so line numbers survive; everything else spaced out.
             out.append(re.sub(r"[^\r\n]", " ", text[i:stop]))
             i = stop
-        elif ch == "/" and regex_can_start(text, i):
+        elif language == "typescript" and ch == "/" and regex_can_start(text, i):
             end = regex_end(text, i)
             out.append(text[i:end])
             i = end
@@ -119,12 +148,18 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
-def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
+def balanced(
+    text: str, start: int, open_ch: str, close_ch: str, *, strict_slashes: bool = False
+) -> str:
     """The text between the bracket at ``start`` and the one that balances it.
 
     Depth-counted rather than matched lazily to the next closer, because every
     table here nests: a route's ``query`` holds objects and a body's schema holds
     more of them, so the first ``]`` is nowhere near the end of the list.
+
+    Template interpolations require strict slash handling before any delimiter
+    is interpreted. Other callers may read languages with ordinary division;
+    retaining their existing behavior avoids imposing JavaScript rules there.
     """
     depth = 0
     i = start
@@ -141,8 +176,8 @@ def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
             end = text.find("*/", i + 2)
             i = len(text) if end == -1 else end + 2
             continue
-        if ch == "/" and regex_can_start(text, i):
-            i = regex_end(text, i)
+        if ch == "/" and (strict_slashes or regex_can_start(text, i)):
+            i = checked_slash_end(text, i) if strict_slashes else regex_end(text, i)
             continue
         if ch == open_ch:
             depth += 1
@@ -171,16 +206,7 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
             i = quoted_end(source, i)
             continue
         if ch == "/":
-            # After a control condition, a slash can start a regex statement;
-            # after an expression it can mean division. This bounded reader
-            # does not distinguish those roles. Refuse at any depth rather
-            # than let regex contents alter scope or supply declarations.
-            if not regex_can_start(source, i):
-                raise ValueError(f"ambiguous slash at offset {i}")
-            end = regex_end(source, i)
-            if end == i + 1:
-                raise ValueError(f"unreadable regex literal at offset {i}")
-            i = end
+            i = checked_slash_end(source, i)
             continue
         if not stack and (i == 0 or not _IDENT_CHAR.match(source[i - 1])):
             match = expression.match(source, i)
