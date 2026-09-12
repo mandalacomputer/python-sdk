@@ -1122,18 +1122,26 @@ MAX_CLIPBOARD_BYTES = 64 * 1024
 def clipboard_body(text: str) -> dict[str, Any]:
     """Text for the desktop's clipboard, checked before it costs a round trip.
 
-    Empty text clears the selection. A NUL is refused because a clipboard write
-    cannot carry it reliably.
+    Empty text clears the selection — the only way to say it, and the platform
+    reads a present ``text`` field holding an empty string as exactly that.
+
+    A NUL is refused, and it is the one worth explaining: the platform confirms
+    a write by reading the selection back through a command substitution, and a
+    shell truncates that at the first NUL — so the write would land, the
+    read-back would disagree, and the answer would be a 409 inviting a retry at
+    something that had already worked.
 
     The cap is counted in UTF-8 BYTES rather than characters. An emoji is four of
     them, so a ``len(text)`` check would pass four times the legal payload to an
     ``execve`` that answers E2BIG.
     """
     # `canonical` rather than an isinstance check, for the reason it documents:
-    # every check below must read the same string the request sends. A `str`
-    # subclass can otherwise answer differently during validation and encoding.
-    # It also makes this a ValueError like every other refusal in this file,
-    # rather than the one TypeError among them.
+    # every check below reads `text`, and the request then encodes the ORIGINAL
+    # object again. A `str` subclass can answer differently the second time — an
+    # override that reports a clear here and a full buffer to the serialiser
+    # walks past every refusal below, and now sends a write where the checks saw
+    # nothing. It also makes this a ValueError like every other refusal in this
+    # file, rather than the one TypeError among them.
     text = canonical(text, "clipboard text")
     if "\0" in text:
         raise ValueError("clipboard text must not contain a NUL")

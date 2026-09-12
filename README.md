@@ -354,6 +354,23 @@ deliberate continuation with the returned delay and token and all original
 create arguments. For other image refusals, inspect the response before deciding
 whether to rebuild or retry.
 
+Two of those refusals never clear, and both arrive as a `400` — a bare
+`APIError` rather than the `UnavailableError` a `503` becomes, because a retry
+loop reads a `503` as an answer worth waiting for and these are not. A document
+that builds into a family this account may not build into is one: no hypervisor
+will launch it, and what changes the answer is publishing a new version, not
+sending the create again. A document that builds nothing and names an account
+family is the other: a create is served only from the families that ship with
+the product.
+
+The refusals beside them mean something else. A `409` — `ConflictError` — says
+no verified image for this exact document is available yet: finish the build,
+or restore an image that has gone missing or is still being verified. A `503`
+— `UnavailableError` — says no hypervisor has an image for that template *right
+now*, which is the one to retry as it stands. A create can answer `503` for
+capacity as well, and that one is worth a smaller size rather than only a
+wait.
+
 Everything here has an async twin: `await client.templates.publish(doc)`,
 `await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
 
@@ -1165,8 +1182,10 @@ times out and a nominated tree never armed, the error says so.
 
 **Match on what `hello` gives back, not on what you sent.** The host normalises
 a nomination — a trailing slash and a `.` segment are cleaned away — and the
-cleaned form is what every event carries in `ev.watch`. `stream.watching` is
-where the answer is, and it carries the half a client gets wrong:
+cleaned form is what every event carries in `ev.watch`. The cleaned nomination
+is where the answer is, and it carries the half a client gets wrong — through
+`on_connect`, which is handed the state as the connection opens, or from
+`stream.watching` once it has:
 
 ```python
 from contextlib import closing
@@ -1187,7 +1206,10 @@ with closing(c.events(watch=["/home/user/out/", "/srv/build"], on_connect=show_w
 Iteration opens the connection and calls `show_watches` with the initial,
 normalised watch state before yielding events. The loop then receives every
 event, including the first; interrupt it when finished, and `closing` releases
-the connection. The callback runs again if the stream reconnects.
+the connection. The callback runs again if the stream reconnects. `on_connect`
+rather than reading `stream.watching` before the loop, because nothing has
+connected yet at that point: read from the stream first and `watching` is
+`None`, which is not the same statement as "nothing armed".
 
 `armed` is whether the tree is *already being watched*. A watch is not live the
 moment the nomination is accepted — the guest has to be asked, and on a computer

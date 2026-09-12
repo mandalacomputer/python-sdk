@@ -659,7 +659,6 @@ def test_an_interpolated_regex_cannot_supply_a_shared_entry(
         "balanced",
         "split_items",
         "top_level_keys",
-        "top_level_value_at",
         "literal_contents",
     ],
 )
@@ -677,8 +676,6 @@ def test_interpolation_boundaries_are_checked_through_each_reader(
             surface_text.quoted_end(template, 0)
         elif reader == "balanced":
             surface_text.balanced("{value: " + template + "}", 0, "{", "}")
-        elif reader == "top_level_value_at":
-            surface_text.top_level_value_at("value: " + template, "absent")
         elif reader == "literal_contents":
             surface_text.literal_contents("[" + template + "]", "[", "]")
         else:
@@ -700,6 +697,79 @@ def test_member_division_inside_interpolation_preserves_the_inventory(
     source = "const prose = `${Math.ceil(result." + property_name + " / 1000)}`;\n"
     source += "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
     assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize("divisor", ["3600 / 2", "WINDOW_S / 2", "window.size / 2"])
+def test_ordinary_division_beside_a_table_is_read_as_arithmetic(
+    check_surface: ModuleType, divisor: str
+) -> None:
+    """Legal arithmetic upstream must not cost the whole comparison.
+
+    The run that enforces this is the platform's CI, so a refusal here is a red
+    build over source this reader has no interest in — and a slash after a
+    value cannot open a regex, so reading it as division is not a guess.
+    """
+    source = "const HALF = " + divisor + ";\n"
+    source += "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+def test_a_slash_after_a_keyword_is_not_read_as_division(check_surface: ModuleType) -> None:
+    """A keyword is not a value, so the slash after one is still a regex.
+
+    `_DIVISION_OPERAND` matches any trailing word, and a word that can precede
+    a regex has to stay out of that reading: `return /}/` divides nothing, and
+    treating its literal as an operator would put the table's own delimiters
+    back inside a regex nobody read.
+    """
+    surface_text = sys.modules["surface_text"]
+    source = "const f = () => { return /}}/.test(x); };"
+    assert (
+        surface_text.checked_slash_end(source, source.index("/}}/")) == source.index("/.test") + 1
+    )
+
+
+@pytest.mark.parametrize(
+    "prelude",
+    [
+        "export default /a; export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; z/;",
+        "class C extends /}/.constructor {}",
+        "const t = `${class extends /}[`]/.constructor {}}`;",
+    ],
+)
+def test_a_regex_after_a_keyword_cannot_supply_a_table(
+    check_surface: ModuleType, prelude: str
+) -> None:
+    """Every reserved word, not only the ones that can lead a regex.
+
+    `export default /…/` and `extends /…/` are legal TypeScript, and reading
+    either slash as division walks the reader into the regex: the first carried
+    a whole fake route table inside one, and the other two close a scope and
+    end a template with delimiters nobody wrote.
+    """
+    source = prelude + "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_a_keyword_this_reader_cannot_classify_is_still_refused(
+    check_surface: ModuleType,
+) -> None:
+    """The division reading is for values only; the rest stays fail-closed."""
+    surface_text = sys.modules["surface_text"]
+    source = "const f = () => { typeof /}}/; };"
+    with pytest.raises(ValueError, match="ambiguous slash"):
+        surface_text.checked_slash_end(source, source.index("/}}/"))
+
+
+def test_an_undecidable_slash_is_refused_with_a_line_and_column(
+    check_surface: ModuleType,
+) -> None:
+    """The offset it used to name is not a place anybody can go and look."""
+    surface_text = sys.modules["surface_text"]
+    source = "const a = 1;\nconst b = size() /* x */;\n"
+    with pytest.raises(ValueError, match=r"ambiguous slash at line 2 column 18"):
+        surface_text.checked_slash_end(source.replace("/* x */", "/[a]"), source.index("/*"))
 
 
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
