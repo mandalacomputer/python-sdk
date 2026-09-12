@@ -2852,21 +2852,21 @@ def test_a_clipboard_read_with_no_text_raises_rather_than_coercing(
 
 
 @respx.mock
+@pytest.mark.parametrize("text", ["hello", "", " \t\n"])
 def test_writing_the_clipboard_sends_the_one_field_the_platform_decodes(
     client: mc.Client,
+    text: str,
 ) -> None:
     route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
         httpx.Response(200, json={"ok": True})
     )
-    _computer(client).set_clipboard("hello")
-    assert json.loads(route.calls.last.request.content) == {"text": "hello"}
+    mc.Computer(client._t, COMPUTER).set_clipboard(text)
+    assert json.loads(route.calls.last.request.content) == {"text": text}
+    assert route.call_count == 1
+    assert len(respx.calls) == 1
 
 
 def test_the_clipboard_write_refuses_locally_what_the_platform_would_refuse() -> None:
-    # Empty: clearing the clipboard is not what that endpoint does, and a caller
-    # who meant to clear it should hear so rather than read a status code.
-    with pytest.raises(ValueError, match="must not be empty"):
-        mc._api.clipboard_body("")
     # A NUL would LAND and then be reported as a failure: the platform confirms
     # the write through a command substitution, a shell truncates one at the
     # first NUL, and the answer is a 409 inviting a retry at something that has
@@ -2881,13 +2881,7 @@ def test_the_clipboard_write_refuses_locally_what_the_platform_would_refuse() ->
 
 
 def test_the_clipboard_write_sends_the_buffer_it_checked() -> None:
-    """A `str` subclass can answer differently the second time it is read.
-
-    Every guard above reads `text`; the request then encodes the object again.
-    An override that reports empty to the checks and a full buffer to the
-    serialiser walks past all three, which is the hole `canonical` exists to
-    close and which this builder was not using.
-    """
+    """A string subclass must not turn a write of text into a clear instruction."""
 
     class Shifty(str):
         def __str__(self) -> str:
@@ -2909,8 +2903,8 @@ def test_the_clipboard_write_refuses_before_it_reaches_the_wire(client: mc.Clien
         httpx.Response(200, json={"ok": True})
     )
     computer = _computer(client)
-    with pytest.raises(ValueError, match="must not be empty"):
-        computer.set_clipboard("")
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        computer.set_clipboard("\ud800")
     with pytest.raises(ValueError, match="NUL"):
         computer.set_clipboard("a\0b")
     with pytest.raises(ValueError, match="at most"):
