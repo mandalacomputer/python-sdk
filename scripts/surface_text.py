@@ -11,6 +11,12 @@ This bounded reader handles literal inventories and the lexical boundaries
 needed to locate them. A declaration it cannot read is refused explicitly,
 so an unsupported expression cannot silently become a missing route or an
 empty parameter inventory.
+
+It was a direct port of the TypeScript SDK's ``scripts/surface-text.mjs`` and no
+longer is: that reader, and the MCP SDK's copy of it, still match parameter
+names with a single-quote regex and drop what they cannot read. So a refusal
+here says nothing about them — the same upstream shape can pass there and be
+missing from their mirrors, which is the failure this file stopped having.
 """
 
 from __future__ import annotations
@@ -24,6 +30,34 @@ _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
 _KEY = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
 _IDENT_CHAR = re.compile(r"[\w$]")
 _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
+#: A value a slash can only divide: a number, or a name that is not one of the
+#: keywords a regex is allowed to follow. Anything else — a closing parenthesis
+#: or bracket above all — stays undecidable here and is refused rather than
+#: guessed at, because a control condition's ``)`` is exactly what precedes the
+#: regex literals this reader must not walk into.
+_DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
+#: Every word after which a slash opens a regex rather than dividing. Longer
+#: than ``_REGEX_CAN_FOLLOW_WORDS``, which only lists the ones that reach
+#: ``regex_can_start``: this set has to be complete in the other direction,
+#: since a word missing from it would be read as a value being divided.
+_OPERATOR_WORDS = frozenset(
+    {
+        "await",
+        "case",
+        "delete",
+        "do",
+        "else",
+        "in",
+        "instanceof",
+        "new",
+        "of",
+        "return",
+        "throw",
+        "typeof",
+        "void",
+        "yield",
+    }
+)
 
 
 def quoted_end(text: str, start: int) -> int:
@@ -85,6 +119,19 @@ def regex_end(text: str, start: int) -> int:
     return start + 1
 
 
+def position(text: str, offset: int) -> str:
+    """Where an offset is, in the terms the file's own editor uses.
+
+    Every refusal in this reader names a place, and an offset is not one: the
+    run that enforces this comparison is the platform's CI, so the person who
+    reads the message is looking at *their* file for the construct it cannot
+    read. A byte count sends them counting; a line and column is where the
+    cursor goes.
+    """
+    line = text.count("\n", 0, offset) + 1
+    return f"line {line} column {offset - text.rfind(chr(10), 0, offset)}"
+
+
 def checked_slash_end(text: str, start: int) -> int:
     """Skip a known regex or division operator, refusing undecidable slash roles.
 
@@ -93,15 +140,24 @@ def checked_slash_end(text: str, start: int) -> int:
     """
     # A same-line member access is an operand, even with a keyword property.
     # Never borrow a member-looking suffix from a preceding line comment.
-    # Other division forms need an explicit reader update; in particular a
-    # closing parenthesis may instead end a regex-leading control condition.
-    if _MEMBER_OPERAND.search(text[:start]):
+    before = text[:start]
+    if _MEMBER_OPERAND.search(before):
+        return start + 1
+    # Ordinary arithmetic over a number or a plain name, which is what `60 * 60
+    # / 2` in a document being read is: a slash cannot open a regex after a
+    # value, so nothing here is a guess. Refusing it made every legal division
+    # upstream a failed comparison in the platform's CI, over source this
+    # reader does not otherwise care about. A keyword is not a value, and a
+    # closing parenthesis or bracket is still undecidable — see
+    # `_DIVISION_OPERAND`.
+    operand = _DIVISION_OPERAND.search(before)
+    if operand and operand.group(0).strip() not in _OPERATOR_WORDS:
         return start + 1
     if not regex_can_start(text, start):
-        raise ValueError(f"ambiguous slash at offset {start}")
+        raise ValueError(f"ambiguous slash at {position(text, start)}")
     end = regex_end(text, start)
     if end == start + 1:
-        raise ValueError(f"unreadable regex literal at offset {start}")
+        raise ValueError(f"unreadable regex literal at {position(text, start)}")
     return end
 
 
@@ -186,7 +242,7 @@ def balanced(
             if depth == 0:
                 return text[start + 1 : i]
         i += 1
-    raise ValueError(f"unbalanced {open_ch} from offset {start}")
+    raise ValueError(f"unbalanced {open_ch} from {position(text, start)}")
 
 
 def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
@@ -220,7 +276,7 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
         if ch in "{[(":
             stack.append(ch)
         elif ch in "}])" and (not stack or stack.pop() != {"}": "{", "]": "[", ")": "("}[ch]):
-            raise ValueError(f"unbalanced {ch} at offset {i}")
+            raise ValueError(f"unbalanced {ch} at {position(source, i)}")
         i += 1
     if stack:
         raise ValueError("unbalanced module scope")
@@ -239,59 +295,6 @@ def initializer_contents(source: str, start: int, opening: str, closing: str) ->
     if remainder and not remainder.startswith(";"):
         raise ValueError("unsupported initializer continuation; expected semicolon or end of input")
     return body
-
-
-def top_level_value_at(body: str, name: str) -> int:
-    """Where the value of one top-level key starts, or ``-1`` when it is not there.
-
-    A sibling of :func:`top_level_keys` for the values it cannot read: the shape
-    of a value is what decides how it is read — ``object(...)`` has named fields,
-    a raw ``{ type: 'string' }`` schema has none to name, a bare identifier is a
-    shape this cannot read at all — and telling those apart by searching the
-    whole entry for a spelling answers about whichever one turns up first at any
-    depth. A ``body: { … }`` quoted in a response example then vouches for the
-    entry's own ``body: SHARED_BODY``, the unreadable shape passes as a readable
-    one, and the route is compared against no fields at all.
-
-    Depth-counted rather than found by ``str.find`` for that reason, and by the
-    key rather than by ``key: `` for another: the one space after the colon is a
-    spelling, not a shape, so a list the formatter wrapped over two lines —
-    ``query:\n  [{ name: 'limit' }]`` — is still found here and was silently
-    skipped before.
-
-    Quoted spellings of the key as well: ``'body':`` names the same field as
-    ``body:`` does, and a reader that insists on one of them reports the other
-    as absent.
-    """
-    lit = re.escape(name)
-    key = re.compile(rf"(?:'{lit}'|\"{lit}\"|{lit})\s*:\s*")
-    depth = 0
-    i = 0
-    while i < len(body):
-        # Before the literal skip below, so a quoted key is still seen; and not
-        # mid-identifier, so `subbody:` is not read as `body:`.
-        if depth == 0 and (i == 0 or not _IDENT_CHAR.match(body[i - 1])):
-            m = key.match(body, i)
-            if m:
-                return m.end()
-        ch = body[i]
-        if ch in "{[(":
-            depth += 1
-        elif ch in "}])":
-            depth -= 1
-            if depth < 0:
-                # As in its siblings: a depth that goes negative never comes
-                # back, so the key would be reported missing rather than
-                # unreadable — and missing is an answer this caller acts on.
-                raise ValueError(f"unbalanced {ch} at offset {i}")
-        elif ch in "'\"`":
-            i = quoted_end(body, i)
-            continue
-        elif ch == "/" and regex_can_start(body, i):
-            i = regex_end(body, i)
-            continue
-        i += 1
-    return -1
 
 
 def split_items(body: str) -> list[str]:
@@ -316,7 +319,7 @@ def split_items(body: str) -> list[str]:
             stack.append(ch)
         elif ch in "}])":
             if not stack or stack.pop() != {"}": "{", "]": "[", ")": "("}[ch]:
-                raise ValueError(f"unbalanced {ch} at offset {i}")
+                raise ValueError(f"unbalanced {ch} at {position(body, i)}")
         elif ch == "," and not stack:
             item = body[start:i].strip()
             if not item:
