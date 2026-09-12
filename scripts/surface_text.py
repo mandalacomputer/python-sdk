@@ -170,8 +170,17 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
         if ch in "'\"`":
             i = quoted_end(source, i)
             continue
-        if ch == "/" and regex_can_start(source, i):
-            i = regex_end(source, i)
+        if ch == "/":
+            # After a control condition, a slash can start a regex statement;
+            # after an expression it can mean division. This bounded reader
+            # does not distinguish those roles. Refuse at any depth rather
+            # than let regex contents alter scope or supply declarations.
+            if not regex_can_start(source, i):
+                raise ValueError(f"ambiguous slash at offset {i}")
+            end = regex_end(source, i)
+            if end == i + 1:
+                raise ValueError(f"unreadable regex literal at offset {i}")
+            i = end
             continue
         if not stack and (i == 0 or not _IDENT_CHAR.match(source[i - 1])):
             match = expression.match(source, i)

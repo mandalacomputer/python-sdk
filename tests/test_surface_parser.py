@@ -552,3 +552,62 @@ def test_a_literal_declaration_may_end_at_eof(check_surface: ModuleType, tmp_pat
         )
         == set()
     )
+
+
+@pytest.mark.parametrize("real", ["", "buildRoutes()", "[{ method: 'GET', pattern: 'widgets' }]"])
+def test_a_control_statement_regex_cannot_supply_routes(
+    check_surface: ModuleType, real: str
+) -> None:
+    source = (
+        "if (enabled) /export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];/.test(text);"
+    )
+    if real:
+        source += "\nexport const ROUTES: Route[] = " + real + ";"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+@pytest.mark.parametrize("real", ["", "buildDocs()", "{ 'GET sizes': { query: [] } }"])
+def test_a_control_statement_regex_cannot_supply_documented_parameters(
+    check_surface: ModuleType, tmp_path: Path, real: str
+) -> None:
+    source = (
+        "if (enabled) /export const DOCS: Record<string, Doc> = "
+        "{'GET sizes': { query: [] }};/.test(text);"
+    )
+    if real:
+        source += "\nexport const DOCS: Record<string, Doc> = " + real + ";"
+    with pytest.raises(SystemExit, match="cannot read DOCS.*slash"):
+        scan(check_surface, tmp_path, source)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "function example() { if (enabled) /fake/.test(text); }\n",
+        "const example = (value() / 2);\n",
+        "const example = { value: value() / 2 };\n",
+    ],
+)
+def test_an_ambiguous_slash_is_refused_inside_nested_scopes(
+    check_surface: ModuleType, prefix: str
+) -> None:
+    source = prefix + "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_a_supported_regex_position_still_hides_its_contents(check_surface: ModuleType) -> None:
+    source = """const pattern = /export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];/;
+    function example() { return /[{}]/; }
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    """
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+def test_an_unreadable_regex_cannot_supply_a_declaration(check_surface: ModuleType) -> None:
+    source = """const example = /unterminated
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    """
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*regex"):
+        check_surface.table(source, "ROUTES")
