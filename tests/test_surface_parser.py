@@ -799,3 +799,303 @@ def test_typescript_constant_scanning_keeps_strict_interpolation_boundaries(
     source += "export const SAMPLE_LIMIT = 36;"
     with pytest.raises(ValueError, match="ambiguous slash"):
         check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+# --- a constant read out of prose (OPL-4805) -------------------------------
+#
+# Comment blanking closed one half of this: a commented-out declaration cannot
+# be read as the declaration. A QUOTED one still could, and the first match in
+# the file won, so a snippet in a template or in a Go raw string decided what
+# the platform's constant was — and a number read out of prose that happens to
+# equal the mirror is a comparison that passes over real drift.
+
+
+def test_a_quoted_typescript_declaration_does_not_win_over_the_real_one(
+    check_surface: ModuleType,
+) -> None:
+    source = (
+        "export const snippet = `\nexport const SAMPLE_LIMIT = 99;\n`;\n"
+        "export const SAMPLE_LIMIT = 36;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 36
+
+
+def test_a_go_raw_string_declaration_does_not_win_over_the_real_one(
+    check_surface: ModuleType,
+) -> None:
+    source = (
+        "package example\n"
+        "var script = `\nconst sampleLimit = 99\n`\n"
+        "const (\n\tsampleLimit = 12 * 3\n)\n"
+    )
+    assert check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go")) == 36
+
+
+@pytest.mark.parametrize(
+    ("source", "name", "suffix"),
+    [
+        ("export const A = 1;\nexport const A = 2;\n", "A", ".ts"),
+        ("package example\nconst a = 1\nconst (\n\ta = 2\n)\n", "a", ".go"),
+    ],
+    ids=["typescript", "go"],
+)
+def test_two_declarations_of_one_name_are_refused_rather_than_ordered(
+    check_surface: ModuleType, source: str, name: str, suffix: str
+) -> None:
+    """Position is not evidence. Picking the first is how it agrees with the wrong one."""
+    with pytest.raises(SystemExit, match="declared more than once"):
+        check_surface.constant(source, name, Path("fixture").with_suffix(suffix))
+
+
+def test_a_regex_this_reader_cannot_place_refuses_rather_than_picking_a_side(
+    check_surface: ModuleType,
+) -> None:
+    """The attack the blanking alone did not stop (adversarial review, OPL-4805).
+
+    A regex literal after a `)` is a position this reader cannot decide, and a
+    backtick inside one moves a template's boundary: read as an operator, the real
+    declaration lands inside the "template" and is blanked, leaving the snippet as
+    the only declaration in the file. Both readings are taken and the disagreement
+    is the answer — the value this would otherwise have reported is the prose one.
+    """
+    source = (
+        'if (true) /`/.test("");\n'
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        'if (true) /`/.test("");\n'
+    )
+    with pytest.raises(SystemExit, match="undecidable slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_a_typed_go_declaration_is_not_invisible_to_a_local_of_the_same_name(
+    check_surface: ModuleType,
+) -> None:
+    """`const name int = 99` is still the declaration (adversarial review, OPL-4805).
+
+    A pattern blind to the type read the file as if the constant were declared
+    somewhere else, and a function-local of the same name was where it then found
+    it — so a local `36` answered for an exported `99`.
+    """
+    source = (
+        "package example\n"
+        "const sampleLimit int = 99\n\n"
+        "func f() {\n\tconst sampleLimit = 36\n\t_ = sampleLimit\n}\n"
+    )
+    assert check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go")) == 99
+
+
+def test_a_declaration_only_inside_a_function_is_not_the_platforms_constant(
+    check_surface: ModuleType,
+) -> None:
+    """Nothing mirrors a local, so finding one is finding nothing."""
+    source = "package example\nfunc f() {\n\tconst sampleLimit = 36\n}\n"
+    with pytest.raises(SystemExit, match="not found"):
+        check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go"))
+
+
+@pytest.mark.parametrize(
+    "division",
+    ["Date.now() / 1000", "x++ / 2", "obj.return / 2"],
+    ids=["after-a-call", "after-a-postfix", "after-a-reserved-property"],
+)
+def test_an_ordinary_division_still_does_not_refuse_a_constant(
+    check_surface: ModuleType, division: str
+) -> None:
+    """Three divisions the slash predicate places differently, none of which may cost
+    the comparison: the first it cannot decide, and the other two it reads as the
+    start of a regex. A regex cannot cross a line break, so neither reading moves a
+    boundary here, and the two policies agree."""
+    source = f"const value = {division};\nexport const SAMPLE_LIMIT = 36;\n"
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 36
+
+
+def test_a_division_after_a_property_named_like_a_keyword_is_not_a_regex(
+    check_surface: ModuleType,
+) -> None:
+    """The agreement of two readings is worth nothing where both guess the same way.
+
+    `obj.return / …` is a division, and the slash predicate calls it a regex
+    position because the word before it is `return`. Both policies then consumed a
+    backtick as part of that "regex", which moved a template's boundary: the
+    declaration inside the template was left standing and the real one was blanked.
+    A value a member access decides is not a guess, so it is settled before either
+    policy is consulted (adversarial review, OPL-4805).
+    """
+    source = (
+        "const obj = {return: 1};\n"
+        "const ratio = obj.return / `/\nexport const SAMPLE_LIMIT = 36;\n` / 2;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const marker = /`/;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_a_brace_inside_a_regex_does_not_move_a_declarations_scope(
+    check_surface: ModuleType,
+) -> None:
+    """A regex body is a literal, and one left standing is counted as code.
+
+    A `}` in a regex closed a scope nobody opened, so the module's own declaration
+    read as nested and a nested one read as top level — the exported 99 lost to a
+    namespace's 36. An unmatched `{` did the mirror image and reported a real
+    declaration missing (adversarial review, OPL-4805).
+    """
+    hidden = (
+        "const pattern = /[}]/;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "namespace Example {\nexport const SAMPLE_LIMIT = 36;\n}\n"
+    )
+    ts = Path("fixture").with_suffix(".ts")
+    assert check_surface.constant(hidden, "SAMPLE_LIMIT", ts) == 99
+    unmatched = "const pattern = /[{]/;\nexport const SAMPLE_LIMIT = 36;\n"
+    assert check_surface.constant(unmatched, "SAMPLE_LIMIT", ts) == 36
+
+
+def test_a_prefix_update_of_a_regex_property_is_not_a_division(
+    check_surface: ModuleType,
+) -> None:
+    """`++ /re/.lastIndex` increments a property OF a regex, so the slash opens one.
+
+    The postfix test was written as "a `++` before the slash" and matched this,
+    which turned a regex into a division and let its backtick move a template's
+    boundary. A postfix update has an operand in front of it; a prefix one does not
+    (adversarial review, OPL-4805).
+    """
+    source = (
+        "++ /`/.lastIndex;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        "++ /`/.lastIndex;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+@pytest.mark.parametrize("value", ["obj.return", "x++"], ids=["member-access", "postfix-update"])
+def test_a_line_break_between_a_value_and_its_slash_is_still_a_division(
+    check_surface: ModuleType, value: str
+) -> None:
+    """A value on the line above divides just the same, and JavaScript agrees:
+    a name, a line break and a slash is one expression, not a new statement.
+
+    The operand tests reached only as far as a space or a tab, so both divisions
+    came back as regex positions the moment the line wrapped (adversarial review,
+    OPL-4805).
+    """
+    source = (
+        "const obj = {return: 1};\nlet x = 2;\n"
+        f"const ratio = {value}\n / `/\nexport const SAMPLE_LIMIT = 36;\n` / 2;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const marker = /`/;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_a_hashbang_is_not_code_and_its_braces_are_not_scope(
+    check_surface: ModuleType,
+) -> None:
+    """Every tool that reads one of these files treats a `#!` line as a comment.
+
+    This reader did not, so a brace in one closed a scope nobody opened — which hid
+    the module's own declaration and promoted a namespace's (adversarial review,
+    OPL-4805).
+    """
+    source = (
+        "#!/usr/bin/env node --title=}\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "namespace Example {\nexport const SAMPLE_LIMIT = 36;\n}\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_braces_that_do_not_balance_refuse_rather_than_placing_a_declaration(
+    check_surface: ModuleType,
+) -> None:
+    """The depth rule is a count, and a count that has gone negative is evidence of
+    text this reader is not seeing as text. Whether the declaration is at the top
+    level is then exactly what cannot be established, so it is refused."""
+    with pytest.raises(SystemExit, match="do not balance"):
+        check_surface.constant(
+            "}\nexport const SAMPLE_LIMIT = 36;\n",
+            "SAMPLE_LIMIT",
+            Path("fixture").with_suffix(".ts"),
+        )
+
+
+#: A file whose real declaration is 99 and whose template carries a 36, with the
+#: attack construct substituted in. Every case below is the same question: did the
+#: reader place the template's boundary where JavaScript places it?
+_HIDDEN_BY_A_TEMPLATE = (
+    "const obj = {{return: 1}};\nlet x = 1;\n"
+    "{attack}\n"
+    "export const SAMPLE_LIMIT = 99;\n"
+    "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+    "const marker = /`/;\n"
+)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "if (true) ++ /`/.lastIndex;",
+        "x\n++ /`/.lastIndex;",
+        "const pad = obj.return" + " " * 260 + "/ 2;",
+    ],
+    ids=["prefix-update-after-a-condition", "prefix-update-after-a-line-break", "padded-operand"],
+)
+def test_a_slash_this_reader_cannot_place_never_reports_the_templates_number(
+    check_surface: ModuleType, attack: str
+) -> None:
+    """Three ways the previous round's certainties were false, and one rule for all.
+
+    A `)` is not something a postfix update can be applied to, a line break before
+    `++` is where JavaScript ends the statement, and an operand does not stop being
+    one because 260 spaces follow it. Each of them read a regex as a division or the
+    reverse, moved a template's boundary, and reported the number inside the
+    template. Reading the value correctly is the good outcome and refusing is an
+    acceptable one; reporting the template's 36 is not (adversarial review, OPL-4805).
+    """
+    source = _HIDDEN_BY_A_TEMPLATE.format(attack=attack)
+    try:
+        assert (
+            check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+        )
+    except SystemExit as refusal:
+        assert "SAMPLE_LIMIT" in str(refusal)
+
+
+def test_a_comments_punctuation_cannot_make_a_slash_certain(
+    check_surface: ModuleType,
+) -> None:
+    """Blanking comments protects every slash decision, not only the first.
+
+    A `?` at the end of a line comment was read as the character before the slash
+    below it, which made an undecidable division certainly a regex — and both
+    policies then guessed it the same way, so the disagreement that is supposed to
+    catch a guess never happened (adversarial review, OPL-4805).
+    """
+    source = (
+        "const ratio = (1) // why?\n / `/\nexport const SAMPLE_LIMIT = 36;\n` / 2;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const marker = /`/;\n"
+    )
+    with pytest.raises(SystemExit, match="undecidable slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_a_brace_count_that_recovers_is_still_not_a_placement(
+    check_surface: ModuleType,
+) -> None:
+    """A closing brace this reader cannot see, and the count back at zero afterwards.
+
+    The `}` inside a regex closed a scope nobody opened, and the next real `{`
+    brought the count back to zero — so a declaration inside a namespace read as one
+    at the top level. Checking the number at the declaration is not enough; the
+    whole prefix has to have stayed non-negative (adversarial review, OPL-4805).
+    """
+    source = (
+        'export {};\nlet unused\n/[}]/.test("");\n'
+        "namespace Example {\nexport const SAMPLE_LIMIT = 36;\n}\n"
+    )
+    with pytest.raises(SystemExit, match="do not balance|not found"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
