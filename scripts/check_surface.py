@@ -428,6 +428,18 @@ def constant(source: str, name: str, module: Path) -> int:
     TypeScript one was not, which made a commented-out declaration upstream a
     silent match here.
 
+    Quoted text is blanked along with the comments, and the match must be the ONLY
+    one in the file. Both halves close what the comment blanking left open: a
+    declaration-shaped LINE inside a template or a Go raw string — a snippet in a
+    generated document, a script embedded in a module — matched, and the first
+    match won, so prose earlier in the file decided what the platform's constant
+    was. A number read out of prose is not a comparison, and where it happens to
+    equal the mirror the check passes over a constant that has drifted, which is
+    the one direction that matters for a published package. Two declarations of
+    one name is the same situation from the other side and is refused rather than
+    settled by position, which is the rule :func:`table` already follows
+    (OPL-4805).
+
     Which form is tried is decided by the module's suffix rather than by trying
     both: the two patterns are close enough that a file answering to the wrong
     one is a way for this to agree by accident.
@@ -441,20 +453,27 @@ def constant(source: str, name: str, module: Path) -> int:
     rule the rest of this file follows — "could not tell" and "they agree" must
     never be the same answer.
     """
-    blanked = strip_comments(source, language="go" if module.suffix == ".go" else "typescript")
+    go = module.suffix == ".go"
+    blanked = strip_comments(source, language="go" if go else "typescript", literals=True)
     pattern = (
         rf"^\s*(?:const[ \t]+)?{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
-        if module.suffix == ".go"
+        if go
         else rf"^\s*export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
     )
-    m = re.search(pattern, blanked, re.MULTILINE)
-    if m is None:
+    found = re.findall(pattern, blanked, re.MULTILINE)
+    if not found:
         raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
+    if len(found) > 1:
+        raise SystemExit(
+            f"{name} is declared {len(found)} times in {module} — this reader cannot tell\n"
+            "  which one the platform uses, and picking by position is how it would agree\n"
+            "  with the wrong one."
+        )
     try:
-        return _arith(ast.parse(m.group(1).strip(), mode="eval").body)
+        return _arith(ast.parse(found[0].strip(), mode="eval").body)
     except (SyntaxError, ValueError) as err:
         raise SystemExit(
-            f"{name} is {m.group(1)!r} in {module}, which this reader cannot evaluate"
+            f"{name} is {found[0]!r} in {module}, which this reader cannot evaluate"
         ) from err
 
 

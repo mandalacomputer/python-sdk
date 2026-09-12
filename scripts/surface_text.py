@@ -211,13 +211,33 @@ def checked_slash_end(text: str, start: int) -> int:
     return end
 
 
-def strip_comments(text: str, *, language: Literal["typescript", "go"] = "typescript") -> str:
+def blank_inside(literal: str) -> str:
+    """One quoted literal with its CONTENTS spaced out, delimiters and lines kept."""
+    if len(literal) < 2:
+        return literal
+    return literal[0] + re.sub(r"[^\r\n]", " ", literal[1:-1]) + literal[-1]
+
+
+def strip_comments(
+    text: str,
+    *,
+    language: Literal["typescript", "go"] = "typescript",
+    literals: bool = False,
+) -> str:
     """Blank out comments without touching comment markers inside literals.
 
     Replaced with spaces rather than deleted, so every offset in the result still
     names the same character in the original — which is what lets a match here be
     used against the source it came from. Go raw backticks have neither escapes
     nor template interpolation, and Go has no regex literal syntax.
+
+    ``literals=True`` blanks the CONTENTS of every string, template and raw
+    literal as well, leaving the quotes where they were. For a reader that finds
+    a declaration by matching over the whole file, a literal is prose: a template
+    or a raw string is free to carry a line that reads exactly like the
+    declaration being looked for — an example in a generated document, a snippet
+    of a script — and a match inside one is a sentence, not a declaration. It is
+    off by default because the readers that locate literal DATA need the data.
     """
     out: list[str] = []
     i = 0
@@ -231,7 +251,7 @@ def strip_comments(text: str, *, language: Literal["typescript", "go"] = "typesc
                 end = closing + 1
             else:
                 end = quoted_end(text, i)
-            out.append(text[i:end])
+            out.append(blank_inside(text[i:end]) if literals else text[i:end])
             i = end
         elif ch == "/" and text[i : i + 2] == "//":
             end = text.find("\n", i + 2)
@@ -244,6 +264,19 @@ def strip_comments(text: str, *, language: Literal["typescript", "go"] = "typesc
             # Newlines kept so line numbers survive; everything else spaced out.
             out.append(re.sub(r"[^\r\n]", " ", text[i:stop]))
             i = stop
+        # The tolerant predicate, deliberately, and not `checked_slash_end`. This
+        # pass runs over EVERY upstream module a constant is read out of, and
+        # those are ordinary source rather than tables: `Date.now() / 1000` is in
+        # one of them today, and a slash after a `)` is exactly what
+        # `checked_slash_end` refuses to decide — so the strict reader would
+        # answer a legal division with a refusal and take the whole comparison
+        # down with it. `regex_can_start` cannot make the mistake in the other
+        # direction either: it opens a regex only where one can begin, never after
+        # a number, a name or a `)`. What it does leave is a regex that genuinely
+        # follows a `)` — unskipped, so a quote inside it lexes as a string. The
+        # callers that walk delimiters (`balanced`, `module_matches`) are strict
+        # for that reason; this one blanks comments, where the cost of the strict
+        # answer is higher than the cost of the gap.
         elif language == "typescript" and ch == "/" and regex_can_start(text, i):
             end = regex_end(text, i)
             out.append(text[i:end])

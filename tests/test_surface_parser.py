@@ -799,3 +799,64 @@ def test_typescript_constant_scanning_keeps_strict_interpolation_boundaries(
     source += "export const SAMPLE_LIMIT = 36;"
     with pytest.raises(ValueError, match="ambiguous slash"):
         check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+# --- a constant read out of prose (OPL-4805) -------------------------------
+#
+# Comment blanking closed one half of this: a commented-out declaration cannot
+# be read as the declaration. A QUOTED one still could, and the first match in
+# the file won, so a snippet in a template or in a Go raw string decided what
+# the platform's constant was — and a number read out of prose that happens to
+# equal the mirror is a comparison that passes over real drift.
+
+
+def test_a_quoted_typescript_declaration_does_not_win_over_the_real_one(
+    check_surface: ModuleType,
+) -> None:
+    source = (
+        "export const snippet = `\nexport const SAMPLE_LIMIT = 99;\n`;\n"
+        "export const SAMPLE_LIMIT = 36;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 36
+
+
+def test_a_go_raw_string_declaration_does_not_win_over_the_real_one(
+    check_surface: ModuleType,
+) -> None:
+    source = (
+        "package example\n"
+        "var script = `\nconst sampleLimit = 99\n`\n"
+        "const (\n\tsampleLimit = 12 * 3\n)\n"
+    )
+    assert check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go")) == 36
+
+
+@pytest.mark.parametrize(
+    ("source", "name", "suffix"),
+    [
+        ("export const A = 1;\nexport const A = 2;\n", "A", ".ts"),
+        ("package example\nconst a = 1\nconst (\n\ta = 2\n)\n", "a", ".go"),
+    ],
+    ids=["typescript", "go"],
+)
+def test_two_declarations_of_one_name_are_refused_rather_than_ordered(
+    check_surface: ModuleType, source: str, name: str, suffix: str
+) -> None:
+    """Position is not evidence. Picking the first is how it agrees with the wrong one."""
+    with pytest.raises(SystemExit, match="declared 2 times"):
+        check_surface.constant(source, name, Path("fixture").with_suffix(suffix))
+
+
+def test_an_ordinary_division_in_a_constants_module_is_not_refused(
+    check_surface: ModuleType,
+) -> None:
+    """The modules constants are read out of are source, not tables.
+
+    A slash after a `)` is undecidable to the strict reader the table walkers use,
+    and `Date.now() / 1000` is exactly that shape — ordinary arithmetic, in a file
+    this has to get a constant out of. Blanking comments with the tolerant
+    predicate is what keeps a legal division from taking the comparison down; it
+    cannot read one as a regex, because a regex cannot begin after a value.
+    """
+    source = "const seconds = Date.now() / 1000;\nexport const SAMPLE_LIMIT = 36;\n"
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 36
