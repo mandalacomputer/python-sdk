@@ -341,15 +341,18 @@ normally share an image, which is what makes a repeated build cheap;
 `start(doc, no_reuse=True)` builds again even when an image already carries this
 document's build digest.
 
-**A build that declares its own family is not launchable yet.** The fleet does
-not advertise a family it built rather than shipped, so a create naming such a
-ref is refused with a `400` — a bare `APIError`, and a permanent answer: the
-message says in words that retrying the create changes nothing and that what
-would change it is publishing a new version. Deliberately not a `503`, which
-arrives as `UnavailableError` and reads to a retry loop as an answer worth
-waiting for. A `503` on this path still means the case that does come good: a
-shipped family whose only holder is unreachable. Publishing the document is
-worth doing anyway — it claims the ref, and it is what `builds.start()` takes.
+After a successful build, launch the published template with
+`client.computers.create(template=t.ref)`. A pinned template version selects
+the latest successful image built from that exact document; an unpinned ref
+first selects the newest published template version. Existing computers keep
+their original image when a later build becomes available.
+
+A create may need to prepare that image before it can launch. Follow the
+[template preparation guidance](#your-own-templates) for a
+`template_image_preparing` response: inspect its state and error, then make a
+deliberate continuation with the returned delay and token and all original
+create arguments. For other image refusals, inspect the response before deciding
+whether to rebuild or retry.
 
 Everything here has an async twin: `await client.templates.publish(doc)`,
 `await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
@@ -909,8 +912,8 @@ on_clipboard = c.clipboard()  # "" is an empty clipboard
 `set_clipboard()` takes at most 64 KiB of UTF-8; `clipboard()` returns at most
 128 KiB. They are different bounds on different channels, and the read is
 **refused rather than truncated** past its own — half a password is not less of
-an answer, it is a wrong one that looks completely normal. Empty text and a NUL
-are refused here, before the request goes out.
+an answer, it is a wrong one that looks completely normal. Empty text clears the
+clipboard; a NUL is refused here, before the request goes out.
 
 The platform confirms the write by reading the selection back before it
 answers, so `set_clipboard()` returning means the desktop is *holding* the text
@@ -920,10 +923,12 @@ rather than that a command ran.
 an `APIError.reason`: `contention` and `starting` clear on their own, while
 `unavailable` and `unsupported` require a different action. `is_transient()`
 therefore answers `True` for the first pair and `False` for the second. A
-stopped or suspended computer is `unavailable`; start it instead of retrying
-the clipboard request. If an older platform response has no recognised reason,
-the SDK preserves the historical `ConflictError` fallback of `True`, so code
-that must support unclassified responses should verify the computer state and
+response classified as `unavailable` requires starting the computer or otherwise
+restoring access, rather than retrying unchanged. Read the returned reason:
+being suspended alone does not determine the classification. If an older
+platform response has no recognised reason, the SDK preserves the historical
+`ConflictError` fallback of `True`, so code that must support unclassified
+responses should verify the computer state and
 keep its retry loop bounded.
 
 Two others worth knowing. A **400** never clears: a computer built from a golden
@@ -1164,10 +1169,25 @@ cleaned form is what every event carries in `ev.watch`. `stream.watching` is
 where the answer is, and it carries the half a client gets wrong:
 
 ```python
-with closing(c.events(watch=["/home/user/out", "/srv/build"])) as stream:
-    for tree in stream.watching or []:
+from contextlib import closing
+from mandala_computer import Hello
+
+
+def show_watches(hello: Hello) -> None:
+    for tree in hello.watching or []:
         print(tree.path, tree.armed)
+
+
+with closing(c.events(watch=["/home/user/out/", "/srv/build"], on_connect=show_watches)) as stream:
+    for ev in stream:
+        if ev.type == "file.changed" and ev.path:
+            print(ev.watch, ev.kind, ev.path)
 ```
+
+Iteration opens the connection and calls `show_watches` with the initial,
+normalised watch state before yielding events. The loop then receives every
+event, including the first; interrupt it when finished, and `closing` releases
+the connection. The callback runs again if the stream reconnects.
 
 `armed` is whether the tree is *already being watched*. A watch is not live the
 moment the nomination is accepted — the guest has to be asked, and on a computer
@@ -1313,21 +1333,31 @@ def handle(headers: dict[str, str], raw: bytes) -> int:
     if not verify(secret, headers, raw):
         return 401
     event = json.loads(raw)
-    ...
+    ...  # atomically persist the delivery id and enqueue new work durably
     return 200
 ```
 
 `verify` checks the signature against the raw bytes and refuses a
-`webhook-timestamp` more than 300 seconds from your clock. What it cannot do
-for you: remember each `webhook-id` you accept for at least that long and
-refuse a repeat. Retries carry the same id and a fresh signature, so that is
-what makes a delivery processed once. A secret of the wrong shape, or a body
-handed over as text, is a `ValueError` rather than a quiet `False` — neither is
-something a forged request can cause.
+`webhook-timestamp` more than 300 seconds from your clock. This checks freshness,
+not whether you already handled the delivery. A captured attempt can remain
+valid for up to twice the tolerance after its earliest acceptance, because the
+check accepts timestamps on either side of your clock. Retries also carry the
+same `webhook-id` with a fresh timestamp and signature.
 
-Acknowledge with a 2xx *before* doing the work. An attempt is cut at ten
-seconds and counted as a failure; anything else is retried, eight attempts over
-about fourteen hours, and then the delivery is `exhausted` — visible, never
+Keep delivery ids in durable storage for the full redelivery horizon your
+receiver supports, with a margin, and cover that captured-attempt validity
+window too. Atomically record the id with the durable enqueue or business
+operation so concurrent requests and crashes cannot admit duplicate work.
+Acknowledge an already recorded delivery without enqueueing it again. A
+retention period alone does not guarantee exactly-once processing; downstream
+work must also handle retries idempotently. A secret of the wrong shape, or a
+body handed over as text, is a `ValueError` rather than a quiet `False` — neither
+is something a forged request can cause.
+
+Acknowledge with a 2xx after that durable acceptance, before doing slow work.
+An attempt is cut at ten seconds and counted as a failure; anything else is
+retried, eight attempts over about fourteen hours, and then the delivery is
+`exhausted` — visible, never
 silently dropped:
 
 ```python
@@ -1983,10 +2013,12 @@ length in `size`, which is the whole point of the status: you asked about a file
 whose length you did not know, and the number comes back with the refusal
 instead of behind another request. See [Files](#files).
 
-`RateLimitError` is the only refusal that says how long to wait:
-`retry_after` carries the `Retry-After` header in seconds. Every route on this
-surface is metered, including ones that go on to answer 404 — the meter runs
-before the routing does — so a burst of anything counts against the same budget.
+`APIError.retry_after` carries a valid `Retry-After` header in seconds, including
+on `RateLimitError` and template preparation refusals. It is `None` when that
+metadata is absent or malformed; a delay alone does not make an operation safe
+to retry. Every route on this surface is metered, including ones that go on to
+answer 404 — the meter runs before the routing does — so a burst of anything
+counts against the same budget.
 That budget is generous, in the low thousands of requests a minute even at the
 bottom of the range, so hitting it usually means a poll loop with no sleep in it
 rather than real load.
@@ -2066,13 +2098,14 @@ the request is not. Template preparation is an exception: inspect its state
 and error, then deliberately continue with the returned token and the original
 create arguments when appropriate, as shown above.
 
-Two do not clear. `MoveRequiredError` is one, and it has a class you can catch.
-The other is a clipboard refusal on a stopped or suspended computer: waiting
-will not start it, so `start()` is the fix. Current platform responses classify
-that refusal with `APIError.reason == "unavailable"`, and `is_transient()`
-answers `False`; `contention` and `starting` answer `True`. An absent or unknown
-reason is deliberately treated as unclassified and falls back to the exception
-type, so a legacy `ConflictError` still answers `True`. If you support such
+Some require a different action. `MoveRequiredError` is one, and it has a class
+you can catch. For clipboard refusals, read `APIError.reason`:
+`unavailable` and `unsupported` make `is_transient()` answer `False`, while
+`contention` and `starting` answer `True`. A suspended computer's read is refused,
+but its status alone does not determine the reason; follow the returned
+classification. An absent or unknown reason is deliberately treated as
+unclassified and falls back to the exception type, so a legacy `ConflictError`
+still answers `True`. If you support such
 responses, check the computer state and keep the retry loop bounded.
 
 A retry loop on it terminates because it has a deadline, not because of any
