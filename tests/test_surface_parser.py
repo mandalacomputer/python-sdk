@@ -256,3 +256,476 @@ def test_a_raw_schema_body_is_no_fields_rather_than_a_refusal(
         "{ 'GET sizes': { body: { type: 'string', format: 'binary' } } };\n",
     )
     assert found == set()
+
+
+def test_route_comments_do_not_contribute_entries(check_surface: ModuleType) -> None:
+    source = """export const ROUTES: Route[] = [
+      { method: 'GET', pattern: 'widgets' },
+      // { method: 'POST', pattern: 'retired' },
+    ];"""
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "// ] } a comment must not close the list\n{ method: 'POST', pattern: 'widgets' },",
+        '/* ] } */ { method: "POST", pattern: "widgets" },',
+        '{ pattern: "widgets", method: "POST" },',
+        (
+            "{ method: 'POST', pattern: 'widgets', roles: ['reader', 'writer'], "
+            "description: 'keep ] and } inside this string' },"
+        ),
+    ],
+)
+def test_every_literal_route_is_compared(check_surface: ModuleType, extra: str) -> None:
+    source = (
+        "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' },\n" + extra + "\n];"
+    )
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets"), ("POST", "widgets")}
+
+
+def test_a_commented_declaration_cannot_replace_the_live_table(check_surface: ModuleType) -> None:
+    source = """/* export const ROUTES: Route[] = [
+      { method: 'POST', pattern: 'retired' },
+    ]; */
+    export const ROUTES: Route[] = [
+      { 'pattern': "widgets", "method": 'GET' },
+    ];"""
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "OTHER_ROUTE];",
+        "...OTHER_ROUTES];",
+        "{ method: METHOD, pattern: 'widgets' }];",
+        "{ method: 'POST' }];",
+        "{ method: 'POST', method: 'DELETE', pattern: 'widgets' }];",
+        "{ method: 'POST', pattern: 'widgets' ];",
+        "{ method: 'POST', pattern: 'widgets' }",
+        "{ method: 'POST', pattern: 'unterminated }];",
+        "{ method: 'POST', pattern: 'widgets', roles: [) }];",
+        ",];",
+    ],
+)
+def test_a_supported_route_does_not_hide_an_unreadable_entry(
+    check_surface: ModuleType, tail: str
+) -> None:
+    source = "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' },\n" + tail
+    with pytest.raises(SystemExit, match="cannot read ROUTES"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_quoted_body_keys_are_fields_but_nested_keys_are_not(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    found = scan(
+        check_surface,
+        tmp_path,
+        """export const DOCS: Record<string, Doc> = {
+          'GET sizes': { 'body': object({
+            'name': str('Name'), "size": str('Size'),
+            nested: object({ 'child': str('Child') }),
+          }) },
+        };""",
+    )
+    assert found == {"body:name", "body:size", "body:nested"}
+
+
+def test_double_quoted_routes_and_parameter_names_are_inventoried(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    path = tmp_path / check_surface.APIDOC
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        """const SHARED: Query = { "name": "shared", description: 'Example' };
+        export const DOCS: Record<string, Doc> = {
+          'GET widgets': { query: [] },
+          "POST widgets": {
+            "query": [{ 'name': "limit", description: "ignore name: 'ghost'" }, SHARED],
+            'headers': [SHARED, { name: 'X-Example' }],
+          },
+        };"""
+    )
+    assert check_surface.parameters(tmp_path) == {
+        "GET widgets": set(),
+        "POST widgets": {"query:limit", "query:shared", "header:shared", "header:X-Example"},
+    }
+
+
+@pytest.mark.parametrize("key", ["query", "headers"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "SHARED_ARRAY",
+        "[UNKNOWN_ENTRY]",
+        "[{ name: 'known' }, UNKNOWN_ENTRY]",
+        "[...SHARED_ARRAY]",
+        "[makeEntry()]",
+        "[{ description: 'name omitted' }]",
+        "[{ name: NAME }]",
+        "[{ name: 'known' }] || SHARED_ARRAY",
+    ],
+)
+def test_unreadable_parameter_declarations_do_not_become_empty_inventories(
+    check_surface: ModuleType, tmp_path: Path, key: str, value: str
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        scan(
+            check_surface,
+            tmp_path,
+            f"export const DOCS: Record<string, Doc> = {{ 'GET sizes': {{ {key}: {value} }} }};",
+        )
+    assert "GET sizes" in str(exc.value)
+    assert key in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "object(SHARED_FIELDS, { title: 'This is not the schema' })",
+        "object({ known: str('Known'), ...SHARED_FIELDS })",
+        "object({ [FIELD]: str('Name') })",
+        "object({ 'unterminated: str('Name') })",
+        "object({ known: str('Known') }) || SHARED_BODY",
+    ],
+)
+def test_unreadable_body_fields_are_not_a_partial_inventory(
+    check_surface: ModuleType, tmp_path: Path, body: str
+) -> None:
+    with pytest.raises(SystemExit):
+        scan(
+            check_surface,
+            tmp_path,
+            f"export const DOCS: Record<string, Doc> = {{ 'GET sizes': {{ body: {body} }} }};",
+        )
+
+
+def test_empty_lists_and_a_raw_body_schema_remain_valid(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    assert (
+        scan(
+            check_surface,
+            tmp_path,
+            """export const DOCS: Record<string, Doc> = {
+          'GET sizes': { query: [], headers: [], body: { type: 'string' } },
+        };""",
+        )
+        == set()
+    )
+
+
+@pytest.mark.parametrize("suffix", [".concat(OTHER_ROUTES)", "\n.concat(OTHER_ROUTES)"])
+def test_route_initializer_continuations_are_refused(
+    check_surface: ModuleType, suffix: str
+) -> None:
+    source = "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }]" + suffix + ";"
+    with pytest.raises(SystemExit, match="cannot read ROUTES"):
+        check_surface.table(source, "ROUTES")
+
+
+@pytest.mark.parametrize("kind", ["docs", "shared"])
+def test_parameter_initializer_continuations_are_refused(
+    check_surface: ModuleType, tmp_path: Path, kind: str
+) -> None:
+    shared = "const SHARED: Query = { name: 'known' }"
+    docs = "export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } }"
+    source = shared + (" && OTHER_ENTRY" if kind == "shared" else "") + ";\n"
+    source += docs + (" && OTHER_DOCS" if kind == "docs" else "") + ";"
+    with pytest.raises(SystemExit, match="cannot read DOCS"):
+        scan(check_surface, tmp_path, source)
+
+
+def test_a_template_string_cannot_supply_the_route_declaration(check_surface: ModuleType) -> None:
+    source = """const example = `
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'retired' }];
+    `;
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    """
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+def test_a_template_string_cannot_supply_parameter_declarations(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    found = scan(
+        check_surface,
+        tmp_path,
+        """const example = `
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [] } };
+        `;
+        const SHARED: Query = { name: 'known' };
+        const another = `
+        const SHARED: Query = { name: 'retired' };
+        `;
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+        """,
+    )
+    assert found == {"query:known"}
+
+
+def test_a_function_local_parameter_does_not_replace_the_module_entry(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    found = scan(
+        check_surface,
+        tmp_path,
+        """const SHARED: Query = { name: 'known' };
+        function example() {
+          const SHARED: Query = { name: 'retired' };
+          return SHARED;
+        }
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+        """,
+    )
+    assert found == {"query:known"}
+
+
+def test_nested_template_interpolations_cannot_supply_declarations(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    source = """const example = `outer ${(() => {
+      const SHARED: Query = { name: 'local' };
+      return `inner ${`deep
+        export const ROUTES: Route[] = [{ method: 'POST', pattern: 'retired' }];
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [] } };
+      `}`;
+    })()}
+    const SHARED: Query = { name: 'quoted' };
+    `;
+    const SHARED: Query = { name: 'known' };
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+    """
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+    assert scan(check_surface, tmp_path, source) == {"query:known"}
+
+
+@pytest.mark.parametrize("kind", ["docs", "shared"])
+def test_a_declaration_available_only_in_a_template_is_refused(
+    check_surface: ModuleType, tmp_path: Path, kind: str
+) -> None:
+    shared = "const SHARED: Query = { name: 'known' };"
+    docs = "export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };"
+    source = (
+        shared + "\nconst example = `\n" + docs + "\n`;"
+        if kind == "docs"
+        else "const example = `\n" + shared + "\n`;\n" + docs
+    )
+    with pytest.raises(SystemExit, match="cannot read"):
+        scan(check_surface, tmp_path, source)
+
+
+def test_a_local_entry_without_a_module_declaration_is_unresolved(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit, match="unresolved parameter entry"):
+        scan(
+            check_surface,
+            tmp_path,
+            """function example() {
+              const SHARED: Query = { name: 'local' };
+            }
+            export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+            """,
+        )
+
+
+def test_duplicate_module_declarations_are_ambiguous(check_surface: ModuleType) -> None:
+    source = "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];\n"
+    with pytest.raises(SystemExit, match="ambiguous"):
+        check_surface.table(source + source, "ROUTES")
+
+
+def test_a_literal_declaration_may_end_at_eof(check_surface: ModuleType, tmp_path: Path) -> None:
+    assert check_surface.table(
+        "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }]", "ROUTES"
+    ) == {("GET", "widgets")}
+    assert (
+        scan(
+            check_surface,
+            tmp_path,
+            "export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [] } }",
+        )
+        == set()
+    )
+
+
+@pytest.mark.parametrize("real", ["", "buildRoutes()", "[{ method: 'GET', pattern: 'widgets' }]"])
+def test_a_control_statement_regex_cannot_supply_routes(
+    check_surface: ModuleType, real: str
+) -> None:
+    source = (
+        "if (enabled) /export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];/.test(text);"
+    )
+    if real:
+        source += "\nexport const ROUTES: Route[] = " + real + ";"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+@pytest.mark.parametrize("real", ["", "buildDocs()", "{ 'GET sizes': { query: [] } }"])
+def test_a_control_statement_regex_cannot_supply_documented_parameters(
+    check_surface: ModuleType, tmp_path: Path, real: str
+) -> None:
+    source = (
+        "if (enabled) /export const DOCS: Record<string, Doc> = "
+        "{'GET sizes': { query: [] }};/.test(text);"
+    )
+    if real:
+        source += "\nexport const DOCS: Record<string, Doc> = " + real + ";"
+    with pytest.raises(SystemExit, match="cannot read DOCS.*slash"):
+        scan(check_surface, tmp_path, source)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "function example() { if (enabled) /fake/.test(text); }\n",
+        "const example = (value() / 2);\n",
+        "const example = { value: value() / 2 };\n",
+    ],
+)
+def test_an_ambiguous_slash_is_refused_inside_nested_scopes(
+    check_surface: ModuleType, prefix: str
+) -> None:
+    source = prefix + "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_a_supported_regex_position_still_hides_its_contents(check_surface: ModuleType) -> None:
+    source = """const pattern = /export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];/;
+    function example() { return /[{}]/; }
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    """
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+def test_an_unreadable_regex_cannot_supply_a_declaration(check_surface: ModuleType) -> None:
+    source = """const example = /unterminated
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    """
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*regex"):
+        check_surface.table(source, "ROUTES")
+
+
+def _interpolated_regex_prose(declaration: str) -> str:
+    return (
+        "const prose = `${(() => { if (enabled) /}}`; " + declaration + " `/.test(text); })()}`;\n"
+    )
+
+
+def test_an_interpolated_regex_cannot_supply_routes(check_surface: ModuleType) -> None:
+    source = (
+        _interpolated_regex_prose("export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];")
+        + "export const ROUTES: Route[] = buildRoutes();"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_an_interpolated_regex_cannot_supply_documentation(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    source = (
+        _interpolated_regex_prose(
+            "export const DOCS: Record<string, Doc> = {'GET sizes': {query: []}};"
+        )
+        + "export const DOCS: Record<string, Doc> = buildDocs();"
+    )
+    with pytest.raises(SystemExit, match="cannot read DOCS.*slash"):
+        scan(check_surface, tmp_path, source)
+
+
+def test_an_interpolated_regex_cannot_supply_a_shared_entry(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    source = _interpolated_regex_prose("const SHARED: Query = {name: 'fake'};") + (
+        "export const DOCS: Record<string, Doc> = {'GET sizes': {query: [SHARED]}};"
+    )
+    with pytest.raises(SystemExit, match="cannot read DOCS.*slash"):
+        scan(check_surface, tmp_path, source)
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "quoted_end",
+        "strip_comments",
+        "balanced",
+        "split_items",
+        "top_level_keys",
+        "top_level_value_at",
+        "literal_contents",
+    ],
+)
+def test_interpolation_boundaries_are_checked_through_each_reader(
+    check_surface: ModuleType, reader: str
+) -> None:
+    surface_text = sys.modules["surface_text"]
+    template = (
+        _interpolated_regex_prose("const HIDDEN = {}; ")
+        .removeprefix("const prose = ")
+        .removesuffix(";\n")
+    )
+    with pytest.raises(ValueError, match="ambiguous slash"):
+        if reader == "quoted_end":
+            surface_text.quoted_end(template, 0)
+        elif reader == "balanced":
+            surface_text.balanced("{value: " + template + "}", 0, "{", "}")
+        elif reader == "top_level_value_at":
+            surface_text.top_level_value_at("value: " + template, "absent")
+        elif reader == "literal_contents":
+            surface_text.literal_contents("[" + template + "]", "[", "]")
+        else:
+            getattr(surface_text, reader)("value: " + template)
+
+
+def test_a_recognized_interpolation_regex_hides_its_delimiters(check_surface: ModuleType) -> None:
+    source = _interpolated_regex_prose(
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];"
+    ).replace("if (enabled)", "return")
+    source += "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize("property_name", ["delay", "return"])
+def test_member_division_inside_interpolation_preserves_the_inventory(
+    check_surface: ModuleType, property_name: str
+) -> None:
+    source = "const prose = `${Math.ceil(result." + property_name + " / 1000)}`;\n"
+    source += "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_an_interpolation_comment_cannot_supply_a_division_operand(
+    check_surface: ModuleType, line_ending: str
+) -> None:
+    source = _interpolated_regex_prose(
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];"
+    ).replace("if (enabled) /", "if (enabled) // prose.member" + line_ending + "/")
+    source += "export const ROUTES: Route[] = buildRoutes();"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
+@pytest.mark.parametrize("contents", ["echo ${value/path}", "echo ${unfinished", "echo \\"])
+def test_go_raw_strings_do_not_invoke_template_interpolation(
+    check_surface: ModuleType, contents: str
+) -> None:
+    source = "package example\nconst script = `" + contents + "`\nconst sampleLimit = 12 * 3\n"
+    assert check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go")) == 36
+
+
+def test_typescript_constant_scanning_keeps_strict_interpolation_boundaries(
+    check_surface: ModuleType,
+) -> None:
+    source = _interpolated_regex_prose("export const SAMPLE_LIMIT = 99;")
+    source += "export const SAMPLE_LIMIT = 36;"
+    with pytest.raises(ValueError, match="ambiguous slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))

@@ -7,21 +7,23 @@ this much care because both files are heavily commented and several of those
 comments *quote the shapes being matched*. Over a raw file, the patterns in
 ``check_surface`` invent routes and parameters out of prose.
 
-A direct port of the TypeScript SDK's ``scripts/surface-text.mjs``, function for
-function. The two scripts read the same files and should not disagree about what
-is in them: a parameter one of them cannot see is a gap the other reports alone,
-which is a worse failure than neither seeing it.
+This bounded reader handles literal inventories and the lexical boundaries
+needed to locate them. A declaration it cannot read is refused explicitly,
+so an unsupported expression cannot silently become a missing route or an
+empty parameter inventory.
 """
 
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 _REGEX_CAN_FOLLOW = "([{=,:;!?&|~+*%^<>"
 _REGEX_CAN_FOLLOW_WORDS = ("return", "case", "throw", "yield")
 _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
-_KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_KEY = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
 _IDENT_CHAR = re.compile(r"[\w$]")
+_MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 
 
 def quoted_end(text: str, start: int) -> int:
@@ -32,10 +34,16 @@ def quoted_end(text: str, start: int) -> int:
         if text[i] == "\\":
             i += 2
             continue
+        if quote == "`" and text[i : i + 2] == "${":
+            # Interpolations may contain strings or nested templates of their
+            # own. Their quotes cannot terminate the surrounding template.
+            contents = balanced(text, i + 1, "{", "}", strict_slashes=True)
+            i += len(contents) + 3
+            continue
         if text[i] == quote:
             return i + 1
         i += 1
-    return len(text)
+    raise ValueError("unterminated quoted literal")
 
 
 def regex_can_start(text: str, at: int) -> bool:
@@ -77,19 +85,46 @@ def regex_end(text: str, start: int) -> int:
     return start + 1
 
 
-def strip_comments(text: str) -> str:
+def checked_slash_end(text: str, start: int) -> int:
+    """Skip a known regex or division operator, refusing undecidable slash roles.
+
+    Use before interpreting delimiters in code, including template
+    interpolations: regex braces and backticks must never alter lexical scope.
+    """
+    # A same-line member access is an operand, even with a keyword property.
+    # Never borrow a member-looking suffix from a preceding line comment.
+    # Other division forms need an explicit reader update; in particular a
+    # closing parenthesis may instead end a regex-leading control condition.
+    if _MEMBER_OPERAND.search(text[:start]):
+        return start + 1
+    if not regex_can_start(text, start):
+        raise ValueError(f"ambiguous slash at offset {start}")
+    end = regex_end(text, start)
+    if end == start + 1:
+        raise ValueError(f"unreadable regex literal at offset {start}")
+    return end
+
+
+def strip_comments(text: str, *, language: Literal["typescript", "go"] = "typescript") -> str:
     """Blank out comments without touching comment markers inside literals.
 
     Replaced with spaces rather than deleted, so every offset in the result still
     names the same character in the original — which is what lets a match here be
-    used against the source it came from.
+    used against the source it came from. Go raw backticks have neither escapes
+    nor template interpolation, and Go has no regex literal syntax.
     """
     out: list[str] = []
     i = 0
     while i < len(text):
         ch = text[i]
         if ch in "'\"`":
-            end = quoted_end(text, i)
+            if language == "go" and ch == "`":
+                closing = text.find("`", i + 1)
+                if closing == -1:
+                    raise ValueError("unterminated raw string")
+                end = closing + 1
+            else:
+                end = quoted_end(text, i)
             out.append(text[i:end])
             i = end
         elif ch == "/" and text[i : i + 2] == "//":
@@ -103,7 +138,7 @@ def strip_comments(text: str) -> str:
             # Newlines kept so line numbers survive; everything else spaced out.
             out.append(re.sub(r"[^\r\n]", " ", text[i:stop]))
             i = stop
-        elif ch == "/" and regex_can_start(text, i):
+        elif language == "typescript" and ch == "/" and regex_can_start(text, i):
             end = regex_end(text, i)
             out.append(text[i:end])
             i = end
@@ -113,12 +148,18 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
-def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
+def balanced(
+    text: str, start: int, open_ch: str, close_ch: str, *, strict_slashes: bool = False
+) -> str:
     """The text between the bracket at ``start`` and the one that balances it.
 
     Depth-counted rather than matched lazily to the next closer, because every
     table here nests: a route's ``query`` holds objects and a body's schema holds
     more of them, so the first ``]`` is nowhere near the end of the list.
+
+    Template interpolations require strict slash handling before any delimiter
+    is interpreted. Other callers may read languages with ordinary division;
+    retaining their existing behavior avoids imposing JavaScript rules there.
     """
     depth = 0
     i = start
@@ -135,8 +176,8 @@ def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
             end = text.find("*/", i + 2)
             i = len(text) if end == -1 else end + 2
             continue
-        if ch == "/" and regex_can_start(text, i):
-            i = regex_end(text, i)
+        if ch == "/" and (strict_slashes or regex_can_start(text, i)):
+            i = checked_slash_end(text, i) if strict_slashes else regex_end(text, i)
             continue
         if ch == open_ch:
             depth += 1
@@ -146,6 +187,58 @@ def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
                 return text[start + 1 : i]
         i += 1
     raise ValueError(f"unbalanced {open_ch} from offset {start}")
+
+
+def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
+    """Find declarations only in module code, outside literals and nested scopes.
+
+    The source must already be comment-blanked. This is a lexical boundary
+    check, not expression evaluation; unsupported declarations remain absent
+    and their callers refuse an inventory they cannot establish.
+    """
+    expression = re.compile(pattern)
+    matches: list[re.Match[str]] = []
+    stack: list[str] = []
+    i = 0
+    while i < len(source):
+        ch = source[i]
+        if ch in "'\"`":
+            i = quoted_end(source, i)
+            continue
+        if ch == "/":
+            i = checked_slash_end(source, i)
+            continue
+        if not stack and (i == 0 or not _IDENT_CHAR.match(source[i - 1])):
+            match = expression.match(source, i)
+            if match:
+                matches.append(match)
+                # Patterns end at the initializer's opening delimiter. Process
+                # it below so its contents are nested, while
+                # avoiding a second match at an exported declaration's const.
+                i = match.end() - 1
+                ch = source[i]
+        if ch in "{[(":
+            stack.append(ch)
+        elif ch in "}])" and (not stack or stack.pop() != {"}": "{", "]": "[", ")": "("}[ch]):
+            raise ValueError(f"unbalanced {ch} at offset {i}")
+        i += 1
+    if stack:
+        raise ValueError("unbalanced module scope")
+    return matches
+
+
+def initializer_contents(source: str, start: int, opening: str, closing: str) -> str:
+    """Read a literal initializer only when its declaration ends there.
+
+    A semicolon or end of input supplies an unambiguous boundary. Other
+    continuations, including expressions after a newline, require a reader
+    update; a balanced literal alone says nothing about the final value.
+    """
+    body = balanced(source, start, opening, closing)
+    remainder = source[start + len(body) + 2 :].lstrip()
+    if remainder and not remainder.startswith(";"):
+        raise ValueError("unsupported initializer continuation; expected semicolon or end of input")
+    return body
 
 
 def top_level_value_at(body: str, name: str) -> int:
@@ -201,32 +294,107 @@ def top_level_value_at(body: str, name: str) -> int:
     return -1
 
 
-def top_level_keys(body: str) -> list[str]:
-    """The keys of an object literal, at its own depth only.
+def split_items(body: str) -> list[str]:
+    """Split comma-separated entries, refusing incomplete or mismatched syntax.
 
-    A nested schema has keys of its own — ``type``, ``description``, ``items`` —
-    and every one of them would otherwise read as a field of the body.
+    Literals and nested collections belong to an entry; their commas do not
+    separate entries. A trailing comma is allowed, but a hole is unreadable.
     """
-    keys: list[str] = []
-    depth = 0
-    i = 0
+    items: list[str] = []
+    stack: list[str] = []
+    start = i = 0
     while i < len(body):
         ch = body[i]
         if ch in "'\"`":
-            i = quoted_end(body, i)
+            end = quoted_end(body, i)
+            i = end
             continue
         if ch == "/" and regex_can_start(body, i):
             i = regex_end(body, i)
             continue
         if ch in "{[(":
-            depth += 1
+            stack.append(ch)
         elif ch in "}])":
-            depth -= 1
-        elif depth == 0:
-            m = _KEY.match(body, i)
-            if m:
-                keys.append(m.group(1))
-                i = m.end()
-                continue
+            if not stack or stack.pop() != {"}": "{", "]": "[", ")": "("}[ch]:
+                raise ValueError(f"unbalanced {ch} at offset {i}")
+        elif ch == "," and not stack:
+            item = body[start:i].strip()
+            if not item:
+                raise ValueError("empty entry between separators")
+            items.append(item)
+            start = i + 1
         i += 1
-    return keys
+    if stack:
+        raise ValueError("unbalanced entry")
+    tail = body[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def literal_string(value: str) -> str:
+    """Read a quoted name, without evaluating expressions or escape languages.
+
+    Quotes, slashes and backslashes may be escaped. Other escapes in names
+    require an explicit reader update instead of being guessed at.
+    """
+    value = value.strip()
+    if not value or value[0] not in "'\"" or quoted_end(value, 0) != len(value):
+        raise ValueError("expected a single- or double-quoted literal")
+    quote = value[0]
+    if len(value) < 2 or value[-1] != quote:
+        raise ValueError("unterminated literal")
+    out: list[str] = []
+    i = 1
+    while i < len(value) - 1:
+        ch = value[i]
+        if ch == "\\":
+            i += 1
+            if i >= len(value) - 1 or value[i] not in "'\"/\\":
+                raise ValueError("unsupported escape in a name")
+            ch = value[i]
+        if ord(ch) < 32:
+            raise ValueError("control character in a name")
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def object_entries(body: str) -> dict[str, str]:
+    """Read every object's own key/value pair, or refuse an unknown entry."""
+    entries: dict[str, str] = {}
+    for item in split_items(body):
+        if item[0] in "'\"":
+            end = quoted_end(item, 0)
+            key = literal_string(item[:end])
+            rest = item[end:].lstrip()
+            if not rest.startswith(":"):
+                raise ValueError("expected a colon after a quoted key")
+            value = rest[1:].strip()
+        else:
+            match = _KEY.match(item)
+            if match is None:
+                raise ValueError("unsupported object entry")
+            key, value = match.group(1), item[match.end() :].strip()
+        if not value or key in entries:
+            raise ValueError("missing value or duplicate object key")
+        entries[key] = value
+    return entries
+
+
+def literal_contents(value: str, opening: str, closing: str) -> str:
+    """Read one complete collection literal, with no trailing expression."""
+    value = value.strip()
+    if not value.startswith(opening):
+        raise ValueError(f"expected a {opening}{closing} literal")
+    body = balanced(value, 0, opening, closing)
+    if value[len(body) + 2 :].strip():
+        raise ValueError("unsupported expression after a literal")
+    # Validate all delimiter kinds, not only the one the outer literal uses.
+    split_items(body)
+    return body
+
+
+def top_level_keys(body: str) -> list[str]:
+    """Every key at the object's own depth, including quoted spellings."""
+    return list(object_entries(body))

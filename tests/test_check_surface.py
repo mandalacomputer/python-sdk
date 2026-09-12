@@ -343,3 +343,30 @@ def test_missing_foreground_timeout_module_is_reported(
     assert check_surface.missing_mirror_sources(platform) == [module]
     assert check_surface.main() == 1
     assert str(platform / module) in capsys.readouterr().out
+
+
+def test_an_added_route_cannot_agree_with_a_stale_mirror(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exercise the real route inventory and final gate with unrelated checks held steady."""
+    path = tmp_path / check_surface.SURFACE
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        """export const V1_ROUTES: Route[] = [
+          { method: 'GET', pattern: 'widgets' },
+          // ] The following route is new.
+          { pattern: "widgets", method: "POST" },
+        ];"""
+    )
+    monkeypatch.setattr(check_surface, "platform_repo", lambda: tmp_path)
+    monkeypatch.setattr(check_surface, "missing_mirror_sources", lambda _: [])
+    monkeypatch.setattr(check_surface, "constant_drift", lambda _: [])
+    monkeypatch.setattr(check_surface, "parameters", lambda _: {})
+    monkeypatch.setattr(check_surface, "mirrored_parameters", dict)
+    monkeypatch.setattr(check_surface, "mirrored", lambda: {("GET", "widgets")})
+
+    assert check_surface.main() == 1
+    assert "+ POST widgets" in capsys.readouterr().out
