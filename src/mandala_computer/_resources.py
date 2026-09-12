@@ -860,11 +860,11 @@ class Builds:
         :class:`~mandala_computer.Listing` saying ``is_complete`` is false is the
         only evidence there is.
 
-        A short computer or snapshot listing appends one marked row per thing it
-        could not reach — but only for a key that spans the account. A key
-        scoped to one workspace gets no marked rows from any of the three, since
-        the ids would come out of a placement cache with no workspace column.
-        On such a key the Listing is the only evidence everywhere.
+        A short computer listing can include marked rows for both account-wide
+        and workspace-scoped keys. Marked snapshot rows are returned only to
+        account-wide keys; workspace-scoped snapshot listings omit unreachable
+        rows. Build listings have no marked rows under either scope. Check
+        ``is_complete`` for all three, including when no marked row is present.
         """
         data, incomplete = self._t.listing(_api.BUILDS, params=_api.partial_params(allow_partial))
         return Listing.of([TemplateBuild.from_api(b) for b in data or []], incomplete)

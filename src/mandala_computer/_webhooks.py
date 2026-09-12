@@ -7,13 +7,15 @@ against this file. This is the reference verifier the Python SDK ships, and it
 does the one thing that scheme's three headers ask for:
 
 * ``webhook-id`` — the delivery id, ``whd-`` and sixteen hex characters,
-  unchanged across retries. Remember each one you accept for at least the
-  replay window, and a retry of a delivery you already handled is recognised
-  rather than processed twice.
+  unchanged across retries. Store accepted ids durably for the full redelivery
+  horizon your receiver supports, with a margin. Record an id atomically with
+  durable enqueue or handling of its work, before acknowledging the request,
+  so concurrent retries cannot enqueue or handle the same delivery again.
 * ``webhook-timestamp`` — Unix seconds, the time of THIS attempt. A delivery
   more than :data:`REPLAY_WINDOW_S` from your clock is refused before its MAC
-  is even computed; retries carry a fresh one, so the eighth attempt sixteen
-  hours on verifies as cleanly as the first.
+  is even computed; retries carry a fresh one, so a later attempt can verify
+  after an earlier attempt's timestamp has expired. Freshness is separate
+  from delivery idempotency.
 * ``webhook-signature`` — ``v1,`` and base64 of HMAC-SHA256 over
   ``<id>.<timestamp>.<raw body>``, keyed by the secret's bytes after
   ``whsec_``, base64-decoded. Several signatures may share the header,
@@ -48,11 +50,12 @@ __all__ = ["REPLAY_WINDOW_S", "SECRET_PREFIX", "verify"]
 #: ``webhook-timestamp`` may lie and still be accepted. The platform's own
 #: number, which is also what the specification recommends and what Stripe's
 #: verifier defaults to, so every library a receiver might reach for already
-#: enforces it. Together
-#: with a receiver that remembers each accepted ``webhook-id`` for this long,
-#: it closes every replay there is: a captured request older than the window
-#: is refused on the timestamp before the id is consulted, so the memory a
-#: receiver needs is finite by construction.
+#: enforces it. This is a timestamp tolerance, not a deduplication lifetime.
+#: A captured attempt can verify for up to twice this tolerance after its
+#: earliest acceptance, because future timestamps within the tolerance pass
+#: too. Retain ids for at least that validity window and the full supported
+#: redelivery horizon, with a margin: retries carry fresh timestamps. Durable,
+#: atomic idempotency handling is still needed; a TTL alone cannot provide it.
 REPLAY_WINDOW_S = _api.WEBHOOK_REPLAY_WINDOW_S
 
 #: What every signing secret begins with. The bytes after it, base64-decoded,
@@ -171,7 +174,7 @@ def verify(
     looking at the sender for a bug in the receiver.
 
     ``now`` is the receiver's clock in Unix seconds, for tests; it defaults to
-    :func:`time.time`. ``tolerance`` is the replay window, defaulting to the
+    :func:`time.time`. ``tolerance`` is the timestamp tolerance, defaulting to the
     platform's :data:`REPLAY_WINDOW_S`.
 
     A ``webhook-id`` that is not ASCII is one of the malformed headers this
@@ -180,10 +183,15 @@ def verify(
     is stricter than the hazard it closes, which is only the id that cannot be
     encoded at all.
 
-    What this does not do, and a receiver still must: remember every
-    ``webhook-id`` it accepts for at least the window, and refuse a repeat.
-    Retries carry the same id, so that is what makes a delivery processed
-    once.
+    This does not track accepted ``webhook-id`` values. A captured attempt can
+    verify for up to twice ``tolerance`` after its earliest acceptance; retries
+    carry the same id with fresh timestamps and signatures. Store accepted ids
+    durably for that validity window and the full redelivery horizon your
+    receiver supports, with a margin. Record the id atomically with durable
+    enqueue or handling of its work before returning a 2xx, and acknowledge
+    duplicates without enqueueing them again. A retention period alone does
+    not guarantee exactly-once processing; downstream work must also handle
+    retries idempotently.
     """
     key = _key(secret)
     if isinstance(raw_body, str):
