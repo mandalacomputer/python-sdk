@@ -202,10 +202,10 @@ def _attach_agent_partial(exc: APIError) -> None:
     if exc.agent is not None or not isinstance(exc.body, Mapping):
         return
     usage = exc.body.get("usage")
-    steps = exc.body.get("steps_taken")
-    if not isinstance(steps, list):
-        steps = exc.body.get("steps")
-    if not isinstance(usage, Mapping) and not isinstance(steps, list):
+    # Either name for the completed steps, on the one rule the converter reads
+    # them by — which is what keeps the gate and the record from disagreeing.
+    steps = any(isinstance(exc.body.get(name), list) for name in ("steps", "steps_taken"))
+    if not isinstance(usage, Mapping) and not steps:
         return
     # ``status`` off the body would be the platform repeating itself at best; the
     # status that refused this request is the one on the response.

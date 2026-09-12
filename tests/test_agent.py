@@ -18,6 +18,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer._agent import to_agent_event
 from mandala_computer._client import MODEL_KEY_HEADER
 from mandala_computer._sse import SSEEvent
 
@@ -524,6 +525,29 @@ def test_a_mid_run_refusal_prefers_the_steps_over_a_count_beside_them(
     with pytest.raises(mc.PermissionDeniedError) as error:
         computer.agent_once("do the thing", model_key=KEY)
     assert error.value.agent is not None and len(error.value.agent.steps) == 2
+
+
+@respx.mock
+def test_a_mid_run_refusal_is_not_emptied_by_a_defaulted_step_list(
+    computer: mc.Computer,
+) -> None:
+    """An empty list under one name must not shadow a populated one under the other.
+
+    A body spelling out both, one of them defaulted, would otherwise report a run
+    of no steps over the record of what it actually did — and the steps would be
+    sitting in `e.body` the whole time (adversarial review, OPL-4804).
+    """
+    respx.post(AGENT).mock(httpx.Response(403, json={**MIDRUN_401, "steps": []}))
+    with pytest.raises(mc.PermissionDeniedError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is not None and len(error.value.agent.steps) == 2
+
+
+def test_a_defaulted_step_list_does_not_empty_a_stream_failure_either() -> None:
+    """The converter is shared, so the rule is tested where it lives as well."""
+    body = {"error": "no", "steps": [], "steps_taken": [{"n": 1}]}
+    failure = to_agent_event("error", body, 0)
+    assert isinstance(failure, mc.AgentFailed) and len(failure.steps) == 1
 
 
 @respx.mock
