@@ -235,14 +235,30 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
         return AgentDone(AgentResult.from_api(data))
     if event == "error":
         r = data if isinstance(data, Mapping) else {}
-        taken = r.get("steps")
+        # Two spellings, because two transports. A stream's error frame calls the
+        # completed steps ``steps``; a non-streaming run that is refused mid-flight
+        # answers with an HTTP status and calls them ``steps_taken``, because in
+        # that body ``steps`` is the count a finished run reports.
+        #
+        # What is read is the first NON-EMPTY list under either name. Neither the
+        # key's presence nor its position decides, and both halves of that matter:
+        # a count under ``steps`` must not shadow the steps themselves, and
+        # neither must an empty list beside a populated one — a body that spells
+        # out both names, one of them defaulted, would otherwise report a run of
+        # no steps over the record of what it actually did. Two populated lists
+        # under the two names would be the platform contradicting itself; the
+        # stream's own name is read first there, and nothing more is claimed
+        # about a shape that has never been sent (OPL-4804).
+        taken: Any = ()
+        for name in ("steps", "steps_taken"):
+            value = r.get(name)
+            if isinstance(value, list) and value:
+                taken = value
+                break
         return AgentFailed(
             _text(r.get("error")) or "the run failed",
             _num(r.get("status")),
             AgentUsage.from_api(r.get("usage")),
-            tuple(
-                AgentStep.from_api(step, i + 1)
-                for i, step in enumerate(taken if isinstance(taken, list) else ())
-            ),
+            tuple(AgentStep.from_api(step, i + 1) for i, step in enumerate(taken)),
         )
     return None

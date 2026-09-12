@@ -18,6 +18,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer._agent import to_agent_event
 from mandala_computer._client import MODEL_KEY_HEADER
 from mandala_computer._sse import SSEEvent
 
@@ -481,6 +482,100 @@ def test_agent_once_reads_a_result_that_names_no_error(
     assert result.finished and result.text == "all set"
 
 
+# --- a run refused part-way through ---------------------------------------
+#
+# The non-streaming route answers a mid-run refusal with a STATUS, so the body
+# carrying what the run had already done never reaches the outcome helper: the
+# transport raises first. Authorization is rechecked before each further model
+# call and before each tool, so this is the ordinary shape of a key revoked, a
+# role dropped or a plan downgraded during a run — not an exotic case (OPL-4804).
+
+MIDRUN_401 = {
+    "error": "unauthorized",
+    "usage": {"input_tokens": 90},
+    "steps_taken": [{"n": 1}, {"n": 2}],
+}
+
+
+@respx.mock
+def test_a_mid_run_refusal_keeps_the_steps_it_already_took(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(httpx.Response(401, json=MIDRUN_401))
+    with pytest.raises(mc.AuthenticationError, match="unauthorized") as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    failure = error.value.agent
+    assert failure is not None
+    assert len(failure.steps) == 2
+    assert failure.usage.input_tokens == 90
+    # The status that refused the request, off the response rather than the body.
+    assert failure.status == 401 and error.value.status == 401
+    # And it is not a transport failure: the credential has to change first.
+    assert mc.is_transient(error.value) is False
+
+
+@respx.mock
+def test_a_mid_run_refusal_prefers_the_steps_over_a_count_beside_them(
+    computer: mc.Computer,
+) -> None:
+    """`steps` is a COUNT in a finished run's body, so the list is what decides.
+
+    Reading whichever key is present would answer a body carrying both with an
+    empty step tuple — the value that means "the platform did not say".
+    """
+    respx.post(AGENT).mock(httpx.Response(403, json={**MIDRUN_401, "steps": 2}))
+    with pytest.raises(mc.PermissionDeniedError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is not None and len(error.value.agent.steps) == 2
+
+
+@respx.mock
+def test_a_mid_run_refusal_is_not_emptied_by_a_defaulted_step_list(
+    computer: mc.Computer,
+) -> None:
+    """An empty list under one name must not shadow a populated one under the other.
+
+    A body spelling out both, one of them defaulted, would otherwise report a run
+    of no steps over the record of what it actually did — and the steps would be
+    sitting in `e.body` the whole time (adversarial review, OPL-4804).
+    """
+    respx.post(AGENT).mock(httpx.Response(403, json={**MIDRUN_401, "steps": []}))
+    with pytest.raises(mc.PermissionDeniedError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is not None and len(error.value.agent.steps) == 2
+
+
+def test_a_defaulted_step_list_does_not_empty_a_stream_failure_either() -> None:
+    """The converter is shared, so the rule is tested where it lives as well."""
+    body = {"error": "no", "steps": [], "steps_taken": [{"n": 1}]}
+    failure = to_agent_event("error", body, 0)
+    assert isinstance(failure, mc.AgentFailed) and len(failure.steps) == 1
+
+
+@respx.mock
+def test_a_refusal_that_reports_no_run_carries_none(computer: mc.Computer) -> None:
+    """A key that was never any good is refused before a step happens.
+
+    `e.agent` means "here is what the run did", and answering every 401 on this
+    route with an empty record would turn it into "this came from the agent
+    route" — which a caller cannot act on.
+    """
+    respx.post(AGENT).mock(httpx.Response(401, json={"error": "unauthorized"}))
+    with pytest.raises(mc.AuthenticationError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is None
+
+
+@respx.mock
+def test_a_plan_refused_mid_run_keeps_the_account_too(computer: mc.Computer) -> None:
+    """402 as well as 401 and 403: the plan is rechecked against the current one."""
+    respx.post(AGENT).mock(
+        httpx.Response(402, json={"error": "Choose a plan.", "usage": {"input_tokens": 5}})
+    )
+    with pytest.raises(mc.PlanLimitError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is not None and error.value.agent.usage.input_tokens == 5
+    assert error.value.agent.steps == ()
+
+
 # --- forward compatibility -------------------------------------------------
 
 
@@ -930,6 +1025,20 @@ async def test_the_async_non_streaming_form_reads_a_result_that_names_no_error(
     async with mc.AsyncClient("gck_test", base_url=BASE) as client:
         c = mc.AsyncComputer(client._t, COMPUTER)
         assert (await c.agent_once("do the thing", model_key=KEY)).text == "all set"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_non_streaming_form_keeps_a_mid_run_refusals_steps() -> None:
+    """Both halves attach the same record, from the same helper."""
+    respx.post(AGENT).mock(httpx.Response(401, json=MIDRUN_401))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.AuthenticationError, match="unauthorized") as error:
+            await c.agent_once("do the thing", model_key=KEY)
+    failure = error.value.agent
+    assert failure is not None
+    assert len(failure.steps) == 2 and failure.usage.input_tokens == 90
 
 
 @respx.mock
