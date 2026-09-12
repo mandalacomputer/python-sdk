@@ -36,6 +36,9 @@ _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 #: guessed at, because a control condition's ``)`` is exactly what precedes the
 #: regex literals this reader must not walk into.
 _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
+#: A postfix increment or decrement: a value, and one whose last character is an
+#: operator that a regex is otherwise allowed to follow.
+_POSTFIX_OPERAND = re.compile(r"(?:\+\+|--)[ \t]*\Z")
 #: Words that are not values, so a slash after one is not a division. Spelled
 #: as every reserved and contextual word there is rather than as the handful
 #: that can lead a regex, because the cost of the two mistakes is not the same:
@@ -211,12 +214,36 @@ def checked_slash_end(text: str, start: int) -> int:
     return end
 
 
+def certain_operator(text: str, at: int) -> bool:
+    """Whether the slash at ``at`` can ONLY divide — it follows a value.
+
+    The three shapes a value ends in: a member access, a postfix ``++`` or
+    ``--``, and a number or a name that is not a reserved word. ``checked_slash_end``
+    asks the same question first, for the same reason: a regex cannot begin after
+    a value, so these positions are not guesses at all.
+
+    ``regex_can_start`` does not subsume it and answering it first is the point.
+    That predicate reads the character before the slash, so ``x++ / 2`` looks like
+    a slash after ``+``, and ``obj.return / 2`` looks like a slash after the
+    keyword ``return`` — both of which it calls regex positions, and both of which
+    are divisions (adversarial review, OPL-4805).
+    """
+    before = text[:at]
+    if _MEMBER_OPERAND.search(before) or _POSTFIX_OPERAND.search(before):
+        return True
+    operand = _DIVISION_OPERAND.search(before)
+    return bool(operand and operand.group(0).strip() not in _NOT_A_VALUE)
+
+
 def _reads_as_regex(text: str, at: int, undecided: Literal["operator", "regex"]) -> bool:
     """Whether to read the slash at ``at`` as opening a regex literal.
 
-    ``regex_can_start`` where it is confident, and the caller's policy for the
-    positions it is not — see ``strip_comments``.
+    Certain divisions first, then ``regex_can_start`` where it is confident, then
+    the caller's policy for the positions nothing here can decide — see
+    ``strip_comments``.
     """
+    if certain_operator(text, at):
+        return False
     if regex_can_start(text, at):
         return True
     return undecided == "regex" and regex_end(text, at) > at + 1
@@ -243,8 +270,8 @@ def strip_comments(
     used against the source it came from. Go raw backticks have neither escapes
     nor template interpolation, and Go has no regex literal syntax.
 
-    ``literals=True`` blanks the CONTENTS of every string, template and raw
-    literal as well, leaving the quotes where they were. For a reader that finds
+    ``literals=True`` blanks the CONTENTS of every string, template, raw and
+    regex literal as well, leaving the delimiters where they were. For a reader that finds
     a declaration by matching over the whole file, a literal is prose: a template
     or a raw string is free to carry a line that reads exactly like the
     declaration being looked for — an example in a generated document, a snippet
@@ -306,7 +333,13 @@ def strip_comments(
         # when they disagree; `constant` does exactly that.
         elif language == "typescript" and ch == "/" and _reads_as_regex(text, i, undecided_slash):
             end = regex_end(text, i)
-            out.append(text[i:end])
+            # A regex body is a literal like any other, and one that is left
+            # standing is one whose braces and quotes are counted as code. That
+            # cost a reader of top-level declarations both answers: a `}` in a
+            # regex closed a scope nobody opened, so a module declaration read as
+            # nested and a nested one read as top level (adversarial review,
+            # OPL-4805).
+            out.append(blank_inside(text[i:end]) if literals else text[i:end])
             i = end
         else:
             out.append(ch)

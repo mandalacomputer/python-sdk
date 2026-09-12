@@ -908,3 +908,45 @@ def test_an_ordinary_division_still_does_not_refuse_a_constant(
     boundary here, and the two policies agree."""
     source = f"const value = {division};\nexport const SAMPLE_LIMIT = 36;\n"
     assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 36
+
+
+def test_a_division_after_a_property_named_like_a_keyword_is_not_a_regex(
+    check_surface: ModuleType,
+) -> None:
+    """The agreement of two readings is worth nothing where both guess the same way.
+
+    `obj.return / …` is a division, and the slash predicate calls it a regex
+    position because the word before it is `return`. Both policies then consumed a
+    backtick as part of that "regex", which moved a template's boundary: the
+    declaration inside the template was left standing and the real one was blanked.
+    A value a member access decides is not a guess, so it is settled before either
+    policy is consulted (adversarial review, OPL-4805).
+    """
+    source = (
+        "const obj = {return: 1};\n"
+        "const ratio = obj.return / `/\nexport const SAMPLE_LIMIT = 36;\n` / 2;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const marker = /`/;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_a_brace_inside_a_regex_does_not_move_a_declarations_scope(
+    check_surface: ModuleType,
+) -> None:
+    """A regex body is a literal, and one left standing is counted as code.
+
+    A `}` in a regex closed a scope nobody opened, so the module's own declaration
+    read as nested and a nested one read as top level — the exported 99 lost to a
+    namespace's 36. An unmatched `{` did the mirror image and reported a real
+    declaration missing (adversarial review, OPL-4805).
+    """
+    hidden = (
+        "const pattern = /[}]/;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "namespace Example {\nexport const SAMPLE_LIMIT = 36;\n}\n"
+    )
+    ts = Path("fixture").with_suffix(".ts")
+    assert check_surface.constant(hidden, "SAMPLE_LIMIT", ts) == 99
+    unmatched = "const pattern = /[{]/;\nexport const SAMPLE_LIMIT = 36;\n"
+    assert check_surface.constant(unmatched, "SAMPLE_LIMIT", ts) == 36
