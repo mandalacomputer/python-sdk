@@ -1020,3 +1020,82 @@ def test_braces_that_do_not_balance_refuse_rather_than_placing_a_declaration(
             "SAMPLE_LIMIT",
             Path("fixture").with_suffix(".ts"),
         )
+
+
+#: A file whose real declaration is 99 and whose template carries a 36, with the
+#: attack construct substituted in. Every case below is the same question: did the
+#: reader place the template's boundary where JavaScript places it?
+_HIDDEN_BY_A_TEMPLATE = (
+    "const obj = {{return: 1}};\nlet x = 1;\n"
+    "{attack}\n"
+    "export const SAMPLE_LIMIT = 99;\n"
+    "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+    "const marker = /`/;\n"
+)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "if (true) ++ /`/.lastIndex;",
+        "x\n++ /`/.lastIndex;",
+        "const pad = obj.return" + " " * 260 + "/ 2;",
+    ],
+    ids=["prefix-update-after-a-condition", "prefix-update-after-a-line-break", "padded-operand"],
+)
+def test_a_slash_this_reader_cannot_place_never_reports_the_templates_number(
+    check_surface: ModuleType, attack: str
+) -> None:
+    """Three ways the previous round's certainties were false, and one rule for all.
+
+    A `)` is not something a postfix update can be applied to, a line break before
+    `++` is where JavaScript ends the statement, and an operand does not stop being
+    one because 260 spaces follow it. Each of them read a regex as a division or the
+    reverse, moved a template's boundary, and reported the number inside the
+    template. Reading the value correctly is the good outcome and refusing is an
+    acceptable one; reporting the template's 36 is not (adversarial review, OPL-4805).
+    """
+    source = _HIDDEN_BY_A_TEMPLATE.format(attack=attack)
+    try:
+        assert (
+            check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+        )
+    except SystemExit as refusal:
+        assert "SAMPLE_LIMIT" in str(refusal)
+
+
+def test_a_comments_punctuation_cannot_make_a_slash_certain(
+    check_surface: ModuleType,
+) -> None:
+    """Blanking comments protects every slash decision, not only the first.
+
+    A `?` at the end of a line comment was read as the character before the slash
+    below it, which made an undecidable division certainly a regex — and both
+    policies then guessed it the same way, so the disagreement that is supposed to
+    catch a guess never happened (adversarial review, OPL-4805).
+    """
+    source = (
+        "const ratio = (1) // why?\n / `/\nexport const SAMPLE_LIMIT = 36;\n` / 2;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const marker = /`/;\n"
+    )
+    with pytest.raises(SystemExit, match="undecidable slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_a_brace_count_that_recovers_is_still_not_a_placement(
+    check_surface: ModuleType,
+) -> None:
+    """A closing brace this reader cannot see, and the count back at zero afterwards.
+
+    The `}` inside a regex closed a scope nobody opened, and the next real `{`
+    brought the count back to zero — so a declaration inside a namespace read as one
+    at the top level. Checking the number at the declaration is not enough; the
+    whole prefix has to have stayed non-negative (adversarial review, OPL-4805).
+    """
+    source = (
+        'export {};\nlet unused\n/[}]/.test("");\n'
+        "namespace Example {\nexport const SAMPLE_LIMIT = 36;\n}\n"
+    )
+    with pytest.raises(SystemExit, match="do not balance|not found"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))

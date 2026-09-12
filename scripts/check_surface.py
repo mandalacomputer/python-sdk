@@ -539,11 +539,12 @@ def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> s
     exports, so "declared somewhere this does not mirror" and "not declared" are the
     same news.
 
-    The depth is a count, so it is checked for going NEGATIVE as well as for being
-    zero. A closing brace nobody opened is evidence of text this reader is not
-    seeing as text, and the honest answer there is that the declaration cannot be
-    placed — :data:`_UNBALANCED`, which refuses — rather than a count that comes
-    back to zero by accident.
+    The depth is a count, so what is checked is the whole prefix and not the number
+    at the declaration: a prefix that ever went NEGATIVE refuses, even where the
+    count has come back to zero since. A closing brace nobody opened is evidence of
+    text this reader is not seeing as text, and the honest answer there is that the
+    declaration cannot be placed — :data:`_UNBALANCED` — rather than a depth that
+    balances by accident and reads a nested declaration as a top-level one.
     """
     blanked = strip_comments(
         source,
@@ -551,13 +552,23 @@ def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> s
         literals=True,
         undecided_slash="regex" if undecided_slash == "regex" else "operator",
     )
+    depth = 0
+    floor = 0
+    at = 0
     found = []
     for match in re.finditer(pattern, blanked, re.MULTILINE):
-        opened = blanked.count("{", 0, match.start())
-        closed = blanked.count("}", 0, match.start())
-        if closed > opened:
+        for ch in blanked[at : match.start()]:
+            depth += 1 if ch == "{" else -1 if ch == "}" else 0
+            floor = min(floor, depth)
+        at = match.start()
+        # The floor and not only the current depth. A brace this reader could not
+        # see closes a scope nobody opened and the count recovers at the next real
+        # `{`, which reads a nested declaration as a top-level one — so a prefix
+        # that ever went negative refuses, rather than the count happening to come
+        # back to zero (adversarial review, OPL-4805).
+        if floor < 0:
             return _UNBALANCED
-        if opened == closed:
+        if depth == 0:
             found.append(match)
     if not found:
         return None

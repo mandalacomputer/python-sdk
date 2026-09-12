@@ -29,9 +29,28 @@ _REGEX_CAN_FOLLOW_WORDS = ("return", "case", "throw", "yield")
 _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
 _KEY = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
 _IDENT_CHAR = re.compile(r"[\w$]")
-#: How far back a slash's role is decided from. Longer than any operand this looks
-#: for, and bounded so that one pass over a file stays linear in its length.
+#: How far back a slash's role is decided from, in SIGNIFICANT characters: the tail
+#: it is measured over has every run of whitespace collapsed to one character first
+#: — see `_significant` — so padding and blanked comments cannot push the operand
+#: out of reach, which 256 spaces
+#: between `obj.return` and its slash did exactly that (adversarial review,
+#: OPL-4805). Bounded at all so that one pass over a file stays linear in its
+#: length rather than quadratic in the slashes in it.
 _LOOKBACK = 256
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _significant(text: str) -> str:
+    """``text`` with every run of whitespace collapsed to ONE character.
+
+    A run that contained a line break collapses to a newline and every other run
+    to a space, because one of the operand tests turns on whether a line break is
+    there: collapsing everything to a space made `x` and `++` on two lines look
+    like a postfix update on one (adversarial review, OPL-4805).
+    """
+    return _WHITESPACE_RUN.sub(lambda run: "\n" if "\n" in run.group(0) else " ", text)
+
+
 _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 #: A value a slash can only divide: a number, or a name that is not one of the
 #: keywords a regex is allowed to follow. Anything else — a closing parenthesis
@@ -40,10 +59,14 @@ _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 #: regex literals this reader must not walk into.
 _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
 #: A postfix increment or decrement — a VALUE, and one whose last character is an
-#: operator a regex is otherwise allowed to follow. The operand before the `++` is
-#: required: bare `++ /re/.lastIndex` is a PREFIX update of a regex property, which
-#: is legal and is not a division (adversarial review, OPL-4805).
-_POSTFIX_OPERAND = re.compile(r"[\w$\])]\s*(?:\+\+|--)\s*\Z")
+#: operator a regex is otherwise allowed to follow. Three things have to hold for
+#: the update to be postfix, and each was a false certainty in turn (adversarial
+#: review, OPL-4805): an operand before the `++`, since bare `++ /re/.lastIndex` is
+#: a PREFIX update of a regex property; an operand that can actually be assigned to,
+#: which a `)` cannot, so `if (c) ++ /re/.lastIndex` is a prefix update too; and no
+#: line break between the two, because that is where JavaScript inserts a semicolon
+#: and makes the update prefix whatever was above it.
+_POSTFIX_OPERAND = re.compile(r"[\w$\]][ \t]*(?:\+\+|--)\s*\Z")
 #: The same three operands as `_MEMBER_OPERAND` and `_DIVISION_OPERAND`, allowing a
 #: LINE BREAK between the value and the slash. Their own tails stop at a space or a
 #: tab on purpose, because `checked_slash_end` reads raw source, where looking back
@@ -264,7 +287,12 @@ def _reads_as_regex(
     """
     if certain_operator(before):
         return False
-    if regex_can_start(text, at):
+    # Over the blanked prefix, not the raw source. `regex_can_start` reads the
+    # character before the slash, and read raw that character can come out of a
+    # comment: a `?` in `const r = (1) // why?` made the division below it certainly
+    # a regex, which is a guess dressed as an answer — and one both policies then
+    # made the same way (adversarial review, OPL-4805).
+    if regex_can_start(before + "/", len(before)):
         return True
     return undecided == "regex" and regex_end(text, at) > at + 1
 
@@ -321,7 +349,7 @@ def strip_comments(
     def keep(chunk: str) -> None:
         nonlocal tail
         out.append(chunk)
-        tail = (tail + chunk)[-_LOOKBACK:]
+        tail = _significant(tail + chunk)[-_LOOKBACK:]
 
     i = 0
     # A hashbang is a comment to every tool that reads one of these files and was
