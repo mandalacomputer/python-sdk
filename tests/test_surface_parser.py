@@ -950,3 +950,73 @@ def test_a_brace_inside_a_regex_does_not_move_a_declarations_scope(
     assert check_surface.constant(hidden, "SAMPLE_LIMIT", ts) == 99
     unmatched = "const pattern = /[{]/;\nexport const SAMPLE_LIMIT = 36;\n"
     assert check_surface.constant(unmatched, "SAMPLE_LIMIT", ts) == 36
+
+
+def test_a_prefix_update_of_a_regex_property_is_not_a_division(
+    check_surface: ModuleType,
+) -> None:
+    """`++ /re/.lastIndex` increments a property OF a regex, so the slash opens one.
+
+    The postfix test was written as "a `++` before the slash" and matched this,
+    which turned a regex into a division and let its backtick move a template's
+    boundary. A postfix update has an operand in front of it; a prefix one does not
+    (adversarial review, OPL-4805).
+    """
+    source = (
+        "++ /`/.lastIndex;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        "++ /`/.lastIndex;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+@pytest.mark.parametrize("value", ["obj.return", "x++"], ids=["member-access", "postfix-update"])
+def test_a_line_break_between_a_value_and_its_slash_is_still_a_division(
+    check_surface: ModuleType, value: str
+) -> None:
+    """A value on the line above divides just the same, and JavaScript agrees:
+    a name, a line break and a slash is one expression, not a new statement.
+
+    The operand tests reached only as far as a space or a tab, so both divisions
+    came back as regex positions the moment the line wrapped (adversarial review,
+    OPL-4805).
+    """
+    source = (
+        "const obj = {return: 1};\nlet x = 2;\n"
+        f"const ratio = {value}\n / `/\nexport const SAMPLE_LIMIT = 36;\n` / 2;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const marker = /`/;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_a_hashbang_is_not_code_and_its_braces_are_not_scope(
+    check_surface: ModuleType,
+) -> None:
+    """Every tool that reads one of these files treats a `#!` line as a comment.
+
+    This reader did not, so a brace in one closed a scope nobody opened — which hid
+    the module's own declaration and promoted a namespace's (adversarial review,
+    OPL-4805).
+    """
+    source = (
+        "#!/usr/bin/env node --title=}\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "namespace Example {\nexport const SAMPLE_LIMIT = 36;\n}\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_braces_that_do_not_balance_refuse_rather_than_placing_a_declaration(
+    check_surface: ModuleType,
+) -> None:
+    """The depth rule is a count, and a count that has gone negative is evidence of
+    text this reader is not seeing as text. Whether the declaration is at the top
+    level is then exactly what cannot be established, so it is refused."""
+    with pytest.raises(SystemExit, match="do not balance"):
+        check_surface.constant(
+            "}\nexport const SAMPLE_LIMIT = 36;\n",
+            "SAMPLE_LIMIT",
+            Path("fixture").with_suffix(".ts"),
+        )

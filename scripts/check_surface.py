@@ -488,6 +488,12 @@ def constant(source: str, name: str, module: Path) -> int:
     found = readings["operator"]
     if found is None:
         raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
+    if found == _UNBALANCED:
+        raise SystemExit(
+            f"{name} is in a {module} this reader cannot place declarations in — the braces\n"
+            "  before it do not balance, so whether it is at the top level or inside\n"
+            "  something is exactly what cannot be established."
+        )
     if found == _AMBIGUOUS:
         raise SystemExit(
             f"{name} is declared more than once at the top level of {module} — this reader\n"
@@ -509,6 +515,13 @@ def constant(source: str, name: str, module: Path) -> int:
 #: the more useful half of it.
 _AMBIGUOUS = "<more than one declaration>"
 
+#: What it returns for a file whose braces do not balance where the declaration is.
+#: The depth rule below is a COUNT, not a parse, and a count that has gone negative
+#: is evidence that something it cannot see is contributing braces — so the answer
+#: is that the declaration cannot be placed, rather than a depth that happens to
+#: read as zero (adversarial review, OPL-4805).
+_UNBALANCED = "<braces do not balance>"
+
 
 def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> str | None:
     """The expression this pattern finds at the top level, under one slash policy.
@@ -521,7 +534,16 @@ def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> s
     declared in one shadows nothing the SDK mirrors — reading it as the platform's
     value is how a local `36` answered for an exported `99`. Go groups its
     constants in parentheses rather than braces, so a `const (…)` block counts as
-    the top level it is.
+    the top level it is. A declaration only inside a TypeScript ``namespace`` block
+    is not at the top level either, and reads as absent: the mirror is of a module's
+    exports, so "declared somewhere this does not mirror" and "not declared" are the
+    same news.
+
+    The depth is a count, so it is checked for going NEGATIVE as well as for being
+    zero. A closing brace nobody opened is evidence of text this reader is not
+    seeing as text, and the honest answer there is that the declaration cannot be
+    placed — :data:`_UNBALANCED`, which refuses — rather than a count that comes
+    back to zero by accident.
     """
     blanked = strip_comments(
         source,
@@ -529,11 +551,14 @@ def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> s
         literals=True,
         undecided_slash="regex" if undecided_slash == "regex" else "operator",
     )
-    found = [
-        match
-        for match in re.finditer(pattern, blanked, re.MULTILINE)
-        if blanked.count("{", 0, match.start()) == blanked.count("}", 0, match.start())
-    ]
+    found = []
+    for match in re.finditer(pattern, blanked, re.MULTILINE):
+        opened = blanked.count("{", 0, match.start())
+        closed = blanked.count("}", 0, match.start())
+        if closed > opened:
+            return _UNBALANCED
+        if opened == closed:
+            found.append(match)
     if not found:
         return None
     return _AMBIGUOUS if len(found) > 1 else found[0].group(1)

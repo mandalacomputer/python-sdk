@@ -29,6 +29,9 @@ _REGEX_CAN_FOLLOW_WORDS = ("return", "case", "throw", "yield")
 _TRAILING_WORD = re.compile(r"([A-Za-z_$][\w$]*)\Z")
 _KEY = re.compile(r"([A-Za-z_$][\w$]*)\s*:")
 _IDENT_CHAR = re.compile(r"[\w$]")
+#: How far back a slash's role is decided from. Longer than any operand this looks
+#: for, and bounded so that one pass over a file stays linear in its length.
+_LOOKBACK = 256
 _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 #: A value a slash can only divide: a number, or a name that is not one of the
 #: keywords a regex is allowed to follow. Anything else — a closing parenthesis
@@ -36,9 +39,21 @@ _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 #: guessed at, because a control condition's ``)`` is exactly what precedes the
 #: regex literals this reader must not walk into.
 _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
-#: A postfix increment or decrement: a value, and one whose last character is an
-#: operator that a regex is otherwise allowed to follow.
-_POSTFIX_OPERAND = re.compile(r"(?:\+\+|--)[ \t]*\Z")
+#: A postfix increment or decrement — a VALUE, and one whose last character is an
+#: operator a regex is otherwise allowed to follow. The operand before the `++` is
+#: required: bare `++ /re/.lastIndex` is a PREFIX update of a regex property, which
+#: is legal and is not a division (adversarial review, OPL-4805).
+_POSTFIX_OPERAND = re.compile(r"[\w$\])]\s*(?:\+\+|--)\s*\Z")
+#: The same three operands as `_MEMBER_OPERAND` and `_DIVISION_OPERAND`, allowing a
+#: LINE BREAK between the value and the slash. Their own tails stop at a space or a
+#: tab on purpose, because `checked_slash_end` reads raw source, where looking back
+#: over a newline can borrow a token out of a line comment. `certain_operator`
+#: reads a prefix whose comments are already blanked, so it can afford the longer
+#: reach — and needs it, since `obj.return` on the line above a slash is the same
+#: division as `obj.return` beside it (adversarial review, OPL-4805). ASI does not
+#: change that: `a` then a newline then `/b/` is a division in JavaScript too.
+_MEMBER_OPERAND_LINES = re.compile(r"\.[A-Za-z_$][\w$]*\s*\Z")
+_DIVISION_OPERAND_LINES = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)\s*\Z")
 #: Words that are not values, so a slash after one is not a division. Spelled
 #: as every reserved and contextual word there is rather than as the handful
 #: that can lead a regex, because the cost of the two mistakes is not the same:
@@ -214,35 +229,40 @@ def checked_slash_end(text: str, start: int) -> int:
     return end
 
 
-def certain_operator(text: str, at: int) -> bool:
-    """Whether the slash at ``at`` can ONLY divide — it follows a value.
+def certain_operator(before: str) -> bool:
+    """Whether a slash straight after ``before`` can ONLY divide — it follows a value.
 
-    The three shapes a value ends in: a member access, a postfix ``++`` or
-    ``--``, and a number or a name that is not a reserved word. ``checked_slash_end``
-    asks the same question first, for the same reason: a regex cannot begin after
-    a value, so these positions are not guesses at all.
+    The three shapes a value ends in: a member access, a postfix ``++`` or ``--``
+    with an operand in front of it, and a number or a name that is not a reserved
+    word. ``checked_slash_end`` asks the first and the third for the same reason: a
+    regex cannot begin after a value, so these positions are not guesses at all.
 
-    ``regex_can_start`` does not subsume it and answering it first is the point.
-    That predicate reads the character before the slash, so ``x++ / 2`` looks like
-    a slash after ``+``, and ``obj.return / 2`` looks like a slash after the
-    keyword ``return`` — both of which it calls regex positions, and both of which
-    are divisions (adversarial review, OPL-4805).
+    ``before`` must be the text up to the slash with its COMMENTS already blanked.
+    The reach here crosses line breaks, and over raw source that would let a name
+    inside a line comment answer for the code below it.
+
+    ``regex_can_start`` does not subsume this and asking it first is the point.
+    That predicate looks at the character before the slash, so ``x++ / 2`` reads as
+    a slash after ``+`` and ``obj.return / 2`` as a slash after the keyword
+    ``return`` — both of which it calls regex positions, and both of which are
+    divisions (adversarial review, OPL-4805).
     """
-    before = text[:at]
-    if _MEMBER_OPERAND.search(before) or _POSTFIX_OPERAND.search(before):
+    if _MEMBER_OPERAND_LINES.search(before) or _POSTFIX_OPERAND.search(before):
         return True
-    operand = _DIVISION_OPERAND.search(before)
+    operand = _DIVISION_OPERAND_LINES.search(before)
     return bool(operand and operand.group(0).strip() not in _NOT_A_VALUE)
 
 
-def _reads_as_regex(text: str, at: int, undecided: Literal["operator", "regex"]) -> bool:
+def _reads_as_regex(
+    before: str, text: str, at: int, undecided: Literal["operator", "regex"]
+) -> bool:
     """Whether to read the slash at ``at`` as opening a regex literal.
 
     Certain divisions first, then ``regex_can_start`` where it is confident, then
     the caller's policy for the positions nothing here can decide — see
-    ``strip_comments``.
+    ``strip_comments``. ``before`` is the comment-blanked text up to the slash.
     """
-    if certain_operator(text, at):
+    if certain_operator(before):
         return False
     if regex_can_start(text, at):
         return True
@@ -293,7 +313,25 @@ def strip_comments(
     skipped over at most as far as the end of its own line.
     """
     out: list[str] = []
+    # The tail of what has been written, bounded: every lookback here is a few
+    # tokens, and joining the whole prefix at each slash would make one pass over
+    # a file quadratic in the number of slashes in it.
+    tail = ""
+
+    def keep(chunk: str) -> None:
+        nonlocal tail
+        out.append(chunk)
+        tail = (tail + chunk)[-_LOOKBACK:]
+
     i = 0
+    # A hashbang is a comment to every tool that reads one of these files and was
+    # not one to this reader, so its text counted as code — including a brace,
+    # which is how a closing one nobody wrote hid a top-level declaration
+    # (adversarial review, OPL-4805).
+    if text.startswith("#!"):
+        end = text.find("\n")
+        i = len(text) if end == -1 else end
+        keep(" " * i)
     while i < len(text):
         ch = text[i]
         if ch in "'\"`":
@@ -304,18 +342,18 @@ def strip_comments(
                 end = closing + 1
             else:
                 end = quoted_end(text, i)
-            out.append(blank_inside(text[i:end]) if literals else text[i:end])
+            keep(blank_inside(text[i:end]) if literals else text[i:end])
             i = end
         elif ch == "/" and text[i : i + 2] == "//":
             end = text.find("\n", i + 2)
             stop = len(text) if end == -1 else end
-            out.append(" " * (stop - i))
+            keep(" " * (stop - i))
             i = stop
         elif ch == "/" and text[i : i + 2] == "/*":
             end = text.find("*/", i + 2)
             stop = len(text) if end == -1 else end + 2
             # Newlines kept so line numbers survive; everything else spaced out.
-            out.append(re.sub(r"[^\r\n]", " ", text[i:stop]))
+            keep(re.sub(r"[^\r\n]", " ", text[i:stop]))
             i = stop
         # Not `checked_slash_end`, which REFUSES an undecidable slash: this pass
         # runs over ordinary modules rather than over literal tables, and a slash
@@ -331,7 +369,11 @@ def strip_comments(
         # of its mistakes can move a literal's boundary. A caller that must not be
         # wrong reads the file under both `undecided_slash` policies and refuses
         # when they disagree; `constant` does exactly that.
-        elif language == "typescript" and ch == "/" and _reads_as_regex(text, i, undecided_slash):
+        elif (
+            language == "typescript"
+            and ch == "/"
+            and _reads_as_regex(tail, text, i, undecided_slash)
+        ):
             end = regex_end(text, i)
             # A regex body is a literal like any other, and one that is left
             # standing is one whose braces and quotes are counted as code. That
@@ -339,10 +381,10 @@ def strip_comments(
             # regex closed a scope nobody opened, so a module declaration read as
             # nested and a nested one read as top level (adversarial review,
             # OPL-4805).
-            out.append(blank_inside(text[i:end]) if literals else text[i:end])
+            keep(blank_inside(text[i:end]) if literals else text[i:end])
             i = end
         else:
-            out.append(ch)
+            keep(ch)
             i += 1
     return "".join(out)
 
