@@ -36,25 +36,75 @@ _MEMBER_OPERAND = re.compile(r"\.[A-Za-z_$][\w$]*[ \t]*\Z")
 #: guessed at, because a control condition's ``)`` is exactly what precedes the
 #: regex literals this reader must not walk into.
 _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
-#: Every word after which a slash opens a regex rather than dividing. Longer
-#: than ``_REGEX_CAN_FOLLOW_WORDS``, which only lists the ones that reach
-#: ``regex_can_start``: this set has to be complete in the other direction,
-#: since a word missing from it would be read as a value being divided.
-_OPERATOR_WORDS = frozenset(
+#: Words that are not values, so a slash after one is not a division. Spelled
+#: as every reserved and contextual word there is rather than as the handful
+#: that can lead a regex, because the cost of the two mistakes is not the same:
+#: a word wrongly listed here loses a division and refuses, and a word left out
+#: reads a regex as arithmetic and walks into its body — where a ``}`` closes a
+#: scope nobody opened and a backtick ends a template. Enumerating the openers
+#: is how ``export default /…/`` and ``extends /…/`` got in, both of which
+#: carried a whole fake route table inside a regex. The five reserved words
+#: that ARE values — ``this``, ``super``, ``true``, ``false`` and ``null`` —
+#: are deliberately absent.
+_NOT_A_VALUE = frozenset(
     {
+        "abstract",
+        "as",
+        "asserts",
+        "async",
         "await",
+        "break",
         "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "declare",
+        "default",
         "delete",
         "do",
         "else",
+        "enum",
+        "export",
+        "extends",
+        "finally",
+        "for",
+        "from",
+        "function",
+        "if",
+        "implements",
+        "import",
         "in",
+        "infer",
         "instanceof",
+        "interface",
+        "is",
+        "keyof",
+        "let",
+        "namespace",
         "new",
         "of",
+        "out",
+        "override",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "readonly",
         "return",
+        "satisfies",
+        "static",
+        "switch",
         "throw",
+        "try",
+        "type",
         "typeof",
+        "unique",
+        "var",
         "void",
+        "while",
+        "with",
         "yield",
     }
 )
@@ -147,11 +197,11 @@ def checked_slash_end(text: str, start: int) -> int:
     # / 2` in a document being read is: a slash cannot open a regex after a
     # value, so nothing here is a guess. Refusing it made every legal division
     # upstream a failed comparison in the platform's CI, over source this
-    # reader does not otherwise care about. A keyword is not a value, and a
-    # closing parenthesis or bracket is still undecidable — see
-    # `_DIVISION_OPERAND`.
+    # reader does not otherwise care about. A reserved word is not a value —
+    # see `_NOT_A_VALUE` — and a closing parenthesis or bracket is still
+    # undecidable, so both fall through to the refusal below.
     operand = _DIVISION_OPERAND.search(before)
-    if operand and operand.group(0).strip() not in _OPERATOR_WORDS:
+    if operand and operand.group(0).strip() not in _NOT_A_VALUE:
         return start + 1
     if not regex_can_start(text, start):
         raise ValueError(f"ambiguous slash at {position(text, start)}")

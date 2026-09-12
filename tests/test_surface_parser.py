@@ -729,6 +729,29 @@ def test_a_slash_after_a_keyword_is_not_read_as_division(check_surface: ModuleTy
     )
 
 
+@pytest.mark.parametrize(
+    "prelude",
+    [
+        "export default /a; export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; z/;",
+        "class C extends /}/.constructor {}",
+        "const t = `${class extends /}[`]/.constructor {}}`;",
+    ],
+)
+def test_a_regex_after_a_keyword_cannot_supply_a_table(
+    check_surface: ModuleType, prelude: str
+) -> None:
+    """Every reserved word, not only the ones that can lead a regex.
+
+    `export default /…/` and `extends /…/` are legal TypeScript, and reading
+    either slash as division walks the reader into the regex: the first carried
+    a whole fake route table inside one, and the other two close a scope and
+    end a template with delimiters nobody wrote.
+    """
+    source = prelude + "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash"):
+        check_surface.table(source, "ROUTES")
+
+
 def test_a_keyword_this_reader_cannot_classify_is_still_refused(
     check_surface: ModuleType,
 ) -> None:

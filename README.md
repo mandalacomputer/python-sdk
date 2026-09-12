@@ -361,8 +361,15 @@ that builds into a family this account may not build into is one: no hypervisor
 will launch it, and what changes the answer is publishing a new version, not
 sending the create again. A document that builds nothing and names an account
 family is the other: a create is served only from the families that ship with
-the product. The `503` on this path is the one that does come good — an image
-whose only holder is unreachable right now.
+the product.
+
+The refusals beside them mean something else. A `409` — `ConflictError` — says
+no verified image for this exact document is available yet: finish the build,
+or restore an image that has gone missing or is still being verified. A `503`
+— `UnavailableError` — says no hypervisor has an image for that template *right
+now*, which is the one to retry as it stands. A create can answer `503` for
+capacity as well, and that one is worth a smaller size rather than only a
+wait.
 
 Everything here has an async twin: `await client.templates.publish(doc)`,
 `await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
