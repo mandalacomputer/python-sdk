@@ -2682,9 +2682,17 @@ class WebhookDelivery:
     attempted_at: str | None
     #: The HTTP status of the newest attempt, or ``None`` when it got no answer.
     last_status: int | None
-    #: One line about the newest failure: ``timeout``, ``dns``, ``refused``,
-    #: ``tls``, ``redirect``, ``address refused``, or ``status NNN``. ``None``
-    #: after a success and before any attempt.
+    #: One line about the newest failure, for a person to read. ``None`` after a
+    #: success and before any attempt.
+    #:
+    #: An **open** set, not an enumeration. What a delivery failed on is most
+    #: often the transport — ``timeout``, ``dns``, ``refused``, ``tls``,
+    #: ``redirect``, ``address refused``, ``status NNN`` — but the platform also
+    #: reports a delivery it could not finish bookkeeping for, and those read as a
+    #: prefix and a cause (``attempt failed: …``, ``settle failed: …``). New
+    #: wordings arrive without warning, because this field describes an operator's
+    #: failure rather than a client's contract. Branch on :attr:`state`,
+    #: :attr:`last_status` and :attr:`attempts`, which do not move; show this one.
     last_error: str | None
     #: When the 2xx came back. ``None`` otherwise.
     delivered_at: str | None

@@ -1050,6 +1050,15 @@ eight stays an account of eight steps rather than only a message — the spend i
 on a key the platform never meters, and the clicks are still on the desktop.
 `agent_stream()` hands the same record over as an `AgentFailed` event.
 
+`agent_once()` can be stopped the same way, and it arrives differently. The API
+rechecks authorization before each further model call and before each tool, so a
+key revoked, a role dropped, an account suspended or a plan downgraded mid-run
+ends that one request with a 401, a 403 or a 402 rather than with a body — after
+steps that already ran on the desktop and already cost model tokens. Where the
+refusal says how far the run got, `e.agent` carries it there too. What it is not
+is a reason to send the request again: the credential, the role or the plan has
+to change first, and `is_transient()` answers `False` for all three.
+
 ```python
 import mandala_computer as mc
 
@@ -1991,6 +2000,20 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
 | `ConnectionInterruptedError` | the request was dispatched and the answer was lost; do not replay a create |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
+
+**401, 403 and 402 can arrive at the end of a wait, not only at the start.**
+Authorization is not settled once per request: the API rechecks it after the
+waits inside a call and before each further piece of work, so a key revoked, a
+membership removed, a role dropped, an account suspended or a plan downgraded
+while a call was in flight comes back as one of those three even though the same
+call was authorized when it was sent. Two consequences worth writing code for.
+None of the three is a transport failure — `is_transient()` answers `False`, and
+repeating the request unchanged gets the same answer. And the refusal is about
+the credential rather than the resource: a 401 here does not mean the computer is
+gone. Where the work is a durable write the API refuses before writing, so a
+`403` on a create, a move, a webhook or a template publish leaves nothing behind;
+the exception is the agent loop, whose completed steps stand (see
+[Letting the platform drive](#letting-the-platform-drive)).
 
 <a name="refused-before-it-was-sent"></a>
 **An argument refused before it was sent is not a `MandalaError`.** Nothing left

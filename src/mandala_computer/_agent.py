@@ -235,7 +235,16 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
         return AgentDone(AgentResult.from_api(data))
     if event == "error":
         r = data if isinstance(data, Mapping) else {}
+        # Two spellings, because two transports. A stream's error frame calls the
+        # completed steps ``steps``; a non-streaming run that is refused mid-flight
+        # answers with an HTTP status and calls them ``steps_taken``, because in
+        # that body ``steps`` is the count a finished run reports. A LIST is the
+        # only thing either name can contribute here, so the value decides rather
+        # than which key is present — a count under ``steps`` must not shadow the
+        # steps themselves (OPL-4804).
         taken = r.get("steps")
+        if not isinstance(taken, list):
+            taken = r.get("steps_taken")
         return AgentFailed(
             _text(r.get("error")) or "the run failed",
             _num(r.get("status")),

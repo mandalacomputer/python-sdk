@@ -173,6 +173,47 @@ def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
     return _agent_outcome(None, failure)
 
 
+def _attach_agent_partial(exc: APIError) -> None:
+    """Carry a refused non-streaming run's own account onto the error it raises.
+
+    A non-streaming agent run can be refused by the API **after** it has already
+    driven the desktop: authorization is rechecked before each further model call
+    and before each tool, so a key revoked, a role dropped, an account suspended
+    or a plan downgraded mid-run stops the loop with an HTTP status — 401, 403 or
+    402 — rather than with a body this SDK reads as a result. The steps already
+    taken stand on the desktop and their tokens are already spent on the caller's
+    model key, and that refusal body is the only place either is ever reported.
+
+    So the account is moved onto the exception as
+    :attr:`~mandala_computer.MandalaError.agent`, which is where the streaming
+    half already puts it. The exception itself is left alone otherwise — same
+    class, same message, same status — because that message is the platform's own
+    reason for refusing, and a caller already catching
+    :class:`~mandala_computer.AuthenticationError` around this call keeps catching
+    exactly what it did before.
+
+    Attached only when the body actually carries an account — a ``usage`` object
+    or a list of completed steps. A 401 from a bad API key on the very first
+    attempt carries neither, and answering it with an empty
+    :class:`~mandala_computer.AgentFailed` would make ``if e.agent:`` mean "this
+    came from the agent route" where it currently means "there is a record of
+    what the run did". (OPL-4804)
+    """
+    if exc.agent is not None or not isinstance(exc.body, Mapping):
+        return
+    usage = exc.body.get("usage")
+    steps = exc.body.get("steps_taken")
+    if not isinstance(steps, list):
+        steps = exc.body.get("steps")
+    if not isinstance(usage, Mapping) and not isinstance(steps, list):
+        return
+    # ``status`` off the body would be the platform repeating itself at best; the
+    # status that refused this request is the one on the response.
+    failure = to_agent_event("error", {**exc.body, "status": exc.status}, 0)
+    if isinstance(failure, AgentFailed):  # defensive: the converter owns this shape
+        exc.agent = failure
+
+
 def _file_body(data: bytes | str) -> bytes:
     if isinstance(data, str):
         # Unpaired surrogates are not UTF-8; ``encode`` raises
@@ -2946,6 +2987,16 @@ class Computer(ComputerFields):
         coming back as a run of no steps that ended for no reason — the same
         check :meth:`agent` makes on the content type, made on the body.
 
+        **A run can be refused part-way through.** Authorization is checked again
+        before each further model call and before each tool, so a key revoked, a
+        role dropped, an account suspended or a plan downgraded mid-run ends the
+        request with an HTTP status — 401, 403 or 402 — after some steps have
+        already run on the desktop and been billed to your model key. Where the
+        refusal says how far it got, that account rides on the exception as
+        :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
+        :meth:`agent`. None of the three is worth retrying unchanged; the
+        credential, the role or the plan is what has to change first.
+
         The proxy in front of ``app.mandala.computer`` gives up at about two
         minutes, measured — so on that deployment this is not a risk but a
         certainty for any run longer than that, and it arrives as
@@ -2955,15 +3006,21 @@ class Computer(ComputerFields):
         hop that would otherwise stop waiting.
         """
         model_key = _require_model_key(model_key)
-        data = self._t.json_object(
-            "POST",
-            _api.computer_action(self.id, "agent"),
-            json=_api.agent_body(
-                prompt, stream=False, system=system, max_steps=max_steps, model=model
-            ),
-            headers={MODEL_KEY_HEADER: model_key},
-            timeout=NO_DEADLINE,
-        )
+        try:
+            data = self._t.json_object(
+                "POST",
+                _api.computer_action(self.id, "agent"),
+                json=_api.agent_body(
+                    prompt, stream=False, system=system, max_steps=max_steps, model=model
+                ),
+                headers={MODEL_KEY_HEADER: model_key},
+                timeout=NO_DEADLINE,
+            )
+        except APIError as exc:
+            # A refusal that arrived mid-run carries what the run had already
+            # done. See :func:`_attach_agent_partial`.
+            _attach_agent_partial(exc)
+            raise
         return _agent_once_outcome(data)
 
     # --- events ---------------------------------------------------------

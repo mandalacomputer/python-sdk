@@ -41,6 +41,7 @@ from ._computer import (
     ComputerFields,
     _agent_once_outcome,
     _agent_outcome,
+    _attach_agent_partial,
     _clipboard_text,
     _continues,
     _cursor,
@@ -71,6 +72,7 @@ from ._events import (
     unreachable_types,
 )
 from ._exceptions import (
+    APIError,
     ConnectionError,
     MandalaError,
     RangeNotSatisfiableError,
@@ -1588,6 +1590,16 @@ class AsyncComputer(ComputerFields):
         coming back as a run of no steps that ended for no reason — the same
         check :meth:`agent` makes on the content type, made on the body.
 
+        **A run can be refused part-way through.** Authorization is checked again
+        before each further model call and before each tool, so a key revoked, a
+        role dropped, an account suspended or a plan downgraded mid-run ends the
+        request with an HTTP status — 401, 403 or 402 — after some steps have
+        already run on the desktop and been billed to your model key. Where the
+        refusal says how far it got, that account rides on the exception as
+        :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
+        :meth:`agent`. None of the three is worth retrying unchanged; the
+        credential, the role or the plan is what has to change first.
+
         The proxy in front of ``app.mandala.computer`` gives up at about two
         minutes, measured — so on that deployment this is not a risk but a
         certainty for any run longer than that, and it arrives as
@@ -1597,15 +1609,21 @@ class AsyncComputer(ComputerFields):
         hop that would otherwise stop waiting.
         """
         model_key = _require_model_key(model_key)
-        data = await self._t.json_object(
-            "POST",
-            _api.computer_action(self.id, "agent"),
-            json=_api.agent_body(
-                prompt, stream=False, system=system, max_steps=max_steps, model=model
-            ),
-            headers={MODEL_KEY_HEADER: model_key},
-            timeout=NO_DEADLINE,
-        )
+        try:
+            data = await self._t.json_object(
+                "POST",
+                _api.computer_action(self.id, "agent"),
+                json=_api.agent_body(
+                    prompt, stream=False, system=system, max_steps=max_steps, model=model
+                ),
+                headers={MODEL_KEY_HEADER: model_key},
+                timeout=NO_DEADLINE,
+            )
+        except APIError as exc:
+            # A refusal that arrived mid-run carries what the run had already
+            # done. See :func:`_attach_agent_partial`.
+            _attach_agent_partial(exc)
+            raise
         return _agent_once_outcome(data)
 
     # --- events ---------------------------------------------------------
