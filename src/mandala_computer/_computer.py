@@ -2526,8 +2526,8 @@ class Computer(ComputerFields):
 
         At most 64 KiB of UTF-8 goes in — half what comes out, and the two are
         different bounds on different channels rather than one number rounded
-        twice; see ``_api.MAX_CLIPBOARD_BYTES``. Empty text and a NUL are
-        refused here rather than on the wire.
+        twice; see ``_api.MAX_CLIPBOARD_BYTES``. Empty text clears the clipboard.
+        A NUL is refused here rather than on the wire.
 
         The platform confirms the write by reading the selection back before it
         answers, so this returning means the desktop is *holding* the text
@@ -2538,8 +2538,8 @@ class Computer(ComputerFields):
         ``contention`` and ``starting`` clear on their own, while ``unavailable``
         and ``unsupported`` require a different action.
         :func:`~mandala_computer.is_transient` answers ``True`` for the first
-        pair and ``False`` for the second. A stopped or suspended computer is
-        ``unavailable``; :meth:`start` it instead of retrying this request. An
+        pair and ``False`` for the second. If ``unavailable`` is returned,
+        :meth:`start` the computer instead of retrying this request. An
         absent or unknown reason remains unclassified and falls back to the
         historical ``ConflictError`` answer of ``True``, so code supporting
         such responses should verify the computer state and bound its retries.

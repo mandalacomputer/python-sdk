@@ -123,12 +123,18 @@ async def test_the_async_clipboard_keeps_an_empty_selection(client: mc.AsyncClie
 
 
 @respx.mock
-async def test_the_async_clipboard_write_sends_the_one_field(client: mc.AsyncClient) -> None:
+@pytest.mark.parametrize("text", ["hello", "", " \t\n"])
+async def test_the_async_clipboard_write_sends_the_one_field(
+    client: mc.AsyncClient,
+    text: str,
+) -> None:
     route = respx.put(f"{BASE}/computers/vm-1/clipboard").mock(
         httpx.Response(200, json={"ok": True})
     )
-    await mc.AsyncComputer(client._t, COMPUTER).set_clipboard("hello")
-    assert json.loads(route.calls.last.request.content) == {"text": "hello"}
+    await mc.AsyncComputer(client._t, COMPUTER).set_clipboard(text)
+    assert json.loads(route.calls.last.request.content) == {"text": text}
+    assert route.call_count == 1
+    assert len(respx.calls) == 1
     await client.aclose()
 
 
@@ -147,8 +153,8 @@ async def test_the_async_clipboard_write_refuses_before_it_reaches_the_wire(
         httpx.Response(200, json={"ok": True})
     )
     computer = mc.AsyncComputer(client._t, COMPUTER)
-    with pytest.raises(ValueError, match="must not be empty"):
-        await computer.set_clipboard("")
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        await computer.set_clipboard("\ud800")
     with pytest.raises(ValueError, match="NUL"):
         await computer.set_clipboard("a\0b")
     with pytest.raises(ValueError, match="at most"):
