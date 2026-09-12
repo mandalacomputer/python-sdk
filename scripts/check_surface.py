@@ -428,8 +428,8 @@ def constant(source: str, name: str, module: Path) -> int:
     TypeScript one was not, which made a commented-out declaration upstream a
     silent match here.
 
-    Quoted text is blanked along with the comments, and the match must be the ONLY
-    one in the file. Both halves close what the comment blanking left open: a
+    Quoted text is blanked along with the comments, the declaration must be at the
+    top level, and the match must be the ONLY one there. Both halves close what the comment blanking left open: a
     declaration-shaped LINE inside a template or a Go raw string — a snippet in a
     generated document, a script embedded in a module — matched, and the first
     match won, so prose earlier in the file decided what the platform's constant
@@ -437,8 +437,18 @@ def constant(source: str, name: str, module: Path) -> int:
     equal the mirror the check passes over a constant that has drifted, which is
     the one direction that matters for a published package. Two declarations of
     one name is the same situation from the other side and is refused rather than
-    settled by position, which is the rule :func:`table` already follows
-    (OPL-4805).
+    settled by position, which is the rule :func:`table` already follows.
+
+    None of that is enough on its own, because blanking a literal depends on
+    knowing where it starts, and in TypeScript that depends on a slash whose role
+    is sometimes undecidable: a backtick inside a regex literal this reader places
+    wrongly moves a template's boundary, and the real declaration can end up
+    blanked with the prose left standing — the same false pass, reached through the
+    lexer instead of through the pattern. So the file is read BOTH ways, under each
+    ``undecided_slash`` policy, and a name whose value depends on which way is
+    refused. That is the whole guarantee here: not that this reader lexes
+    JavaScript correctly, but that it will not report a number it had to guess at
+    (OPL-4805, and its adversarial review).
 
     Which form is tried is decided by the module's suffix rather than by trying
     both: the two patterns are close enough that a file answering to the wrong
@@ -454,27 +464,79 @@ def constant(source: str, name: str, module: Path) -> int:
     never be the same answer.
     """
     go = module.suffix == ".go"
-    blanked = strip_comments(source, language="go" if go else "typescript", literals=True)
     pattern = (
-        rf"^\s*(?:const[ \t]+)?{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
+        # A Go declaration may name its type, and one that does is still the
+        # declaration: a pattern blind to `const name int = 4` reads the file as
+        # if the constant were declared somewhere else — which, where a local of
+        # the same name exists, it then finds (adversarial review, OPL-4805).
+        rf"^[ \t]*(?:const[ \t]+)?{re.escape(name)}"
+        rf"(?:[ \t]+[A-Za-z_][\w.\[\]*]*)?[ \t]*=[ \t]*([0-9*+()\s]+?)[ \t]*$"
         if go
-        else rf"^\s*export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
+        else rf"^[ \t]*export const {re.escape(name)}[ \t]*=[ \t]*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
     )
-    found = re.findall(pattern, blanked, re.MULTILINE)
-    if not found:
-        raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
-    if len(found) > 1:
+    readings = {
+        policy: _declared(source, pattern, go=go, undecided_slash=policy)
+        for policy in ("operator", "regex")
+    }
+    if len(set(readings.values())) != 1:
         raise SystemExit(
-            f"{name} is declared {len(found)} times in {module} — this reader cannot tell\n"
-            "  which one the platform uses, and picking by position is how it would agree\n"
-            "  with the wrong one."
+            f"{name} in {module} depends on how an undecidable slash in that file is\n"
+            "  read — one way it is "
+            + " and the other ".join(repr(r) for r in readings.values())
+            + ".\n  A constant this reader cannot establish without guessing is one it refuses."
+        )
+    found = readings["operator"]
+    if found is None:
+        raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
+    if found == _AMBIGUOUS:
+        raise SystemExit(
+            f"{name} is declared more than once at the top level of {module} — this reader\n"
+            "  cannot tell which one the platform uses, and picking by position is how it\n"
+            "  would agree with the wrong one."
         )
     try:
-        return _arith(ast.parse(found[0].strip(), mode="eval").body)
+        return _arith(ast.parse(found.strip(), mode="eval").body)
     except (SyntaxError, ValueError) as err:
         raise SystemExit(
-            f"{name} is {found[0]!r} in {module}, which this reader cannot evaluate"
+            f"{name} is {found!r} in {module}, which this reader cannot evaluate"
         ) from err
+
+
+#: What :func:`_declared` returns for a name declared more than once where this
+#: reader can see it. A sentinel rather than an exception so that the two slash
+#: policies can be compared before either is reported: "declared twice under one
+#: reading and once under the other" is itself a refusal, and the ambiguity is
+#: the more useful half of it.
+_AMBIGUOUS = "<more than one declaration>"
+
+
+def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> str | None:
+    """The expression this pattern finds at the top level, under one slash policy.
+
+    ``None`` where the file declares it nowhere this reader can see, and
+    :data:`_AMBIGUOUS` where it is declared more than once.
+
+    Top level means brace depth zero, counted over the blanked source. A constant
+    a package exports is not declared inside a function body, and a name that IS
+    declared in one shadows nothing the SDK mirrors — reading it as the platform's
+    value is how a local `36` answered for an exported `99`. Go groups its
+    constants in parentheses rather than braces, so a `const (…)` block counts as
+    the top level it is.
+    """
+    blanked = strip_comments(
+        source,
+        language="go" if go else "typescript",
+        literals=True,
+        undecided_slash="regex" if undecided_slash == "regex" else "operator",
+    )
+    found = [
+        match
+        for match in re.finditer(pattern, blanked, re.MULTILINE)
+        if blanked.count("{", 0, match.start()) == blanked.count("}", 0, match.start())
+    ]
+    if not found:
+        return None
+    return _AMBIGUOUS if len(found) > 1 else found[0].group(1)
 
 
 def _arith(node: ast.expr) -> int:

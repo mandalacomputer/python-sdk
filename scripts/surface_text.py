@@ -211,6 +211,17 @@ def checked_slash_end(text: str, start: int) -> int:
     return end
 
 
+def _reads_as_regex(text: str, at: int, undecided: Literal["operator", "regex"]) -> bool:
+    """Whether to read the slash at ``at`` as opening a regex literal.
+
+    ``regex_can_start`` where it is confident, and the caller's policy for the
+    positions it is not — see ``strip_comments``.
+    """
+    if regex_can_start(text, at):
+        return True
+    return undecided == "regex" and regex_end(text, at) > at + 1
+
+
 def blank_inside(literal: str) -> str:
     """One quoted literal with its CONTENTS spaced out, delimiters and lines kept."""
     if len(literal) < 2:
@@ -223,6 +234,7 @@ def strip_comments(
     *,
     language: Literal["typescript", "go"] = "typescript",
     literals: bool = False,
+    undecided_slash: Literal["operator", "regex"] = "operator",
 ) -> str:
     """Blank out comments without touching comment markers inside literals.
 
@@ -238,6 +250,20 @@ def strip_comments(
     declaration being looked for — an example in a generated document, a snippet
     of a script — and a match inside one is a sentence, not a declaration. It is
     off by default because the readers that locate literal DATA need the data.
+
+    ``undecided_slash`` says what to do with a TypeScript slash whose role this
+    reader cannot decide — the ones `regex_can_start` answers ``False`` for that
+    are not obviously divisions either, a slash after a ``)`` above all, since a
+    control condition's closing parenthesis is exactly what precedes
+    ``if (ok) /re/.test(v)`` and also exactly what precedes ``(a + b) / 2``.
+    ``"operator"`` reads it as division and leaves the characters alone, which is
+    what this pass has always done; ``"regex"`` reads it as a regex literal and
+    skips its body. Neither answer is right in general, and that is the point of
+    the parameter: a caller that cannot afford to be wrong can read the file BOTH
+    ways and refuse when the two disagree, which is a cheaper guarantee than a
+    JavaScript parser and a stronger one than either reading alone. A regex
+    literal cannot span a line break, so under ``"regex"`` a real division is
+    skipped over at most as far as the end of its own line.
     """
     out: list[str] = []
     i = 0
@@ -264,20 +290,21 @@ def strip_comments(
             # Newlines kept so line numbers survive; everything else spaced out.
             out.append(re.sub(r"[^\r\n]", " ", text[i:stop]))
             i = stop
-        # The tolerant predicate, deliberately, and not `checked_slash_end`. This
-        # pass runs over EVERY upstream module a constant is read out of, and
-        # those are ordinary source rather than tables: `Date.now() / 1000` is in
-        # one of them today, and a slash after a `)` is exactly what
-        # `checked_slash_end` refuses to decide — so the strict reader would
-        # answer a legal division with a refusal and take the whole comparison
-        # down with it. `regex_can_start` cannot make the mistake in the other
-        # direction either: it opens a regex only where one can begin, never after
-        # a number, a name or a `)`. What it does leave is a regex that genuinely
-        # follows a `)` — unskipped, so a quote inside it lexes as a string. The
-        # callers that walk delimiters (`balanced`, `module_matches`) are strict
-        # for that reason; this one blanks comments, where the cost of the strict
-        # answer is higher than the cost of the gap.
-        elif language == "typescript" and ch == "/" and regex_can_start(text, i):
+        # Not `checked_slash_end`, which REFUSES an undecidable slash: this pass
+        # runs over ordinary modules rather than over literal tables, and a slash
+        # after a `)` — which it cannot decide — is `Date.now() / 1000` in one of
+        # them today, so the strict reader would answer legal arithmetic with a
+        # refusal and take the whole comparison down with it.
+        #
+        # `regex_can_start` is not a substitute for that strictness and is not
+        # claimed as one. It says "a regex COULD begin here", and a division can
+        # stand in some of the same places: after `++`, or after a member access
+        # whose property is a reserved word, it answers yes to what is really an
+        # operator (adversarial review, OPL-4805). It is a lexical guess, and both
+        # of its mistakes can move a literal's boundary. A caller that must not be
+        # wrong reads the file under both `undecided_slash` policies and refuses
+        # when they disagree; `constant` does exactly that.
+        elif language == "typescript" and ch == "/" and _reads_as_regex(text, i, undecided_slash):
             end = regex_end(text, i)
             out.append(text[i:end])
             i = end

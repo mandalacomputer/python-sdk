@@ -843,20 +843,68 @@ def test_two_declarations_of_one_name_are_refused_rather_than_ordered(
     check_surface: ModuleType, source: str, name: str, suffix: str
 ) -> None:
     """Position is not evidence. Picking the first is how it agrees with the wrong one."""
-    with pytest.raises(SystemExit, match="declared 2 times"):
+    with pytest.raises(SystemExit, match="declared more than once"):
         check_surface.constant(source, name, Path("fixture").with_suffix(suffix))
 
 
-def test_an_ordinary_division_in_a_constants_module_is_not_refused(
+def test_a_regex_this_reader_cannot_place_refuses_rather_than_picking_a_side(
     check_surface: ModuleType,
 ) -> None:
-    """The modules constants are read out of are source, not tables.
+    """The attack the blanking alone did not stop (adversarial review, OPL-4805).
 
-    A slash after a `)` is undecidable to the strict reader the table walkers use,
-    and `Date.now() / 1000` is exactly that shape — ordinary arithmetic, in a file
-    this has to get a constant out of. Blanking comments with the tolerant
-    predicate is what keeps a legal division from taking the comparison down; it
-    cannot read one as a regex, because a regex cannot begin after a value.
+    A regex literal after a `)` is a position this reader cannot decide, and a
+    backtick inside one moves a template's boundary: read as an operator, the real
+    declaration lands inside the "template" and is blanked, leaving the snippet as
+    the only declaration in the file. Both readings are taken and the disagreement
+    is the answer — the value this would otherwise have reported is the prose one.
     """
-    source = "const seconds = Date.now() / 1000;\nexport const SAMPLE_LIMIT = 36;\n"
+    source = (
+        'if (true) /`/.test("");\n'
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        'if (true) /`/.test("");\n'
+    )
+    with pytest.raises(SystemExit, match="undecidable slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_a_typed_go_declaration_is_not_invisible_to_a_local_of_the_same_name(
+    check_surface: ModuleType,
+) -> None:
+    """`const name int = 99` is still the declaration (adversarial review, OPL-4805).
+
+    A pattern blind to the type read the file as if the constant were declared
+    somewhere else, and a function-local of the same name was where it then found
+    it — so a local `36` answered for an exported `99`.
+    """
+    source = (
+        "package example\n"
+        "const sampleLimit int = 99\n\n"
+        "func f() {\n\tconst sampleLimit = 36\n\t_ = sampleLimit\n}\n"
+    )
+    assert check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go")) == 99
+
+
+def test_a_declaration_only_inside_a_function_is_not_the_platforms_constant(
+    check_surface: ModuleType,
+) -> None:
+    """Nothing mirrors a local, so finding one is finding nothing."""
+    source = "package example\nfunc f() {\n\tconst sampleLimit = 36\n}\n"
+    with pytest.raises(SystemExit, match="not found"):
+        check_surface.constant(source, "sampleLimit", Path("fixture").with_suffix(".go"))
+
+
+@pytest.mark.parametrize(
+    "division",
+    ["Date.now() / 1000", "x++ / 2", "obj.return / 2"],
+    ids=["after-a-call", "after-a-postfix", "after-a-reserved-property"],
+)
+def test_an_ordinary_division_still_does_not_refuse_a_constant(
+    check_surface: ModuleType, division: str
+) -> None:
+    """Three divisions the slash predicate places differently, none of which may cost
+    the comparison: the first it cannot decide, and the other two it reads as the
+    start of a regex. A regex cannot cross a line break, so neither reading moves a
+    boundary here, and the two policies agree."""
+    source = f"const value = {division};\nexport const SAMPLE_LIMIT = 36;\n"
     assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 36
