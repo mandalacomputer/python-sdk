@@ -56,9 +56,10 @@ from pathlib import Path
 from types import ModuleType
 
 from surface_text import (
-    balanced,
+    initializer_contents,
     literal_contents,
     literal_string,
+    module_matches,
     object_entries,
     split_items,
     strip_comments,
@@ -300,14 +301,13 @@ def table(source: str, name: str) -> set[tuple[str, str]]:
     """Read every route literal, or refuse a table this reader cannot compare."""
     try:
         source = strip_comments(source)
-        declaration = re.search(
-            rf"^\s*export\s+const\s+{re.escape(name)}\s*:\s*Route\[\]\s*=\s*\[",
+        declarations = module_matches(
             source,
-            re.MULTILINE,
+            rf"export\s+const\s+{re.escape(name)}\s*:\s*Route\[\]\s*=\s*\[",
         )
-        if declaration is None:
-            raise ValueError("declaration not found or unsupported")
-        body = balanced(source, declaration.end() - 1, "[", "]")
+        if len(declarations) != 1:
+            raise ValueError("declaration absent, ambiguous, or unsupported")
+        body = initializer_contents(source, declarations[0].end() - 1, "[", "]")
         routes = set()
         for entry in split_items(body):
             fields = object_entries(literal_contents(entry, "{", "}"))
@@ -328,15 +328,18 @@ def shared_query(source: str) -> dict[str, str]:
     arbitrary expressions are deliberately outside this reader's grammar.
     """
     found = {}
-    for match in re.finditer(
-        r"^\s*(?:export\s+)?const ([A-Za-z_$][\w$]*):\s*Query\s*=\s*\{",
+    for match in module_matches(
         source,
-        re.MULTILINE,
+        r"(?:export\s+)?const ([A-Za-z_$][\w$]*):\s*Query\s*=\s*\{",
     ):
-        fields = object_entries(balanced(source, match.end() - 1, "{", "}"))
-        if "name" not in fields:
-            raise ValueError("shared parameter entry has no name")
-        found[match.group(1)] = literal_string(fields["name"])
+        name = match.group(1)
+        try:
+            fields = object_entries(initializer_contents(source, match.end() - 1, "{", "}"))
+            if "name" not in fields or name in found:
+                raise ValueError("shared parameter entry has no name or an ambiguous declaration")
+            found[name] = literal_string(fields["name"])
+        except ValueError as err:
+            raise ValueError(f"shared parameter {name}: {err}") from None
     return found
 
 
@@ -361,14 +364,13 @@ def parameters(platform: Path) -> dict[str, set[str]]:
     try:
         source = strip_comments((platform / APIDOC).read_text())
         shared = shared_query(source)
-        declaration = re.search(
-            r"^\s*export\s+const\s+DOCS\s*:\s*Record<string,\s*Doc>\s*=\s*\{",
+        declarations = module_matches(
             source,
-            re.MULTILINE,
+            r"export\s+const\s+DOCS\s*:\s*Record<string,\s*Doc>\s*=\s*\{",
         )
-        if declaration is None:
-            raise ValueError("DOCS declaration not found or unsupported")
-        docs = object_entries(balanced(source, declaration.end() - 1, "{", "}"))
+        if len(declarations) != 1:
+            raise ValueError("DOCS declaration absent, ambiguous, or unsupported")
+        docs = object_entries(initializer_contents(source, declarations[0].end() - 1, "{", "}"))
         table: dict[str, set[str]] = {}
         for route, value in docs.items():
             if re.fullmatch(r"[A-Z]+ .+", route) is None:

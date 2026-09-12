@@ -416,3 +416,139 @@ def test_empty_lists_and_a_raw_body_schema_remain_valid(
         )
         == set()
     )
+
+
+@pytest.mark.parametrize("suffix", [".concat(OTHER_ROUTES)", "\n.concat(OTHER_ROUTES)"])
+def test_route_initializer_continuations_are_refused(
+    check_surface: ModuleType, suffix: str
+) -> None:
+    source = "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }]" + suffix + ";"
+    with pytest.raises(SystemExit, match="cannot read ROUTES"):
+        check_surface.table(source, "ROUTES")
+
+
+@pytest.mark.parametrize("kind", ["docs", "shared"])
+def test_parameter_initializer_continuations_are_refused(
+    check_surface: ModuleType, tmp_path: Path, kind: str
+) -> None:
+    shared = "const SHARED: Query = { name: 'known' }"
+    docs = "export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } }"
+    source = shared + (" && OTHER_ENTRY" if kind == "shared" else "") + ";\n"
+    source += docs + (" && OTHER_DOCS" if kind == "docs" else "") + ";"
+    with pytest.raises(SystemExit, match="cannot read DOCS"):
+        scan(check_surface, tmp_path, source)
+
+
+def test_a_template_string_cannot_supply_the_route_declaration(check_surface: ModuleType) -> None:
+    source = """const example = `
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'retired' }];
+    `;
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    """
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+def test_a_template_string_cannot_supply_parameter_declarations(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    found = scan(
+        check_surface,
+        tmp_path,
+        """const example = `
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [] } };
+        `;
+        const SHARED: Query = { name: 'known' };
+        const another = `
+        const SHARED: Query = { name: 'retired' };
+        `;
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+        """,
+    )
+    assert found == {"query:known"}
+
+
+def test_a_function_local_parameter_does_not_replace_the_module_entry(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    found = scan(
+        check_surface,
+        tmp_path,
+        """const SHARED: Query = { name: 'known' };
+        function example() {
+          const SHARED: Query = { name: 'retired' };
+          return SHARED;
+        }
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+        """,
+    )
+    assert found == {"query:known"}
+
+
+def test_nested_template_interpolations_cannot_supply_declarations(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    source = """const example = `outer ${(() => {
+      const SHARED: Query = { name: 'local' };
+      return `inner ${`deep
+        export const ROUTES: Route[] = [{ method: 'POST', pattern: 'retired' }];
+        export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [] } };
+      `}`;
+    })()}
+    const SHARED: Query = { name: 'quoted' };
+    `;
+    const SHARED: Query = { name: 'known' };
+    export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];
+    export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+    """
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+    assert scan(check_surface, tmp_path, source) == {"query:known"}
+
+
+@pytest.mark.parametrize("kind", ["docs", "shared"])
+def test_a_declaration_available_only_in_a_template_is_refused(
+    check_surface: ModuleType, tmp_path: Path, kind: str
+) -> None:
+    shared = "const SHARED: Query = { name: 'known' };"
+    docs = "export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };"
+    source = (
+        shared + "\nconst example = `\n" + docs + "\n`;"
+        if kind == "docs"
+        else "const example = `\n" + shared + "\n`;\n" + docs
+    )
+    with pytest.raises(SystemExit, match="cannot read"):
+        scan(check_surface, tmp_path, source)
+
+
+def test_a_local_entry_without_a_module_declaration_is_unresolved(
+    check_surface: ModuleType, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit, match="unresolved parameter entry"):
+        scan(
+            check_surface,
+            tmp_path,
+            """function example() {
+              const SHARED: Query = { name: 'local' };
+            }
+            export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [SHARED] } };
+            """,
+        )
+
+
+def test_duplicate_module_declarations_are_ambiguous(check_surface: ModuleType) -> None:
+    source = "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }];\n"
+    with pytest.raises(SystemExit, match="ambiguous"):
+        check_surface.table(source + source, "ROUTES")
+
+
+def test_a_literal_declaration_may_end_at_eof(check_surface: ModuleType, tmp_path: Path) -> None:
+    assert check_surface.table(
+        "export const ROUTES: Route[] = [{ method: 'GET', pattern: 'widgets' }]", "ROUTES"
+    ) == {("GET", "widgets")}
+    assert (
+        scan(
+            check_surface,
+            tmp_path,
+            "export const DOCS: Record<string, Doc> = { 'GET sizes': { query: [] } }",
+        )
+        == set()
+    )

@@ -7,10 +7,10 @@ this much care because both files are heavily commented and several of those
 comments *quote the shapes being matched*. Over a raw file, the patterns in
 ``check_surface`` invent routes and parameters out of prose.
 
-A direct port of the TypeScript SDK's ``scripts/surface-text.mjs``, function for
-function. The two scripts read the same files and should not disagree about what
-is in them: a parameter one of them cannot see is a gap the other reports alone,
-which is a worse failure than neither seeing it.
+This bounded reader handles literal inventories and the lexical boundaries
+needed to locate them. A declaration it cannot read is refused explicitly,
+so an unsupported expression cannot silently become a missing route or an
+empty parameter inventory.
 """
 
 from __future__ import annotations
@@ -31,6 +31,12 @@ def quoted_end(text: str, start: int) -> int:
     while i < len(text):
         if text[i] == "\\":
             i += 2
+            continue
+        if quote == "`" and text[i : i + 2] == "${":
+            # Interpolations may contain strings or nested templates of their
+            # own. Their quotes cannot terminate the surrounding template.
+            contents = balanced(text, i + 1, "{", "}")
+            i += len(contents) + 3
             continue
         if text[i] == quote:
             return i + 1
@@ -146,6 +152,58 @@ def balanced(text: str, start: int, open_ch: str, close_ch: str) -> str:
                 return text[start + 1 : i]
         i += 1
     raise ValueError(f"unbalanced {open_ch} from offset {start}")
+
+
+def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
+    """Find declarations only in module code, outside literals and nested scopes.
+
+    The source must already be comment-blanked. This is a lexical boundary
+    check, not expression evaluation; unsupported declarations remain absent
+    and their callers refuse an inventory they cannot establish.
+    """
+    expression = re.compile(pattern)
+    matches: list[re.Match[str]] = []
+    stack: list[str] = []
+    i = 0
+    while i < len(source):
+        ch = source[i]
+        if ch in "'\"`":
+            i = quoted_end(source, i)
+            continue
+        if ch == "/" and regex_can_start(source, i):
+            i = regex_end(source, i)
+            continue
+        if not stack and (i == 0 or not _IDENT_CHAR.match(source[i - 1])):
+            match = expression.match(source, i)
+            if match:
+                matches.append(match)
+                # Patterns end at the initializer's opening delimiter. Process
+                # it below so its contents are nested, while
+                # avoiding a second match at an exported declaration's const.
+                i = match.end() - 1
+                ch = source[i]
+        if ch in "{[(":
+            stack.append(ch)
+        elif ch in "}])" and (not stack or stack.pop() != {"}": "{", "]": "[", ")": "("}[ch]):
+            raise ValueError(f"unbalanced {ch} at offset {i}")
+        i += 1
+    if stack:
+        raise ValueError("unbalanced module scope")
+    return matches
+
+
+def initializer_contents(source: str, start: int, opening: str, closing: str) -> str:
+    """Read a literal initializer only when its declaration ends there.
+
+    A semicolon or end of input supplies an unambiguous boundary. Other
+    continuations, including expressions after a newline, require a reader
+    update; a balanced literal alone says nothing about the final value.
+    """
+    body = balanced(source, start, opening, closing)
+    remainder = source[start + len(body) + 2 :].lstrip()
+    if remainder and not remainder.startswith(";"):
+        raise ValueError("unsupported initializer continuation; expected semicolon or end of input")
+    return body
 
 
 def top_level_value_at(body: str, name: str) -> int:
