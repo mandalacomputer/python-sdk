@@ -577,6 +577,28 @@ def test_a_reason_this_version_has_never_heard_of_falls_back_to_the_type() -> No
         assert mc.is_transient(err) is True, reason
 
 
+def test_revoked_is_permanent_by_the_word_rather_than_by_luck() -> None:
+    """The platform's fifth word, about the caller rather than about a computer.
+
+    ``revoked`` means the authority this request arrived with no longer holds
+    (OPL-4801). A 401 and a 403 are none of the four transient classes, so an
+    unrecognised word already answered ``False`` — which is why naming it matters
+    rather than being urgent: answering by accident leaves a future status for this
+    refusal, or a new transient class, free to make a permission failure look
+    replayable.
+
+    The 409 is the case that proves the WORD is answering: a
+    :class:`ConflictError` is transient by class, so without ``revoked`` named it
+    says "send it again" to a caller whose authority has gone.
+    """
+    for status in (401, 403):
+        err = mc.APIError("unauthorized", status=status, body={"reason": "revoked"})
+        assert err.reason == "revoked"
+        assert mc.is_transient(err) is False, status
+    conflict = mc.ConflictError("unauthorized", status=409, body={"reason": "revoked"})
+    assert mc.is_transient(conflict) is False
+
+
 def test_a_body_with_no_usable_reason_leaves_the_answer_where_it_was() -> None:
     """Absent, malformed and non-dict bodies are all "no answer given"."""
     for body in (None, {}, {"error": "refused"}, {"reason": 7}, {"reason": None}, "html"):
