@@ -551,6 +551,15 @@ def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> s
         language="go" if go else "typescript",
         literals=True,
         undecided_slash="regex" if undecided_slash == "regex" else "operator",
+        # Refused here rather than read under each policy and compared. The policies
+        # are chosen for the whole FILE, so two undecidable slashes whose real roles
+        # differ are both read wrongly under either one — and two wrong readings that
+        # land on the same number reach :func:`constant` as agreement. A file with a
+        # `for (const x of ++ /re/…)` and an `of++ /` did exactly that: 36 out of a
+        # template under both policies, over a module whose own constant was 99
+        # (adversarial review, round 4). Agreement between two file-wide readings is
+        # not evidence, so the shape that can manufacture it is refused instead.
+        undecided_update="refuse",
     )
     depth = 0
     floor = 0

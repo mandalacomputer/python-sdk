@@ -936,15 +936,14 @@ def test_an_update_of_a_contextual_word_is_refused_by_the_strict_reader(
         check_surface.table(source, "ROUTES")
 
 
-def test_an_update_of_a_contextual_word_makes_the_two_policies_disagree(
-    check_surface: ModuleType,
-) -> None:
-    """The lenient reader cannot refuse, so it hands the shape to the policy instead.
+def test_a_constant_refuses_an_update_it_cannot_place(check_surface: ModuleType) -> None:
+    """The constant reader refuses this shape rather than reading the file both ways.
 
-    `regex_can_start` would answer from the `+` before the slash and give both
-    policies the same guess — the agreement of two readings that is worth nothing.
-    Put to the policy, they disagree, and the reader that reads a file both ways
-    refuses a constant it can only reach by choosing one.
+    Putting it to the two policies was not enough. They are chosen for the whole
+    FILE, so where two undecidable slashes have opposite real roles each policy gets
+    one of them wrong — and the fixture below made both wrong readings land on the
+    same number, which the comparison then took for agreement (adversarial review,
+    round 4).
     """
     source = (
         "let of = 2;\n"
@@ -953,7 +952,36 @@ def test_an_update_of_a_contextual_word_makes_the_two_policies_disagree(
         "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
         "const m = of++ /`/.lastIndex;\n"
     )
-    with pytest.raises(SystemExit, match="depends on how an undecidable slash"):
+    with pytest.raises(ValueError, match="unreadable update before a slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_two_policies_agreeing_on_one_wrong_number_is_not_a_reading(
+    check_surface: ModuleType,
+) -> None:
+    """Agreement between two file-wide readings is not evidence, and here it was not.
+
+    This file holds two undecidable updates whose real roles are opposite: the
+    `for (const x of ++ /re/…)` heads are PREFIX updates, so their slashes open
+    regexes, and `of++ /` is a postfix update, so its slash divides. No single
+    file-wide policy gets both right, and the two wrong readings both left the
+    template's `36` standing as module code while blanking the module's own `99`.
+    The comparison saw one number twice and accepted it, over source Node runs and
+    reports 99 for — the fail-open the both-ways reading was introduced to close,
+    arriving through the both-ways reading (adversarial review, round 4).
+    """
+    source = (
+        "let of = 2;\n"
+        "for (const x of ++ /`/.lastIndex ? [] : []) {}\n"
+        "const ratio = of++ / ` / 2;\n"
+        "export const SAMPLE_LIMIT = 36;\n"
+        "`;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\n"
+        "const tail = of++ / ` + 1; const z = 4 / 5;\n"
+        "for (const x of ++ /`/.lastIndex ? [] : []) {}\n"
+    )
+    with pytest.raises(ValueError, match="unreadable update before a slash at line 2"):
         check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
 
 

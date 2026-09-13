@@ -439,7 +439,11 @@ def certain_operator(before: str) -> bool:
 
 
 def _reads_as_regex(
-    before: str, text: str, at: int, undecided: Literal["operator", "regex"]
+    before: str,
+    text: str,
+    at: int,
+    undecided: Literal["operator", "regex"],
+    undecided_update: Literal["policy", "refuse"] = "policy",
 ) -> bool:
     """Whether to read the slash at ``at`` as opening a regex literal.
 
@@ -447,13 +451,15 @@ def _reads_as_regex(
     the caller's policy for the positions nothing here can decide — see
     ``strip_comments``. ``before`` is the comment-blanked text up to the slash.
 
-    An update whose operand is a contextual word goes straight to that policy rather
-    than to ``regex_can_start``, which would answer from the ``+`` before the slash
-    and give both policies the same guess. Put to the policy, the two readings
-    disagree, and a caller that reads the file both ways refuses instead of picking
-    one (adversarial review, rounds 2 and 3 — each required one of the readings).
+    An update whose operand is a contextual word is not put to ``regex_can_start``,
+    which would answer from the ``+`` before the slash and give both policies the
+    same guess. ``undecided_update`` says what to do with it instead: ``"refuse"``
+    raises, and ``"policy"`` hands it to ``undecided`` like any other slash this
+    reader cannot place.
     """
     if postfix_role(before) == "undecided":
+        if undecided_update == "refuse":
+            raise ValueError(f"unreadable update before a slash at {position(text, at)}")
         return undecided == "regex" and regex_end(text, at) > at + 1
     if certain_operator(before):
         return False
@@ -480,6 +486,7 @@ def strip_comments(
     language: Literal["typescript", "go"] = "typescript",
     literals: bool = False,
     undecided_slash: Literal["operator", "regex"] = "operator",
+    undecided_update: Literal["policy", "refuse"] = "policy",
 ) -> str:
     """Blank out comments without touching comment markers inside literals.
 
@@ -509,6 +516,18 @@ def strip_comments(
     JavaScript parser and a stronger one than either reading alone. A regex
     literal cannot span a line break, so under ``"regex"`` a real division is
     skipped over at most as far as the end of its own line.
+
+    That both-ways guarantee is weaker than it sounds, and ``undecided_update`` is
+    where this file stops leaning on it. The two readings are chosen FILE-WIDE, so a
+    file with two undecidable slashes of OPPOSITE real roles gets a wrong answer
+    from each policy — and two wrong readings can land on the same value, which the
+    comparison then reads as agreement. A `for (const x of ++ /re/…)` and an `of++ /`
+    in one file did exactly that: both policies returned a number out of a template
+    and the caller accepted it (adversarial review, round 4). ``"refuse"`` makes this
+    pass raise on a contextual update instead of reading it either way, so the caller
+    never has to tell a real agreement from a manufactured one. It is the setting for
+    a reader whose answer is a comparison; ``"policy"`` keeps the behaviour for the
+    passes whose own second stage — the strict reader — refuses the same slash.
     """
     out: list[str] = []
     # The tail of what has been written, bounded: every lookback here is a few
@@ -570,7 +589,7 @@ def strip_comments(
         elif (
             language == "typescript"
             and ch == "/"
-            and _reads_as_regex(tail, text, i, undecided_slash)
+            and _reads_as_regex(tail, text, i, undecided_slash, undecided_update)
         ):
             end = regex_end(text, i)
             # A regex body is a literal like any other, and one that is left
