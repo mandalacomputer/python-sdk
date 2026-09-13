@@ -53,6 +53,9 @@ def _platform_with(
     """A recognized synthetic checkout holding ``manifest`` — or, for ``None``, no manifest."""
     platform = tmp_path / "platform"
     platform.mkdir(parents=True, exist_ok=True)
+    for marker in check_surface.PLATFORM_MARKERS:
+        (platform / marker).parent.mkdir(parents=True, exist_ok=True)
+        (platform / marker).write_text("// synthesized platform source\n")
     if manifest is not None:
         text = manifest if isinstance(manifest, str) else json.dumps(manifest)
         (platform / check_surface.MANIFEST).write_text(text)
@@ -201,6 +204,80 @@ def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
 
     monkeypatch.setenv("GIT_DIR", str(other / ".git"))
     assert check_surface.remotes(platform) == frozenset({check_surface.PLATFORM_REMOTE})
+
+
+def test_an_export_recognized_by_its_files_but_lacking_the_manifest_fails(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Identity is not the manifest: a copy that lost it must fail, not skip.
+
+    With the manifest as the only marker, a sibling export that predated or lost
+    it was "not the platform", and the automatic search skipped at exit 0 — the
+    silent path this check exists to refuse (review of OPL-4837).
+    """
+    monkeypatch.delenv("MANDALA_PLATFORM_REPO", raising=False)
+    sibling = _platform_with(check_surface, tmp_path / "next-door", None)
+    monkeypatch.setattr(check_surface, "REPO", sibling.parent / "sdk")
+    monkeypatch.setattr(check_surface, "SIBLINGS", (sibling.name,))
+
+    assert check_surface.platform_repo() == sibling
+    assert check_surface.main() == 1
+    out = capsys.readouterr().out
+    assert str(sibling / check_surface.MANIFEST) in out
+    assert "skipping" not in out
+
+
+def test_a_key_that_appears_twice_is_refused_rather_than_read_last(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``json.loads`` keeps the last of two equal keys; this must not (review of OPL-4837)."""
+    manifest = json.dumps(_manifest_of(check_surface))
+    twice_limits = manifest.replace('"limits": {', '"limits": {"exec.maxTimeoutSeconds": 601, ', 1)
+    assert twice_limits != manifest
+    # A route the real table already carries, so the second entry is a repeat and
+    # not an addition the diff would report for a different reason.
+    twice_route = manifest.replace(
+        '"parameters": {', '"parameters": {"DELETE computers/:id": ["query:new_required"], ', 1
+    )
+    for text in (twice_limits, twice_route):
+        platform = _platform_with(check_surface, tmp_path, text)
+        monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+        assert check_surface.main() == 1
+        out = capsys.readouterr().out
+        assert "appears twice" in out
+        assert "in step" not in out
+
+
+def test_constants_are_read_from_this_checkout_and_not_the_installed_sdk(
+    check_surface: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A constant changed only on the branch under review must be the one compared.
+
+    A bare import answered with whatever SDK the interpreter had installed — on a
+    laptop, a sibling checkout — so the branch's own value was never looked at
+    (review of OPL-4837).
+    """
+    import types
+
+    fake = types.ModuleType("mandala_computer._api")
+    fake.MAX_STEPS = -1  # type: ignore[attr-defined]
+    fake.__file__ = "/elsewhere/mandala_computer/_api.py"
+    monkeypatch.setitem(sys.modules, "mandala_computer._api", fake)
+    api = check_surface._sdk_api()
+    assert Path(api.__file__).resolve().is_relative_to(check_surface.REPO / "src")
+    assert api.MAX_STEPS > 0
+    # And the interpreter's own module table is as it was.
+    assert sys.modules["mandala_computer._api"] is fake
+
+    monkeypatch.setattr(check_surface, "REPO", Path("/nowhere/at/all"))
+    with pytest.raises(check_surface.ManifestError, match="not this checkout"):
+        check_surface._sdk_api()
 
 
 def test_a_manifest_in_step_with_the_mirror_says_so_with_the_counts(
@@ -375,7 +452,7 @@ def test_a_variable_pointing_at_no_checkout_fails_instead_of_looking_elsewhere(
         check_surface.platform_repo()
     message = str(exit_info.value)
     assert str(absent) in message
-    assert str(check_surface.MANIFEST) in message
+    assert all(str(marker) in message for marker in check_surface.PLATFORM_MARKERS)
     assert str(sibling) not in message
 
 

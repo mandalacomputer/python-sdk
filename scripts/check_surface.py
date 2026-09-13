@@ -127,12 +127,16 @@ def git_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
 
 
-#: The file that identifies a platform checkout git cannot vouch for — an export,
+#: The files that identify a platform checkout git cannot vouch for — an export,
 #: a vendored copy, a clone whose remote was removed. A fallback rather than the
-#: primary test: it is contents, and contents are what goes missing when the
-#: mirror drifts. :func:`read_manifest` separately says whether a recognized
-#: checkout holds a manifest this can compare against.
-PLATFORM_MARKERS = (MANIFEST,)
+#: primary test: they are contents, and contents are what goes missing when the
+#: mirror drifts. Named for identity only and never read: the MANIFEST is
+#: deliberately not among them, because a checkout recognized by the very file
+#: the comparison needs is one that "is not the platform" the moment that file
+#: is missing — an export that predates or lost the manifest then skipped at
+#: exit 0 instead of failing (review of OPL-4837). :func:`read_manifest`
+#: separately says whether a recognized checkout holds one.
+PLATFORM_MARKERS = (Path("web/lib/surface.ts"), Path("web/lib/apidoc.ts"))
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
@@ -269,6 +273,22 @@ class ManifestError(Exception):
     """A manifest this cannot compare against, and why — never an empty answer."""
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """An object with each key once, or a refusal naming the key that repeats.
+
+    ``json.loads`` keeps the LAST of two equal keys and says nothing, so a
+    manifest carrying a route's parameters twice, or a limit twice, compared
+    against whichever came second and silently ignored the other (review of
+    OPL-4837). Two answers to one question is a manifest this cannot read.
+    """
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"the key {key!r} appears twice in one object")
+        seen[key] = value
+    return seen
+
+
 def read_manifest(platform: Path) -> dict[str, object]:
     """The platform's surface manifest, checked to the shape this compares.
 
@@ -283,7 +303,7 @@ def read_manifest(platform: Path) -> dict[str, object]:
     if not path.is_file():
         raise ManifestError(f"{path} is not there — the checkout predates the manifest, or lost it")
     try:
-        manifest = json.loads(path.read_text())
+        manifest = json.loads(path.read_text(), object_pairs_hook=_no_duplicate_keys)
     except (OSError, ValueError) as error:
         raise ManifestError(f"{path} cannot be read: {error}") from error
     if not isinstance(manifest, dict):
@@ -348,9 +368,45 @@ def parameters(manifest: dict[str, object]) -> dict[str, set[str]]:
     return {route: set(listed.get(route, [])) for route in found}
 
 
+def _sdk_api() -> ModuleType:
+    """This checkout's ``mandala_computer._api``, and provably this checkout's.
+
+    A bare ``import`` answers with whatever SDK is installed in the interpreter,
+    which on a laptop is usually a sibling checkout — so a constant changed only
+    on the branch under review compared as unchanged, because the installed copy
+    still matched upstream (review of OPL-4837). ``src`` goes first on the path,
+    any already-imported copy is set aside, and the module that arrives has to
+    come from under this repository or the comparison refuses to use it.
+    """
+    src = REPO / "src"
+    path = str(src)
+    aside = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name.split(".")[0] == "mandala_computer"
+    }
+    sys.path.insert(0, path)
+    try:
+        import importlib
+
+        api = importlib.import_module("mandala_computer._api")
+    finally:
+        if sys.path and sys.path[0] == path:
+            sys.path.pop(0)
+        for name in [n for n in sys.modules if n.split(".")[0] == "mandala_computer"]:
+            del sys.modules[name]
+        sys.modules.update(aside)
+    origin = Path(api.__file__ or "").resolve()
+    if src.resolve() not in origin.parents:
+        raise ManifestError(
+            f"the SDK constants were read from {origin}, which is not this checkout"
+        )
+    return api
+
+
 def constant_drift(manifest: dict[str, object]) -> list[str]:
     """Every mirrored constant whose value is not the manifest's limit."""
-    from mandala_computer import _api
+    _api = _sdk_api()
 
     limits = manifest["limits"]
     assert isinstance(limits, dict)
