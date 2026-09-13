@@ -51,7 +51,7 @@ class MandalaError(Exception):
 
 
 #: The words the platform will put in a refusal's ``reason`` (OPL-3898, and
-#: split by what a retry loop should do about each. ``error`` beside it stays a
+#: OPL-4801 for the fifth), split by what a retry loop should do about each. ``error`` beside it stays a
 #: sentence for a person and stays free to be reworded; this is the part a
 #: program is allowed to depend on.
 #:
