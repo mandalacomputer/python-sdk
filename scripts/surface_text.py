@@ -71,12 +71,75 @@ _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
 #: `typeof ++` — is a PREFIX update of a regex property, which read as a division
 #: walked into the regex and reported a route table out of its body (adversarial
 #: review, OPL-4824). A word reached through a `.` is a property and assignable
-#: whatever it is spelled, so `obj.return++ / 2` stays the division it is.
-_POSTFIX_OPERAND = re.compile(r"(\.?)([A-Za-z_$][\w$]*|[\w$\]])[ \t]*(?:\+\+|--)\s*\Z")
-#: Words that cannot be assigned to, so a `++` after one updates whatever follows it
-#: instead. The five reserved words that are values but not targets are here and not
-#: in `_NOT_A_VALUE`, because `this / 2` divides and `this ++ /re/` does not.
-_NOT_ASSIGNABLE = frozenset({"this", "super", "true", "false", "null"})
+#: whatever it is spelled, so `obj.return++ / 2` stays the division it is — but the
+#: dot has to be a member access and not the last of a `...`, which exempted
+#: `fn(...typeof ++ /re/.lastIndex)` and reopened exactly that hole (adversarial
+#: review, round 2). The name is matched whole, from a position no identifier
+#: character precedes, so a reserved word that is the TAIL of a longer name — the
+#: `void` in `évoid`, whose first letter this pattern's ASCII class does not cover —
+#: cannot answer for it.
+_POSTFIX_OPERAND = re.compile(
+    r"((?<!\.)\.\s*)?(?:(?<![\w$])([A-Za-z_$][\w$]*)|([\w$\]]))[ \t]*(?:\+\+|--)\s*\Z"
+)
+#: Words a `++` cannot update, so one after any of them is a PREFIX update of what
+#: follows and the slash after it opens a regex. Every reserved word of the language
+#: plus the ones a module reserves, and NOT the contextual words `_NOT_A_VALUE`
+#: also lists: `async`, `type`, `of` and their kind are legal variable names, and
+#: rejecting `async++ / 2` cost the division and read the regex it is not
+#: (adversarial review, round 2). This list decides a slash rather than refusing it,
+#: so it is the enumerable set it claims to be — the reserved words — and not a
+#: superset chosen for caution: a word wrongly in it loses a legal division, and a
+#: word wrongly out of it reads a prefix update as one.
+_NOT_ASSIGNABLE = frozenset(
+    {
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    }
+)
 #: The same three operands as `_MEMBER_OPERAND` and `_DIVISION_OPERAND`, allowing a
 #: LINE BREAK between the value and the slash. Their own tails stop at a space or a
 #: tab on purpose, because `checked_slash_end` may be handed raw source, where
@@ -321,9 +384,11 @@ def certain_operator(before: str) -> bool:
     if _MEMBER_OPERAND_LINES.search(before):
         return True
     postfix = _POSTFIX_OPERAND.search(before)
+    # A member access, a `]` or any other single character the pattern allows is an
+    # assignable operand whatever it is spelled; a bare WORD is one unless the
+    # language reserves it, in which case the `++` updates what follows instead.
     if postfix and (
-        postfix.group(1) == "."
-        or (postfix.group(2) not in _NOT_A_VALUE and postfix.group(2) not in _NOT_ASSIGNABLE)
+        postfix.group(1) or postfix.group(3) or postfix.group(2) not in _NOT_ASSIGNABLE
     ):
         return True
     operand = _DIVISION_OPERAND_LINES.search(before)

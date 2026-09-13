@@ -857,6 +857,79 @@ def test_a_line_split_value_in_raw_source_is_refused_rather_than_read(
         check_surface.table(source, "ROUTES")
 
 
+def _prefix_update_of_a_regex(operand: str) -> str:
+    """A file whose real route table is the one OUTSIDE the regex `operand ++` opens.
+
+    A route table spelled inside the regex body, so a reader that takes the slash
+    for a division reports ``fake`` or refuses two declarations, and one that reads
+    the regex literal it is reports the real table below. Asserting the table rather
+    than a refusal is deliberate: a refusal message is also what an unrelated reader
+    failure produces, so it does not distinguish this from that (adversarial review,
+    round 2).
+    """
+    return (
+        f"const n = {operand} ++ /a; "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; z/.lastIndex;\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];\n"
+    )
+
+
+def test_a_spread_token_is_not_a_member_access_that_exempts_a_keyword(
+    check_surface: ModuleType,
+) -> None:
+    """The property exemption is for a member access, and `...` is not one.
+
+    `fn(...typeof ++ /re/.lastIndex)` is legal, and the last dot of the spread made
+    `typeof` look like a property — which exempted it, read the slash as a division
+    and walked into the regex, reopening the hole the commit before this one closed
+    (adversarial review, round 2).
+    """
+    source = (
+        "const n = fn(...typeof ++ /a); "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; fn(z/.lastIndex);\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];\n"
+    )
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize(
+    ("prelude", "value"),
+    [
+        ("let async = 2;\n", "async++"),
+        ("const obj = {return: 1};\n", "obj.return++"),
+        ("let x = 2;\n", "x++"),
+    ],
+    ids=["contextual-name", "reserved-property", "plain-name"],
+)
+def test_an_assignable_operand_still_divides_however_it_is_spelled(
+    check_surface: ModuleType, prelude: str, value: str
+) -> None:
+    """Narrowing the postfix test may not cost the updates that are postfix.
+
+    `async`, `type`, `of` and their kind are legal variable names, however many
+    keyword positions they also have, so `async++ / 2` divides. Refusing it sent the
+    slash on to the predicate that sees only the `+` before it, which answered
+    "regex" — a legal division silently reading a literal, which is the failure this
+    ticket is about, arriving from the fix for it (adversarial review, round 2).
+    """
+    assert check_surface.table(_line_split_division(prelude, value), "ROUTES") == {
+        ("GET", "widgets")
+    }
+
+
+def test_a_reserved_word_is_not_read_out_of_a_longer_name(check_surface: ModuleType) -> None:
+    """`évoid++` is a postfix update of a name, not a prefix update after `void`.
+
+    The name is matched whole from a position no identifier character precedes, so a
+    reserved word that happens to end one cannot answer for it — including where the
+    name begins with a character this pattern's ASCII class does not cover, which is
+    how the `void` in `évoid` came to decide the slash (adversarial review, round 2).
+    """
+    surface_text = sys.modules["surface_text"]
+    assert surface_text.certain_operator("const ratio = évoid++ ")
+    assert not surface_text.certain_operator("const ratio = void ++ ")
+
+
 @pytest.mark.parametrize("prefix", ["void", "typeof", "await", "this", "true"])
 def test_a_prefix_update_after_a_word_is_not_a_postfix_value(
     check_surface: ModuleType, prefix: str
@@ -867,17 +940,10 @@ def test_a_prefix_update_after_a_word_is_not_a_postfix_value(
     read the final letter of `void` as the value in front of the `++` — so the slash
     came back a division, the reader walked into the regex, and the route table
     inside its body was reported as the platform's (adversarial review, OPL-4824).
-    Two kinds of word cannot be the target: the ones that are not values at all, and
-    `this`, `super`, `true`, `false` and `null`, which are values and still not
-    assignable.
+    What cannot be the target is a reserved word — every one of them, `this`, `true`
+    and `null` included, and none of the contextual words that are legal names.
     """
-    source = (
-        f"const n = {prefix} ++ /a; "
-        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; z/.lastIndex;\n"
-        "export const ROUTES: Route[] = buildRoutes();\n"
-    )
-    with pytest.raises(SystemExit, match="cannot read ROUTES"):
-        check_surface.table(source, "ROUTES")
+    assert check_surface.table(_prefix_update_of_a_regex(prefix), "ROUTES") == {("GET", "widgets")}
 
 
 def test_a_real_postfix_update_is_still_the_division_it_is(check_surface: ModuleType) -> None:
