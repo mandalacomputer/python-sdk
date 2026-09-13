@@ -377,27 +377,37 @@ def _sdk_api() -> ModuleType:
     still matched upstream (review of OPL-4837). ``src`` goes first on the path,
     any already-imported copy is set aside, and the module that arrives has to
     come from under this repository or the comparison refuses to use it.
+
+    Resolved, and required to stay INSIDE this repository once it is: a ``src``
+    that is a symlink into a sibling checkout resolves there, and so does every
+    module imported through it, so comparing the two resolved paths to each other
+    accepted the sibling's constants. And the whole path is restored, not only
+    the entry this put first: an importer that prepends a path of its own and
+    then raises would otherwise leave both behind (second review).
     """
     src = REPO / "src"
-    path = str(src)
+    root = REPO.resolve()
+    resolved = src.resolve()
+    if root not in resolved.parents:
+        raise ManifestError(f"{src} resolves to {resolved}, which is outside this checkout")
     aside = {
         name: sys.modules.pop(name)
         for name in list(sys.modules)
         if name.split(".")[0] == "mandala_computer"
     }
-    sys.path.insert(0, path)
+    before = list(sys.path)
+    sys.path.insert(0, str(src))
     try:
         import importlib
 
         api = importlib.import_module("mandala_computer._api")
     finally:
-        if sys.path and sys.path[0] == path:
-            sys.path.pop(0)
+        sys.path[:] = before
         for name in [n for n in sys.modules if n.split(".")[0] == "mandala_computer"]:
             del sys.modules[name]
         sys.modules.update(aside)
     origin = Path(api.__file__ or "").resolve()
-    if src.resolve() not in origin.parents:
+    if resolved not in origin.parents:
         raise ManifestError(
             f"the SDK constants were read from {origin}, which is not this checkout"
         )

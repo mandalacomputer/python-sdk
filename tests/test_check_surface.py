@@ -28,6 +28,10 @@ def check_surface(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return check_surface
 
 
+#: The files that make a directory the platform to a copy git cannot vouch for.
+IDENTITY = (Path("web/lib/surface.ts"), Path("web/lib/apidoc.ts"))
+
+
 def _manifest_of(check_surface: ModuleType) -> dict[str, object]:
     """A manifest exactly in step with this repository's own mirror.
 
@@ -53,9 +57,16 @@ def _platform_with(
     """A recognized synthetic checkout holding ``manifest`` — or, for ``None``, no manifest."""
     platform = tmp_path / "platform"
     platform.mkdir(parents=True, exist_ok=True)
-    for marker in check_surface.PLATFORM_MARKERS:
+    # Spelled here rather than read off the implementation: a fixture that wrote
+    # whatever PLATFORM_MARKERS named would, on a version where the manifest WAS
+    # the marker, write a manifest for the very test that asserts there is none
+    # (second review).
+    for marker in IDENTITY:
         (platform / marker).parent.mkdir(parents=True, exist_ok=True)
         (platform / marker).write_text("// synthesized platform source\n")
+    # A test may build the platform twice in one directory; whatever the earlier
+    # build wrote is not this call's manifest.
+    (platform / check_surface.MANIFEST).unlink(missing_ok=True)
     if manifest is not None:
         text = manifest if isinstance(manifest, str) else json.dumps(manifest)
         (platform / check_surface.MANIFEST).write_text(text)
@@ -276,8 +287,55 @@ def test_constants_are_read_from_this_checkout_and_not_the_installed_sdk(
     assert sys.modules["mandala_computer._api"] is fake
 
     monkeypatch.setattr(check_surface, "REPO", Path("/nowhere/at/all"))
-    with pytest.raises(check_surface.ManifestError, match="not this checkout"):
+    with pytest.raises(check_surface.ManifestError, match="this checkout"):
         check_surface._sdk_api()
+
+
+def test_the_installed_sdk_does_not_answer_for_this_checkouts_constants(
+    check_surface: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the comparison itself: a wrong installed copy, a right checkout, no drift."""
+    import types
+
+    # Built first: the fixture reads the real constants, and must not meet the fake.
+    manifest = _manifest_of(check_surface)
+    fake = types.ModuleType("mandala_computer._api")
+    fake.MAX_STEPS = -1  # type: ignore[attr-defined]
+    fake.__file__ = "/elsewhere/mandala_computer/_api.py"
+    monkeypatch.setitem(sys.modules, "mandala_computer", types.ModuleType("mandala_computer"))
+    monkeypatch.setitem(sys.modules, "mandala_computer._api", fake)
+    assert check_surface.constant_drift(manifest) == []
+
+
+def test_a_src_that_is_a_symlink_elsewhere_is_refused(
+    check_surface: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolving both sides to the same foreign place is not agreement (second review)."""
+    elsewhere = tmp_path / "sibling" / "src"
+    elsewhere.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").symlink_to(elsewhere, target_is_directory=True)
+    monkeypatch.setattr(check_surface, "REPO", repo)
+    with pytest.raises(check_surface.ManifestError, match="outside this checkout"):
+        check_surface._sdk_api()
+
+
+def test_an_importer_that_moves_the_path_and_raises_leaves_it_as_it_was(
+    check_surface: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    before = list(sys.path)
+
+    def explode(name: str) -> ModuleType:
+        sys.path.insert(0, "/an/importer/prepended/this")
+        raise ImportError(name)
+
+    monkeypatch.setattr(importlib, "import_module", explode)
+    with pytest.raises(ImportError):
+        check_surface._sdk_api()
+    assert sys.path == before
 
 
 def test_a_manifest_in_step_with_the_mirror_says_so_with_the_counts(
