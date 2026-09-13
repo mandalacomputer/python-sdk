@@ -50,7 +50,7 @@ class MandalaError(Exception):
     agent: AgentFailed | None = None
 
 
-#: The four words the platform will put in a refusal's ``reason`` (OPL-3898),
+#: The words the platform will put in a refusal's ``reason`` (OPL-3898, and
 #: split by what a retry loop should do about each. ``error`` beside it stays a
 #: sentence for a person and stays free to be reworded; this is the part a
 #: program is allowed to depend on.
@@ -62,7 +62,15 @@ class MandalaError(Exception):
 #: one status, so a subclass of one of them could not carry it. See
 #: :func:`is_transient`.
 _REASON_CLEARS = frozenset({"contention", "starting"})
-_REASON_PERMANENT = frozenset({"unavailable", "unsupported"})
+#: ``revoked`` is the first of these about the CALLER rather than about a computer:
+#: the authority the request arrived with no longer holds — suspended, demoted,
+#: removed, or a session the platform has retired (OPL-4801). Permanent, and named
+#: rather than left to fall through: a 401 or a 403 is none of the four transient
+#: classes, so an unrecognised word already answered ``False`` and nothing changes
+#: today. What changes is that a future status for this refusal cannot quietly make
+#: it look replayable. The status still says what to do about it — 401 present a
+#: credential again, 403 the role changed and signing in again will not help.
+_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked"})
 
 
 def _refusal_reason(body: object) -> str | None:
