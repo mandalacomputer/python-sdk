@@ -895,26 +895,66 @@ def test_a_spread_token_is_not_a_member_access_that_exempts_a_keyword(
 @pytest.mark.parametrize(
     ("prelude", "value"),
     [
-        ("let async = 2;\n", "async++"),
         ("const obj = {return: 1};\n", "obj.return++"),
         ("let x = 2;\n", "x++"),
+        ("const arr = [2];\n", "arr[0]++"),
     ],
-    ids=["contextual-name", "reserved-property", "plain-name"],
+    ids=["reserved-property", "plain-name", "element"],
 )
 def test_an_assignable_operand_still_divides_however_it_is_spelled(
     check_surface: ModuleType, prelude: str, value: str
 ) -> None:
-    """Narrowing the postfix test may not cost the updates that are postfix.
+    """Narrowing the postfix test may not cost the updates that ARE postfix.
 
-    `async`, `type`, `of` and their kind are legal variable names, however many
-    keyword positions they also have, so `async++ / 2` divides. Refusing it sent the
-    slash on to the predicate that sees only the `+` before it, which answered
-    "regex" — a legal division silently reading a literal, which is the failure this
-    ticket is about, arriving from the fix for it (adversarial review, round 2).
+    A name, a dotted property however it is spelled, and a bracketed element are
+    operands, and the slash after one of them divides — read as a regex position it
+    consumed the line it was on (adversarial review, round 2).
     """
     assert check_surface.table(_line_split_division(prelude, value), "ROUTES") == {
         ("GET", "widgets")
     }
+
+
+def test_an_update_of_a_contextual_word_is_refused_by_the_strict_reader(
+    check_surface: ModuleType,
+) -> None:
+    """`of++` divides and `for (const x of ++ /re/…)` does not, and both are legal.
+
+    Round 2 required the first reading and round 3 the second, each with a working
+    counterexample, and nothing lexical separates them: the difference is a position
+    only a parser sees. So the strict reader refuses the shape by name. Read as a
+    value it reported a route table out of a regex body; read as an update it
+    consumed a real division's line.
+    """
+    source = (
+        "for (const x of ++ /a); "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; "
+        "(z/.lastIndex ? [] : []) {}\n"
+        "export const ROUTES: Route[] = buildRoutes();\n"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*unreadable update"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_an_update_of_a_contextual_word_makes_the_two_policies_disagree(
+    check_surface: ModuleType,
+) -> None:
+    """The lenient reader cannot refuse, so it hands the shape to the policy instead.
+
+    `regex_can_start` would answer from the `+` before the slash and give both
+    policies the same guess — the agreement of two readings that is worth nothing.
+    Put to the policy, they disagree, and the reader that reads a file both ways
+    refuses a constant it can only reach by choosing one.
+    """
+    source = (
+        "let of = 2;\n"
+        "const ratio = of++ /`/.lastIndex;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        "const m = of++ /`/.lastIndex;\n"
+    )
+    with pytest.raises(SystemExit, match="depends on how an undecidable slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
 
 
 def test_a_reserved_word_is_not_read_out_of_a_longer_name(check_surface: ModuleType) -> None:

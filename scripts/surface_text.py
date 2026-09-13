@@ -225,6 +225,42 @@ _NOT_A_VALUE = frozenset(
         "yield",
     }
 )
+#: Words that are legal variable names AND occupy keyword positions, which is why
+#: they are in `_NOT_A_VALUE` without being reserved. A `++` after one of these can
+#: go either way and nothing lexical separates the two: `of++ / 2` increments a
+#: variable called `of` and divides, while `for (const x of ++ /re/.lastIndex)`
+#: increments a property of a regex, so the same slash opens a literal. Round 2 of
+#: this ticket's review required the first reading and round 3 the second, both
+#: correctly; the disagreement is not about the word but about a position only a
+#: parser can see. So this set is neither read as a value nor as an update — it is
+#: the third answer, and the readers treat it as the undecidable thing it is.
+_CONTEXTUAL_WORDS = _NOT_A_VALUE - _NOT_ASSIGNABLE
+
+
+def postfix_role(before: str) -> Literal["value", "update", "undecided"] | None:
+    """How the ``++`` or ``--`` ending ``before`` reads, or ``None`` if there is none.
+
+    ``"value"`` for a postfix update, whose operand is a value the following slash
+    can only divide; ``"update"`` for a prefix update of whatever comes after the
+    slash, which is therefore a regex literal; ``"undecided"`` where the operand is
+    one of :data:`_CONTEXTUAL_WORDS` and both readings are available.
+
+    Callers must not collapse ``"undecided"`` into either answer by default: reading
+    it as a value exposes a regex body as code, and reading it as an update consumes
+    a real division's line. The strict reader refuses it and the lenient reader hands
+    it to the caller's policy, so a reader of both policies sees them disagree.
+    """
+    match = _POSTFIX_OPERAND.search(before)
+    if match is None:
+        return None
+    # A member access or a single character — a `]` above all — is an assignable
+    # operand whatever it is spelled.
+    if match.group(1) or match.group(3):
+        return "value"
+    word = match.group(2)
+    if word in _NOT_ASSIGNABLE:
+        return "update"
+    return "undecided" if word in _CONTEXTUAL_WORDS else "value"
 
 
 def quoted_end(text: str, start: int, *, comments_blanked: bool = False) -> int:
@@ -351,6 +387,14 @@ def checked_slash_end(text: str, start: int, *, comments_blanked: bool = False) 
     # comments are already blanked. Where that is not promised the answer is a
     # refusal: this reader exists to refuse what it cannot read, and a slash it
     # would have to guess at is not made readable by guessing quietly.
+    #
+    # An update whose operand is a contextual word is neither, and is refused as
+    # itself: `of++ / 2` divides and `for (const x of ++ /re/.lastIndex)` does not,
+    # and this reader cannot see which position the word is in — see
+    # :func:`postfix_role`. Read as a value it reported a route table out of a regex
+    # body (adversarial review, round 3).
+    if postfix_role(before) == "undecided":
+        raise ValueError(f"unreadable update before a slash at {position(text, start)}")
     if certain_operator(before):
         if comments_blanked:
             return start + 1
@@ -380,16 +424,15 @@ def certain_operator(before: str) -> bool:
     a slash after ``+`` and ``obj.return / 2`` as a slash after the keyword
     ``return`` — both of which it calls regex positions, and both of which are
     divisions (adversarial review, OPL-4805).
+
+    An update this cannot place — :func:`postfix_role`'s ``"undecided"`` — is not
+    certain and so answers ``False`` here. That is not the same as "it is a regex":
+    both callers ask ``postfix_role`` themselves for that case, one to refuse it and
+    one to put it to the caller's policy.
     """
     if _MEMBER_OPERAND_LINES.search(before):
         return True
-    postfix = _POSTFIX_OPERAND.search(before)
-    # A member access, a `]` or any other single character the pattern allows is an
-    # assignable operand whatever it is spelled; a bare WORD is one unless the
-    # language reserves it, in which case the `++` updates what follows instead.
-    if postfix and (
-        postfix.group(1) or postfix.group(3) or postfix.group(2) not in _NOT_ASSIGNABLE
-    ):
+    if postfix_role(before) == "value":
         return True
     operand = _DIVISION_OPERAND_LINES.search(before)
     return bool(operand and operand.group(0).strip() not in _NOT_A_VALUE)
@@ -403,7 +446,15 @@ def _reads_as_regex(
     Certain divisions first, then ``regex_can_start`` where it is confident, then
     the caller's policy for the positions nothing here can decide — see
     ``strip_comments``. ``before`` is the comment-blanked text up to the slash.
+
+    An update whose operand is a contextual word goes straight to that policy rather
+    than to ``regex_can_start``, which would answer from the ``+`` before the slash
+    and give both policies the same guess. Put to the policy, the two readings
+    disagree, and a caller that reads the file both ways refuses instead of picking
+    one (adversarial review, rounds 2 and 3 — each required one of the readings).
     """
+    if postfix_role(before) == "undecided":
+        return undecided == "regex" and regex_end(text, at) > at + 1
     if certain_operator(before):
         return False
     # Over the blanked prefix, not the raw source. `regex_can_start` reads the
