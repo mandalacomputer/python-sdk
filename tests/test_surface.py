@@ -1078,27 +1078,25 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
         pytest.skip("platform repo not checked out; set MANDALA_PLATFORM_REPO to compare")
 
     # Recognition is identity now (OPL-3901), so a checkout can be the platform
-    # and still be missing the files this reads: a sparse or half-deleted clone
-    # is the state the script reports at exit 1, and reading straight through it
-    # would raise FileNotFoundError from inside a comparison instead. Fails here
-    # with the same inventory the script prints.
-    missing = check_surface.missing_mirror_sources(platform)
-    assert missing == [], "the platform checkout is missing mirror sources: " + ", ".join(
-        str(platform / source) for source in missing
-    )
+    # and still be missing the manifest this reads, or hold one this cannot
+    # compare: that is the state the script reports at exit 1, and it fails here
+    # with the same sentence rather than reading through it.
+    try:
+        manifest = check_surface.read_manifest(platform)
+    except check_surface.ManifestError as error:
+        pytest.fail(str(error))
 
     # Compared as sets rather than through main(), so a drift prints as the
     # routes that differ instead of as a non-zero exit code.
-    upstream = check_surface.table((platform / check_surface.SURFACE).read_text(), "V1_ROUTES")
-    assert upstream == ALLOWED
+    assert check_surface.routes(manifest) == ALLOWED
     # And the same for what each of them takes. `Range` on the download is the
     # reason this half exists: a whole feature, on a route the line above was
     # already satisfied by.
-    assert check_surface.parameter_drift(check_surface.parameters(platform), PARAMETERS) == []
+    assert check_surface.parameter_drift(check_surface.parameters(manifest), PARAMETERS) == []
     # And the mirrored NUMBERS, which drift the same way and were the half this
     # test imported without ever calling: MAX_CLIPBOARD_BYTES can diverge from
-    # the platform's `clipboardWriteMax` through a green run of this suite.
-    assert check_surface.constant_drift(platform) == []
+    # the platform's clipboard limit through a green run of this suite.
+    assert check_surface.constant_drift(manifest) == []
 
 
 def test_allowlist_excludes_the_daemons_internal_routes() -> None:

@@ -2250,11 +2250,13 @@ matter how far behind the client falls, so closing a gap means deleting a line
 from `UNIMPLEMENTED` rather than nobody noticing.
 
 A mirror nobody compares is a comment, though. `scripts/check_surface.py` does
-the comparison against the platform's real route table whenever a checkout of
-the platform is available to it (next door, or wherever `MANDALA_PLATFORM_REPO`
-points — a maintainer's setup, not something a contributor needs), and says so
-and exits 0 when it is not. The suite runs it too: `pytest` skips it where the
-platform is not checked out and fails on drift where it is.
+the comparison against the platform's published surface manifest — a file the
+platform generates from its own tables and commits like a lockfile — whenever a
+checkout of the platform is available to it (next door, or wherever
+`MANDALA_PLATFORM_REPO` points — a maintainer's setup, not something a
+contributor needs), and says so and exits 0 when it is not. A manifest it cannot
+read is a failure, never a comparison of nothing. The suite runs it too: `pytest`
+skips it where the platform is not checked out and fails on drift where it is.
 
 Response objects keep the raw payload in `.raw`, so a server that starts
 returning more fields does not break older clients. `.raw` is evidence rather
