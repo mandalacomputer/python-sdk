@@ -69,10 +69,13 @@ _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
 _POSTFIX_OPERAND = re.compile(r"[\w$\]][ \t]*(?:\+\+|--)\s*\Z")
 #: The same three operands as `_MEMBER_OPERAND` and `_DIVISION_OPERAND`, allowing a
 #: LINE BREAK between the value and the slash. Their own tails stop at a space or a
-#: tab on purpose, because `checked_slash_end` reads raw source, where looking back
-#: over a newline can borrow a token out of a line comment. `certain_operator`
-#: reads a prefix whose comments are already blanked, so it can afford the longer
-#: reach — and needs it, since `obj.return` on the line above a slash is the same
+#: tab on purpose, because `checked_slash_end` may be handed raw source, where
+#: looking back over a newline can borrow a token out of a line comment — so that
+#: reader answers a line-split value from these patterns only where its caller has
+#: promised the comments are blanked, and refuses otherwise (OPL-4824).
+#: `certain_operator` reads a prefix whose comments are already blanked, so it can
+#: afford the longer reach — and needs it, since `obj.return` on the line above a
+#: slash is the same
 #: division as `obj.return` beside it (adversarial review, OPL-4805). ASI does not
 #: change that: `a` then a newline then `/b/` is a division in JavaScript too.
 _MEMBER_OPERAND_LINES = re.compile(r"\.[A-Za-z_$][\w$]*\s*\Z")
@@ -151,8 +154,13 @@ _NOT_A_VALUE = frozenset(
 )
 
 
-def quoted_end(text: str, start: int) -> int:
-    """One past the end of the single-, double-, or backtick-quoted literal at ``start``."""
+def quoted_end(text: str, start: int, *, comments_blanked: bool = False) -> int:
+    """One past the end of the single-, double-, or backtick-quoted literal at ``start``.
+
+    ``comments_blanked`` says the caller's ``text`` has had its comments blanked
+    already, and is passed on to the strict slash reader used inside template
+    interpolations — see :func:`checked_slash_end`.
+    """
     quote = text[start]
     i = start + 1
     while i < len(text):
@@ -162,7 +170,14 @@ def quoted_end(text: str, start: int) -> int:
         if quote == "`" and text[i : i + 2] == "${":
             # Interpolations may contain strings or nested templates of their
             # own. Their quotes cannot terminate the surrounding template.
-            contents = balanced(text, i + 1, "{", "}", strict_slashes=True)
+            contents = balanced(
+                text,
+                i + 1,
+                "{",
+                "}",
+                strict_slashes=True,
+                comments_blanked=comments_blanked,
+            )
             i += len(contents) + 3
             continue
         if text[i] == quote:
@@ -223,11 +238,17 @@ def position(text: str, offset: int) -> str:
     return f"line {line} column {offset - text.rfind(chr(10), 0, offset)}"
 
 
-def checked_slash_end(text: str, start: int) -> int:
+def checked_slash_end(text: str, start: int, *, comments_blanked: bool = False) -> int:
     """Skip a known regex or division operator, refusing undecidable slash roles.
 
     Use before interpreting delimiters in code, including template
     interpolations: regex braces and backticks must never alter lexical scope.
+
+    ``comments_blanked`` is the caller's promise that comments in ``text`` are
+    already spaces, which is what lets the operand tests reach back over a line
+    break. Without it a name in a line comment could answer for the code below
+    it, so a value that is only reachable across a break is refused rather than
+    read either way — see the line-split branch below.
     """
     # A same-line member access is an operand, even with a keyword property.
     # Never borrow a member-looking suffix from a preceding line comment.
@@ -244,6 +265,23 @@ def checked_slash_end(text: str, start: int) -> int:
     operand = _DIVISION_OPERAND.search(before)
     if operand and operand.group(0).strip() not in _NOT_A_VALUE:
         return start + 1
+    # The same value, one line up — or a postfix update, whose last character is an
+    # operator a regex is otherwise allowed to follow. Both were read as REGEX
+    # positions here, and each reading ends at the next slash on the line: over a
+    # table's file that swallowed a template's backtick, which exposed the prose
+    # inside the template as code and hid the real declaration inside the shifted
+    # literal that followed. The reader then reported a route table it had read out
+    # of a string — the fail-open class of OPL-4805, in the strict path (OPL-4824).
+    #
+    # `certain_operator` is the predicate the lenient reader settles these with, and
+    # it reaches across a line break, so it may only be believed over text whose
+    # comments are already blanked. Where that is not promised the answer is a
+    # refusal: this reader exists to refuse what it cannot read, and a slash it
+    # would have to guess at is not made readable by guessing quietly.
+    if certain_operator(before):
+        if comments_blanked:
+            return start + 1
+        raise ValueError(f"unreadable slash after a value at {position(text, start)}")
     if not regex_can_start(text, start):
         raise ValueError(f"ambiguous slash at {position(text, start)}")
     end = regex_end(text, start)
@@ -418,7 +456,13 @@ def strip_comments(
 
 
 def balanced(
-    text: str, start: int, open_ch: str, close_ch: str, *, strict_slashes: bool = False
+    text: str,
+    start: int,
+    open_ch: str,
+    close_ch: str,
+    *,
+    strict_slashes: bool = False,
+    comments_blanked: bool = False,
 ) -> str:
     """The text between the bracket at ``start`` and the one that balances it.
 
@@ -429,13 +473,15 @@ def balanced(
     Template interpolations require strict slash handling before any delimiter
     is interpreted. Other callers may read languages with ordinary division;
     retaining their existing behavior avoids imposing JavaScript rules there.
+    ``comments_blanked`` is passed through to that strict reader and says nothing
+    about this function's own comment handling, which is the same either way.
     """
     depth = 0
     i = start
     while i < len(text):
         ch = text[i]
         if ch in "'\"`":
-            i = quoted_end(text, i)
+            i = quoted_end(text, i, comments_blanked=comments_blanked)
             continue
         if ch == "/" and text[i : i + 2] == "//":
             end = text.find("\n", i + 2)
@@ -446,7 +492,11 @@ def balanced(
             i = len(text) if end == -1 else end + 2
             continue
         if ch == "/" and (strict_slashes or regex_can_start(text, i)):
-            i = checked_slash_end(text, i) if strict_slashes else regex_end(text, i)
+            i = (
+                checked_slash_end(text, i, comments_blanked=comments_blanked)
+                if strict_slashes
+                else regex_end(text, i)
+            )
             continue
         if ch == open_ch:
             depth += 1
@@ -464,6 +514,10 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
     The source must already be comment-blanked. This is a lexical boundary
     check, not expression evaluation; unsupported declarations remain absent
     and their callers refuse an inventory they cannot establish.
+
+    That requirement is what is passed to the slash reader as
+    ``comments_blanked``: over this source a value on the line above a slash is
+    the operand it looks like, because no comment survives to supply one.
     """
     expression = re.compile(pattern)
     matches: list[re.Match[str]] = []
@@ -472,10 +526,10 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
     while i < len(source):
         ch = source[i]
         if ch in "'\"`":
-            i = quoted_end(source, i)
+            i = quoted_end(source, i, comments_blanked=True)
             continue
         if ch == "/":
-            i = checked_slash_end(source, i)
+            i = checked_slash_end(source, i, comments_blanked=True)
             continue
         if not stack and (i == 0 or not _IDENT_CHAR.match(source[i - 1])):
             match = expression.match(source, i)

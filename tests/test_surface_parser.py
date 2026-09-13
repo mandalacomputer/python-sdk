@@ -784,6 +784,97 @@ def test_an_interpolation_comment_cannot_supply_a_division_operand(
         check_surface.table(source, "ROUTES")
 
 
+def _line_split_division(prelude: str, value: str) -> str:
+    """A file whose only real route table is reachable ONLY across two line breaks.
+
+    Deliberately adversarial, and spelled out because no formatter produces it: two
+    divisions are wrapped so the slash opens its line, and each of the reader's two
+    readings of such a slash ends at the next slash on that line. Read as regex
+    literals they eat one backtick each — the opening and the closing one of the
+    template holding the fake table — which keeps the reader's backtick parity even,
+    so nothing downstream refuses. The fake table inside the template then reads as
+    code and the real one, swallowed by the second reading, is not there at all.
+
+    What JavaScript sees is ``value / `…` + 1``: a division by a template,
+    the fake table being that template's TEXT, and one route table in the file.
+    """
+    return (
+        prelude + f"const ratio = {value}\n"
+        " / ` / 2;\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];\n"
+        f"const tail = {value}\n"
+        " / ` + 1; export const ROUTES: Route[] = "
+        "[{method:'GET',pattern:'widgets'}]; const z = 4 / 5;\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("prelude", "value"),
+    [
+        ("const obj = {return: 1};\n", "obj.return"),
+        ("let x = 2;\n", "x++"),
+        ("const count = 2;\n", "count"),
+    ],
+    ids=["member-access", "postfix-update", "plain-name"],
+)
+def test_a_line_split_division_cannot_expose_a_table_inside_a_template(
+    check_surface: ModuleType, prelude: str, value: str
+) -> None:
+    """The strict reader's operand tests stopped at the end of the line.
+
+    So a division the source wrapped left it reading a regex where there was an
+    operator — for a plain name it refused, which is honest, and for the other two
+    it walked into the "regex" and came back with a route table it had read out of a
+    template's prose while the real one was inside a literal that reading had
+    shifted. That is the fail-open OPL-4805 closed in the lenient reader, in the
+    strict one (OPL-4824).
+
+    The same three spellings as the lenient reader's own line-break test, because
+    the slash predicate places them differently: a member access whose property is
+    a reserved word and a postfix update both read as regex positions, and a plain
+    name reads as neither.
+    """
+    assert check_surface.table(_line_split_division(prelude, value), "ROUTES") == {
+        ("GET", "widgets")
+    }
+
+
+def test_a_line_split_value_in_raw_source_is_refused_rather_than_read(
+    check_surface: ModuleType,
+) -> None:
+    """Inside a template interpolation the strict reader is handed RAW source.
+
+    Its comments are not blanked there, so a name on the line above the slash may
+    have come out of a line comment and the operand cannot be believed. The answer
+    is the refusal a gate is for: it used to read the slash as opening a regex and
+    carry on with the wrong state, silently.
+    """
+    source = (
+        "const prose = `${(() => { let x = 2; const r = x++\n / 2 / 3; return r; })()}`;\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash after a value"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_the_two_slash_readers_differ_only_in_what_the_caller_promised(
+    check_surface: ModuleType,
+) -> None:
+    """One position, two answers, and the difference is a promise about comments.
+
+    Blanked source cannot hide an operand in a comment, so the value one line up is
+    the operand it looks like and the slash divides. Raw source can, so the same
+    position refuses. Pinned together because a caller that passes the flag without
+    blanking would get the division reading over a comment's token.
+    """
+    surface_text = sys.modules["surface_text"]
+    source = "const ratio = obj.return\n / 2;"
+    at = source.index("/ 2")
+    assert surface_text.checked_slash_end(source, at, comments_blanked=True) == at + 1
+    with pytest.raises(ValueError, match="unreadable slash after a value at line 2 column 2"):
+        surface_text.checked_slash_end(source, at)
+
+
 @pytest.mark.parametrize("contents", ["echo ${value/path}", "echo ${unfinished", "echo \\"])
 def test_go_raw_strings_do_not_invoke_template_interpolation(
     check_surface: ModuleType, contents: str
