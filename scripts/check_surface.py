@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-"""Diff the mirrors in tests/test_surface.py against the real tables upstream.
+"""Diff the mirrors in tests/surface_tables.py against the platform's surface manifest.
 
-``ALLOWED`` in the surface test mirrors ``V1_ROUTES`` in the platform's
-``web/lib/surface.ts``, and it is what keeps this SDK honest about which routes
-exist: a client calling a route the server does not expose fails in a user's
-hands rather than here. But a mirror nobody compares is a comment. This does the
-comparison whenever the platform repo happens to be checked out — next door by
-default, or wherever ``MANDALA_PLATFORM_REPO`` points. That variable is an
-assertion rather than a hint: set to a path that does not hold a checkout, this
-says so and exits 1 instead of quietly comparing against a neighbour or
-skipping (OPL-4512).
+``ALLOWED`` mirrors the platform's v1 route table, ``PARAMETERS`` the documented
+parameters of each route, and eight constants in ``mandala_computer._api`` mirror
+the platform's limits. They are what keep this SDK honest about which routes
+exist and what each takes: a client calling a route the server does not expose,
+or refusing a value the platform would take, fails in a user's hands rather than
+here. But a mirror nobody compares is a comment. This does the comparison
+whenever the platform repo happens to be checked out — next door by default, or
+wherever ``MANDALA_PLATFORM_REPO`` points. That variable is an assertion rather
+than a hint: set to a path that does not hold a checkout, this says so and exits
+1 instead of quietly comparing against a neighbour or skipping (OPL-4512).
 
-Not having the script is how three routes went missing. ``GET`` and ``DELETE
-computers/:id/exec/:pid`` (OPL-3584) and ``GET computers/:id/snapshots``
-(OPL-3636) landed upstream and never reached the mirror, and every test here
-stayed green throughout — "every call lands on an allowlisted route" is
-trivially true of a route the allowlist has never heard of, and so is "the
-unreached part of the surface is exactly what we think".
+What it compares against is the platform's ``surface-manifest.json`` (platform
+OPL-4827): a file the platform generates from its own tables, verifies
+byte-for-byte in its own suite, and commits like a lockfile. It carries the
+routes, the parameters per route, and the limits keyed by what each number
+means. This used to be a scanner over the platform's TypeScript and Go source
+— eleven hundred lines of it, in a language that is not Python's to parse, and
+every review of it found another construct it read wrong. The manifest is the
+platform saying what its surface is, once, in a form a client can read without
+guessing (OPL-4837).
+
+The reader is FAIL-CLOSED. The recurring defect in the scanners was a false
+all-clear — reporting the mirror in step because the scan silently read nothing
+— and a JSON diff can do that too. So a manifest that is missing, unparseable,
+of a version this does not know, with no routes, with a parameter on a route it
+does not list, or without one of the limits this SDK mirrors, is a failure that
+names the problem, never an empty comparison that passes.
 
 Exits 0 and says so when the platform repo is not there, which is most of the
 time: nothing in this repository's CI has both, and failing over an absence
@@ -24,30 +35,16 @@ would make this a check people learn to ignore.
 
 Where it is enforced is the platform's own CI, which checks this repo out
 beside itself and runs this script against it (OPL-3916). That is the run a
-route added upstream cannot get past, and it is deliberately not here. The
-comparison prints the routes, parameters and constant values that have not
-shipped yet, and this repository's Actions logs are world-readable the day it
-goes public; the platform's are not. Running it here would also mean a read key
-for a private repo living in a public one, which is the wrong direction for a
-credential to point.
-
-So on a laptop with both checked out this is the check that catches drift
-before a push, and everywhere else it is the thing the platform runs.
-
-The parameter half exists because the route half was not enough. `Range` on
-`GET computers/:id/files` (OPL-3727) is a whole feature — the only way a file
-larger than one request moves comes off a computer at all — and it is not a
-route. It arrived on a route the mirror already knew about, so nothing here had
-anything to compare and this script went on reporting the SDK in step. A route
-table cannot see a parameter: the call lands in the right place either way, and
-what is missing is the argument that made it worth making.
+route added upstream cannot get past, and it is deliberately not here: the
+comparison prints what has not shipped yet, and this repository's Actions logs
+are world-readable.
 
     python scripts/check_surface.py
 """
 
 from __future__ import annotations
 
-import ast
+import json
 import os
 import re
 import subprocess
@@ -55,56 +52,40 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from surface_text import (
-    initializer_contents,
-    literal_contents,
-    literal_string,
-    module_matches,
-    object_entries,
-    split_items,
-    strip_comments,
-    top_level_keys,
-)
-
 REPO = Path(__file__).resolve().parent.parent
-SURFACE = Path("web/lib/surface.ts")
-AGENT = Path("web/lib/agent.ts")
-APIDOC = Path("web/lib/apidoc.ts")
 
-#: Platform constants this SDK mirrors, as ``(our name, their file, their name)``.
+#: The platform's surface manifest, at the root of its checkout.
+MANIFEST = Path("surface-manifest.json")
+
+#: The manifest format this reader understands. The platform bumps it only when
+#: the shape changes in a way a reader must notice; a version this has not heard
+#: of is refused rather than read on the assumption that nothing moved.
+MANIFEST_VERSION = 1
+
+#: Platform limits this SDK mirrors, as ``(our name, the manifest's key)``.
 #:
 #: A number copied out of the platform is a route by another name: the SDK
 #: refuses a value early to save the caller a round trip, and a ceiling that has
 #: drifted turns that favour into a refusal of a run the platform would have
-#: taken — with nothing failing here to say so.
-#: The reader supports both TypeScript and Go constants.
-CLIPBOARD = Path("server/clipboard.go")
-EXEC = Path("server/execbg.go")
-API = Path("server/api.go")
-WEBHOOKS = Path("web/lib/webhooks.ts")
-WEBHOOKSIGN = Path("web/lib/webhooksign.ts")
-
-CONSTANTS = [
-    ("MAX_STEPS", AGENT, "MAX_MAX_STEPS"),
-    ("MAX_CLIPBOARD_BYTES", CLIPBOARD, "clipboardWriteMax"),
-    # A mirrored number that nothing compares is a number that drifts, which is
-    # the whole reason this list exists — and these two arrived as local
-    # constants without an entry here.
-    ("MAX_ENV_ENTRIES", EXEC, "execMaxEnv"),
-    ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
-    ("MAX_EXEC_TIMEOUT_SECONDS", API, "execMaxTimeoutSec"),
-    # The two webhook caps the SDK refuses at, and the replay window the
-    # verifier defaults to — which is the one number a RECEIVER codes against.
-    ("WEBHOOK_DESCRIPTION_MAX", WEBHOOKS, "DESCRIPTION_MAX"),
-    ("WEBHOOK_COMPUTERS_MAX", WEBHOOKS, "COMPUTERS_MAX"),
-    ("WEBHOOK_REPLAY_WINDOW_S", WEBHOOKSIGN, "REPLAY_WINDOW_S"),
+#: taken — with nothing failing here to say so. The manifest keys them by what
+#: each number MEANS, never by the platform's own name for it.
+LIMITS = [
+    ("MAX_STEPS", "agent.maxSteps"),
+    ("MAX_CLIPBOARD_BYTES", "clipboard.writeMaxBytes"),
+    ("MAX_ENV_ENTRIES", "exec.maxEnvEntries"),
+    ("MAX_ENV_ENTRY_BYTES", "exec.maxEnvEntryBytes"),
+    ("MAX_EXEC_TIMEOUT_SECONDS", "exec.maxTimeoutSeconds"),
+    ("WEBHOOK_DESCRIPTION_MAX", "webhook.descriptionMaxChars"),
+    ("WEBHOOK_COMPUTERS_MAX", "webhook.computersMax"),
+    ("WEBHOOK_REPLAY_WINDOW_S", "webhook.replayWindowSeconds"),
 ]
 
-#: The files whose contents this check mirrors. Kept separately from the
-#: markers that identify a platform checkout: a checkout with one of these
-#: missing is evidence of drift (or an incomplete checkout), not evidence that
-#: there is no checkout and therefore permission to skip the comparison.
-MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))))
+#: The methods a route entry may begin with. Anything else is not a route this
+#: SDK could mirror, and a manifest that says so is a manifest this misread.
+METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+
+#: Where a documented parameter lives, as the manifest and the mirror both spell it.
+PARAMETER_KINDS = ("query:", "header:", "body:")
 
 #: The platform repository, as ``owner/name`` on whatever remote it was cloned
 #: from — which is what a checkout *is*, and the one thing about it that does not
@@ -146,12 +127,12 @@ def git_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
 
 
-#: The files that identify a platform checkout git cannot vouch for — an export,
+#: The file that identifies a platform checkout git cannot vouch for — an export,
 #: a vendored copy, a clone whose remote was removed. A fallback rather than the
-#: primary test: they are contents, and contents are what goes missing when the
-#: mirror drifts. ``MIRROR_SOURCES`` separately says whether a recognized
-#: checkout is complete enough to compare against.
-PLATFORM_MARKERS = (SURFACE, APIDOC)
+#: primary test: it is contents, and contents are what goes missing when the
+#: mirror drifts. :func:`read_manifest` separately says whether a recognized
+#: checkout holds a manifest this can compare against.
+PLATFORM_MARKERS = (MANIFEST,)
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
@@ -284,348 +265,101 @@ def platform_repo() -> Path | None:
     return next((d for d in (REPO.parent / s for s in SIBLINGS) if is_platform_checkout(d)), None)
 
 
-def missing_mirror_sources(platform: Path) -> list[Path]:
-    """Files a recognized platform checkout is missing for this comparison.
+class ManifestError(Exception):
+    """A manifest this cannot compare against, and why — never an empty answer."""
 
-    This used to be folded into :func:`platform_repo`: a checkout that had the
-    route and parameter tables but had lost ``server/clipboard.go`` looked
-    absent, so the entire check skipped. Before that skip was added it looked
-    complete and ``constant_drift`` died in ``Path.read_text``. Neither answer
-    distinguishes "there is no checkout" from "the checkout drifted underneath
-    the mirror"; this inventory is the third state that does.
+
+def read_manifest(platform: Path) -> dict[str, object]:
+    """The platform's surface manifest, checked to the shape this compares.
+
+    Every check here is a way the scanners once printed a false all-clear, made
+    into a failure that names itself: a file that is not there, that does not
+    parse, that is a version this has not heard of, that lists no routes, that
+    documents a parameter on a route it does not list, or that lacks a limit this
+    SDK mirrors. Anything short of the full shape is refused, because a diff over
+    a half-read manifest passes for the same reason a scan that read nothing did.
     """
-    return [source for source in MIRROR_SOURCES if not (platform / source).is_file()]
-
-
-def table(source: str, name: str) -> set[tuple[str, str]]:
-    """Read every route literal, or refuse a table this reader cannot compare."""
+    path = platform / MANIFEST
+    if not path.is_file():
+        raise ManifestError(f"{path} is not there — the checkout predates the manifest, or lost it")
     try:
-        source = strip_comments(source)
-        declarations = module_matches(
-            source,
-            rf"export\s+const\s+{re.escape(name)}\s*:\s*Route\[\]\s*=\s*\[",
+        manifest = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ManifestError(f"{path} cannot be read: {error}") from error
+    if not isinstance(manifest, dict):
+        raise ManifestError(f"{path} is not a JSON object")
+    if manifest.get("version") != MANIFEST_VERSION:
+        raise ManifestError(
+            f"{path} is manifest version {manifest.get('version')!r}; this reader knows {MANIFEST_VERSION}"
         )
-        if len(declarations) != 1:
-            raise ValueError("declaration absent, ambiguous, or unsupported")
-        body = initializer_contents(source, declarations[0].end() - 1, "[", "]")
-        routes = set()
-        for entry in split_items(body):
-            fields = object_entries(literal_contents(entry, "{", "}"))
-            if "method" not in fields or "pattern" not in fields:
-                raise ValueError("route needs literal method and pattern fields")
-            routes.add((literal_string(fields["method"]), literal_string(fields["pattern"])))
-        if not routes:
-            raise ValueError("found no routes")
-        return routes
-    except ValueError as err:
-        raise SystemExit(f"cannot read {name} in {SURFACE}: {err}") from None
+    routes = manifest.get("routes")
+    if not isinstance(routes, list) or not routes:
+        raise ManifestError(f"{path} lists no routes")
+    for entry in routes:
+        if not (
+            isinstance(entry, str) and len(entry.split(" ")) == 2 and entry.split(" ")[0] in METHODS
+        ):
+            raise ManifestError(f"{path} holds a route that is not 'METHOD pattern': {entry!r}")
+    listed = set(routes)
+    parameters = manifest.get("parameters")
+    if not isinstance(parameters, dict):
+        raise ManifestError(f"{path} has no parameters table")
+    for route, names in parameters.items():
+        if route not in listed:
+            raise ManifestError(
+                f"{path} documents parameters for a route it does not list: {route}"
+            )
+        if not isinstance(names, list) or not all(
+            isinstance(name, str) and name.startswith(PARAMETER_KINDS) for name in names
+        ):
+            raise ManifestError(
+                f"{path} holds a parameter list this cannot read, on {route}: {names!r}"
+            )
+    limits = manifest.get("limits")
+    if not isinstance(limits, dict):
+        raise ManifestError(f"{path} has no limits table")
+    for _, key in LIMITS:
+        value = limits.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ManifestError(
+                f"{path} does not carry the limit {key}, or it is not a positive integer"
+            )
+    return manifest
 
 
-def shared_query(source: str) -> dict[str, str]:
-    """Read named parameter-entry literals from comment-blanked source.
+def routes(manifest: dict[str, object]) -> set[tuple[str, str]]:
+    """The platform's routes, in the mirror's own ``(method, pattern)`` spelling."""
+    found = manifest["routes"]
+    assert isinstance(found, list)
+    return {(entry.split(" ")[0], entry.split(" ")[1]) for entry in found}
 
-    Unknown references are refused at their use site; shared arrays and
-    arbitrary expressions are deliberately outside this reader's grammar.
+
+def parameters(manifest: dict[str, object]) -> dict[str, set[str]]:
+    """The documented parameters of EVERY route, empty for the ones that take none.
+
+    The manifest lists only the routes that have any; the mirror lists every
+    route, so a route with an empty set is a claim about it, and the diff has to
+    see both sides the same way.
     """
-    found = {}
-    for match in module_matches(
-        source,
-        r"(?:export\s+)?const ([A-Za-z_$][\w$]*):\s*Query\s*=\s*\{",
-    ):
-        name = match.group(1)
-        try:
-            fields = object_entries(initializer_contents(source, match.end() - 1, "{", "}"))
-            if "name" not in fields or name in found:
-                raise ValueError("shared parameter entry has no name or an ambiguous declaration")
-            found[name] = literal_string(fields["name"])
-        except ValueError as err:
-            raise ValueError(f"shared parameter {name}: {err}") from None
-    return found
+    listed = manifest["parameters"]
+    assert isinstance(listed, dict)
+    found = manifest["routes"]
+    assert isinstance(found, list)
+    return {route: set(listed.get(route, [])) for route in found}
 
 
-def _parameter_names(value: str, shared: dict[str, str]) -> set[str]:
-    """Account for every entry in a query/header array, including named entries."""
-    names = set()
-    for entry in split_items(literal_contents(value, "[", "]")):
-        if entry.startswith("{"):
-            fields = object_entries(literal_contents(entry, "{", "}"))
-            if "name" not in fields:
-                raise ValueError("parameter entry has no name")
-            names.add(literal_string(fields["name"]))
-        elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry) and entry in shared:
-            names.add(shared[entry])
-        else:
-            raise ValueError("unsupported or unresolved parameter entry")
-    return names
-
-
-def parameters(platform: Path) -> dict[str, set[str]]:
-    """Read all documented route parameters, refusing unknown declarations."""
-    try:
-        source = strip_comments((platform / APIDOC).read_text())
-        shared = shared_query(source)
-        declarations = module_matches(
-            source,
-            r"export\s+const\s+DOCS\s*:\s*Record<string,\s*Doc>\s*=\s*\{",
-        )
-        if len(declarations) != 1:
-            raise ValueError("DOCS declaration absent, ambiguous, or unsupported")
-        docs = object_entries(initializer_contents(source, declarations[0].end() - 1, "{", "}"))
-        table: dict[str, set[str]] = {}
-        for route, value in docs.items():
-            if re.fullmatch(r"[A-Z]+ .+", route) is None:
-                raise ValueError("unsupported route key in DOCS")
-            try:
-                fields = object_entries(literal_contents(value, "{", "}"))
-                found: set[str] = set()
-                for key, kind in (("query", "query"), ("headers", "header")):
-                    if key in fields:
-                        try:
-                            found.update(
-                                f"{kind}:{name}" for name in _parameter_names(fields[key], shared)
-                            )
-                        except ValueError as err:
-                            raise ValueError(f"{key}: {err}") from None
-                if "body" in fields:
-                    body = fields["body"]
-                    call = re.match(r"object\s*(?=\()", body)
-                    if call:
-                        args = split_items(literal_contents(body[call.end() :], "(", ")"))
-                        if not args or not args[0].startswith("{"):
-                            raise ValueError("unreadable body fields")
-                        found.update(
-                            f"body:{key}"
-                            for key in top_level_keys(literal_contents(args[0], "{", "}"))
-                        )
-                    elif body.startswith("{"):
-                        # Raw schemas describe binary bodies, with no named fields.
-                        object_entries(literal_contents(body, "{", "}"))
-                    else:
-                        raise ValueError("unreadable body fields")
-                table[route] = found
-            except ValueError as err:
-                if str(err) == "unreadable body fields":
-                    raise SystemExit(
-                        f"'{route}' in {APIDOC} documents a body in a form this\n"
-                        "  reader does not know — neither object(...) nor a raw schema literal."
-                    ) from None
-                raise SystemExit(f"cannot read '{route}' in {APIDOC}: {err}") from None
-        if not table:
-            raise ValueError("found no routes in DOCS")
-        return table
-    except ValueError as err:
-        raise SystemExit(f"cannot read DOCS in {APIDOC}: {err}") from None
-
-
-def constant(source: str, name: str, module: Path) -> int:
-    """One integer constant out of a platform module, TypeScript or Go.
-
-    Supports TypeScript ``export const NAME = <expr>``, standalone Go
-    ``const name = <expr>``, and ``name = <expr>`` inside a Go ``const`` block.
-    Declarations are matched at the start of a line over source whose comments have been
-    blanked first, so that a mention of the name in a comment or in another
-    expression is not read as its declaration — the Go form always was, and the
-    TypeScript one was not, which made a commented-out declaration upstream a
-    silent match here.
-
-    Quoted text is blanked along with the comments, the declaration must be at the
-    top level, and the match must be the ONLY one there. Both halves close what the comment blanking left open: a
-    declaration-shaped LINE inside a template or a Go raw string — a snippet in a
-    generated document, a script embedded in a module — matched, and the first
-    match won, so prose earlier in the file decided what the platform's constant
-    was. A number read out of prose is not a comparison, and where it happens to
-    equal the mirror the check passes over a constant that has drifted, which is
-    the one direction that matters for a published package. Two declarations of
-    one name is the same situation from the other side and is refused rather than
-    settled by position, which is the rule :func:`table` already follows.
-
-    None of that is enough on its own, because blanking a literal depends on
-    knowing where it starts, and in TypeScript that depends on a slash whose role
-    is sometimes undecidable: a backtick inside a regex literal this reader places
-    wrongly moves a template's boundary, and the real declaration can end up
-    blanked with the prose left standing — the same false pass, reached through the
-    lexer instead of through the pattern. So the file is read BOTH ways, under each
-    ``undecided_slash`` policy, and a name whose value depends on which way is
-    refused. That is the whole guarantee here: not that this reader lexes
-    JavaScript correctly, but that it will not report a number it had to guess at
-    (OPL-4805, and its adversarial review).
-
-    Which form is tried is decided by the module's suffix rather than by trying
-    both: the two patterns are close enough that a file answering to the wrong
-    one is a way for this to agree by accident.
-
-    The value is an EXPRESSION, not a literal, because both languages write
-    these as products — ``64 * 1024`` is how a byte ceiling is legible, and a
-    reader that demanded a bare integer could not see the very constants it exists to
-    compare. Evaluated with a grammar that admits integers, ``*``, ``+`` and
-    parentheses and nothing else: no names, no calls, no attribute access. A
-    declaration this cannot evaluate raises rather than being skipped, on the
-    rule the rest of this file follows — "could not tell" and "they agree" must
-    never be the same answer.
-    """
-    go = module.suffix == ".go"
-    pattern = (
-        # A Go declaration may name its type, and one that does is still the
-        # declaration: a pattern blind to `const name int = 4` reads the file as
-        # if the constant were declared somewhere else — which, where a local of
-        # the same name exists, it then finds (adversarial review, OPL-4805).
-        rf"^[ \t]*(?:const[ \t]+)?{re.escape(name)}"
-        rf"(?:[ \t]+[A-Za-z_][\w.\[\]*]*)?[ \t]*=[ \t]*([0-9*+()\s]+?)[ \t]*$"
-        if go
-        else rf"^[ \t]*export const {re.escape(name)}[ \t]*=[ \t]*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
-    )
-    readings = {
-        policy: _declared(source, pattern, go=go, undecided_slash=policy)
-        for policy in ("operator", "regex")
-    }
-    if len(set(readings.values())) != 1:
-        raise SystemExit(
-            f"{name} in {module} depends on how an undecidable slash in that file is\n"
-            "  read — one way it is "
-            + " and the other ".join(repr(r) for r in readings.values())
-            + ".\n  A constant this reader cannot establish without guessing is one it refuses."
-        )
-    found = readings["operator"]
-    if found is None:
-        raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
-    if found == _UNBALANCED:
-        raise SystemExit(
-            f"{name} is in a {module} this reader cannot place declarations in — the braces\n"
-            "  before it do not balance, so whether it is at the top level or inside\n"
-            "  something is exactly what cannot be established."
-        )
-    if found == _AMBIGUOUS:
-        raise SystemExit(
-            f"{name} is declared more than once at the top level of {module} — this reader\n"
-            "  cannot tell which one the platform uses, and picking by position is how it\n"
-            "  would agree with the wrong one."
-        )
-    try:
-        return _arith(ast.parse(found.strip(), mode="eval").body)
-    except (SyntaxError, ValueError) as err:
-        raise SystemExit(
-            f"{name} is {found!r} in {module}, which this reader cannot evaluate"
-        ) from err
-
-
-#: What :func:`_declared` returns for a name declared more than once where this
-#: reader can see it. A sentinel rather than an exception so that the two slash
-#: policies can be compared before either is reported: "declared twice under one
-#: reading and once under the other" is itself a refusal, and the ambiguity is
-#: the more useful half of it.
-_AMBIGUOUS = "<more than one declaration>"
-
-#: What it returns for a file whose braces do not balance where the declaration is.
-#: The depth rule below is a COUNT, not a parse, and a count that has gone negative
-#: is evidence that something it cannot see is contributing braces — so the answer
-#: is that the declaration cannot be placed, rather than a depth that happens to
-#: read as zero (adversarial review, OPL-4805).
-_UNBALANCED = "<braces do not balance>"
-
-
-def _declared(source: str, pattern: str, *, go: bool, undecided_slash: str) -> str | None:
-    """The expression this pattern finds at the top level, under one slash policy.
-
-    ``None`` where the file declares it nowhere this reader can see, and
-    :data:`_AMBIGUOUS` where it is declared more than once.
-
-    Top level means brace depth zero, counted over the blanked source. A constant
-    a package exports is not declared inside a function body, and a name that IS
-    declared in one shadows nothing the SDK mirrors — reading it as the platform's
-    value is how a local `36` answered for an exported `99`. Go groups its
-    constants in parentheses rather than braces, so a `const (…)` block counts as
-    the top level it is. A declaration only inside a TypeScript ``namespace`` block
-    is not at the top level either, and reads as absent: the mirror is of a module's
-    exports, so "declared somewhere this does not mirror" and "not declared" are the
-    same news.
-
-    The depth is a count, so what is checked is the whole prefix and not the number
-    at the declaration: a prefix that ever went NEGATIVE refuses, even where the
-    count has come back to zero since. A closing brace nobody opened is evidence of
-    text this reader is not seeing as text, and the honest answer there is that the
-    declaration cannot be placed — :data:`_UNBALANCED` — rather than a depth that
-    balances by accident and reads a nested declaration as a top-level one.
-    """
-    blanked = strip_comments(
-        source,
-        language="go" if go else "typescript",
-        literals=True,
-        undecided_slash="regex" if undecided_slash == "regex" else "operator",
-        # Refused here rather than read under each policy and compared. The policies
-        # are chosen for the whole FILE, so two undecidable slashes whose real roles
-        # differ are both read wrongly under either one — and two wrong readings that
-        # land on the same number reach :func:`constant` as agreement. A file with a
-        # `for (const x of ++ /re/…)` and an `of++ /` did exactly that: 36 out of a
-        # template under both policies, over a module whose own constant was 99
-        # (adversarial review, round 4). Agreement between two file-wide readings is
-        # not evidence, so the shape that can manufacture it is refused instead.
-        undecided_update="refuse",
-    )
-    depth = 0
-    floor = 0
-    at = 0
-    found = []
-    for match in re.finditer(pattern, blanked, re.MULTILINE):
-        for ch in blanked[at : match.start()]:
-            depth += 1 if ch == "{" else -1 if ch == "}" else 0
-            floor = min(floor, depth)
-        at = match.start()
-        # The floor and not only the current depth. A brace this reader could not
-        # see closes a scope nobody opened and the count recovers at the next real
-        # `{`, which reads a nested declaration as a top-level one — so a prefix
-        # that ever went negative refuses, rather than the count happening to come
-        # back to zero (adversarial review, OPL-4805).
-        if floor < 0:
-            return _UNBALANCED
-        if depth == 0:
-            found.append(match)
-    if not found:
-        return None
-    return _AMBIGUOUS if len(found) > 1 else found[0].group(1)
-
-
-def _arith(node: ast.expr) -> int:
-    """Evaluate an integer arithmetic expression, and nothing else.
-
-    Deliberately not :func:`eval`, and not :func:`ast.literal_eval` either —
-    the first would run whatever a platform file happened to contain, and the
-    second refuses ``64 * 1024``, which is the only shape these constants are
-    ever written in.
-    """
-    if (
-        isinstance(node, ast.Constant)
-        and isinstance(node.value, int)
-        and not isinstance(node.value, bool)
-    ):
-        return node.value
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Add)):
-        left, right = _arith(node.left), _arith(node.right)
-        return left * right if isinstance(node.op, ast.Mult) else left + right
-    raise ValueError(f"not integer arithmetic: {ast.dump(node)}")
-
-
-def constant_drift(platform: Path) -> list[str]:
-    """Every mirrored constant that no longer matches the platform's.
-
-    Imported rather than scraped, for the reason :func:`mirrored` is: the module
-    is the mirror, and a second parser over it would be one more thing that can
-    disagree with what the SDK actually sends.
-    """
-    sys.path.insert(0, str(REPO / "src"))
+def constant_drift(manifest: dict[str, object]) -> list[str]:
+    """Every mirrored constant whose value is not the manifest's limit."""
     from mandala_computer import _api
 
+    limits = manifest["limits"]
+    assert isinstance(limits, dict)
     drifted = []
-    for ours, module, theirs in CONSTANTS:
+    for ours, key in LIMITS:
         mine = getattr(_api, ours)
-        try:
-            source = (platform / module).read_text()
-        except OSError as err:
-            raise SystemExit(
-                f"{module} is not readable in the platform checkout — has it moved or changed shape?"
-            ) from err
-        upstream = constant(source, theirs, module)
+        upstream = limits[key]
         if mine != upstream:
-            drifted.append(f"  ! {ours} is {mine}, but {module}'s {theirs} is {upstream}")
+            drifted.append(f"  ! {ours} is {mine}, but the platform's {key} is {upstream}")
     return drifted
 
 
@@ -693,35 +427,33 @@ def main() -> int:
         print(
             "check-surface — platform repo not found, skipping.\n"
             f"  Looked for a clone of {PLATFORM_REMOTE} in: {looked or '(nowhere)'}\n"
-            f"  Set MANDALA_PLATFORM_REPO to compare against {SURFACE}."
+            f"  Set MANDALA_PLATFORM_REPO to compare against {MANIFEST}."
         )
         return 0
 
-    missing = missing_mirror_sources(platform)
-    if missing:
-        print("check-surface — platform repo found, but mirror sources are missing.")
-        for source in missing:
-            print(f"  ! {platform / source}")
-        print("  Restore or update these paths before comparing the mirrored surface.")
+    try:
+        manifest = read_manifest(platform)
+    except ManifestError as error:
+        # Named, and a failure: the checkout is the platform and the comparison
+        # could not be made, which is the third state between "no checkout" and
+        # "in step" — the one the scanners used to report as the second.
+        print("check-surface — platform repo found, but its surface manifest cannot be compared.")
+        print(f"  ! {error}")
         return 1
 
-    upstream = table((platform / SURFACE).read_text(), "V1_ROUTES")
+    upstream = routes(manifest)
     mirror = mirrored()
     added = sorted(upstream - mirror)
     removed = sorted(mirror - upstream)
-    drifted = constant_drift(platform)
-    params = parameter_drift(parameters(platform), mirrored_parameters())
+    drifted = constant_drift(manifest)
+    params = parameter_drift(parameters(manifest), mirrored_parameters())
 
     if not added and not removed and not drifted and not params:
-        n = len(CONSTANTS)
+        n = len(LIMITS)
         counted = sum(len(names) for names in mirrored_parameters().values())
         print(
-            # `platform`, not `platform / SURFACE.parent`. The routes and
-            # parameters come from web/lib and the constants no longer all do —
-            # clipboardWriteMax is read out of server/ — so naming one
-            # directory understated what had been compared.
             f"check-surface — {len(mirror)} routes, {counted} parameters and {n} constant"
-            f"{'' if n == 1 else 's'}, in step with {platform}."
+            f"{'' if n == 1 else 's'}, in step with {platform / MANIFEST}."
         )
         return 0
 
