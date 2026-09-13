@@ -65,8 +65,18 @@ _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
 #: a PREFIX update of a regex property; an operand that can actually be assigned to,
 #: which a `)` cannot, so `if (c) ++ /re/.lastIndex` is a prefix update too; and no
 #: line break between the two, because that is where JavaScript inserts a semicolon
-#: and makes the update prefix whatever was above it.
-_POSTFIX_OPERAND = re.compile(r"[\w$\]][ \t]*(?:\+\+|--)\s*\Z")
+#: and makes the update prefix whatever was above it. The operand is captured so the
+#: third condition can be checked rather than assumed: a bare word before `++` is an
+#: operand only if it is a name, and `void ++ /re/.lastIndex` — or `this ++`, or
+#: `typeof ++` — is a PREFIX update of a regex property, which read as a division
+#: walked into the regex and reported a route table out of its body (adversarial
+#: review, OPL-4824). A word reached through a `.` is a property and assignable
+#: whatever it is spelled, so `obj.return++ / 2` stays the division it is.
+_POSTFIX_OPERAND = re.compile(r"(\.?)([A-Za-z_$][\w$]*|[\w$\]])[ \t]*(?:\+\+|--)\s*\Z")
+#: Words that cannot be assigned to, so a `++` after one updates whatever follows it
+#: instead. The five reserved words that are values but not targets are here and not
+#: in `_NOT_A_VALUE`, because `this / 2` divides and `this ++ /re/` does not.
+_NOT_ASSIGNABLE = frozenset({"this", "super", "true", "false", "null"})
 #: The same three operands as `_MEMBER_OPERAND` and `_DIVISION_OPERAND`, allowing a
 #: LINE BREAK between the value and the slash. Their own tails stop at a space or a
 #: tab on purpose, because `checked_slash_end` may be handed raw source, where
@@ -308,7 +318,13 @@ def certain_operator(before: str) -> bool:
     ``return`` — both of which it calls regex positions, and both of which are
     divisions (adversarial review, OPL-4805).
     """
-    if _MEMBER_OPERAND_LINES.search(before) or _POSTFIX_OPERAND.search(before):
+    if _MEMBER_OPERAND_LINES.search(before):
+        return True
+    postfix = _POSTFIX_OPERAND.search(before)
+    if postfix and (
+        postfix.group(1) == "."
+        or (postfix.group(2) not in _NOT_A_VALUE and postfix.group(2) not in _NOT_ASSIGNABLE)
+    ):
         return True
     operand = _DIVISION_OPERAND_LINES.search(before)
     return bool(operand and operand.group(0).strip() not in _NOT_A_VALUE)

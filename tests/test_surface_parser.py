@@ -857,6 +857,61 @@ def test_a_line_split_value_in_raw_source_is_refused_rather_than_read(
         check_surface.table(source, "ROUTES")
 
 
+@pytest.mark.parametrize("prefix", ["void", "typeof", "await", "this", "true"])
+def test_a_prefix_update_after_a_word_is_not_a_postfix_value(
+    check_surface: ModuleType, prefix: str
+) -> None:
+    """`++` after a word is a postfix update only where the word can be assigned to.
+
+    `void ++ /re/.lastIndex` increments a property OF a regex, and the operand test
+    read the final letter of `void` as the value in front of the `++` — so the slash
+    came back a division, the reader walked into the regex, and the route table
+    inside its body was reported as the platform's (adversarial review, OPL-4824).
+    Two kinds of word cannot be the target: the ones that are not values at all, and
+    `this`, `super`, `true`, `false` and `null`, which are values and still not
+    assignable.
+    """
+    source = (
+        f"const n = {prefix} ++ /a; "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; z/.lastIndex;\n"
+        "export const ROUTES: Route[] = buildRoutes();\n"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_a_real_postfix_update_is_still_the_division_it_is(check_surface: ModuleType) -> None:
+    """The narrowing above may not cost the updates that ARE postfix.
+
+    A name, a bracketed element and a property reached through a `.` are all
+    assignable, and a property is assignable whatever it is spelled — `obj.return++`
+    included, which is why the check exempts anything behind a dot rather than
+    testing the word alone.
+    """
+    surface_text = sys.modules["surface_text"]
+    for value in ("x++", "arr[0]++", "obj.return++", "obj.return ++"):
+        assert surface_text.certain_operator(f"const r = {value} "), value
+
+
+def test_a_prefix_update_does_not_move_a_template_boundary_for_the_lenient_reader(
+    check_surface: ModuleType,
+) -> None:
+    """The same operand test decides the lenient reader's certain divisions.
+
+    So this was wrong there too, before the strict path was given the predicate at
+    all: `void ++ /`/` read as arithmetic, its backtick moved the template's
+    boundary, and the constant inside the template answered for the module's
+    (adversarial review, OPL-4824).
+    """
+    source = (
+        "const n = void ++ /`/.lastIndex;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        "const m = void ++ /`/.lastIndex;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
 def test_the_two_slash_readers_differ_only_in_what_the_caller_promised(
     check_surface: ModuleType,
 ) -> None:
