@@ -784,6 +784,286 @@ def test_an_interpolation_comment_cannot_supply_a_division_operand(
         check_surface.table(source, "ROUTES")
 
 
+def _line_split_division(prelude: str, value: str) -> str:
+    """A file whose only real route table is reachable ONLY across two line breaks.
+
+    Deliberately adversarial, and spelled out because no formatter produces it: two
+    divisions are wrapped so the slash opens its line, and each of the reader's two
+    readings of such a slash ends at the next slash on that line. Read as regex
+    literals they eat one backtick each — the opening and the closing one of the
+    template holding the fake table — which keeps the reader's backtick parity even,
+    so nothing downstream refuses. The fake table inside the template then reads as
+    code and the real one, swallowed by the second reading, is not there at all.
+
+    What JavaScript sees is ``value / `…` + 1``: a division by a template,
+    the fake table being that template's TEXT, and one route table in the file.
+    """
+    return (
+        prelude + f"const ratio = {value}\n"
+        " / ` / 2;\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}];\n"
+        f"const tail = {value}\n"
+        " / ` + 1; export const ROUTES: Route[] = "
+        "[{method:'GET',pattern:'widgets'}]; const z = 4 / 5;\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("prelude", "value"),
+    [
+        ("const obj = {return: 1};\n", "obj.return"),
+        ("let x = 2;\n", "x++"),
+        ("const count = 2;\n", "count"),
+    ],
+    ids=["member-access", "postfix-update", "plain-name"],
+)
+def test_a_line_split_division_cannot_expose_a_table_inside_a_template(
+    check_surface: ModuleType, prelude: str, value: str
+) -> None:
+    """The strict reader's operand tests stopped at the end of the line.
+
+    So a division the source wrapped left it reading a regex where there was an
+    operator — for a plain name it refused, which is honest, and for the other two
+    it walked into the "regex" and came back with a route table it had read out of a
+    template's prose while the real one was inside a literal that reading had
+    shifted. That is the fail-open OPL-4805 closed in the lenient reader, in the
+    strict one (OPL-4824).
+
+    The same three spellings as the lenient reader's own line-break test, because
+    the slash predicate places them differently: a member access whose property is
+    a reserved word and a postfix update both read as regex positions, and a plain
+    name reads as neither.
+    """
+    assert check_surface.table(_line_split_division(prelude, value), "ROUTES") == {
+        ("GET", "widgets")
+    }
+
+
+def test_a_line_split_value_in_raw_source_is_refused_rather_than_read(
+    check_surface: ModuleType,
+) -> None:
+    """Inside a template interpolation the strict reader is handed RAW source.
+
+    Its comments are not blanked there, so a name on the line above the slash may
+    have come out of a line comment and the operand cannot be believed. The answer
+    is the refusal a gate is for: it used to read the slash as opening a regex and
+    carry on with the wrong state, silently.
+    """
+    source = (
+        "const prose = `${(() => { let x = 2; const r = x++\n / 2 / 3; return r; })()}`;\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*slash after a value"):
+        check_surface.table(source, "ROUTES")
+
+
+def _prefix_update_of_a_regex(operand: str) -> str:
+    """A file whose real route table is the one OUTSIDE the regex `operand ++` opens.
+
+    A route table spelled inside the regex body, so a reader that takes the slash
+    for a division reports ``fake`` or refuses two declarations, and one that reads
+    the regex literal it is reports the real table below. Asserting the table rather
+    than a refusal is deliberate: a refusal message is also what an unrelated reader
+    failure produces, so it does not distinguish this from that (adversarial review,
+    round 2).
+    """
+    return (
+        f"const n = {operand} ++ /a; "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; z/.lastIndex;\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];\n"
+    )
+
+
+def test_a_spread_token_is_not_a_member_access_that_exempts_a_keyword(
+    check_surface: ModuleType,
+) -> None:
+    """The property exemption is for a member access, and `...` is not one.
+
+    `fn(...typeof ++ /re/.lastIndex)` is legal, and the last dot of the spread made
+    `typeof` look like a property — which exempted it, read the slash as a division
+    and walked into the regex, reopening the hole the commit before this one closed
+    (adversarial review, round 2).
+    """
+    source = (
+        "const n = fn(...typeof ++ /a); "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; fn(z/.lastIndex);\n"
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'widgets'}];\n"
+    )
+    assert check_surface.table(source, "ROUTES") == {("GET", "widgets")}
+
+
+@pytest.mark.parametrize(
+    ("prelude", "value"),
+    [
+        ("const obj = {return: 1};\n", "obj.return++"),
+        ("let x = 2;\n", "x++"),
+        ("const arr = [2];\n", "arr[0]++"),
+    ],
+    ids=["reserved-property", "plain-name", "element"],
+)
+def test_an_assignable_operand_still_divides_however_it_is_spelled(
+    check_surface: ModuleType, prelude: str, value: str
+) -> None:
+    """Narrowing the postfix test may not cost the updates that ARE postfix.
+
+    A name, a dotted property however it is spelled, and a bracketed element are
+    operands, and the slash after one of them divides — read as a regex position it
+    consumed the line it was on (adversarial review, round 2).
+    """
+    assert check_surface.table(_line_split_division(prelude, value), "ROUTES") == {
+        ("GET", "widgets")
+    }
+
+
+def test_an_update_of_a_contextual_word_is_refused_by_the_strict_reader(
+    check_surface: ModuleType,
+) -> None:
+    """`of++` divides and `for (const x of ++ /re/…)` does not, and both are legal.
+
+    Round 2 required the first reading and round 3 the second, each with a working
+    counterexample, and nothing lexical separates them: the difference is a position
+    only a parser sees. So the strict reader refuses the shape by name. Read as a
+    value it reported a route table out of a regex body; read as an update it
+    consumed a real division's line.
+    """
+    source = (
+        "for (const x of ++ /a); "
+        "export const ROUTES: Route[] = [{method:'GET',pattern:'fake'}]; "
+        "(z/.lastIndex ? [] : []) {}\n"
+        "export const ROUTES: Route[] = buildRoutes();\n"
+    )
+    with pytest.raises(SystemExit, match="cannot read ROUTES.*unreadable update"):
+        check_surface.table(source, "ROUTES")
+
+
+def test_a_constant_refuses_an_update_it_cannot_place(check_surface: ModuleType) -> None:
+    """The constant reader refuses this shape rather than reading the file both ways.
+
+    Putting it to the two policies was not enough. They are chosen for the whole
+    FILE, so where two undecidable slashes have opposite real roles each policy gets
+    one of them wrong — and the fixture below made both wrong readings land on the
+    same number, which the comparison then took for agreement (adversarial review,
+    round 4).
+    """
+    source = (
+        "let of = 2;\n"
+        "const ratio = of++ /`/.lastIndex;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        "const m = of++ /`/.lastIndex;\n"
+    )
+    with pytest.raises(ValueError, match="unreadable update before a slash"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_two_policies_agreeing_on_one_wrong_number_is_not_a_reading(
+    check_surface: ModuleType,
+) -> None:
+    """Agreement between two file-wide readings is not evidence, and here it was not.
+
+    This file holds two undecidable updates whose real roles are opposite: the
+    `for (const x of ++ /re/…)` heads are PREFIX updates, so their slashes open
+    regexes, and `of++ /` is a postfix update, so its slash divides. No single
+    file-wide policy gets both right, and the two wrong readings both left the
+    template's `36` standing as module code while blanking the module's own `99`.
+    The comparison saw one number twice and accepted it, over source Node runs and
+    reports 99 for — the fail-open the both-ways reading was introduced to close,
+    arriving through the both-ways reading (adversarial review, round 4).
+    """
+    source = (
+        "let of = 2;\n"
+        "for (const x of ++ /`/.lastIndex ? [] : []) {}\n"
+        "const ratio = of++ / ` / 2;\n"
+        "export const SAMPLE_LIMIT = 36;\n"
+        "`;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\n"
+        "const tail = of++ / ` + 1; const z = 4 / 5;\n"
+        "for (const x of ++ /`/.lastIndex ? [] : []) {}\n"
+    )
+    with pytest.raises(ValueError, match="unreadable update before a slash at line 2"):
+        check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts"))
+
+
+def test_a_reserved_word_is_not_read_out_of_a_longer_name(check_surface: ModuleType) -> None:
+    """`évoid++` is a postfix update of a name, not a prefix update after `void`.
+
+    The name is matched whole from a position no identifier character precedes, so a
+    reserved word that happens to end one cannot answer for it — including where the
+    name begins with a character this pattern's ASCII class does not cover, which is
+    how the `void` in `évoid` came to decide the slash (adversarial review, round 2).
+    """
+    surface_text = sys.modules["surface_text"]
+    assert surface_text.certain_operator("const ratio = évoid++ ")
+    assert not surface_text.certain_operator("const ratio = void ++ ")
+
+
+@pytest.mark.parametrize("prefix", ["void", "typeof", "await", "this", "true"])
+def test_a_prefix_update_after_a_word_is_not_a_postfix_value(
+    check_surface: ModuleType, prefix: str
+) -> None:
+    """`++` after a word is a postfix update only where the word can be assigned to.
+
+    `void ++ /re/.lastIndex` increments a property OF a regex, and the operand test
+    read the final letter of `void` as the value in front of the `++` — so the slash
+    came back a division, the reader walked into the regex, and the route table
+    inside its body was reported as the platform's (adversarial review, OPL-4824).
+    What cannot be the target is a reserved word — every one of them, `this`, `true`
+    and `null` included, and none of the contextual words that are legal names.
+    """
+    assert check_surface.table(_prefix_update_of_a_regex(prefix), "ROUTES") == {("GET", "widgets")}
+
+
+def test_a_real_postfix_update_is_still_the_division_it_is(check_surface: ModuleType) -> None:
+    """The narrowing above may not cost the updates that ARE postfix.
+
+    A name, a bracketed element and a property reached through a `.` are all
+    assignable, and a property is assignable whatever it is spelled — `obj.return++`
+    included, which is why the check exempts anything behind a dot rather than
+    testing the word alone.
+    """
+    surface_text = sys.modules["surface_text"]
+    for value in ("x++", "arr[0]++", "obj.return++", "obj.return ++"):
+        assert surface_text.certain_operator(f"const r = {value} "), value
+
+
+def test_a_prefix_update_does_not_move_a_template_boundary_for_the_lenient_reader(
+    check_surface: ModuleType,
+) -> None:
+    """The same operand test decides the lenient reader's certain divisions.
+
+    So this was wrong there too, before the strict path was given the predicate at
+    all: `void ++ /`/` read as arithmetic, its backtick moved the template's
+    boundary, and the constant inside the template answered for the module's
+    (adversarial review, OPL-4824).
+    """
+    source = (
+        "const n = void ++ /`/.lastIndex;\n"
+        "export const SAMPLE_LIMIT = 99;\n"
+        "const snippet = `\nexport const SAMPLE_LIMIT = 36;\n`;\n"
+        "const m = void ++ /`/.lastIndex;\n"
+    )
+    assert check_surface.constant(source, "SAMPLE_LIMIT", Path("fixture").with_suffix(".ts")) == 99
+
+
+def test_the_two_slash_readers_differ_only_in_what_the_caller_promised(
+    check_surface: ModuleType,
+) -> None:
+    """One position, two answers, and the difference is a promise about comments.
+
+    Blanked source cannot hide an operand in a comment, so the value one line up is
+    the operand it looks like and the slash divides. Raw source can, so the same
+    position refuses. Pinned together because a caller that passes the flag without
+    blanking would get the division reading over a comment's token.
+    """
+    surface_text = sys.modules["surface_text"]
+    source = "const ratio = obj.return\n / 2;"
+    at = source.index("/ 2")
+    assert surface_text.checked_slash_end(source, at, comments_blanked=True) == at + 1
+    with pytest.raises(ValueError, match="unreadable slash after a value at line 2 column 2"):
+        surface_text.checked_slash_end(source, at)
+
+
 @pytest.mark.parametrize("contents", ["echo ${value/path}", "echo ${unfinished", "echo \\"])
 def test_go_raw_strings_do_not_invoke_template_interpolation(
     check_surface: ModuleType, contents: str

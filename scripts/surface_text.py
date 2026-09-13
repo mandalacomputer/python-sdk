@@ -65,14 +65,90 @@ _DIVISION_OPERAND = re.compile(r"(?:[0-9][\w.]*|[A-Za-z_$][\w$]*)[ \t]*\Z")
 #: a PREFIX update of a regex property; an operand that can actually be assigned to,
 #: which a `)` cannot, so `if (c) ++ /re/.lastIndex` is a prefix update too; and no
 #: line break between the two, because that is where JavaScript inserts a semicolon
-#: and makes the update prefix whatever was above it.
-_POSTFIX_OPERAND = re.compile(r"[\w$\]][ \t]*(?:\+\+|--)\s*\Z")
+#: and makes the update prefix whatever was above it. The operand is captured so the
+#: third condition can be checked rather than assumed: a bare word before `++` is an
+#: operand only if it is a name, and `void ++ /re/.lastIndex` — or `this ++`, or
+#: `typeof ++` — is a PREFIX update of a regex property, which read as a division
+#: walked into the regex and reported a route table out of its body (adversarial
+#: review, OPL-4824). A word reached through a `.` is a property and assignable
+#: whatever it is spelled, so `obj.return++ / 2` stays the division it is — but the
+#: dot has to be a member access and not the last of a `...`, which exempted
+#: `fn(...typeof ++ /re/.lastIndex)` and reopened exactly that hole (adversarial
+#: review, round 2). The name is matched whole, from a position no identifier
+#: character precedes, so a reserved word that is the TAIL of a longer name — the
+#: `void` in `évoid`, whose first letter this pattern's ASCII class does not cover —
+#: cannot answer for it.
+_POSTFIX_OPERAND = re.compile(
+    r"((?<!\.)\.\s*)?(?:(?<![\w$])([A-Za-z_$][\w$]*)|([\w$\]]))[ \t]*(?:\+\+|--)\s*\Z"
+)
+#: Words a `++` cannot update, so one after any of them is a PREFIX update of what
+#: follows and the slash after it opens a regex. Every reserved word of the language
+#: plus the ones a module reserves, and NOT the contextual words `_NOT_A_VALUE`
+#: also lists: `async`, `type`, `of` and their kind are legal variable names, and
+#: rejecting `async++ / 2` cost the division and read the regex it is not
+#: (adversarial review, round 2). This list decides a slash rather than refusing it,
+#: so it is the enumerable set it claims to be — the reserved words — and not a
+#: superset chosen for caution: a word wrongly in it loses a legal division, and a
+#: word wrongly out of it reads a prefix update as one.
+_NOT_ASSIGNABLE = frozenset(
+    {
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    }
+)
 #: The same three operands as `_MEMBER_OPERAND` and `_DIVISION_OPERAND`, allowing a
 #: LINE BREAK between the value and the slash. Their own tails stop at a space or a
-#: tab on purpose, because `checked_slash_end` reads raw source, where looking back
-#: over a newline can borrow a token out of a line comment. `certain_operator`
-#: reads a prefix whose comments are already blanked, so it can afford the longer
-#: reach — and needs it, since `obj.return` on the line above a slash is the same
+#: tab on purpose, because `checked_slash_end` may be handed raw source, where
+#: looking back over a newline can borrow a token out of a line comment — so that
+#: reader answers a line-split value from these patterns only where its caller has
+#: promised the comments are blanked, and refuses otherwise (OPL-4824).
+#: `certain_operator` reads a prefix whose comments are already blanked, so it can
+#: afford the longer reach — and needs it, since `obj.return` on the line above a
+#: slash is the same
 #: division as `obj.return` beside it (adversarial review, OPL-4805). ASI does not
 #: change that: `a` then a newline then `/b/` is a division in JavaScript too.
 _MEMBER_OPERAND_LINES = re.compile(r"\.[A-Za-z_$][\w$]*\s*\Z")
@@ -149,10 +225,51 @@ _NOT_A_VALUE = frozenset(
         "yield",
     }
 )
+#: Words that are legal variable names AND occupy keyword positions, which is why
+#: they are in `_NOT_A_VALUE` without being reserved. A `++` after one of these can
+#: go either way and nothing lexical separates the two: `of++ / 2` increments a
+#: variable called `of` and divides, while `for (const x of ++ /re/.lastIndex)`
+#: increments a property of a regex, so the same slash opens a literal. Round 2 of
+#: this ticket's review required the first reading and round 3 the second, both
+#: correctly; the disagreement is not about the word but about a position only a
+#: parser can see. So this set is neither read as a value nor as an update — it is
+#: the third answer, and the readers treat it as the undecidable thing it is.
+_CONTEXTUAL_WORDS = _NOT_A_VALUE - _NOT_ASSIGNABLE
 
 
-def quoted_end(text: str, start: int) -> int:
-    """One past the end of the single-, double-, or backtick-quoted literal at ``start``."""
+def postfix_role(before: str) -> Literal["value", "update", "undecided"] | None:
+    """How the ``++`` or ``--`` ending ``before`` reads, or ``None`` if there is none.
+
+    ``"value"`` for a postfix update, whose operand is a value the following slash
+    can only divide; ``"update"`` for a prefix update of whatever comes after the
+    slash, which is therefore a regex literal; ``"undecided"`` where the operand is
+    one of :data:`_CONTEXTUAL_WORDS` and both readings are available.
+
+    Callers must not collapse ``"undecided"`` into either answer by default: reading
+    it as a value exposes a regex body as code, and reading it as an update consumes
+    a real division's line. The strict reader refuses it and the lenient reader hands
+    it to the caller's policy, so a reader of both policies sees them disagree.
+    """
+    match = _POSTFIX_OPERAND.search(before)
+    if match is None:
+        return None
+    # A member access or a single character — a `]` above all — is an assignable
+    # operand whatever it is spelled.
+    if match.group(1) or match.group(3):
+        return "value"
+    word = match.group(2)
+    if word in _NOT_ASSIGNABLE:
+        return "update"
+    return "undecided" if word in _CONTEXTUAL_WORDS else "value"
+
+
+def quoted_end(text: str, start: int, *, comments_blanked: bool = False) -> int:
+    """One past the end of the single-, double-, or backtick-quoted literal at ``start``.
+
+    ``comments_blanked`` says the caller's ``text`` has had its comments blanked
+    already, and is passed on to the strict slash reader used inside template
+    interpolations — see :func:`checked_slash_end`.
+    """
     quote = text[start]
     i = start + 1
     while i < len(text):
@@ -162,7 +279,14 @@ def quoted_end(text: str, start: int) -> int:
         if quote == "`" and text[i : i + 2] == "${":
             # Interpolations may contain strings or nested templates of their
             # own. Their quotes cannot terminate the surrounding template.
-            contents = balanced(text, i + 1, "{", "}", strict_slashes=True)
+            contents = balanced(
+                text,
+                i + 1,
+                "{",
+                "}",
+                strict_slashes=True,
+                comments_blanked=comments_blanked,
+            )
             i += len(contents) + 3
             continue
         if text[i] == quote:
@@ -223,11 +347,17 @@ def position(text: str, offset: int) -> str:
     return f"line {line} column {offset - text.rfind(chr(10), 0, offset)}"
 
 
-def checked_slash_end(text: str, start: int) -> int:
+def checked_slash_end(text: str, start: int, *, comments_blanked: bool = False) -> int:
     """Skip a known regex or division operator, refusing undecidable slash roles.
 
     Use before interpreting delimiters in code, including template
     interpolations: regex braces and backticks must never alter lexical scope.
+
+    ``comments_blanked`` is the caller's promise that comments in ``text`` are
+    already spaces, which is what lets the operand tests reach back over a line
+    break. Without it a name in a line comment could answer for the code below
+    it, so a value that is only reachable across a break is refused rather than
+    read either way — see the line-split branch below.
     """
     # A same-line member access is an operand, even with a keyword property.
     # Never borrow a member-looking suffix from a preceding line comment.
@@ -244,6 +374,31 @@ def checked_slash_end(text: str, start: int) -> int:
     operand = _DIVISION_OPERAND.search(before)
     if operand and operand.group(0).strip() not in _NOT_A_VALUE:
         return start + 1
+    # The same value, one line up — or a postfix update, whose last character is an
+    # operator a regex is otherwise allowed to follow. Both were read as REGEX
+    # positions here, and each reading ends at the next slash on the line: over a
+    # table's file that swallowed a template's backtick, which exposed the prose
+    # inside the template as code and hid the real declaration inside the shifted
+    # literal that followed. The reader then reported a route table it had read out
+    # of a string — the fail-open class of OPL-4805, in the strict path (OPL-4824).
+    #
+    # `certain_operator` is the predicate the lenient reader settles these with, and
+    # it reaches across a line break, so it may only be believed over text whose
+    # comments are already blanked. Where that is not promised the answer is a
+    # refusal: this reader exists to refuse what it cannot read, and a slash it
+    # would have to guess at is not made readable by guessing quietly.
+    #
+    # An update whose operand is a contextual word is neither, and is refused as
+    # itself: `of++ / 2` divides and `for (const x of ++ /re/.lastIndex)` does not,
+    # and this reader cannot see which position the word is in — see
+    # :func:`postfix_role`. Read as a value it reported a route table out of a regex
+    # body (adversarial review, round 3).
+    if postfix_role(before) == "undecided":
+        raise ValueError(f"unreadable update before a slash at {position(text, start)}")
+    if certain_operator(before):
+        if comments_blanked:
+            return start + 1
+        raise ValueError(f"unreadable slash after a value at {position(text, start)}")
     if not regex_can_start(text, start):
         raise ValueError(f"ambiguous slash at {position(text, start)}")
     end = regex_end(text, start)
@@ -269,22 +424,43 @@ def certain_operator(before: str) -> bool:
     a slash after ``+`` and ``obj.return / 2`` as a slash after the keyword
     ``return`` — both of which it calls regex positions, and both of which are
     divisions (adversarial review, OPL-4805).
+
+    An update this cannot place — :func:`postfix_role`'s ``"undecided"`` — is not
+    certain and so answers ``False`` here. That is not the same as "it is a regex":
+    both callers ask ``postfix_role`` themselves for that case, one to refuse it and
+    one to put it to the caller's policy.
     """
-    if _MEMBER_OPERAND_LINES.search(before) or _POSTFIX_OPERAND.search(before):
+    if _MEMBER_OPERAND_LINES.search(before):
+        return True
+    if postfix_role(before) == "value":
         return True
     operand = _DIVISION_OPERAND_LINES.search(before)
     return bool(operand and operand.group(0).strip() not in _NOT_A_VALUE)
 
 
 def _reads_as_regex(
-    before: str, text: str, at: int, undecided: Literal["operator", "regex"]
+    before: str,
+    text: str,
+    at: int,
+    undecided: Literal["operator", "regex"],
+    undecided_update: Literal["policy", "refuse"] = "policy",
 ) -> bool:
     """Whether to read the slash at ``at`` as opening a regex literal.
 
     Certain divisions first, then ``regex_can_start`` where it is confident, then
     the caller's policy for the positions nothing here can decide — see
     ``strip_comments``. ``before`` is the comment-blanked text up to the slash.
+
+    An update whose operand is a contextual word is not put to ``regex_can_start``,
+    which would answer from the ``+`` before the slash and give both policies the
+    same guess. ``undecided_update`` says what to do with it instead: ``"refuse"``
+    raises, and ``"policy"`` hands it to ``undecided`` like any other slash this
+    reader cannot place.
     """
+    if postfix_role(before) == "undecided":
+        if undecided_update == "refuse":
+            raise ValueError(f"unreadable update before a slash at {position(text, at)}")
+        return undecided == "regex" and regex_end(text, at) > at + 1
     if certain_operator(before):
         return False
     # Over the blanked prefix, not the raw source. `regex_can_start` reads the
@@ -310,6 +486,7 @@ def strip_comments(
     language: Literal["typescript", "go"] = "typescript",
     literals: bool = False,
     undecided_slash: Literal["operator", "regex"] = "operator",
+    undecided_update: Literal["policy", "refuse"] = "policy",
 ) -> str:
     """Blank out comments without touching comment markers inside literals.
 
@@ -339,6 +516,18 @@ def strip_comments(
     JavaScript parser and a stronger one than either reading alone. A regex
     literal cannot span a line break, so under ``"regex"`` a real division is
     skipped over at most as far as the end of its own line.
+
+    That both-ways guarantee is weaker than it sounds, and ``undecided_update`` is
+    where this file stops leaning on it. The two readings are chosen FILE-WIDE, so a
+    file with two undecidable slashes of OPPOSITE real roles gets a wrong answer
+    from each policy — and two wrong readings can land on the same value, which the
+    comparison then reads as agreement. A `for (const x of ++ /re/…)` and an `of++ /`
+    in one file did exactly that: both policies returned a number out of a template
+    and the caller accepted it (adversarial review, round 4). ``"refuse"`` makes this
+    pass raise on a contextual update instead of reading it either way, so the caller
+    never has to tell a real agreement from a manufactured one. It is the setting for
+    a reader whose answer is a comparison; ``"policy"`` keeps the behaviour for the
+    passes whose own second stage — the strict reader — refuses the same slash.
     """
     out: list[str] = []
     # The tail of what has been written, bounded: every lookback here is a few
@@ -400,7 +589,7 @@ def strip_comments(
         elif (
             language == "typescript"
             and ch == "/"
-            and _reads_as_regex(tail, text, i, undecided_slash)
+            and _reads_as_regex(tail, text, i, undecided_slash, undecided_update)
         ):
             end = regex_end(text, i)
             # A regex body is a literal like any other, and one that is left
@@ -418,7 +607,13 @@ def strip_comments(
 
 
 def balanced(
-    text: str, start: int, open_ch: str, close_ch: str, *, strict_slashes: bool = False
+    text: str,
+    start: int,
+    open_ch: str,
+    close_ch: str,
+    *,
+    strict_slashes: bool = False,
+    comments_blanked: bool = False,
 ) -> str:
     """The text between the bracket at ``start`` and the one that balances it.
 
@@ -429,13 +624,15 @@ def balanced(
     Template interpolations require strict slash handling before any delimiter
     is interpreted. Other callers may read languages with ordinary division;
     retaining their existing behavior avoids imposing JavaScript rules there.
+    ``comments_blanked`` is passed through to that strict reader and says nothing
+    about this function's own comment handling, which is the same either way.
     """
     depth = 0
     i = start
     while i < len(text):
         ch = text[i]
         if ch in "'\"`":
-            i = quoted_end(text, i)
+            i = quoted_end(text, i, comments_blanked=comments_blanked)
             continue
         if ch == "/" and text[i : i + 2] == "//":
             end = text.find("\n", i + 2)
@@ -446,7 +643,11 @@ def balanced(
             i = len(text) if end == -1 else end + 2
             continue
         if ch == "/" and (strict_slashes or regex_can_start(text, i)):
-            i = checked_slash_end(text, i) if strict_slashes else regex_end(text, i)
+            i = (
+                checked_slash_end(text, i, comments_blanked=comments_blanked)
+                if strict_slashes
+                else regex_end(text, i)
+            )
             continue
         if ch == open_ch:
             depth += 1
@@ -464,6 +665,10 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
     The source must already be comment-blanked. This is a lexical boundary
     check, not expression evaluation; unsupported declarations remain absent
     and their callers refuse an inventory they cannot establish.
+
+    That requirement is what is passed to the slash reader as
+    ``comments_blanked``: over this source a value on the line above a slash is
+    the operand it looks like, because no comment survives to supply one.
     """
     expression = re.compile(pattern)
     matches: list[re.Match[str]] = []
@@ -472,10 +677,10 @@ def module_matches(source: str, pattern: str) -> list[re.Match[str]]:
     while i < len(source):
         ch = source[i]
         if ch in "'\"`":
-            i = quoted_end(source, i)
+            i = quoted_end(source, i, comments_blanked=True)
             continue
         if ch == "/":
-            i = checked_slash_end(source, i)
+            i = checked_slash_end(source, i, comments_blanked=True)
             continue
         if not stack and (i == 0 or not _IDENT_CHAR.match(source[i - 1])):
             match = expression.match(source, i)
