@@ -486,7 +486,16 @@ MALFORMED: list[tuple[str, Any, str]] = [
     ("no routes", lambda b: _without(b, "routes"), "has no 'routes'"),
     ("no parameters", lambda b: _without(b, "parameters"), "has no 'parameters'"),
     ("no limits", lambda b: _without(b, "limits"), "has no 'limits'"),
-    ("routes is an object", lambda b: _set(b, "routes", {}), "'routes' is not a non-empty array"),
+    # A NON-EMPTY object, keyed by the routes that were there. `{}` would be
+    # refused by the emptiness half of the same guard, so it pins nothing about
+    # the type half — and iterating a dict yields its KEYS, so a mapping spelled
+    # this way survives the loop and produces a valid-looking route set while
+    # every value in it is ignored. That is the fail-open, not a hypothetical.
+    (
+        "routes is a non-empty object",
+        lambda b: _set(b, "routes", dict.fromkeys(b["routes"])),
+        "'routes' is not a non-empty array",
+    ),
     ("routes is empty", lambda b: _set(b, "routes", []), "'routes' is not a non-empty array"),
     (
         "a route is a number",
@@ -501,6 +510,11 @@ MALFORMED: list[tuple[str, Any, str]] = [
     (
         "a route method is lowercase",
         lambda b: _set(b, "routes", [*b["routes"], "get widgets"]),
+        "is not 'METHOD pattern'",
+    ),
+    (
+        "a route has no pattern",
+        lambda b: _set(b, "routes", [*b["routes"], "GET "]),
         "is not 'METHOD pattern'",
     ),
     (
