@@ -5729,7 +5729,10 @@ def test_read_text_file_is_read_file_and_makes_no_request_of_its_own(
 
     A sentinel exception rides along for the same reason: the refusals
     `read_text_file` inherits are inherited BECAUSE it calls `read_file`, so
-    what has to hold is that nothing is caught or reshaped on the way through.
+    what has to hold is that the failure arrives as the SAME object — not
+    replaced, not wrapped, not turned into a return value. It does not prove
+    nothing is caught: catching and re-raising the same exception would pass,
+    and would also be harmless.
     """
     c = _computer(client)
     calls: list[str] = []
