@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+from unittest import mock
 
 import httpx
 import pytest
@@ -1223,9 +1224,48 @@ async def test_read_text_file_decodes_on_the_async_half_too(client: mc.AsyncClie
     c = await client.computers.get("vm-1")
 
     assert await c.read_text_file("/etc/hostname") == "hello — ünïcode\n"
+    # ONE request, counted. See the sync half for why `calls.last` alone is
+    # satisfied by a method that transferred the file twice.
+    assert route.call_count == 1
     assert route.calls.last.request.headers["Accept"] == "application/octet-stream"
 
     respx.get(f"{BASE}/computers/vm-1/files").mock(
         httpx.Response(200, content=b"\xff\xfe\x00 not text")
     )
     assert "�" in await c.read_text_file("/tmp/blob")
+
+
+@respx.mock
+async def test_read_text_file_awaits_read_file_once_on_the_async_half(
+    client: mc.AsyncClient,
+) -> None:
+    """The async half's delegation, which the sync test cannot speak for.
+
+    Two implementations of one API drift, and the decode is inside the body
+    where `test_parity` cannot see it. Asserting the await happens once, with
+    the path as given, is what keeps this half from growing a request of its
+    own.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    c = await client.computers.get("vm-1")
+    calls: list[str] = []
+
+    async def fake(path: str) -> bytes:
+        calls.append(path)
+        return b"config\n"
+
+    with mock.patch.object(type(c), "read_file", staticmethod(fake)):
+        assert await c.read_text_file("/etc/app.conf") == "config\n"
+    assert calls == ["/etc/app.conf"]
+
+    sentinel = RuntimeError("from read_file")
+
+    async def raiser(path: str) -> bytes:
+        raise sentinel
+
+    with (
+        mock.patch.object(type(c), "read_file", staticmethod(raiser)),
+        pytest.raises(RuntimeError) as caught,
+    ):
+        await c.read_text_file("/etc/app.conf")
+    assert caught.value is sentinel

@@ -9,6 +9,7 @@ import json
 import math
 import shlex
 import time
+from unittest import mock
 
 import httpx
 import pytest
@@ -5671,6 +5672,11 @@ def test_read_text_file_decodes_utf8_and_sends_the_same_request(client: mc.Clien
     c = _computer(client)
 
     assert c.read_text_file("/etc/hostname") == "hello — ünïcode\n"
+    # ONE request, counted rather than inspected. Reading `calls.last` alone is
+    # satisfied by a method that transferred the file twice and by one that
+    # builds its own request from scratch — both of which this test exists to
+    # refuse, and neither of which its last-call assertions can see.
+    assert route.call_count == 1
     assert route.calls.last.request.url.params["path"] == "/etc/hostname"
     assert route.calls.last.request.headers["Accept"] == "application/octet-stream"
     assert _budget(route)["read"] == mc._client.FILE_TIMEOUT
@@ -5707,3 +5713,43 @@ def test_read_text_file_refuses_a_relative_path_before_the_request(
     with pytest.raises(ValueError):
         _computer(client).read_text_file("relative/path")
     assert not route.called
+
+
+@respx.mock
+def test_read_text_file_is_read_file_and_makes_no_request_of_its_own(
+    client: mc.Client,
+) -> None:
+    """Delegation, asserted against the method rather than against the wire.
+
+    The request-shape test above proves the two asks look alike; this proves
+    there is only one ask and that it is `read_file`'s. A reimplementation that
+    built its own request would satisfy every assertion over the transport and
+    still be a second place for the path rules, the Accept header and the file
+    budget to drift out of step.
+
+    A sentinel exception rides along for the same reason: the refusals
+    `read_text_file` inherits are inherited BECAUSE it calls `read_file`, so
+    what has to hold is that nothing is caught or reshaped on the way through.
+    """
+    c = _computer(client)
+    calls: list[str] = []
+
+    def fake(path: str) -> bytes:
+        calls.append(path)
+        return b"config\n"
+
+    with mock.patch.object(type(c), "read_file", staticmethod(fake)):
+        assert c.read_text_file("/etc/app.conf") == "config\n"
+    assert calls == ["/etc/app.conf"]
+
+    sentinel = RuntimeError("from read_file")
+
+    def raiser(path: str) -> bytes:
+        raise sentinel
+
+    with (
+        mock.patch.object(type(c), "read_file", staticmethod(raiser)),
+        pytest.raises(RuntimeError) as caught,
+    ):
+        c.read_text_file("/etc/app.conf")
+    assert caught.value is sentinel
