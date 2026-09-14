@@ -1474,10 +1474,17 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
 #: Kept in step by ``scripts/check_surface.py`` — a mirror nobody compares is a
 #: comment, and one that drifts refuses a run the platform would have taken.
 #:
-#: Capped rather than obeyed for the reason the platform gives: each step is a
-#: model call plus a screenshot on the caller's own key, so a ``max_steps`` of
-#: ten thousand is a request to spend their money for an hour on a task that has
-#: plainly gone wrong.
+#: Capped rather than obeyed for the reason the platform gives: every step drives
+#: the desktop and most of them cost a model call and a screenshot on the
+#: caller's own key, so a ``max_steps`` of ten thousand is a request to spend
+#: their money for an hour on a task that has plainly gone wrong.
+#:
+#: MOST, not every, and the distinction is the platform's rather than ours: a
+#: step is one ACTION, ``steps`` is incremented per tool call, and one model
+#: reply may ask for several. A paused turn is resubmitted and costs tokens and
+#: no step; a ``bash`` call and a cursor read take no screenshot. So this bounds
+#: the work and not the bill, and the README says so where a caller sizing a run
+#: will read it.
 MAX_STEPS = 100
 
 

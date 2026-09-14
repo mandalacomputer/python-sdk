@@ -5,9 +5,11 @@ interleaved with calls to a model API, running for minutes. So it answers with a
 stream of steps rather than a result, and this file is the shape of that stream.
 
 It runs on **your** Anthropic key, which the platform never stores: pass it as
-``model_key`` and it travels on that one request as ``X-Model-Key``. Every step
-is a model call plus a screenshot billed to that key, which is why ``max_steps``
-bounds spending as much as it bounds the loop.
+``model_key`` and it travels on that one request as ``X-Model-Key``. A step is
+one ACTION on the desktop rather than one exchange with the model — several can
+come out of a single reply, a paused turn costs tokens and no step, and a
+``bash`` call takes no screenshot — so ``max_steps`` bounds the loop and bounds
+what that key is billed only loosely.
 
 Everything here is built by :func:`to_agent_event` out of whatever a frame
 carried, and never by asserting a shape. A frame this SDK does not model is
