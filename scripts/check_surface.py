@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Diff the mirrors in tests/test_surface.py against the real tables upstream.
+"""Diff the mirrors in ``tests/surface_tables.py`` against the platform's manifest.
 
-``ALLOWED`` in the surface test mirrors ``V1_ROUTES`` in the platform's
-``web/lib/surface.ts``, and it is what keeps this SDK honest about which routes
-exist: a client calling a route the server does not expose fails in a user's
-hands rather than here. But a mirror nobody compares is a comment. This does the
-comparison whenever the platform repo happens to be checked out — next door by
-default, or wherever ``MANDALA_PLATFORM_REPO`` points. That variable is an
-assertion rather than a hint: set to a path that does not hold a checkout, this
-says so and exits 1 instead of quietly comparing against a neighbour or
-skipping (OPL-4512).
+``ALLOWED`` in the surface tables mirrors ``V1_ROUTES`` in the platform, and it
+is what keeps this SDK honest about which routes exist: a client calling a route
+the server does not expose fails in a user's hands rather than here. But a
+mirror nobody compares is a comment. This does the comparison whenever the
+platform repo happens to be checked out — next door by default, or wherever
+``MANDALA_PLATFORM_REPO`` points. That variable is an assertion rather than a
+hint: set to a path that does not hold a checkout, this says so and exits 1
+instead of quietly comparing against a neighbour or skipping (OPL-3901,
+OPL-4512).
 
 Not having the script is how three routes went missing. ``GET`` and ``DELETE
 computers/:id/exec/:pid`` (OPL-3584) and ``GET computers/:id/snapshots``
@@ -25,29 +25,73 @@ would make this a check people learn to ignore.
 Where it is enforced is the platform's own CI, which checks this repo out
 beside itself and runs this script against it (OPL-3916). That is the run a
 route added upstream cannot get past, and it is deliberately not here. The
-comparison prints the routes, parameters and constant values that have not
-shipped yet, and this repository's Actions logs are world-readable the day it
-goes public; the platform's are not. Running it here would also mean a read key
-for a private repo living in a public one, which is the wrong direction for a
-credential to point.
+comparison prints the routes, parameters and limits that have not shipped yet,
+and this repository's Actions logs are world-readable the day it goes public;
+the platform's are not. Running it here would also mean a read key for a private
+repo living in a public one, which is the wrong direction for a credential to
+point.
 
 So on a laptop with both checked out this is the check that catches drift
 before a push, and everywhere else it is the thing the platform runs.
 
-The parameter half exists because the route half was not enough. `Range` on
-`GET computers/:id/files` (OPL-3727) is a whole feature — the only way a file
-larger than one request moves comes off a computer at all — and it is not a
-route. It arrived on a route the mirror already knew about, so nothing here had
-anything to compare and this script went on reporting the SDK in step. A route
-table cannot see a parameter: the call lands in the right place either way, and
-what is missing is the argument that made it worth making.
+WHAT IT READS, AND WHY THAT CHANGED (OPL-4849)
+==============================================
+
+This used to scan the platform's TypeScript as TEXT — ``web/lib/surface.ts``
+for the routes, ``web/lib/apidoc.ts`` for the parameters, and five more modules
+in two languages for the numbers — through a hand-written reader in
+``scripts/surface_text.py``.
+
+That reader is gone, and so is the whole class of defect it kept producing.
+Across eleven adversarial review rounds the three client repositories' scanners
+turned up, and then closed, at least a dozen distinct FAIL-OPENS: runs that
+printed "the mirror matches the platform" without having read it. A ``.concat``
+after the leading array. A decoy table inside a type annotation. A projection
+callback that ignored its argument. ``.add`` after the constructor. An extra
+callback parameter whose default ran. A computed key in a destructured
+parameter. A type assertion that was really a comparison chain. A line comment
+ended by a carriage return. Each was fixed and the next spelling arrived,
+because recognising TypeScript is a TypeScript parser's job and this was not
+one.
+
+The platform already had the data — these are the tables its own API reference
+and OpenAPI document are built from. What was missing was a FILE, and since
+OPL-4827 there is one: ``surface-manifest.json`` at the platform's repo root,
+carrying the routes, the documented parameters and the numeric limits a client
+refuses against.
+
+Not the OpenAPI document, and the reason is the same one the platform gives:
+it does not carry the limits, and a checker that has to walk paths/methods/
+parameters to recover ``GET sizes`` is a second reader with its own bugs.
+
+THE THREE THINGS COMPARED
+=========================
+
+*Routes*, against ``ALLOWED``. The original check, and the one that is not
+enough on its own.
+
+*Parameters*, against ``PARAMETERS``. Every query, header and body field the
+platform documents, by route. This half exists because the route half was not
+enough: ``Range`` on ``GET computers/:id/files`` (OPL-3727) is a whole feature
+— the only way a file larger than one request moves comes off a computer at all
+— and it is not a route. It arrived on a route the mirror already knew about,
+so nothing here had anything to compare and this script went on reporting the
+SDK in step. A route table cannot see a parameter: the call lands in the right
+place either way, and what is missing is the argument that made it worth
+making.
+
+*Limits*, against the constants in ``_api``. A number copied out of the
+platform is a route by another name: the SDK refuses a value early to save the
+caller a round trip, and a ceiling that has drifted turns that favour into a
+refusal of a run the platform would have taken — with nothing failing here to
+say so.
 
     python scripts/check_surface.py
 """
 
 from __future__ import annotations
 
-import ast
+import json
 import os
 import re
 import subprocess
@@ -55,56 +99,53 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from surface_text import (
-    initializer_contents,
-    literal_contents,
-    literal_string,
-    module_matches,
-    object_entries,
-    split_items,
-    strip_comments,
-    top_level_keys,
-)
-
 REPO = Path(__file__).resolve().parent.parent
-SURFACE = Path("web/lib/surface.ts")
-AGENT = Path("web/lib/agent.ts")
-APIDOC = Path("web/lib/apidoc.ts")
 
-#: Platform constants this SDK mirrors, as ``(our name, their file, their name)``.
+#: The platform's generated inventory of its own v1 surface (OPL-4827).
 #:
-#: A number copied out of the platform is a route by another name: the SDK
-#: refuses a value early to save the caller a round trip, and a ceiling that has
-#: drifted turns that favour into a refusal of a run the platform would have
-#: taken — with nothing failing here to say so.
-#: The reader supports both TypeScript and Go constants.
-CLIPBOARD = Path("server/clipboard.go")
-EXEC = Path("server/execbg.go")
-API = Path("server/api.go")
-WEBHOOKS = Path("web/lib/webhooks.ts")
-WEBHOOKSIGN = Path("web/lib/webhooksign.ts")
+#: The single file this check reads. Everything it used to parse out of seven
+#: modules in two languages is in here, generated from the same tables the
+#: platform's reference and OpenAPI document are built from.
+MANIFEST = Path("surface-manifest.json")
 
+#: The manifest layouts this reader understands.
+#:
+#: A version it has never heard of is an ERROR rather than a best-effort read,
+#: on the rule the rest of this file follows: "could not tell" and "they agree"
+#: must never be the same answer. A future version that moved ``parameters``
+#: under a new key would otherwise read as a platform that documents no
+#: parameters at all, which is the exact shape of a silent pass.
+SUPPORTED_VERSIONS = frozenset({1})
+
+#: Platform limits this SDK mirrors, as ``(our constant, their manifest key)``.
+#:
+#: Every key here must be present in the manifest's ``limits``: a number that
+#: has moved or been renamed upstream is the news, not a reason to skip the
+#: comparison. The manifest may carry limits this SDK does not mirror — it is
+#: the platform's whole inventory, not our subset — and those are ignored
+#: rather than refused, because a ceiling this SDK never refuses against is
+#: nothing it can drift from.
 CONSTANTS = [
-    ("MAX_STEPS", AGENT, "MAX_MAX_STEPS"),
-    ("MAX_CLIPBOARD_BYTES", CLIPBOARD, "clipboardWriteMax"),
+    ("MAX_STEPS", "agent.maxSteps"),
+    ("MAX_CLIPBOARD_BYTES", "clipboard.writeMaxBytes"),
     # A mirrored number that nothing compares is a number that drifts, which is
     # the whole reason this list exists — and these two arrived as local
     # constants without an entry here.
-    ("MAX_ENV_ENTRIES", EXEC, "execMaxEnv"),
-    ("MAX_ENV_ENTRY_BYTES", EXEC, "execMaxEnvLen"),
-    ("MAX_EXEC_TIMEOUT_SECONDS", API, "execMaxTimeoutSec"),
+    ("MAX_ENV_ENTRIES", "exec.maxEnvEntries"),
+    ("MAX_ENV_ENTRY_BYTES", "exec.maxEnvEntryBytes"),
+    ("MAX_EXEC_TIMEOUT_SECONDS", "exec.maxTimeoutSeconds"),
     # The two webhook caps the SDK refuses at, and the replay window the
     # verifier defaults to — which is the one number a RECEIVER codes against.
-    ("WEBHOOK_DESCRIPTION_MAX", WEBHOOKS, "DESCRIPTION_MAX"),
-    ("WEBHOOK_COMPUTERS_MAX", WEBHOOKS, "COMPUTERS_MAX"),
-    ("WEBHOOK_REPLAY_WINDOW_S", WEBHOOKSIGN, "REPLAY_WINDOW_S"),
+    ("WEBHOOK_DESCRIPTION_MAX", "webhook.descriptionMaxChars"),
+    ("WEBHOOK_COMPUTERS_MAX", "webhook.computersMax"),
+    ("WEBHOOK_REPLAY_WINDOW_S", "webhook.replayWindowSeconds"),
 ]
 
 #: The files whose contents this check mirrors. Kept separately from the
 #: markers that identify a platform checkout: a checkout with one of these
 #: missing is evidence of drift (or an incomplete checkout), not evidence that
 #: there is no checkout and therefore permission to skip the comparison.
-MIRROR_SOURCES = tuple(dict.fromkeys((SURFACE, APIDOC, *(module for _, module, _ in CONSTANTS))))
+MIRROR_SOURCES = (MANIFEST,)
 
 #: The platform repository, as ``owner/name`` on whatever remote it was cloned
 #: from — which is what a checkout *is*, and the one thing about it that does not
@@ -148,10 +189,20 @@ def git_environment() -> dict[str, str]:
 
 #: The files that identify a platform checkout git cannot vouch for — an export,
 #: a vendored copy, a clone whose remote was removed. A fallback rather than the
-#: primary test: they are contents, and contents are what goes missing when the
-#: mirror drifts. ``MIRROR_SOURCES`` separately says whether a recognized
-#: checkout is complete enough to compare against.
-PLATFORM_MARKERS = (SURFACE, APIDOC)
+#: primary test.
+#:
+#: Deliberately NOT the manifest, even though the manifest is now the only file
+#: this check reads. A marker and a mirror source have opposite failure modes:
+#: the marker says "this is the platform", the mirror source is the thing whose
+#: absence is the news. Make them the same file and a checkout that LOST the
+#: manifest stops being recognized as the platform at all — so instead of the
+#: loud "mirror sources are missing" that :func:`missing_mirror_sources` exists
+#: to print, the search falls through to a silent skip at exit 0. That is
+#: OPL-3901 reopened by tidying.
+#:
+#: These two are still the platform's, and still where the manifest is
+#: generated FROM; this reader simply no longer parses them.
+PLATFORM_MARKERS = (Path("web/lib/surface.ts"), Path("web/lib/apidoc.ts"))
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
@@ -290,216 +341,172 @@ def missing_mirror_sources(platform: Path) -> list[Path]:
     This used to be folded into :func:`platform_repo`: a checkout that had the
     route and parameter tables but had lost ``server/clipboard.go`` looked
     absent, so the entire check skipped. Before that skip was added it looked
-    complete and ``constant_drift`` died in ``Path.read_text``. Neither answer
-    distinguishes "there is no checkout" from "the checkout drifted underneath
-    the mirror"; this inventory is the third state that does.
+    complete and the constant comparison died in ``Path.read_text``. Neither
+    answer distinguishes "there is no checkout" from "the checkout drifted
+    underneath the mirror"; this inventory is the third state that does.
+
+    One file now instead of seven, and it matters MORE rather than less: a
+    platform checkout without its manifest is a platform this check cannot
+    compare against at all, and the one thing it must not do about that is
+    print a number and exit 0.
     """
     return [source for source in MIRROR_SOURCES if not (platform / source).is_file()]
 
 
-def table(source: str, name: str) -> set[tuple[str, str]]:
-    """Read every route literal, or refuse a table this reader cannot compare."""
-    try:
-        source = strip_comments(source)
-        declarations = module_matches(
-            source,
-            rf"export\s+const\s+{re.escape(name)}\s*:\s*Route\[\]\s*=\s*\[",
-        )
-        if len(declarations) != 1:
-            raise ValueError("declaration absent, ambiguous, or unsupported")
-        body = initializer_contents(source, declarations[0].end() - 1, "[", "]")
-        routes = set()
-        for entry in split_items(body):
-            fields = object_entries(literal_contents(entry, "{", "}"))
-            if "method" not in fields or "pattern" not in fields:
-                raise ValueError("route needs literal method and pattern fields")
-            routes.add((literal_string(fields["method"]), literal_string(fields["pattern"])))
-        if not routes:
-            raise ValueError("found no routes")
-        return routes
-    except ValueError as err:
-        raise SystemExit(f"cannot read {name} in {SURFACE}: {err}") from None
+class ManifestError(Exception):
+    """The manifest is absent, unreadable, or not the shape this reader knows.
 
-
-def shared_query(source: str) -> dict[str, str]:
-    """Read named parameter-entry literals from comment-blanked source.
-
-    Unknown references are refused at their use site; shared arrays and
-    arbitrary expressions are deliberately outside this reader's grammar.
+    Its own exception so every raise site can say what it found and every one
+    of them lands on the same exit — there is no shape of this file that means
+    "compare what you can". The generated article either describes the
+    platform's surface or this check has nothing to compare, and the second of
+    those is a failure, not a quiet zero.
     """
-    found = {}
-    for match in module_matches(
-        source,
-        r"(?:export\s+)?const ([A-Za-z_$][\w$]*):\s*Query\s*=\s*\{",
-    ):
-        name = match.group(1)
-        try:
-            fields = object_entries(initializer_contents(source, match.end() - 1, "{", "}"))
-            if "name" not in fields or name in found:
-                raise ValueError("shared parameter entry has no name or an ambiguous declaration")
-            found[name] = literal_string(fields["name"])
-        except ValueError as err:
-            raise ValueError(f"shared parameter {name}: {err}") from None
+
+
+def _routes(raw: object) -> set[tuple[str, str]]:
+    """``["GET computers", ...]`` as ``{("GET", "computers"), ...}``."""
+    if not isinstance(raw, list) or not raw:
+        raise ManifestError("'routes' is not a non-empty array")
+    found: set[tuple[str, str]] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise ManifestError(f"'routes' holds a non-string entry: {entry!r}")
+        # One space, method first. Split on the FIRST space rather than any
+        # run of whitespace: a pattern cannot contain a space, so a second one
+        # is a malformed entry rather than something to normalize away.
+        method, sep, pattern = entry.partition(" ")
+        if not sep or not method.isupper() or not pattern or " " in pattern:
+            raise ManifestError(f"'routes' entry is not 'METHOD pattern': {entry!r}")
+        if (method, pattern) in found:
+            raise ManifestError(f"'routes' lists {entry!r} twice")
+        found.add((method, pattern))
     return found
 
 
-def _parameter_names(value: str, shared: dict[str, str]) -> set[str]:
-    """Account for every entry in a query/header array, including named entries."""
-    names = set()
-    for entry in split_items(literal_contents(value, "[", "]")):
-        if entry.startswith("{"):
-            fields = object_entries(literal_contents(entry, "{", "}"))
-            if "name" not in fields:
-                raise ValueError("parameter entry has no name")
-            names.add(literal_string(fields["name"]))
-        elif re.fullmatch(r"[A-Za-z_$][\w$]*", entry) and entry in shared:
-            names.add(shared[entry])
-        else:
-            raise ValueError("unsupported or unresolved parameter entry")
-    return names
+def _parameters(raw: object, routes: set[tuple[str, str]]) -> dict[str, set[str]]:
+    """The documented parameters, keyed the way ``PARAMETERS`` is.
+
+    The manifest omits a route that documents none, so those are filled back in
+    as empty sets here. Without that, every one of the 27 routes that take no
+    argument would read as "in PARAMETERS, no longer documented upstream" — 27
+    lines of drift on a mirror that is exactly right, which is the kind of
+    noise that gets a check ignored.
+
+    A key that is not a known route is refused rather than filled in: the two
+    halves of the manifest describing different surfaces is a generator bug,
+    and the safe reading of a parameter table for a route that does not exist
+    is not to quietly compare it.
+    """
+    if not isinstance(raw, dict):
+        raise ManifestError("'parameters' is not an object")
+    known = {f"{method} {pattern}" for method, pattern in routes}
+    table = {route: set() for route in known}
+    for route, names in raw.items():
+        if route not in known:
+            raise ManifestError(f"'parameters' documents {route!r}, which is not in 'routes'")
+        if not isinstance(names, list):
+            raise ManifestError(f"'parameters' for {route!r} is not an array")
+        for name in names:
+            if not isinstance(name, str):
+                raise ManifestError(f"'parameters' for {route!r} holds a non-string: {name!r}")
+            # `query:`, `header:` and `body:` are the three kinds the mirror
+            # spells out. An unprefixed name would compare equal to nothing in
+            # PARAMETERS and read as one missing parameter plus one stale one,
+            # which describes a reader that has lost the vocabulary rather than
+            # a platform that changed.
+            if not name.startswith(("query:", "header:", "body:")):
+                raise ManifestError(
+                    f"'parameters' for {route!r} holds {name!r}, which names no "
+                    "query:, header: or body: field"
+                )
+        table[route] = set(names)
+    return table
 
 
-def parameters(platform: Path) -> dict[str, set[str]]:
-    """Read all documented route parameters, refusing unknown declarations."""
+def _limits(raw: object) -> dict[str, int]:
+    """The numeric ceilings, as ``{key: value}``.
+
+    ``bool`` is excluded explicitly because it is an ``int`` in Python and
+    ``True`` would otherwise compare equal to a mirrored ``1``.
+    """
+    if not isinstance(raw, dict):
+        raise ManifestError("'limits' is not an object")
+    found: dict[str, int] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ManifestError(f"'limits' entry {key!r} is {value!r}, which is not an integer")
+        found[key] = value
+    return found
+
+
+def manifest(platform: Path) -> tuple[set[tuple[str, str]], dict[str, set[str]], dict[str, int]]:
+    """The platform's own inventory of its v1 surface.
+
+    Fails closed at every step, and that is the entire point of reading a
+    generated file rather than parsing source: an absent file, a truncated one,
+    a version this reader does not know, a missing top-level key, or an entry
+    in a shape it cannot read all raise. None of them may reach the comparison
+    as "the platform documents nothing here", because that is indistinguishable
+    from agreement — and a dozen closed fail-opens in the reader this replaces
+    is what indistinguishable looks like in practice.
+    """
+    path = platform / MANIFEST
     try:
-        source = strip_comments((platform / APIDOC).read_text())
-        shared = shared_query(source)
-        declarations = module_matches(
-            source,
-            r"export\s+const\s+DOCS\s*:\s*Record<string,\s*Doc>\s*=\s*\{",
+        raw = path.read_text()
+    except OSError as err:
+        raise ManifestError(f"cannot be read: {err.strerror or err}") from err
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise ManifestError(f"is not valid JSON: {err}") from err
+    if not isinstance(data, dict):
+        raise ManifestError("is not a JSON object")
+
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ManifestError(f"has no integer 'version' (got {version!r})")
+    if version not in SUPPORTED_VERSIONS:
+        known = ", ".join(str(v) for v in sorted(SUPPORTED_VERSIONS))
+        raise ManifestError(
+            f"is version {version}, and this reader knows {known}. "
+            "Teach it the new layout rather than comparing against a guess"
         )
-        if len(declarations) != 1:
-            raise ValueError("DOCS declaration absent, ambiguous, or unsupported")
-        docs = object_entries(initializer_contents(source, declarations[0].end() - 1, "{", "}"))
-        table: dict[str, set[str]] = {}
-        for route, value in docs.items():
-            if re.fullmatch(r"[A-Z]+ .+", route) is None:
-                raise ValueError("unsupported route key in DOCS")
-            try:
-                fields = object_entries(literal_contents(value, "{", "}"))
-                found: set[str] = set()
-                for key, kind in (("query", "query"), ("headers", "header")):
-                    if key in fields:
-                        try:
-                            found.update(
-                                f"{kind}:{name}" for name in _parameter_names(fields[key], shared)
-                            )
-                        except ValueError as err:
-                            raise ValueError(f"{key}: {err}") from None
-                if "body" in fields:
-                    body = fields["body"]
-                    call = re.match(r"object\s*(?=\()", body)
-                    if call:
-                        args = split_items(literal_contents(body[call.end() :], "(", ")"))
-                        if not args or not args[0].startswith("{"):
-                            raise ValueError("unreadable body fields")
-                        found.update(
-                            f"body:{key}"
-                            for key in top_level_keys(literal_contents(args[0], "{", "}"))
-                        )
-                    elif body.startswith("{"):
-                        # Raw schemas describe binary bodies, with no named fields.
-                        object_entries(literal_contents(body, "{", "}"))
-                    else:
-                        raise ValueError("unreadable body fields")
-                table[route] = found
-            except ValueError as err:
-                if str(err) == "unreadable body fields":
-                    raise SystemExit(
-                        f"'{route}' in {APIDOC} documents a body in a form this\n"
-                        "  reader does not know — neither object(...) nor a raw schema literal."
-                    ) from None
-                raise SystemExit(f"cannot read '{route}' in {APIDOC}: {err}") from None
-        if not table:
-            raise ValueError("found no routes in DOCS")
-        return table
-    except ValueError as err:
-        raise SystemExit(f"cannot read DOCS in {APIDOC}: {err}") from None
+
+    for key in ("routes", "parameters", "limits"):
+        if key not in data:
+            raise ManifestError(f"has no {key!r}")
+
+    routes = _routes(data["routes"])
+    return routes, _parameters(data["parameters"], routes), _limits(data["limits"])
 
 
-def constant(source: str, name: str, module: Path) -> int:
-    """One integer constant out of a platform module, TypeScript or Go.
-
-    Supports TypeScript ``export const NAME = <expr>``, standalone Go
-    ``const name = <expr>``, and ``name = <expr>`` inside a Go ``const`` block.
-    Declarations are matched at the start of a line over source whose comments have been
-    blanked first, so that a mention of the name in a comment or in another
-    expression is not read as its declaration — the Go form always was, and the
-    TypeScript one was not, which made a commented-out declaration upstream a
-    silent match here.
-
-    Which form is tried is decided by the module's suffix rather than by trying
-    both: the two patterns are close enough that a file answering to the wrong
-    one is a way for this to agree by accident.
-
-    The value is an EXPRESSION, not a literal, because both languages write
-    these as products — ``64 * 1024`` is how a byte ceiling is legible, and a
-    reader that demanded a bare integer could not see the very constants it exists to
-    compare. Evaluated with a grammar that admits integers, ``*``, ``+`` and
-    parentheses and nothing else: no names, no calls, no attribute access. A
-    declaration this cannot evaluate raises rather than being skipped, on the
-    rule the rest of this file follows — "could not tell" and "they agree" must
-    never be the same answer.
-    """
-    blanked = strip_comments(source, language="go" if module.suffix == ".go" else "typescript")
-    pattern = (
-        rf"^\s*(?:const[ \t]+)?{re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*$"
-        if module.suffix == ".go"
-        else rf"^\s*export const {re.escape(name)}\s*=\s*([0-9*+()\s]+?)[ \t]*;?[ \t]*$"
-    )
-    m = re.search(pattern, blanked, re.MULTILINE)
-    if m is None:
-        raise SystemExit(f"{name} not found in {module} — has it moved or changed shape?")
-    try:
-        return _arith(ast.parse(m.group(1).strip(), mode="eval").body)
-    except (SyntaxError, ValueError) as err:
-        raise SystemExit(
-            f"{name} is {m.group(1)!r} in {module}, which this reader cannot evaluate"
-        ) from err
-
-
-def _arith(node: ast.expr) -> int:
-    """Evaluate an integer arithmetic expression, and nothing else.
-
-    Deliberately not :func:`eval`, and not :func:`ast.literal_eval` either —
-    the first would run whatever a platform file happened to contain, and the
-    second refuses ``64 * 1024``, which is the only shape these constants are
-    ever written in.
-    """
-    if (
-        isinstance(node, ast.Constant)
-        and isinstance(node.value, int)
-        and not isinstance(node.value, bool)
-    ):
-        return node.value
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Add)):
-        left, right = _arith(node.left), _arith(node.right)
-        return left * right if isinstance(node.op, ast.Mult) else left + right
-    raise ValueError(f"not integer arithmetic: {ast.dump(node)}")
-
-
-def constant_drift(platform: Path) -> list[str]:
+def limit_drift(limits: dict[str, int]) -> list[str]:
     """Every mirrored constant that no longer matches the platform's.
 
-    Imported rather than scraped, for the reason :func:`mirrored` is: the module
-    is the mirror, and a second parser over it would be one more thing that can
-    disagree with what the SDK actually sends.
+    ``_api`` is imported rather than scraped, for the reason :func:`mirrored`
+    is: the module is the mirror, and a second parser over it would be one more
+    thing that can disagree with what the SDK actually sends.
+
+    A key the manifest does not carry raises rather than being skipped. A
+    ceiling this SDK refuses against and the platform no longer publishes is
+    the most dangerous of the three drifts — the SDK goes on turning away calls
+    the platform would take, and nothing anywhere says why.
     """
     sys.path.insert(0, str(REPO / "src"))
     from mandala_computer import _api
 
     drifted = []
-    for ours, module, theirs in CONSTANTS:
+    for ours, theirs in CONSTANTS:
         mine = getattr(_api, ours)
-        try:
-            source = (platform / module).read_text()
-        except OSError as err:
-            raise SystemExit(
-                f"{module} is not readable in the platform checkout — has it moved or changed shape?"
-            ) from err
-        upstream = constant(source, theirs, module)
+        if theirs not in limits:
+            raise ManifestError(
+                f"does not publish the limit {theirs!r}, which this SDK mirrors as "
+                f"{ours} = {mine}. Has it been renamed or withdrawn upstream?"
+            )
+        upstream = limits[theirs]
         if mine != upstream:
-            drifted.append(f"  ! {ours} is {mine}, but {module}'s {theirs} is {upstream}")
+            drifted.append(f"  ! {ours} is {mine}, but the manifest's {theirs} is {upstream}")
     return drifted
 
 
@@ -533,7 +540,12 @@ def mirrored() -> set[tuple[str, str]]:
 
 
 def mirrored_parameters() -> dict[str, set[str]]:
-    """The parameter mirror, imported for the same reason :func:`mirrored` is."""
+    """The parameter mirror, imported for the same reason :func:`mirrored` is.
+
+    Keyed ``"METHOD pattern"`` to match the manifest. The table itself is keyed
+    that way already; this only copies the sets so a caller cannot mutate the
+    module's own.
+    """
     return {route: set(names) for route, names in _surface_tables().PARAMETERS.items()}
 
 
@@ -567,7 +579,7 @@ def main() -> int:
         print(
             "check-surface — platform repo not found, skipping.\n"
             f"  Looked for a clone of {PLATFORM_REMOTE} in: {looked or '(nowhere)'}\n"
-            f"  Set MANDALA_PLATFORM_REPO to compare against {SURFACE}."
+            f"  Set MANDALA_PLATFORM_REPO to compare against {MANIFEST}."
         )
         return 0
 
@@ -579,23 +591,28 @@ def main() -> int:
         print("  Restore or update these paths before comparing the mirrored surface.")
         return 1
 
-    upstream = table((platform / SURFACE).read_text(), "V1_ROUTES")
+    try:
+        upstream, upstream_params, limits = manifest(platform)
+        drifted = limit_drift(limits)
+    except ManifestError as err:
+        print(
+            f"check-surface — {platform / MANIFEST} {err}.\n"
+            "  This check compares nothing it cannot read: a manifest it does not\n"
+            "  understand is a failure rather than a green run over an empty table."
+        )
+        return 1
+
     mirror = mirrored()
     added = sorted(upstream - mirror)
     removed = sorted(mirror - upstream)
-    drifted = constant_drift(platform)
-    params = parameter_drift(parameters(platform), mirrored_parameters())
+    params = parameter_drift(upstream_params, mirrored_parameters())
 
     if not added and not removed and not drifted and not params:
         n = len(CONSTANTS)
         counted = sum(len(names) for names in mirrored_parameters().values())
         print(
-            # `platform`, not `platform / SURFACE.parent`. The routes and
-            # parameters come from web/lib and the constants no longer all do —
-            # clipboardWriteMax is read out of server/ — so naming one
-            # directory understated what had been compared.
-            f"check-surface — {len(mirror)} routes, {counted} parameters and {n} constant"
-            f"{'' if n == 1 else 's'}, in step with {platform}."
+            f"check-surface — {len(mirror)} routes, {counted} parameters and {n} limit"
+            f"{'' if n == 1 else 's'}, in step with {platform / MANIFEST}."
         )
         return 0
 
@@ -612,7 +629,7 @@ def main() -> int:
         "  Update ALLOWED and PARAMETERS in tests/surface_tables.py, and add anything\n"
         "  new to UNIMPLEMENTED or UNIMPLEMENTED_PARAMETERS until this SDK can send\n"
         "  it — which is the line that makes a gap somebody's to close rather than\n"
-        "  nobody's to notice. A constant that has moved belongs in\n"
+        "  nobody's to notice. A limit that has moved belongs in\n"
         "  src/mandala_computer/_api.py."
     )
     return 1

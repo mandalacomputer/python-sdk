@@ -1,11 +1,29 @@
-"""The platform surface check's checkout discovery and failure boundaries."""
+"""The platform surface check's checkout discovery and failure boundaries.
+
+Two halves. The first is discovery — which directory is the platform, and what
+happens when the answer is "none" or "not the one you named". The second is the
+manifest reader, and every test in it asks the same question a different way:
+when this cannot read the platform's inventory, does it FAIL, or does it print
+a number and exit 0?
+
+That question is the whole of OPL-4849. The reader this replaced scanned the
+platform's TypeScript as text, and across eleven review rounds it produced at
+least a dozen distinct fail-opens — runs that announced "the mirror matches the
+platform" without having read it. Reading a generated JSON file removes the
+grammar, but it does not by itself remove the failure mode: a missing key read
+as an empty table, or an unknown version read as best-effort, is the same green
+run over nothing. So the shape checks below are not defensive programming
+around a file we control. They are the point.
+"""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -27,15 +45,58 @@ def check_surface(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return check_surface
 
 
-def _platform_without(check_surface: ModuleType, tmp_path: Path, missing: Path) -> Path:
-    """A recognized synthetic checkout with exactly one mirror source absent."""
+def _manifest_body(check_surface: ModuleType) -> dict[str, Any]:
+    """A manifest that agrees with this SDK's mirror on all three tables.
+
+    Built from the mirror rather than copied from the platform, so these tests
+    exercise the READER without also re-pinning the surface — the comparison
+    against the real platform is `scripts/check_surface.py` run against a real
+    checkout, and duplicating 56 routes here would be a third mirror to keep in
+    step.
+    """
+    from mandala_computer import _api
+
+    routes = sorted(f"{method} {pattern}" for method, pattern in check_surface.mirrored())
+    parameters = {
+        route: sorted(names)
+        for route, names in check_surface.mirrored_parameters().items()
+        # The platform omits a route that documents no parameters, and the
+        # reader fills those back in. Omitting them here is what makes that
+        # behaviour load-bearing in these fixtures rather than incidental.
+        if names
+    }
+    limits = {theirs: getattr(_api, ours) for ours, theirs in check_surface.CONSTANTS}
+    return {"version": 1, "routes": routes, "parameters": parameters, "limits": limits}
+
+
+def _platform(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    *,
+    manifest: Any = ...,
+    raw: str | None = None,
+    missing_marker: Path | None = None,
+) -> Path:
+    """A synthetic platform checkout, recognized by its marker files.
+
+    ``manifest`` is written as JSON; pass ``None`` to leave the file out
+    entirely, or ``raw`` to write bytes that are not JSON at all.
+    """
     platform = tmp_path / "platform"
-    for source in check_surface.MIRROR_SOURCES:
-        if source == missing:
+    for marker in check_surface.PLATFORM_MARKERS:
+        if marker == missing_marker:
             continue
-        path = platform / source
+        path = platform / marker
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("// synthesized platform source\n")
+
+    path = platform / check_surface.MANIFEST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if raw is not None:
+        path.write_text(raw)
+    elif manifest is not None:
+        body = _manifest_body(check_surface) if manifest is ... else manifest
+        path.write_text(json.dumps(body))
     return platform
 
 
@@ -64,29 +125,79 @@ def _clone_of(check_surface: ModuleType, remote: str, directory: Path) -> Path:
     return directory
 
 
-def test_a_checkout_that_lost_only_apidoc_ts_is_recognized_by_its_remote(
+# ---------------------------------------------------------------------------
+# Discovery: which directory is the platform
+# ---------------------------------------------------------------------------
+
+
+def test_a_checkout_that_lost_its_manifest_is_recognized_by_its_remote(
     check_surface: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """OPL-3901: the fail-open that marker files left one file wide.
+    """OPL-3901, restated against the one file this now reads.
 
-    ``apidoc.ts`` is the parameter table, so losing it is precisely the drift
-    this check exists to notice — and while recognition was a test of contents,
-    losing it made the checkout look absent and the whole comparison skipped at
-    exit 0. Identity does not care which files are there.
+    The manifest IS the comparison, so losing it is precisely the drift this
+    check exists to notice — and while recognition was a test of contents,
+    losing the compared file made the checkout look absent and the whole
+    comparison skipped at exit 0. Identity does not care which files are there.
     """
-    platform = _platform_without(check_surface, tmp_path, check_surface.APIDOC)
+    platform = _platform(check_surface, tmp_path, manifest=None)
     _clone_of(check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", platform)
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
     assert check_surface.platform_repo() == platform
     assert check_surface.main() == 1
-    assert str(platform / check_surface.APIDOC) in capsys.readouterr().out
+    assert str(platform / check_surface.MANIFEST) in capsys.readouterr().out
 
 
-def test_a_clone_with_no_mirror_sources_at_all_is_still_the_platform(
+def test_the_manifest_is_not_a_marker_so_losing_it_stays_loud(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The tidying that would quietly reopen OPL-3901.
+
+    With the manifest as the only file read, it is tempting to make it the
+    marker too. Then a copy git cannot vouch for that has LOST the manifest
+    stops being the platform at all: instead of "mirror sources are missing" at
+    exit 1, the search falls through to "not found, skipping" at exit 0 — the
+    exact fail-open, wearing a tidier hat.
+
+    So this checkout has no remote and no manifest, and is still recognized.
+    """
+    platform = _platform(check_surface, tmp_path, manifest=None)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.remotes(platform) == frozenset()
+    assert check_surface.is_platform_checkout(platform) is True
+    assert check_surface.main() == 1
+    assert "mirror sources are missing" in capsys.readouterr().out
+
+
+def test_a_checkout_that_lost_a_marker_still_compares_via_its_remote(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The markers are identity only — a checkout with the manifest still passes.
+
+    ``apidoc.ts`` is where the parameter half of the manifest is generated from,
+    but this reader no longer opens it. A clone that has the manifest and not
+    the marker is a complete answer to the question being asked.
+    """
+    platform = _platform(check_surface, tmp_path, missing_marker=check_surface.PLATFORM_MARKERS[1])
+    _clone_of(check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", platform)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.platform_repo() == platform
+    assert check_surface.missing_mirror_sources(platform) == []
+    assert check_surface.main() == 0
+
+
+def test_a_clone_with_nothing_in_it_at_all_is_still_the_platform(
     check_surface: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -130,7 +241,7 @@ def test_a_copy_git_cannot_vouch_for_is_still_recognized_by_its_files(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An export or a vendored copy has no remote to ask about, and still counts."""
-    platform = _platform_without(check_surface, tmp_path, missing=Path("nothing/is/missing"))
+    platform = _platform(check_surface, tmp_path)
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
     assert check_surface.remotes(platform) == frozenset()
@@ -148,12 +259,10 @@ def test_a_directory_inside_a_repository_does_not_borrow_its_identity(
     )
     inside = clone / "web"
     inside.mkdir()
-    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(inside))
 
+    assert check_surface.remotes(clone) == frozenset({check_surface.PLATFORM_REMOTE})
     assert check_surface.remotes(inside) == frozenset()
     assert check_surface.is_platform_checkout(inside) is False
-    with pytest.raises(SystemExit):
-        check_surface.platform_repo()
 
 
 def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
@@ -161,54 +270,21 @@ def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``GIT_DIR`` outranks ``-C``, and a git hook exports one.
+    """A git hook exports GIT_DIR, and it outranks ``-C``.
 
-    Both directions are wrong and both are reachable from a hook or a wrapper
-    that runs this check: an unrelated clone answering with the platform's name,
-    and a platform sibling answering with the SDK's — the second being OPL-3901
-    again, since recognition then falls back to the marker files that a missing
-    ``apidoc.ts`` defeats.
+    Left in place, every directory this asked about would report the remotes of
+    whichever repository the hook fired in.
     """
     platform = _clone_of(
-        check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "app"
+        check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "platform"
     )
     other = _clone_of(
         check_surface, "git@github.com:mandalacomputer/python-sdk.git", tmp_path / "sdk"
     )
-
-    monkeypatch.setenv("GIT_DIR", str(platform / ".git"))
     assert check_surface.remotes(other) == frozenset({"mandalacomputer/python-sdk"})
 
     monkeypatch.setenv("GIT_DIR", str(other / ".git"))
     assert check_surface.remotes(platform) == frozenset({check_surface.PLATFORM_REMOTE})
-
-
-def test_a_recognized_checkout_missing_a_constants_module_fails_and_names_it(
-    check_surface: ModuleType,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    platform = _platform_without(check_surface, tmp_path, check_surface.CLIPBOARD)
-    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
-
-    assert check_surface.platform_repo() == platform
-    assert check_surface.main() == 1
-    assert str(platform / check_surface.CLIPBOARD) in capsys.readouterr().out
-
-
-def test_a_recognized_checkout_missing_agent_ts_fails_instead_of_skipping(
-    check_surface: ModuleType,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    platform = _platform_without(check_surface, tmp_path, check_surface.AGENT)
-    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
-
-    assert check_surface.platform_repo() == platform
-    assert check_surface.main() == 1
-    assert str(platform / check_surface.AGENT) in capsys.readouterr().out
 
 
 def test_a_genuinely_absent_platform_checkout_still_skips_cleanly(
@@ -246,7 +322,7 @@ def test_a_variable_pointing_at_no_checkout_fails_instead_of_looking_elsewhere(
     absent.mkdir()
     # A sibling that would answer, so the failure is the variable being wrong
     # rather than there being nothing else to find.
-    sibling = _platform_without(check_surface, tmp_path / "next-door", Path("nothing/is/missing"))
+    sibling = _platform(check_surface, tmp_path / "next-door")
     monkeypatch.setattr(check_surface, "REPO", sibling.parent / "sdk")
     monkeypatch.setattr(check_surface, "SIBLINGS", (sibling.name,))
     assert check_surface.platform_repo() == sibling
@@ -256,7 +332,7 @@ def test_a_variable_pointing_at_no_checkout_fails_instead_of_looking_elsewhere(
         check_surface.platform_repo()
     message = str(exit_info.value)
     assert str(absent) in message
-    assert str(check_surface.SURFACE) in message
+    assert str(check_surface.PLATFORM_MARKERS[0]) in message
     assert str(sibling) not in message
 
 
@@ -271,7 +347,7 @@ def test_a_variable_set_and_empty_is_not_read_as_no_variable(
     expand leaves an empty string, not an absent key — so reading empty as unset
     would hand exactly that failure back to the sibling search it came from.
     """
-    sibling = _platform_without(check_surface, tmp_path / "next-door", Path("nothing/is/missing"))
+    sibling = _platform(check_surface, tmp_path / "next-door")
     monkeypatch.setattr(check_surface, "REPO", sibling.parent / "sdk")
     monkeypatch.setattr(check_surface, "SIBLINGS", (sibling.name,))
 
@@ -293,7 +369,7 @@ def test_the_variable_is_read_relative_to_the_repository_not_the_caller(
     be read against the working directory instead, so the same setting would
     mean two different checkouts depending on where the check was invoked.
     """
-    platform = _platform_without(check_surface, tmp_path, missing=Path("nothing/is/missing"))
+    platform = _platform(check_surface, tmp_path)
     monkeypatch.setattr(check_surface, "REPO", tmp_path / "sdk")
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", "../platform")
 
@@ -305,44 +381,226 @@ def test_the_variable_is_read_relative_to_the_repository_not_the_caller(
     assert check_surface.platform_repo() == platform
 
 
-def test_foreground_timeout_constant_drift_is_detected(
-    check_surface: ModuleType, tmp_path: Path
-) -> None:
-    from mandala_computer import _api
-
-    platform = tmp_path / "platform"
-    for ours, module, theirs in check_surface.CONSTANTS:
-        path = platform / module
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as source:
-            value = getattr(_api, ours)
-            if module.suffix == ".go":
-                source.write(f"const (\n{theirs} = {value}\n)\n")
-            else:
-                source.write(f"export const {theirs} = {value};\n")
-    api = platform / "server/api.go"
-    api.write_text("package server\nconst execMaxTimeoutSec = 600\n")
-    assert check_surface.constant_drift(platform) == []
-
-    api.write_text("package server\nconst execMaxTimeoutSec = 601\n")
-    assert check_surface.constant_drift(platform) == [
-        "  ! MAX_EXEC_TIMEOUT_SECONDS is 600, but server/api.go's execMaxTimeoutSec is 601"
-    ]
+# ---------------------------------------------------------------------------
+# The manifest reader: every unreadable shape must fail, not pass
+# ---------------------------------------------------------------------------
 
 
-def test_missing_foreground_timeout_module_is_reported(
+def test_a_manifest_that_agrees_with_the_mirror_passes_and_says_so(
     check_surface: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = Path("server/api.go")
-    platform = _platform_without(check_surface, tmp_path, module)
+    """The green path, and the counts it is allowed to print."""
+    platform = _platform(check_surface, tmp_path)
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
-    assert check_surface.missing_mirror_sources(platform) == [module]
+    assert check_surface.main() == 0
+    out = capsys.readouterr().out
+    assert f"{len(check_surface.mirrored())} routes" in out
+    assert f"{len(check_surface.CONSTANTS)} limits" in out
+
+
+def test_a_route_documenting_no_parameters_is_not_reported_as_drift(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest omits them; the mirror lists them as empty sets.
+
+    Read literally, that is 27 routes "no longer documented upstream" on a
+    mirror that is exactly right — enough noise to make the check worth
+    ignoring, which is the failure one step past a false green.
+    """
+    body = _manifest_body(check_surface)
+    documented = set(body["parameters"])
+    assert documented < set(body["routes"]), "fixture must exercise the omitted-route case"
+
+    platform = _platform(check_surface, tmp_path, manifest=body)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+    assert check_surface.main() == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"),
+    [
+        ("truncated mid-object", '{"version": 1, "routes": ['),
+        ("empty file", ""),
+        ("HTML from a proxy", "<!doctype html><title>404</title>"),
+        ("a JSON array", "[]"),
+        ("a JSON string", '"surface"'),
+    ],
+)
+def test_a_manifest_that_is_not_a_json_object_fails(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    raw: str,
+) -> None:
+    """None of these may reach the comparison as "the platform documents nothing"."""
+    platform = _platform(check_surface, tmp_path, raw=raw)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.main() == 1, name
+    assert "compares nothing it cannot read" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("no version", {"routes": ["GET sizes"], "parameters": {}, "limits": {}}),
+        ("version is a string", {"version": "1", "routes": [], "parameters": {}, "limits": {}}),
+        ("version is a bool", {"version": True, "routes": [], "parameters": {}, "limits": {}}),
+        ("a version from the future", {"version": 2, "routes": [], "parameters": {}, "limits": {}}),
+        ("no routes", {"version": 1, "parameters": {}, "limits": {}}),
+        ("no parameters", {"version": 1, "routes": ["GET sizes"], "limits": {}}),
+        ("no limits", {"version": 1, "routes": ["GET sizes"], "parameters": {}}),
+        ("routes is an object", {"version": 1, "routes": {}, "parameters": {}, "limits": {}}),
+        ("routes is empty", {"version": 1, "routes": [], "parameters": {}, "limits": {}}),
+        ("a route is a number", {"version": 1, "routes": [7], "parameters": {}, "limits": {}}),
+        (
+            "a route has no method",
+            {"version": 1, "routes": ["sizes"], "parameters": {}, "limits": {}},
+        ),
+        (
+            "a route method is lowercase",
+            {"version": 1, "routes": ["get sizes"], "parameters": {}, "limits": {}},
+        ),
+        (
+            "a route has a space in its pattern",
+            {"version": 1, "routes": ["GET computers/:id files"], "parameters": {}, "limits": {}},
+        ),
+        (
+            "a route is listed twice",
+            {"version": 1, "routes": ["GET sizes", "GET sizes"], "parameters": {}, "limits": {}},
+        ),
+        (
+            "parameters is an array",
+            {"version": 1, "routes": ["GET sizes"], "parameters": [], "limits": {}},
+        ),
+        (
+            "parameters documents an unknown route",
+            {
+                "version": 1,
+                "routes": ["GET sizes"],
+                "parameters": {"GET widgets": ["query:w"]},
+                "limits": {},
+            },
+        ),
+        (
+            "a parameter list is a string",
+            {
+                "version": 1,
+                "routes": ["GET sizes"],
+                "parameters": {"GET sizes": "query:w"},
+                "limits": {},
+            },
+        ),
+        (
+            "a parameter is a number",
+            {
+                "version": 1,
+                "routes": ["GET sizes"],
+                "parameters": {"GET sizes": [7]},
+                "limits": {},
+            },
+        ),
+        (
+            "a parameter names no kind",
+            {
+                "version": 1,
+                "routes": ["GET sizes"],
+                "parameters": {"GET sizes": ["w"]},
+                "limits": {},
+            },
+        ),
+        (
+            "limits is an array",
+            {"version": 1, "routes": ["GET sizes"], "parameters": {}, "limits": []},
+        ),
+        (
+            "a limit is a string",
+            {
+                "version": 1,
+                "routes": ["GET sizes"],
+                "parameters": {},
+                "limits": {"agent.maxSteps": "100"},
+            },
+        ),
+        (
+            "a limit is a bool",
+            {
+                "version": 1,
+                "routes": ["GET sizes"],
+                "parameters": {},
+                "limits": {"agent.maxSteps": True},
+            },
+        ),
+    ],
+)
+def test_a_manifest_this_reader_cannot_understand_fails(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    body: dict[str, Any],
+) -> None:
+    """Each of these used to have a plausible "read it leniently" answer.
+
+    Every one of those answers is a green run over a table that is empty for a
+    reason nobody was told about. The version check is the sharpest: a layout
+    that moved ``parameters`` under a new key reads, leniently, as a platform
+    that documents no parameters at all.
+    """
+    platform = _platform(check_surface, tmp_path, manifest=body)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.main() == 1, name
+    assert "compares nothing it cannot read" in capsys.readouterr().out
+
+
+def test_a_limit_this_sdk_mirrors_and_the_manifest_drops_is_reported(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The most dangerous of the three drifts, and the quietest.
+
+    The SDK goes on refusing values early against a ceiling the platform has
+    stopped publishing — turning a favour into a refusal of a run the platform
+    would have taken, with nothing anywhere saying why. Skipping an absent key
+    would make that permanent.
+    """
+    body = _manifest_body(check_surface)
+    dropped = check_surface.CONSTANTS[0][1]
+    del body["limits"][dropped]
+
+    platform = _platform(check_surface, tmp_path, manifest=body)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
     assert check_surface.main() == 1
-    assert str(platform / module) in capsys.readouterr().out
+    assert dropped in capsys.readouterr().out
+
+
+def test_a_drifted_limit_is_detected_and_named(check_surface: ModuleType, tmp_path: Path) -> None:
+    from mandala_computer import _api
+
+    body = _manifest_body(check_surface)
+    assert check_surface.limit_drift(body["limits"]) == []
+
+    body["limits"]["exec.maxTimeoutSeconds"] = _api.MAX_EXEC_TIMEOUT_SECONDS + 1
+    assert check_surface.limit_drift(body["limits"]) == [
+        (
+            f"  ! MAX_EXEC_TIMEOUT_SECONDS is {_api.MAX_EXEC_TIMEOUT_SECONDS}, "
+            f"but the manifest's exec.maxTimeoutSeconds is "
+            f"{_api.MAX_EXEC_TIMEOUT_SECONDS + 1}"
+        )
+    ]
 
 
 def test_an_added_route_cannot_agree_with_a_stale_mirror(
@@ -351,22 +609,34 @@ def test_an_added_route_cannot_agree_with_a_stale_mirror(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Exercise the real route inventory and final gate with unrelated checks held steady."""
-    path = tmp_path / check_surface.SURFACE
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        """export const V1_ROUTES: Route[] = [
-          { method: 'GET', pattern: 'widgets' },
-          // ] The following route is new.
-          { pattern: "widgets", method: "POST" },
-        ];"""
-    )
-    monkeypatch.setattr(check_surface, "platform_repo", lambda: tmp_path)
-    monkeypatch.setattr(check_surface, "missing_mirror_sources", lambda _: [])
-    monkeypatch.setattr(check_surface, "constant_drift", lambda _: [])
-    monkeypatch.setattr(check_surface, "parameters", lambda _: {})
-    monkeypatch.setattr(check_surface, "mirrored_parameters", dict)
-    monkeypatch.setattr(check_surface, "mirrored", lambda: {("GET", "widgets")})
+    """The original defect, end to end: a route upstream that the mirror lacks."""
+    body = _manifest_body(check_surface)
+    body["routes"].append("POST widgets")
+
+    platform = _platform(check_surface, tmp_path, manifest=body)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
     assert check_surface.main() == 1
-    assert "+ POST widgets" in capsys.readouterr().out
+    assert "+ POST widgets  (upstream, missing from ALLOWED)" in capsys.readouterr().out
+
+
+def test_an_added_parameter_on_a_known_route_cannot_agree_either(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """OPL-3727 restated: the whole feature that arrived without a route.
+
+    ``Range`` on ``GET computers/:id/files`` is the only way a file larger than
+    one request comes off a computer at all, and it landed on a route the mirror
+    already listed. A route table cannot see it.
+    """
+    body = _manifest_body(check_surface)
+    body["parameters"].setdefault("GET computers/:id/files", []).append("header:X-New-Thing")
+
+    platform = _platform(check_surface, tmp_path, manifest=body)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.main() == 1
+    assert "header:X-New-Thing  (upstream, missing from PARAMETERS)" in capsys.readouterr().out

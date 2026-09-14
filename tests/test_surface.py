@@ -1089,16 +1089,21 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
 
     # Compared as sets rather than through main(), so a drift prints as the
     # routes that differ instead of as a non-zero exit code.
-    upstream = check_surface.table((platform / check_surface.SURFACE).read_text(), "V1_ROUTES")
+    #
+    # One read of the platform's generated manifest (OPL-4849) for all three
+    # tables, where this used to scan three kinds of source through a
+    # hand-written TypeScript reader. A ManifestError is deliberately allowed to
+    # propagate: a manifest this cannot parse must fail the suite, not skip it.
+    upstream, upstream_parameters, limits = check_surface.manifest(platform)
     assert upstream == ALLOWED
     # And the same for what each of them takes. `Range` on the download is the
     # reason this half exists: a whole feature, on a route the line above was
     # already satisfied by.
-    assert check_surface.parameter_drift(check_surface.parameters(platform), PARAMETERS) == []
+    assert check_surface.parameter_drift(upstream_parameters, PARAMETERS) == []
     # And the mirrored NUMBERS, which drift the same way and were the half this
     # test imported without ever calling: MAX_CLIPBOARD_BYTES can diverge from
-    # the platform's `clipboardWriteMax` through a green run of this suite.
-    assert check_surface.constant_drift(platform) == []
+    # the platform's `clipboard.writeMaxBytes` through a green run of this suite.
+    assert check_surface.limit_drift(limits) == []
 
 
 def test_allowlist_excludes_the_daemons_internal_routes() -> None:
