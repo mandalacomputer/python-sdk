@@ -1910,6 +1910,20 @@ c.write_file("/home/user/app/.env", "API_TOKEN=hunter2\n")
 report = c.read_file("/home/user/report.csv")
 ```
 
+`read_file()` answers **bytes**, because a guest file is not promised to be
+text and decoding one that is not would put replacement characters at the SDK
+boundary for every caller, including the one reading a tarball. When you know
+it is text, `read_text_file()` is the same request with the decode done:
+
+```python
+hostname = c.read_text_file("/etc/hostname")
+```
+
+That decode is `errors="replace"`, so it never raises on a file that turns out
+not to be text — the same bargain `ExecResult.stdout_text` makes, and
+acceptable for the same reason: the caller asked for text, and the bytes are
+one call away.
+
 Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
 directory. A transfer resumes a suspended computer, like any other use.

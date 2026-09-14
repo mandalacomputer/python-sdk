@@ -2303,6 +2303,31 @@ class Computer(ComputerFields):
             content_types=("application/octet-stream",),
         )
 
+    def read_text_file(self, path: str) -> str:
+        """:meth:`read_file`, decoded as UTF-8, for a file you know is text.
+
+        ``errors="replace"``, so this never raises on a file that turns out not
+        to be text — the same bargain :attr:`~mandala_computer.ExecResult.stdout_text`
+        makes, and for the same reason. The lossy reading is fine where the
+        caller asked for text and the bytes are one call away; what was not fine
+        was a wire format doing it before anything reached this SDK, with no way
+        back (OPL-4544).
+
+        ``read_file`` stays the primitive and stays bytes. A guest file is not
+        promised to be text, and a ``str`` return as the only option would put
+        U+FFFD rewriting at the SDK boundary for every caller — including the
+        ones reading a tarball. This is the convenience on top, not a
+        replacement: reach for it for a config file, a log, a ``/proc`` entry,
+        and for anything whose type you are not sure of read the bytes and
+        decide yourself.
+
+        Every limit :meth:`read_file` has, this has: the whole file crosses in
+        one request, so past 64 MiB it raises
+        :class:`~mandala_computer.FileTooLargeError` and
+        :meth:`download_file` is what fetches one of any size.
+        """
+        return self.read_file(path).decode("utf-8", "replace")
+
     def read_file_part(
         self,
         path: str,
