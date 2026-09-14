@@ -1206,3 +1206,26 @@ async def test_running_wait_does_not_accept_cache_after_failed_refreshes(
     with pytest.raises(mc.TimeoutError, match="could not be confirmed running"):
         await mc.AsyncComputer(client._t, COMPUTER).wait_until_running(timeout=2, poll=0)
     assert route.call_count == 2
+
+
+@respx.mock
+async def test_read_text_file_decodes_on_the_async_half_too(client: mc.AsyncClient) -> None:
+    """The async half wires its own request and so can drift on its own.
+
+    ``test_parity`` proves the two expose the same names with the same
+    signatures; it cannot prove they decode the same way, because the decode is
+    inside the body.
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(200, content="hello — ünïcode\n".encode())
+    )
+    c = await client.computers.get("vm-1")
+
+    assert await c.read_text_file("/etc/hostname") == "hello — ünïcode\n"
+    assert route.calls.last.request.headers["Accept"] == "application/octet-stream"
+
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(200, content=b"\xff\xfe\x00 not text")
+    )
+    assert "�" in await c.read_text_file("/tmp/blob")

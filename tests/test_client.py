@@ -5654,3 +5654,56 @@ def test_create_preserves_template_transfer_token(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
     client.computers.create(template="acc-1/tool@1.0.0", template_transfer="prepare-token")
     assert json.loads(route.calls.last.request.content)["template_transfer"] == "prepare-token"
+
+
+@respx.mock
+def test_read_text_file_decodes_utf8_and_sends_the_same_request(client: mc.Client) -> None:
+    """The convenience on top of ``read_file``, not a second way to ask.
+
+    Same route, same params, same octet-stream Accept: the only difference is
+    who calls ``.decode``. If this ever stops being true the two methods have
+    become two requests, and a caller reaching for the text one would be paying
+    for a transfer the bytes one already made.
+    """
+    route = respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(200, content="hello — ünïcode\n".encode())
+    )
+    c = _computer(client)
+
+    assert c.read_text_file("/etc/hostname") == "hello — ünïcode\n"
+    assert route.calls.last.request.url.params["path"] == "/etc/hostname"
+    assert route.calls.last.request.headers["Accept"] == "application/octet-stream"
+    assert _budget(route)["read"] == mc._client.FILE_TIMEOUT
+
+
+@respx.mock
+def test_read_text_file_replaces_undecodable_bytes_rather_than_raising(
+    client: mc.Client,
+) -> None:
+    """``errors="replace"``, the same bargain ``stdout_text`` makes.
+
+    A caller who asked for text on a file that turns out to be a tarball gets a
+    lossy reading, not a ``UnicodeDecodeError`` several frames from anything
+    they wrote. The bytes are one call away on ``read_file``, which is what
+    makes the lossy reading acceptable HERE — what was not acceptable was a
+    wire format doing it before anything reached this SDK (OPL-4544).
+    """
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(200, content=b"\xff\xfe\x00 not text")
+    )
+    c = _computer(client)
+
+    text = c.read_text_file("/tmp/blob")
+    assert "�" in text
+    assert text.endswith(" not text")
+
+
+@respx.mock
+def test_read_text_file_refuses_a_relative_path_before_the_request(
+    client: mc.Client,
+) -> None:
+    """It inherits every refusal ``read_file`` makes, because it IS ``read_file``."""
+    route = respx.get(f"{BASE}/computers/vm-1/files")
+    with pytest.raises(ValueError):
+        _computer(client).read_text_file("relative/path")
+    assert not route.called

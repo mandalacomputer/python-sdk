@@ -997,6 +997,13 @@ class AsyncComputer(ComputerFields):
             content_types=("application/octet-stream",),
         )
 
+    async def read_text_file(self, path: str) -> str:
+        """:meth:`read_file`, decoded as UTF-8, for a file you know is text.
+
+        See :meth:`mandala_computer.Computer.read_text_file`.
+        """
+        return (await self.read_file(path)).decode("utf-8", "replace")
+
     async def read_file_part(
         self,
         path: str,
