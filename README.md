@@ -1004,10 +1004,17 @@ if not result.finished:
 **It runs on your own Anthropic key**, passed as `model_key` and sent on that
 one request as `X-Model-Key`. The platform never stores one, never bills you for
 it, and will not fall back to anything — so the key is a per-call argument
-rather than something the client holds. Every step is a model call plus a
-screenshot on that key, which is why `max_steps` bounds spending as much as it
-bounds the loop. It is a whole number from 1 to 100 — the platform's ceiling,
-which the SDK refuses past rather than spending a round trip to be told.
+rather than something the client holds.
+
+`max_steps` bounds the loop, and bounds your Anthropic spend only loosely. A
+step is one **action on the desktop**, not one exchange with the model, and the
+two do not line up in either direction: one model reply may ask for several
+actions and spends a step on each, while a reply that asks for none — or a
+paused turn, resubmitted — costs tokens and no step at all. Nor does every step
+take a screenshot; a `bash` call or a cursor read does not. Size the run from
+this; size the bill from your own key. It defaults to 20 and is a whole number
+up to 100 — the platform's ceiling, which the SDK refuses past rather than
+spending a round trip to be told.
 
 **The computer must already be running.** This route will not start one for you:
 starting is billable, and it is not a decision to make on your behalf because
