@@ -502,9 +502,13 @@ MALFORMED: list[tuple[str, Any, str]] = [
         lambda b: _set(b, "routes", [*b["routes"], 7]),
         "'routes' holds a non-string entry",
     ),
+    # A LEADING space, so the method is empty and the pattern is not. Spelled
+    # "widgets" it trips three predicates at once — no separator, a method that
+    # is not uppercase, and no pattern — so the case pins none of them, and
+    # method validation could be dropped with it still green.
     (
         "a route has no method",
-        lambda b: _set(b, "routes", [*b["routes"], "widgets"]),
+        lambda b: _set(b, "routes", [*b["routes"], " widgets"]),
         "is not 'METHOD pattern'",
     ),
     (

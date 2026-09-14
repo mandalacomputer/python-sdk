@@ -397,8 +397,13 @@ def _routes(raw: object) -> set[tuple[str, str]]:
         # One space, method first. Split on the FIRST space rather than any
         # run of whitespace: a pattern cannot contain a space, so a second one
         # is a malformed entry rather than something to normalize away.
-        method, sep, pattern = entry.partition(" ")
-        if not sep or not method.isupper() or not pattern or " " in pattern:
+        #
+        # No `not sep` test. After `partition`, an entry with no space at all
+        # leaves BOTH halves empty, so `not pattern` already answers it — and a
+        # predicate that can never fire alone is one no test can pin, which is
+        # the thing this file is otherwise careful about.
+        method, _, pattern = entry.partition(" ")
+        if not method.isupper() or not pattern or " " in pattern:
             raise ManifestError(f"'routes' entry is not 'METHOD pattern': {entry!r}")
         if (method, pattern) in found:
             raise ManifestError(f"'routes' lists {entry!r} twice")
