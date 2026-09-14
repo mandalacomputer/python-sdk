@@ -448,119 +448,204 @@ def test_a_manifest_that_is_not_a_json_object_fails(
     assert "compares nothing it cannot read" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize(
-    ("name", "body"),
-    [
-        ("no version", {"routes": ["GET sizes"], "parameters": {}, "limits": {}}),
-        ("version is a string", {"version": "1", "routes": [], "parameters": {}, "limits": {}}),
-        ("version is a bool", {"version": True, "routes": [], "parameters": {}, "limits": {}}),
-        ("a version from the future", {"version": 2, "routes": [], "parameters": {}, "limits": {}}),
-        ("no routes", {"version": 1, "parameters": {}, "limits": {}}),
-        ("no parameters", {"version": 1, "routes": ["GET sizes"], "limits": {}}),
-        ("no limits", {"version": 1, "routes": ["GET sizes"], "parameters": {}}),
-        ("routes is an object", {"version": 1, "routes": {}, "parameters": {}, "limits": {}}),
-        ("routes is empty", {"version": 1, "routes": [], "parameters": {}, "limits": {}}),
-        ("a route is a number", {"version": 1, "routes": [7], "parameters": {}, "limits": {}}),
-        (
-            "a route has no method",
-            {"version": 1, "routes": ["sizes"], "parameters": {}, "limits": {}},
+def _without(body: dict[str, Any], key: str) -> dict[str, Any]:
+    """A valid manifest with one top-level key removed."""
+    del body[key]
+    return body
+
+
+def _set(body: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
+    body[key] = value
+    return body
+
+
+def _first_route_with_parameters(body: dict[str, Any]) -> str:
+    return min(body["parameters"])
+
+
+#: One defect apiece, each applied to an OTHERWISE VALID manifest, with the
+#: diagnostic it must produce.
+#:
+#: Built this way because the first version of this table was not. Its cases
+#: were hand-written stubs like ``{"version": "1", "routes": [], ...}``, and an
+#: empty ``routes`` list fails on its own — so the case meant to pin the VERSION
+#: check passed with the version check deleted. A review found it by neutralising
+#: the guard and watching its own regression test stay green, which is the exact
+#: shape of a test that cannot regress.
+#:
+#: So: start from something that passes, break one thing, and assert the message
+#: that names the thing broken. A guard removed now fails the case named for it,
+#: and only that case.
+MALFORMED: list[tuple[str, Any, str]] = [
+    ("no version", lambda b: _without(b, "version"), "has no integer 'version'"),
+    ("version is a string", lambda b: _set(b, "version", "1"), "has no integer 'version'"),
+    ("version is a bool", lambda b: _set(b, "version", True), "has no integer 'version'"),
+    # The sharpest of them. A future layout that moved `parameters` under a new
+    # key reads, leniently, as a platform that documents no parameters at all.
+    ("a version from the future", lambda b: _set(b, "version", 2), "this reader knows 1"),
+    ("no routes", lambda b: _without(b, "routes"), "has no 'routes'"),
+    ("no parameters", lambda b: _without(b, "parameters"), "has no 'parameters'"),
+    ("no limits", lambda b: _without(b, "limits"), "has no 'limits'"),
+    ("routes is an object", lambda b: _set(b, "routes", {}), "'routes' is not a non-empty array"),
+    ("routes is empty", lambda b: _set(b, "routes", []), "'routes' is not a non-empty array"),
+    (
+        "a route is a number",
+        lambda b: _set(b, "routes", [*b["routes"], 7]),
+        "'routes' holds a non-string entry",
+    ),
+    (
+        "a route has no method",
+        lambda b: _set(b, "routes", [*b["routes"], "widgets"]),
+        "is not 'METHOD pattern'",
+    ),
+    (
+        "a route method is lowercase",
+        lambda b: _set(b, "routes", [*b["routes"], "get widgets"]),
+        "is not 'METHOD pattern'",
+    ),
+    (
+        "a route has a space in its pattern",
+        lambda b: _set(b, "routes", [*b["routes"], "GET wid gets"]),
+        "is not 'METHOD pattern'",
+    ),
+    (
+        "a route is listed twice",
+        lambda b: _set(b, "routes", [*b["routes"], b["routes"][0]]),
+        "twice",
+    ),
+    (
+        "parameters is an array",
+        lambda b: _set(b, "parameters", []),
+        "'parameters' is not an object",
+    ),
+    (
+        "parameters documents an unknown route",
+        lambda b: _set(b, "parameters", {**b["parameters"], "GET widgets": ["query:w"]}),
+        "which is not in 'routes'",
+    ),
+    (
+        "a parameter list is a string",
+        lambda b: _set(
+            b, "parameters", {**b["parameters"], _first_route_with_parameters(b): "query:w"}
         ),
-        (
-            "a route method is lowercase",
-            {"version": 1, "routes": ["get sizes"], "parameters": {}, "limits": {}},
+        "is not an array",
+    ),
+    (
+        "a parameter is a number",
+        lambda b: _set(b, "parameters", {**b["parameters"], _first_route_with_parameters(b): [7]}),
+        "holds a non-string",
+    ),
+    (
+        "a parameter names no kind",
+        lambda b: _set(
+            b, "parameters", {**b["parameters"], _first_route_with_parameters(b): ["w"]}
         ),
-        (
-            "a route has a space in its pattern",
-            {"version": 1, "routes": ["GET computers/:id files"], "parameters": {}, "limits": {}},
-        ),
-        (
-            "a route is listed twice",
-            {"version": 1, "routes": ["GET sizes", "GET sizes"], "parameters": {}, "limits": {}},
-        ),
-        (
-            "parameters is an array",
-            {"version": 1, "routes": ["GET sizes"], "parameters": [], "limits": {}},
-        ),
-        (
-            "parameters documents an unknown route",
-            {
-                "version": 1,
-                "routes": ["GET sizes"],
-                "parameters": {"GET widgets": ["query:w"]},
-                "limits": {},
-            },
-        ),
-        (
-            "a parameter list is a string",
-            {
-                "version": 1,
-                "routes": ["GET sizes"],
-                "parameters": {"GET sizes": "query:w"},
-                "limits": {},
-            },
-        ),
-        (
-            "a parameter is a number",
-            {
-                "version": 1,
-                "routes": ["GET sizes"],
-                "parameters": {"GET sizes": [7]},
-                "limits": {},
-            },
-        ),
-        (
-            "a parameter names no kind",
-            {
-                "version": 1,
-                "routes": ["GET sizes"],
-                "parameters": {"GET sizes": ["w"]},
-                "limits": {},
-            },
-        ),
-        (
-            "limits is an array",
-            {"version": 1, "routes": ["GET sizes"], "parameters": {}, "limits": []},
-        ),
-        (
-            "a limit is a string",
-            {
-                "version": 1,
-                "routes": ["GET sizes"],
-                "parameters": {},
-                "limits": {"agent.maxSteps": "100"},
-            },
-        ),
-        (
-            "a limit is a bool",
-            {
-                "version": 1,
-                "routes": ["GET sizes"],
-                "parameters": {},
-                "limits": {"agent.maxSteps": True},
-            },
-        ),
-    ],
-)
+        "names no query:, header: or body: field",
+    ),
+    ("limits is an array", lambda b: _set(b, "limits", []), "'limits' is not an object"),
+    (
+        "a limit is a string",
+        lambda b: _set(b, "limits", {**b["limits"], "agent.maxSteps": "100"}),
+        "which is not an integer",
+    ),
+    (
+        "a limit is a bool",
+        lambda b: _set(b, "limits", {**b["limits"], "agent.maxSteps": True}),
+        "which is not an integer",
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "break_it", "expected"), MALFORMED, ids=[m[0] for m in MALFORMED])
 def test_a_manifest_this_reader_cannot_understand_fails(
     check_surface: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     name: str,
-    body: dict[str, Any],
+    break_it: Any,
+    expected: str,
 ) -> None:
     """Each of these used to have a plausible "read it leniently" answer.
 
     Every one of those answers is a green run over a table that is empty for a
-    reason nobody was told about. The version check is the sharpest: a layout
-    that moved ``parameters`` under a new key reads, leniently, as a platform
-    that documents no parameters at all.
+    reason nobody was told about.
     """
-    platform = _platform(check_surface, tmp_path, manifest=body)
+    platform = _platform(check_surface, tmp_path, manifest=break_it(_manifest_body(check_surface)))
     monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
 
     assert check_surface.main() == 1, name
-    assert "compares nothing it cannot read" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "compares nothing it cannot read" in out, name
+    # The specific diagnostic, not merely a failure. Without this the case is
+    # satisfied by any guard at all, including one it was not written for.
+    assert expected in out, f"{name}: expected {expected!r} in:\n{out}"
+
+
+def test_every_malformed_case_starts_from_a_manifest_that_passes(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The property that makes the table above mean anything.
+
+    If the unmutated body did not pass, a case could be satisfied by the defect
+    it was born with rather than the one it names — which is how the first
+    version of this table pinned nothing.
+    """
+    platform = _platform(check_surface, tmp_path)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+    assert check_surface.main() == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"),
+    [
+        (
+            "two routes tables",
+            (
+                '{"version": 1, "routes": ["GET widgets"], "routes": ["GET sizes"], '
+                '"parameters": {}, "limits": {}}'
+            ),
+        ),
+        (
+            "one route documented twice",
+            (
+                '{"version": 1, "routes": ["GET sizes"], "parameters": '
+                '{"GET sizes": ["query:a"], "GET sizes": ["query:b"]}, "limits": {}}'
+            ),
+        ),
+        (
+            "one limit written twice",
+            (
+                '{"version": 1, "routes": ["GET sizes"], "parameters": {}, '
+                '"limits": {"agent.maxSteps": 100, "agent.maxSteps": 999}}'
+            ),
+        ),
+    ],
+)
+def test_a_manifest_naming_a_key_twice_is_refused(
+    check_surface: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    raw: str,
+) -> None:
+    """``json.loads`` keeps the LAST of a repeated key and says nothing.
+
+    So a manifest carrying two ``routes`` tables, two entries for one route, or
+    one limit written twice with different values would be compared against
+    whichever copy came last, with the other discarded before any shape check
+    saw it — a green run over data this never read. The TypeScript reader this
+    replaced refused duplicate keys explicitly; dropping that on the way across
+    would have been the one fail-open carried into the replacement.
+    """
+    platform = _platform(check_surface, tmp_path, raw=raw)
+    monkeypatch.setenv("MANDALA_PLATFORM_REPO", str(platform))
+
+    assert check_surface.main() == 1, name
+    assert "twice in one object" in capsys.readouterr().out, name
 
 
 def test_a_limit_this_sdk_mirrors_and_the_manifest_drops_is_reported(

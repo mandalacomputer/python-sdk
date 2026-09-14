@@ -64,6 +64,27 @@ Not the OpenAPI document, and the reason is the same one the platform gives:
 it does not carry the limits, and a checker that has to walk paths/methods/
 parameters to recover ``GET sizes`` is a second reader with its own bugs.
 
+WHAT THIS PROVES, AND WHAT IT DOES NOT
+======================================
+
+It proves the mirror agrees with the manifest. It does NOT prove the manifest
+agrees with the platform's own tables — a generated file that was not
+regenerated describes the surface as it was, and this would compare against
+that snapshot and report the SDK in step.
+
+That gap is real and it is deliberately not closed here, because the only way
+to close it from this side is to read ``surface.ts`` and ``apidoc.ts`` and
+check the manifest against them — which is the parser this change exists to
+delete, doing the same job under a new name.
+
+It is closed upstream instead, where the tables are. The platform's
+``web/lib/surfacemanifest.test.ts`` asserts the committed file is byte-for-byte
+what its tables generate, and fails the platform's CI with "surface-manifest.json
+is stale. Regenerate it with GC_WRITE_SURFACE_MANIFEST=1 …" when it is not. So
+a stale manifest cannot reach a platform merge, and the run that enforces THIS
+check is a run of that same CI. One owner for the file, one test for its
+freshness, and three clients that read it.
+
 THE THREE THINGS COMPARED
 =========================
 
@@ -98,6 +119,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -440,6 +462,30 @@ def _limits(raw: object) -> dict[str, int]:
     return found
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build an object, refusing one that names the same key twice.
+
+    ``json.loads`` keeps the LAST occurrence of a repeated key and says nothing,
+    at every depth. So a manifest carrying two ``routes`` tables, or two entries
+    for one route under ``parameters``, or one limit written twice with
+    different values, would be compared against whichever copy happened to come
+    last — and the other is discarded before any of the shape checks below ever
+    see it. That is a green run over data this never read, which is the whole
+    failure class this file exists to close.
+
+    The deleted ``surface_text.object_entries`` refused duplicate keys for
+    exactly this reason. Reading JSON instead of TypeScript removed the grammar;
+    it did not remove the need for the guard, and dropping it on the way across
+    would have been the one fail-open carried into the replacement.
+    """
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ManifestError(f"names {key!r} twice in one object")
+        seen[key] = value
+    return seen
+
+
 def manifest(platform: Path) -> tuple[set[tuple[str, str]], dict[str, set[str]], dict[str, int]]:
     """The platform's own inventory of its v1 surface.
 
@@ -457,7 +503,7 @@ def manifest(platform: Path) -> tuple[set[tuple[str, str]], dict[str, set[str]],
     except OSError as err:
         raise ManifestError(f"cannot be read: {err.strerror or err}") from err
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as err:
         raise ManifestError(f"is not valid JSON: {err}") from err
     if not isinstance(data, dict):
