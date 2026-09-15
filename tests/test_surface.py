@@ -77,6 +77,9 @@ UNIMPLEMENTED = {
     ("POST", "chat/completions"),
     # The SDK can read and write files, but has no directory-listing method yet.
     ("GET", "computers/:id/files/list"),
+    # Stable execution reads have no SDK convenience methods yet.
+    ("GET", "computers/:id/executions/:executionId"),
+    ("GET", "computers/:id/executions/:executionId/output"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -91,6 +94,9 @@ UNIMPLEMENTED_PARAMETERS = {
     "PUT computers/:id/files  query:no_wake",
     # Directory listing is not wrapped yet; see UNIMPLEMENTED.
     "GET computers/:id/files/list  query:path",
+    "GET computers/:id/executions/:executionId/output  query:stdout_offset",
+    "GET computers/:id/executions/:executionId/output  query:stderr_offset",
+    "GET computers/:id/executions/:executionId/output  query:limit",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
