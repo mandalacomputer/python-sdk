@@ -75,24 +75,22 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # The two template document routes were pinned here, behind a comment saying
-    # they "become worth a method with publish and launch-by-ref". Publish
-    # shipped in platform OPL-3789 and launch-by-ref in OPL-3788, so the line
-    # became somebody's to delete and this is it (OPL-3835). Nothing has replaced
-    # them: every route this SDK can reach, it calls. The TypeScript SDK deleted
-    # the same two.
+    # The SDK can read and write files, but has no directory-listing method yet.
+    ("GET", "computers/:id/files/list"),
 }
 
-# Parameters the platform documents that this SDK deliberately does not send.
+# Parameters the SDK does not yet send or deliberately omits.
 #
 # UNIMPLEMENTED's counterpart, and the same argument: PARAMETERS mirrors the
 # platform, so without this the difference between "documented" and "sent" would
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
-#
-# Three of these are the flat vocabulary's second name for something already
-# sent, and one is a whole route.
 UNIMPLEMENTED_PARAMETERS = {
+    # File transfers cannot yet opt out of waking a suspended computer.
+    "GET computers/:id/files  query:no_wake",
+    "PUT computers/:id/files  query:no_wake",
+    # Directory listing is not wrapped yet; see UNIMPLEMENTED.
+    "GET computers/:id/files/list  query:path",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
