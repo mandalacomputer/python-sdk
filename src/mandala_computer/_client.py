@@ -1044,6 +1044,12 @@ _NEVER_DISPATCHED = (
     httpx.UnsupportedProtocol,
 )
 
+# Public connection-error classes describe dispatch uncertainty, not replay
+# permission. Only these native families establish a potentially transient
+# connection failure; local validation, decoding, redirect limits, timeouts,
+# and unclassified request/protocol errors remain terminal.
+_RETRYABLE_REQUEST_ERRORS = (httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
+
 
 def _request_failed(method: str, path: str, exc: httpx.RequestError) -> ConnectionError:
     """The SDK's error for a request that failed before an HTTP response arrived.
@@ -1203,7 +1209,9 @@ class _Retry:
     def delay(self, exc: MandalaError) -> float:
         cause: BaseException | None = exc
         for _ in range(10):
-            if isinstance(cause, httpx.DecodingError):
+            if isinstance(cause, httpx.RequestError) and not isinstance(
+                cause, _RETRYABLE_REQUEST_ERRORS
+            ):
                 raise exc
             cause = cause.__cause__ if cause is not None else None
         # Redirect/auth processing and response hooks can receive headers, then

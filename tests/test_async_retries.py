@@ -1,5 +1,6 @@
 """Opt-in transport retries, complete bodies, and terminal failures."""
 
+import httpcore
 import httpx
 import pytest
 
@@ -1212,3 +1213,211 @@ async def test_auth_challenge_body_failure_is_terminal_without_response_body_fla
         else:
             await t.json("GET", "/computers")
     assert inspected == [429] and len(calls) == 1 and delays == []
+
+
+class InMemoryWire(httpx.AsyncHTTPTransport):
+    """Use the native HTTP parser and connection pool with no socket backend."""
+
+    def __init__(self):
+        self.calls = 0
+        self._pool = httpcore.AsyncConnectionPool(network_backend=httpcore.AsyncMockBackend([]))
+
+    async def handle_async_request(self, request):
+        self.calls += 1
+        return await super().handle_async_request(request)
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse", "public"])
+@pytest.mark.parametrize(
+    "key,base_url,native,expected,retryable",
+    [
+        (
+            "pasted-token\n",
+            "http://example.test",
+            httpx.LocalProtocolError,
+            ConnectionInterruptedError,
+            False,
+        ),
+        ("test-key", "ftp://example.test", httpx.UnsupportedProtocol, ConnectionError, False),
+        (
+            "test-key",
+            "http://example.test",
+            httpx.RemoteProtocolError,
+            ConnectionInterruptedError,
+            True,
+        ),
+        ("test-key", "http://[invalid]", httpx.InvalidURL, httpx.InvalidURL, False),
+    ],
+)
+async def test_native_protocol_errors_preserve_classes_without_replaying_local_failures(
+    policy, kind, key, base_url, native, expected, retryable, delays
+):
+    wire = InMemoryWire()
+    async with httpx.AsyncClient(transport=wire, trust_env=False) as http:
+        with pytest.raises(expected) as caught:
+            if kind == "public":
+                async with AsyncClient(
+                    key, base_url=base_url, http_client=http, retries=policy
+                ) as sdk:
+                    await sdk.sizes.list()
+            else:
+                t = AsyncTransport(key, base_url=base_url, client=http, retries=policy)
+                if kind == "ordinary":
+                    await t.json("GET", "/computers")
+                elif kind == "bounded":
+                    await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+                else:
+                    await anext(t.sse("GET", "/builds/b/events"))
+    assert type(caught.value) is expected
+    if native is httpx.InvalidURL:
+        assert wire.calls == 0
+    else:
+        assert type(caught.value.__cause__) is native
+        assert wire.calls == (3 if retryable and policy and policy["idempotent"] else 1)
+    assert delays == ([0.25, 0.5] if retryable and policy and policy["idempotent"] else [])
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+@pytest.mark.parametrize(
+    "key,base_url,native,expected",
+    [
+        (
+            "pasted-token\n",
+            "http://example.test",
+            httpx.LocalProtocolError,
+            ConnectionInterruptedError,
+        ),
+        ("test-key", "ftp://example.test", httpx.UnsupportedProtocol, ConnectionError),
+    ],
+)
+async def test_local_protocol_failure_keeps_its_cause_with_a_short_budget(
+    policy, key, base_url, native, expected, delays
+):
+    wire = InMemoryWire()
+    async with httpx.AsyncClient(transport=wire, trust_env=False) as http:
+        t = AsyncTransport(key, base_url=base_url, client=http, retries=policy)
+        with pytest.raises(expected) as caught:
+            await t.json("GET", "/computers", timeout_cap=0.1)
+    assert type(caught.value) is expected
+    assert type(caught.value.__cause__) is native
+    assert wire.calls == 1
+    assert delays == []
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 1}])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+@pytest.mark.parametrize("status", [None, 503, 429])
+@pytest.mark.parametrize(
+    "family,retryable",
+    [
+        (httpx.RequestError, False),
+        (httpx.TransportError, False),
+        (httpx.TimeoutException, False),
+        (httpx.ConnectTimeout, False),
+        (httpx.ReadTimeout, False),
+        (httpx.WriteTimeout, False),
+        (httpx.PoolTimeout, False),
+        (httpx.NetworkError, True),
+        (httpx.ConnectError, True),
+        (httpx.ReadError, True),
+        (httpx.WriteError, True),
+        (httpx.CloseError, True),
+        (httpx.ProtocolError, False),
+        (httpx.LocalProtocolError, False),
+        (httpx.RemoteProtocolError, True),
+        (httpx.ProxyError, True),
+        (httpx.UnsupportedProtocol, False),
+        (httpx.DecodingError, False),
+        (httpx.TooManyRedirects, False),
+    ],
+)
+async def test_native_exception_family_controls_replay_before_and_after_response(
+    policy, kind, status, family, retryable, delays
+):
+    calls = []
+    bodies = []
+    failures = []
+
+    def handler(request):
+        calls.append(request)
+        failure = family("native request failure")
+        failures.append(failure)
+        if status is None:
+            raise failure
+        body = Broken(error=failure)
+        bodies.append(body)
+        return httpx.Response(status, stream=body, headers={"Retry-After": "9"})
+
+    if issubclass(family, httpx.TimeoutException):
+        expected = TimeoutError
+    elif status is not None:
+        expected = RateLimitError if status == 429 else APIError
+    elif family in (httpx.ConnectError, httpx.ProxyError, httpx.UnsupportedProtocol):
+        expected = ConnectionError
+    else:
+        expected = ConnectionInterruptedError
+    t = make(handler, policy)
+    with pytest.raises(expected) as caught:
+        if kind == "ordinary":
+            await t.json("GET", "/computers")
+        elif kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+        else:
+            await anext(t.sse("GET", "/builds/b/events"))
+    assert caught.value.__cause__ is failures[-1]
+    if status is not None and not issubclass(family, httpx.TimeoutException):
+        assert caught.value.status == status
+        assert caught.value.retry_after == 9
+    allowed = retryable and status != 429 and policy is not None
+    assert len(calls) == (2 if allowed else 1)
+    assert delays == ([9 if status else 0.25] if allowed else [])
+    assert all(body.closed for body in bodies)
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 1}])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+@pytest.mark.parametrize("status", [None, 503])
+@pytest.mark.parametrize(
+    "nested,retryable",
+    [
+        (httpx.LocalProtocolError, False),
+        (httpx.UnsupportedProtocol, False),
+        (httpx.RemoteProtocolError, True),
+    ],
+)
+async def test_local_failure_cannot_gain_replay_permission_through_a_network_wrapper(
+    policy, kind, status, nested, retryable, delays
+):
+    calls = []
+    bodies = []
+    failures = []
+
+    def handler(request):
+        calls.append(request)
+        failure = httpx.ReadError("wrapped request failure")
+        failure.__cause__ = nested("underlying protocol failure")
+        failures.append(failure)
+        if status is None:
+            raise failure
+        body = Broken(error=failure)
+        bodies.append(body)
+        return httpx.Response(status, stream=body, headers={"Retry-After": "9"})
+
+    t = make(handler, policy)
+    with pytest.raises(APIError if status else ConnectionInterruptedError) as caught:
+        if kind == "ordinary":
+            await t.json("GET", "/computers")
+        elif kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+        else:
+            await anext(t.sse("GET", "/builds/b/events"))
+    assert caught.value.__cause__ is failures[-1]
+    assert type(caught.value.__cause__.__cause__) is nested
+    if status:
+        assert caught.value.status == status
+        assert caught.value.retry_after == 9
+    allowed = retryable and policy is not None
+    assert len(calls) == (2 if allowed else 1)
+    assert delays == ([9 if status else 0.25] if allowed else [])
+    assert all(body.closed for body in bodies)
