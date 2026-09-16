@@ -2288,22 +2288,28 @@ header metadata; older servers and connection failures may supply none. `allow`
 and `www_authenticate` preserve the received headers and are never inferred from
 the body. A 405 does not trigger an automatic method change or retry.
 
+Replace the ID below with an existing computer's ID.
+
 ```python
-try:
-    computer.read_file("/tmp/report.txt")
-except mc.APIError as error:
-    print(
-        error.status,
-        str(error),
-        {
-            "request_id": error.request_id,
-            "reason": error.reason,
-            "allow": error.allow,
-            "www_authenticate": error.www_authenticate,
-            "retry_after": error.retry_after,  # seconds, when supplied
-        },
-    )
-    raise
+import mandala_computer as mc
+
+with mc.Client() as client:
+    try:
+        computer = client.computers.get("vm-0a1b2c3d4e5f")
+        computer.read_file("/tmp/report.txt")
+    except mc.APIError as error:
+        print(
+            error.status,
+            str(error),
+            {
+                "request_id": error.request_id,
+                "reason": error.reason,
+                "allow": error.allow,
+                "www_authenticate": error.www_authenticate,
+                "retry_after": error.retry_after,  # seconds, when supplied
+            },
+        )
+        raise
 ```
 
 A missing guest file uses the existing `NotFoundError`, just like a missing
