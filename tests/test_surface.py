@@ -65,6 +65,11 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
+    # Explicit retained output is tracked until client helpers are available.
+    ("POST", "computers/:id/executions/:executionId/retained-output"),
+    ("GET", "computers/:id/results/:resultId"),
+    ("GET", "computers/:id/results/:resultId/output"),
+    ("DELETE", "computers/:id/results/:resultId"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -91,6 +96,12 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # Retained output is not wrapped yet; see UNIMPLEMENTED.
+    "POST computers/:id/executions/:executionId/retained-output  body:max_bytes_per_stream",
+    "POST computers/:id/executions/:executionId/retained-output  body:retention_seconds",
+    "GET computers/:id/results/:resultId/output  query:stream",
+    "GET computers/:id/results/:resultId/output  query:offset",
+    "GET computers/:id/results/:resultId/output  query:limit",
     # File transfers cannot yet opt out of waking a suspended computer.
     "GET computers/:id/files  query:no_wake",
     "PUT computers/:id/files  query:no_wake",
