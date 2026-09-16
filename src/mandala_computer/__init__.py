@@ -84,6 +84,7 @@ from ._exceptions import (
     UnavailableError,
     is_transient,
 )
+from ._executions import ExecutionMetadata, ExecutionOutput
 from ._models import (
     BuildProgress,
     BuildStep,
@@ -154,6 +155,8 @@ __all__ = [
     "EventStream",
     "ExecResult",
     "ExecStatus",
+    "ExecutionMetadata",
+    "ExecutionOutput",
     "FilePart",
     "FileTooLargeError",
     "GatewayTimeoutError",

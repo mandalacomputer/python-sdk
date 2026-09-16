@@ -225,7 +225,7 @@ def test_field_accessors_are_shared_not_copied() -> None:
 
     assert issubclass(mc.BackgroundCommand, BackgroundCommandFields)
     assert issubclass(mc.AsyncBackgroundCommand, BackgroundCommandFields)
-    for field in ("pid", "command", "started_at", "raw"):
+    for field in ("pid", "execution_id", "command", "started_at", "raw"):
         assert getattr(mc.BackgroundCommand, field) is getattr(mc.AsyncBackgroundCommand, field)
 
 

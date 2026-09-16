@@ -248,3 +248,11 @@ def test_both_halves_are_non_empty_and_disjoint() -> None:
     sync, asynchronous = half(found, asynchronous=False), half(found, asynchronous=True)
     assert names(sync) and names(asynchronous)
     assert not (set(sync) & set(asynchronous))
+
+
+def test_stable_execution_reads_are_in_both_real_method_inventories() -> None:
+    found = inventory()
+    for cls in (mc.Computer, mc.AsyncComputer):
+        assert {"execution", "execution_output"} <= found[cls]
+    for cls in (mc.BackgroundCommand, mc.AsyncBackgroundCommand):
+        assert found[cls] == {"poll", "kill"}

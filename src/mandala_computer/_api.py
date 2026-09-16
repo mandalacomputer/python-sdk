@@ -271,6 +271,41 @@ def exec_handle(computer_id: str, pid: int) -> str:
     return f"computers/{seg(computer_id)}/exec/{guest_pid(pid)}"
 
 
+EXECUTION_MAX_OFFSET = 9_007_199_254_740_991
+EXECUTION_READ_DEFAULT = 65_536
+EXECUTION_READ_MAX = 1_048_576
+
+
+def execution_id(value: str) -> str:
+    """An opaque execution identity; never a PID or a path fragment."""
+    value = canonical(value, "execution_id")
+    if not re.fullmatch(r"exec_[0-9a-f]{32}", value):
+        raise ValueError("execution_id must be exec_ followed by 32 lowercase hex digits")
+    return value
+
+
+def execution(computer_id: str, identity: str) -> str:
+    return f"{computer(computer_id)}/executions/{execution_id(identity)}"
+
+
+def execution_output(computer_id: str, identity: str) -> str:
+    return f"{execution(computer_id, identity)}/output"
+
+
+def execution_output_params(stdout_offset: int, stderr_offset: int, limit: int) -> dict[str, int]:
+    """Independent byte positions, with room for a full read in the safe range."""
+    limit = whole(limit, "limit", exc=ValueError)
+    if not 1 <= limit <= EXECUTION_READ_MAX:
+        raise ValueError(f"limit must be from 1 to {EXECUTION_READ_MAX}")
+    params = {"limit": limit}
+    for name, value in (("stdout_offset", stdout_offset), ("stderr_offset", stderr_offset)):
+        value = whole(value, name, exc=ValueError)
+        if not 0 <= value <= EXECUTION_MAX_OFFSET - limit:
+            raise ValueError(f"{name} plus limit must be within the safe integer range")
+        params[name] = value
+    return params
+
+
 def window(computer_id: str, window_id: str) -> str:
     """One window on the guest's desktop, addressed by its X id.
 
