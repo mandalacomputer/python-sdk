@@ -37,6 +37,7 @@ from ._agent import (
     AgentText,
     AgentUsage,
 )
+from ._artifacts import Artifact, ArtifactAssociation
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import (
     AsyncBuilds,
@@ -114,6 +115,18 @@ from ._models import (
     WindowResult,
 )
 from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, Usage, Webhooks
+from ._results import (
+    BackgroundResult,
+    ResultDiagnostic,
+    ResultObservation,
+    ResultOutput,
+    ResultPrefix,
+    ResultStream,
+    RetainedResult,
+    RetainOutputOptions,
+    SynchronousResult,
+    SynchronousResultPrefix,
+)
 from ._webhooks import REPLAY_WINDOW_S, verify
 
 __version__ = "0.4.0"
@@ -137,12 +150,15 @@ __all__ = [
     "AgentStepEvent",
     "AgentText",
     "AgentUsage",
+    "Artifact",
+    "ArtifactAssociation",
     "AsyncBackgroundCommand",
     "AsyncClient",
     "AsyncComputer",
     "AsyncEventStream",
     "AuthenticationError",
     "BackgroundCommand",
+    "BackgroundResult",
     "BuildProgress",
     "BuildStep",
     "Client",
@@ -174,11 +190,20 @@ __all__ = [
     "PublishedTemplate",
     "RangeNotSatisfiableError",
     "RateLimitError",
+    "ResultDiagnostic",
+    "ResultObservation",
+    "ResultOutput",
+    "ResultPrefix",
+    "ResultStream",
+    "RetainOutputOptions",
+    "RetainedResult",
     "Retention",
     "RetiredTemplates",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
+    "SynchronousResult",
+    "SynchronousResultPrefix",
     "Template",
     "TemplateBuild",
     "TemplateCheck",

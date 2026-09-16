@@ -8,6 +8,8 @@ what a 402 is or where a request goes.
 
 from __future__ import annotations
 
+import asyncio
+import json as jsonlib
 import math
 import os
 import re
@@ -350,6 +352,85 @@ def _refused_size(resp: httpx.Response) -> int | None:
     """
     m = _UNSATISFIED_RANGE.fullmatch(resp.headers.get("content-range", ""))
     return int(m.group(1)) if m else None
+
+
+# Only the explicit retained routes use this envelope and these strict readers.
+# Existing guest/file/SSE transports intentionally keep their compatibility.
+_RETAINED_ERROR_BYTES = 8192
+
+
+def _retained_header(resp: httpx.Response, name: str) -> str | None:
+    values = resp.headers.get_list(name)
+    if len(values) > 1:
+        raise MandalaError(f"retained response has duplicate {name}")
+    return values[0] if values else None
+
+
+def _retained_length(resp: httpx.Response, maximum: int, required: bool) -> int | None:
+    length = _retained_header(resp, "content-length")
+    if length is None:
+        if required:
+            raise MandalaError("retained response is missing Content-Length")
+        return None
+    if not re.fullmatch(r"[0-9]{1,16}", length) or int(length) > maximum:
+        raise MandalaError("retained response exceeds the byte limit or has invalid Content-Length")
+    return int(length)
+
+
+def _retained_success(
+    resp: httpx.Response, status: int, maximum: int, media: str | None, exact_bytes: int | None
+) -> int | None:
+    if resp.status_code != status:
+        raise MandalaError("retained response has an unexpected success status")
+    encoding = _retained_header(resp, "content-encoding")
+    if encoding is not None and encoding.strip().lower() != "identity":
+        raise MandalaError("retained response has unsupported content encoding")
+    if _retained_header(resp, "content-range") is not None:
+        raise MandalaError("retained response unexpectedly contains Content-Range")
+    if media is not None:
+        content_type = _retained_header(resp, "content-type") or ""
+        if content_type.partition(";")[0].strip().lower() != media:
+            raise MandalaError("retained response has an unexpected content type")
+    length = _retained_length(resp, maximum, media == "application/octet-stream")
+    if exact_bytes is not None and length is not None and length != exact_bytes:
+        raise MandalaError("retained response size does not match its metadata")
+    # Validate only the headers this finite byte-page protocol uses. Others,
+    # including filenames and Location, are never returned or followed.
+    for name in ("x-result-offset", "x-result-next-offset", "x-result-eof"):
+        _retained_header(resp, name)
+    return length
+
+
+def _retained_object(body: bytes) -> Mapping[str, Any]:
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    def bad_constant(value: str) -> Any:
+        raise ValueError("non-finite JSON")
+
+    try:
+        data = jsonlib.loads(
+            body.decode("utf-8"), object_pairs_hook=object_pairs, parse_constant=bad_constant
+        )
+        if isinstance(data, dict):
+            return data
+    except (ValueError, UnicodeError, RecursionError):
+        pass
+    raise MandalaError("retained response is not a valid bounded JSON object")
+
+
+def _retained_envelope(resp: httpx.Response, content: bytes) -> tuple[bytes, Mapping[str, str]]:
+    headers = {
+        name: resp.headers[name]
+        for name in ("x-result-offset", "x-result-next-offset", "x-result-eof")
+        if name in resp.headers
+    }
+    return content, headers
 
 
 class _BaseTransport:
@@ -999,8 +1080,103 @@ def _retry_after(resp: httpx.Response) -> float | None:
     return max(seconds, 0.0)
 
 
+def _retained_exec_object(resp: httpx.Response, path: str) -> Mapping[str, Any]:
+    """The existing exec object interpretation, retaining status at its caller."""
+    data = _BaseTransport._parse(resp)
+    if not isinstance(data, Mapping):
+        raise _BaseTransport._not_an_object("POST", path, resp)
+    return data
+
+
 class Transport(_BaseTransport):
     """Blocking transport."""
+
+    def bounded_binary(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        status: int = 200,
+        media: str | None = "application/octet-stream",
+        exact_bytes: int | None = None,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bytes, Mapping[str, str]]:
+        """One complete bounded response, with ownership through body closure.
+
+        Timeout widening is per read/write phase, not a total deadline. A
+        caller-owned client's longer/None budgets remain in effect.
+        """
+        try:
+            with self._http.stream(
+                method,
+                self._url(path),
+                json=json,
+                params=params,
+                headers=self._sent(
+                    {"Accept": media or "application/json", "Accept-Encoding": "identity"}
+                ),
+                timeout=self._budget(self._http.timeout, timeout),
+                follow_redirects=False,
+            ) as resp:
+                success = resp.is_success
+                if success:
+                    length = _retained_success(resp, status, max_bytes, media, exact_bytes)
+                    ceiling = max_bytes
+                else:
+                    length = None
+                    ceiling = _RETAINED_ERROR_BYTES
+                    # Error decoding must not inflate or accumulate an arbitrary proxy body.
+                    if resp.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise self._error(
+                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                        )
+                body = bytearray()
+                chunks = resp.iter_bytes() if resp.is_stream_consumed else resp.iter_raw()
+                for chunk in chunks:
+                    if len(chunk) > ceiling - len(body):
+                        if success:
+                            raise MandalaError("retained response exceeds the byte limit")
+                        raise self._error(
+                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                        )
+                    body.extend(chunk)
+                if not success:
+                    raise self._error(
+                        httpx.Response(resp.status_code, headers=resp.headers, content=bytes(body))
+                    )
+                if (length is not None and len(body) != length) or (
+                    exact_bytes is not None and len(body) != exact_bytes
+                ):
+                    raise MandalaError("retained response ended before its declared size")
+                return _retained_envelope(resp, bytes(body))
+        except httpx.TimeoutException as exc:
+            raise _timed_out(method, path, exc) from exc
+        except httpx.RequestError as exc:
+            raise _request_failed(method, path, exc) from exc
+
+    def bounded_json_object(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        status: int = 200,
+        json: Any = None,
+        timeout: float | None = None,
+    ) -> Mapping[str, Any]:
+        body, _ = self.bounded_binary(
+            method,
+            path,
+            max_bytes=max_bytes,
+            status=status,
+            media="application/json",
+            json=json,
+            timeout=timeout,
+        )
+        return _retained_object(body)
 
     def phase_ceiling(self, err: BaseException) -> float | None:
         """See :meth:`_BaseTransport._phase_ceiling`."""
@@ -1029,8 +1205,12 @@ class Transport(_BaseTransport):
         timeout: float | None = None,
         timeout_cap: float | None = None,
         headers: Mapping[str, str] | None = None,
+        follow_redirects: bool | None = None,
     ) -> httpx.Response:
         """One request, with optional widening and a final per-phase cap."""
+        redirect_option: dict[str, Any] = (
+            {} if follow_redirects is None else {"follow_redirects": follow_redirects}
+        )
         try:
             resp = self._http.request(
                 method,
@@ -1040,6 +1220,7 @@ class Transport(_BaseTransport):
                 content=content,
                 headers=self._sent(headers),
                 timeout=self._cap_budget(self._budget(self._http.timeout, timeout), timeout_cap),
+                **redirect_option,
             )
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
@@ -1207,6 +1388,96 @@ class Transport(_BaseTransport):
 class AsyncTransport(_BaseTransport):
     """Non-blocking transport."""
 
+    async def bounded_binary(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        status: int = 200,
+        media: str | None = "application/octet-stream",
+        exact_bytes: int | None = None,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bytes, Mapping[str, str]]:
+        """One complete bounded response, with ownership through body closure.
+
+        Timeout widening is per read/write phase, not a total deadline. A
+        caller-owned client's longer/None budgets remain in effect.
+        """
+        await asyncio.sleep(0)
+        try:
+            async with self._http.stream(
+                method,
+                self._url(path),
+                json=json,
+                params=params,
+                headers=self._sent(
+                    {"Accept": media or "application/json", "Accept-Encoding": "identity"}
+                ),
+                timeout=self._budget(self._http.timeout, timeout),
+                follow_redirects=False,
+            ) as resp:
+                success = resp.is_success
+                if success:
+                    length = _retained_success(resp, status, max_bytes, media, exact_bytes)
+                    ceiling = max_bytes
+                else:
+                    length = None
+                    ceiling = _RETAINED_ERROR_BYTES
+                    # Error decoding must not inflate or accumulate an arbitrary proxy body.
+                    if resp.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise self._error(
+                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                        )
+                body = bytearray()
+                chunks = resp.aiter_bytes() if resp.is_stream_consumed else resp.aiter_raw()
+                async for chunk in chunks:
+                    if len(chunk) > ceiling - len(body):
+                        if success:
+                            raise MandalaError("retained response exceeds the byte limit")
+                        raise self._error(
+                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                        )
+                    body.extend(chunk)
+                if not success:
+                    raise self._error(
+                        httpx.Response(resp.status_code, headers=resp.headers, content=bytes(body))
+                    )
+                if (length is not None and len(body) != length) or (
+                    exact_bytes is not None and len(body) != exact_bytes
+                ):
+                    raise MandalaError("retained response ended before its declared size")
+                envelope = _retained_envelope(resp, bytes(body))
+            await asyncio.sleep(0)
+            return envelope
+        except httpx.TimeoutException as exc:
+            raise _timed_out(method, path, exc) from exc
+        except httpx.RequestError as exc:
+            raise _request_failed(method, path, exc) from exc
+
+    async def bounded_json_object(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        status: int = 200,
+        json: Any = None,
+        timeout: float | None = None,
+    ) -> Mapping[str, Any]:
+        body, _ = await self.bounded_binary(
+            method,
+            path,
+            max_bytes=max_bytes,
+            status=status,
+            media="application/json",
+            json=json,
+            timeout=timeout,
+        )
+        return _retained_object(body)
+
     def phase_ceiling(self, err: BaseException) -> float | None:
         """See :meth:`_BaseTransport._phase_ceiling`."""
         return self._phase_ceiling(self._http.timeout, err)
@@ -1234,8 +1505,12 @@ class AsyncTransport(_BaseTransport):
         timeout: float | None = None,
         timeout_cap: float | None = None,
         headers: Mapping[str, str] | None = None,
+        follow_redirects: bool | None = None,
     ) -> httpx.Response:
         """One request, with optional widening and a final per-phase cap."""
+        redirect_option: dict[str, Any] = (
+            {} if follow_redirects is None else {"follow_redirects": follow_redirects}
+        )
         try:
             resp = await self._http.request(
                 method,
@@ -1245,6 +1520,7 @@ class AsyncTransport(_BaseTransport):
                 content=content,
                 headers=self._sent(headers),
                 timeout=self._cap_budget(self._budget(self._http.timeout, timeout), timeout_cap),
+                **redirect_option,
             )
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc

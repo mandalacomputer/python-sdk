@@ -354,3 +354,23 @@ def test_an_unmodelled_server_field_does_not_split_a_record_in_two() -> None:
     assert lean == fuller
     assert len({lean, fuller}) == 1
     assert fuller.raw["z_order"] == 3, "the payload is still there to read"
+
+
+def test_retained_models_and_options_are_public_and_frozen() -> None:
+    for name in (
+        "RetainOutputOptions",
+        "RetainedResult",
+        "ResultOutput",
+        "Artifact",
+        "ArtifactAssociation",
+        "BackgroundResult",
+        "SynchronousResult",
+        "ResultPrefix",
+        "SynchronousResultPrefix",
+        "ResultDiagnostic",
+        "ResultObservation",
+        "ResultStream",
+    ):
+        assert name in mc.__all__ and hasattr(mc, name)
+    for cls in (mc.ResultOutput, mc.Artifact, mc.BackgroundResult, mc.SynchronousResult):
+        assert dataclasses.is_dataclass(cls) and cls.__dataclass_params__.frozen

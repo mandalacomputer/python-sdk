@@ -908,8 +908,119 @@ passive Activities view. Files are volatile and guest-mutable; independent
 readers do not get an immutable snapshot. Suspended computers or missing logs
 return an error. Handles live in daemon memory; observed exits expire after ten
 minutes, and restart, deletion, reassignment or PID replacement can invalidate
-them sooner. Retained output, artifacts and synchronous execution identity are
-not provided by these methods.
+them sooner. These volatile methods do not retain output or artifacts. Use the
+explicit retained methods below when an immutable version is needed.
+
+### Retained results and artifacts
+
+These methods use explicit immutable versions. Capture is optional and can fail
+independently of the command. A ready version or matching digest describes stored
+bytes, not task success or complete original output. Objects expire and share
+storage limits; unavailable, expired, deleted or foreign objects raise an error.
+
+```python
+# One explicit capture of existing background output. No polling or replay.
+retained = c.retain_execution_output(
+    job.execution_id, max_bytes_per_stream=1024 * 1024, retention_seconds=86400
+)
+metadata = c.result(retained.result_id)
+page = c.result_output(retained.result_id, stream="stdout", offset=0, limit=65536)
+print(page.data)  # exact bytes, including invalid UTF-8
+# Use page.next_offset for this reader's next explicit request.
+c.delete_result(retained.result_id)
+
+# Opt in on a synchronous command; no second execution is started for capture.
+result = c.exec("make", retain_output={"max_bytes_per_stream": 1048576})
+if result.result_id is not None:
+    metadata = c.result(result.result_id)  # explicit metadata read
+```
+
+`retain_execution_output()` makes one POST and reads guest output explicitly.
+`result()`, `result_output()` and `delete_result()` each make one retained request
+without guest I/O or waking a computer. Results use `res_` IDs, distinct from
+volatile `exec_` handles. No automatic retry, tail, legacy PID lookup or output
+fallback occurs. A lost or malformed capture response leaves publication
+unconfirmed; the server may already have committed it. Do not replay a command
+or repeat a capture automatically to repair that uncertainty.
+
+`result()` returns the finite frozen `BackgroundResult` or `SynchronousResult`
+variant of `RetainedResult`. Both carry scope, capture/expiry timestamps, stream
+byte counts and SHA-256 digests. Background versions carry their execution ID,
+last observed running/exited evidence and a separate wrapper diagnostic.
+Synchronous versions have no execution ID or diagnostic; they preserve signed
+exit evidence, exact source-response byte counts and `upstream_truncated`
+separately from retained-prefix truncation. Unknown versions or inconsistent
+identity/evidence raise `MandalaError` rather than an empty successful result.
+
+`ResultOutput` has `result_id`, `stream`, `offset`, `next_offset`, `eof` and exact
+`data: bytes`. Stream is stdout, stderr or diagnostic; offset is required and
+nonnegative. Limit is 1..65536 bytes, default 65536, and offset plus limit must
+fit a safe integer (9007199254740991). Readers share no cursor. EOF describes
+this immutable retained prefix; it does not establish task completion or mean
+that all original output was captured. Reading a synchronous diagnostic raises
+`ConflictError` (409); it is not an empty diagnostic. A page does not claim to
+verify the whole stream's hash.
+
+`retain_output` is keyword-only on `exec()`: absent/False omits the wire option;
+True or a strict `RetainOutputOptions` object enables it. The two options are
+`max_bytes_per_stream` (1..4 MiB, default 1 MiB) and `retention_seconds`
+(1..604800 seconds, default 86400). Wrapper diagnostic capture is capped at
+64 KiB. Invalid options fail before execution. `start_exec()`, readiness and
+`open()` do not gain a retention option. The optional `ExecResult.result_id` is
+keyword-only and excluded from positional matching, equality and hashing;
+missing or malformed optional identity does not change the command's outcome.
+
+Artifact publication requires an exact path, expected size and SHA-256 supplied
+by the caller. The SDK does not discover, read or hash guest files to prepare a
+nomination. Accepted absolute Linux, Windows drive and UNC paths are preserved
+byte-for-byte; the server checks the computer's actual OS.
+
+For this example, the producing step has already written `/tmp/report.bin` as
+exactly `b"abc"` (three bytes, no newline). Its size and digest below are known
+constants; no guest read or hash is performed to discover them.
+
+```python
+artifact = c.publish_artifact(
+    "/tmp/report.bin",
+    expected_size=3,
+    expected_sha256="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    # execution_id=job.execution_id,  # optional caller-selected association
+    max_bytes=8 * 1024 * 1024,
+    retention_seconds=86400,
+)
+metadata = c.artifact(artifact.artifact_id)
+content = c.download_artifact(artifact.artifact_id, max_bytes=8 * 1024 * 1024)
+c.delete_artifact(artifact.artifact_id)
+```
+
+`publish_artifact()` makes one explicit guest capture POST. `artifact()` and
+`delete_artifact()` each make one retained request. The finite `Artifact` model
+contains the `art_` ID, computer/workspace, creation/expiry, size, digest and
+nullable `execution_association`; a caller-selected execution association does
+not prove that execution produced the file. Artifacts have no public account ID
+or version field.
+
+`download_artifact()` first makes one metadata GET, then at most one whole
+binary GET to the fixed download route. It refuses metadata larger than the
+independent download cap before transfer. It returns `bytes` only after complete
+size and SHA-256 verification, including for empty artifacts. It never requests
+Range, follows redirects/Location, returns an unverified prefix, writes a local
+file, or falls back to guest reads. A change/deletion/revocation between requests,
+short/oversized body, digest mismatch or cancellation returns no successful
+content. Publication `max_bytes` and download `max_bytes` are separate caps:
+both default to 8 MiB and permit 1..64 MiB; expected artifact size permits zero.
+A larger download cap does not enlarge a stored artifact or trigger capture.
+Both delete methods return None on 204; repeating a deletion truthfully raises
+`NotFoundError` rather than claiming another deletion succeeded.
+
+All eight methods have matching `AsyncComputer` coroutines with `await`. Async
+task cancellation closes active responses and prevents follow-on requests.
+Metadata success bodies are bounded to 8 KiB for results and 4 KiB for artifacts;
+new retained error bodies are bounded too. Capture and whole-download calls
+widen read/write phases to at least 90 seconds, preserving longer or unlimited
+caller-owned client settings. These are **httpx phase/inactivity timeouts, not a
+total wall-clock deadline**; a slow stream can outlast that allowance. The usual
+sync exec timeout calculation remains unchanged.
 
 ### What is on the desktop
 

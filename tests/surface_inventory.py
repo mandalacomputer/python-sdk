@@ -72,6 +72,8 @@ VERBS = frozenset(
         "listing",
         "binary",
         "binary_part",
+        "bounded_binary",
+        "bounded_json_object",
     }
 )
 

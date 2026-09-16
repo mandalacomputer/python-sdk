@@ -7,6 +7,7 @@ import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import IO, Any
 
@@ -19,6 +20,7 @@ from ._agent import (
     AgentStepEvent,
     to_agent_event,
 )
+from ._artifacts import Artifact, decode_artifact, verify_download, verify_nomination
 from ._client import (
     DEADLINE_SLACK,
     FILE_PART_SIZE,
@@ -29,6 +31,7 @@ from ._client import (
     SNAPSHOT_POLL,
     SNAPSHOT_WAIT_TIMEOUT,
     Transport,
+    _retained_exec_object,
     error_for_status,
 )
 from ._events import (
@@ -68,6 +71,14 @@ from ._models import (
     is_unreachable_stub,
     move_rows,
     window_contradiction,
+)
+from ._results import (
+    ResultOutput,
+    ResultStream,
+    RetainedResult,
+    RetainOutputOptions,
+    decode_result,
+    decode_result_output,
 )
 
 __all__ = ["BackgroundCommand", "Computer"]
@@ -2128,11 +2139,17 @@ class Computer(ComputerFields):
         desktop: bool = False,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        retain_output: bool | RetainOutputOptions = False,
     ) -> ExecResult:
         """Run a shell command inside the guest.
 
         Uses the guest's native shell — bash on Linux, cmd.exe on Windows. A
         non-zero exit is returned, not raised; check :attr:`ExecResult.ok`.
+
+        ``retain_output=True`` (or a finite :class:`RetainOutputOptions` object)
+        explicitly retains the completed response. Missing/False keeps the
+        original behavior. A valid ``result_id`` confirms a committed version;
+        its absence is unconfirmed retention, never a reason to replay work.
 
         By default the command runs in the system context: as ``root`` on Linux,
         with no display attached. Pass ``desktop=True`` to run it in the logged-in
@@ -2171,6 +2188,7 @@ class Computer(ComputerFields):
             desktop=desktop,
             cwd=cwd,
             env=env,
+            retain_output=retain_output,
         )
 
     def _exec(
@@ -2181,9 +2199,24 @@ class Computer(ComputerFields):
         desktop: bool = False,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        retain_output: bool | RetainOutputOptions = False,
         timeout_cap: float | None = None,
     ) -> ExecResult:
-        """The exec request, with an optional wall-clock cap for readiness probes."""
+        """The exec request, with an optional per-phase cap for readiness probes."""
+        if retain_output is not False:
+            path = _api.computer_action(self.id, "exec")
+            response = self._t.request(
+                "POST",
+                path,
+                json=_api.exec_body(
+                    command, timeout, desktop, cwd=cwd, env=env, retain_output=retain_output
+                ),
+                timeout=timeout + DEADLINE_SLACK,
+                timeout_cap=timeout_cap,
+                follow_redirects=False,
+            )
+            result = ExecResult.from_api(_retained_exec_object(response, path))
+            return result if response.status_code == 200 else replace(result, result_id=None)
         data = self._t.json_object(
             "POST",
             _api.computer_action(self.id, "exec"),
@@ -2298,6 +2331,132 @@ class Computer(ComputerFields):
         params = _api.execution_output_params(stdout_offset, stderr_offset, limit)
         data = self._t.json_object("GET", _api.execution_output(self.id, identity), params=params)
         return decode_output(data, execution_id=identity, **params)
+
+    def retain_execution_output(
+        self,
+        execution_id: str,
+        *,
+        max_bytes_per_stream: int | None = None,
+        retention_seconds: int | None = None,
+    ) -> RetainedResult:
+        """Explicitly capture a new immutable version of existing guest output.
+
+        One POST, no retry. A lost/invalid response leaves publication unconfirmed.
+        The 90-second allowance widens read/write phases, not total elapsed time.
+        """
+        identity = _api.execution_id(execution_id)
+        computer_id = self.id
+        options = _api.retained_options(max_bytes_per_stream, retention_seconds)
+        data = self._t.bounded_json_object(
+            "POST",
+            _api.execution(computer_id, identity) + "/retained-output",
+            json=options,
+            max_bytes=8192,
+            status=201,
+            timeout=90.0,
+        )
+        return decode_result(data, computer_id=computer_id, execution_id=identity)
+
+    def result(self, result_id: str) -> RetainedResult:
+        """Read finite retained metadata once, without guest I/O."""
+        identity = _api.result_id(result_id)
+        computer_id = self.id
+        data = self._t.bounded_json_object(
+            "GET", _api.retained_result(computer_id, identity), max_bytes=8192
+        )
+        return decode_result(data, computer_id=computer_id, result_id=identity)
+
+    def result_output(
+        self, result_id: str, *, stream: ResultStream, offset: int, limit: int = 65536
+    ) -> ResultOutput:
+        """Read one immutable byte page. EOF is for this retained prefix only.
+
+        No implicit metadata read or shared cursor. Synchronous diagnostic is
+        unavailable (409), never synthesized as empty successful output.
+        """
+        identity = _api.result_id(result_id)
+        params = _api.result_output_params(stream, offset, limit)
+        data, headers = self._t.bounded_binary(
+            "GET",
+            _api.retained_result(self.id, identity) + "/output",
+            params=params,
+            max_bytes=params["limit"],
+        )
+        return decode_result_output(data, headers, result_id=identity, **params)
+
+    def delete_result(self, result_id: str) -> None:
+        """Delete one retained version. Repeated deletion remains a 404 error."""
+        path = _api.retained_result(self.id, result_id)
+        self._t.bounded_binary("DELETE", path, max_bytes=0, status=204, media=None, exact_bytes=0)
+
+    def publish_artifact(
+        self,
+        path: str,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+        execution_id: str | None = None,
+        max_bytes: int | None = None,
+        retention_seconds: int | None = None,
+    ) -> Artifact:
+        """Explicitly publish the exact guest file nominated by size and hash.
+
+        Does not discover, stat or hash guest files. One POST, never retried;
+        a lost response does not establish whether publication committed.
+        """
+        body = _api.artifact_body(
+            path,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            association=execution_id,
+            max_bytes=max_bytes,
+            retention_seconds=retention_seconds,
+        )
+        computer_id = self.id
+        data = self._t.bounded_json_object(
+            "POST", _api.artifacts(computer_id), json=body, max_bytes=4096, status=201, timeout=90.0
+        )
+        return verify_nomination(decode_artifact(data, computer_id=computer_id), body)
+
+    def artifact(self, artifact_id: str) -> Artifact:
+        """Read one artifact's finite metadata without guest I/O."""
+        identity = _api.artifact_id(artifact_id)
+        computer_id = self.id
+        data = self._t.bounded_json_object(
+            "GET", _api.artifact(computer_id, identity), max_bytes=4096
+        )
+        return decode_artifact(data, computer_id=computer_id, artifact_id=identity)
+
+    def download_artifact(self, artifact_id: str, *, max_bytes: int = 8388608) -> bytes:
+        """Return the complete retained artifact after exact size/hash verification.
+
+        One metadata GET and at most one whole download, never Range or retry.
+        max_bytes is an independent download cap (1..64 MiB, default 8 MiB),
+        not a capture option. Phase timeouts are not total wall-clock deadlines.
+        """
+        identity = _api.artifact_id(artifact_id)
+        maximum = _api.bounded_integer(max_bytes, "download max_bytes", 1, _api.ARTIFACT_MAX_BYTES)
+        computer_id = self.id
+        path = _api.artifact(computer_id, identity)
+        data = self._t.bounded_json_object("GET", path, max_bytes=4096)
+        artifact = decode_artifact(data, computer_id=computer_id, artifact_id=identity)
+        if artifact.size > maximum:
+            raise MandalaError(
+                "artifact size exceeds the download max_bytes; no download was started"
+            )
+        content, _ = self._t.bounded_binary(
+            "GET",
+            path + "/download",
+            max_bytes=artifact.size,
+            exact_bytes=artifact.size,
+            timeout=90.0,
+        )
+        return verify_download(artifact, content)
+
+    def delete_artifact(self, artifact_id: str) -> None:
+        """Delete one artifact. Repeated deletion remains a 404 error."""
+        path = _api.artifact(self.id, artifact_id)
+        self._t.bounded_binary("DELETE", path, max_bytes=0, status=204, media=None, exact_bytes=0)
 
     def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::
