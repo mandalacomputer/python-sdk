@@ -94,7 +94,7 @@ a new client to load a replacement. Revoking the device-named key in Settings �
 API keys makes requests fail with `AuthenticationError` and the server's reason;
 the SDK does not switch profiles, reread the store, or start login after a 401.
 The existing Python CLI inherits file authentication, with `MANDALA_PROFILE=Work`
-selecting a profile for SSH, SCP and webhook commands.
+selecting a profile for terminal, SCP and webhook commands.
 
 `timeout` is the per-request budget, 60 seconds unless a call knows it needs
 longer. `http_client` takes an `httpx.Client` (or `httpx.AsyncClient`) of your own
@@ -2701,13 +2701,13 @@ Your own terminal against a computer, addressed by name or id. Authentication
 is the SDK's: `MANDALA_API_KEY` in the environment.
 
 ```sh
-mandala ssh dev                    # an interactive shell in the guest
+mandala terminal dev               # an interactive shell in the guest
 mandala scp .env dev:/home/user/app/.env
 mandala scp dev:/home/user/report.csv .
 mandala webhooks list              # and create, get, update, delete, rotate, test, deliveries
 ```
 
-`ssh` opens the platform's terminal websocket: a PTY the platform keeps alive
+`terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
 server-side, running as the desktop user. Disconnecting *detaches* rather than
 ends it — the shell and whatever it was running keep going, and running the
 same command reattaches with recent output replayed. `--session <name>` keeps
@@ -2715,9 +2715,9 @@ several; the shell's exit code becomes the command's own. Inside, plain
 `nano`/`vim`/`echo` work as they would over real ssh.
 
 Where the shell's status cannot be had — the link dropped before the exit frame
-arrived, or the frame carried no readable code — `ssh` exits **255** and says
+arrived, or the frame carried no readable code — `terminal` exits **255** and says
 why on stderr, the same status ssh itself uses for that. It never exits 0 for a
-status it did not read, so a wrapper that gates on it — `mandala ssh dev <
+status it did not read, so a wrapper that gates on it — `mandala terminal dev <
 build.sh && ./deploy.sh` — will not ship on a build whose end nobody saw. Pipe
 a script in and it must end with `exit`: the guest shell is on a PTY the
 platform keeps alive, so it never sees the EOF that ends `ssh host < script`
@@ -2726,7 +2726,7 @@ no exit frame at all. A detach is one of those cases: the
 session survives and reattaching still works, but the command's fate is
 unknown until you do.
 
-The interactive `ssh` command currently requires a Unix-like local terminal.
+The interactive `terminal` command currently requires a Unix-like local terminal.
 `scp` remains available on Windows, including with drive-letter paths.
 
 `scp` copies one file per invocation, the side spelled `<computer>:/path` being

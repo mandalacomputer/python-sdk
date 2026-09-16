@@ -19,7 +19,7 @@ classifiers = [
 ]
 # httpx over requests: the SDK needs a sync and an async client from the same
 # surface, and agent frameworks are overwhelmingly async. websockets carries
-# `mandala ssh` and the event stream; it is pure Python with no dependencies of
+# `mandala terminal` and the event stream; it is pure Python with no dependencies of
 # its own, which is why it rides in the core install instead of an extra nobody
 # would discover.
 #

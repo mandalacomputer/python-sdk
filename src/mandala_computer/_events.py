@@ -1412,8 +1412,9 @@ def _refusal(
 # Module-level rather than inlined so a test can put its own connection behind
 # them, which is what every websocket test in this suite does. The imports are
 # deferred for the reason `_cli` defers its own: `websockets` is a core
-# dependency because `mandala ssh` needs it, but importing the package costs a
-# few milliseconds that a caller who only ever makes API calls should not pay.
+# dependency because `mandala terminal` and the event stream need it, but
+# importing the package costs a few milliseconds that a caller who only ever
+# makes API calls should not pay.
 
 
 def _connect(url: str, *, open_timeout: float, max_queue: int) -> Any:

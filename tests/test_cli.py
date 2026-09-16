@@ -285,7 +285,7 @@ def test_ctrl_c_ends_a_command_with_a_message_rather_than_a_traceback(
 ) -> None:
     """Interrupting a transfer is a normal thing to do, not a crash.
 
-    `_interact` has answered Ctrl-C with 130 on the `ssh` path since that path
+    `_interact` has answered Ctrl-C with 130 on the `terminal` path since that path
     existed, so what the CLI owes a person pressing it was already settled;
     `scp` and every `webhooks` verb run outside that handler, and `main` caught
     `MandalaError`, `ValueError` and `OSError` — none of which a
@@ -313,7 +313,7 @@ def test_ctrl_c_ends_a_command_with_a_message_rather_than_a_traceback(
     assert "interrupted" in capsys.readouterr().err
 
 
-# --- ssh preflight ---------------------------------------------------------
+# --- terminal preflight ----------------------------------------------------
 
 
 def _computer(payload: dict) -> None:
@@ -340,21 +340,21 @@ _TERMINAL_COMPUTER = {
 
 
 @respx.mock
-def test_ssh_windows_guest_dies_plainly() -> None:
+def test_terminal_windows_guest_dies_plainly() -> None:
     _computer({"status": "running", "os": "windows"})
     with pytest.raises(SystemExit, match="Windows"):
-        _cli.main(["ssh", "dev"])
+        _cli.main(["terminal", "dev"])
 
 
 @respx.mock
-def test_ssh_stopped_computer_says_start_it() -> None:
+def test_terminal_stopped_computer_says_start_it() -> None:
     _computer({"status": "stopped", "os": "linux"})
     with pytest.raises(SystemExit, match="start it"):
-        _cli.main(["ssh", "dev"])
+        _cli.main(["terminal", "dev"])
 
 
 @respx.mock
-def test_ssh_closes_the_api_client_before_interacting(
+def test_terminal_closes_the_api_client_before_interacting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _computer(_TERMINAL_COMPUTER)
@@ -379,14 +379,14 @@ def test_ssh_closes_the_api_client_before_interacting(
         return 7
 
     monkeypatch.setattr(_cli, "_interact", interact)
-    assert _cli.main(["ssh", "dev"]) == 7
+    assert _cli.main(["terminal", "dev"]) == 7
 
 
 @respx.mock
-def test_ssh_sizes_the_session_from_the_terminal_even_with_stdout_piped(
+def test_terminal_sizes_the_session_from_the_terminal_even_with_stdout_piped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OPL-4246: `mandala ssh dev | tee log` used to open the PTY at 80x24.
+    """OPL-4246: `mandala terminal dev | tee log` used to open the PTY at 80x24.
 
     The broker takes the PTY's initial geometry from `cols`/`rows` on the
     upgrade URL and only honours a `resize` frame afterwards, so the login
@@ -400,12 +400,12 @@ def test_ssh_sizes_the_session_from_the_terminal_even_with_stdout_piped(
     seen: list[str] = []
     monkeypatch.setattr(_cli, "_interact", lambda url: seen.append(url) or 0)
 
-    assert _cli.main(["ssh", "dev", "--session", "two"]) == 0
+    assert _cli.main(["terminal", "dev", "--session", "two"]) == 0
     assert seen == ["wss://terminal.test?session=two&cols=203&rows=51"]
 
 
 @respx.mock
-def test_ssh_without_a_terminal_anywhere_sizes_nothing(
+def test_terminal_without_a_terminal_anywhere_sizes_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fully non-interactive run has no window to report; the broker defaults."""
@@ -414,7 +414,7 @@ def test_ssh_without_a_terminal_anywhere_sizes_nothing(
     seen: list[str] = []
     monkeypatch.setattr(_cli, "_interact", lambda url: seen.append(url) or 0)
 
-    assert _cli.main(["ssh", "dev"]) == 0
+    assert _cli.main(["terminal", "dev"]) == 0
     assert seen == ["wss://terminal.test"]
 
 
@@ -441,7 +441,7 @@ def test_terminal_fd_prefers_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_terminal_fd_falls_back_past_a_piped_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`mandala ssh dev < script` still draws its output in a real window."""
+    """`mandala terminal dev < script` still draws its output in a real window."""
     monkeypatch.setattr(_cli.sys, "stdin", _Stream(0, False))
     monkeypatch.setattr(_cli.sys, "stdout", _Stream(1, False))
     monkeypatch.setattr(_cli.sys, "stderr", _Stream(2, True))
@@ -519,13 +519,45 @@ def test_terminal_size_honours_the_environment_override(
     assert _cli._terminal_size(7) == want
 
 
-def test_ssh_on_a_local_windows_terminal_dies_before_connecting(
+def test_terminal_on_a_local_windows_terminal_dies_before_connecting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_cli, "LOCAL_WINDOWS", True)
     monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
     with pytest.raises(SystemExit, match="Unix-like local terminal"):
-        _cli.main(["ssh", "dev"])
+        _cli.main(["terminal", "dev"])
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["ssh"], ["ssh", "dev"], ["ssh", "dev", "--session", "two"], ["ssh", "--help"]],
+)
+def test_ssh_refuses_and_points_at_terminal(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ssh` is being rebuilt as real OpenSSH; until then it must not run the terminal.
+
+    A script written for one must never quietly run the other, so it refuses
+    with a non-zero status, one line on stderr, and nothing on stdout.
+    """
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    monkeypatch.setattr(_cli, "_interact", lambda url: pytest.fail("must not open a terminal"))
+    assert _cli.main(argv) != 0
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        'mandala ssh is being rebuilt as a real OpenSSH session; use "mandala terminal" for a shell.\n'
+    )
+
+
+def test_top_level_help_lists_terminal_and_not_ssh(capsys: pytest.CaptureFixture[str]) -> None:
+    """`ssh` has no meaning yet, so help does not offer it."""
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["--help"])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert "terminal" in out
+    assert "ssh" not in out
 
 
 # --- guest paths are not local paths ---------------------------------------
@@ -664,7 +696,7 @@ def test_a_full_pipe_stalls_before_the_write_finishes() -> None:
     """OPL-4246, reproduced: a consumer that stops reading blocks the pump.
 
     Filling a real pipe is the whole bug — `_write_all` was an unbounded
-    `os.write` loop on the recv path, so `mandala ssh dev | head -c 1` parked
+    `os.write` loop on the recv path, so `mandala terminal dev | head -c 1` parked
     it here for good. What the guard changes is only the terminal: the write
     is still in progress when the callback runs, and it still completes once
     somebody drains the pipe.
@@ -914,7 +946,7 @@ def test_a_piped_stdout_still_sizes_the_guest_pty(
 ) -> None:
     """OPL-4246: the resize used to be gated on stdout being a TTY.
 
-    Raw mode is set from stdin, so `mandala ssh dev | tee log` is an
+    Raw mode is set from stdin, so `mandala terminal dev | tee log` is an
     interactive session by every measure the terminal cares about — and it was
     the one session that never sent a resize at all.
     """
@@ -1436,7 +1468,7 @@ def test_a_detach_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch, ca
 
 
 def test_an_unknown_status_is_not_reported_as_success(capsys) -> None:
-    """`mandala ssh cmd && next` must not run `next` on a status nobody read.
+    """`mandala terminal cmd && next` must not run `next` on a status nobody read.
 
     0 is the one value that claims the command succeeded, so it is the one
     value an unreadable frame must not produce. 255 is what ssh answers when it
@@ -1511,7 +1543,7 @@ def test_scp_upload_preserves_linux_filename_ending_in_backslash(tmp_path, remot
 
 @pytest.mark.parametrize("store", ["missing", "corrupt", "unsafe"])
 @pytest.mark.parametrize(
-    "argv", [["--help"], ["ssh", "--help"], ["scp", "--help"], ["webhooks", "--help"]]
+    "argv", [["--help"], ["terminal", "--help"], ["scp", "--help"], ["webhooks", "--help"]]
 )
 def test_O01_offline(
     store: str,
@@ -1545,7 +1577,7 @@ def test_O01_offline(
 
 
 @respx.mock
-@pytest.mark.parametrize("verb", ["webhooks", "ssh", "scp"])
+@pytest.mark.parametrize("verb", ["webhooks", "terminal", "scp"])
 @pytest.mark.parametrize("profile", [None, "Work"])
 def test_O02_profile_cli_paths(
     verb: str,
@@ -1577,7 +1609,7 @@ def test_O02_profile_cli_paths(
             respx.get(base + "/computers/vm-1").mock(httpx.Response(200, json=_TERMINAL_COMPUTER))
             monkeypatch.setattr(_cli, "_terminal_fd", lambda: None)
             monkeypatch.setattr(_cli, "_interact", lambda url: 0)
-            argv = ["ssh", "dev"]
+            argv = ["terminal", "dev"]
     assert _cli.main(argv) == 0
     assert len(respx.calls) >= 1
     for call in respx.calls:
