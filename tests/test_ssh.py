@@ -686,13 +686,87 @@ def test_setup_without_a_key_says_how_to_make_one(env: Path) -> None:
 
 
 @respx.mock
-def test_setup_on_a_computer_that_predates_ssh_fails(
+@pytest.mark.parametrize(
+    ("access", "message"),
+    [
+        (
+            {**ON, "available": False},
+            (
+                "mandala: dev was made from a template that predates SSH; "
+                "create a new computer to use SSH"
+            ),
+        ),
+        (
+            {**ON, "error": "no room"},
+            "mandala: the computer's host refused the SSH setting: no room",
+        ),
+    ],
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_setup_that_cannot_work_prints_no_success(
+    pub: Path,
+    env: Path,
+    capsys: pytest.CaptureFixture[str],
+    access: dict[str, Any],
+    message: str,
+    as_json: bool,
+) -> None:
+    """A failed setup looks like every other CLI failure, --json included:
+    one line on stderr, exit 1, and nothing on stdout a script could parse
+    as success."""
+    with respx.mock:
+        mock_setup([KEY], access)
+        argv = ["ssh", "--setup", "dev", *(["--json"] if as_json else [])]
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(argv)
+    assert caught.value.code == message
+    assert capsys.readouterr().out == ""
+    assert not kh(env).exists()
+
+
+@respx.mock
+def test_setup_survives_a_racing_setup_of_its_own(
     pub: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    mock_setup([KEY], {**ON, "available": False})
-    with pytest.raises(SystemExit, match="predates SSH; create a new computer"):
-        _cli.main(["ssh", "--setup", "dev"])
-    assert "SSH is on for dev" in capsys.readouterr().out
+    """Listed before a concurrent run added the key: the add is a 409, and a
+    second listing shows the key is ours, so setup carries on."""
+    computers()
+    respx.get(f"{BASE}/ssh-keys").mock(
+        side_effect=[httpx.Response(200, json=[]), httpx.Response(200, json=[KEY])]
+    )
+    add = respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(409, json={"error": "That key is already registered."})
+    )
+    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
+    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 0
+    assert add.call_count == 1
+    assert put.called
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["key_added"] is False
+    assert printed["key"] == KEY
+
+
+@respx.mock
+def test_setup_refuses_a_key_somebody_else_owns(
+    pub: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    computers()
+    keys = respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(
+            409,
+            json={"error": "That key is already registered. A key can belong to one person only."},
+        )
+    )
+    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
+    assert _cli.main(["ssh", "--setup", "dev"]) == 1
+    assert keys.call_count == 2
+    assert not put.called
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == (
+        "mandala: That key is already registered. A key can belong to one person only.\n"
+    )
 
 
 @respx.mock
@@ -809,6 +883,32 @@ def test_ssh_config_writes(env: Path, capsys: pytest.CaptureFixture[str]) -> Non
         "path": str(config),
         "changed": False,
     }
+
+
+@respx.mock
+def test_ssh_config_uses_the_id_when_another_computer_shares_the_name(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"id": "vm-9", "name": "dev", "status": "running", "os": "linux"},
+                {"id": "vm-7", "name": "dev", "status": "running", "os": "linux"},
+            ],
+        )
+    )
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    out, err = capsys.readouterr()
+    assert err == "mandala: another computer is also named dev; using Host vm-9 instead\n"
+    config = env / ".ssh" / "config"
+    assert out == f"wrote Host vm-9 in {config}\nconnect with: ssh vm-9\n"
+    assert config.read_text() == snippet("vm-9", home=env)
+    assert "Host dev\n" not in config.read_text()
+    assert _cli.main(["ssh-config", "vm-7", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out)["host"] == "vm-7"
+    assert "using Host vm-7 instead" in err
 
 
 @respx.mock

@@ -55,8 +55,8 @@ from . import _openssh
 from ._api import looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
-from ._exceptions import MandalaError
-from ._models import SshAccess, SshKey, Webhook, WebhookDelivery
+from ._exceptions import ConflictError, MandalaError
+from ._models import Listing, SshAccess, SshKey, Webhook, WebhookDelivery
 
 if TYPE_CHECKING:
     from websockets.sync.client import ClientConnection
@@ -201,12 +201,16 @@ def _client() -> Client:
     return Client()
 
 
-def _resolve(client: Client, target: str) -> Computer:
-    """The computer ``target`` names — an exact id, or a unique name."""
+def _resolve(client: Client, target: str, computers: Listing[Computer] | None = None) -> Computer:
+    """The computer ``target`` names — an exact id, or a unique name.
+
+    *computers* is a listing the caller already holds, to save a second one.
+    """
     # Resolution is not a fleet-wide consistency decision. One unreachable
     # hypervisor must not block terminal/scp to a computer on a healthy one, and the
     # partial response still carries cached id-only rows for unavailable hosts.
-    computers = client.computers.list(allow_partial=True)
+    if computers is None:
+        computers = client.computers.list(allow_partial=True)
     for c in computers:
         if c.id == target:
             return c
@@ -1204,11 +1208,31 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
     gw = _openssh.gateway()
     with _client() as client:
         c = _resolve(client, target)
-        existing = next((k for k in client.ssh_keys.list() if k.fingerprint == fingerprint), None)
-        registered = existing if existing is not None else client.ssh_keys.add(line)
+        existing = _own_key(client, fingerprint)
+        if existing is None:
+            try:
+                registered = client.ssh_keys.add(line)
+            except ConflictError:
+                # Registered between the listing and the add — by another
+                # `--setup` of our own, or by somebody else. Only the first is
+                # ours to carry on with; the second keeps the platform's refusal.
+                existing = _own_key(client, fingerprint)
+                if existing is None:
+                    raise
+                registered = existing
+        else:
+            registered = existing
         access = c.set_ssh_access(True)
-    _openssh.ensure_known_hosts(gw, _openssh.known_hosts_path())
     label = c.name or c.id
+    # Checked before anything is printed: a setup that cannot work must not
+    # say "SSH is on" or hand a script a success object first.
+    if access.available is False:
+        _die(
+            f"{label} was made from a template that predates SSH; create a new computer to use SSH"
+        )
+    if access.error:
+        _die(f"the computer's host refused the SSH setting: {access.error}")
+    _openssh.ensure_known_hosts(gw, _openssh.known_hosts_path())
     command = f"mandala ssh {shlex.quote(target)}"
     if as_json:
         _json(
@@ -1226,12 +1250,6 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
         print(f"key {registered.fingerprint} ({registered.name}) {state}")
         print(f"SSH is on for {label}")
         print(f"connect with: {command}")
-    if access.available is False:
-        _die(
-            f"{label} was made from a template that predates SSH; create a new computer to use SSH"
-        )
-    if access.error:
-        _die(f"the computer's host refused the SSH setting: {access.error}")
     if access.pending:
         print(
             f"mandala: {label} has not received the setting yet; it is sent again "
@@ -1239,6 +1257,10 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def _own_key(client: Client, fingerprint: str) -> SshKey | None:
+    return next((k for k in client.ssh_keys.list() if k.fingerprint == fingerprint), None)
 
 
 def _key_rows(keys: Sequence[SshKey]) -> str:
@@ -1313,11 +1335,20 @@ def _cmd_ssh_access(args: argparse.Namespace) -> int:
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
     gw = _openssh.gateway()
     with _client() as client:
-        c = _resolve(client, args.target)
+        computers = client.computers.list(allow_partial=True)
+        c = _resolve(client, args.target, computers)
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
-    snippet = _openssh.config_snippet(c.name, c.id, gw, known_hosts)
-    host = _openssh.host_alias(c.name, c.id)
+    # A name two computers share would give two blocks one Host, and ssh would
+    # only ever use the first; the id is unique.
+    shared = bool(c.name) and any(o.name == c.name and o.id != c.id for o in computers)
+    host = c.id if shared else _openssh.host_alias(c.name, c.id)
+    if shared and host != c.name:
+        print(
+            f"mandala: another computer is also named {c.name}; using Host {c.id} instead",
+            file=sys.stderr,
+        )
+    snippet = _openssh.config_snippet(host, c.id, gw, known_hosts)
     path = Path.home() / ".ssh" / "config"
     changed = _openssh.write_config(path, snippet) if args.write else None
     if args.json:
