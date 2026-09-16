@@ -67,6 +67,8 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
+    # Account quota has no SDK convenience resource yet; the typed Account follow-up adds it.
+    ("GET", "account"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
