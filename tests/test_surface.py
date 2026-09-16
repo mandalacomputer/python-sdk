@@ -70,6 +70,11 @@ UNIMPLEMENTED = {
     ("GET", "computers/:id/results/:resultId"),
     ("GET", "computers/:id/results/:resultId/output"),
     ("DELETE", "computers/:id/results/:resultId"),
+    # Explicit artifacts await runtime helpers.
+    ("POST", "computers/:id/artifacts"),
+    ("GET", "computers/:id/artifacts/:artifactId"),
+    ("GET", "computers/:id/artifacts/:artifactId/download"),
+    ("DELETE", "computers/:id/artifacts/:artifactId"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -96,6 +101,13 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # Artifact publication is not wrapped yet.
+    "POST computers/:id/artifacts  body:path",
+    "POST computers/:id/artifacts  body:expected_size",
+    "POST computers/:id/artifacts  body:expected_sha256",
+    "POST computers/:id/artifacts  body:execution_id",
+    "POST computers/:id/artifacts  body:max_bytes",
+    "POST computers/:id/artifacts  body:retention_seconds",
     # Retained output is not wrapped yet; see UNIMPLEMENTED.
     "POST computers/:id/executions/:executionId/retained-output  body:max_bytes_per_stream",
     "POST computers/:id/executions/:executionId/retained-output  body:retention_seconds",
