@@ -105,6 +105,13 @@ ALLOWED = {
     ("POST", "webhooks/:id/rotate"),
     ("POST", "webhooks/:id/test"),
     ("GET", "webhooks/:id/deliveries"),
+    # SSH access: the caller's own public keys, which belong to the person
+    # rather than the account, and whether SSH is on for one computer.
+    ("GET", "ssh-keys"),
+    ("POST", "ssh-keys"),
+    ("DELETE", "ssh-keys/:id"),
+    ("GET", "computers/:id/ssh"),
+    ("PUT", "computers/:id/ssh"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -307,4 +314,10 @@ PARAMETERS: dict[str, set[str]] = {
     "POST webhooks/:id/rotate": set(),
     "POST webhooks/:id/test": set(),
     "GET webhooks/:id/deliveries": set(),
+    # A key is one OpenSSH public key line; `name` is optional.
+    "GET ssh-keys": set(),
+    "POST ssh-keys": {"body:public_key", "body:name"},
+    "DELETE ssh-keys/:id": set(),
+    "GET computers/:id/ssh": set(),
+    "PUT computers/:id/ssh": {"body:enabled"},
 }
