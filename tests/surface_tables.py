@@ -62,6 +62,7 @@ ALLOWED = {
     ("DELETE", "computers/:id/artifacts/:artifactId"),
     ("GET", "computers/:id/activities"),
     ("GET", "computers/:id/activities/:activity"),
+    ("GET", "computers/:id/activities/:activity/results"),
     ("GET", "computers/:id/signals"),
     ("GET", "computers/:id/windows"),
     ("POST", "computers/:id/windows/:window"),
@@ -201,6 +202,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:session",
         "body:timeout_s",
         "body:background",
+        "body:retain_output",
         "body:cwd",
         "body:env",
     },
@@ -209,6 +211,7 @@ PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/executions/:executionId": set(),
     "GET computers/:id/activities": {"query:cursor", "query:changes"},
     "GET computers/:id/activities/:activity": set(),
+    "GET computers/:id/activities/:activity/results": set(),
     "GET computers/:id/signals": {"query:since", "query:limit"},
     "GET computers/:id/executions/:executionId/output": {
         "query:stdout_offset",

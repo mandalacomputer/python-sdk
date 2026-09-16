@@ -90,6 +90,7 @@ UNIMPLEMENTED = {
     # Retained API history has no SDK convenience methods yet.
     ("GET", "computers/:id/activities"),
     ("GET", "computers/:id/activities/:activity"),
+    ("GET", "computers/:id/activities/:activity/results"),
     # Passive platform signals have no SDK convenience method yet.
     ("GET", "computers/:id/signals"),
 }
@@ -101,6 +102,8 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # Synchronous output retention is tracked until runtime support is available.
+    "POST computers/:id/exec  body:retain_output",
     # Artifact publication is not wrapped yet.
     "POST computers/:id/artifacts  body:path",
     "POST computers/:id/artifacts  body:expected_size",
