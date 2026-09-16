@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import math
 import time
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
@@ -112,6 +113,16 @@ raising, the computer is reported with a warning rather than a second exception,
 so what you catch is still your own error. That warning means a machine outlived
 its block and is still billable.
 """
+
+
+def _launch_start_admitted(data: Mapping[str, Any]) -> bool:
+    held = data.get("running_ram_mb")
+    return (
+        isinstance(held, (int, float))
+        and not isinstance(held, bool)
+        and math.isfinite(held)
+        and held > 0
+    )
 
 
 class Computers:
@@ -290,11 +301,38 @@ class Computers:
             return left
 
         try:
+            start_admitted = _launch_start_admitted(computer.raw)
+            delay = 0.0
+            while True:
+                if computer.build_failed:
+                    computer.wait_until_built(timeout=0, poll=poll)
+                if computer.start_error:
+                    raise MandalaError(f"did not start: {computer.start_error}")
+                status = computer.raw.get("status")
+                if isinstance(status, str) and status in ("running", "stopped", "suspended"):
+                    break
+                if delay > 0:
+                    time.sleep(min(delay, remaining()))
+                try:
+                    computer._refresh(timeout_cap=remaining())
+                    # A later stopped row must not erase an earlier admitted attempt.
+                    start_admitted = start_admitted or _launch_start_admitted(computer.raw)
+                    delay = poll
+                except MandalaError as err:
+                    if not _is_transient_for_poll(err):
+                        raise
+                    remaining()
+                    delay = _poll_delay(err, poll)
             computer.wait_until_built(timeout=remaining(), poll=poll)
             if computer.start_error:
                 raise MandalaError(f"did not start: {computer.start_error}")
-            if computer.status in ("stopped", "suspended") and (
-                computer._nothing_admitted() or (not start and "running_ram_mb" not in computer.raw)
+            if (
+                not start_admitted
+                and computer.status in ("stopped", "suspended")
+                and (
+                    computer._nothing_admitted()
+                    or (not start and "running_ram_mb" not in computer.raw)
+                )
             ):
                 remaining()
                 computer.start()

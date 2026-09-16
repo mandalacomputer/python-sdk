@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
@@ -248,8 +249,10 @@ async def test_cancellation_mid_request_preserves_cancelled_error(stage):
         task = asyncio.create_task(client.computers.launch(poll=0))
         await asyncio.wait_for(entered.wait(), timeout=1)
         task.cancel("caller cancelled")
-        with pytest.raises(asyncio.CancelledError, match="caller cancelled"):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await task
+        if sys.version_info >= (3, 11):
+            assert str(cancelled.value) == "caller cancelled"
         count = len(requests)
         await asyncio.sleep(0)
         assert len(requests) == count
@@ -262,7 +265,8 @@ async def test_cancellation_during_build_sleep():
 
     async def handle(request):
         requests.append(request)
-        entered.set()
+        if request.method == "GET":
+            entered.set()
         return httpx.Response(200, json=state("building", 0))
 
     async with (
@@ -275,7 +279,7 @@ async def test_cancellation_during_build_sleep():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    assert len(requests) == 1
+    assert len(requests) == 2
 
 
 async def test_zero_budget_preserves_id_without_starting():
@@ -306,3 +310,106 @@ async def test_explicitly_deferred_create_starts_without_reservation_field():
         await client.computers.launch(start=False)
     assert json.loads(scenario.requests[0].content) == {"start": False}
     assert not scenario.steps
+
+
+@pytest.mark.parametrize("initial", [True, False])
+async def test_admitted_start_is_not_replayed_after_disk_preparation(initial):
+    reads = 0
+    replayed = False
+    requests = []
+
+    def handle(request):
+        nonlocal reads, replayed
+        requests.append(request)
+        path = request.url.path
+        if path == "/api/v1/computers":
+            return httpx.Response(200, json=state("building", 2048 if initial else 0))
+        if path.endswith("/start"):
+            replayed = True
+            return httpx.Response(200, json={"ok": True})
+        if path.endswith("/exec"):
+            return httpx.Response(200, json=GUEST)
+        reads += 1
+        if not initial and reads == 1:
+            return httpx.Response(200, json=state("building", 2048))
+        return httpx.Response(200, json=COMPUTER if replayed else state("stopped", 0))
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(mc.MandalaError, match="launch-42"):
+            await client.computers.launch(poll=0)
+    assert not replayed
+    assert all(not r.url.path.endswith("/exec") and r.method != "DELETE" for r in requests)
+
+
+@pytest.mark.parametrize("status", [None, "", ["stopped"], "unrecognized"])
+async def test_unknown_build_status_does_not_enter_another_stage(monkeypatch, status):
+    row = {**COMPUTER, "status": status, "running_ram_mb": 0}
+    scenario = Scenario([step("POST", "", row), step("GET", "/launch-42", row, elapsed=1)])
+    scenario.install(monkeypatch, resources, computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(mc.TimeoutError, match="launch-42") as caught:
+            await client.computers.launch(timeout=1, poll=0)
+    assert "still building" not in str(caught.value)
+    assert not scenario.steps
+
+
+@pytest.mark.parametrize(
+    "status, expected", [(401, mc.AuthenticationError), (503, mc.TimeoutError)]
+)
+async def test_build_refresh_failure_at_deadline(monkeypatch, status, expected):
+    scenario = Scenario(
+        [
+            step("POST", "", state("building", 0)),
+            step("GET", "/launch-42", {"error": "refresh failed"}, status, 1),
+        ]
+    )
+    scenario.install(monkeypatch, resources, computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(expected, match="launch-42") as caught:
+            await client.computers.launch(timeout=1, poll=0)
+    assert "still building" not in str(caught.value)
+    assert not scenario.steps
+
+
+async def test_build_transient_failures_honour_retry_after(monkeypatch):
+    scenario = Scenario([])
+    scenario.install(monkeypatch, resources, computers)
+    requests = []
+    reads = 0
+
+    def handle(request):
+        nonlocal reads
+        requests.append(request)
+        path = request.url.path
+        if path == "/api/v1/computers":
+            return httpx.Response(200, json=state("building", 0))
+        if path.endswith("/start"):
+            return httpx.Response(200, json={"ok": True})
+        if path.endswith("/exec"):
+            return httpx.Response(200, json=GUEST)
+        reads += 1
+        if reads == 1:
+            return httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "1"})
+        if reads == 2:
+            assert scenario.now == 1
+            return httpx.Response(503, json={"error": "busy"})
+        assert scenario.now == 1.25
+        return httpx.Response(200, json=state("stopped", 0) if reads == 3 else COMPUTER)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.launch(start=False, timeout=2, poll=0.25)
+        assert c.id == "launch-42"
+    assert json.loads(requests[0].content) == {"start": False}
+    assert len([r for r in requests if r.url.path.endswith("/start")]) == 1

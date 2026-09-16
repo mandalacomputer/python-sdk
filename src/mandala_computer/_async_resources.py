@@ -70,6 +70,7 @@ from ._resources import (
     Templates,
     Webhooks,
     _LastPoll,
+    _launch_start_admitted,
     _named,
     _wait_timed_out,
     classify_poll_failure,
@@ -269,11 +270,38 @@ class AsyncComputers:
             return left
 
         try:
+            start_admitted = _launch_start_admitted(computer.raw)
+            delay = 0.0
+            while True:
+                if computer.build_failed:
+                    await computer.wait_until_built(timeout=0, poll=poll)
+                if computer.start_error:
+                    raise MandalaError(f"did not start: {computer.start_error}")
+                status = computer.raw.get("status")
+                if isinstance(status, str) and status in ("running", "stopped", "suspended"):
+                    break
+                if delay > 0:
+                    await asyncio.sleep(min(delay, remaining()))
+                try:
+                    await computer._refresh(timeout_cap=remaining())
+                    # A later stopped row must not erase an earlier admitted attempt.
+                    start_admitted = start_admitted or _launch_start_admitted(computer.raw)
+                    delay = poll
+                except MandalaError as err:
+                    if not _is_transient_for_poll(err):
+                        raise
+                    remaining()
+                    delay = _poll_delay(err, poll)
             await computer.wait_until_built(timeout=remaining(), poll=poll)
             if computer.start_error:
                 raise MandalaError(f"did not start: {computer.start_error}")
-            if computer.status in ("stopped", "suspended") and (
-                computer._nothing_admitted() or (not start and "running_ram_mb" not in computer.raw)
+            if (
+                not start_admitted
+                and computer.status in ("stopped", "suspended")
+                and (
+                    computer._nothing_admitted()
+                    or (not start and "running_ram_mb" not in computer.raw)
+                )
             ):
                 remaining()
                 await computer.start()
