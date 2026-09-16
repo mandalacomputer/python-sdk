@@ -214,6 +214,8 @@ class AgentFailed:
     #: error and the status alone — so this being empty means "not reported"
     #: rather than "nothing happened".
     steps: tuple[AgentStep, ...] = ()
+    #: The complete received error frame, including reason and request_id.
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 #: One event out of :meth:`~mandala_computer.Computer.agent_stream`. Match on it
@@ -262,5 +264,6 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
             _num(r.get("status")),
             AgentUsage.from_api(r.get("usage")),
             tuple(AgentStep.from_api(step, i + 1) for i, step in enumerate(taken)),
+            raw=r,
         )
     return None

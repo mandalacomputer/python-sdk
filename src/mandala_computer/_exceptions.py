@@ -17,6 +17,7 @@ __all__ = [
     "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
+    "MethodNotAllowedError",
     "MoveRequiredError",
     "NotFoundError",
     "OriginResponseError",
@@ -87,7 +88,15 @@ def _refusal_reason(body: object) -> str | None:
     if not isinstance(body, dict):
         return None
     reason = body.get("reason")
-    return reason if isinstance(reason, str) else None
+    if isinstance(reason, str):
+        return reason
+    error = body.get("error")
+    nested = error.get("reason") if isinstance(error, dict) else None
+    return nested if isinstance(nested, str) else None
+
+
+def _nonblank(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
 
 
 class APIError(MandalaError):
@@ -100,6 +109,9 @@ class APIError(MandalaError):
         status: int,
         body: object = None,
         retry_after: float | None = None,
+        request_id: str | None = None,
+        allow: str | None = None,
+        www_authenticate: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -121,10 +133,17 @@ class APIError(MandalaError):
         #: whoever loses the race to the running check hears the same fact the
         #: earlier caller heard.
         self.reason = _refusal_reason(body)
+        #: Correlation for this response, when supplied; not an idempotency key.
+        self.request_id = _nonblank(request_id) or _nonblank(
+            body.get("request_id") if isinstance(body, dict) else None
+        )
+        #: The received Allow and WWW-Authenticate headers, when supplied.
+        self.allow = allow
+        self.www_authenticate = www_authenticate
 
 
 class AuthenticationError(APIError):
-    """The API key is missing, malformed, or revoked (401)."""
+    """A credential was refused (401); reason/challenge may classify the refusal."""
 
 
 class PermissionDeniedError(APIError):
@@ -132,7 +151,7 @@ class PermissionDeniedError(APIError):
 
 
 class NotFoundError(APIError):
-    """No such resource (404).
+    """No such computer, snapshot, guest file, or route (404).
 
     Tenant scoping is enforced server-side, so another tenant's resource is
     reported as missing rather than forbidden — existence is not leaked.
@@ -208,8 +227,19 @@ class RangeNotSatisfiableError(APIError):
         body: object = None,
         size: int | None = None,
         retry_after: float | None = None,
+        request_id: str | None = None,
+        allow: str | None = None,
+        www_authenticate: str | None = None,
     ) -> None:
-        super().__init__(message, status=status, body=body, retry_after=retry_after)
+        super().__init__(
+            message,
+            status=status,
+            body=body,
+            retry_after=retry_after,
+            request_id=request_id,
+            allow=allow,
+            www_authenticate=www_authenticate,
+        )
         #: The file's length in bytes, or ``None`` if the refusal did not carry it.
         self.size = size
 
@@ -360,8 +390,19 @@ class RateLimitError(APIError):
         status: int,
         body: object = None,
         retry_after: float | None = None,
+        request_id: str | None = None,
+        allow: str | None = None,
+        www_authenticate: str | None = None,
     ) -> None:
-        super().__init__(message, status=status, body=body)
+        super().__init__(
+            message,
+            status=status,
+            body=body,
+            retry_after=retry_after,
+            request_id=request_id,
+            allow=allow,
+            www_authenticate=www_authenticate,
+        )
         #: Seconds to wait before retrying, from ``Retry-After``.
         #:
         #: ``None`` where there was no usable header, which on an ordinary
@@ -371,6 +412,10 @@ class RateLimitError(APIError):
         #: so there is no header to read and nothing to guess from. That is the
         #: one place to expect this to be ``None`` and back off on your own.
         self.retry_after = retry_after
+
+
+class MethodNotAllowedError(APIError):
+    """The path does not accept this method (405). See the received Allow header."""
 
 
 class ConflictError(APIError):
@@ -467,8 +512,19 @@ class MoveRequiredError(ConflictError):
         body: object = None,
         move_possible: bool,
         retry_after: float | None = None,
+        request_id: str | None = None,
+        allow: str | None = None,
+        www_authenticate: str | None = None,
     ) -> None:
-        super().__init__(message, status=status, body=body, retry_after=retry_after)
+        super().__init__(
+            message,
+            status=status,
+            body=body,
+            retry_after=retry_after,
+            request_id=request_id,
+            allow=allow,
+            www_authenticate=www_authenticate,
+        )
         #: Whether a host in this region could run the size that was asked for.
         self.move_possible = move_possible
 
@@ -669,6 +725,8 @@ def is_transient(err: BaseException) -> bool:
     # Arbitrary exceptions may also happen to expose ``reason`` — including an
     # unhashable value — but that is neither this protocol nor retry advice.
     if isinstance(err, APIError):
+        if err.status in (401, 402, 403, 404, 405):
+            return False
         if isinstance(err.body, dict) and err.body.get("code") == "template_image_preparing":
             # Continuation requires the returned token and original create arguments.
             # The same code can also describe failed preparation; inspect its body.
@@ -680,6 +738,12 @@ def is_transient(err: BaseException) -> bool:
         # not retry advice on a 401, a 402, a 403 or a 404, even if the body
         # happens to carry the word — this predicate is the public "safe to
         # replay, including a create" answer.
+        # Nested run errors can describe completed work; a clearing reason
+        # there remains diagnostic and cannot grant permission to replay it.
+        if reason in _REASON_CLEARS and not (
+            isinstance(err.body, dict) and isinstance(err.body.get("reason"), str)
+        ):
+            return False
         if reason in _REASON_CLEARS and (
             isinstance(err, ConflictError) or err.status in (400, 409)
         ):

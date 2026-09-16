@@ -30,6 +30,7 @@ from ._exceptions import (
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
+    MethodNotAllowedError,
     MoveRequiredError,
     NotFoundError,
     OriginResponseError,
@@ -192,6 +193,7 @@ _STATUS_ERRORS = {
     402: PlanLimitError,
     403: PermissionDeniedError,
     404: NotFoundError,
+    405: MethodNotAllowedError,
     409: ConflictError,
     # Both file statuses, and both of them about the same ceiling seen from
     # different sides — see FILE_SIZE_LIMIT. Their own classes rather than a
@@ -856,9 +858,15 @@ class _BaseTransport:
         named = False
         try:
             body = resp.json()
-            if isinstance(body, dict) and body.get("error"):
-                message = str(body["error"])
+            error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(error, str) and error:
+                message = error
                 named = True
+            elif isinstance(error, dict):
+                candidate = error.get("message")
+                if isinstance(candidate, str) and candidate.strip():
+                    message = candidate
+                    named = True
         except ValueError:
             text = resp.text.strip()
             if text:
@@ -869,6 +877,11 @@ class _BaseTransport:
                 # it — a Cloudflare Ray ID lives in that HTML and nowhere else,
                 # and substituting the message used to drop it on the floor.
                 body = message
+        metadata = {
+            "request_id": resp.headers.get("x-request-id"),
+            "allow": resp.headers.get("allow"),
+            "www_authenticate": resp.headers.get("www-authenticate"),
+        }
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
 
         def substituted(said: str) -> str:
@@ -906,7 +919,11 @@ class _BaseTransport:
         if cls is ConflictError:
             if isinstance(body, dict) and body.get("code") == "template_image_preparing":
                 return ConflictError(
-                    message, status=resp.status_code, body=body, retry_after=_retry_after(resp)
+                    message,
+                    status=resp.status_code,
+                    body=body,
+                    retry_after=_retry_after(resp),
+                    **metadata,
                 )
             # The 409 that is an offer, told apart by its body — see
             # MoveRequiredError. Never given a substituted message: the
@@ -920,6 +937,7 @@ class _BaseTransport:
                     body=body,
                     move_possible=offer,
                     retry_after=_retry_after(resp),
+                    **metadata,
                 )
         if cls is RateLimitError:
             return RateLimitError(
@@ -927,6 +945,7 @@ class _BaseTransport:
                 status=resp.status_code,
                 body=body,
                 retry_after=_retry_after(resp),
+                **metadata,
             )
         if cls is RangeNotSatisfiableError:
             # The one refusal on this surface that answers the question it is
@@ -938,8 +957,11 @@ class _BaseTransport:
                 body=body,
                 size=_refused_size(resp),
                 retry_after=_retry_after(resp),
+                **metadata,
             )
-        return cls(message, status=resp.status_code, body=body, retry_after=_retry_after(resp))
+        return cls(
+            message, status=resp.status_code, body=body, retry_after=_retry_after(resp), **metadata
+        )
 
 
 def _move_offer(body: object) -> bool | None:
@@ -963,7 +985,7 @@ def _move_offer(body: object) -> bool | None:
     return possible
 
 
-def error_for_status(status: int, message: str) -> APIError:
+def error_for_status(status: int, message: str, body: object = None) -> APIError:
     """The exception a status deserves, for a failure that arrived in a stream.
 
     The agent loop reports its own failures as events rather than as a status —
@@ -994,7 +1016,14 @@ def error_for_status(status: int, message: str) -> APIError:
         # different events, and a caller branching on the class to decide
         # whether its work survived would be answered wrongly here.
         cls = APIError
-    return cls(message, status=status)
+    # Stream failures may include completed work. Retain its correlation and
+    # accounting without making flat or nested reasons into replay advice.
+    if isinstance(body, dict):
+        body = {key: value for key, value in body.items() if key != "reason"}
+        nested = body.get("error")
+        if isinstance(nested, dict):
+            body["error"] = {key: value for key, value in nested.items() if key != "reason"}
+    return cls(message, status=status, body=body)
 
 
 def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutError:
