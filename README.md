@@ -2215,12 +2215,15 @@ including when its error body is interrupted; `RateLimitError.retry_after` still
 carries a usable server delay. Other statuses and local validation, decoding,
 size or integrity failures do not permit retries.
 
-Caller-owned httpx clients keep their redirect and authentication behavior.
-A returned redirect chain is retryable only if every request in its history is
-safe. If automatic redirects are enabled and an attempt fails before httpx
-returns a final response, the SDK cannot inspect its complete history and does
-not retry that failure. Clients with automatic redirects disabled retain
-connection-error retries.
+Caller-owned httpx clients keep their redirect, response-hook and authentication
+behavior. A returned response is retryable only if every request in its history
+is safe. Automatic redirects, response hooks and configured authentication can
+consume a response before httpx returns it to the SDK. If an attempt fails
+before that return, and any of those mechanisms were enabled before dispatch,
+the SDK cannot establish the received status, headers and history and does not
+retry that failure. This applies to ordinary, retained and SSE reads. Without
+those mechanisms, connection-error retries remain available; the SDK's ordinary
+Authorization header does not disable them.
 
 Backoff starts at 250 ms, doubles after each failure, and caps at 30 seconds.
 A valid `Retry-After` is a lower bound on that delay, including HTTP dates and

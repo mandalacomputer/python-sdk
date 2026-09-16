@@ -905,3 +905,310 @@ async def test_http_date_delay_is_evaluated_after_error_body_consumption(monkeyp
 
     assert await make(handler, {"idempotent": 1}).json("GET", "/computers") == {}
     assert delays == [0.25]
+
+
+@pytest.mark.parametrize("status", [200, 429, 502, 503, 504])
+@pytest.mark.parametrize("kind", ["json", "sse"])
+@pytest.mark.parametrize("policy", [None, {"idempotent": 1}])
+async def test_decoding_error_is_terminal_for_every_sdk_error_class(status, kind, policy, delays):
+    bodies = []
+
+    class GzipBody(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b"not a gzip body"
+
+        async def aclose(self):
+            self.closed = True
+
+    def handler(request):
+        body = GzipBody()
+        bodies.append(body)
+        return httpx.Response(
+            status,
+            stream=body,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Type": "text/event-stream" if kind == "sse" else "application/json",
+                "Retry-After": "9",
+            },
+        )
+
+    t = make(handler, policy)
+    with pytest.raises(ConnectionInterruptedError if status == 200 else APIError) as caught:
+        if kind == "sse":
+            await anext(t.sse("GET", "/builds/b/events"))
+        else:
+            await t.json("GET", "/computers")
+    assert isinstance(caught.value.__cause__, httpx.DecodingError)
+    if status != 200:
+        assert caught.value.status == status
+        assert caught.value.retry_after == 9
+    assert len(bodies) == 1 and bodies[0].closed
+    assert delays == []
+
+
+@pytest.mark.parametrize("status", [200, 429, 502, 503, 504])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+@pytest.mark.parametrize("observer", ["response_hook", "auth_body", "auth_flow"])
+@pytest.mark.parametrize("policy", [None, {"idempotent": 1}])
+async def test_pre_return_body_processing_failure_is_terminal(
+    status, kind, observer, policy, delays
+):
+    bodies, calls, inspected = [], [], []
+
+    async def hook(response):
+        inspected.append(response.status_code)
+        await response.aread()
+
+    class BodyAuth(httpx.Auth):
+        requires_response_body = True
+
+        def auth_flow(self, request):
+            inspected.append("auth started")
+            yield request
+
+    class FlowAuth(httpx.Auth):
+        async def async_auth_flow(self, request):
+            response = yield request
+            inspected.append(response.status_code)
+            await response.aread()
+
+    auth = (
+        BodyAuth() if observer == "auth_body" else FlowAuth() if observer == "auth_flow" else None
+    )
+    hooks = {"response": [hook]} if observer == "response_hook" else {}
+
+    def handler(request):
+        calls.append(request)
+        body = Broken()
+        bodies.append(body)
+        return httpx.Response(
+            status, stream=body, headers={"Retry-After": "9" * 1000 if status == 503 else "9"}
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), auth=auth, event_hooks=hooks)
+    original_hooks = {key: list(value) for key, value in http.event_hooks.items()}
+    t = AsyncTransport("test", client=http, retries=policy)
+    with pytest.raises(ConnectionInterruptedError) as caught:
+        if kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        elif kind == "sse":
+            await anext(t.sse("GET", "/builds/b/events"))
+        else:
+            await t.json("GET", "/computers", timeout_cap=1)
+    assert isinstance(caught.value.__cause__, httpx.ReadError)
+    assert len(calls) == len(bodies) == 1 and bodies[0].closed
+    assert inspected == (["auth started"] if observer == "auth_body" else [status])
+    assert delays == []
+    assert http.auth is auth and http.event_hooks == original_hooks
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+@pytest.mark.parametrize("observer", ["response_hook", "auth_body", "auth_flow"])
+async def test_returned_responses_can_retry_after_caller_body_processing(kind, observer, delays):
+    calls, inspected = [], []
+
+    async def hook(response):
+        inspected.append(response.status_code)
+        await response.aread()
+
+    class BodyAuth(httpx.Auth):
+        requires_response_body = True
+
+    class FlowAuth(httpx.Auth):
+        async def async_auth_flow(self, request):
+            response = yield request
+            inspected.append(response.status_code)
+            await response.aread()
+
+    auth = (
+        BodyAuth() if observer == "auth_body" else FlowAuth() if observer == "auth_flow" else None
+    )
+    hooks = {"response": [hook]} if observer == "response_hook" else {}
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, json={"error": "try again"})
+        content = (
+            b"event: ready\ndata: {}\n\n"
+            if kind == "sse"
+            else b"ok"
+            if kind == "bounded"
+            else b"{}"
+        )
+        media = (
+            "text/event-stream"
+            if kind == "sse"
+            else "application/octet-stream"
+            if kind == "bounded"
+            else "application/json"
+        )
+        return httpx.Response(
+            200,
+            content=content,
+            headers={"Content-Type": media, "Content-Length": str(len(content))},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), auth=auth, event_hooks=hooks)
+    original_hooks = {key: list(value) for key, value in http.event_hooks.items()}
+    t = AsyncTransport("test", client=http, retries={"idempotent": 1})
+    if kind == "sse":
+        events = [event async for event in t.sse("GET", "/builds/b/events")]
+        assert len(events) == 1
+    elif kind == "bounded":
+        result, _ = await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        assert result == b"ok"
+    else:
+        assert await t.json("GET", "/computers") == {}
+    assert len(calls) == 2 and delays == [0.25]
+    assert inspected == ([] if observer == "auth_body" else [503, 200])
+    assert http.auth is auth and http.event_hooks == original_hooks
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+@pytest.mark.parametrize("observer", ["response_hook", "auth_flow"])
+async def test_callback_cannot_clear_captured_response_uncertainty(kind, observer, delays):
+    calls, bodies = [], []
+
+    async def hook(response):
+        http.event_hooks["response"].clear()
+        await response.aread()
+
+    class Auth(httpx.Auth):
+        async def async_auth_flow(self, request):
+            response = yield request
+            http.auth = None
+            await response.aread()
+
+    auth = Auth() if observer == "auth_flow" else None
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: handler(request)),
+        auth=auth,
+        event_hooks={"response": [hook]} if observer == "response_hook" else {},
+    )
+
+    def handler(request):
+        calls.append(request)
+        body = Broken()
+        bodies.append(body)
+        return httpx.Response(429, stream=body, headers={"Retry-After": "9"})
+
+    t = AsyncTransport("test", client=http, retries={"idempotent": 3})
+    with pytest.raises(ConnectionInterruptedError):
+        if kind == "sse":
+            await anext(t.sse("GET", "/builds/b/events"))
+        elif kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        else:
+            await t.json("GET", "/computers")
+    assert len(calls) == len(bodies) == 1 and bodies[0].closed
+    assert delays == []
+    assert http.event_hooks["response"] == [] and http.auth is None
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+async def test_response_boundary_configuration_is_captured_for_each_attempt(kind, monkeypatch):
+    calls, delays = [], []
+
+    async def hook(response):
+        await response.aread()
+
+    async def sleep(delay):
+        delays.append(delay)
+        http.event_hooks["response"] = [hook]
+
+    monkeypatch.setattr(_client, "_async_retry_sleep", sleep)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, json={})
+        return httpx.Response(429, stream=Broken(), headers={"Retry-After": "9"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    t = AsyncTransport("test", client=http, retries={"idempotent": 3})
+    with pytest.raises(ConnectionInterruptedError):
+        if kind == "sse":
+            await anext(t.sse("GET", "/builds/b/events"))
+        elif kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        else:
+            await t.json("GET", "/computers")
+    assert len(calls) == 2 and delays == [0.25]
+
+
+@pytest.mark.parametrize(
+    "kind,follows,override,expected",
+    [
+        ("ordinary", True, False, 2),
+        ("ordinary", False, True, 1),
+        ("bounded", True, None, 2),
+        ("sse", True, None, 1),
+    ],
+)
+@pytest.mark.parametrize("processor", ["none", "response_hook", "auth"])
+async def test_effective_observation_policy_across_all_read_paths(
+    kind, follows, override, expected, processor, delays
+):
+    calls = []
+
+    async def hook(response):
+        await response.aread()
+
+    def handler(request):
+        calls.append(request)
+        if processor != "auth":
+            assert request.headers["Authorization"] == "Bearer test"
+        raise httpx.ConnectError("no returned response", request=request)
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=follows,
+        auth=httpx.BasicAuth("user", "password") if processor == "auth" else None,
+        event_hooks={"response": [hook]} if processor == "response_hook" else {},
+    )
+    t = AsyncTransport("test", client=http, retries={"idempotent": 1})
+    with pytest.raises(ConnectionError):
+        if kind == "sse":
+            await anext(t.sse("GET", "/builds/b/events"))
+        elif kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        else:
+            await t.json("GET", "/computers", follow_redirects=override)
+    assert len(calls) == (expected if processor == "none" else 1)
+    assert delays == ([0.25] if expected == 2 and processor == "none" else [])
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse"])
+async def test_auth_challenge_body_failure_is_terminal_without_response_body_flag(kind, delays):
+    calls, inspected = [], []
+
+    class Auth(httpx.Auth):
+        def auth_flow(self, request):
+            response = yield request
+            inspected.append(response.status_code)
+            # httpx reads this intermediate body before sending the next auth request.
+            yield request
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(429, stream=Broken(), headers={"Retry-After": "9"})
+
+    auth = Auth()
+    assert auth.requires_response_body is False
+    t = AsyncTransport(
+        "test",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler), auth=auth),
+        retries={"idempotent": 2},
+    )
+    with pytest.raises(ConnectionInterruptedError):
+        if kind == "sse":
+            await anext(t.sse("GET", "/builds/b/events"))
+        elif kind == "bounded":
+            await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        else:
+            await t.json("GET", "/computers")
+    assert inspected == [429] and len(calls) == 1 and delays == []

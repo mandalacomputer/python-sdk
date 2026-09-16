@@ -464,11 +464,26 @@ class _BaseTransport:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/{path.lstrip('/')}"
 
-    def _retry(self, method: str, path: str, timeout_cap: float | None = None) -> _Retry:
+    def _retry(
+        self,
+        method: str,
+        path: str,
+        timeout_cap: float | None = None,
+        *,
+        client: httpx.Client | httpx.AsyncClient,
+        follow_redirects: bool | None = None,
+    ) -> _Retry:
         # Legacy PID reads consume a shared output cursor, despite using GET.
         pathname = httpx.URL(self._url(path)).path
         safe = _safe_read(method, pathname)
-        return _Retry(self._retries if safe else 0, method, path, timeout_cap)
+        return _Retry(
+            self._retries if safe else 0,
+            method,
+            path,
+            timeout_cap,
+            client,
+            follow_redirects,
+        )
 
     def _response_failed(
         self, method: str, path: str, resp: httpx.Response | None, exc: httpx.RequestError
@@ -1125,13 +1140,25 @@ def _safe_read(method: str, pathname: str) -> bool:
 class _Retry:
     """One exchange's attempt counter and optional caller budget."""
 
-    def __init__(self, count: int, method: str, path: str, cap: float | None) -> None:
+    def __init__(
+        self,
+        count: int,
+        method: str,
+        path: str,
+        cap: float | None,
+        client: httpx.Client | httpx.AsyncClient,
+        follow_redirects: bool | None,
+    ) -> None:
         self.count = count
         self.attempt = 0
         self.method = method
         self.path = path
         self.cap = cap
         self.after: float | None = None
+        self.client = client
+        self.follow_redirects = follow_redirects
+        self.observed_response = False
+        self.hidden_response_possible = False
         # Default-off and ineligible requests retain their original phase cap,
         # including the final boundary probe a wait may make with cap=0.
         self.deadline = None if cap is None or count == 0 else time.monotonic() + cap
@@ -1143,21 +1170,27 @@ class _Retry:
 
     def begin(self) -> float | None:
         self.after = None
+        self.observed_response = False
+        # Capture before dispatch: a callback can change client configuration
+        # before its body read fails, without returning the response to us.
+        redirects = (
+            self.client.follow_redirects if self.follow_redirects is None else self.follow_redirects
+        )
+        self.hidden_response_possible = (
+            redirects
+            or bool(self.client.event_hooks.get("response"))
+            or self.client.auth is not None
+        )
         return self.remaining()
 
     def observe_response(self, response: httpx.Response) -> None:
+        self.observed_response = True
         for hop in (*response.history, response):
             self.observe(hop.request)
         after = _retry_after(response, for_retry=True)
         # Only overflow needs a separate channel. Finite values come from the
         # final API error, whose date delay is evaluated after body consumption.
         self.after = after if after is not None and math.isinf(after) else None
-
-    def missing_response(self, follows_redirects: bool) -> None:
-        # httpx keeps history local until it returns a response. A failed
-        # followed chain can hide a consuming hop, so its replay is unsafe.
-        if follows_redirects:
-            self.count = 0
 
     def remaining(self) -> float | None:
         if self.deadline is None:
@@ -1168,12 +1201,16 @@ class _Retry:
         return left
 
     def delay(self, exc: MandalaError) -> float:
-        if isinstance(exc, ConnectionError):
-            cause: BaseException | None = exc
-            for _ in range(10):
-                if isinstance(cause, httpx.DecodingError):
-                    raise exc
-                cause = cause.__cause__ if cause is not None else None
+        cause: BaseException | None = exc
+        for _ in range(10):
+            if isinstance(cause, httpx.DecodingError):
+                raise exc
+            cause = cause.__cause__ if cause is not None else None
+        # Redirect/auth processing and response hooks can receive headers, then
+        # fail while consuming a body before httpx returns its response/history.
+        # Unknown headers may include a terminal status or a longer Retry-After.
+        if self.hidden_response_possible and not self.observed_response:
+            raise exc
         if isinstance(exc.__cause__, httpx.RequestError):
             try:
                 self.observe(exc.__cause__.request)
@@ -1232,7 +1269,7 @@ class Transport(_BaseTransport):
         timeout: float | None = None,
     ) -> tuple[bytes, Mapping[str, str]]:
         """Buffer each attempt independently and close it before any retry."""
-        retry = self._retry(method, path)
+        retry = self._retry(method, path, client=self._http, follow_redirects=False)
         while True:
             retry.begin()
             try:
@@ -1375,7 +1412,13 @@ class Transport(_BaseTransport):
 
         Ordinary httpx timeouts still apply separately to each network phase.
         """
-        retry = self._retry(method, path, timeout_cap)
+        retry = self._retry(
+            method,
+            path,
+            timeout_cap,
+            client=self._http,
+            follow_redirects=follow_redirects,
+        )
         redirect_option: dict[str, Any] = (
             {} if follow_redirects is None else {"follow_redirects": follow_redirects}
         )
@@ -1404,12 +1447,6 @@ class Transport(_BaseTransport):
                 except httpx.TimeoutException as exc:
                     raise _timed_out(method, path, exc) from exc
                 except httpx.RequestError as exc:
-                    if resp is None:
-                        retry.missing_response(
-                            self._http.follow_redirects
-                            if follow_redirects is None
-                            else follow_redirects
-                        )
                     raise self._response_failed(method, path, resp, exc) from exc
             except MandalaError as exc:
                 _retry_sleep(retry.delay(exc))
@@ -1423,7 +1460,7 @@ class Transport(_BaseTransport):
         headers: Mapping[str, str] | None = None,
     ) -> Generator[SSEEvent, None, None]:
         """Retry establishment only; an exposed event makes failure terminal."""
-        retry = self._retry(method, path)
+        retry = self._retry(method, path, client=self._http)
         exposed = False
         while True:
             retry.begin()
@@ -1500,8 +1537,6 @@ class Transport(_BaseTransport):
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
         except httpx.RequestError as exc:
-            if resp is None:
-                retry.missing_response(self._http.follow_redirects)
             raise self._response_failed(method, path, resp, exc) from exc
 
     def json(self, method: str, path: str, **kw: Any) -> Any:
@@ -1627,7 +1662,7 @@ class AsyncTransport(_BaseTransport):
         timeout: float | None = None,
     ) -> tuple[bytes, Mapping[str, str]]:
         """Buffer each attempt independently and close it before any retry."""
-        retry = self._retry(method, path)
+        retry = self._retry(method, path, client=self._http, follow_redirects=False)
         while True:
             retry.begin()
             try:
@@ -1773,7 +1808,13 @@ class AsyncTransport(_BaseTransport):
 
         Ordinary httpx timeouts still apply separately to each network phase.
         """
-        retry = self._retry(method, path, timeout_cap)
+        retry = self._retry(
+            method,
+            path,
+            timeout_cap,
+            client=self._http,
+            follow_redirects=follow_redirects,
+        )
         redirect_option: dict[str, Any] = (
             {} if follow_redirects is None else {"follow_redirects": follow_redirects}
         )
@@ -1802,12 +1843,6 @@ class AsyncTransport(_BaseTransport):
                 except httpx.TimeoutException as exc:
                     raise _timed_out(method, path, exc) from exc
                 except httpx.RequestError as exc:
-                    if resp is None:
-                        retry.missing_response(
-                            self._http.follow_redirects
-                            if follow_redirects is None
-                            else follow_redirects
-                        )
                     raise self._response_failed(method, path, resp, exc) from exc
             except MandalaError as exc:
                 await _async_retry_sleep(retry.delay(exc))
@@ -1821,7 +1856,7 @@ class AsyncTransport(_BaseTransport):
         headers: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[SSEEvent, None]:
         """Retry establishment only; an exposed event makes failure terminal."""
-        retry = self._retry(method, path)
+        retry = self._retry(method, path, client=self._http)
         exposed = False
         while True:
             retry.begin()
@@ -1897,8 +1932,6 @@ class AsyncTransport(_BaseTransport):
         except httpx.TimeoutException as exc:
             raise _timed_out(method, path, exc) from exc
         except httpx.RequestError as exc:
-            if resp is None:
-                retry.missing_response(self._http.follow_redirects)
             raise self._response_failed(method, path, resp, exc) from exc
 
     async def json(self, method: str, path: str, **kw: Any) -> Any:
