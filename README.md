@@ -1923,6 +1923,74 @@ platform did not say. `None` rather than `0`: reporting "nothing was destroyed"
 because the server was quiet is the one wrong answer worth going out of the way
 to avoid.
 
+### Account quota
+
+`client.account.read()` returns a frozen `AccountQuota`: instantaneous plan
+ceilings, per-computer maxima, capabilities, consumption and remaining headroom.
+It uses one read-only `GET /account` with no selectors. Viewer access is enough,
+and workspace-scoped keys receive the same **account-wide aggregates**. Use
+[`client.usage.read()`](#usage) for historical metering instead.
+
+```python
+from mandala_computer import Client
+
+with Client() as client:  # MANDALA_API_KEY
+    quota = client.account.read()
+    print(quota.plan.label, quota.observed_at, "(advisory)")
+    if quota.complete.computers:
+        print("Configured vCPU headroom:", quota.remaining.configured_vcpu)
+        print("Running/reserved RAM headroom (MB):", quota.remaining.running_or_reserved_ram_mb)
+    else:
+        print("Current computer consumption and headroom are unknown.")
+    if quota.complete.snapshots:
+        print("Indexed snapshot byte headroom:", quota.remaining.snapshot_storage_bytes)
+    else:
+        print("Current snapshot consumption and headroom are unknown.")
+```
+
+The async client has the same models and checks:
+
+```python
+import asyncio
+from mandala_computer import AsyncClient
+
+
+async def main():
+    async with AsyncClient() as client:
+        quota = await client.account.read()
+        if quota.complete.computers:
+            print("Configured vCPU headroom:", quota.remaining.configured_vcpu)
+        else:
+            print("Current computer headroom is unknown.")
+
+
+asyncio.run(main())
+```
+
+`complete.computers` and `complete.snapshots` are independent. An incomplete
+group has explicit `None` for **every** related `usage` and `remaining` field;
+the other group and verified plan ceilings remain usable. A complete empty
+inventory has numeric zeros. Missing or malformed required fields raise
+`MandalaError`; the SDK never turns them into an empty account. Unknown future
+fields remain available in `raw`.
+
+Configured vCPU and disk GB include all kept computers, including stopped ones;
+disk is provisioned capacity, not filesystem occupancy. Running/reserved RAM MB
+includes pending reservations and excludes released stopped RAM. The separate
+running/reserved computer and vCPU totals describe that active subset. Snapshot
+storage is **indexed stored bytes**, including pending/deleting rows and stored
+copies during handover; it excludes in-flight capture reservations. Its remaining
+bytes do not predict whether a new capture will be admitted.
+
+Zero ceilings, including a no-plan account, are real limits. Retained resources
+can exceed a ceiling: usage stays visible and remaining headroom is clamped at
+zero. `advisory` is always true. `observed_at` is the UTC collection completion
+time, not a consistency token; concurrent changes can make it stale immediately.
+The read creates no reservation, promises no later operation will fit, and is
+not a check of host capacity. Read again for a fresh observation. Both clients
+use their existing transport and context-manager lifetimes; cancelling the async
+read cancels its transport request.
+
 ### Usage
 
 What the account has spent, in the same figures the dashboard shows and the
