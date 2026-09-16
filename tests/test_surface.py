@@ -77,9 +77,6 @@ UNIMPLEMENTED = {
     ("POST", "chat/completions"),
     # The SDK can read and write files, but has no directory-listing method yet.
     ("GET", "computers/:id/files/list"),
-    # Stable execution reads have no SDK convenience methods yet.
-    ("GET", "computers/:id/executions/:executionId"),
-    ("GET", "computers/:id/executions/:executionId/output"),
     # Retained API history has no SDK convenience methods yet.
     ("GET", "computers/:id/activities"),
     ("GET", "computers/:id/activities/:activity"),
@@ -99,9 +96,6 @@ UNIMPLEMENTED_PARAMETERS = {
     "PUT computers/:id/files  query:no_wake",
     # Directory listing is not wrapped yet; see UNIMPLEMENTED.
     "GET computers/:id/files/list  query:path",
-    "GET computers/:id/executions/:executionId/output  query:stdout_offset",
-    "GET computers/:id/executions/:executionId/output  query:stderr_offset",
-    "GET computers/:id/executions/:executionId/output  query:limit",
     # Retained API history is not wrapped yet; see UNIMPLEMENTED.
     "GET computers/:id/activities  query:cursor",
     "GET computers/:id/activities  query:changes",
@@ -319,6 +313,8 @@ def pattern_for(path: str) -> str:
             return ":window"
         if i == 3 and parts[0] == "computers" and parts[2] == "exec":
             return ":pid"
+        if i == 3 and parts[0] == "computers" and parts[2] == "executions":
+            return ":executionId"
         return seg
 
     # A template ref's two halves, pinned to a THREE-segment path under
@@ -368,6 +364,34 @@ def api_handler(request: httpx.Request) -> httpx.Response:
                 "stderr_b64": "",
                 "timed_out": False,
                 "pid": 4242,
+            },
+        )
+    if "/executions/" in path:
+        identity = path.split("/executions/", 1)[1].split("/")[0]
+        if path.endswith("/output"):
+            return httpx.Response(
+                200,
+                json={
+                    "execution_id": identity,
+                    "stdout_b64": "",
+                    "stderr_b64": "",
+                    "stdout_offset": int(request.url.params["stdout_offset"]),
+                    "stderr_offset": int(request.url.params["stderr_offset"]),
+                    "stdout_more": False,
+                    "stderr_more": False,
+                    "diagnostic_b64": "",
+                    "diagnostic_truncated": False,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "execution_id": identity,
+                "computer_id": "vm-1",
+                "pid": 4242,
+                "status": "running",
+                "started_at": "2026-09-15T12:00:00Z",
+                "output_source": "volatile_guest_files",
             },
         )
     if "/exec/" in path:
@@ -570,6 +594,10 @@ def exercise_everything(client: mc.Client) -> None:
     job.poll()
     job.kill()
     c.background_command(4242).poll()
+    c.execution("exec_0123456789abcdef0123456789abcdef")
+    c.execution_output(
+        "exec_0123456789abcdef0123456789abcdef", stdout_offset=7, stderr_offset=13, limit=1024
+    )
     c.windows()
     c.windows(include_all=True)
     c.window_action("0x2600003", "focus")
@@ -742,6 +770,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await job.poll()
     await job.kill()
     await c.background_command(4242).poll()
+    await c.execution("exec_0123456789abcdef0123456789abcdef")
+    await c.execution_output(
+        "exec_0123456789abcdef0123456789abcdef", stdout_offset=7, stderr_offset=13, limit=1024
+    )
     await c.windows()
     await c.windows(include_all=True)
     await c.window_action("0x2600003", "focus")
@@ -1148,3 +1180,15 @@ def test_retention_is_reachable_only_to_read() -> None:
     ALLOWED without deleting a test.
     """
     assert {method for method, pattern in ALLOWED if pattern == "retention"} == {"GET"}
+
+
+def test_execution_path_placeholder_stays_at_the_identity_position() -> None:
+    assert (
+        pattern_for("/computers/vm-1/executions/exec_" + "a" * 32)
+        == "computers/:id/executions/:executionId"
+    )
+    assert (
+        pattern_for("/computers/vm-1/executions/exec_" + "a" * 32 + "/output")
+        == "computers/:id/executions/:executionId/output"
+    )
+    assert pattern_for("/computers/executions/start") == "computers/:id/start"

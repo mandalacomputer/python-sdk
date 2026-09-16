@@ -79,6 +79,7 @@ from ._exceptions import (
     TimeoutError,
     _is_transient_for_poll,
 )
+from ._executions import ExecutionMetadata, ExecutionOutput, decode_metadata, decode_output
 from ._models import (
     ExecResult,
     ExecStatus,
@@ -934,9 +935,11 @@ class AsyncComputer(ComputerFields):
         the flag checked because the read is consuming — see
         :meth:`~mandala_computer.Computer.start_exec` for why both matter.
 
-        The handle is the guest pid. It survives this process — a later session
+        Legacy poll/kill address the guest pid. It survives this process — a later session
         can rebuild one with :meth:`background_command` — but not a restart of
         the computer, and only commands this API started can be read back.
+        Newer servers also provide :attr:`BackgroundCommand.execution_id` for
+        identity-bound :meth:`execution` and :meth:`execution_output` reads.
         """
         data = await self._t.json_object(
             "POST",
@@ -961,6 +964,45 @@ class AsyncComputer(ComputerFields):
         than a sentence about the pid.
         """
         return AsyncBackgroundCommand(self._t, self.id, {"pid": _api.guest_pid(pid)})
+
+    async def execution(self, execution_id: str) -> ExecutionMetadata:
+        """Read one execution's last observed metadata without guest I/O.
+
+        The canonical ID comes from a background start, never a PID lookup.
+        This makes one request and never resumes, retries or replays work.
+        Malformed or mismatched evidence raises :class:`~mandala_computer.MandalaError`.
+        """
+        identity = _api.execution_id(execution_id)
+        computer_id = self.id
+        data = await self._t.json_object("GET", _api.execution(computer_id, identity))
+        return decode_metadata(data, execution_id=identity, computer_id=computer_id)
+
+    async def execution_output(
+        self,
+        execution_id: str,
+        *,
+        stdout_offset: int,
+        stderr_offset: int,
+        limit: int = _api.EXECUTION_READ_DEFAULT,
+    ) -> ExecutionOutput:
+        """Read volatile guest output at this reader's independent byte positions.
+
+        Both offsets are required; each stream is limited separately. Send the
+        returned offsets on this reader's next call. Empty bytes and false
+        ``more`` flags mean current EOF, not completion. Wrapper diagnostics
+        repeat separately from guest stderr and do not consume legacy output.
+
+        This performs guest I/O and belongs only in an explicit output flow.
+        It never resumes, retries, tails, or falls back to PID polling. Invalid
+        arguments raise ``ValueError`` before I/O; malformed response evidence
+        raises :class:`~mandala_computer.MandalaError` without moving a cursor.
+        """
+        identity = _api.execution_id(execution_id)
+        params = _api.execution_output_params(stdout_offset, stderr_offset, limit)
+        data = await self._t.json_object(
+            "GET", _api.execution_output(self.id, identity), params=params
+        )
+        return decode_output(data, execution_id=identity, **params)
 
     async def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::

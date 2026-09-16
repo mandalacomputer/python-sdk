@@ -853,6 +853,64 @@ the tail as well as ending the job. `job.pid` survives the process: a later run
 can pick the command back up with `c.background_command(pid)`, which makes no
 request until you poll it.
 
+### Stable execution reads
+
+Newer servers return `job.execution_id` from a background start. The value is a
+canonical `exec_` followed by 32 lowercase hex digits. Older servers and handles
+rebuilt with `background_command(pid)` have `None`; the SDK never discovers an ID
+by consuming a poll. PID polling and killing keep their existing behavior and
+can address a newer command after PID reuse.
+
+Use the stable ID for metadata and independent byte readers:
+
+```python
+job = c.start_exec("printf 'hello'", cwd="/tmp")
+execution_id = job.execution_id
+if execution_id is None:
+    raise RuntimeError("this start did not provide a stable execution ID")
+
+observed = c.execution(execution_id)  # metadata only; no guest I/O
+first = c.execution_output(execution_id, stdout_offset=0, stderr_offset=0, limit=65536)
+second_reader = c.execution_output(execution_id, stdout_offset=0, stderr_offset=0)
+next_part = c.execution_output(
+    execution_id,
+    stdout_offset=first.stdout_offset,
+    stderr_offset=first.stderr_offset,
+)
+# Each reader owns both offsets. Interpret bytes only after assembling them,
+# or use a streaming text decoder when UTF-8 characters cross read boundaries.
+```
+
+`AsyncComputer` offers the same methods with `await`. Each method makes one
+request, with no resume, automatic retry, command replay, polling loop or legacy
+fallback. Metadata returns `ExecutionMetadata`: the last observed `running`,
+`exited` or `lost` state. Only `exited` includes `ended_at` and a signed
+`exit_code`; `lost` proves no outcome, and `running` does not prove the computer
+is awake. A zero exit code does not prove the task achieved its goal.
+
+`execution_output()` returns `ExecutionOutput` with exact `stdout`/`stderr`
+bytes, independent next offsets, and separate `stdout_more`/`stderr_more` flags.
+False means EOF at this read, not completion or a promise that no more bytes will
+arrive. An offset beyond the current file length returns no bytes at that same
+position. Both offsets are required integers; booleans are refused. `limit` is
+65,536 bytes per stream by default, from 1 through 1,048,576, and each offset plus
+limit must be at most 9,007,199,254,740,991. Malformed arguments raise `ValueError`
+before I/O. Malformed response identities, binary encoding or cursor evidence
+raise `MandalaError`, without silently substituting empty output.
+
+The separate `diagnostic` bytes contain wrapper stderr followed by wrapper stdout,
+repeat on every output read, and advance neither stream. They are bounded to
+65,536 bytes; `diagnostic_truncated` reports an incomplete capture. These reads
+neither move the legacy poll cursor nor consume its diagnostic.
+
+Output reads perform guest I/O and belong in an explicit output flow, never a
+passive Activities view. Files are volatile and guest-mutable; independent
+readers do not get an immutable snapshot. Suspended computers or missing logs
+return an error. Handles live in daemon memory; observed exits expire after ten
+minutes, and restart, deletion, reassignment or PID replacement can invalidate
+them sooner. Retained output, artifacts and synchronous execution identity are
+not provided by these methods.
+
 ### What is on the desktop
 
 A screenshot says what the desktop looks like; `windows()` says what any of it

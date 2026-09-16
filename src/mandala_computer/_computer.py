@@ -50,6 +50,7 @@ from ._exceptions import (
     TimeoutError,
     _is_transient_for_poll,
 )
+from ._executions import ExecutionMetadata, ExecutionOutput, decode_metadata, decode_output
 from ._models import (
     ExecResult,
     ExecStatus,
@@ -2231,9 +2232,11 @@ class Computer(ComputerFields):
         already advanced the daemon's cursor, and everything else about that
         status says a command that printed nothing.
 
-        The handle is the guest pid. It survives this process — a later session
+        Legacy poll/kill address the guest pid. It survives this process — a later session
         can rebuild one with :meth:`background_command` — but not a restart of
         the computer, and only commands this API started can be read back.
+        Newer servers also provide :attr:`BackgroundCommand.execution_id` for
+        identity-bound :meth:`execution` and :meth:`execution_output` reads.
         """
         data = self._t.json_object(
             "POST",
@@ -2258,6 +2261,43 @@ class Computer(ComputerFields):
         than a sentence about the pid.
         """
         return BackgroundCommand(self._t, self.id, {"pid": _api.guest_pid(pid)})
+
+    def execution(self, execution_id: str) -> ExecutionMetadata:
+        """Read one execution's last observed metadata without guest I/O.
+
+        The canonical ID comes from a background start, never a PID lookup.
+        This makes one request and never resumes, retries or replays work.
+        Malformed or mismatched evidence raises :class:`~mandala_computer.MandalaError`.
+        """
+        identity = _api.execution_id(execution_id)
+        computer_id = self.id
+        data = self._t.json_object("GET", _api.execution(computer_id, identity))
+        return decode_metadata(data, execution_id=identity, computer_id=computer_id)
+
+    def execution_output(
+        self,
+        execution_id: str,
+        *,
+        stdout_offset: int,
+        stderr_offset: int,
+        limit: int = _api.EXECUTION_READ_DEFAULT,
+    ) -> ExecutionOutput:
+        """Read volatile guest output at this reader's independent byte positions.
+
+        Both offsets are required; each stream is limited separately. Send the
+        returned offsets on this reader's next call. Empty bytes and false
+        ``more`` flags mean current EOF, not completion. Wrapper diagnostics
+        repeat separately from guest stderr and do not consume legacy output.
+
+        This performs guest I/O and belongs only in an explicit output flow.
+        It never resumes, retries, tails, or falls back to PID polling. Invalid
+        arguments raise ``ValueError`` before I/O; malformed response evidence
+        raises :class:`~mandala_computer.MandalaError` without moving a cursor.
+        """
+        identity = _api.execution_id(execution_id)
+        params = _api.execution_output_params(stdout_offset, stderr_offset, limit)
+        data = self._t.json_object("GET", _api.execution_output(self.id, identity), params=params)
+        return decode_output(data, execution_id=identity, **params)
 
     def open(self, url: str, *, timeout: int = 30) -> ExecResult:
         """Open a URL in the guest's browser, on the screen::
@@ -3396,7 +3436,7 @@ class BackgroundCommandFields:
 
     @property
     def pid(self) -> int:
-        """The guest pid, which is this command's identity on the API.
+        """The guest pid used by the legacy poll and kill routes.
 
         `_require_background_pid` has already refused anything this cannot
         read, so the conversion here is the same one it made rather than a
@@ -3405,6 +3445,21 @@ class BackgroundCommandFields:
         """
         raw = self._data.get("pid", 0)
         return _require_whole(raw, "exec start answered without a positive pid")
+
+    @property
+    def execution_id(self) -> str | None:
+        """The validated start-response identity, absent on older servers.
+
+        Reconstructed PID handles have no stable ID. Poll and kill never fill
+        this field: after PID reuse their responses may describe another job.
+        A present malformed identity raises :class:`~mandala_computer.MandalaError`.
+        """
+        if "execution_id" not in self._data:
+            return None
+        try:
+            return _api.execution_id(self._data["execution_id"])
+        except ValueError:
+            raise MandalaError("background handle has invalid execution_id") from None
 
     @property
     def command(self) -> str:
