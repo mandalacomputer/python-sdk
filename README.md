@@ -1345,10 +1345,83 @@ portable across Python implementations. To stop a run early, wrap the iterator
 in `contextlib.closing()` (sync) or `contextlib.aclosing()` (async); leaving that
 context closes the HTTP stream and stops the run.
 
-The platform also exposes the same engine behind an OpenAI-shaped door at
-`POST /chat/completions`. This SDK deliberately does not wrap it: if you want
-that, you already have an OpenAI client — point its `base_url` here, which is
-the whole reason the door is there.
+#### OpenAI-compatible computer agent
+
+An existing OpenAI client can drive the same computer agent through
+`POST https://app.mandala.computer/api/v1/chat/completions`. Install the separate
+OpenAI library; this example is tested with `openai==3.14.1`:
+
+```sh
+pip install openai==3.14.1
+```
+
+Set these environment variables before running the Python example:
+
+| Variable | Value |
+| --- | --- |
+| `MANDALA_API_KEY` | Your Mandala API key, used as the bearer credential. Requires member role or stronger and access within the key's account/workspace scope. |
+| `MANDALA_COMPUTER_ID` | A computer accessible to that key and already running. This endpoint does not start it; another agent run can prevent access. |
+| `ANTHROPIC_API_KEY` | Your separate Anthropic key, sent in `X-Model-Key`. An OpenAI provider key cannot replace it. |
+| `ANTHROPIC_MODEL` | An Anthropic model identifier available to your key and appropriate for computer use. It is passed through unchanged. |
+
+The OpenAI library does not read Mandala's saved login profiles. Set
+`MANDALA_API_KEY` explicitly even after `mandala login`; the saved credential
+file does not contain your Anthropic key. OpenAI clients require a model, so
+the example reads `ANTHROPIC_MODEL` instead of relying on the endpoint's default.
+
+<!-- byok-openai-example:start -->
+```python
+import os
+from openai import OpenAI
+
+with OpenAI(
+    api_key=os.environ["MANDALA_API_KEY"],
+    base_url="https://app.mandala.computer/api/v1",
+    max_retries=0,
+) as client:
+    completion = client.chat.completions.create(
+        model=os.environ["ANTHROPIC_MODEL"],
+        messages=[{"role": "user", "content": "Read the page title in the browser and report it."}],
+        extra_headers={"X-Model-Key": os.environ["ANTHROPIC_API_KEY"]},
+        extra_body={"computer_id": os.environ["MANDALA_COMPUTER_ID"], "max_steps": 5},
+        stream=False,
+    )
+    print(completion.choices[0].message.content)
+```
+<!-- byok-openai-example:end -->
+
+The printed text is the model's report, not a guarantee that the task finished.
+Inspect the JSON response's optional `agent.stop` extension: `end_turn` means
+finished. `choices[0].finish_reason == "stop"` alone is insufficient because
+rate-budget exhaustion can also map to `stop`. Use this SDK's native `agent()`
+and `result.finished` for typed detailed results. The response's `model` label
+identifies the agent endpoint, not necessarily the requested provider model.
+
+Python's `extra_body` places `computer_id` and `max_steps` at the top level of
+the request JSON. `max_steps` bounds desktop actions, not tokens or spending.
+Only the last user message supplies the task; system messages are concatenated.
+Earlier user/assistant history is not replayed. This is a computer-agent
+compatibility endpoint, with no general promise of developer messages, image
+inputs, tool-call conversations, the Responses API or other OpenAI features.
+
+`max_retries=0` prevents the OpenAI client from automatically replaying a
+desktop task after a refusal or interrupted connection. A failed, aborted or
+limited run may already have changed the desktop; inspect it before deciding
+whether to try again. Existing Mandala computer charges and rate budgets apply,
+and Anthropic bills model usage to your key. This does not add hosted inference,
+included model credits or dashboard chat persistence.
+
+Omitting `stream`, or setting `stream=False` as above, returns one JSON
+completion. Explicit `stream=True` returns OpenAI-style SSE chunks with
+keepalive comments and a final `[DONE]`, rather than the native SDK's named
+events. The stream does not include the JSON response's full `agent`/usage
+extension. Consume errors from the stream and close it on early exit; errors
+can arrive after HTTP 200, and `[DONE]` does not prove task completion.
+
+Early validation or authorization failures can have a string `error`; failed
+runs can have a nested OpenAI-style `error` object. A 401 can concern either
+credential. Use the error envelope, reason and request ID for context instead
+of attributing a failure from its status alone.
 
 ### Events
 
