@@ -550,6 +550,16 @@ def test_ssh_refuses_and_points_at_terminal(
     )
 
 
+def test_top_level_help_lists_terminal_and_not_ssh(capsys: pytest.CaptureFixture[str]) -> None:
+    """`ssh` has no meaning yet, so help does not offer it."""
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["--help"])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert "terminal" in out
+    assert "ssh" not in out
+
+
 # --- guest paths are not local paths ---------------------------------------
 
 

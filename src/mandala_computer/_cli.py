@@ -234,7 +234,7 @@ SSH_REFUSAL = (
 )
 
 
-def _cmd_ssh(args: argparse.Namespace) -> int:
+def _cmd_ssh() -> int:
     print(SSH_REFUSAL, file=sys.stderr)
     return 1
 
@@ -1058,13 +1058,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     terminal.set_defaults(fn=_cmd_terminal)
 
-    # Listed for `mandala --help`; `main` answers it before parsing.
-    ssh = sub.add_parser(
-        "ssh", add_help=False, help='not available yet; use "terminal" for a shell'
-    )
-    ssh.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    ssh.set_defaults(fn=_cmd_ssh)
-
     scp = sub.add_parser("scp", help="copy one file in or out of the guest")
     scp.add_argument("src", metavar="SRC", help="local path, or <computer>:/path")
     scp.add_argument("dst", metavar="DST", help="local path, or <computer>:/path")
@@ -1077,8 +1070,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     words = sys.argv[1:] if argv is None else argv
     if words[:1] == ["ssh"]:
-        # Before argparse, which would answer `ssh --help` itself.
-        return _cmd_ssh(argparse.Namespace())
+        # `ssh` has no parser, so this intercept is the only thing that answers
+        # it: every `mandala ssh …`, `--help` included, gets the refusal
+        # whatever argparse would have done with those words.
+        return _cmd_ssh()
     args = _parser().parse_args(argv)
     try:
         return int(args.fn(args))
