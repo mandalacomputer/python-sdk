@@ -156,7 +156,9 @@ def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> A
         taken = f" after {n} step{'' if n == 1 else 's'}" if n else ""
         message = f"the agent run failed{taken}: {failure.error}"
         error = (
-            error_for_status(failure.status, message) if failure.status else MandalaError(message)
+            error_for_status(failure.status, message, dict(failure.raw))
+            if failure.status
+            else MandalaError(message)
         )
         error.agent = failure
         raise error

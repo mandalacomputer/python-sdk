@@ -2260,10 +2260,11 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 
 | Exception | When |
 |---|---|
-| `AuthenticationError` | 401 — key missing, malformed, or revoked |
+| `AuthenticationError` | 401 — a credential was refused |
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
 | `PermissionDeniedError` | 403 — suspended or unverified account |
-| `NotFoundError` | 404 — no such resource (also another tenant's) |
+| `NotFoundError` | 404 — no such computer, snapshot, guest file, or route |
+| `MethodNotAllowedError` | 405 — method unsupported; see `allow` |
 | `ConflictError` | 409 — right request, wrong moment; retry, except the two cases below |
 | `MoveRequiredError` | 409 — …except this one: the size needs a host that can run it |
 | `FileTooLargeError` | 413 — past what one request carries. A file over 64 MiB: ask for a window. A clipboard over 128 KiB: there is no window to ask for |
@@ -2278,6 +2279,59 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
 | `ConnectionInterruptedError` | the request was dispatched and the answer was lost; do not replay a create |
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
+
+Every `APIError` exposes optional `request_id`, `allow` and `www_authenticate`
+properties. `request_id` uses a nonblank `X-Request-ID` response header first,
+then a nonblank top-level `request_id` in the body. It is an opaque diagnostic,
+not an idempotency key. HEAD errors and unreadable error bodies can still carry
+header metadata; older servers and connection failures may supply none. `allow`
+and `www_authenticate` preserve the received headers and are never inferred from
+the body. A 405 does not trigger an automatic method change or retry.
+
+Replace the ID below with an existing computer's ID.
+
+```python
+import mandala_computer as mc
+
+with mc.Client() as client:
+    try:
+        computer = client.computers.get("vm-0a1b2c3d4e5f")
+        computer.read_file("/tmp/report.txt")
+    except mc.APIError as error:
+        print(
+            error.status,
+            str(error),
+            {
+                "request_id": error.request_id,
+                "reason": error.reason,
+                "allow": error.allow,
+                "www_authenticate": error.www_authenticate,
+                "retry_after": error.retry_after,  # seconds, when supplied
+            },
+        )
+        raise
+```
+
+A missing guest file uses the existing `NotFoundError`, just like a missing
+computer or route, with the response's own message. Permission failures retain
+the status the server sent.
+
+For 401, `reason` may say `missing`, `invalid` or `revoked`; unknown string values
+are retained too. A nested finite chat error exposes its string message and
+reason while `body` keeps the entire envelope, including usage, steps and native
+agent evidence. A valid top-level reason takes precedence over a nested one.
+An unclassified 401, including a model-provider refusal, does not by itself
+identify which credential failed. Check the supplied classification and challenge
+before changing credentials, and inspect recorded work before starting another
+run. No 401, 402, 403, 404 or 405 is transient, even with a contradictory reason.
+Nested run reasons never grant replay permission. `AgentFailed.raw` keeps the
+complete error frame; thrown stream errors expose its request ID and preserve
+`error.agent` accounting, without turning frame reasons or the successful
+stream's headers into retry advice. Sync and async clients expose the same fields.
+
+For your own WebSocket client, use the exact returned `events_url`, including
+its desktop capability. A REST Bearer key alone is insufficient; a REST call to
+the events path returns guidance to use `events_url`.
 
 **401, 403 and 402 can arrive at the end of a wait, not only at the start.**
 Authorization is not settled once per request: the API rechecks it after the
