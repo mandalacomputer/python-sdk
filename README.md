@@ -2212,12 +2212,20 @@ client copies this setting at construction. Only GET and HEAD can retry, on
 connection failures or HTTP 502, 503 and 504. The legacy PID output poll is
 excluded because reading it advances a shared cursor. HTTP 429 is never retried,
 including when its error body is interrupted; `RateLimitError.retry_after` still
-carries any valid server delay. Other statuses and local validation, decoding,
+carries a usable server delay. Other statuses and local validation, decoding,
 size or integrity failures do not permit retries.
+
+Caller-owned httpx clients keep their redirect and authentication behavior.
+A returned redirect chain is retryable only if every request in its history is
+safe. If automatic redirects are enabled and an attempt fails before httpx
+returns a final response, the SDK cannot inspect its complete history and does
+not retry that failure. Clients with automatic redirects disabled retain
+connection-error retries.
 
 Backoff starts at 250 ms, doubles after each failure, and caps at 30 seconds.
 A valid `Retry-After` is a lower bound on that delay, including HTTP dates and
-zero. Cancellation and timeout failures end the operation. An explicit caller
+zero. Very large valid delays never fall back to a shorter wait. Cancellation
+and timeout failures end the operation. An explicit caller
 `timeout_cap`, such as a wait helper's remaining budget, shrinks by monotonic
 elapsed time across attempts and backoff; a retry that cannot fit is refused.
 Ordinary httpx connect/read/write/pool timeouts remain phase-specific and do

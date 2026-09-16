@@ -593,3 +593,232 @@ def test_exhausted_http_failure_is_not_reclassified_after_budget_expiry(monkeypa
     assert caught.value.status == 503
     assert caught.value.body == {"error": "failure 2"}
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("kind", ["json", "binary", "sse"])
+@pytest.mark.parametrize("policy", [None, {"idempotent": 2}])
+def test_content_decoding_failure_is_terminal_with_original_class(kind, policy, delays):
+    bodies = []
+
+    class EncodedBody(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self):
+            yield b"not a gzip body"
+
+        def close(self):
+            self.closed = True
+
+    def handler(request):
+        body = EncodedBody()
+        bodies.append(body)
+        return httpx.Response(
+            200,
+            stream=body,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Type": "text/event-stream" if kind == "sse" else "application/json",
+            },
+        )
+
+    t = make(handler, policy)
+    with pytest.raises(ConnectionInterruptedError) as caught:
+        if kind == "sse":
+            next(t.sse("GET", "/builds/b/events"))
+        elif kind == "binary":
+            t.binary(
+                "GET",
+                "/computers/vm/files",
+                accept="application/octet-stream",
+                content_types=("application/octet-stream",),
+            )
+        else:
+            t.json("GET", "/computers")
+    assert isinstance(caught.value.__cause__, httpx.DecodingError)
+    assert len(bodies) == 1 and bodies[0].closed
+    assert delays == []
+
+
+@pytest.mark.parametrize("digits", [309, 5000])
+def test_overflowing_numeric_retry_after_cannot_bypass_budget(digits, delays):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503, headers={"Retry-After": "9" * digits})
+
+    with pytest.raises(TimeoutError):
+        make(handler, {"idempotent": 2}).json("GET", "/computers", timeout_cap=1)
+    assert len(calls) == 1
+    assert delays == []
+
+
+@pytest.mark.parametrize("kind", ["json", "bounded", "sse"])
+def test_overflowing_header_uses_interruptible_long_wait_without_cap(kind, monkeypatch):
+
+    calls, waits = [], []
+
+    def sleep(delay):
+        if delay == 0:
+            return
+        waits.append(delay)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(_client.time, "sleep", sleep)
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503, headers={"Retry-After": "9" * 309})
+
+    t = make(handler, {"idempotent": 2})
+    with pytest.raises(KeyboardInterrupt):
+        if kind == "sse":
+            next(t.sse("GET", "/builds/b/events"))
+        elif kind == "bounded":
+            t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
+        else:
+            t.json("GET", "/computers")
+    assert waits == [86400.0]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("kind", ["json", "sse"])
+@pytest.mark.parametrize("failure", ["status", "connection", "redirect_body"])
+def test_intermediate_consuming_redirect_is_never_replayed(kind, failure, delays):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/computers":
+            return httpx.Response(307, headers={"Location": "/computers/vm/exec/12"})
+        if request.url.path == "/computers/vm/exec/12":
+            return httpx.Response(
+                307,
+                headers={"Location": "/safe-final"},
+                **({"stream": Broken()} if failure == "redirect_body" else {}),
+            )
+        if failure == "connection":
+            raise httpx.ConnectError("final connection failed", request=request)
+        return httpx.Response(503)
+
+    t = Transport(
+        "test",
+        base_url="https://example.test",
+        retries={"idempotent": 2},
+        client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
+    )
+    with pytest.raises((APIError, ConnectionError)):
+        if kind == "sse":
+            next(t.sse("GET", "/computers"))
+        else:
+            t.json("GET", "/computers")
+    assert calls == ["/computers", "/computers/vm/exec/12"] + (
+        [] if failure == "redirect_body" else ["/safe-final"]
+    )
+    assert delays == []
+
+
+@pytest.mark.parametrize("kind", ["json", "sse"])
+def test_complete_safe_redirect_chain_can_retry_without_changing_client_auth_or_hooks(kind, delays):
+    calls, auth_calls, hook_calls = [], [], []
+
+    class Auth(httpx.Auth):
+        def auth_flow(self, request):
+            auth_calls.append(request.url.path)
+            request.headers["X-Custom-Auth"] = "kept"
+            yield request
+
+    def hook(request):
+        hook_calls.append(request.url.path)
+
+    def handler(request):
+        calls.append(request.url.path)
+        assert request.headers["X-Custom-Auth"] == "kept"
+        if request.url.path == "/computers":
+            return httpx.Response(307, headers={"Location": "/safe-final"})
+        if len(calls) == 2:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            content=b"event: ready\ndata: {}\n\n" if kind == "sse" else b"{}",
+            headers={"Content-Type": "text/event-stream" if kind == "sse" else "application/json"},
+        )
+
+    http = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+        auth=Auth(),
+        event_hooks={"request": [hook]},
+    )
+    hooks = list(http.event_hooks["request"])
+    t = Transport("test", base_url="https://example.test", retries={"idempotent": 1}, client=http)
+    if kind == "sse":
+        events = [event for event in t.sse("GET", "/computers")]
+        assert len(events) == 1
+    else:
+        assert t.json("GET", "/computers") == {}
+    assert calls == hook_calls == ["/computers", "/safe-final", "/computers", "/safe-final"]
+    assert auth_calls == ["/computers", "/computers"]
+    assert http.event_hooks["request"] == hooks and http.follow_redirects is True
+    assert delays == [0.25]
+
+
+@pytest.mark.parametrize("follows,override", [(True, None), (False, True), (True, False)])
+def test_connection_failure_without_response_obeys_effective_redirect_policy(
+    follows, override, delays
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise httpx.ConnectError("no final response", request=request)
+
+    t = Transport(
+        "test",
+        retries={"idempotent": 1},
+        client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=follows),
+    )
+    with pytest.raises(ConnectionError):
+        t.json("GET", "/computers", follow_redirects=override)
+    assert len(calls) == (2 if override is False else 1)
+    assert delays == ([0.25] if override is False else [])
+
+
+def test_previous_retry_after_does_not_leak_into_next_connection_failure(delays):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, headers={"Retry-After": "7"})
+        if len(calls) == 2:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, json={})
+
+    assert make(handler, {"idempotent": 2}).json("GET", "/computers") == {}
+    assert delays == [7, 0.5]
+
+
+def test_http_date_delay_is_evaluated_after_error_body_consumption(monkeypatch, delays):
+    from types import SimpleNamespace
+
+    now = [1924992000.0]
+    monkeypatch.setattr(_client, "time", SimpleNamespace(time=lambda: now[0]))
+
+    class SlowBody(httpx.SyncByteStream):
+        def __iter__(self):
+            now[0] += 5
+            yield b"{}"
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(
+                503, stream=SlowBody(), headers={"Retry-After": "Wed, 01 Jan 2031 00:00:04 GMT"}
+            )
+        return httpx.Response(200, json={})
+
+    assert make(handler, {"idempotent": 1}).json("GET", "/computers") == {}
+    assert delays == [0.25]

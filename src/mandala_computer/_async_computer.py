@@ -1028,7 +1028,8 @@ class AsyncComputer(ComputerFields):
         repeat separately from guest stderr and do not consume legacy output.
 
         This performs guest I/O and belongs only in an explicit output flow.
-        It never resumes, retries, tails, or falls back to PID polling. Invalid
+        It makes one request by default; opt-in safe GET retries reuse the offsets.
+        It never resumes, tails, or falls back to PID polling. Invalid
         arguments raise ``ValueError`` before I/O; malformed response evidence
         raises :class:`~mandala_computer.MandalaError` without moving a cursor.
         """
