@@ -80,6 +80,9 @@ UNIMPLEMENTED = {
     # Stable execution reads have no SDK convenience methods yet.
     ("GET", "computers/:id/executions/:executionId"),
     ("GET", "computers/:id/executions/:executionId/output"),
+    # Retained API history has no SDK convenience methods yet.
+    ("GET", "computers/:id/activities"),
+    ("GET", "computers/:id/activities/:activity"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -97,6 +100,9 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/executions/:executionId/output  query:stdout_offset",
     "GET computers/:id/executions/:executionId/output  query:stderr_offset",
     "GET computers/:id/executions/:executionId/output  query:limit",
+    # Retained API history is not wrapped yet; see UNIMPLEMENTED.
+    "GET computers/:id/activities  query:cursor",
+    "GET computers/:id/activities  query:changes",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
