@@ -9,6 +9,7 @@ import json
 import math
 import shlex
 import time
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -49,8 +50,10 @@ def client() -> mc.Client:
     return mc.Client("gck_test", base_url=BASE)
 
 
-def test_api_key_required(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_api_key_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("MANDALA_API_KEY", raising=False)
+    monkeypatch.delenv("MANDALA_PROFILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(mc.MandalaError, match="No API key"):
         mc.Client()
 
@@ -5756,3 +5759,22 @@ def test_read_text_file_is_read_file_and_makes_no_request_of_its_own(
     ):
         c.read_text_file("/etc/app.conf")
     assert caught.value is sentinel
+
+
+@respx.mock
+def test_saved_credentials_keep_owned_client_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.test_credentials import BASE_DOCUMENT, write_store
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in ("MANDALA_API_KEY", "MANDALA_BASE_URL", "MANDALA_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    write_store(tmp_path)
+    entry = BASE_DOCUMENT["profiles"]["Work"]
+    route = respx.get(entry["base_url"] + "/computers").mock(httpx.Response(200, json=[]))
+    with mc.Client(profile="Work") as client:
+        assert not client._t._http.is_closed
+        client.computers.list()
+        assert route.calls.last.request.headers["Authorization"] == "Bearer " + entry["api_key"]
+    assert client._t._http.is_closed

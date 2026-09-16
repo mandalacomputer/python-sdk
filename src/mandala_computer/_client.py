@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import math
-import os
 import re
 import time
 from collections.abc import AsyncGenerator, Generator, Mapping
@@ -21,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from ._credentials import resolve_credentials
 from ._exceptions import (
     APIError,
     AuthenticationError,
@@ -439,7 +439,11 @@ class _BaseTransport:
     """Auth, URL, and error rules — everything about a request except the IO."""
 
     def __init__(
-        self, api_key: str | None, base_url: str | None, retries: Mapping[str, int] | None = None
+        self,
+        api_key: str | None,
+        base_url: str | None,
+        retries: Mapping[str, int] | None = None,
+        profile: str | None = None,
     ) -> None:
         if retries is not None and (
             not isinstance(retries, Mapping)
@@ -449,17 +453,12 @@ class _BaseTransport:
         ):
             raise ValueError("retries must be {'idempotent': a non-negative integer}")
         self._retries = 0 if retries is None else retries["idempotent"]
-        key = api_key or os.environ.get("MANDALA_API_KEY")
-        if not key:
-            raise MandalaError(
-                "No API key. Pass api_key=... or set MANDALA_API_KEY "
-                "(create one at Settings -> API keys)."
-            )
-        self.base_url = (base_url or os.environ.get("MANDALA_BASE_URL") or DEFAULT_BASE_URL).rstrip(
-            "/"
-        )
+        credentials = resolve_credentials(api_key, base_url, profile, DEFAULT_BASE_URL)
+        self.base_url = credentials.base_url
+        self._credential_source = credentials.source
+        self._profile = credentials.profile
         self._headers = {
-            "Authorization": f"Bearer {key}",
+            "Authorization": f"Bearer {credentials.key}",
             "Accept": "application/json",
         }
 
@@ -475,6 +474,8 @@ class _BaseTransport:
         client: httpx.Client | httpx.AsyncClient,
         follow_redirects: bool | None = None,
     ) -> _Retry:
+        if self._credential_source == "file":
+            follow_redirects = False
         # Legacy PID reads consume a shared output cursor, despite using GET.
         pathname = httpx.URL(self._url(path)).path
         safe = _safe_read(method, pathname)
@@ -1430,11 +1431,12 @@ class Transport(_BaseTransport):
         api_key: str | None = None,
         *,
         base_url: str | None = None,
+        profile: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         client: httpx.Client | None = None,
         retries: Mapping[str, int] | None = None,
     ) -> None:
-        super().__init__(api_key, base_url, retries)
+        super().__init__(api_key, base_url, retries, profile)
         self._owns_client = client is None
         self._http = client or httpx.Client(timeout=timeout)
 
@@ -1455,6 +1457,8 @@ class Transport(_BaseTransport):
 
         Ordinary httpx timeouts still apply separately to each network phase.
         """
+        if self._credential_source == "file":
+            follow_redirects = False
         retry = self._retry(
             method,
             path,
@@ -1549,6 +1553,9 @@ class Transport(_BaseTransport):
                 json=json,
                 headers=self._sent(sent),
                 timeout=self._stream_budget(self._http.timeout),
+                follow_redirects=(
+                    False if self._credential_source == "file" else self._http.follow_redirects
+                ),
             ) as resp:
                 retry.observe_response(resp)
                 if not resp.is_success:
@@ -1826,11 +1833,12 @@ class AsyncTransport(_BaseTransport):
         api_key: str | None = None,
         *,
         base_url: str | None = None,
+        profile: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         client: httpx.AsyncClient | None = None,
         retries: Mapping[str, int] | None = None,
     ) -> None:
-        super().__init__(api_key, base_url, retries)
+        super().__init__(api_key, base_url, retries, profile)
         self._owns_client = client is None
         self._http = client or httpx.AsyncClient(timeout=timeout)
 
@@ -1851,6 +1859,8 @@ class AsyncTransport(_BaseTransport):
 
         Ordinary httpx timeouts still apply separately to each network phase.
         """
+        if self._credential_source == "file":
+            follow_redirects = False
         retry = self._retry(
             method,
             path,
@@ -1945,6 +1955,9 @@ class AsyncTransport(_BaseTransport):
                 json=json,
                 headers=self._sent(sent),
                 timeout=self._stream_budget(self._http.timeout),
+                follow_redirects=(
+                    False if self._credential_source == "file" else self._http.follow_redirects
+                ),
             ) as resp:
                 retry.observe_response(resp)
                 if not resp.is_success:
