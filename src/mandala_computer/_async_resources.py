@@ -280,8 +280,8 @@ class AsyncComputers:
                 status = computer.raw.get("status")
                 if isinstance(status, str) and status in ("running", "stopped", "suspended"):
                     break
-                if delay > 0:
-                    await asyncio.sleep(min(delay, remaining()))
+                # Immediate transports may never yield; zero-delay polls must still do so.
+                await asyncio.sleep(min(delay, remaining()))
                 try:
                     await computer._refresh(timeout_cap=remaining())
                     # A later stopped row must not erase an earlier admitted attempt.

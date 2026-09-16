@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -280,6 +281,49 @@ async def test_cancellation_during_build_sleep():
         with pytest.raises(asyncio.CancelledError):
             await task
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("response", ["building", "unknown", "unavailable"])
+async def test_zero_poll_yields_for_cancellation_between_completed_build_requests(
+    monkeypatch, response
+):
+    entered = asyncio.Event()
+    requests = []
+    now = 0.0
+    monkeypatch.setattr(resources, "time", SimpleNamespace(monotonic=lambda: now))
+
+    # Immediate responses deliberately provide no scheduling checkpoint themselves.
+    def handle(request):
+        nonlocal now
+        requests.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(200, json=state("building", 0))
+        entered.set()
+        now += 1
+        if response == "unavailable":
+            return httpx.Response(503, json={"error": "temporarily unavailable"})
+        return httpx.Response(
+            200, json=state("building" if response == "building" else "unrecognized", 0)
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        # Advancing only the deadline clock bounds a starving loop without a timing race.
+        task = asyncio.create_task(client.computers.launch(timeout=100, poll=0))
+        await entered.wait()
+        accepted = task.cancel("caller cancelled")
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+        assert accepted
+        if sys.version_info >= (3, 11):
+            assert str(cancelled.value) == "caller cancelled"
+        await asyncio.sleep(0)
+        assert requests == [
+            ("POST", "/api/v1/computers"),
+            ("GET", "/api/v1/computers/launch-42"),
+        ]
 
 
 async def test_zero_budget_preserves_id_without_starting():
