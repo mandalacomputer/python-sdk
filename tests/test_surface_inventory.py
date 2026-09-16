@@ -256,3 +256,29 @@ def test_stable_execution_reads_are_in_both_real_method_inventories() -> None:
         assert {"execution", "execution_output"} <= found[cls]
     for cls in (mc.BackgroundCommand, mc.AsyncBackgroundCommand):
         assert found[cls] == {"poll", "kill"}
+
+
+@pytest.mark.parametrize("verb", ["bounded_binary", "bounded_json_object"])
+def test_bounded_retained_verbs_are_request_making(verb: str) -> None:
+    source = f"""
+class Computer:
+    def retained(self):
+        return self._t.{verb}("GET", "computers/x/results/y", max_bytes=8)
+"""
+    assert requesting_methods(source) == {"Computer": frozenset({"retained"})}
+
+
+def test_all_retained_methods_are_in_both_real_inventories() -> None:
+    found = names(inventory())
+    for method in (
+        "retain_execution_output",
+        "result",
+        "result_output",
+        "delete_result",
+        "publish_artifact",
+        "artifact",
+        "download_artifact",
+        "delete_artifact",
+    ):
+        assert f"Computer.{method}" in found
+        assert f"AsyncComputer.{method}" in found

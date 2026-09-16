@@ -2450,6 +2450,10 @@ class ExecResult:
     #: stays out of ``__match_args__``.
     output_unreadable: bool = field(default=False, kw_only=True)
 
+    #: A confirmed retained version, absent when optional capture was unconfirmed.
+    #: Keyword-only and excluded from equality/hash and positional matching.
+    result_id: str | None = field(default=None, kw_only=True, compare=False)
+
     @property
     def stdout_text(self) -> str:
         """:attr:`stdout` as text, with undecodable bytes replaced.
@@ -2507,6 +2511,37 @@ class ExecResult:
             raw=dict(d),
             output_unreadable=unreadable,
         )
+
+
+def _optional_result_id(
+    data: Mapping[str, Any], stdout: bytes, stderr: bytes, unreadable: bool
+) -> str | None:
+    """Validate optional payload evidence after the exec caller has checked HTTP 200.
+
+    ``from_api`` has no HTTP status, so it cannot confirm a retained version.
+    This helper never changes the already executed action's legacy interpretation.
+    """
+    identity = data.get("result_id")
+    code = data.get("exit_code")
+    if (
+        not isinstance(identity, str)
+        or not re.fullmatch(r"res_[a-f0-9]{32}", identity)
+        or type(code) is not int
+        or not -2147483648 <= code <= 2147483647
+        or _wire(data, "timed_out") is not _Wire.FALSE
+        # The legacy classifier recognizes numeric/string booleans too. A
+        # retained ID additionally requires the actual JSON boolean evidence.
+        or type(data["timed_out"]) is not bool
+        or unreadable
+        or type(data.get("out_truncated")) is not bool
+        or type(data.get("err_truncated")) is not bool
+        or len(stdout) > 16 * 1024 * 1024
+        or len(stderr) > 16 * 1024 * 1024
+        or base64.b64encode(stdout).decode("ascii") != data.get("stdout_b64")
+        or base64.b64encode(stderr).decode("ascii") != data.get("stderr_b64")
+    ):
+        return None
+    return str.__str__(identity)
 
 
 def _opt_text(value: Any) -> str | None:

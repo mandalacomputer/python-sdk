@@ -51,6 +51,8 @@ import pytest
 import respx
 from tests.surface_inventory import half, inventory, names, record_named_calls
 from tests.surface_tables import ALLOWED, PARAMETERS
+from tests.test_artifacts import ARTIFACT_ID, artifact_manifest, download
+from tests.test_retained_results import EXECUTION_ID, RESULT_ID, page, result_manifest
 
 import mandala_computer as mc
 
@@ -65,16 +67,6 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # Explicit retained output is tracked until client helpers are available.
-    ("POST", "computers/:id/executions/:executionId/retained-output"),
-    ("GET", "computers/:id/results/:resultId"),
-    ("GET", "computers/:id/results/:resultId/output"),
-    ("DELETE", "computers/:id/results/:resultId"),
-    # Explicit artifacts await runtime helpers.
-    ("POST", "computers/:id/artifacts"),
-    ("GET", "computers/:id/artifacts/:artifactId"),
-    ("GET", "computers/:id/artifacts/:artifactId/download"),
-    ("DELETE", "computers/:id/artifacts/:artifactId"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -102,21 +94,6 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
-    # Synchronous output retention is tracked until runtime support is available.
-    "POST computers/:id/exec  body:retain_output",
-    # Artifact publication is not wrapped yet.
-    "POST computers/:id/artifacts  body:path",
-    "POST computers/:id/artifacts  body:expected_size",
-    "POST computers/:id/artifacts  body:expected_sha256",
-    "POST computers/:id/artifacts  body:execution_id",
-    "POST computers/:id/artifacts  body:max_bytes",
-    "POST computers/:id/artifacts  body:retention_seconds",
-    # Retained output is not wrapped yet; see UNIMPLEMENTED.
-    "POST computers/:id/executions/:executionId/retained-output  body:max_bytes_per_stream",
-    "POST computers/:id/executions/:executionId/retained-output  body:retention_seconds",
-    "GET computers/:id/results/:resultId/output  query:stream",
-    "GET computers/:id/results/:resultId/output  query:offset",
-    "GET computers/:id/results/:resultId/output  query:limit",
     # File transfers cannot yet opt out of waking a suspended computer.
     "GET computers/:id/files  query:no_wake",
     "PUT computers/:id/files  query:no_wake",
@@ -341,6 +318,10 @@ def pattern_for(path: str) -> str:
             return ":pid"
         if i == 3 and parts[0] == "computers" and parts[2] == "executions":
             return ":executionId"
+        if i == 3 and parts[0] == "computers" and parts[2] == "results":
+            return ":resultId"
+        if i == 3 and parts[0] == "computers" and parts[2] == "artifacts":
+            return ":artifactId"
         return seg
 
     # A template ref's two halves, pinned to a THREE-segment path under
@@ -381,7 +362,51 @@ def api_handler(request: httpx.Request) -> httpx.Response:
                 200, content=AGENT_DONE, headers={"Content-Type": "text/event-stream"}
             )
         return httpx.Response(200, json=AGENT_RESULT)
+    if path.endswith("/retained-output"):
+        return httpx.Response(
+            201, json=result_manifest(execution_id=path.split("/executions/", 1)[1].split("/")[0])
+        )
+    if "/results/" in path:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        if path.endswith("/output"):
+            return page(b"", offset=int(request.url.params["offset"]))
+        return httpx.Response(200, json=result_manifest())
+    if path.endswith("/artifacts") and request.method == "POST":
+        body = json.loads(request.content)
+        association = (
+            {
+                "kind": "caller_selected",
+                "execution_id": body["execution_id"],
+                "verified_at": "2026-09-16T12:00:00.123456789Z",
+            }
+            if "execution_id" in body
+            else None
+        )
+        return httpx.Response(201, json=artifact_manifest(execution_association=association))
+    if "/artifacts/" in path:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        if path.endswith("/download"):
+            return download(b"abc")
+        return httpx.Response(200, json=artifact_manifest())
     if path.endswith("/exec"):
+        if (
+            json.loads(request.content).get("retain_output") is not None
+            and json.loads(request.content).get("retain_output") is not False
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "exit_code": 0,
+                    "stdout_b64": "",
+                    "stderr_b64": "",
+                    "timed_out": False,
+                    "out_truncated": False,
+                    "err_truncated": False,
+                    "result_id": RESULT_ID,
+                },
+            )
         return httpx.Response(
             200,
             json={
@@ -611,6 +636,22 @@ def exercise_everything(client: mc.Client) -> None:
     c.wait(1)
     c.cursor_position()
     c.exec("true")
+    c.exec("true", retain_output={"max_bytes_per_stream": 64, "retention_seconds": 60})
+    c.retain_execution_output(EXECUTION_ID, max_bytes_per_stream=64, retention_seconds=60)
+    c.result(RESULT_ID)
+    c.result_output(RESULT_ID, stream="stdout", offset=0, limit=64)
+    c.delete_result(RESULT_ID)
+    c.publish_artifact(
+        "/tmp/a",
+        expected_size=3,
+        expected_sha256=artifact_manifest()["sha256"],
+        execution_id=EXECUTION_ID,
+        max_bytes=64,
+        retention_seconds=60,
+    )
+    c.artifact(ARTIFACT_ID)
+    c.download_artifact(ARTIFACT_ID, max_bytes=64)
+    c.delete_artifact(ARTIFACT_ID)
     c.exec("true", cwd="/tmp", env={"CI": "1"})
     # `desktop` is the wire's `session`, and the only value it takes.
     c.exec("true", desktop=True)
@@ -789,6 +830,22 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.wait(1)
     await c.cursor_position()
     await c.exec("true")
+    await c.exec("true", retain_output={"max_bytes_per_stream": 64, "retention_seconds": 60})
+    await c.retain_execution_output(EXECUTION_ID, max_bytes_per_stream=64, retention_seconds=60)
+    await c.result(RESULT_ID)
+    await c.result_output(RESULT_ID, stream="stdout", offset=0, limit=64)
+    await c.delete_result(RESULT_ID)
+    await c.publish_artifact(
+        "/tmp/a",
+        expected_size=3,
+        expected_sha256=artifact_manifest()["sha256"],
+        execution_id=EXECUTION_ID,
+        max_bytes=64,
+        retention_seconds=60,
+    )
+    await c.artifact(ARTIFACT_ID)
+    await c.download_artifact(ARTIFACT_ID, max_bytes=64)
+    await c.delete_artifact(ARTIFACT_ID)
     await c.exec("true", cwd="/tmp", env={"CI": "1"})
     await c.exec("true", desktop=True)
     await c.open("https://example.com")
@@ -1218,3 +1275,20 @@ def test_execution_path_placeholder_stays_at_the_identity_position() -> None:
         == "computers/:id/executions/:executionId/output"
     )
     assert pattern_for("/computers/executions/start") == "computers/:id/start"
+
+
+def test_retained_path_placeholders_do_not_hide_literal_segments() -> None:
+    assert (
+        pattern_for(f"/computers/vm-1/results/{RESULT_ID}/output")
+        == "computers/:id/results/:resultId/output"
+    )
+    assert (
+        pattern_for(f"/computers/vm-1/artifacts/{ARTIFACT_ID}/download")
+        == "computers/:id/artifacts/:artifactId/download"
+    )
+    assert pattern_for("/computers/results/start") == "computers/:id/start"
+    assert pattern_for("/computers/artifacts/start") == "computers/:id/start"
+    assert (
+        pattern_for("/computers/vm-1/activities/act-1/results")
+        == "computers/:id/activities/act-1/results"
+    )

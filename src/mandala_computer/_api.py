@@ -306,6 +306,134 @@ def execution_output_params(stdout_offset: int, stderr_offset: int, limit: int) 
     return params
 
 
+RESULT_PAGE_MAX = 65_536
+RESULT_STREAM_MAX = 4 * 1024 * 1024
+RESULT_RETENTION_MAX = 604_800
+ARTIFACT_DEFAULT_BYTES = 8 * 1024 * 1024
+ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def result_id(value: str) -> str:
+    value = canonical(value, "result_id")
+    if not re.fullmatch(r"res_[0-9a-f]{32}", value):
+        raise ValueError("result_id must be res_ followed by 32 lowercase hex digits")
+    return value
+
+
+def artifact_id(value: str) -> str:
+    value = canonical(value, "artifact_id")
+    if not re.fullmatch(r"art_[0-9a-f]{32}", value):
+        raise ValueError("artifact_id must be art_ followed by 32 lowercase hex digits")
+    return value
+
+
+def retained_result(computer_id: str, identity: str) -> str:
+    return f"{computer(computer_id)}/results/{result_id(identity)}"
+
+
+def artifacts(computer_id: str) -> str:
+    return f"{computer(computer_id)}/artifacts"
+
+
+def artifact(computer_id: str, identity: str) -> str:
+    return f"{artifacts(computer_id)}/{artifact_id(identity)}"
+
+
+def bounded_integer(value: object, name: str, minimum: int, maximum: int) -> int:
+    number = whole(value, name, exc=ValueError)
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{name} must be from {minimum} to {maximum}")
+    return number
+
+
+def retained_options(
+    max_bytes_per_stream: int | None, retention_seconds: int | None
+) -> dict[str, int]:
+    body: dict[str, int] = {}
+    if max_bytes_per_stream is not None:
+        body["max_bytes_per_stream"] = bounded_integer(
+            max_bytes_per_stream, "max_bytes_per_stream", 1, RESULT_STREAM_MAX
+        )
+    if retention_seconds is not None:
+        body["retention_seconds"] = bounded_integer(
+            retention_seconds, "retention_seconds", 1, RESULT_RETENTION_MAX
+        )
+    return body
+
+
+def retain_output_option(value: object) -> bool | dict[str, int]:
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("retain_output must be a boolean or retention options object")
+    body: dict[str, int] = {}
+    for key, number in value.items():
+        name = canonical(key, "retention option")
+        maximum = {
+            "max_bytes_per_stream": RESULT_STREAM_MAX,
+            "retention_seconds": RESULT_RETENTION_MAX,
+        }.get(name)
+        if maximum is None or name in body:
+            raise ValueError("unknown or duplicate retention option")
+        body[name] = bounded_integer(number, name, 1, maximum)
+    return body
+
+
+def result_output_params(stream: str, offset: int, limit: int) -> dict[str, Any]:
+    stream = canonical(stream, "stream")
+    if stream not in ("stdout", "stderr", "diagnostic"):
+        raise ValueError("stream must be stdout, stderr or diagnostic")
+    count = bounded_integer(limit, "limit", 1, RESULT_PAGE_MAX)
+    start = bounded_integer(offset, "offset", 0, EXECUTION_MAX_OFFSET - count)
+    return {"stream": stream, "offset": start, "limit": count}
+
+
+def artifact_body(
+    path: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    association: str | None,
+    max_bytes: int | None,
+    retention_seconds: int | None,
+) -> dict[str, Any]:
+    text = canonical(path, "path")
+    try:
+        path_bytes = len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValueError("path must be valid UTF-8") from None
+    if (
+        not text
+        or path_bytes > 4096
+        or re.search(r"[\x00-\x1f\x7f]", text)
+        or not is_absolute_guest_path(text)
+    ):
+        raise ValueError(
+            "path must be an absolute guest path of at most 4096 UTF-8 bytes without controls"
+        )
+    size = bounded_integer(expected_size, "expected_size", 0, ARTIFACT_MAX_BYTES)
+    maximum = (
+        ARTIFACT_DEFAULT_BYTES
+        if max_bytes is None
+        else bounded_integer(max_bytes, "max_bytes", 1, ARTIFACT_MAX_BYTES)
+    )
+    if size > maximum:
+        raise ValueError("expected_size exceeds the artifact capture max_bytes")
+    digest = canonical(expected_sha256, "expected_sha256")
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("expected_sha256 must be 64 lowercase hexadecimal characters")
+    body: dict[str, Any] = {"path": text, "expected_size": size, "expected_sha256": digest}
+    if association is not None:
+        body["execution_id"] = execution_id(association)
+    if max_bytes is not None:
+        body["max_bytes"] = maximum
+    if retention_seconds is not None:
+        body["retention_seconds"] = bounded_integer(
+            retention_seconds, "retention_seconds", 1, RESULT_RETENTION_MAX
+        )
+    return body
+
+
 def window(computer_id: str, window_id: str) -> str:
     """One window on the guest's desktop, addressed by its X id.
 
@@ -924,6 +1052,7 @@ def exec_body(
     background: bool = False,
     cwd: str | None = None,
     env: Mapping[str, str] | None = None,
+    retain_output: object = False,
 ) -> dict[str, Any]:
     """Build an exec payload.
 
@@ -977,6 +1106,11 @@ def exec_body(
         body["cwd"] = text
     if env:
         body["env"] = _env_object(env)
+    retention = retain_output_option(retain_output)
+    if retention is not False:
+        if background:
+            raise ValueError("retain_output is only available for synchronous exec")
+        body["retain_output"] = retention
     return body
 
 

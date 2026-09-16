@@ -176,3 +176,21 @@ async def test_internal_exec_keeps_fractional_http_cap(client: Any) -> None:
     await resolved(computer(client)._exec("true", 1, timeout_cap=0.25))
     assert json.loads(route.calls.last.request.content)["timeout_s"] == 1
     assert route.calls.last.request.extensions["timeout"]["read"] == 0.25
+
+
+def test_retained_option_and_offset_contracts_are_separate_from_live_reads() -> None:
+    assert _api.RESULT_PAGE_MAX == 65536
+    assert _api.EXECUTION_READ_MAX == 1048576
+    assert _api.retained_options(None, None) == {}
+    assert _api.artifact_body(
+        "/tmp/a",
+        expected_size=0,
+        expected_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        association=None,
+        max_bytes=None,
+        retention_seconds=None,
+    ) == {
+        "path": "/tmp/a",
+        "expected_size": 0,
+        "expected_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    }
