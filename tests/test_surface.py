@@ -321,7 +321,7 @@ def pattern_for(path: str) -> str:
     parts = [p for p in path.strip("/").split("/") if p]
 
     def one(i: int, seg: str) -> str:
-        if i and parts[i - 1] in ("computers", "snapshots", "builds", "webhooks"):
+        if i and parts[i - 1] in ("computers", "snapshots", "builds", "webhooks", "ssh-keys"):
             return ":id"
         if i == 3 and parts[0] == "computers" and parts[2] == "windows":
             return ":window"
@@ -1203,6 +1203,12 @@ def test_pattern_for_treats_ids_as_ids() -> None:
     assert pattern_for("/computers/vm-1/snapshots") == "computers/:id/snapshots"
     # A computer whose id looks like a route segment is still an id.
     assert pattern_for("/computers/audit") == "computers/:id"
+    # Every collection whose next segment is an id, including the ones this
+    # client does not call yet: a mirrored route that cannot be matched is one
+    # the first call to it would report as off the table.
+    assert pattern_for("/builds/bld-1/events") == "builds/:id/events"
+    assert pattern_for("/webhooks/whk-1/deliveries") == "webhooks/:id/deliveries"
+    assert pattern_for("/ssh-keys/key-1") == "ssh-keys/:id"
 
 
 def test_the_mirror_is_in_step_with_the_platform() -> None:
