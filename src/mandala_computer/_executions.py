@@ -94,9 +94,10 @@ def _time(value: object, field: str) -> str:
     if not _TIMESTAMP.fullmatch(text):
         raise _invalid(field)
     try:
-        # Validate calendar/time fields on Python 3.10 too, retaining the exact
-        # nanosecond wire spelling rather than rounding it to microseconds.
-        datetime.fromisoformat(re.sub(r"(\.[0-9]{6})[0-9]+", r"\1", text).replace("Z", "+00:00"))
+        # Python 3.10 only accepts three or six fractional digits. Normalize
+        # to six for calendar validation, keeping the original wire spelling.
+        validation = re.sub(r"\.([0-9]+)", lambda match: "." + match[1][:6].ljust(6, "0"), text)
+        datetime.fromisoformat(validation.replace("Z", "+00:00"))
     except ValueError:
         raise _invalid(field) from None
     return text

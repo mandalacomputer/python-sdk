@@ -164,6 +164,64 @@ async def test_metadata_projects_only_observed_evidence(
     assert route.call_count == 1
 
 
+@pytest.mark.parametrize("fraction_length", range(10))
+@pytest.mark.parametrize("zone", ["Z", "+05:30", "-07:00"])
+@pytest.mark.parametrize("field", ["started_at", "ended_at"])
+@respx.mock
+async def test_metadata_preserves_every_fraction_length_in_both_timestamps(
+    client: Any, fraction_length: int, zone: str, field: str
+) -> None:
+    fraction = "." + "123456789"[:fraction_length] if fraction_length else ""
+    timestamp = f"2024-02-29T12:30:59{fraction}{zone}"
+    body = {**METADATA, field: timestamp}
+    if field == "ended_at":
+        body.update(status="exited", exit_code=0)
+    route = respx.get(f"{BASE}/computers/vm-1/executions/{EXECUTION_ID}").mock(
+        httpx.Response(200, json=body)
+    )
+    result = await resolved(computer(client).execution(EXECUTION_ID))
+    assert getattr(result, field) == timestamp
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize("field", ["started_at", "ended_at"])
+@pytest.mark.parametrize(
+    "timestamp, valid",
+    [
+        ("2026-09-30T23:59:59.1Z", True),
+        ("2024-02-29T00:00:00.12345+00:00", True),
+        ("2026-09-31T12:30:59.1Z", False),
+        ("2026-02-29T12:30:59.12345Z", False),
+        ("2026-02-30T12:30:59.123456789Z", False),
+        ("2026-09-15T24:00:00.1Z", False),
+        ("2026-09-15T12:60:00.1Z", False),
+        ("2026-09-15T12:30:60.1234Z", False),
+        ("2026-09-15T12:30:59.1+24:00", False),
+        ("2026-09-15T12:30:59.12345-00:60", False),
+        ("2026-09-15T12:30:59.1", False),
+        ("2026-09-15T12:30:59.1234567890Z", False),
+        ("2026-09-15T12:30:59.Z", False),
+    ],
+)
+@respx.mock
+async def test_fraction_normalization_preserves_calendar_and_timezone_restrictions(
+    client: Any, field: str, timestamp: str, valid: bool
+) -> None:
+    body = {**METADATA, field: timestamp}
+    if field == "ended_at":
+        body.update(status="exited", exit_code=0)
+    route = respx.get(f"{BASE}/computers/vm-1/executions/{EXECUTION_ID}").mock(
+        httpx.Response(200, json=body)
+    )
+    if valid:
+        result = await resolved(computer(client).execution(EXECUTION_ID))
+        assert getattr(result, field) == timestamp
+    else:
+        with pytest.raises(mc.MandalaError, match=field):
+            await resolved(computer(client).execution(EXECUTION_ID))
+    assert route.call_count == 1
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
