@@ -2224,6 +2224,12 @@ the SDK cannot establish the received status, headers and history and does not
 retry that failure. This applies to ordinary, retained and SSE reads. Without
 those mechanisms, connection-error retries remain available; the SDK's ordinary
 Authorization header does not disable them.
+Proxy tunnel failures reported as `httpx.ProxyError` are terminal because their
+response status and headers are unavailable to the SDK.
+A native `httpx.WriteError` before a response is returned is also terminal:
+HTTP/2 can receive headers before an acknowledgement write fails. Write failures
+while reading an already returned response still follow its status and delay
+rules.
 
 Backoff starts at 250 ms, doubles after each failure, and caps at 30 seconds.
 A valid `Retry-After` is a lower bound on that delay, including HTTP dates and

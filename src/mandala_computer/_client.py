@@ -1047,8 +1047,9 @@ _NEVER_DISPATCHED = (
 # Public connection-error classes describe dispatch uncertainty, not replay
 # permission. Only these native families establish a potentially transient
 # connection failure; local validation, decoding, redirect limits, timeouts,
-# and unclassified request/protocol errors remain terminal.
-_RETRYABLE_REQUEST_ERRORS = (httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
+# and unclassified request/protocol errors remain terminal. ProxyError can
+# conceal a CONNECT refusal's status and headers, so it cannot permit replay.
+_RETRYABLE_REQUEST_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
 
 
 def _request_failed(method: str, path: str, exc: httpx.RequestError) -> ConnectionError:
@@ -1212,6 +1213,11 @@ class _Retry:
             if isinstance(cause, httpx.RequestError) and not isinstance(
                 cause, _RETRYABLE_REQUEST_ERRORS
             ):
+                raise exc
+            # HTTP/2 may receive response headers before an acknowledgement
+            # write fails. Until httpx returns the response, its status and
+            # Retry-After are unknown; a write failure cannot authorize replay.
+            if isinstance(cause, httpx.WriteError) and not self.observed_response:
                 raise exc
             cause = cause.__cause__ if cause is not None else None
         # Redirect/auth processing and response hooks can receive headers, then

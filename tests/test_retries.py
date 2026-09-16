@@ -1,5 +1,8 @@
 """Opt-in transport retries, complete bodies, and terminal failures."""
 
+import h2.config
+import h2.connection
+import h2.events
 import httpcore
 import httpx
 import pytest
@@ -1241,7 +1244,7 @@ def test_local_protocol_failure_keeps_its_cause_with_a_short_budget(
         (httpx.ProtocolError, False),
         (httpx.LocalProtocolError, False),
         (httpx.RemoteProtocolError, True),
-        (httpx.ProxyError, True),
+        (httpx.ProxyError, False),
         (httpx.UnsupportedProtocol, False),
         (httpx.DecodingError, False),
         (httpx.TooManyRedirects, False),
@@ -1284,7 +1287,12 @@ def test_native_exception_family_controls_replay_before_and_after_response(
     if status is not None and not issubclass(family, httpx.TimeoutException):
         assert caught.value.status == status
         assert caught.value.retry_after == 9
-    allowed = retryable and status != 429 and policy is not None
+    allowed = (
+        retryable
+        and status != 429
+        and policy is not None
+        and not (family is httpx.WriteError and status is None)
+    )
     assert len(calls) == (2 if allowed else 1)
     assert delays == ([9 if status else 0.25] if allowed else [])
     assert all(body.closed for body in bodies)
@@ -1298,6 +1306,8 @@ def test_native_exception_family_controls_replay_before_and_after_response(
     [
         (httpx.LocalProtocolError, False),
         (httpx.UnsupportedProtocol, False),
+        (httpx.ProxyError, False),
+        (httpx.WriteError, True),
         (httpx.RemoteProtocolError, True),
     ],
 )
@@ -1332,7 +1342,328 @@ def test_local_failure_cannot_gain_replay_permission_through_a_network_wrapper(
     if status:
         assert caught.value.status == status
         assert caught.value.retry_after == 9
-    allowed = retryable and policy is not None
+    allowed = (
+        retryable and policy is not None and not (nested is httpx.WriteError and status is None)
+    )
     assert len(calls) == (2 if allowed else 1)
     assert delays == ([9 if status else 0.25] if allowed else [])
     assert all(body.closed for body in bodies)
+
+
+class InMemoryProxyWire(httpx.HTTPTransport):
+    """Native CONNECT parsing and TLS upgrade with tracked in-memory streams."""
+
+    def __init__(self, responses, first_failure=None):
+        self.calls = 0
+        self.streams = []
+        self.connects = 0
+        wire = self
+
+        class Stream(httpcore.MockStream):
+            def __init__(self, buffer):
+                super().__init__(buffer)
+                self.closed = False
+                self.written = []
+
+            def write(self, buffer, timeout=None):
+                self.written.append(buffer)
+                super().write(buffer, timeout)
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        class Backend(httpcore.MockBackend):
+            def connect_tcp(self, *args, **kwargs):
+                wire.connects += 1
+                if wire.connects == 1 and first_failure == "connect":
+                    raise httpcore.ConnectError("proxy connection refused")
+                buffer = [] if wire.connects == 1 and first_failure == "remote" else responses
+                stream = Stream(list(buffer))
+                wire.streams.append(stream)
+                return stream
+
+        self._pool = httpcore.HTTPProxy(
+            "http://proxy.test",
+            proxy_headers=[(b"X-Proxy-Context", b"kept")],
+            network_backend=Backend([]),
+        )
+
+    def handle_request(self, request):
+        self.calls += 1
+        return super().handle_request(request)
+
+
+def proxy_refusal(status):
+    return (
+        f"HTTP/1.1 {status} Refused\r\nRetry-After: {'9' * 1000}\r\nContent-Length: 4\r\n\r\nlost"
+    ).encode()
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse", "public"])
+@pytest.mark.parametrize("status", [407, 429, 503])
+def test_native_proxy_refusal_is_terminal_and_closed(status, kind, policy, delays):
+    wire = InMemoryProxyWire([proxy_refusal(status)])
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        with pytest.raises(ConnectionError) as caught:
+            if kind == "public":
+                sdk = Client(
+                    "test", base_url="https://example.test", http_client=http, retries=policy
+                )
+                sdk.sizes.list()
+            else:
+                t = Transport("test", base_url="https://example.test", client=http, retries=policy)
+                if kind == "ordinary":
+                    t.json("GET", "/computers")
+                elif kind == "bounded":
+                    t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+                else:
+                    next(t.sse("GET", "/builds/b/events"))
+        # Check before closing the caller-owned client: the failed exchange
+        # itself must release the CONNECT response and its connection.
+        assert wire.streams and all(stream.closed for stream in wire.streams)
+        assert type(caught.value) is ConnectionError
+        assert type(caught.value.__cause__) is httpx.ProxyError
+        assert wire.calls == wire.connects == 1
+        assert delays == []
+        sent = b"".join(wire.streams[0].written)
+        assert sent.startswith(b"CONNECT example.test:443 HTTP/1.1\r\n")
+        assert b"X-Proxy-Context: kept\r\n" in sent
+        assert b"GET " not in sent
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+@pytest.mark.parametrize("status", [407, 429, 503])
+def test_native_proxy_refusal_keeps_original_error_under_short_cap(status, policy, delays):
+    wire = InMemoryProxyWire([proxy_refusal(status)])
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        t = Transport("test", base_url="https://example.test", client=http, retries=policy)
+        with pytest.raises(ConnectionError) as caught:
+            t.json("GET", "/computers", timeout_cap=0.1)
+        assert type(caught.value) is ConnectionError
+        assert type(caught.value.__cause__) is httpx.ProxyError
+        assert wire.calls == wire.connects == 1
+        assert wire.streams and all(stream.closed for stream in wire.streams)
+        assert delays == []
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse", "public"])
+@pytest.mark.parametrize("failure", ["connect", "remote"])
+def test_native_proxy_connection_failure_can_retry_without_a_refusal(failure, kind, delays):
+    content = b"data: {}\n\n" if kind == "sse" else b"[]" if kind == "public" else b"{}"
+    media = (
+        "text/event-stream"
+        if kind == "sse"
+        else "application/octet-stream"
+        if kind == "bounded"
+        else "application/json"
+    )
+    response = (
+        f"HTTP/1.1 200 OK\r\nContent-Type: {media}\r\n"
+        f"Content-Length: {len(content)}\r\nConnection: close\r\n\r\n"
+    ).encode() + content
+    wire = InMemoryProxyWire([b"HTTP/1.1 200 Established\r\n\r\n", response], failure)
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        if kind == "public":
+            sdk = Client(
+                "test", base_url="https://example.test", http_client=http, retries={"idempotent": 1}
+            )
+            assert sdk.sizes.list() == []
+        else:
+            t = Transport(
+                "test", base_url="https://example.test", client=http, retries={"idempotent": 1}
+            )
+            if kind == "ordinary":
+                assert t.json("GET", "/computers") == {}
+            elif kind == "bounded":
+                result, _ = t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+                assert result == content
+            else:
+                events = t.sse("GET", "/builds/b/events")
+                event = next(events)
+                assert event.data == {}
+                events.close()
+        assert wire.calls == wire.connects == 2
+        assert delays == [0.25]
+        assert all(stream.closed for stream in wire.streams)
+
+
+class InMemoryHTTP2Wire(httpx.HTTPTransport):
+    """Native HTTP/2 frames with an I/O failure before or after headers return."""
+
+    def __init__(self, status, mode, after="9"):
+        self.calls = 0
+        self.streams = []
+        wire = self
+
+        class Stream(httpcore.MockStream):
+            def __init__(self):
+                super().__init__([], http2=True)
+                self.server = h2.connection.H2Connection(
+                    h2.config.H2Configuration(client_side=False)
+                )
+                self.server.initiate_connection()
+                self.stream_id = None
+                self.response_sent = False
+                self.body_sent = False
+                self.failed_writes = 0
+                self.closed = False
+
+            def write(self, data, timeout=None):
+                if data and self.response_sent:
+                    if mode == "headers_ack_failure" or (
+                        mode == "body_ack_failure" and self.body_sent
+                    ):
+                        self.failed_writes += 1
+                        raise httpcore.WriteError(
+                            "connection closed while acknowledging received frames"
+                        )
+                    if mode in ("goaway", "goaway_error"):
+                        return  # The server has already closed its HTTP/2 state.
+                for event in self.server.receive_data(data):
+                    if isinstance(event, h2.events.RequestReceived):
+                        self.stream_id = event.stream_id
+                        self.server.send_headers(
+                            event.stream_id,
+                            [(":status", str(status)), ("retry-after", after)],
+                            end_stream=mode != "body_ack_failure",
+                        )
+                        if mode in ("goaway", "goaway_error"):
+                            self.server.close_connection(
+                                error_code=1 if mode == "goaway_error" else 0,
+                                last_stream_id=event.stream_id,
+                            )
+
+            def read(self, max_bytes, timeout=None):
+                if mode == "disconnect":
+                    return b""
+                if mode == "body_ack_failure" and self.response_sent and not self.body_sent:
+                    # A PING arrives after the SDK has received the headers;
+                    # writing its ACK fails during body consumption.
+                    self.server.ping(b"12345678")
+                    self.server.send_data(self.stream_id, b"lost", end_stream=True)
+                    self.body_sent = True
+                data = self.server.data_to_send()
+                self.response_sent = self.stream_id is not None
+                return data
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        class Backend(httpcore.MockBackend):
+            def connect_tcp(self, *args, **kwargs):
+                stream = Stream()
+                wire.streams.append(stream)
+                return stream
+
+        self._pool = httpcore.ConnectionPool(http2=True, network_backend=Backend([]))
+
+    def handle_request(self, request):
+        self.calls += 1
+        return super().handle_request(request)
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse", "public"])
+@pytest.mark.parametrize("status", [200, 407, 429, 503])
+def test_native_http2_write_failure_before_response_return_is_terminal(
+    status, kind, policy, delays
+):
+    wire = InMemoryHTTP2Wire(status, "headers_ack_failure", "9" * 1000)
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        with pytest.raises(ConnectionInterruptedError) as caught:
+            if kind == "public":
+                sdk = Client(
+                    "test", base_url="https://example.test", http_client=http, retries=policy
+                )
+                sdk.sizes.list()
+            else:
+                t = Transport("test", base_url="https://example.test", client=http, retries=policy)
+                if kind == "ordinary":
+                    t.json("GET", "/computers")
+                elif kind == "bounded":
+                    t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+                else:
+                    next(t.sse("GET", "/builds/b/events"))
+        assert type(caught.value) is ConnectionInterruptedError
+        assert type(caught.value.__cause__) is httpx.WriteError
+        assert not http.is_closed  # The SDK does not close its caller's client.
+        assert wire.calls == 1 and delays == []
+        assert wire.streams[0].response_sent and wire.streams[0].failed_writes == 1
+    assert all(stream.closed for stream in wire.streams)
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+@pytest.mark.parametrize("status", [407, 429, 503])
+def test_native_http2_opaque_write_failure_preserves_error_under_short_cap(status, policy, delays):
+    wire = InMemoryHTTP2Wire(status, "headers_ack_failure", "9" * 1000)
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        t = Transport("test", base_url="https://example.test", client=http, retries=policy)
+        with pytest.raises(ConnectionInterruptedError) as caught:
+            t.json("GET", "/computers", timeout_cap=0.1)
+        assert type(caught.value) is ConnectionInterruptedError
+        assert type(caught.value.__cause__) is httpx.WriteError
+        assert wire.calls == 1 and delays == []
+    assert all(stream.closed for stream in wire.streams)
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 2}])
+@pytest.mark.parametrize("kind", ["ordinary", "bounded", "sse", "public"])
+@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("mode", ["goaway", "goaway_error", "body_ack_failure", "disconnect"])
+def test_native_http2_returned_headers_and_remote_disconnect_keep_retry_rules(
+    policy, kind, status, mode, delays
+):
+    wire = InMemoryHTTP2Wire(status, mode)
+    expected = (
+        ConnectionInterruptedError
+        if mode == "disconnect"
+        else RateLimitError
+        if status == 429
+        else APIError
+    )
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        with pytest.raises(expected) as caught:
+            if kind == "public":
+                sdk = Client(
+                    "test", base_url="https://example.test", http_client=http, retries=policy
+                )
+                sdk.sizes.list()
+            else:
+                t = Transport("test", base_url="https://example.test", client=http, retries=policy)
+                if kind == "ordinary":
+                    t.json("GET", "/computers")
+                elif kind == "bounded":
+                    t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=100)
+                else:
+                    next(t.sse("GET", "/builds/b/events"))
+        allowed = policy is not None and (mode == "disconnect" or status == 503)
+        assert wire.calls == (3 if allowed else 1)
+        assert delays == (([0.25, 0.5] if mode == "disconnect" else [9, 9]) if allowed else [])
+        if mode == "disconnect":
+            assert type(caught.value.__cause__) is httpx.RemoteProtocolError
+            assert not any(stream.response_sent for stream in wire.streams)
+        else:
+            assert caught.value.status == status and caught.value.retry_after == 9
+            assert all(stream.response_sent for stream in wire.streams)
+            if mode == "body_ack_failure":
+                assert type(caught.value.__cause__) is httpx.WriteError
+                assert all(
+                    stream.body_sent and stream.failed_writes == 1 for stream in wire.streams
+                )
+    assert all(stream.closed for stream in wire.streams)
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_native_http2_goaway_keeps_huge_retry_after_and_status(status, delays):
+    wire = InMemoryHTTP2Wire(status, "goaway", "9" * 1000)
+    with httpx.Client(transport=wire, trust_env=False) as http:
+        t = Transport(
+            "test", base_url="https://example.test", client=http, retries={"idempotent": 2}
+        )
+        with pytest.raises(RateLimitError if status == 429 else TimeoutError):
+            t.json("GET", "/computers", timeout_cap=1)
+        assert wire.calls == 1 and delays == []
+        assert wire.streams[0].response_sent and wire.streams[0].closed
