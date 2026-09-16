@@ -644,8 +644,17 @@ def pub(env: Path) -> Path:
     return path
 
 
-def mock_setup(keys: list[dict[str, Any]], access: dict[str, Any] = ON) -> tuple[Any, Any]:
+#: What a computer that has never been asked answers before setup.
+UNASKED = {**OFF, "available": None}
+
+
+def mock_setup(
+    keys: list[dict[str, Any]],
+    access: dict[str, Any] = ON,
+    before: dict[str, Any] = UNASKED,
+) -> tuple[Any, Any]:
     computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=before))
     respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=keys))
     add = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
     put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(
@@ -742,12 +751,29 @@ def test_setup_that_cannot_work_prints_no_success(
 
 
 @respx.mock
+def test_setup_refuses_a_computer_that_predates_ssh_before_changing_anything(
+    pub: Path, env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    add, put = mock_setup([], before={**OFF, "available": False})
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh", "--setup", "dev", "--json"])
+    assert caught.value.code == (
+        "mandala: dev was made from a template that predates SSH; create a new computer to use SSH"
+    )
+    assert not add.called
+    assert not put.called
+    assert capsys.readouterr().out == ""
+    assert not kh(env).exists()
+
+
+@respx.mock
 def test_setup_survives_a_racing_setup_of_its_own(
     pub: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Listed before a concurrent run added the key: the add is a 409, and a
     second listing shows the key is ours, so setup carries on."""
     computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
     respx.get(f"{BASE}/ssh-keys").mock(
         side_effect=[httpx.Response(200, json=[]), httpx.Response(200, json=[KEY])]
     )
@@ -768,6 +794,7 @@ def test_setup_refuses_a_key_somebody_else_owns(
     pub: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
     keys = respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/ssh-keys").mock(
         return_value=httpx.Response(
@@ -926,6 +953,25 @@ def test_ssh_config_uses_the_id_when_another_computer_shares_the_name(
     out, err = capsys.readouterr()
     assert json.loads(out)["host"] == "vm-7"
     assert "using Host vm-7 instead" in err
+
+
+@respx.mock
+def test_ssh_config_uses_the_id_when_the_listing_is_incomplete(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"id": "vm-9", "name": "dev", "status": "running", "os": "linux"}],
+            headers={"X-GC-Incomplete": "1"},
+        )
+    )
+    assert _cli.main(["ssh-config", "vm-9", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert err == "mandala: could not check other computers' names; using Host vm-9 instead\n"
+    printed = json.loads(out)
+    assert printed["host"] == "vm-9"
+    assert printed["config"] == snippet("vm-9", home=env)
 
 
 @respx.mock
