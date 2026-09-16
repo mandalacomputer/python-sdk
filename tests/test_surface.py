@@ -86,6 +86,12 @@ UNIMPLEMENTED = {
     ("GET", "computers/:id/activities/:activity/results"),
     # Passive platform signals have no SDK convenience method yet.
     ("GET", "computers/:id/signals"),
+    # SSH keys and the per-computer SSH switch have no SDK methods yet.
+    ("GET", "ssh-keys"),
+    ("POST", "ssh-keys"),
+    ("DELETE", "ssh-keys/:id"),
+    ("GET", "computers/:id/ssh"),
+    ("PUT", "computers/:id/ssh"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -105,6 +111,10 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/activities  query:changes",
     "GET computers/:id/signals  query:since",
     "GET computers/:id/signals  query:limit",
+    # SSH is not wrapped yet; see UNIMPLEMENTED.
+    "POST ssh-keys  body:public_key",
+    "POST ssh-keys  body:name",
+    "PUT computers/:id/ssh  body:enabled",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
