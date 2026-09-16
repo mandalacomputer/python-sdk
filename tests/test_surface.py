@@ -83,6 +83,8 @@ UNIMPLEMENTED = {
     # Retained API history has no SDK convenience methods yet.
     ("GET", "computers/:id/activities"),
     ("GET", "computers/:id/activities/:activity"),
+    # Passive platform signals have no SDK convenience method yet.
+    ("GET", "computers/:id/signals"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -103,6 +105,8 @@ UNIMPLEMENTED_PARAMETERS = {
     # Retained API history is not wrapped yet; see UNIMPLEMENTED.
     "GET computers/:id/activities  query:cursor",
     "GET computers/:id/activities  query:changes",
+    "GET computers/:id/signals  query:since",
+    "GET computers/:id/signals  query:limit",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",

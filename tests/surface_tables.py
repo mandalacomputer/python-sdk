@@ -54,6 +54,7 @@ ALLOWED = {
     ("GET", "computers/:id/executions/:executionId/output"),
     ("GET", "computers/:id/activities"),
     ("GET", "computers/:id/activities/:activity"),
+    ("GET", "computers/:id/signals"),
     ("GET", "computers/:id/windows"),
     ("POST", "computers/:id/windows/:window"),
     # The desktop's clipboard (platform OPL-3743, OPL-3768). Session-only for
@@ -200,6 +201,7 @@ PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/executions/:executionId": set(),
     "GET computers/:id/activities": {"query:cursor", "query:changes"},
     "GET computers/:id/activities/:activity": set(),
+    "GET computers/:id/signals": {"query:since", "query:limit"},
     "GET computers/:id/executions/:executionId/output": {
         "query:stdout_offset",
         "query:stderr_offset",
