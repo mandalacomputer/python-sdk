@@ -261,8 +261,10 @@ __all__ = [
 class Client:
     """Entry point to the Mandala Computer API.
 
-    :param api_key: defaults to ``MANDALA_API_KEY``.
-    :param base_url: defaults to ``MANDALA_BASE_URL``, then the public API.
+    :param api_key: defaults to ``MANDALA_API_KEY``, then the saved credential file.
+    :param profile: saved profile, otherwise ``MANDALA_PROFILE`` or the file default.
+    :param base_url: with a key, defaults to ``MANDALA_BASE_URL``, then the public API;
+        with a saved profile, an override must match its stored base.
     """
 
     def __init__(
@@ -270,12 +272,18 @@ class Client:
         api_key: str | None = None,
         *,
         base_url: str | None = None,
+        profile: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.Client | None = None,
         retries: Mapping[str, int] | None = None,
     ) -> None:
         self._t = Transport(
-            api_key, base_url=base_url, timeout=timeout, client=http_client, retries=retries
+            api_key,
+            base_url=base_url,
+            profile=profile,
+            timeout=timeout,
+            client=http_client,
+            retries=retries,
         )
         self.account = Account(self._t)
         self.builds = Builds(self._t)
@@ -308,8 +316,10 @@ class AsyncClient:
     Same arguments and behaviour as :class:`Client`; every method that performs
     IO is a coroutine.
 
-    :param api_key: defaults to ``MANDALA_API_KEY``.
-    :param base_url: defaults to ``MANDALA_BASE_URL``, then the public API.
+    :param api_key: defaults to ``MANDALA_API_KEY``, then the saved credential file.
+    :param profile: saved profile, otherwise ``MANDALA_PROFILE`` or the file default.
+    :param base_url: with a key, defaults to ``MANDALA_BASE_URL``, then the public API;
+        with a saved profile, an override must match its stored base.
     """
 
     def __init__(
@@ -317,12 +327,18 @@ class AsyncClient:
         api_key: str | None = None,
         *,
         base_url: str | None = None,
+        profile: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.AsyncClient | None = None,
         retries: Mapping[str, int] | None = None,
     ) -> None:
         self._t = AsyncTransport(
-            api_key, base_url=base_url, timeout=timeout, client=http_client, retries=retries
+            api_key,
+            base_url=base_url,
+            profile=profile,
+            timeout=timeout,
+            client=http_client,
+            retries=retries,
         )
         self.account = AsyncAccount(self._t)
         self.builds = AsyncBuilds(self._t)

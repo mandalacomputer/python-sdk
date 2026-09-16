@@ -39,12 +39,66 @@ the rest of your system is depending on.
 
 ## Use
 
-Authentication is an API key from the dashboard (Settings → API keys), read from
-`MANDALA_API_KEY` unless you pass one as `Client(api_key=...)`. Requests go to
-`https://app.mandala.computer/api/v1`; `MANDALA_BASE_URL` or
-`Client(base_url=...)` points them elsewhere. `timeout` is the per-request
-budget, 60 seconds unless a call knows it needs longer, and `http_client` takes
-an `httpx.Client` of your own if you have proxies or certificates to configure.
+Authenticate once with the **TypeScript CLI** and both Python clients can read
+its saved profile:
+
+```sh
+npx -y mandala-computer login --profile Work --workspace Research
+```
+
+The npm package supplies `mandala login`; the Python package does not implement
+login. Both packages install an executable named `mandala`, so use the explicit
+`npx` invocation above when both are installed. Omitting `--workspace` requests
+account scope. Review the device and scope shown in the browser before approving.
+
+```python
+from mandala_computer import Client, AsyncClient
+
+client = Client(profile="Work")
+async_client = AsyncClient(profile="Work")
+# Close with client.close() / await async_client.aclose(), or use context managers.
+```
+
+Authentication is selected once when a client is constructed, in this order:
+
+1. An explicit `api_key` (trimmed; empty or non-string values fail).
+2. A nonempty, trimmed `MANDALA_API_KEY`.
+3. A profile from `~/.mandala/credentials.json`: explicit `profile`, then
+   nonempty trimmed `MANDALA_PROFILE`, then the file's `default_profile`.
+
+`None` means an option is absent. Profile names are case-sensitive. Explicit or
+environment keys bypass the credential file completely, including an unused
+profile selector. You can still create a key at Settings → API keys and pass
+`Client(api_key=...)` or set `MANDALA_API_KEY`.
+
+A saved profile binds its key to its stored canonical base URL. A supplied
+`base_url`, or otherwise a nonempty `MANDALA_BASE_URL`, must match that entire
+base after normalization, including its path prefix. HTTPS is required except
+for an explicitly saved loopback HTTP target. File-backed requests do not follow
+redirects. With explicit or environment keys, requests retain their existing
+base precedence: `base_url`, `MANDALA_BASE_URL`, then
+`https://app.mandala.computer/api/v1`.
+
+The shared store is supported on POSIX systems with verified file protection:
+`.mandala` must be a real directory owned by the current user with mode `0700`;
+`credentials.json` must be an owned regular file with mode `0600` and one link.
+Symlinks, hardlinks, malformed files, unknown versions, files over 64 KiB and
+stores over 100 profiles fail locally. Every profile is validated. There is no
+working-directory or alternate-store search. Windows file protection is not
+implemented; explicit or environment keys remain usable there. The store
+contains Mandala API credentials and descriptive scope metadata, never model
+provider keys or passwords.
+
+A running client keeps its selected key and base after the file changes. Create
+a new client to load a replacement. Revoking the device-named key in Settings →
+API keys makes requests fail with `AuthenticationError` and the server's reason;
+the SDK does not switch profiles, reread the store, or start login after a 401.
+The existing Python CLI inherits file authentication, with `MANDALA_PROFILE=Work`
+selecting a profile for SSH, SCP and webhook commands.
+
+`timeout` is the per-request budget, 60 seconds unless a call knows it needs
+longer. `http_client` takes an `httpx.Client` (or `httpx.AsyncClient`) of your own
+if you have proxies or certificates to configure.
 
 ```python
 from mandala_computer import Client

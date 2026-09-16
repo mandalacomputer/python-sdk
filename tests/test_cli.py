@@ -9,6 +9,7 @@ right routes. The HTTP layer is respx, same as the client tests.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import httpx
 import pytest
@@ -1506,3 +1507,81 @@ def test_scp_upload_preserves_linux_filename_ending_in_backslash(tmp_path, remot
     assert _cli.main(["scp", str(src), f"dev:{remote_path}"]) == 0
     assert put.calls.last.request.url.params["path"] == remote_path
     assert put.calls.last.request.content == b"payload"
+
+
+@pytest.mark.parametrize("store", ["missing", "corrupt", "unsafe"])
+@pytest.mark.parametrize(
+    "argv", [["--help"], ["ssh", "--help"], ["scp", "--help"], ["webhooks", "--help"]]
+)
+def test_O01_offline(
+    store: str,
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tests.test_credentials import observe_store_io, write_store
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MANDALA_API_KEY")
+    monkeypatch.delenv("MANDALA_BASE_URL")
+    monkeypatch.setenv("MANDALA_PROFILE", "../invalid")
+    if store != "missing":
+        path = write_store(tmp_path, payload=b"{broken")
+        if store == "unsafe":
+            path.chmod(0o644)
+    with monkeypatch.context() as observation:
+        observed = observe_store_io(observation, forbid_home=True)
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(argv)
+        assert caught.value.code == 0
+        # argparse checks gettext catalogs while rendering help; those are
+        # unrelated to credential IO. Every observed stat must be such a file.
+        for call in observed["stat"].call_args_list:
+            catalog = Path(call.args[0])
+            assert "locale" in catalog.parts and catalog.suffix == ".mo"
+        assert not any(spy.called for name, spy in observed.items() if name != "stat")
+    assert "usage:" in capsys.readouterr().out
+
+
+@respx.mock
+@pytest.mark.parametrize("verb", ["webhooks", "ssh", "scp"])
+@pytest.mark.parametrize("profile", [None, "Work"])
+def test_O02_profile_cli_paths(
+    verb: str,
+    profile: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tests.test_credentials import BASE_DOCUMENT, KEYS, write_store
+
+    monkeypatch.delenv("MANDALA_API_KEY")
+    monkeypatch.delenv("MANDALA_BASE_URL")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MANDALA_PROFILE", raising=False)
+    if profile is not None:
+        monkeypatch.setenv("MANDALA_PROFILE", profile)
+    write_store(tmp_path)
+    entry = BASE_DOCUMENT["profiles"][profile or "default"]
+    base = entry["base_url"]
+    if verb == "webhooks":
+        respx.get(base + "/webhooks").mock(httpx.Response(200, json=[]))
+        argv = ["webhooks", "list", "--json"]
+    else:
+        respx.get(base + "/computers").mock(httpx.Response(200, json=COMPUTERS))
+        if verb == "scp":
+            respx.get(base + "/computers/vm-1/files").mock(httpx.Response(200, content=b"fixture"))
+            argv = ["scp", "dev:/fixture.txt", str(tmp_path / "download.txt")]
+        else:
+            respx.get(base + "/computers/vm-1").mock(httpx.Response(200, json=_TERMINAL_COMPUTER))
+            monkeypatch.setattr(_cli, "_terminal_fd", lambda: None)
+            monkeypatch.setattr(_cli, "_interact", lambda url: 0)
+            argv = ["ssh", "dev"]
+    assert _cli.main(argv) == 0
+    assert len(respx.calls) >= 1
+    for call in respx.calls:
+        assert call.request.headers["Authorization"] == "Bearer " + entry["api_key"]
+        assert str(call.request.url).startswith(base + "/")
+    output = capsys.readouterr()
+    assert all(key not in output.out + output.err for key in KEYS)

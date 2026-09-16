@@ -7,9 +7,11 @@ lifecycle.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -1269,3 +1271,57 @@ async def test_read_text_file_awaits_read_file_once_on_the_async_half(
     ):
         await c.read_text_file("/etc/app.conf")
     assert caught.value is sentinel
+
+
+async def test_saved_credentials_preserve_async_cancellation_and_client_ownership(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.test_credentials import BASE_DOCUMENT, write_store
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in ("MANDALA_API_KEY", "MANDALA_BASE_URL", "MANDALA_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    path = write_store(tmp_path)
+    entry = BASE_DOCUMENT["profiles"]["Work"]
+    entered = asyncio.Event()
+    requests: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        entered.set()
+        if len(requests) == 1:
+            await asyncio.Event().wait()
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        async with mc.AsyncClient(profile="Work", http_client=http) as client:
+            pending = asyncio.create_task(client.computers.list())
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            path.unlink()
+            assert await client.computers.list() == []
+        assert not http.is_closed
+    assert http.is_closed
+    assert len(requests) == 2
+    assert all(
+        request.headers["Authorization"] == "Bearer " + entry["api_key"] for request in requests
+    )
+
+
+@respx.mock
+async def test_saved_credentials_close_owned_async_http_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.test_credentials import BASE_DOCUMENT, write_store
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in ("MANDALA_API_KEY", "MANDALA_BASE_URL", "MANDALA_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    write_store(tmp_path)
+    base = BASE_DOCUMENT["profiles"]["Work"]["base_url"]
+    respx.get(base + "/computers").mock(httpx.Response(200, json=[]))
+    async with mc.AsyncClient(profile="Work") as client:
+        await client.computers.list()
+    assert client._t._http.is_closed

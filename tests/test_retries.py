@@ -1151,7 +1151,7 @@ class InMemoryWire(httpx.HTTPTransport):
     "key,base_url,native,expected,retryable",
     [
         (
-            "pasted-token\n",
+            "pasted\ntoken",
             "http://example.test",
             httpx.LocalProtocolError,
             ConnectionInterruptedError,
@@ -1201,7 +1201,7 @@ def test_native_protocol_errors_preserve_classes_without_replaying_local_failure
     "key,base_url,native,expected",
     [
         (
-            "pasted-token\n",
+            "pasted\ntoken",
             "http://example.test",
             httpx.LocalProtocolError,
             ConnectionInterruptedError,
@@ -1392,6 +1392,26 @@ class InMemoryProxyWire(httpx.HTTPTransport):
     def handle_request(self, request):
         self.calls += 1
         return super().handle_request(request)
+
+
+@pytest.mark.parametrize("policy", [None, {"idempotent": 0}, {"idempotent": 2}])
+def test_terminal_newline_key_is_trimmed_before_native_header_serialization(policy, delays):
+    wire = InMemoryProxyWire(
+        [b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]"]
+    )
+    with (
+        httpx.Client(transport=wire, trust_env=False) as http,
+        Client(
+            "pasted-token\n", base_url="http://example.test", http_client=http, retries=policy
+        ) as sdk,
+    ):
+        assert sdk.sizes.list() == []
+    assert wire.calls == 1 and wire.connects == 1
+    assert len(wire.streams) == 1
+    sent = b"".join(wire.streams[0].written)
+    assert b"\r\nAuthorization: Bearer pasted-token\r\n" in sent
+    assert b"pasted-token\n" not in sent
+    assert delays == []
 
 
 def proxy_refusal(status):
