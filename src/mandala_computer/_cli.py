@@ -3,7 +3,7 @@ and the account's webhooks.
 
 Two subcommands address a computer by name or id:
 
-``mandala ssh <computer>``
+``mandala terminal <computer>``
     An interactive shell in the guest, over the platform's terminal websocket —
     a PTY the platform keeps alive server-side. Disconnecting detaches the
     session rather than ending it; running the same command reattaches and
@@ -20,6 +20,9 @@ Two subcommands address a computer by name or id:
     The account's webhook subscriptions — the CRUD only. The CLI does not
     receive webhooks; a receiver is a server, and :func:`mandala_computer.verify`
     is what it calls. ``create`` and ``rotate`` print the secret ONCE.
+
+``mandala ssh`` is reserved for a real OpenSSH session and, until that lands,
+refuses with a pointer to ``terminal``.
 
 Authentication is the SDK's: ``MANDALA_API_KEY`` (and optionally
 ``MANDALA_BASE_URL``) in the environment.
@@ -112,7 +115,7 @@ def _write_all(fd: int, data: bytes, on_stall: Callable[[], None] | None = None)
     caller uses this to stop paying for the stall with something it cares about
     more, not to give up on the output. Without it this loop is unbounded, and
     a consumer that read one pipe buffer and stopped —
-    ``mandala ssh dev | head -c 1`` and then nothing — parked the recv pump
+    ``mandala terminal dev | head -c 1`` and then nothing — parked the recv pump
     here forever with the local terminal still raw and ``ISIG`` off, so Ctrl-C
     was a byte to a guest nobody was reading and recovery meant a ``kill`` from
     another window (OPL-4246).
@@ -137,11 +140,11 @@ def _terminal_fd() -> int | None:
 
     stdin first: it is the fd raw mode is set from, and its terminal is the one
     SIGWINCH reports on. stdout is not the right answer on its own —
-    ``mandala ssh dev | tee session.log`` is still a session in whatever window
+    ``mandala terminal dev | tee session.log`` is still a session in whatever window
     the user is sitting in, and sizing it from the pipe left the guest PTY at
     the platform's 80x24 default for the whole session, with ``vim``, ``htop``
     and ``less`` wrong all the way through (OPL-4246). The other two are tried
-    after it so a redirected stdin (``mandala ssh dev < script``) still reports
+    after it so a redirected stdin (``mandala terminal dev < script``) still reports
     the window its output is being drawn in.
     """
     for stream in (sys.stdin, sys.stdout, sys.stderr):
@@ -192,7 +195,7 @@ def _client() -> Client:
 def _resolve(client: Client, target: str) -> Computer:
     """The computer ``target`` names — an exact id, or a unique name."""
     # Resolution is not a fleet-wide consistency decision. One unreachable
-    # hypervisor must not block ssh/scp to a computer on a healthy one, and the
+    # hypervisor must not block terminal/scp to a computer on a healthy one, and the
     # partial response still carries cached id-only rows for unavailable hosts.
     computers = client.computers.list(allow_partial=True)
     for c in computers:
@@ -221,12 +224,24 @@ def _resolve(client: Client, target: str) -> Computer:
     _die(f"no computer named {target!r}. You have:\n{have}")
 
 
-# --- ssh -------------------------------------------------------------------
+# --- terminal --------------------------------------------------------------
+
+#: All ``mandala ssh`` does for now: it is being rebuilt as a real OpenSSH
+#: session, and must not quietly run the terminal in the meantime. The
+#: TypeScript CLI prints the same line.
+SSH_REFUSAL = (
+    'mandala ssh is being rebuilt as a real OpenSSH session; use "mandala terminal" for a shell.'
+)
 
 
 def _cmd_ssh(args: argparse.Namespace) -> int:
+    print(SSH_REFUSAL, file=sys.stderr)
+    return 1
+
+
+def _cmd_terminal(args: argparse.Namespace) -> int:
     if LOCAL_WINDOWS:
-        _die("interactive ssh requires a Unix-like local terminal")
+        _die("interactive terminal requires a Unix-like local terminal")
     with _client() as client:
         c = _resolve(client, args.target).refresh()
     vnc = c.vnc
@@ -283,7 +298,7 @@ def _connect(url: str) -> ClientConnection:
         _die("could not open the terminal")
 
 
-#: What ``mandala ssh`` returns when it cannot report the command's status —
+#: What ``mandala terminal`` returns when it cannot report the command's status —
 #: an exit frame it could not read a status out of, or a link that dropped
 #: before one arrived. 255 is what ssh itself returns when it cannot report a remote
 #: status, so a wrapper already written against ssh reads this correctly, and it
@@ -1033,14 +1048,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    ssh = sub.add_parser("ssh", help="an interactive shell in the guest")
-    ssh.add_argument("target", metavar="computer", help="computer name or id")
-    ssh.add_argument(
+    terminal = sub.add_parser("terminal", help="an interactive shell in the guest")
+    terminal.add_argument("target", metavar="computer", help="computer name or id")
+    terminal.add_argument(
         "-s",
         "--session",
         default="main",
         help="named session to attach; sessions persist across disconnects (default: main)",
     )
+    terminal.set_defaults(fn=_cmd_terminal)
+
+    # Listed for `mandala --help`; `main` answers it before parsing.
+    ssh = sub.add_parser(
+        "ssh", add_help=False, help='not available yet; use "terminal" for a shell'
+    )
+    ssh.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     ssh.set_defaults(fn=_cmd_ssh)
 
     scp = sub.add_parser("scp", help="copy one file in or out of the guest")
@@ -1053,6 +1075,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    words = sys.argv[1:] if argv is None else argv
+    if words[:1] == ["ssh"]:
+        # Before argparse, which would answer `ssh --help` itself.
+        return _cmd_ssh(argparse.Namespace())
     args = _parser().parse_args(argv)
     try:
         return int(args.fn(args))
@@ -1066,7 +1092,7 @@ def main(argv: list[str] | None = None) -> int:
         # Ctrl-C is how a person ends a transfer or a wait, not a fault, and
         # 130 is the shell's number for it — 128 plus SIGINT, which is what a
         # caller's `$?` and every wrapper script reads. `_interact` has
-        # answered it that way on the `ssh` path since that path existed, so
+        # answered it that way on the `terminal` path since that path existed, so
         # the intent was already settled in-tree; `scp` and every `webhooks`
         # verb run outside that handler and ended in a traceback and a 1
         # instead (adversarial review, OPL-4479). A `BaseException`, so it
