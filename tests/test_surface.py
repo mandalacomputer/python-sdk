@@ -581,6 +581,7 @@ def exercise_everything(client: mc.Client) -> None:
     client.computers.list()
     client.computers.get("vm-1")
     c = client.computers.create(template="base")
+    client.computers.launch(template="base")
     # Everything a create can name, in the two shapes that are allowed: a size
     # stands in for a template and a shape together, so it cannot be combined
     # with the four it replaces.
@@ -783,6 +784,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.computers.list()
     await client.computers.get("vm-1")
     c = await client.computers.create(template="base")
+    await client.computers.launch(template="base")
     await client.computers.create(
         name="dev",
         template="base",

@@ -215,6 +215,76 @@ class AsyncComputers:
         data = await self._t.json_object("POST", _api.COMPUTERS, json=body)
         return AsyncComputer(self._t, _api.computer_payload(data))
 
+    async def launch(
+        self,
+        *,
+        name: str | None = None,
+        size: str | None = None,
+        template: str | None = None,
+        template_transfer: str | None = None,
+        cpu: int | None = None,
+        ram_mb: int | None = None,
+        disk_gb: int | None = None,
+        start: bool = True,
+        resolution: str | None = None,
+        timeout: float = 180.0,
+        poll: float = 3.0,
+    ) -> AsyncComputer:
+        """Create, start if needed, and wait for the guest agent to answer.
+
+        Every create argument is preserved. ``start=False`` defers starting
+        until the disk is built; launch still starts it before returning.
+        An admitted start is waited on, and a failed start is never retried.
+
+        ``timeout`` is one readiness budget in seconds, beginning after create
+        returns. Disk, running and guest waits share the remaining time, and
+        elapsed start work consumes it too. Create and start retain their usual
+        transport deadlines: this is not a total wall-clock limit on launch.
+        ``poll`` is the delay in seconds between polls in every stage.
+
+        The computer is persistent and is never deleted on failure. SDK errors
+        after creation retain their type and include its id. Task cancellation
+        propagates unchanged. Use ``ephemeral`` for scoped cleanup. Guest
+        readiness does not guarantee the desktop has finished logging in.
+        """
+        check_wait_args(timeout, poll)
+        computer = await self.create(
+            name=name,
+            size=size,
+            template=template,
+            template_transfer=template_transfer,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            start=start,
+            resolution=resolution,
+        )
+        computer_id = computer.id
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"readiness budget of {timeout:g}s expired")
+            return left
+
+        try:
+            await computer.wait_until_built(timeout=remaining(), poll=poll)
+            if computer.start_error:
+                raise MandalaError(f"did not start: {computer.start_error}")
+            if computer.status in ("stopped", "suspended") and (
+                computer._nothing_admitted() or (not start and "running_ram_mb" not in computer.raw)
+            ):
+                remaining()
+                await computer.start()
+            await computer.wait_until_running(timeout=remaining(), poll=poll)
+            await computer.wait_for_guest(timeout=remaining(), poll=poll)
+            return computer
+        except MandalaError as err:
+            # Preserve the error object, API attributes and original cause.
+            err.args = (f"launch of {computer_id} failed: {err}",)
+            raise
+
     @asynccontextmanager
     async def ephemeral(self, **kwargs: Any) -> AsyncIterator[AsyncComputer]:
         computer = await self.create(**kwargs)
