@@ -53,6 +53,7 @@ PAIRS = [
     (mc.Client, mc.AsyncClient),
     (mc.Computer, mc.AsyncComputer),
     (mc.BackgroundCommand, mc.AsyncBackgroundCommand),
+    (_resources.Account, _async_resources.AsyncAccount),
     (_resources.Computers, _async_resources.AsyncComputers),
     (_resources.Moves, _async_resources.AsyncMoves),
     (_resources.Snapshots, _async_resources.AsyncSnapshots),

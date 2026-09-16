@@ -15,6 +15,7 @@ from ._async_computer import AsyncComputer
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport
 from ._exceptions import MandalaError, TimeoutError
 from ._models import (
+    AccountQuota,
     BuildProgress,
     Listing,
     Move,
@@ -81,6 +82,7 @@ from ._resources import (
 from ._sse import SSEEvent
 
 __all__ = [
+    "AsyncAccount",
     "AsyncBuilds",
     "AsyncComputers",
     "AsyncMoves",
@@ -817,6 +819,22 @@ class AsyncSizes:
     async def list(self) -> builtins.list[Size]:
         data = await self._t.json_array("GET", _api.SIZES)
         return [Size.from_api(s) for s in data]
+
+
+class AsyncAccount:
+    """Instantaneous account-wide quota; historical metering is on Usage."""
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def read(self) -> AccountQuota:
+        """Read current plan ceilings and observed consumption.
+
+        Check each ``complete`` group before using remaining headroom; unknowns
+        stay None. This advisory observation reserves nothing and can become
+        stale immediately. Snapshot headroom excludes in-flight reservations.
+        """
+        return AccountQuota.from_api(await self._t.json_object("GET", _api.ACCOUNT))
 
 
 class AsyncUsage:

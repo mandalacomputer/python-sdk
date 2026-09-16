@@ -21,6 +21,7 @@ from ._exceptions import (
     _is_transient_for_poll,
 )
 from ._models import (
+    AccountQuota,
     BuildProgress,
     Listing,
     Move,
@@ -42,6 +43,7 @@ from ._models import (
 from ._sse import SSEEvent
 
 __all__ = [
+    "Account",
     "Builds",
     "Computers",
     "Moves",
@@ -1221,6 +1223,22 @@ class Sizes:
     def list(self) -> builtins.list[Size]:
         data = self._t.json_array("GET", _api.SIZES)
         return [Size.from_api(s) for s in data]
+
+
+class Account:
+    """Instantaneous account-wide quota; historical metering is on Usage."""
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def read(self) -> AccountQuota:
+        """Read current plan ceilings and observed consumption.
+
+        Check each ``complete`` group before using remaining headroom; unknowns
+        stay None. This advisory observation reserves nothing and can become
+        stale immediately. Snapshot headroom excludes in-flight reservations.
+        """
+        return AccountQuota.from_api(self._t.json_object("GET", _api.ACCOUNT))
 
 
 class Usage:

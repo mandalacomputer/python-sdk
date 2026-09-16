@@ -51,6 +51,7 @@ import pytest
 import respx
 from tests.surface_inventory import half, inventory, names, record_named_calls
 from tests.surface_tables import ALLOWED, PARAMETERS
+from tests.test_account import account_report
 from tests.test_artifacts import ARTIFACT_ID, artifact_manifest, download
 from tests.test_retained_results import EXECUTION_ID, RESULT_ID, page, result_manifest
 
@@ -67,8 +68,6 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # Account quota has no SDK convenience resource yet; the typed Account follow-up adds it.
-    ("GET", "account"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -492,6 +491,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         if not get:
             return httpx.Response(200, json=SNAPSHOT)
         return httpx.Response(200, json=HOLDINGS if "/computers/" in path else [SNAPSHOT])
+    if path.endswith("/account"):
+        return httpx.Response(200, json=account_report())
     if path.endswith("/usage"):
         return httpx.Response(200, json=USAGE)
     if path.endswith("/moves"):
@@ -686,6 +687,7 @@ def exercise_everything(client: mc.Client) -> None:
     # `moves.list()` below and is a different method for doing it.
     c.wait_for_move()
     client.moves.list()
+    client.account.read()
     # Both bounds, because a call that names neither cannot show the parameter
     # sweep that this SDK can send either.
     client.usage.read()
@@ -874,6 +876,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.relocate(ram_mb=26000, cpu=2, disk_gb=64)
     await c.wait_for_move()
     await client.moves.list()
+    await client.account.read()
     await client.usage.read()
     await client.usage.read(
         since=datetime(2026, 8, 1, tzinfo=timezone.utc), until="2026-08-22T00:00:00Z"

@@ -13,13 +13,22 @@ import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum, auto
 from operator import index as integer_index
-from typing import Any, SupportsIndex, TypeVar, overload
+from typing import Any, Literal, NoReturn, SupportsIndex, TypeVar, overload
 
 from ._exceptions import MandalaError
 
 __all__ = [
+    "AccountCapabilities",
+    "AccountCompleteness",
+    "AccountLimits",
+    "AccountPerComputer",
+    "AccountPlan",
+    "AccountQuota",
+    "AccountRemaining",
+    "AccountUsage",
     "BuildProgress",
     "BuildStep",
     "ComputerUsage",
@@ -1613,6 +1622,238 @@ class Retention:
             daily=_num(d.get("daily")),
             weekly=_num(d.get("weekly")),
             monthly=_num(d.get("monthly")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class AccountPlan:
+    """Effective plan catalogue identity, without account or billing identifiers."""
+
+    id: str
+    label: str
+
+
+@dataclass(frozen=True)
+class AccountLimits:
+    """Account pool ceilings. Zero is a real ceiling, never unlimited."""
+
+    max_computers: int
+    vcpu_pool: int
+    ram_pool_mb: int
+    disk_pool_gb: int
+    snapshot_storage_bytes: int
+
+
+@dataclass(frozen=True)
+class AccountPerComputer:
+    """Per-computer shape maxima in vCPU, RAM MB and disk GB."""
+
+    max_vcpu: int
+    max_ram_mb: int
+    max_disk_gb: int
+
+
+@dataclass(frozen=True)
+class AccountCapabilities:
+    """Features permitted by the plan."""
+
+    windows: bool
+
+
+@dataclass(frozen=True)
+class AccountCompleteness:
+    """Independent inventory observations; False means that group's figures are None."""
+
+    computers: bool
+    snapshots: bool
+
+
+@dataclass(frozen=True)
+class AccountUsage:
+    """Current consumption, with None for every figure of an incomplete group."""
+
+    kept_computers: int | None
+    #: Configured CPU and disk include stopped computers. Disk is provisioned GB.
+    configured_vcpu: int | None
+    configured_disk_gb: int | None
+    running_or_reserved_computers: int | None
+    running_or_reserved_vcpu: int | None
+    #: Running guest RAM plus pending reservations, in MB.
+    running_or_reserved_ram_mb: int | None
+    #: Indexed stored bytes, excluding in-flight capture reservations.
+    snapshot_storage_bytes: int | None
+
+
+@dataclass(frozen=True)
+class AccountRemaining:
+    """Headroom clamped at zero; usage stays visible even above plan ceilings."""
+
+    kept_computers: int | None
+    configured_vcpu: int | None
+    configured_disk_gb: int | None
+    running_or_reserved_ram_mb: int | None
+    #: Indexed-byte headroom does not predict snapshot capture admission.
+    snapshot_storage_bytes: int | None
+
+
+@dataclass(frozen=True)
+class AccountQuota:
+    """Instantaneous quota for the whole account, including workspace-scoped keys.
+
+    Read ``complete`` before using numbers. This observation is advisory,
+    reserves nothing, and is separate from historical metering in UsageReport.
+    Unknown future fields remain in ``raw``, using the same shallow copy as Usage.
+    """
+
+    scope: Literal["account"]
+    advisory: Literal[True]
+    #: UTC collection completion time, not a consistency token.
+    observed_at: str
+    plan: AccountPlan
+    limits: AccountLimits
+    per_computer: AccountPerComputer
+    capabilities: AccountCapabilities
+    complete: AccountCompleteness
+    usage: AccountUsage
+    remaining: AccountRemaining
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, value: object) -> AccountQuota:
+        """Decode required fields without coercing unknown consumption into zero."""
+
+        def refuse(field: str, expected: str) -> NoReturn:
+            raise MandalaError(f"expected an account quota report: {field} must be {expected}")
+
+        def record(v: object, field: str) -> Mapping[str, Any]:
+            return v if isinstance(v, Mapping) else refuse(field, "an object")
+
+        def text(v: object, field: str) -> str:
+            return v if isinstance(v, str) and v else refuse(field, "a nonempty string")
+
+        def flag(v: object, field: str) -> bool:
+            return v if isinstance(v, bool) else refuse(field, "a boolean")
+
+        def quantity(v: object, field: str) -> int:
+            if (
+                isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and 0 <= v <= 2**53 - 1
+                and int(v) == v
+            ):
+                return int(v)
+            return refuse(field, "a nonnegative safe integer")
+
+        def observed(v: object, field: str, complete: bool) -> int | None:
+            if complete:
+                return quantity(v, field)
+            return None if v is None else refuse(field, "null when incomplete")
+
+        d = record(value, "response")
+        if d.get("scope") != "account":
+            refuse("scope", "account")
+        if d.get("advisory") is not True:
+            refuse("advisory", "true")
+        observed_at = text(d.get("observed_at"), "observed_at")
+        if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", observed_at):
+            refuse("observed_at", "a UTC timestamp")
+        try:
+            datetime.fromisoformat(observed_at[:-1] + "+00:00")
+        except ValueError:
+            refuse("observed_at", "a UTC timestamp")
+        plan = record(d.get("plan"), "plan")
+        limits = record(d.get("limits"), "limits")
+        per = record(d.get("per_computer"), "per_computer")
+        caps = record(d.get("capabilities"), "capabilities")
+        complete = record(d.get("complete"), "complete")
+        usage = record(d.get("usage"), "usage")
+        remaining = record(d.get("remaining"), "remaining")
+        computers = flag(complete.get("computers"), "complete.computers")
+        snapshots = flag(complete.get("snapshots"), "complete.snapshots")
+        # A missing nullable field is malformed, not an explicit null.
+        missing = object()
+        return cls(
+            scope="account",
+            advisory=True,
+            observed_at=observed_at,
+            plan=AccountPlan(
+                id=text(plan.get("id"), "plan.id"), label=text(plan.get("label"), "plan.label")
+            ),
+            limits=AccountLimits(
+                max_computers=quantity(limits.get("max_computers"), "limits.max_computers"),
+                vcpu_pool=quantity(limits.get("vcpu_pool"), "limits.vcpu_pool"),
+                ram_pool_mb=quantity(limits.get("ram_pool_mb"), "limits.ram_pool_mb"),
+                disk_pool_gb=quantity(limits.get("disk_pool_gb"), "limits.disk_pool_gb"),
+                snapshot_storage_bytes=quantity(
+                    limits.get("snapshot_storage_bytes"), "limits.snapshot_storage_bytes"
+                ),
+            ),
+            per_computer=AccountPerComputer(
+                max_vcpu=quantity(per.get("max_vcpu"), "per_computer.max_vcpu"),
+                max_ram_mb=quantity(per.get("max_ram_mb"), "per_computer.max_ram_mb"),
+                max_disk_gb=quantity(per.get("max_disk_gb"), "per_computer.max_disk_gb"),
+            ),
+            capabilities=AccountCapabilities(
+                windows=flag(caps.get("windows"), "capabilities.windows")
+            ),
+            complete=AccountCompleteness(computers=computers, snapshots=snapshots),
+            usage=AccountUsage(
+                kept_computers=observed(
+                    usage.get("kept_computers", missing), "usage.kept_computers", computers
+                ),
+                configured_vcpu=observed(
+                    usage.get("configured_vcpu", missing), "usage.configured_vcpu", computers
+                ),
+                configured_disk_gb=observed(
+                    usage.get("configured_disk_gb", missing), "usage.configured_disk_gb", computers
+                ),
+                running_or_reserved_computers=observed(
+                    usage.get("running_or_reserved_computers", missing),
+                    "usage.running_or_reserved_computers",
+                    computers,
+                ),
+                running_or_reserved_vcpu=observed(
+                    usage.get("running_or_reserved_vcpu", missing),
+                    "usage.running_or_reserved_vcpu",
+                    computers,
+                ),
+                running_or_reserved_ram_mb=observed(
+                    usage.get("running_or_reserved_ram_mb", missing),
+                    "usage.running_or_reserved_ram_mb",
+                    computers,
+                ),
+                snapshot_storage_bytes=observed(
+                    usage.get("snapshot_storage_bytes", missing),
+                    "usage.snapshot_storage_bytes",
+                    snapshots,
+                ),
+            ),
+            remaining=AccountRemaining(
+                kept_computers=observed(
+                    remaining.get("kept_computers", missing), "remaining.kept_computers", computers
+                ),
+                configured_vcpu=observed(
+                    remaining.get("configured_vcpu", missing),
+                    "remaining.configured_vcpu",
+                    computers,
+                ),
+                configured_disk_gb=observed(
+                    remaining.get("configured_disk_gb", missing),
+                    "remaining.configured_disk_gb",
+                    computers,
+                ),
+                running_or_reserved_ram_mb=observed(
+                    remaining.get("running_or_reserved_ram_mb", missing),
+                    "remaining.running_or_reserved_ram_mb",
+                    computers,
+                ),
+                snapshot_storage_bytes=observed(
+                    remaining.get("snapshot_storage_bytes", missing),
+                    "remaining.snapshot_storage_bytes",
+                    snapshots,
+                ),
+            ),
             raw=dict(d),
         )
 

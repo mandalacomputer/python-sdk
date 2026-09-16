@@ -42,6 +42,8 @@ SNAPSHOTS = "snapshots"
 MOVES = "moves"
 #: What the account has used, over a window. Account-scoped, like :data:`MOVES`.
 USAGE = "usage"
+#: Instantaneous account-wide quota, including for workspace-scoped keys.
+ACCOUNT = "account"
 #: How long automatic snapshots are kept — the plan's retention window.
 #:
 #: Account-scoped like :data:`USAGE` and :data:`MOVES`, and answered by the

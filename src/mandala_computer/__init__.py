@@ -42,6 +42,7 @@ from ._agent import (
 from ._artifacts import Artifact, ArtifactAssociation
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import (
+    AsyncAccount,
     AsyncBuilds,
     AsyncComputers,
     AsyncMoves,
@@ -90,6 +91,14 @@ from ._exceptions import (
 )
 from ._executions import ExecutionMetadata, ExecutionOutput
 from ._models import (
+    AccountCapabilities,
+    AccountCompleteness,
+    AccountLimits,
+    AccountPerComputer,
+    AccountPlan,
+    AccountQuota,
+    AccountRemaining,
+    AccountUsage,
     BuildProgress,
     BuildStep,
     ComputerUsage,
@@ -117,7 +126,17 @@ from ._models import (
     Window,
     WindowResult,
 )
-from ._resources import Builds, Computers, Moves, Sizes, Snapshots, Templates, Usage, Webhooks
+from ._resources import (
+    Account,
+    Builds,
+    Computers,
+    Moves,
+    Sizes,
+    Snapshots,
+    Templates,
+    Usage,
+    Webhooks,
+)
 from ._results import (
     BackgroundResult,
     ResultDiagnostic,
@@ -145,6 +164,15 @@ __all__ = [
     "STREAM_FRAME_TYPES",
     "WATCH_EVENT_TYPE",
     "APIError",
+    "Account",
+    "AccountCapabilities",
+    "AccountCompleteness",
+    "AccountLimits",
+    "AccountPerComputer",
+    "AccountPlan",
+    "AccountQuota",
+    "AccountRemaining",
+    "AccountUsage",
     "AgentDone",
     "AgentEvent",
     "AgentFailed",
@@ -155,6 +183,7 @@ __all__ = [
     "AgentUsage",
     "Artifact",
     "ArtifactAssociation",
+    "AsyncAccount",
     "AsyncBackgroundCommand",
     "AsyncClient",
     "AsyncComputer",
@@ -248,6 +277,7 @@ class Client:
         self._t = Transport(
             api_key, base_url=base_url, timeout=timeout, client=http_client, retries=retries
         )
+        self.account = Account(self._t)
         self.builds = Builds(self._t)
         self.computers = Computers(self._t)
         self.moves = Moves(self._t)
@@ -294,6 +324,7 @@ class AsyncClient:
         self._t = AsyncTransport(
             api_key, base_url=base_url, timeout=timeout, client=http_client, retries=retries
         )
+        self.account = AsyncAccount(self._t)
         self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
         self.moves = AsyncMoves(self._t)
