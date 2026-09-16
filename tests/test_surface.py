@@ -86,12 +86,6 @@ UNIMPLEMENTED = {
     ("GET", "computers/:id/activities/:activity/results"),
     # Passive platform signals have no SDK convenience method yet.
     ("GET", "computers/:id/signals"),
-    # SSH keys and the per-computer SSH switch have no SDK methods yet.
-    ("GET", "ssh-keys"),
-    ("POST", "ssh-keys"),
-    ("DELETE", "ssh-keys/:id"),
-    ("GET", "computers/:id/ssh"),
-    ("PUT", "computers/:id/ssh"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -111,10 +105,6 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/activities  query:changes",
     "GET computers/:id/signals  query:since",
     "GET computers/:id/signals  query:limit",
-    # SSH is not wrapped yet; see UNIMPLEMENTED.
-    "POST ssh-keys  body:public_key",
-    "POST ssh-keys  body:name",
-    "PUT computers/:id/ssh  body:enabled",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
@@ -150,6 +140,24 @@ RETENTION = {"daily": 7, "weekly": 4, "monthly": 12}
 # One subscription (platform OPL-4300), and the same one as a create answers
 # it: the secret is on exactly that shape and on no read, so the handler below
 # serves WEBHOOK to the reads and WEBHOOK_CREATED to the create and the rotate.
+SSH_KEY = {
+    "id": "sshk-74025eba1b658b99",
+    "name": "laptop",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGqsBlqrbipXh/7n81gKS46IyjJY7nVv8mGtIAE+v76w",
+    "fingerprint": "SHA256:7OR2azJrv1nm44ploDfzY03D/74wXZGn8Qj4fabJDXs",
+    "key_type": "ssh-ed25519",
+    "created_at": "2026-09-16T12:00:00Z",
+    "last_used_at": None,
+}
+SSH_ACCESS = {
+    "computer": "vm-1",
+    "enabled": True,
+    "available": True,
+    "pending": False,
+    "key_count": 1,
+    "keys_pushed": 1,
+    "error": None,
+}
 WEBHOOK = {
     "id": "whk-2b7d4c809f3c1a7e",
     "url": "https://ci.example.com/mandala",
@@ -524,6 +532,15 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(202, json=DELIVERY)
     if "/webhooks/" in path:
         return httpx.Response(200, json={"ok": True} if request.method == "DELETE" else WEBHOOK)
+    # The caller's keys: the collection lists on GET and answers the one key it
+    # registered on POST; a delete answers an ack. A computer's SSH setting is
+    # one shape on both verbs.
+    if path.endswith("/ssh-keys"):
+        return httpx.Response(200 if get else 201, json=[SSH_KEY] if get else SSH_KEY)
+    if "/ssh-keys/" in path:
+        return httpx.Response(200, json={"ok": True})
+    if path.endswith("/ssh"):
+        return httpx.Response(200, json=SSH_ACCESS)
     if path.endswith("/computers"):
         return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
     return httpx.Response(200, json=COMPUTER)
@@ -771,6 +788,15 @@ def exercise_everything(client: mc.Client) -> None:
     client.webhooks.test("whk-2b7d4c809f3c1a7e")
     client.webhooks.deliveries("whk-2b7d4c809f3c1a7e")
     client.webhooks.delete("whk-2b7d4c809f3c1a7e")
+    # SSH access: the caller's keys, with and without a label, and one
+    # computer's switch in both directions.
+    client.ssh_keys.list()
+    client.ssh_keys.add(SSH_KEY["public_key"])
+    client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
+    client.ssh_keys.remove(SSH_KEY["id"])
+    c.ssh_access()
+    c.set_ssh_access(True)
+    c.set_ssh_access(False)
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -949,6 +975,13 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.webhooks.test("whk-2b7d4c809f3c1a7e")
     await client.webhooks.deliveries("whk-2b7d4c809f3c1a7e")
     await client.webhooks.delete("whk-2b7d4c809f3c1a7e")
+    await client.ssh_keys.list()
+    await client.ssh_keys.add(SSH_KEY["public_key"])
+    await client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
+    await client.ssh_keys.remove(SSH_KEY["id"])
+    await c.ssh_access()
+    await c.set_ssh_access(True)
+    await c.set_ssh_access(False)
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 

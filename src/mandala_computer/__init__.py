@@ -48,6 +48,7 @@ from ._async_resources import (
     AsyncMoves,
     AsyncSizes,
     AsyncSnapshots,
+    AsyncSshKeys,
     AsyncTemplates,
     AsyncUsage,
     AsyncWebhooks,
@@ -113,6 +114,8 @@ from ._models import (
     Size,
     Snapshot,
     SnapshotHoldings,
+    SshAccess,
+    SshKey,
     Template,
     TemplateBuild,
     TemplateCheck,
@@ -133,6 +136,7 @@ from ._resources import (
     Moves,
     Sizes,
     Snapshots,
+    SshKeys,
     Templates,
     Usage,
     Webhooks,
@@ -235,6 +239,8 @@ __all__ = [
     "Size",
     "Snapshot",
     "SnapshotHoldings",
+    "SshAccess",
+    "SshKey",
     "SynchronousResult",
     "SynchronousResultPrefix",
     "Template",
@@ -294,6 +300,7 @@ class Client:
         self.sizes = Sizes(self._t)
         self.usage = Usage(self._t)
         self.webhooks = Webhooks(self._t)
+        self.ssh_keys = SshKeys(self._t)
 
     @property
     def base_url(self) -> str:
@@ -349,6 +356,7 @@ class AsyncClient:
         self.sizes = AsyncSizes(self._t)
         self.usage = AsyncUsage(self._t)
         self.webhooks = AsyncWebhooks(self._t)
+        self.ssh_keys = AsyncSshKeys(self._t)
 
     @property
     def base_url(self) -> str:

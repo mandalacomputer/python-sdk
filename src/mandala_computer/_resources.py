@@ -30,6 +30,7 @@ from ._models import (
     RetiredTemplates,
     Size,
     Snapshot,
+    SshKey,
     Template,
     TemplateBuild,
     TemplateCheck,
@@ -49,6 +50,7 @@ __all__ = [
     "Moves",
     "Sizes",
     "Snapshots",
+    "SshKeys",
     "Templates",
     "Usage",
     "Webhooks",
@@ -1430,6 +1432,50 @@ class Webhooks:
         """
         data = self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
         return [WebhookDelivery.from_api(d) for d in data]
+
+
+class SshKeys:
+    """Your SSH public keys: the ones the platform's jump host and your
+    computers accept when you connect with OpenSSH.
+
+    A key belongs to a PERSON, not to an account. This is the same list
+    whichever account the API key acts on, and a key reaches the computers of
+    every account where you are an owner or member. Whether a given computer
+    accepts logins at all is its own setting:
+    :meth:`~mandala_computer.Computer.set_ssh_access`.
+
+    An API key confined to a workspace cannot add or remove keys: the platform
+    answers :class:`~mandala_computer.PermissionDeniedError`, because a key
+    reaches further than that workspace.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self) -> builtins.list[SshKey]:
+        """Your keys, oldest first."""
+        return [SshKey.from_api(k) for k in self._t.json_array("GET", _api.SSH_KEYS)]
+
+    def add(self, public_key: str, *, name: str | None = None) -> SshKey:
+        """Register one public key: a line from a ``.pub`` file, as read.
+
+        ``name`` is a label, up to 60 characters; without one the platform uses
+        the comment on the line. Accepted: Ed25519, ECDSA, their security-key
+        forms, and RSA of at least 3072 bits. Anything else is an
+        :class:`~mandala_computer.APIError` (400) that names the rule.
+
+        A key already registered — to you or to anybody — is a
+        :class:`~mandala_computer.ConflictError`, and so is a ninth key: each
+        person holds eight. Neither clears by waiting.
+        """
+        body = _api.ssh_key_body(public_key, name)
+        return SshKey.from_api(self._t.json_object("POST", _api.SSH_KEYS, json=body))
+
+    def remove(self, key_id: str) -> None:
+        """Remove one of your keys. New connections with it are refused at once;
+        a session already open goes on until it disconnects. An unknown id is a
+        :class:`~mandala_computer.NotFoundError`."""
+        self._t.request("DELETE", _api.ssh_key(key_id))
 
 
 def _named(**fields: Any) -> dict[str, Any]:

@@ -55,6 +55,9 @@ RETENTION = "retention"
 #: POST this account's events, signed, at an address the caller chose.
 #: Account-scoped and answered by the control plane, like :data:`RETENTION`.
 WEBHOOKS = "webhooks"
+#: The caller's own SSH public keys. A key belongs to a person rather than to an
+#: account, so the collection is the same whichever account a key acts on.
+SSH_KEYS = "ssh-keys"
 
 
 def canonical(value: object, what: str) -> str:
@@ -1834,3 +1837,33 @@ def webhook_body(
     if not body:
         raise ValueError("an update must name at least one field to change")
     return body
+
+
+def ssh_key(key_id: str) -> str:
+    return f"ssh-keys/{seg(key_id)}"
+
+
+def computer_ssh(computer_id: str) -> str:
+    """A computer's SSH setting: read with GET, switch with PUT."""
+    return computer_action(computer_id, "ssh")
+
+
+def ssh_key_body(public_key: object, name: object) -> dict[str, Any]:
+    """``POST ssh-keys``: one ``.pub`` line, and a label only when one was given.
+
+    Surrounding whitespace is dropped, so the contents of a ``.pub`` file can be
+    passed as read, trailing newline and all. Anything else about the line is
+    the platform's to judge, and a refusal names the rule it broke.
+    """
+    line = canonical(public_key, "public_key").strip()
+    if not line:
+        raise ValueError("public_key must not be empty")
+    body: dict[str, Any] = {"public_key": line}
+    if name is not None:
+        body["name"] = canonical(name, "name")
+    return body
+
+
+def ssh_access_body(enabled: object) -> dict[str, Any]:
+    """``PUT computers/:id/ssh``. A real bool: this one opens a computer to logins."""
+    return {"enabled": flag(enabled, "enabled")}

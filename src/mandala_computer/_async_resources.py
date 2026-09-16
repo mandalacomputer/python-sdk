@@ -24,6 +24,7 @@ from ._models import (
     RetiredTemplates,
     Size,
     Snapshot,
+    SshKey,
     Template,
     TemplateBuild,
     TemplateCheck,
@@ -68,6 +69,7 @@ from ._exceptions import _is_transient_for_poll
 from ._resources import (
     EPHEMERAL_DOC,
     Builds,
+    SshKeys,
     Templates,
     Webhooks,
     _LastPoll,
@@ -88,6 +90,7 @@ __all__ = [
     "AsyncMoves",
     "AsyncSizes",
     "AsyncSnapshots",
+    "AsyncSshKeys",
     "AsyncTemplates",
     "AsyncUsage",
     "AsyncWebhooks",
@@ -956,3 +959,24 @@ class AsyncWebhooks:
     rotate.__doc__ = Webhooks.rotate.__doc__
     test.__doc__ = Webhooks.test.__doc__
     deliveries.__doc__ = Webhooks.deliveries.__doc__
+
+
+class AsyncSshKeys:
+    __doc__ = SshKeys.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self) -> builtins.list[SshKey]:
+        return [SshKey.from_api(k) for k in await self._t.json_array("GET", _api.SSH_KEYS)]
+
+    async def add(self, public_key: str, *, name: str | None = None) -> SshKey:
+        body = _api.ssh_key_body(public_key, name)
+        return SshKey.from_api(await self._t.json_object("POST", _api.SSH_KEYS, json=body))
+
+    async def remove(self, key_id: str) -> None:
+        await self._t.request("DELETE", _api.ssh_key(key_id))
+
+    list.__doc__ = SshKeys.list.__doc__
+    add.__doc__ = SshKeys.add.__doc__
+    remove.__doc__ = SshKeys.remove.__doc__

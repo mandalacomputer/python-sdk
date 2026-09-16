@@ -21,8 +21,12 @@ Two subcommands address a computer by name or id:
     receive webhooks; a receiver is a server, and :func:`mandala_computer.verify`
     is what it calls. ``create`` and ``rotate`` print the secret ONCE.
 
-``mandala ssh`` is reserved for a real OpenSSH session and, until that lands,
-refuses with a pointer to ``terminal``.
+``mandala ssh <computer> [ssh-args…]``
+    Real OpenSSH, through the platform's SSH gateway, with the gateway's host
+    key pinned. ``--setup`` registers a public key and switches SSH on;
+    ``ssh-key``, ``ssh-access`` and ``ssh-config`` manage the pieces. It never
+    falls back to ``terminal``: a computer SSH cannot reach is an error that
+    says what to do.
 
 Authentication is the SDK's: ``MANDALA_API_KEY`` (and optionally
 ``MANDALA_BASE_URL``) in the environment.
@@ -35,19 +39,24 @@ import json
 import os
 import queue
 import select
+import shlex
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
+from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from . import _openssh
 from ._api import looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
-from ._exceptions import MandalaError
-from ._models import Webhook, WebhookDelivery
+from ._exceptions import ConflictError, MandalaError
+from ._models import Listing, SshAccess, SshKey, Webhook, WebhookDelivery
 
 if TYPE_CHECKING:
     from websockets.sync.client import ClientConnection
@@ -192,12 +201,16 @@ def _client() -> Client:
     return Client()
 
 
-def _resolve(client: Client, target: str) -> Computer:
-    """The computer ``target`` names — an exact id, or a unique name."""
+def _resolve(client: Client, target: str, computers: Listing[Computer] | None = None) -> Computer:
+    """The computer ``target`` names — an exact id, or a unique name.
+
+    *computers* is a listing the caller already holds, to save a second one.
+    """
     # Resolution is not a fleet-wide consistency decision. One unreachable
     # hypervisor must not block terminal/scp to a computer on a healthy one, and the
     # partial response still carries cached id-only rows for unavailable hosts.
-    computers = client.computers.list(allow_partial=True)
+    if computers is None:
+        computers = client.computers.list(allow_partial=True)
     for c in computers:
         if c.id == target:
             return c
@@ -225,18 +238,6 @@ def _resolve(client: Client, target: str) -> Computer:
 
 
 # --- terminal --------------------------------------------------------------
-
-#: All ``mandala ssh`` does for now: it is being rebuilt as a real OpenSSH
-#: session, and must not quietly run the terminal in the meantime. The
-#: TypeScript CLI prints the same line.
-SSH_REFUSAL = (
-    'mandala ssh is being rebuilt as a real OpenSSH session; use "mandala terminal" for a shell.'
-)
-
-
-def _cmd_ssh() -> int:
-    print(SSH_REFUSAL, file=sys.stderr)
-    return 1
 
 
 def _cmd_terminal(args: argparse.Namespace) -> int:
@@ -1041,6 +1042,392 @@ def _webhooks_parser(sub: Any) -> None:
     deliveries.set_defaults(fn=_cmd_webhooks_deliveries)
 
 
+# --- ssh -------------------------------------------------------------------
+
+SSH_USAGE = """\
+usage: mandala ssh <computer> [ssh-args ...]
+       mandala ssh --setup <computer> [--key PATH] [--json]
+
+Real OpenSSH to a computer, through the platform's SSH gateway, as `user`.
+Everything after the computer goes to ssh unchanged:
+
+  mandala ssh dev
+  mandala ssh dev -L 8080:localhost:8080
+  mandala ssh dev -- uname -a
+
+--setup registers your public key (--key PATH, or the first of
+~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub) unless it already is, and
+switches SSH on for the computer. Run it once per computer.
+
+mandala ssh never falls back to `mandala terminal`, which needs no key.
+
+environment:
+  MANDALA_SSH_GATEWAY               gateway host[:port] (default ssh.mandala.computer:2222)
+  MANDALA_SSH_GATEWAY_KNOWN_HOSTS   known_hosts line, or file, pinning that gateway's key
+"""
+
+
+def _ssh_usage_error(message: str) -> int:
+    print(SSH_USAGE.split("\n\n", 1)[0], file=sys.stderr)
+    print(f"mandala ssh: error: {message}", file=sys.stderr)
+    return 2
+
+
+def _terminal_hint(target: str) -> str:
+    return f'or use "mandala terminal {shlex.quote(target)}" for a shell without a key'
+
+
+def _ssh_binary() -> str:
+    """The ``ssh`` on PATH, or exit 127 — the shell's status for a missing command."""
+    found = shutil.which("ssh")
+    if found is None:
+        print(
+            "mandala: no ssh command found on PATH; install OpenSSH, "
+            'or use "mandala terminal <computer>" for a shell without it',
+            file=sys.stderr,
+        )
+        raise SystemExit(127)
+    return found
+
+
+def _exec(argv: list[str]) -> int:
+    """Become ``ssh``, or on Windows run it and hand back its status."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if LOCAL_WINDOWS:
+        return subprocess.call(argv)
+    os.execv(argv[0], argv)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _parse_ssh(words: list[str]) -> tuple[dict[str, Any], str | None, list[str]] | int:
+    """``mandala ssh``'s own options, the computer, and what goes to ssh.
+
+    Our options come before the computer; everything after it is ssh's. With
+    ``--setup`` nothing goes to ssh, so ``--key`` and ``--json`` may follow the
+    computer too.
+    """
+    opts: dict[str, Any] = {"setup": False, "key": None, "json": False, "help": False}
+    target: str | None = None
+    rest: list[str] = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if target is not None and not opts["setup"]:
+            rest = words[i:]
+            break
+        if word in ("-h", "--help"):
+            opts["help"] = True
+        elif word == "--setup":
+            opts["setup"] = True
+        elif word == "--json":
+            opts["json"] = True
+        elif word == "--key":
+            if i + 1 >= len(words):
+                return _ssh_usage_error("--key needs a PATH")
+            opts["key"] = words[i + 1]
+            i += 1
+        elif word.startswith("--key="):
+            opts["key"] = word.removeprefix("--key=")
+        elif word.startswith("-"):
+            where = "with --setup" if target is not None else "before the computer"
+            return _ssh_usage_error(
+                f"unrecognized option {word} {where}; ssh's own options go after the computer"
+            )
+        elif target is None:
+            target = word
+        else:
+            return _ssh_usage_error(f"--setup takes one computer, not {word!r} as well")
+        i += 1
+    return opts, target, rest
+
+
+def _cmd_ssh(words: list[str]) -> int:
+    parsed = _parse_ssh(words)
+    if isinstance(parsed, int):
+        return parsed
+    opts, target, rest = parsed
+    if opts["help"]:
+        print(SSH_USAGE, end="")
+        return 0
+    if target is None:
+        return _ssh_usage_error("name a computer")
+    if opts["setup"]:
+        return _ssh_setup(target, opts["key"], as_json=opts["json"])
+    if opts["json"]:
+        return _ssh_usage_error("ssh is interactive and has no --json output")
+    if opts["key"] is not None:
+        return _ssh_usage_error(
+            "--key goes with --setup; to connect with a particular key, pass -i PATH "
+            "after the computer"
+        )
+    return _ssh_connect(target, rest)
+
+
+def _ssh_connect(target: str, extra: list[str]) -> int:
+    ssh = _ssh_binary()
+    gw = _openssh.gateway()
+    quoted = shlex.quote(target)
+    with _client() as client:
+        c = _resolve(client, target)
+        label = c.name or c.id
+        access = c.ssh_access()
+        if access.available is False:
+            _die(
+                f"{label} was made from a template that predates SSH; create a new computer "
+                f"to use SSH, {_terminal_hint(target)}"
+            )
+        if not access.enabled:
+            _die(
+                f'SSH is off for {label}; run "mandala ssh --setup {quoted}" to turn it on, '
+                f"{_terminal_hint(target)}"
+            )
+        if not client.ssh_keys.list():
+            _die(
+                f'you have no SSH keys registered; run "mandala ssh --setup {quoted}" to add '
+                f"one, {_terminal_hint(target)}"
+            )
+    known_hosts = _openssh.known_hosts_path()
+    _openssh.ensure_known_hosts(gw, known_hosts)
+    return _exec(_openssh.ssh_argv(ssh, c.id, gw, known_hosts, extra, windows=LOCAL_WINDOWS))
+
+
+def _key_path(given: str | None) -> Path:
+    if given is not None:
+        return Path(given).expanduser()
+    found = _openssh.find_default_key()
+    if found is None:
+        _die(_openssh.no_key_message())
+    return found
+
+
+def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
+    path = _key_path(key)
+    line = _openssh.read_public_key(path)
+    fingerprint = _openssh.fingerprint(line)
+    gw = _openssh.gateway()
+    with _client() as client:
+        c = _resolve(client, target)
+        # Before anything is registered or switched: a computer that cannot run
+        # SSH should cost the caller nothing but this read.
+        if c.ssh_access().available is False:
+            _die(
+                f"{c.name or c.id} was made from a template that predates SSH; "
+                "create a new computer to use SSH"
+            )
+        existing = _own_key(client, fingerprint)
+        if existing is None:
+            try:
+                registered = client.ssh_keys.add(line)
+            except ConflictError:
+                # Registered between the listing and the add — by another
+                # `--setup` of our own, or by somebody else. Only the first is
+                # ours to carry on with; the second keeps the platform's refusal.
+                existing = _own_key(client, fingerprint)
+                if existing is None:
+                    raise
+                registered = existing
+        else:
+            registered = existing
+        access = c.set_ssh_access(True)
+    label = c.name or c.id
+    # Checked before anything is printed: a setup that cannot work must not
+    # say "SSH is on" or hand a script a success object first.
+    if access.available is False:
+        _die(
+            f"{label} was made from a template that predates SSH; create a new computer to use SSH"
+        )
+    if access.error:
+        _die(f"the computer's host refused the SSH setting: {access.error}")
+    _openssh.ensure_known_hosts(gw, _openssh.known_hosts_path())
+    command = f"mandala ssh {shlex.quote(target)}"
+    if as_json:
+        _json(
+            {
+                "computer": c.id,
+                "name": c.name,
+                "key": dict(registered.raw),
+                "key_added": existing is None,
+                "ssh": dict(access.raw),
+                "command": command,
+            }
+        )
+    else:
+        state = "already registered" if existing is not None else "registered"
+        print(f"key {registered.fingerprint} ({registered.name}) {state}")
+        print(f"SSH is on for {label}")
+        print(f"connect with: {command}")
+    if access.pending:
+        print(
+            f"mandala: {label} has not received the setting yet; it is sent again "
+            "automatically, and connecting sends it first",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _own_key(client: Client, fingerprint: str) -> SshKey | None:
+    return next((k for k in client.ssh_keys.list() if k.fingerprint == fingerprint), None)
+
+
+def _key_rows(keys: Sequence[SshKey]) -> str:
+    rows = [(k.id, k.key_type, k.fingerprint, k.last_used_at or "never", k.name) for k in keys]
+    return _table(("ID", "TYPE", "FINGERPRINT", "LAST USED", "NAME"), rows)
+
+
+def _cmd_ssh_key_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        keys = client.ssh_keys.list()
+    if args.json:
+        _json([k.raw for k in keys])
+    elif keys:
+        print(_key_rows(keys))
+    else:
+        print("no SSH keys", file=sys.stderr)
+    return 0
+
+
+def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
+    line = _openssh.read_public_key(_key_path(args.path))
+    with _client() as client:
+        key = client.ssh_keys.add(line, name=args.name)
+    if args.json:
+        _json(key.raw)
+    else:
+        print(f"added {key.id}  {key.fingerprint}  {key.name}")
+    return 0
+
+
+def _cmd_ssh_key_rm(args: argparse.Namespace) -> int:
+    with _client() as client:
+        client.ssh_keys.remove(args.id)
+    print(f"removed {args.id}")
+    return 0
+
+
+def _access_lines(label: str, access: SshAccess) -> list[str]:
+    lines = [f"SSH is {'on' if access.enabled else 'off'} for {label}"]
+    if access.available is False:
+        lines.append(
+            f"  {label} was made from a template that predates SSH; "
+            "create a new computer to use SSH"
+        )
+    elif access.available is None:
+        lines.append(
+            f"  whether {label} can run SSH is not known yet; it is checked at its next start"
+        )
+    if access.enabled:
+        lines.append(f"  keys: {access.keys_pushed} of {access.key_count} delivered")
+    if access.pending:
+        lines.append("  pending: the computer's host has not received the current setting yet")
+    if access.error:
+        lines.append(f"  error: {access.error}")
+    return lines
+
+
+def _cmd_ssh_access(args: argparse.Namespace) -> int:
+    with _client() as client:
+        c = _resolve(client, args.target)
+        if args.state is None:
+            access = c.ssh_access()
+        else:
+            access = c.set_ssh_access(args.state == "on")
+    if args.json:
+        _json(access.raw)
+    else:
+        print("\n".join(_access_lines(c.name or c.id, access)))
+    return 0
+
+
+def _cmd_ssh_config(args: argparse.Namespace) -> int:
+    gw = _openssh.gateway()
+    with _client() as client:
+        computers = client.computers.list(allow_partial=True)
+        c = _resolve(client, args.target, computers)
+    known_hosts = _openssh.known_hosts_path()
+    _openssh.ensure_known_hosts(gw, known_hosts)
+    # A name two computers share would give two blocks one Host, and ssh would
+    # only ever use the first; the id is unique.
+    # A listing that may not hold every computer cannot prove the name is
+    # unique, so the id is used then too.
+    unchecked = not computers.is_complete
+    shared = bool(c.name) and any(o.name == c.name and o.id != c.id for o in computers)
+    host = c.id if unchecked or shared else _openssh.host_alias(c.name, c.id)
+    if unchecked:
+        print(
+            f"mandala: could not check other computers' names; using Host {c.id} instead",
+            file=sys.stderr,
+        )
+    elif shared and host != c.name:
+        print(
+            f"mandala: another computer is also named {c.name}; using Host {c.id} instead",
+            file=sys.stderr,
+        )
+    snippet = _openssh.config_snippet(host, c.id, gw, known_hosts)
+    path = Path.home() / ".ssh" / "config"
+    changed = _openssh.write_config(path, snippet) if args.write else None
+    if args.json:
+        _json(
+            {
+                "computer": c.id,
+                "name": c.name,
+                "host": host,
+                "config": snippet,
+                "path": str(path) if args.write else None,
+                "changed": changed,
+            }
+        )
+    elif args.write:
+        verb = "wrote" if changed else "already up to date:"
+        print(f"{verb} Host {host} in {path}")
+        print(f"connect with: ssh {host}")
+    else:
+        print(snippet, end="")
+    return 0
+
+
+def _ssh_parsers(sub: Any) -> None:
+    # Listed for --help only: `main` answers every `mandala ssh …` itself.
+    sub.add_parser(
+        "ssh",
+        help="real OpenSSH to a computer, through the gateway (mandala ssh --help)",
+        add_help=False,
+    )
+
+    keys = sub.add_parser("ssh-key", help="your SSH public keys")
+    verbs = keys.add_subparsers(dest="verb", required=True)
+    listing = verbs.add_parser("list", help="your registered keys")
+    listing.add_argument("--json", action="store_true", help="the rows as JSON")
+    listing.set_defaults(fn=_cmd_ssh_key_list)
+    add = verbs.add_parser("add", help="register a public key")
+    add.add_argument(
+        "path",
+        metavar="PATH",
+        nargs="?",
+        help="a .pub file (default: the first of ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)",
+    )
+    add.add_argument("--name", help="a label (default: the key's comment)")
+    add.add_argument("--json", action="store_true", help="the key as JSON")
+    add.set_defaults(fn=_cmd_ssh_key_add)
+    rm = verbs.add_parser("rm", help="remove a key")
+    rm.add_argument("id", metavar="ID")
+    rm.set_defaults(fn=_cmd_ssh_key_rm)
+
+    access = sub.add_parser("ssh-access", help="show, or switch, SSH for a computer")
+    access.add_argument("target", metavar="computer", help="computer name or id")
+    access.add_argument("state", nargs="?", choices=("on", "off"), help="omit to show the status")
+    access.add_argument("--json", action="store_true", help="the setting as JSON")
+    access.set_defaults(fn=_cmd_ssh_access)
+
+    config = sub.add_parser("ssh-config", help="a ~/.ssh/config block for a computer")
+    config.add_argument("target", metavar="computer", help="computer name or id")
+    config.add_argument(
+        "--write", action="store_true", help="add it to ~/.ssh/config, replacing an earlier one"
+    )
+    config.add_argument("--json", action="store_true", help="the block as JSON")
+    config.set_defaults(fn=_cmd_ssh_config)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mandala",
@@ -1063,19 +1450,19 @@ def _parser() -> argparse.ArgumentParser:
     scp.add_argument("dst", metavar="DST", help="local path, or <computer>:/path")
     scp.set_defaults(fn=_cmd_scp)
 
+    _ssh_parsers(sub)
     _webhooks_parser(sub)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    words = sys.argv[1:] if argv is None else argv
-    if words[:1] == ["ssh"]:
-        # `ssh` has no parser, so this intercept is the only thing that answers
-        # it: every `mandala ssh …`, `--help` included, gets the refusal
-        # whatever argparse would have done with those words.
-        return _cmd_ssh()
-    args = _parser().parse_args(argv)
+    words = list(sys.argv[1:] if argv is None else argv)
     try:
+        if words[:1] == ["ssh"]:
+            # Parsed by hand: everything after the computer belongs to ssh,
+            # verbatim, and argparse would read `-L` or `--` as its own.
+            return _cmd_ssh(words[1:])
+        args = _parser().parse_args(words)
         return int(args.fn(args))
     except (MandalaError, ValueError) as e:
         print(f"mandala: {e}", file=sys.stderr)
