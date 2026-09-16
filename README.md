@@ -913,7 +913,8 @@ next_part = c.execution_output(
 ```
 
 `AsyncComputer` offers the same methods with `await`. Each method makes one
-request, with no resume, automatic retry, command replay, polling loop or legacy
+read by default; opt-in transport retries can repeat an interrupted read with
+the same offsets. There is no resume, command replay, polling loop or legacy
 fallback. Metadata returns `ExecutionMetadata`: the last observed `running`,
 `exited` or `lost` state. Only `exited` includes `ended_at` and a signed
 `exit_code`; `lost` proves no outcome, and `running` does not prove the computer
@@ -969,8 +970,9 @@ if result.result_id is not None:
 `retain_execution_output()` makes one POST and reads guest output explicitly.
 `result()`, `result_output()` and `delete_result()` each make one retained request
 without guest I/O or waking a computer. Results use `res_` IDs, distinct from
-volatile `exec_` handles. No automatic retry, tail, legacy PID lookup or output
-fallback occurs. A lost or malformed capture response leaves publication
+volatile `exec_` handles. Reads can use the optional transport retry policy;
+mutations remain single attempts. No tail, legacy PID lookup or output fallback
+occurs. A lost or malformed capture response leaves publication
 unconfirmed; the server may already have committed it. Do not replay a command
 or repeat a capture automatically to repair that uncertainty.
 
@@ -1031,8 +1033,9 @@ nullable `execution_association`; a caller-selected execution association does
 not prove that execution produced the file. Artifacts have no public account ID
 or version field.
 
-`download_artifact()` first makes one metadata GET, then at most one whole
-binary GET to the fixed download route. It refuses metadata larger than the
+`download_artifact()` first reads metadata, then downloads the whole binary
+from the fixed download route. Each GET is a single attempt by default; the
+optional transport retry policy may repeat an interrupted GET from the beginning. It refuses metadata larger than the
 independent download cap before transfer. It returns `bytes` only after complete
 size and SHA-256 verification, including for empty artifacts. It never requests
 Range, follows redirects/Location, returns an unverified prefix, writes a local
@@ -2195,6 +2198,60 @@ off the new end — a `RangeNotSatisfiableError` — or it lands inside it and t
 length it reports has dropped, which is a `MandalaError` naming both. The
 alternative is two files spliced at whatever offset the change landed on, under
 a byte count that looks perfectly reasonable.
+
+### Optional retries for reads
+
+Retries are off by default. Set the same option on `Client` or `AsyncClient`:
+
+```python
+client = Client(retries={"idempotent": 2})  # up to two additional attempts per read
+```
+
+`idempotent` must be a nonnegative integer; zero keeps a single attempt. The
+client copies this setting at construction. Only GET and HEAD can retry, on
+connection failures or HTTP 502, 503 and 504. The legacy PID output poll is
+excluded because reading it advances a shared cursor. HTTP 429 is never retried,
+including when its error body is interrupted; `RateLimitError.retry_after` still
+carries a usable server delay. Other statuses and local validation, decoding,
+size or integrity failures do not permit retries.
+
+Caller-owned httpx clients keep their redirect, response-hook and authentication
+behavior. A returned response is retryable only if every request in its history
+is safe. Automatic redirects, response hooks and configured authentication can
+consume a response before httpx returns it to the SDK. If an attempt fails
+before that return, and any of those mechanisms were enabled before dispatch,
+the SDK cannot establish the received status, headers and history and does not
+retry that failure. This applies to ordinary, retained and SSE reads. Without
+those mechanisms, connection-error retries remain available; the SDK's ordinary
+Authorization header does not disable them.
+Proxy tunnel failures reported as `httpx.ProxyError` are terminal because their
+response status and headers are unavailable to the SDK.
+A native `httpx.WriteError` before a response is returned is also terminal:
+HTTP/2 can receive headers before an acknowledgement write fails. Write failures
+while reading an already returned response still follow its status and delay
+rules.
+
+Backoff starts at 250 ms, doubles after each failure, and caps at 30 seconds.
+A valid `Retry-After` is a lower bound on that delay, including HTTP dates and
+zero. Very large valid delays never fall back to a shorter wait. Cancellation
+and timeout failures end the operation. An explicit caller
+`timeout_cap`, such as a wait helper's remaining budget, shrinks by monotonic
+elapsed time across attempts and backoff; a retry that cannot fit is refused.
+Ordinary httpx connect/read/write/pool timeouts remain phase-specific and do
+**not** impose a total wall-clock deadline on a read or its retries.
+
+Finite JSON, listings, files and retained downloads buffer each complete attempt
+before returning anything. An interrupted read discards its partial bytes and
+closes its response before retrying from the beginning; retained size and hash
+checks still apply. An SSE GET can retry only before its first application event
+is exposed. After that event, failures end the stream without replay. Desktop
+websocket reconnection behavior is unchanged.
+
+POST, PUT, PATCH and DELETE are never retried, even on a connection failure.
+A lost answer does not prove a mutation did not happen: another create or exec
+can duplicate work. Creates, template preparation, retained publication and POST
+agent streams therefore remain single attempts. Check an uncertain mutation's
+outcome explicitly before deciding what to do next.
 
 ### Errors
 
