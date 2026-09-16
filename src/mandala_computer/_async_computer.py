@@ -1003,7 +1003,8 @@ class AsyncComputer(ComputerFields):
         """Read one execution's last observed metadata without guest I/O.
 
         The canonical ID comes from a background start, never a PID lookup.
-        This makes one request and never resumes, retries or replays work.
+        This makes one request by default; opt-in safe GET retries may repeat it.
+        It never resumes or replays work.
         Malformed or mismatched evidence raises :class:`~mandala_computer.MandalaError`.
         """
         identity = _api.execution_id(execution_id)
@@ -1138,7 +1139,9 @@ class AsyncComputer(ComputerFields):
     async def download_artifact(self, artifact_id: str, *, max_bytes: int = 8388608) -> bytes:
         """Return the complete retained artifact after exact size/hash verification.
 
-        One metadata GET and at most one whole download, never Range or retry.
+        One metadata GET and one whole download, without Range or resume.
+
+        Opt-in transport retries may repeat an interrupted read from the beginning.
         max_bytes is an independent download cap (1..64 MiB, default 8 MiB),
         not a capture option. Phase timeouts are not total wall-clock deadlines.
         """

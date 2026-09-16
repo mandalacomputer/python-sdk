@@ -25,6 +25,8 @@ hypervisor daemon's own routes — see the README for why that boundary exists.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import httpx
 
 from ._agent import (
@@ -239,8 +241,11 @@ class Client:
         base_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.Client | None = None,
+        retries: Mapping[str, int] | None = None,
     ) -> None:
-        self._t = Transport(api_key, base_url=base_url, timeout=timeout, client=http_client)
+        self._t = Transport(
+            api_key, base_url=base_url, timeout=timeout, client=http_client, retries=retries
+        )
         self.builds = Builds(self._t)
         self.computers = Computers(self._t)
         self.moves = Moves(self._t)
@@ -282,8 +287,11 @@ class AsyncClient:
         base_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.AsyncClient | None = None,
+        retries: Mapping[str, int] | None = None,
     ) -> None:
-        self._t = AsyncTransport(api_key, base_url=base_url, timeout=timeout, client=http_client)
+        self._t = AsyncTransport(
+            api_key, base_url=base_url, timeout=timeout, client=http_client, retries=retries
+        )
         self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
         self.moves = AsyncMoves(self._t)
