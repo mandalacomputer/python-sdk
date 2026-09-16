@@ -2702,6 +2702,8 @@ is the SDK's: `MANDALA_API_KEY` in the environment.
 
 ```sh
 mandala terminal dev               # an interactive shell in the guest
+mandala ssh --setup dev            # once: register your key, switch SSH on
+mandala ssh dev                    # real OpenSSH, through the platform's gateway
 mandala scp .env dev:/home/user/app/.env
 mandala scp dev:/home/user/report.csv .
 mandala webhooks list              # and create, get, update, delete, rotate, test, deliveries
@@ -2754,6 +2756,106 @@ mandala webhooks create https://ci.example.com/mandala --event process.exited
 mandala webhooks update whk-2b7d4c809f3c1a7e --all-events --enable
 mandala webhooks test whk-2b7d4c809f3c1a7e && mandala webhooks deliveries whk-2b7d4c809f3c1a7e
 ```
+
+### SSH access
+
+`mandala ssh` is real OpenSSH: your own `ssh` binary, your own key, port
+forwarding, `scp` and `sftp`. Connections go through the platform's SSH gateway
+(`ssh.mandala.computer`, port 2222), a jump host that checks your key; the
+computer's own sshd then logs you in as `user`.
+
+Once per computer, register a public key and switch SSH on:
+
+```sh
+mandala ssh --setup dev            # uses ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub
+mandala ssh --setup dev --key ~/.ssh/work.pub
+```
+
+`--setup` is safe to repeat: a key whose fingerprint is already registered is
+not uploaded again. Then connect. Everything after the computer goes to `ssh`
+unchanged, and `mandala ssh` exits with `ssh`'s own status:
+
+```sh
+mandala ssh dev
+mandala ssh dev -- uname -a
+mandala ssh dev -L 8080:localhost:8080     # the guest's port 8080 on yours
+mandala ssh dev -i ~/.ssh/work             # the key is offered to the gateway too
+```
+
+The CLI fills in the jump and pins the gateway's host key, in a known_hosts
+file it keeps at `~/.mandala/ssh_known_hosts`. Each computer's own host key is
+trusted the first time you connect and stored in the same file under the
+computer's id, so renaming the computer does not look like a new machine.
+
+`mandala ssh` never falls back to `mandala terminal`. If SSH is off for the
+computer, you have no key registered, the computer was made from a template
+that predates SSH (create a new computer), or there is no `ssh` on your PATH
+(exit 127), it exits non-zero with one line saying what to do.
+
+The pieces, one at a time:
+
+```sh
+mandala ssh-key list               # --json for the rows
+mandala ssh-key add [PATH] [--name NAME]
+mandala ssh-key rm sshk-74025eba1b658b99
+mandala ssh-access dev             # the status; --json for the object
+mandala ssh-access dev on          # or off
+```
+
+A key belongs to you rather than to an account, and reaches the computers of
+every account you are an owner or member of. Each person holds eight.
+
+#### Without the CLI: `ssh-config`, VS Code, scp and sftp
+
+`mandala ssh-config dev` prints a `~/.ssh/config` entry: a `Host` block for the
+gateway, with its pinned key, and a `Host dev` block that jumps through it.
+`--write` adds it to `~/.ssh/config` between marker comments, replacing the
+block it wrote before for that computer and leaving everything else alone (a
+missing file is created with mode 0600). After that, every OpenSSH tool knows
+the computer by name:
+
+```sh
+mandala ssh-config dev --write
+ssh dev
+scp report.csv dev:/home/user/
+sftp dev
+```
+
+In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
+Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also
+takes the one-liner below, but the entry it writes carries no pinned gateway
+key, so prefer the `--write` entry.
+
+Without the CLI at all, this works once `ssh-access` is on and your key is
+registered (you will be asked to confirm the gateway's key the first time):
+
+```sh
+ssh -J mandala@ssh.mandala.computer:2222 user@dev
+```
+
+The gateway's host key fingerprint is
+`SHA256:09QlEDFrF+XXV/2u4X/pBAufS+8iaKwRzW6+EvIPVkg`.
+
+#### `terminal` or `ssh`?
+
+`mandala terminal` needs no key and no SSH setting: it is a shell over the
+platform's own websocket, on a PTY the platform keeps alive, so a disconnect
+detaches rather than ends it. `mandala ssh` is OpenSSH end to end, so it has
+forwarding, `scp`, `sftp`, agent forwarding and every editor that speaks SSH,
+and a session ends when the connection does.
+
+#### Self-hosting and testing
+
+Two environment variables point the CLI at another gateway:
+`MANDALA_SSH_GATEWAY=host:port` (port 2222 if omitted) and
+`MANDALA_SSH_GATEWAY_KNOWN_HOSTS`, a known_hosts line — or the path of a file of
+them — pinning that gateway's key.
+
+In the SDK the same operations are `client.ssh_keys.list()`,
+`client.ssh_keys.add(public_key, name=None)`, `client.ssh_keys.remove(key_id)`,
+and on a computer `c.ssh_access()` and `c.set_ssh_access(enabled)`, which answer
+an `SshAccess` (`enabled`, `available`, `pending`, `key_count`, `keys_pushed`,
+`error`). The async client has the same methods.
 
 ## Design notes
 

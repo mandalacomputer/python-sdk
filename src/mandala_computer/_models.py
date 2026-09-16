@@ -43,6 +43,8 @@ __all__ = [
     "Size",
     "Snapshot",
     "SnapshotHoldings",
+    "SshAccess",
+    "SshKey",
     "Template",
     "TemplateBuild",
     "TemplateCheck",
@@ -3004,5 +3006,91 @@ class WebhookDelivery:
             last_error=_opt_text(d.get("last_error")),
             delivered_at=_opt_text(d.get("delivered_at")),
             created_at=_text(d.get("created_at")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class SshKey:
+    """One of your SSH public keys, from the ``ssh_keys`` resource.
+
+    A key belongs to a person, not to an account: the list is the same
+    whichever account the API key acts on, and the key reaches the computers of
+    every account where you are an owner or member.
+    """
+
+    #: ``sshk-`` and sixteen hex characters.
+    id: str
+    #: Your label. Defaults to the comment that followed the key when it was added.
+    name: str
+    #: ``<type> <base64>``, re-encoded by the platform: no options, no comment.
+    public_key: str
+    #: ``SHA256:`` and 43 characters, exactly as ``ssh-keygen -l`` prints it.
+    fingerprint: str
+    #: ``ssh-ed25519``, ``ecdsa-sha2-nistp256`` and so on.
+    key_type: str
+    created_at: str
+    #: When this key last opened a connection to a computer. ``None`` until it has.
+    last_used_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> SshKey:
+        return cls(
+            id=_text(d.get("id")),
+            name=_text(d.get("name")),
+            public_key=_text(d.get("public_key")),
+            fingerprint=_text(d.get("fingerprint")),
+            key_type=_text(d.get("key_type")),
+            created_at=_text(d.get("created_at")),
+            last_used_at=_opt_text(d.get("last_used_at")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class SshAccess:
+    """Whether SSH is on for one computer, and whether it can work there.
+
+    From :meth:`~mandala_computer.Computer.ssh_access` and
+    :meth:`~mandala_computer.Computer.set_ssh_access`.
+    """
+
+    #: The computer this is about.
+    computer: str
+    #: Whether SSH is switched on. Off until somebody switches it on; a field
+    #: that is missing or unreadable reads as off.
+    enabled: bool
+    #: Whether the computer can run SSH at all. ``False`` for one made from a
+    #: template image that predates SSH: create a new computer to use it.
+    #: ``None`` when the computer has not been asked yet; it is asked when it
+    #: next starts.
+    available: bool | None
+    #: The computer's host has yet to receive the current setting and key list.
+    #: It is sent again automatically, and a connection attempt sends it first.
+    pending: bool
+    #: How many keys may log in: every key of every owner and member of the
+    #: account. ``0`` while SSH is off.
+    key_count: int
+    #: How many of those the computer is given. Fewer than :attr:`key_count`
+    #: only when the account holds more keys than one computer accepts.
+    keys_pushed: int
+    #: Set when the computer's host refused the current setting. ``None`` otherwise.
+    error: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> SshAccess:
+        available = _wire(d, "available")
+        return cls(
+            computer=_text(d.get("computer")),
+            enabled=_wire(d, "enabled") is _Wire.TRUE,
+            available=(
+                True if available is _Wire.TRUE else False if available is _Wire.FALSE else None
+            ),
+            pending=_wire(d, "pending") is _Wire.TRUE,
+            key_count=_num(d.get("key_count")),
+            keys_pushed=_num(d.get("keys_pushed")),
+            error=_opt_text(d.get("error")),
             raw=dict(d),
         )

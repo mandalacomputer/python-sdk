@@ -91,6 +91,7 @@ from ._models import (
     Move,
     Snapshot,
     SnapshotHoldings,
+    SshAccess,
     Window,
     WindowResult,
     _optional_result_id,
@@ -413,6 +414,32 @@ class AsyncComputer(ComputerFields):
             )
         )
         return self
+
+    async def ssh_access(self) -> SshAccess:
+        """Whether SSH is on for this computer, and whether it can work here.
+
+        See :class:`~mandala_computer.SshAccess`. Any role may read it, and it
+        is answered without waiting on the computer's host.
+        """
+        return SshAccess.from_api(await self._t.json_object("GET", _api.computer_ssh(self.id)))
+
+    async def set_ssh_access(self, enabled: bool) -> SshAccess:
+        """Switch SSH on or off for this computer, and answer the setting as stored.
+
+        On, the computer runs an SSH server reachable only through the
+        platform's jump host, and accepts the keys of every owner and member of
+        the account (:attr:`~mandala_computer.Client.ssh_keys`). Off, the
+        server stops and open SSH sessions are closed. No restart either way.
+
+        ``enabled`` must be a real ``bool``. A computer made from a template
+        image that predates SSH stores the setting and answers
+        ``available=False``: create a new computer to use SSH. A host that
+        cannot be reached answers ``pending=True``; the setting is delivered
+        when it is back.
+        """
+        body = _api.ssh_access_body(enabled)
+        data = await self._t.json_object("PUT", _api.computer_ssh(self.id), json=body)
+        return SshAccess.from_api(data)
 
     async def delete(
         self, *, purge_snapshots: bool = False, expect: str | None = None

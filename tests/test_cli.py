@@ -528,36 +528,15 @@ def test_terminal_on_a_local_windows_terminal_dies_before_connecting(
         _cli.main(["terminal", "dev"])
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [["ssh"], ["ssh", "dev"], ["ssh", "dev", "--session", "two"], ["ssh", "--help"]],
-)
-def test_ssh_refuses_and_points_at_terminal(
-    argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_top_level_help_lists_terminal_and_the_ssh_commands(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`ssh` is being rebuilt as real OpenSSH; until then it must not run the terminal.
-
-    A script written for one must never quietly run the other, so it refuses
-    with a non-zero status, one line on stderr, and nothing on stdout.
-    """
-    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
-    monkeypatch.setattr(_cli, "_interact", lambda url: pytest.fail("must not open a terminal"))
-    assert _cli.main(argv) != 0
-    out, err = capsys.readouterr()
-    assert out == ""
-    assert err == (
-        'mandala ssh is being rebuilt as a real OpenSSH session; use "mandala terminal" for a shell.\n'
-    )
-
-
-def test_top_level_help_lists_terminal_and_not_ssh(capsys: pytest.CaptureFixture[str]) -> None:
-    """`ssh` has no meaning yet, so help does not offer it."""
     with pytest.raises(SystemExit) as caught:
         _cli.main(["--help"])
     assert caught.value.code == 0
     out = capsys.readouterr().out
-    assert "terminal" in out
-    assert "ssh" not in out
+    for command in ("terminal", "ssh", "ssh-key", "ssh-access", "ssh-config"):
+        assert command in out
 
 
 # --- guest paths are not local paths ---------------------------------------
