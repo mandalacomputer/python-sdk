@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import math
 import time
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
@@ -112,6 +113,16 @@ raising, the computer is reported with a warning rather than a second exception,
 so what you catch is still your own error. That warning means a machine outlived
 its block and is still billable.
 """
+
+
+def _launch_start_admitted(data: Mapping[str, Any]) -> bool:
+    held = data.get("running_ram_mb")
+    return (
+        isinstance(held, (int, float))
+        and not isinstance(held, bool)
+        and math.isfinite(held)
+        and held > 0
+    )
 
 
 class Computers:
@@ -235,6 +246,103 @@ class Computers:
         )
         data = self._t.json_object("POST", _api.COMPUTERS, json=body)
         return Computer(self._t, _api.computer_payload(data))
+
+    def launch(
+        self,
+        *,
+        name: str | None = None,
+        size: str | None = None,
+        template: str | None = None,
+        template_transfer: str | None = None,
+        cpu: int | None = None,
+        ram_mb: int | None = None,
+        disk_gb: int | None = None,
+        start: bool = True,
+        resolution: str | None = None,
+        timeout: float = 180.0,
+        poll: float = 3.0,
+    ) -> Computer:
+        """Create, start if needed, and wait for the guest agent to answer.
+
+        Every create argument is preserved. ``start=False`` defers starting
+        until the disk is built; launch still starts it before returning.
+        An admitted start is waited on, and a failed start is never retried.
+
+        ``timeout`` is one readiness budget in seconds, beginning after create
+        returns. Disk, running and guest waits share the remaining time, and
+        elapsed start work consumes it too. Create and start retain their usual
+        transport deadlines: this is not a total wall-clock limit on launch.
+        ``poll`` is the delay in seconds between polls in every stage.
+
+        The computer is persistent and is never deleted on failure. SDK errors
+        after creation retain their type and include its id. Interruption
+        propagates unchanged. Use ``ephemeral`` for scoped cleanup. Guest
+        readiness does not guarantee the desktop has finished logging in.
+        """
+        check_wait_args(timeout, poll)
+        computer = self.create(
+            name=name,
+            size=size,
+            template=template,
+            template_transfer=template_transfer,
+            cpu=cpu,
+            ram_mb=ram_mb,
+            disk_gb=disk_gb,
+            start=start,
+            resolution=resolution,
+        )
+        computer_id = computer.id
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"readiness budget of {timeout:g}s expired")
+            return left
+
+        try:
+            start_admitted = _launch_start_admitted(computer.raw)
+            delay = 0.0
+            while True:
+                if computer.build_failed:
+                    computer.wait_until_built(timeout=0, poll=poll)
+                if computer.start_error:
+                    raise MandalaError(f"did not start: {computer.start_error}")
+                status = computer.raw.get("status")
+                if isinstance(status, str) and status in ("running", "stopped", "suspended"):
+                    break
+                if delay > 0:
+                    time.sleep(min(delay, remaining()))
+                try:
+                    computer._refresh(timeout_cap=remaining())
+                    # A later stopped row must not erase an earlier admitted attempt.
+                    start_admitted = start_admitted or _launch_start_admitted(computer.raw)
+                    delay = poll
+                except MandalaError as err:
+                    if not _is_transient_for_poll(err):
+                        raise
+                    remaining()
+                    delay = _poll_delay(err, poll)
+            computer.wait_until_built(timeout=remaining(), poll=poll)
+            if computer.start_error:
+                raise MandalaError(f"did not start: {computer.start_error}")
+            if (
+                not start_admitted
+                and computer.status in ("stopped", "suspended")
+                and (
+                    computer._nothing_admitted()
+                    or (not start and "running_ram_mb" not in computer.raw)
+                )
+            ):
+                remaining()
+                computer.start()
+            computer.wait_until_running(timeout=remaining(), poll=poll)
+            computer.wait_for_guest(timeout=remaining(), poll=poll)
+            return computer
+        except MandalaError as err:
+            # Preserve the error object, API attributes and original cause.
+            err.args = (f"launch of {computer_id} failed: {err}",)
+            raise
 
     @contextmanager
     def ephemeral(self, **kwargs: Any) -> Iterator[Computer]:

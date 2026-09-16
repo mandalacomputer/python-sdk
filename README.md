@@ -51,12 +51,43 @@ from mandala_computer import Client
 
 client = Client()
 
-with client.computers.ephemeral(template="base") as c:
-    c.wait_for_guest()  # guest agent is up and answering
+c = client.computers.launch(template="base")
+try:
     c.open("https://example.com")  # on the screen, not as root
     c.click(640, 400)
     c.type("hello")
     png = c.screenshot()
+finally:
+    c.delete()
+```
+
+`launch()` creates once, waits for the disk, starts the computer if needed, and
+returns when its guest agent answers. Guest readiness does not guarantee that
+the visible desktop has finished logging in. Every `create()` option is accepted;
+`start=False` is sent unchanged to create, then launch starts the computer after
+its disk is ready. An already admitted start is waited on, and failed starts are
+reported without retrying them.
+
+`launch(timeout=600)` allows a longer build. The default readiness budget is 180
+seconds, beginning after create returns. Disk, running and guest waits share the
+remaining budget, including elapsed start work. Create and start retain their
+usual transport deadlines, so this is not a total wall-clock limit on launch.
+`poll` defaults to 3 seconds for every stage. The async equivalent is
+`await client.computers.launch(...)` on an `AsyncClient`; task cancellation
+propagates normally, as does interruption of a synchronous launch.
+
+The returned computer is persistent. A failed or cancelled launch can leave a
+computer behind; SDK errors after creation include its id and keep their type
+(including `TimeoutError`). No failure automatically deletes it. The `finally`
+above cleans up after a successful return; use the id in a readiness error to
+inspect or delete a computer whose launch failed.
+
+For cleanup tied to a context manager, use `ephemeral()`:
+
+```python
+with client.computers.ephemeral(template="base") as c:
+    c.wait_for_guest()
+    c.open("https://example.com")
 # computer is destroyed here, even if the block raised
 ```
 
