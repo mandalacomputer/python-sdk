@@ -93,6 +93,7 @@ from ._models import (
     SnapshotHoldings,
     Window,
     WindowResult,
+    _optional_result_id,
     is_unreachable_stub,
     window_contradiction,
 )
@@ -915,28 +916,28 @@ class AsyncComputer(ComputerFields):
         timeout_cap: float | None = None,
     ) -> ExecResult:
         """The exec request, with an optional per-phase cap for readiness probes."""
-        if retain_output is not False:
-            path = _api.computer_action(self.id, "exec")
-            response = await self._t.request(
-                "POST",
-                path,
-                json=_api.exec_body(
-                    command, timeout, desktop, cwd=cwd, env=env, retain_output=retain_output
-                ),
-                timeout=timeout + DEADLINE_SLACK,
-                timeout_cap=timeout_cap,
-                follow_redirects=False,
-            )
-            result = ExecResult.from_api(_retained_exec_object(response, path))
-            return result if response.status_code == 200 else replace(result, result_id=None)
-        data = await self._t.json_object(
+        path = _api.computer_action(self.id, "exec")
+        response = await self._t.request(
             "POST",
-            _api.computer_action(self.id, "exec"),
-            json=_api.exec_body(command, timeout, desktop, cwd=cwd, env=env),
+            path,
+            json=_api.exec_body(
+                command, timeout, desktop, cwd=cwd, env=env, retain_output=retain_output
+            ),
             timeout=timeout + DEADLINE_SLACK,
             timeout_cap=timeout_cap,
+            # Legacy/default calls retain the injected client's redirect policy.
+            # Explicit capture still refuses redirects and never replays a POST.
+            follow_redirects=None if retain_output is False else False,
         )
-        return ExecResult.from_api(data)
+        result = ExecResult.from_api(_retained_exec_object(response, path))
+        if response.status_code != 200:
+            return result
+        return replace(
+            result,
+            result_id=_optional_result_id(
+                result.raw, result.stdout, result.stderr, result.output_unreadable
+            ),
+        )
 
     async def start_exec(
         self,

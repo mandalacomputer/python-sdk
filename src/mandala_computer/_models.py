@@ -2510,14 +2510,17 @@ class ExecResult:
             err_truncated=_wire(d, "err_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
             raw=dict(d),
             output_unreadable=unreadable,
-            result_id=_optional_result_id(d, stdout, stderr, unreadable),
         )
 
 
 def _optional_result_id(
     data: Mapping[str, Any], stdout: bytes, stderr: bytes, unreadable: bool
 ) -> str | None:
-    """Optional metadata must never turn an already executed action into failure."""
+    """Validate optional payload evidence after the exec caller has checked HTTP 200.
+
+    ``from_api`` has no HTTP status, so it cannot confirm a retained version.
+    This helper never changes the already executed action's legacy interpretation.
+    """
     identity = data.get("result_id")
     code = data.get("exit_code")
     if (

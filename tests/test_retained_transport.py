@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -16,6 +17,9 @@ from tests.test_retained_results import EXECUTION_ID, RESULT_ID, result_manifest
 import mandala_computer as mc
 
 BASE = "https://api.test/prefix/api/v1"
+# Task.cancel(msg) propagates its message to the awaiting task only on Python 3.11+.
+# Cancellation, response closure and request-count assertions remain unconditional.
+CANCEL_MESSAGE_PROPAGATES = sys.version_info >= (3, 11)
 
 
 class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
@@ -284,7 +288,10 @@ async def test_async_cancellation_during_body_closes_and_never_returns_partial_b
         task = asyncio.create_task(c.download_artifact(ARTIFACT_ID))
         await asyncio.wait_for(started.wait(), 1)
         task.cancel("cancel body")
-        with pytest.raises(asyncio.CancelledError, match="cancel body"):
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel body" if CANCEL_MESSAGE_PROPAGATES else None,
+        ):
             await task
     assert body.closed and len(calls) == 2
 
@@ -305,7 +312,10 @@ async def test_cancellation_after_metadata_closure_prevents_binary_request() -> 
 
     async with connected(True, handler) as (c, _):
         task = asyncio.create_task(c.download_artifact(ARTIFACT_ID))
-        with pytest.raises(asyncio.CancelledError, match="between requests"):
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="between requests" if CANCEL_MESSAGE_PROPAGATES else None,
+        ):
             await task
     assert body.closed and len(calls) == 1
 
@@ -324,7 +334,10 @@ async def test_cancellation_while_waiting_for_headers_propagates() -> None:
         task = asyncio.create_task(c.result(RESULT_ID))
         await asyncio.wait_for(started.wait(), 1)
         task.cancel("headers")
-        with pytest.raises(asyncio.CancelledError, match="headers"):
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="headers" if CANCEL_MESSAGE_PROPAGATES else None,
+        ):
             await task
     assert len(calls) == 1
 
@@ -335,6 +348,8 @@ async def test_cancellation_queued_by_hash_verification_prevents_delivery(
     from mandala_computer import _async_computer
 
     original = _async_computer.verify_download
+    body = TrackedBody([b"abc"])
+    calls = []
 
     def cancel_after_hash(artifact, content):
         value = original(artifact, content)
@@ -344,16 +359,25 @@ async def test_cancellation_queued_by_hash_verification_prevents_delivery(
     monkeypatch.setattr(_async_computer, "verify_download", cancel_after_hash)
 
     def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
         if req.url.path.endswith("/download"):
             return httpx.Response(
-                200, content=b"abc", headers={"Content-Type": "application/octet-stream"}
+                200,
+                stream=body,
+                headers={"Content-Type": "application/octet-stream", "Content-Length": "3"},
             )
         return httpx.Response(200, json=artifact_manifest())
 
     async with connected(True, handler) as (c, _):
         task = asyncio.create_task(c.download_artifact(ARTIFACT_ID))
-        with pytest.raises(asyncio.CancelledError, match="verified cancellation"):
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="verified cancellation" if CANCEL_MESSAGE_PROPAGATES else None,
+        ):
             await task
+
+    assert body.closed and len(calls) == 2
+    assert task.cancelled()
 
 
 @pytest.mark.parametrize(
