@@ -213,7 +213,24 @@ def test_a_windows_proxy_command_is_quoted_for_windows() -> None:
 def test_the_gateway_override(spelled: str, host: str, port: int) -> None:
     gw = _openssh.gateway({"MANDALA_SSH_GATEWAY": spelled})
     assert (gw.host, gw.port) == (host, port)
-    assert gw.known_hosts == (PIN,)
+    # The same gateway at another address: the built-in key, under the name
+    # ssh looks up for that address.
+    name = host if port == 22 else f"[{host}]:{port}"
+    assert gw.known_hosts == (f"{name} {PIN.split(None, 1)[1]}",)
+
+
+@respx.mock
+def test_an_address_override_alone_pins_the_public_key_there(
+    env: Path, execs: list[list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MANDALA_SSH_GATEWAY", "gw.example.com:2200")
+    mock_connect(ON, [KEY])
+    assert _cli.main(["ssh", "dev"]) == 0
+    assert kh(env).read_text() == (
+        "[gw.example.com]:2200 ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIJlZegWyY5KLksV9y22mZHnDI4qm++st9qZnbpSId1DR\n"
+    )
+    assert execs[0][10].endswith("-p 2200 -W %h:%p mandala@gw.example.com")
 
 
 @pytest.mark.parametrize("spelled", ["gw:0", "gw:99999", "gw:x", "-oProxy=x", "a b:22", "gw:"])

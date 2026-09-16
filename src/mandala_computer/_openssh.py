@@ -69,6 +69,7 @@ def gateway(env: Mapping[str, str] | None = None) -> Gateway:
     ``MANDALA_SSH_GATEWAY`` is ``host`` or ``host:port`` (``[v6]:port`` for an
     IPv6 address), port 2222 when none is given. ``MANDALA_SSH_GATEWAY_KNOWN_HOSTS``
     is a known_hosts line, or the path of a file of them, pinning its key.
+    Without it, the public gateway's key is pinned under the override's name.
     """
     env = os.environ if env is None else env
     host, port = GATEWAY_HOST, GATEWAY_PORT
@@ -88,7 +89,10 @@ def gateway(env: Mapping[str, str] | None = None) -> Gateway:
         if not lines:
             raise ValueError("MANDALA_SSH_GATEWAY_KNOWN_HOSTS holds no known_hosts line")
     else:
-        lines = (GATEWAY_KNOWN_HOSTS,)
+        # No pin of its own: the override is the same gateway at another
+        # address, so the built-in key is pinned under the name ssh will look up.
+        key = GATEWAY_KNOWN_HOSTS.split(None, 1)[1]
+        lines = (f"{_known_hosts_name(host, port)} {key}",)
     for line in lines:
         if len(line.split()) < 3:
             raise ValueError(
@@ -96,6 +100,11 @@ def gateway(env: Mapping[str, str] | None = None) -> Gateway:
                 "(<host> <key type> <base64>), or a file of them"
             )
     return Gateway(host, port, lines)
+
+
+def _known_hosts_name(host: str, port: int) -> str:
+    """How ssh names *host* in known_hosts: bracketed with the port unless it is 22."""
+    return host if port == 22 else f"[{host}]:{port}"
 
 
 def _host_port(spelled: str) -> tuple[str, int]:

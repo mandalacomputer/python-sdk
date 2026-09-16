@@ -2849,7 +2849,9 @@ and a session ends when the connection does.
 Two environment variables point the CLI at another gateway:
 `MANDALA_SSH_GATEWAY=host:port` (port 2222 if omitted) and
 `MANDALA_SSH_GATEWAY_KNOWN_HOSTS`, a known_hosts line — or the path of a file of
-them — pinning that gateway's key.
+them — pinning that gateway's key. With only the first set, the public
+gateway's key is pinned under the new address, for the same gateway reached
+another way.
 
 In the SDK the same operations are `client.ssh_keys.list()`,
 `client.ssh_keys.add(public_key, name=None)`, `client.ssh_keys.remove(key_id)`,
