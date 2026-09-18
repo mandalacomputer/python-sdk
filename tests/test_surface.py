@@ -95,6 +95,10 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # NOT YET AVAILABLE on the platform: a create that binds secrets is refused
+    # with 400 until delivery into computers ships. The parameter is documented
+    # ahead of that; this client gains a typed argument with that release.
+    "POST computers  body:secrets",
     # File transfers cannot yet opt out of waking a suspended computer.
     "GET computers/:id/files  query:no_wake",
     "PUT computers/:id/files  query:no_wake",
