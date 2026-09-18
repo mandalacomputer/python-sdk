@@ -169,6 +169,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:disk_gb",
         "body:resolution",
         "body:start",
+        "body:secrets",
     },
     "GET computers/:id": set(),
     "PATCH computers/:id": {
