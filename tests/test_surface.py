@@ -95,6 +95,10 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # OPL-4964: `memory: false` builds a memory snapshot's clone from its disk
+    # alone. Listed to stay in step with the surface; this client gains a typed
+    # argument with OPL-4965, alongside reading `memory_dropped` off the response.
+    "POST snapshots/:id/clone  body:memory",
     # NOT YET AVAILABLE on the platform: a create that binds secrets is refused
     # with 400 until delivery into computers ships. The parameter is documented
     # ahead of that; this client gains a typed argument with that release.
