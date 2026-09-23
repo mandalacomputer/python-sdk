@@ -59,8 +59,8 @@ This is the summary you read to decide whether to upgrade.
   consuming each other's output or trusting a reusable PID.
 - **Retained output and artifacts.** `exec(..., retain_output=True)` keeps a
   synchronous run's output and returns its `result_id`;
-  `retain_execution_output(execution_id)` captures a background run's output. `result()`,
-  `result_output()` and `delete_result()` read and remove it, and
+  `retain_execution_output(execution_id)` captures a background run's output.
+  `result()`, `result_output()` and `delete_result()` read and remove it, and
   `publish_artifact()`, `artifact()`, `download_artifact()` (SHA-256 verified)
   and `delete_artifact()` handle files you choose to keep. Default `exec`
   behaviour is unchanged.
