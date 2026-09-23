@@ -112,6 +112,9 @@ ALLOWED = {
     ("DELETE", "ssh-keys/:id"),
     ("GET", "computers/:id/ssh"),
     ("PUT", "computers/:id/ssh"),
+    # A computer's secret bindings, read and replaced whole (OPL-4963).
+    ("GET", "computers/:id/secrets"),
+    ("PUT", "computers/:id/secrets"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -321,4 +324,7 @@ PARAMETERS: dict[str, set[str]] = {
     "DELETE ssh-keys/:id": set(),
     "GET computers/:id/ssh": set(),
     "PUT computers/:id/ssh": {"body:enabled"},
+    # The replace takes the whole list and the version it was read at.
+    "GET computers/:id/secrets": set(),
+    "PUT computers/:id/secrets": {"body:secrets", "body:version"},
 }

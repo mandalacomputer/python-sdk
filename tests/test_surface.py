@@ -86,6 +86,10 @@ UNIMPLEMENTED = {
     ("GET", "computers/:id/activities/:activity/results"),
     # Passive platform signals have no SDK convenience method yet.
     ("GET", "computers/:id/signals"),
+    # A computer's secret bindings, read and replaced whole (OPL-4963); no SDK
+    # method yet.
+    ("GET", "computers/:id/secrets"),
+    ("PUT", "computers/:id/secrets"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -109,6 +113,9 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/activities  query:changes",
     "GET computers/:id/signals  query:since",
     "GET computers/:id/signals  query:limit",
+    # Secret bindings are not wrapped yet; see UNIMPLEMENTED.
+    "PUT computers/:id/secrets  body:secrets",
+    "PUT computers/:id/secrets  body:version",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
