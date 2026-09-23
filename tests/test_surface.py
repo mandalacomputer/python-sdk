@@ -86,10 +86,6 @@ UNIMPLEMENTED = {
     ("GET", "computers/:id/activities/:activity/results"),
     # Passive platform signals have no SDK convenience method yet.
     ("GET", "computers/:id/signals"),
-    # A computer's secret bindings, read and replaced whole (OPL-4963); no SDK
-    # method yet.
-    ("GET", "computers/:id/secrets"),
-    ("PUT", "computers/:id/secrets"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -99,10 +95,6 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
-    # NOT YET AVAILABLE on the platform: a create that binds secrets is refused
-    # with 400 until delivery into computers ships. The parameter is documented
-    # ahead of that; this client gains a typed argument with that release.
-    "POST computers  body:secrets",
     # File transfers cannot yet opt out of waking a suspended computer.
     "GET computers/:id/files  query:no_wake",
     "PUT computers/:id/files  query:no_wake",
@@ -113,9 +105,6 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/activities  query:changes",
     "GET computers/:id/signals  query:since",
     "GET computers/:id/signals  query:limit",
-    # Secret bindings are not wrapped yet; see UNIMPLEMENTED.
-    "PUT computers/:id/secrets  body:secrets",
-    "PUT computers/:id/secrets  body:version",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
@@ -168,6 +157,22 @@ SSH_ACCESS = {
     "key_count": 1,
     "keys_pushed": 1,
     "error": None,
+}
+# A computer's secret bindings, as `GET computers/:id/secrets` answers them.
+SECRET_BINDINGS = {
+    "secrets": [
+        {
+            "secret_id": "csec-0123456789abcdef",
+            "revision_id": "csr-0123456789abcdef01234567",
+            "env": "API_TOKEN",
+        },
+        {
+            "secret_id": "csec-0123456789abcde0",
+            "revision_id": "csr-0123456789abcdef01234568",
+            "file": "kubeconfig",
+        },
+    ],
+    "version": 3,
 }
 WEBHOOK = {
     "id": "whk-2b7d4c809f3c1a7e",
@@ -552,6 +557,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh"):
         return httpx.Response(200, json=SSH_ACCESS)
+    if path.endswith("/secrets"):
+        return httpx.Response(200, json=SECRET_BINDINGS)
     if path.endswith("/computers"):
         return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
     return httpx.Response(200, json=COMPUTER)
@@ -637,6 +644,14 @@ def exercise_everything(client: mc.Client) -> None:
         start=False,
     )
     client.computers.create(size="small")
+    # Secrets bound at create, one as a variable and one as a file.
+    client.computers.create(
+        template="base",
+        secrets=[
+            {"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"},
+            {"secret_id": "csec-0123456789abcde0", "file": "kubeconfig"},
+        ],
+    )
     # The create/delete pair as one scope. Both its routes are reached by their
     # own methods elsewhere here, so nothing but the inventory sees this line.
     with client.computers.ephemeral(template="base"):
@@ -809,6 +824,11 @@ def exercise_everything(client: mc.Client) -> None:
     c.ssh_access()
     c.set_ssh_access(True)
     c.set_ssh_access(False)
+    # A computer's secret bindings, read and replaced against the version read.
+    bound = c.secrets()
+    c.set_secrets(
+        [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
+    )
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -848,6 +868,13 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         start=False,
     )
     await client.computers.create(size="small")
+    await client.computers.create(
+        template="base",
+        secrets=[
+            {"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"},
+            {"secret_id": "csec-0123456789abcde0", "file": "kubeconfig"},
+        ],
+    )
     async with client.computers.ephemeral(template="base"):
         pass
     await c.refresh()
@@ -995,6 +1022,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.ssh_access()
     await c.set_ssh_access(True)
     await c.set_ssh_access(False)
+    bound = await c.secrets()
+    await c.set_secrets(
+        [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
+    )
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 

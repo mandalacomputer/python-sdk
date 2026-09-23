@@ -953,6 +953,7 @@ def create_body(
     resolution: str | None = None,
     size: str | None = None,
     template_transfer: str | None = None,
+    secrets: object = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -963,6 +964,9 @@ def create_body(
     of the four it stands in for is refused here — the server refuses it too,
     but this mistake is knowable without the round trip, and the server's
     refusal exists for callers who are not this SDK.
+
+    ``secrets`` goes through :func:`secret_bindings_body`, and no ``secrets``
+    key is sent when it is ``None``.
     """
     if size is not None and any(
         v is not None for v in (template, template_transfer, cpu, ram_mb, disk_gb)
@@ -1000,6 +1004,8 @@ def create_body(
     for key, count in (("cpu", cpu), ("ram_mb", ram_mb), ("disk_gb", disk_gb)):
         if count is not None:
             body[key] = whole(count, key, exc=ValueError)
+    if secrets is not None:
+        body["secrets"] = secret_bindings_body(secrets)
     return body
 
 
@@ -1885,3 +1891,123 @@ def ssh_key_body(public_key: object, name: object) -> dict[str, Any]:
 def ssh_access_body(enabled: object) -> dict[str, Any]:
     """``PUT computers/:id/ssh``. A real bool: this one opens a computer to logins."""
     return {"enabled": flag(enabled, "enabled")}
+
+
+# --- secret bindings --------------------------------------------------------
+
+
+def computer_secrets(computer_id: str) -> str:
+    """A computer's secret bindings: read with GET, replace whole with PUT."""
+    return computer_action(computer_id, "secrets")
+
+
+#: At most this many secrets per computer, and this many of them as files. The
+#: platform's own bounds, refused here so the mistake is named before the round
+#: trip rather than as a 400 after it.
+SECRET_BINDINGS_MAX = 32
+SECRET_FILES_MAX = 8
+#: A variable's name and a file's, as the platform takes them; matched whole
+#: (``fullmatch``), on the way out and again on an answer read back.
+SECRET_ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+SECRET_FILE = re.compile(r"[a-z][a-z0-9_-]{0,47}")
+_SECRET_KEYS = frozenset({"secret_id", "env", "file", "revision_id"})
+
+
+def _secret_ref(value: object, what: str) -> str:
+    """An id as the platform stores it: nonempty, with no surrounding whitespace.
+
+    Refused rather than stripped: an id the caller padded is one it did not
+    copy from a read, and trimming it would decide which secret it meant.
+    """
+    text = canonical(value, what)
+    if not text or text != text.strip():
+        raise ValueError(f"{what} must be a nonempty id with no surrounding whitespace")
+    return text
+
+
+def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[str, str]]:
+    """A binding list as the wire takes it, checked for what the platform would refuse.
+
+    Each binding names one secret by id and publishes it under exactly one of
+    ``env`` (an environment variable in the desktop session) and ``file``
+    (``/run/mandala-secrets/user/files/<file>``). No secret, variable name or
+    file name twice; a variable and a file may share a spelling, since they are
+    two namespaces. A key this does not know is refused rather than dropped: a
+    misspelt ``revision_id`` left out would silently record the latest instead.
+
+    A bare mapping or string in the list position is refused rather than
+    wrapped, for the reason :func:`_ids` gives.
+    """
+    if isinstance(bindings, (str, bytes, Mapping)) or not isinstance(bindings, (list, tuple)):
+        raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
+            f"{what} must be a list of {{secret_id, env}} or {{secret_id, file}}, "
+            f"not {type(bindings).__name__}"
+        )
+    if len(bindings) > SECRET_BINDINGS_MAX:
+        raise ValueError(f"{what}: at most {SECRET_BINDINGS_MAX} secrets per computer")
+    ids: set[str] = set()
+    envs: set[str] = set()
+    files: set[str] = set()
+    out: list[dict[str, str]] = []
+    for i, binding in enumerate(bindings):
+        at = f"{what}[{i}]"
+        if not isinstance(binding, Mapping):
+            raise ValueError(  # noqa: TRY004
+                f"{at} must be a mapping, not {type(binding).__name__}"
+            )
+        unknown = sorted(str(k) for k in binding if k not in _SECRET_KEYS)
+        if unknown:
+            raise ValueError(f"{at} has unknown keys {unknown}")
+        secret_id = _secret_ref(binding.get("secret_id"), f"{at}.secret_id")
+        if secret_id in ids:
+            raise ValueError(f"{at}: {secret_id} is bound twice")
+        ids.add(secret_id)
+        env, file = binding.get("env"), binding.get("file")
+        if (env is None) == (file is None):
+            raise ValueError(f"{at} must name exactly one of env and file")
+        wire = {"secret_id": secret_id}
+        if env is not None:
+            name = canonical(env, f"{at}.env")
+            if not SECRET_ENV.fullmatch(name):
+                raise ValueError(
+                    f"{at}.env must be letters, digits and underscores, "
+                    "not starting with a digit, at most 64 characters"
+                )
+            if name in envs:
+                raise ValueError(f"{at}.env {name} is bound twice")
+            envs.add(name)
+            wire["env"] = name
+        else:
+            name = canonical(file, f"{at}.file")
+            if not SECRET_FILE.fullmatch(name):
+                raise ValueError(
+                    f"{at}.file must be lowercase letters, digits, - and _, "
+                    "starting with a letter, at most 48 characters"
+                )
+            if name in files:
+                raise ValueError(f"{at}.file {name} is bound twice")
+            files.add(name)
+            wire["file"] = name
+        revision_id = binding.get("revision_id")
+        if revision_id is not None:
+            wire["revision_id"] = _secret_ref(revision_id, f"{at}.revision_id")
+        out.append(wire)
+    if len(files) > SECRET_FILES_MAX:
+        raise ValueError(f"{what}: at most {SECRET_FILES_MAX} secrets as files")
+    return out
+
+
+def secrets_body(bindings: object, version: object = None) -> dict[str, Any]:
+    """``PUT computers/:id/secrets``: the whole list, and the version it was read at.
+
+    ``version`` is sent only when given, and must be the whole number a read
+    answered.
+    """
+    body: dict[str, Any] = {"secrets": secret_bindings_body(bindings)}
+    if version is not None:
+        message = f"version must be the whole number a read answered, not {version!r}"
+        number = whole(version, "version", exc=ValueError, message=message)
+        if number < 0:
+            raise ValueError(message)
+        body["version"] = number
+    return body

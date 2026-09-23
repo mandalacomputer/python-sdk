@@ -89,6 +89,8 @@ from ._models import (
     FilePart,
     Listing,
     Move,
+    SecretBindingArgs,
+    SecretBindings,
     Snapshot,
     SnapshotHoldings,
     SshAccess,
@@ -441,6 +443,38 @@ class AsyncComputer(ComputerFields):
         body = _api.ssh_access_body(enabled)
         data = await self._t.json_object("PUT", _api.computer_ssh(self.id), json=body)
         return SshAccess.from_api(data)
+
+    async def secrets(self) -> SecretBindings:
+        """The secrets this computer is bound to, and the ``version`` to send back.
+
+        See :class:`~mandala_computer.SecretBindings`. Names and revisions only:
+        no value is ever returned. An answer that is not a whole binding list
+        with its version raises :class:`~mandala_computer.MandalaError`.
+        """
+        path = _api.computer_secrets(self.id)
+        data = await self._t.json_object("GET", path)
+        return SecretBindings.from_api(data, f"GET {path}")
+
+    async def set_secrets(
+        self, secrets: Sequence[SecretBindingArgs], *, version: int | None = None
+    ) -> SecretBindings:
+        """Replace the secrets this computer is bound to; ``[]`` removes every one.
+
+        Each binding is a :class:`~mandala_computer.SecretBindingArgs`: a
+        ``secret_id`` and exactly one of ``env`` and ``file``. The new values
+        reach the desktop at the next start or restart, and a binding that
+        names the revision the computer holds now keeps it. Binding a computer
+        for the first time needs it STOPPED. Pass the ``version`` a
+        :meth:`secrets` read answered to change only that list: a
+        :class:`~mandala_computer.ConflictError` if it has changed since.
+
+        A list the platform would refuse raises :class:`ValueError` before any
+        request is made.
+        """
+        body = _api.secrets_body(secrets, version)
+        path = _api.computer_secrets(self.id)
+        data = await self._t.json_object("PUT", path, json=body)
+        return SecretBindings.from_api(data, f"PUT {path}")
 
     async def delete(
         self, *, purge_snapshots: bool = False, expect: str | None = None
