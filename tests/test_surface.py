@@ -99,6 +99,10 @@ UNIMPLEMENTED_PARAMETERS = {
     # alone. Listed to stay in step with the surface; this client gains a typed
     # argument with OPL-4965, alongside reading `memory_dropped` off the response.
     "POST snapshots/:id/clone  body:memory",
+    # OPL-4964: `inherit_secrets: true` consents to resuming a bound computer's
+    # memory snapshot in a new computer that holds the same credentials.
+    # Listed to stay in step with the surface; sent from OPL-4965.
+    "POST snapshots/:id/clone  body:inherit_secrets",
     # NOT YET AVAILABLE on the platform: a create that binds secrets is refused
     # with 400 until delivery into computers ships. The parameter is documented
     # ahead of that; this client gains a typed argument with that release.
