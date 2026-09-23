@@ -282,7 +282,7 @@ PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/snapshots": set(),
     "POST computers/:id/snapshots": {"body:name", "body:memory"},
     "POST snapshots/:id/restore": set(),
-    "POST snapshots/:id/clone": {"body:name"},
+    "POST snapshots/:id/clone": {"body:name", "body:memory"},
     "DELETE snapshots/:id": set(),
     "GET computers/:id/schedule": set(),
     "PUT computers/:id/schedule": {"body:enabled", "body:hour", "body:minute", "body:tz"},
