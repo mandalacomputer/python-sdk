@@ -7,6 +7,20 @@ project is pre-1.0, so a minor version may carry a behaviour change.
 The reasoning behind a change lives in its commit message rather than here.
 This is the summary you read to decide whether to upgrade.
 
+## [Unreleased]
+
+### Added
+
+- **Memory snapshot clone options.** `snapshots.clone(id, memory=False)` builds a
+  memory snapshot's clone from its disk alone, as a fresh boot with its own
+  network identity. `inherit_secrets=True` consents to resuming a memory
+  snapshot of a computer that held secrets: the copy holds the same credentials.
+  Both are keyword-only, and on the async client too.
+- **`Computer.memory_dropped` and `memory_dropped_reason`.** On the computer a
+  snapshot clone returns, they say when the session you asked for was not
+  resumed and the computer was built from the disk instead (`"secrets"` or
+  `"bindings unrecorded"`). Kept through `wait_until_built()`.
+
 ## [0.4.0] — 2026-09-14
 
 ### Added

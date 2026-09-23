@@ -1831,10 +1831,20 @@ snap = c.snapshot(memory=True, name="before-upgrade")  # + live RAM, resumes wit
 client.snapshots.restore(snap.id)
 twin = client.snapshots.clone(snap.id)  # a fork, for memory snapshots
 twin.wait_until_built()  # the disk is copied out of backup first
+fresh = client.snapshots.clone(snap.id, memory=False)  # the disk alone, boots fresh
 c.set_schedule(enabled=True, hour=4, tz="America/Chicago")
 c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the time
 c.clear_schedule()  # removed entirely
 ```
+
+A memory snapshot of a computer that **held secrets** is resumed only with
+`inherit_secrets=True`: the copy holds the same credentials, bound to the same
+secrets, lands in the source's workspace, and cannot run on the same host while
+its source is running. Without it the clone is built from the disk instead, and
+says so: check `twin.memory_dropped` (and `memory_dropped_reason`) before
+assuming the session came across. It is the clone's answer, kept on that handle
+through `wait_until_built()`; a computer fetched later with `computers.get()`
+does not carry it.
 
 **`snapshot()` waits for the capture, and the request does not.** A capture is
 minutes, and scales with how much has been written to the disk — longer than any

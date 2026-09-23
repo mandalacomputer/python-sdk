@@ -120,6 +120,7 @@ class AsyncComputer(ComputerFields):
     def __init__(self, transport: AsyncTransport, data: Mapping[str, Any]) -> None:
         self._t = transport
         self._data = dict(data)
+        self._note_clone_answer(data)
 
     # --- lifecycle ------------------------------------------------------
 

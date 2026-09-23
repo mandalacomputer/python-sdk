@@ -5778,3 +5778,83 @@ def test_saved_credentials_keep_owned_client_lifecycle(
         client.computers.list()
         assert route.calls.last.request.headers["Authorization"] == "Bearer " + entry["api_key"]
     assert client._t._http.is_closed
+
+
+# Platform OPL-4964, SDK OPL-4965: how a memory snapshot is cloned, and whether
+# the session the caller asked for came across.
+
+
+@respx.mock
+def test_snapshot_clone_sends_memory_options_only_when_set(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
+        httpx.Response(201, json={"id": "vm-2", "status": "building"})
+    )
+    client.snapshots.clone("snap-1")
+    client.snapshots.clone("snap-1", name="twin", inherit_secrets=True)
+    client.snapshots.clone("snap-1", memory=False)
+    client.snapshots.clone("snap-1", memory=True, inherit_secrets=False)
+    bodies = [json.loads(call.request.content or b"{}") for call in route.calls]
+    assert bodies == [
+        {},
+        {"name": "twin", "inherit_secrets": True},
+        {"memory": False},
+        # False consent is the default and is not sent; an explicit
+        # memory=True is, because the caller said it.
+        {"memory": True},
+    ]
+
+
+@respx.mock
+def test_snapshot_clone_refuses_options_that_are_not_bools(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
+        httpx.Response(201, json={"id": "vm-2", "status": "building"})
+    )
+    # "false" is truthy to Python and would be read by a person as the
+    # opposite of what it sends.
+    with pytest.raises((TypeError, ValueError)):
+        client.snapshots.clone("snap-1", memory="false")  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        client.snapshots.clone("snap-1", inherit_secrets=1)  # type: ignore[arg-type]
+    assert not route.called
+
+
+@respx.mock
+def test_snapshot_clone_says_when_the_session_was_dropped(client: mc.Client) -> None:
+    respx.post(f"{BASE}/snapshots/snap-1/clone").mock(
+        httpx.Response(
+            201,
+            json={
+                "id": "vm-2",
+                "status": "building",
+                "memory_dropped": True,
+                "memory_dropped_reason": "bindings unrecorded",
+            },
+        )
+    )
+    respx.post(f"{BASE}/snapshots/snap-2/clone").mock(
+        httpx.Response(201, json={"id": "vm-3", "status": "building"})
+    )
+    respx.post(f"{BASE}/snapshots/snap-3/clone").mock(
+        httpx.Response(
+            201, json={"id": "vm-4", "status": "building", "memory_dropped_reason": "secrets"}
+        )
+    )
+    dropped = client.snapshots.clone("snap-1", inherit_secrets=True)
+    assert dropped.memory_dropped is True
+    assert dropped.memory_dropped_reason == "bindings unrecorded"
+    kept = client.snapshots.clone("snap-2")
+    assert kept.memory_dropped is False
+    assert kept.memory_dropped_reason is None
+    # The clone's answer survives the wait that follows every clone: the
+    # computer's own record, which a refresh reads, never repeats it.
+    respx.get(f"{BASE}/computers/vm-2").mock(
+        httpx.Response(200, json={"id": "vm-2", "status": "stopped"})
+    )
+    dropped.refresh()
+    assert dropped.memory_dropped is True
+    assert dropped.memory_dropped_reason == "bindings unrecorded"
+    assert "memory_dropped" not in dropped.raw
+    # A reason with no flag is not a drop.
+    odd = client.snapshots.clone("snap-3")
+    assert odd.memory_dropped is False
+    assert odd.memory_dropped_reason is None
