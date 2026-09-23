@@ -7,7 +7,7 @@ project is pre-1.0, so a minor version may carry a behaviour change.
 The reasoning behind a change lives in its commit message rather than here.
 This is the summary you read to decide whether to upgrade.
 
-## [Unreleased]
+## [0.5.0] — 2026-09-23
 
 ### Added
 
@@ -28,6 +28,73 @@ This is the summary you read to decide whether to upgrade.
   snapshot clone returns, they say when the session you asked for was not
   resumed and the computer was built from the disk instead (`"secrets"` or
   `"bindings unrecorded"`). Kept through `wait_until_built()`.
+- **`client.computers.launch()`** creates a computer, starts it if needed and
+  waits for its guest agent, in one call. It takes the create options, shares a
+  180-second readiness budget after the create (`timeout=` to change it), never
+  replays an admitted start, and leaves the computer in place on failure: the
+  error keeps its type and carries the created computer's id.
+- **SSH.** `client.ssh_keys.list()`, `.add(public_key, name=...)` and
+  `.remove(key_id)` manage the account's keys, and `computer.ssh_access()` /
+  `computer.set_ssh_access(enabled)` read and switch a computer's SSH, with new
+  `SshKey` and `SshAccess` models. The CLI gains `mandala ssh --setup`,
+  `mandala ssh-key`, `mandala ssh-access` and `mandala ssh-config`. On the async
+  client too.
+- **Saved credential profiles.** With no `api_key` and no `MANDALA_API_KEY`, a
+  client now reads the profile the CLI's browser login saved in
+  `~/.mandala/credentials.json`: `profile=`, then `MANDALA_PROFILE`, then the
+  file's default. A saved key is bound to its stored base URL, and an invalid,
+  unsafe or mismatched store fails locally. An explicit or environment key never
+  touches the file.
+- **Opt-in retries for safe reads.** `Client(retries={"idempotent": N})` retries
+  GET and HEAD reads on connection failures and 502/503/504, with backoff and
+  `Retry-After`. Off by default; mutations and the consuming output poll are
+  always one attempt.
+- **`client.account.read()`** returns a typed `AccountQuota`: the plan's
+  instantaneous limits, usage and remaining room, keeping an unknown value
+  distinct from zero.
+- **Background executions by stable id.** A background handle carries an
+  `execution_id` (`None` from an older daemon), and `computer.execution(id)` and
+  `computer.execution_output(id, ...)` read its state and its output from
+  offsets the caller owns, so several readers can follow one run without
+  consuming each other's output or trusting a reusable PID.
+- **Retained output and artifacts.** `exec(..., retain_output=True)` keeps a
+  synchronous run's output and returns its `result_id`;
+  `retain_execution_output(execution_id)` captures a background run's output.
+  `result()`, `result_output()` and `delete_result()` read and remove it, and
+  `publish_artifact()`, `artifact()`, `download_artifact()` (SHA-256 verified)
+  and `delete_artifact()` handle files you choose to keep. Default `exec`
+  behaviour is unchanged.
+- **Error metadata.** API errors carry `request_id`, `allow` and
+  `www_authenticate` when the response had them, and a 405 raises the new
+  `MethodNotAllowedError` (an `APIError`).
+
+### Changed
+
+- **`mandala ssh` is real OpenSSH now; the old shell is `mandala terminal`.** In
+  0.4.0 `mandala ssh <computer>` opened the websocket shell. That command is now
+  `mandala terminal <computer> [--session NAME]`, unchanged, and `mandala ssh`
+  execs the system `ssh` through the SSH gateway, which needs a registered key
+  and SSH switched on for the computer (`mandala ssh --setup` does both). Scripts
+  that called `mandala ssh` for a shell should call `mandala terminal`.
+
+### Fixed
+
+- **An error nested in a response body is classified by the real HTTP status**,
+  keeping its message, reason and full body, and a failed agent run keeps the
+  original error frame and its request id, on both clients.
+
+### Documentation
+
+- **Driving the computer agent from the OpenAI client.** The README shows the
+  OpenAI-compatible `chat/completions` endpoint with the `openai` library,
+  separate Mandala and Anthropic keys, and why its automatic retries should be
+  off. The example is executed by the test suite.
+
+### Internal
+
+- The surface mirror tracks the platform's new routes and parameters (file
+  browser, activity history, signals, secret bindings, snapshot clone options)
+  as each lands, marked not yet wrapped until a client method exists.
 
 ## [0.4.0] — 2026-09-14
 
@@ -97,4 +164,5 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
+[0.5.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.3.0...v0.4.0
