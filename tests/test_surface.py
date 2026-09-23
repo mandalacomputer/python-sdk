@@ -95,14 +95,6 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
-    # OPL-4964: `memory: false` builds a memory snapshot's clone from its disk
-    # alone. Listed to stay in step with the surface; this client gains a typed
-    # argument with OPL-4965, alongside reading `memory_dropped` off the response.
-    "POST snapshots/:id/clone  body:memory",
-    # OPL-4964: `inherit_secrets: true` consents to resuming a bound computer's
-    # memory snapshot in a new computer that holds the same credentials.
-    # Listed to stay in step with the surface; sent from OPL-4965.
-    "POST snapshots/:id/clone  body:inherit_secrets",
     # NOT YET AVAILABLE on the platform: a create that binds secrets is refused
     # with 400 until delivery into computers ships. The parameter is documented
     # ahead of that; this client gains a typed argument with that release.
@@ -764,6 +756,7 @@ def exercise_everything(client: mc.Client) -> None:
     client.snapshots.list(include_unfinished=True, allow_partial=True)
     client.snapshots.restore("snap-1")
     client.snapshots.clone("snap-1", name="from-snap")
+    client.snapshots.clone("snap-1", memory=False, inherit_secrets=True)
     # Both waits on the deletion (OPL-4576). The default polls the listing for
     # the row's absence, so it is sent against an id the mock does not list —
     # SNAPSHOT is `snap-1`, and a deletion of that one would poll until its
@@ -959,6 +952,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.snapshots.list(include_unfinished=True, allow_partial=True)
     await client.snapshots.restore("snap-1")
     await client.snapshots.clone("snap-1", name="from-snap")
+    await client.snapshots.clone("snap-1", memory=False, inherit_secrets=True)
     # See the sync exercise: the waiting delete is sent against an id the mock
     # does not list, and the other is the `wait=False` escape.
     await client.snapshots.delete("snap-2")

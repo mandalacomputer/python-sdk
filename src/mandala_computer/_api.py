@@ -1003,6 +1003,24 @@ def create_body(
     return body
 
 
+def snapshot_clone_body(
+    name: str | None, memory: bool | None = None, inherit_secrets: bool = False
+) -> dict[str, Any]:
+    """A snapshot clone's body (platform OPL-4964).
+
+    The name as :func:`name_body` has it, and the two memory options only when
+    set, so an ordinary clone sends exactly what it always did. ``memory`` is
+    ``None`` for the platform's default (resume a memory snapshot's session);
+    ``inherit_secrets`` is sent only when true, since false is the default.
+    """
+    body = name_body(name)
+    if memory is not None:
+        body["memory"] = flag(memory, "memory")
+    if flag(inherit_secrets, "inherit_secrets"):
+        body["inherit_secrets"] = True
+    return body
+
+
 def name_body(name: str | None) -> dict[str, Any]:
     """An optional name for a clone.
 

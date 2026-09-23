@@ -539,7 +539,14 @@ class Snapshots:
         """Roll a computer back to a snapshot, replacing its current disk."""
         self._t.request("POST", _api.snapshot_action(snapshot_id, "restore"))
 
-    def clone(self, snapshot_id: str, name: str | None = None) -> Computer:
+    def clone(
+        self,
+        snapshot_id: str,
+        name: str | None = None,
+        *,
+        memory: bool | None = None,
+        inherit_secrets: bool = False,
+    ) -> Computer:
         """Create a new computer from a snapshot.
 
         Cloning a memory snapshot forks it: the new machine resumes from the
@@ -552,9 +559,20 @@ class Snapshots:
         computer comes back ``"building"``. Until that lands there is nothing to
         boot and starting it raises :class:`~mandala_computer.ConflictError`; wait
         with :meth:`Computer.wait_until_built`.
+
+        ``memory=False`` clones a memory snapshot from its disk alone: a fresh
+        boot with its own network identity, the way out when the saved session
+        is what is broken. A memory snapshot of a computer that held secrets is
+        resumed only with ``inherit_secrets=True`` — the copy then holds the
+        SAME credentials, lands in the source's workspace, and cannot run on the
+        same host while its source is running. Otherwise it too is built from
+        the disk, and the returned computer's :attr:`memory_dropped` says so;
+        check it before assuming the session came across.
         """
         data = self._t.json_object(
-            "POST", _api.snapshot_action(snapshot_id, "clone"), json=_api.name_body(name)
+            "POST",
+            _api.snapshot_action(snapshot_id, "clone"),
+            json=_api.snapshot_clone_body(name, memory, inherit_secrets),
         )
         return Computer(self._t, _api.computer_payload(data))
 

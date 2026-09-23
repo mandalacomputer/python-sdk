@@ -819,6 +819,21 @@ class ComputerFields:
     """
 
     _data: dict[str, Any]
+    # What the snapshot clone that made this handle said about the session
+    # (platform OPL-4964). Kept APART from ``_data``, because a refresh
+    # replaces ``_data`` with the computer's own record, which never repeats
+    # the clone's answer — and the refresh a caller is most sure to make is
+    # the ``wait_until_built()`` that follows every clone. Class defaults, so a
+    # handle made any other way reads "nothing dropped".
+    _memory_dropped: bool = False
+    _memory_dropped_reason: str | None = None
+
+    def _note_clone_answer(self, data: Mapping[str, Any]) -> None:
+        self._memory_dropped = data.get("memory_dropped") is True
+        reason = data.get("memory_dropped_reason")
+        self._memory_dropped_reason = (
+            reason if self._memory_dropped and isinstance(reason, str) else None
+        )
 
     @property
     def id(self) -> str:
@@ -840,6 +855,28 @@ class ComputerFields:
         :attr:`is_building`.
         """
         return str(self._data.get("status") or "")
+
+    @property
+    def memory_dropped(self) -> bool:
+        """On a computer returned by a snapshot clone: whether the memory
+        snapshot's session was asked for and the computer was built from the
+        disk instead (platform OPL-4964).
+
+        It survives :meth:`refresh` and ``wait_until_built`` on this handle; a
+        handle obtained any other way — ``computers.get()``, a listing — does
+        not know, and reads ``False``.
+        """
+        return self._memory_dropped
+
+    @property
+    def memory_dropped_reason(self) -> str | None:
+        """Why :attr:`memory_dropped`: ``"secrets"`` for a snapshot of a
+        computer that held secrets, cloned without ``inherit_secrets``;
+        ``"bindings unrecorded"`` for one taken before its bindings were
+        recorded, which cannot be resumed with them. ``None`` when nothing was
+        dropped.
+        """
+        return self._memory_dropped_reason
 
     @property
     def is_suspended(self) -> bool:
@@ -1387,6 +1424,7 @@ class Computer(ComputerFields):
     def __init__(self, transport: Transport, data: Mapping[str, Any]) -> None:
         self._t = transport
         self._data = dict(data)
+        self._note_clone_answer(data)
 
     # --- lifecycle ------------------------------------------------------
 
