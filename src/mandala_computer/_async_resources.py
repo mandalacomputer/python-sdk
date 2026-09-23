@@ -22,6 +22,7 @@ from ._models import (
     PublishedTemplate,
     Retention,
     RetiredTemplates,
+    SecretBindingArgs,
     Size,
     Snapshot,
     SshKey,
@@ -159,6 +160,7 @@ class AsyncComputers:
         disk_gb: int | None = None,
         start: bool = True,
         resolution: str | None = None,
+        secrets: Sequence[SecretBindingArgs] | None = None,
     ) -> AsyncComputer:
         """Provision a computer.
 
@@ -197,6 +199,16 @@ class AsyncComputers:
         this desktop — computer-use accuracy is resolution-sensitive, and every
         coordinate the model produces is in this space.
 
+        ``secrets`` binds secrets from the account (Settings → Secrets), each a
+        :class:`~mandala_computer.SecretBindingArgs` delivered into the desktop
+        session each time the computer starts: as an environment variable
+        (``env``) or as a file under ``/run/mandala-secrets/user/files``
+        (``file``). Linux only, and only on a template whose image can receive
+        them. At most 32, at most 8 of them as files, and no secret, variable or
+        file name twice; a list the platform would refuse raises
+        :class:`ValueError` before any request is made. Omitted, no ``secrets``
+        key is sent.
+
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
 
@@ -216,6 +228,7 @@ class AsyncComputers:
             disk_gb=disk_gb,
             start=start,
             resolution=resolution,
+            secrets=secrets,
             size=size,
         )
         data = await self._t.json_object("POST", _api.COMPUTERS, json=body)
@@ -233,6 +246,7 @@ class AsyncComputers:
         disk_gb: int | None = None,
         start: bool = True,
         resolution: str | None = None,
+        secrets: Sequence[SecretBindingArgs] | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
     ) -> AsyncComputer:
@@ -264,6 +278,7 @@ class AsyncComputers:
             disk_gb=disk_gb,
             start=start,
             resolution=resolution,
+            secrets=secrets,
         )
         computer_id = computer.id
         deadline = time.monotonic() + timeout

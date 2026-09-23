@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from operator import index as integer_index
-from typing import Any, Literal, NoReturn, SupportsIndex, TypeVar, overload
+from typing import Any, Literal, NoReturn, SupportsIndex, TypedDict, TypeVar, overload
 
+from ._api import SECRET_ENV, SECRET_FILE
 from ._exceptions import MandalaError
 
 __all__ = [
@@ -40,6 +41,9 @@ __all__ = [
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
+    "SecretBinding",
+    "SecretBindingArgs",
+    "SecretBindings",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
@@ -3094,3 +3098,132 @@ class SshAccess:
             error=_opt_text(d.get("error")),
             raw=dict(d),
         )
+
+
+# --- secret bindings --------------------------------------------------------
+
+
+class _SecretBindingId(TypedDict):
+    secret_id: str
+
+
+class SecretBindingArgs(_SecretBindingId, total=False):
+    """One secret to bind, by id, published under exactly one of ``env`` and ``file``.
+
+    For :meth:`~mandala_computer.Computers.create` and
+    :meth:`~mandala_computer.Computer.set_secrets`.
+
+    ``env`` is the environment variable the value is published under in the
+    desktop session: letters, digits and underscores, not starting with a digit,
+    at most 64 characters.
+
+    ``file`` is the file the value is published as,
+    ``/run/mandala-secrets/user/files/<file>``: lowercase letters, digits, ``-``
+    and ``_``, starting with a letter, at most 48 characters. For what a program
+    reads from a path. A file may hold any bytes, and a replaced value reaches a
+    running computer's file within seconds.
+
+    ``revision_id`` is for a rebind only: naming the revision the computer holds
+    now keeps it; leaving it out records the latest. Every start and restart
+    delivers each secret's latest value regardless.
+    """
+
+    env: str
+    file: str
+    revision_id: str
+
+
+def _binding_text(row: Mapping[str, Any], key: str, where: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise MandalaError(f"{where}: a secret binding has no usable {key}")
+    return str.__str__(value)
+
+
+def _binding_name(
+    row: Mapping[str, Any], key: str, pattern: re.Pattern[str], where: str
+) -> str | None:
+    """``env`` or ``file`` off a row: absent or null is ``None``; anything else
+    must be a name the platform could have stored, or the answer is refused."""
+    value = row.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise MandalaError(f"{where}: a secret binding's {key} is not a name: {value!r}")
+    return str.__str__(value)
+
+
+@dataclass(frozen=True)
+class SecretBinding:
+    """One secret a computer is bound to, as the platform records it.
+
+    ``revision_id`` is the revision last delivered to the computer: every start
+    and restart delivers the secret's latest value and moves it there, and a
+    secret bound as a file is replaced on a running computer as soon as its
+    value is. Exactly one of ``env`` and ``file`` is set. Names and revisions
+    only: no value is ever returned.
+    """
+
+    secret_id: str
+    revision_id: str
+    #: The environment variable the value is published under, or ``None``.
+    env: str | None = None
+    #: The file under ``/run/mandala-secrets/user/files`` the value is
+    #: published as, or ``None``.
+    file: str | None = None
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "secret bindings") -> SecretBinding:
+        """Refuses rather than guesses: a row it cannot read raises.
+
+        A binding list read short would look complete, and a caller replacing
+        the list from it would unbind a secret it never saw.
+        """
+        secret_id = _binding_text(d, "secret_id", where)
+        revision_id = _binding_text(d, "revision_id", where)
+        env = _binding_name(d, "env", SECRET_ENV, where)
+        file = _binding_name(d, "file", SECRET_FILE, where)
+        if (env is None) == (file is None):
+            raise MandalaError(f"{where}: {secret_id} must name exactly one of env and file")
+        return cls(secret_id=secret_id, revision_id=revision_id, env=env, file=file)
+
+
+@dataclass(frozen=True)
+class SecretBindings:
+    """A computer's secret bindings, and the ``version`` a change sends back.
+
+    From :meth:`~mandala_computer.Computer.secrets` and
+    :meth:`~mandala_computer.Computer.set_secrets`.
+    """
+
+    secrets: builtins.list[SecretBinding]
+    #: Send this with :meth:`~mandala_computer.Computer.set_secrets` to change
+    #: only the list you read.
+    version: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "secret bindings") -> SecretBindings:
+        """Refuses an answer that is not a whole binding list with its version.
+
+        Every row must read, and ``version`` must be a non-negative whole
+        number: one invented here would be sent back by a replace as if a read
+        had answered it.
+        """
+        rows = d.get("secrets")
+        if not isinstance(rows, list):
+            raise MandalaError(f"expected secret bindings from {where}")
+        bindings = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise MandalaError(f"{where}: a secret binding is not an object")
+            bindings.append(SecretBinding.from_api(row, where))
+        version = d.get("version")
+        number = (
+            int.__index__(version)
+            if isinstance(version, int) and not isinstance(version, bool)
+            else -1
+        )
+        if number < 0:
+            raise MandalaError(f"{where}: version must be a non-negative whole number")
+        return cls(secrets=bindings, version=number, raw=dict(d))
