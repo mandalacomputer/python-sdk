@@ -98,6 +98,10 @@ UNIMPLEMENTED_PARAMETERS = {
     # File transfers cannot yet opt out of waking a suspended computer.
     "GET computers/:id/files  query:no_wake",
     "PUT computers/:id/files  query:no_wake",
+    # OPL-4994: `overwrite=false` makes an upload create-only, refused with 409
+    # `exists` rather than replacing a file already at the path.
+    # Listed to stay in step with the surface; not yet sent.
+    "PUT computers/:id/files  query:overwrite",
     # Directory listing is not wrapped yet; see UNIMPLEMENTED.
     "GET computers/:id/files/list  query:path",
     # Retained API history is not wrapped yet; see UNIMPLEMENTED.

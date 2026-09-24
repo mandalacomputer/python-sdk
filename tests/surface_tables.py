@@ -278,7 +278,7 @@ PARAMETERS: dict[str, set[str]] = {
     # An upload's body is the file itself, raw — there are no named fields to
     # mirror. A download's `Range` is the one header a *caller* sets that
     # reaches the daemon; see `Computer.read_file_part`.
-    "PUT computers/:id/files": {"query:path", "query:no_wake"},
+    "PUT computers/:id/files": {"query:path", "query:no_wake", "query:overwrite"},
     "GET computers/:id/files": {"query:path", "query:no_wake", "header:Range"},
     "GET computers/:id/files/list": {"query:path"},
     "GET snapshots": {"query:allow_partial", "query:include"},
