@@ -2343,10 +2343,8 @@ file only if nothing is there:
 ```python
 try:
     c.write_file("/home/user/app/config.toml", "debug = false\n", overwrite=False)
-except mc.FileExistsError as e:
-    # This call wrote nothing. e.reason == "exists" means something was already
-    # there; None means the refusal's reason is unknown, so do not say it was.
-    pass
+except mc.FileExistsError:
+    pass  # something was already there, and this call wrote nothing
 ```
 
 A path that is taken raises `FileExistsError` — a `ConflictError` whose
@@ -2356,9 +2354,11 @@ Windows computer refuses it with a 400. A host that cannot do it yet answers a
 `ConflictError` with `reason` `"unsupported"`, and one whose support could not
 be confirmed an `UnavailableError`. In every one of those cases this request
 wrote nothing. A create-only 409 with no usable reason (a body that
-could not be read, or JSON without a string `reason`) is raised as
-`FileExistsError` too, with `reason` `None` and a message saying the reason is
-unknown, so it is never called transient.
+could not be read, or JSON without a string `reason`) raises
+`CreateOnlyConflictError`, a `ConflictError` with `reason` `None` that is not
+transient either. It does not say the path is taken and is not Python's
+built-in `FileExistsError`: read the path to find out what is there before
+deciding.
 
 "Nothing written" is about the request that was refused. If an earlier attempt
 lost its response, it may have written the file itself, and the retry then

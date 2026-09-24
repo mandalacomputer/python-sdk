@@ -1362,7 +1362,10 @@ class AsyncComputer(ComputerFields):
         except ConflictError as err:
             if overwrite:
                 raise
-            raise _create_only_refusal(err) from err
+            refusal = _create_only_refusal(err)
+            if refusal is err:
+                raise
+            raise refusal from None
 
     # --- windows --------------------------------------------------------
 

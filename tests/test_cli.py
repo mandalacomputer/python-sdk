@@ -170,6 +170,34 @@ def test_scp_no_overwrite_says_the_path_is_taken(tmp_path) -> None:
     assert "read it and compare" in message and "--no-overwrite" in message
 
 
+@pytest.mark.parametrize(
+    ("answer", "structured"),
+    [
+        (lambda: httpx.Response(409, json={"error": "a file already exists"}), True),
+        (lambda: httpx.Response(409, content=b""), False),
+        (lambda: httpx.Response(409, content=b"<html>conflict</html>"), False),
+    ],
+    ids=["platform-json", "empty", "proxy-page"],
+)
+@respx.mock
+def test_scp_no_overwrite_never_says_taken_without_the_word(tmp_path, answer, structured) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(side_effect=lambda request: answer())
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hi")
+
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"])
+    message = str(caught.value)
+    assert "refused as a conflict, reason unknown" in message
+    assert "already exists" not in message
+    if structured:
+        assert "this upload wrote nothing" in message
+    else:
+        assert "wrote nothing" not in message
+        assert "whether this upload wrote anything is unconfirmed" in message
+
+
 def test_scp_no_overwrite_is_refused_on_a_download(tmp_path) -> None:
     with pytest.raises(SystemExit, match="applies to an upload, not a download"):
         _cli.main(["scp", "--no-overwrite", "dev:/home/user/report.csv", str(tmp_path / "r")])

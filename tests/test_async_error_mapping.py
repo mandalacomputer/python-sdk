@@ -1,6 +1,8 @@
 """Async transport diagnostics and stream ownership match the sync public API."""
 
 import asyncio
+import builtins
+import traceback
 
 import httpx
 import pytest
@@ -377,8 +379,9 @@ async def test_async_create_only_409_with_an_interrupted_body_is_never_transient
         mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
     ):
         computer = mc.AsyncComputer(client._t, computer_row)
-        with pytest.raises(mc.FileExistsError) as caught:
+        with pytest.raises(mc.CreateOnlyConflictError) as caught:
             await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    assert not isinstance(caught.value, builtins.FileExistsError)
     assert caught.value.reason is None and not mc.is_transient(caught.value)
 
 
@@ -417,9 +420,15 @@ async def test_async_create_only_409_with_no_usable_reason_is_never_transient(bo
         mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
     ):
         computer = mc.AsyncComputer(client._t, computer_row)
-        with pytest.raises(mc.FileExistsError) as caught:
+        with pytest.raises(mc.CreateOnlyConflictError) as caught:
             await computer.write_file("/tmp/a", b"hi", overwrite=False)
-    assert caught.value.reason is None
-    assert "refused as a conflict, reason unknown" in str(caught.value)
-    assert "already exists" not in str(caught.value)
-    assert not mc.is_transient(caught.value)
+    error = caught.value
+    assert not isinstance(error, (mc.FileExistsError, builtins.FileExistsError))
+    assert error.reason is None
+    assert "refused as a conflict, reason unknown" in str(error)
+    assert "already exists" not in str(error)
+    assert not mc.is_transient(error)
+    # Not chained to the original, whose message is the body's own text.
+    assert error.__cause__ is None and error.__suppress_context__
+    assert "already exists" not in "".join(traceback.format_exception(error))
+    assert error.body == body

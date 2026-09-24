@@ -14,6 +14,7 @@ __all__ = [
     "ConflictError",
     "ConnectionError",
     "ConnectionInterruptedError",
+    "CreateOnlyConflictError",
     "FileExistsError",
     "FileTooLargeError",
     "GatewayTimeoutError",
@@ -564,16 +565,31 @@ class FileExistsError(ConflictError, builtins.FileExistsError):
     unknown, read the file and compare it before choosing another path or
     overwriting.
 
-    :attr:`~APIError.reason` is ``"exists"`` when the platform's body said so.
-    It is ``None`` when the 409 answering a create-only upload carried no usable
-    reason — a body interrupted in flight, empty, not the platform's JSON, or
-    JSON without a non-blank string ``reason``. That refusal is raised as this
-    class too, with a message saying it was a conflict whose reason is unknown
-    (it does NOT say the path exists), because a refusal this SDK cannot
-    classify must not be read as a conflict worth sending again. Test
-    ``reason == "exists"``, not the class, before telling anyone the path is
-    taken. :func:`is_transient` answers ``False`` to this
-    class either way.
+    Raised only for the platform's explicit ``reason`` ``"exists"``, so the
+    class is the claim: something is at the path. A create-only 409 whose
+    reason could not be read is :class:`CreateOnlyConflictError` instead, which
+    claims nothing about the path.
+    """
+
+
+class CreateOnlyConflictError(ConflictError):
+    """A create-only upload refused with 409 whose reason could not be read.
+
+    ``write_file(path, data, overwrite=False)`` is answered 409 ``exists``
+    (:class:`FileExistsError`) or 409 ``unsupported`` when it is refused. A 409
+    can also arrive with no usable reason: the body interrupted in flight,
+    empty, a proxy's page instead of the platform's JSON, or JSON whose
+    ``reason`` is missing, not a string, or blank. That refusal is raised as
+    this class, with :attr:`~APIError.reason` ``None`` and a message saying the
+    reason is unknown. It does NOT say the path is taken, and it is NOT
+    Python's built-in :class:`FileExistsError`, so a handler for that does not
+    swallow it.
+
+    Final, not transient: :func:`is_transient` says ``False`` to it. Sending the
+    same create-only write again repeats a refusal that was not said to clear,
+    and a delayed retry after the path is cleared could create the file when no
+    one expected it. Read the path to find out what is there before deciding.
+    The raw body stays on :attr:`~APIError.body` for diagnostics.
     """
 
 
@@ -759,7 +775,7 @@ def is_transient(err: BaseException) -> bool:
     # By class as well as by word: a create-only upload whose 409 carried no
     # usable reason has no ``reason`` at all, and would otherwise fall through to
     # the ConflictError branch below and be called worth sending again.
-    if isinstance(err, FileExistsError):
+    if isinstance(err, (FileExistsError, CreateOnlyConflictError)):
         return False
     # A lost RESPONSE is not a request that never left, and only one of the two
     # is safe to replay blind. Same shape as the line above and the same reason:
@@ -889,7 +905,9 @@ def _is_transient_for_poll(err: BaseException) -> bool:
     """
     if not isinstance(err, (APIError, ConnectionError, TimeoutError)):
         return False
-    if isinstance(err, (MoveRequiredError, FileExistsError, OriginTLSError)):
+    if isinstance(
+        err, (MoveRequiredError, FileExistsError, CreateOnlyConflictError, OriginTLSError)
+    ):
         return False
     if isinstance(err, APIError):
         if err.status == 524:

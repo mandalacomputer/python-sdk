@@ -1,6 +1,8 @@
 """Public HTTP diagnostics, constructor compatibility, and stream isolation."""
 
+import builtins
 import json
+import traceback
 
 import httpx
 import pytest
@@ -9,6 +11,7 @@ import mandala_computer as mc
 from mandala_computer import _client
 from mandala_computer._agent import to_agent_event
 from mandala_computer._client import error_for_status
+from mandala_computer._exceptions import _is_transient_for_poll
 
 BASE = "https://api.test/api/v1"
 COMPUTER = {"id": "vm-1", "name": "dev", "status": "running", "os": "linux", "cpu": 2}
@@ -563,7 +566,10 @@ def _upload_answering(response, *, overwrite):
 def test_a_create_only_409_that_cannot_be_read_is_never_transient(response):
     """The lost body is the one thing that said ``exists``; the request still knows."""
     error = _upload_answering(response, overwrite=False)
-    assert isinstance(error, mc.FileExistsError)
+    assert type(error) is mc.CreateOnlyConflictError
+    assert isinstance(error, mc.ConflictError)
+    # Claims nothing about the path: neither this SDK's nor Python's FileExistsError.
+    assert not isinstance(error, builtins.FileExistsError)
     assert error.status == 409 and error.reason is None
     assert "refused as a conflict, reason unknown" in str(error)
     assert not mc.is_transient(error)
@@ -593,11 +599,19 @@ _REASONLESS_IDS = [
 def test_a_create_only_409_with_no_usable_reason_is_never_transient(body):
     """JSON that arrived but carries no string word is as unclassified as a lost body."""
     error = _upload_answering(lambda: httpx.Response(409, json=body), overwrite=False)
-    assert isinstance(error, mc.FileExistsError)
+    assert type(error) is mc.CreateOnlyConflictError
+    assert isinstance(error, mc.ConflictError)
+    # Claims nothing about the path: neither this SDK's nor Python's FileExistsError.
+    assert not isinstance(error, builtins.FileExistsError)
     assert error.status == 409 and error.reason is None
     assert "refused as a conflict, reason unknown" in str(error)
     assert "already exists" not in str(error)
     assert not mc.is_transient(error)
+    assert not _is_transient_for_poll(error)
+    # Not chained to the original, whose message is the body's own text.
+    assert error.__cause__ is None and error.__suppress_context__
+    assert "already exists" not in "".join(traceback.format_exception(error))
+    assert error.body == body
 
 
 def test_a_reasonless_json_409_on_an_ordinary_upload_is_left_as_it_was():
@@ -618,3 +632,14 @@ def test_a_readable_create_only_409_keeps_the_platforms_word():
         overwrite=False,
     )
     assert type(error) is mc.ConflictError and error.reason == "contention"
+
+
+def test_an_explicit_exists_is_still_file_exists_error_and_unchained():
+    error = _upload_answering(
+        lambda: httpx.Response(409, json={"error": "taken", "reason": "exists"}),
+        overwrite=False,
+    )
+    assert type(error) is mc.FileExistsError and error.reason == "exists"
+    assert isinstance(error, builtins.FileExistsError)
+    assert error.__cause__ is None
+    assert not mc.is_transient(error)

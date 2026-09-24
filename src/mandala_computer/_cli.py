@@ -65,7 +65,7 @@ from . import _openssh
 from ._api import looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
-from ._exceptions import ConflictError, FileExistsError, MandalaError
+from ._exceptions import ConflictError, CreateOnlyConflictError, FileExistsError, MandalaError
 from ._models import Listing, SshAccess, SshKey, Webhook, WebhookDelivery
 
 if TYPE_CHECKING:
@@ -847,18 +847,28 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     with _client() as client:
         try:
             _resolve(client, target).write_file(remote_path, data, overwrite=not args.no_overwrite)
-        except FileExistsError as e:
+        except FileExistsError:
             # Only THIS upload is known to have written nothing: an earlier
             # attempt whose answer was lost may have written the file itself.
-            said = (
-                f"{target}:{remote_path} already exists"
-                if e.reason == "exists"
-                else f"{e} — {target}:{remote_path}"
+            _die(
+                f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
+                "earlier attempt's outcome was unknown, the file may be yours: read it and "
+                "compare before choosing another path or dropping --no-overwrite to replace it."
+            )
+        except CreateOnlyConflictError as e:
+            # No usable reason, so nothing here says the path is taken. And only a
+            # refusal the platform wrote out (a JSON object) says this upload
+            # wrote nothing; an empty, cut-off or proxy body leaves that unconfirmed.
+            outcome = (
+                "this upload wrote nothing"
+                if isinstance(e.body, dict)
+                else "whether this upload wrote anything is unconfirmed"
             )
             _die(
-                f"{said}; this upload wrote nothing. If an earlier attempt's outcome "
-                "was unknown, the file may be yours: read it and compare before "
-                "choosing another path or dropping --no-overwrite to replace it."
+                f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
+                f"reason unknown; {outcome}. Do not send the same upload again blind: read "
+                "the remote path to see what is there before choosing another path or "
+                "dropping --no-overwrite."
             )
     print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0

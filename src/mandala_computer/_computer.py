@@ -48,6 +48,7 @@ from ._exceptions import (
     APIError,
     ConflictError,
     ConnectionError,
+    CreateOnlyConflictError,
     FileExistsError,
     MandalaError,
     RangeNotSatisfiableError,
@@ -241,24 +242,27 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
     and the transport maps that body to :class:`FileExistsError`. But a 409 can
     arrive without a word this SDK can read: the body interrupted in flight,
     empty, a proxy's page instead of the platform's JSON, or JSON with no
-    ``reason``, a ``reason`` that is not a string, or a blank one. The
-    transport then leaves :attr:`~APIError.reason` ``None``, and a bare
+    ``reason``, a ``reason`` that is not a string, or a blank one. A bare
     :class:`ConflictError` is what :func:`is_transient` calls worth sending
-    again — a retry of a refusal that does not clear, and one that could create
-    the file later if the path were cleared in between. So the request's own
-    context, create-only, decides here what the status alone cannot: the
-    refusal is final, and the message says only that it was a conflict whose
-    reason is unknown, not that the path exists. Callers that tell anyone the
-    path is taken test ``reason == "exists"``, not the class. A 409 that DID
-    carry a string reason keeps the platform's classification, whatever the
-    word.
+    again — a retry of a refusal that was not said to clear, and one that could
+    create the file later if the path were cleared in between. So the request's
+    own context, create-only, decides here what the status alone cannot: the
+    refusal is a :class:`CreateOnlyConflictError`, final, with a message that
+    says only that it was a conflict whose reason is unknown. A 409 that DID
+    carry a string reason is returned as it is, whatever the word.
+
+    The caller raises the result ``from None`` when it is new: the original
+    error's message is the body's own text, which could say "already exists"
+    without the platform's ``exists`` reason, and a chained traceback would
+    print it. The body stays on the new error.
     """
-    if isinstance(err, FileExistsError) or (isinstance(err.reason, str) and err.reason.strip()):
+    if isinstance(err, (FileExistsError, CreateOnlyConflictError)) or (
+        isinstance(err.reason, str) and err.reason.strip()
+    ):
         return err
-    refusal = FileExistsError(
+    refusal = CreateOnlyConflictError(
         # Neutral on purpose, and not the body's own text: a reasonless body whose
         # ``error`` says "already exists" would carry the very claim this avoids.
-        # The body is kept on the error for diagnostics.
         "a create-only upload was refused as a conflict, reason unknown: the 409 "
         "carried no reason that could be read, so whether the path is taken was not said; "
         "treat it as final rather than sending the same write again",
@@ -270,7 +274,7 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
         www_authenticate=err.www_authenticate,
     )
     # The constructor reads the body again, and would keep a blank word. Unknown
-    # is ``None`` here, as documented on FileExistsError.
+    # is ``None``, as documented on CreateOnlyConflictError.
     refusal.reason = None
     return refusal
 
@@ -2818,9 +2822,10 @@ class Computer(ComputerFields):
         (its response was lost), that file may be the one it wrote: read it and
         compare before choosing another path or overwriting. A 409 with no
         usable reason (a body that could not be read, or JSON without a string
-        ``reason``) is raised as :class:`~mandala_computer.FileExistsError`
-        too, with ``reason`` ``None`` and a message saying the reason is
-        unknown, so it is never taken for a passing conflict. The default, ``True``, replaces whatever is at
+        ``reason``) is raised as
+        :class:`~mandala_computer.CreateOnlyConflictError`, with ``reason``
+        ``None`` and a message saying the reason is unknown: final, and not a
+        claim that the path is taken. The default, ``True``, replaces whatever is at
         ``path``, as this method always has. Linux computers only: a Windows
         computer refuses ``overwrite=False`` with a 400. A host that cannot do
         create-only yet refuses it with a 409 whose ``reason`` is
@@ -2840,7 +2845,10 @@ class Computer(ComputerFields):
         except ConflictError as err:
             if overwrite:
                 raise
-            raise _create_only_refusal(err) from err
+            refusal = _create_only_refusal(err)
+            if refusal is err:
+                raise
+            raise refusal from None
 
     # --- windows --------------------------------------------------------
 
