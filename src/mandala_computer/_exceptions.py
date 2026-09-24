@@ -565,12 +565,14 @@ class FileExistsError(ConflictError, builtins.FileExistsError):
     overwriting.
 
     :attr:`~APIError.reason` is ``"exists"`` when the platform's body said so.
-    It is ``None`` when the 409 answering a create-only upload could not be read
-    — a body interrupted in flight, empty, or not the platform's JSON. That
-    refusal is raised as this class too, with a message saying the reason was
-    unreadable: on this route a 409 is ``exists`` or ``unsupported``, neither of
-    which clears by waiting, and an unreadable one must not be read as a
-    conflict worth sending again. :func:`is_transient` answers ``False`` to this
+    It is ``None`` when the 409 answering a create-only upload carried no usable
+    reason — a body interrupted in flight, empty, not the platform's JSON, or
+    JSON without a non-blank string ``reason``. That refusal is raised as this
+    class too, with a message saying it was a conflict whose reason is unknown
+    (it does NOT say the path exists), because a refusal this SDK cannot
+    classify must not be read as a conflict worth sending again. Test
+    ``reason == "exists"``, not the class, before telling anyone the path is
+    taken. :func:`is_transient` answers ``False`` to this
     class either way.
     """
 
@@ -754,8 +756,8 @@ def is_transient(err: BaseException) -> bool:
     """
     if isinstance(err, MoveRequiredError):
         return False
-    # By class as well as by word: a create-only upload whose 409 body could not
-    # be read carries no ``reason`` at all, and would otherwise fall through to
+    # By class as well as by word: a create-only upload whose 409 carried no
+    # usable reason has no ``reason`` at all, and would otherwise fall through to
     # the ConflictError branch below and be called worth sending again.
     if isinstance(err, FileExistsError):
         return False

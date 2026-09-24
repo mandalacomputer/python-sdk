@@ -380,3 +380,37 @@ async def test_async_create_only_409_with_an_interrupted_body_is_never_transient
         with pytest.raises(mc.FileExistsError) as caught:
             await computer.write_file("/tmp/a", b"hi", overwrite=False)
     assert caught.value.reason is None and not mc.is_transient(caught.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "conflict"},
+        {"reason": 5},
+        {"error": "conflict", "reason": None},
+        {"reason": ""},
+        {"reason": "   "},
+        {},
+    ],
+    ids=["missing", "numeric", "null", "empty-string", "blank-string", "empty-object"],
+)
+async def test_async_create_only_409_with_no_usable_reason_is_never_transient(body):
+    """The async half of the sync test of the same name (OPL-4994, Codex review)."""
+    computer_row = {"id": "vm-1", "name": "dev", "status": "running"}
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(409, json=body)
+        return httpx.Response(200, json=computer_row)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        computer = mc.AsyncComputer(client._t, computer_row)
+        with pytest.raises(mc.FileExistsError) as caught:
+            await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    assert not (caught.value.reason or "").strip()
+    assert "refused as a conflict, reason unknown" in str(caught.value)
+    assert "already exists" not in str(caught.value)
+    assert not mc.is_transient(caught.value)

@@ -565,8 +565,37 @@ def test_a_create_only_409_that_cannot_be_read_is_never_transient(response):
     error = _upload_answering(response, overwrite=False)
     assert isinstance(error, mc.FileExistsError)
     assert error.status == 409 and error.reason is None
-    assert "reason could not be read" in str(error)
+    assert "refused as a conflict, reason unknown" in str(error)
     assert not mc.is_transient(error)
+
+
+_REASONLESS_JSON = [
+    {"error": "conflict"},
+    {"reason": 5},
+    {"error": "conflict", "reason": None},
+    {"reason": ""},
+    {"reason": "   "},
+    {},
+]
+_REASONLESS_IDS = ["missing", "numeric", "null", "empty-string", "blank-string", "empty-object"]
+
+
+@pytest.mark.parametrize("body", _REASONLESS_JSON, ids=_REASONLESS_IDS)
+def test_a_create_only_409_with_no_usable_reason_is_never_transient(body):
+    """JSON that arrived but carries no string word is as unclassified as a lost body."""
+    error = _upload_answering(lambda: httpx.Response(409, json=body), overwrite=False)
+    assert isinstance(error, mc.FileExistsError)
+    assert error.status == 409 and not (error.reason or "").strip()
+    assert "refused as a conflict, reason unknown" in str(error)
+    assert "already exists" not in str(error)
+    assert not mc.is_transient(error)
+
+
+def test_a_reasonless_json_409_on_an_ordinary_upload_is_left_as_it_was():
+    error = _upload_answering(
+        lambda: httpx.Response(409, json={"error": "conflict"}), overwrite=True
+    )
+    assert type(error) is mc.ConflictError
 
 
 def test_an_unreadable_409_on_an_ordinary_upload_is_left_as_it_was():
