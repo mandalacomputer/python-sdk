@@ -137,6 +137,43 @@ def test_scp_upload_to_directory_keeps_basename(tmp_path) -> None:
 
 
 @respx.mock
+def test_scp_no_overwrite_sends_create_only(tmp_path) -> None:
+    """``--no-overwrite`` sends ``overwrite=false``; without it nothing extra (OPL-4994)."""
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(return_value=httpx.Response(200))
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hi")
+
+    assert _cli.main(["scp", str(src), "dev:/home/user/notes.txt"]) == 0
+    assert "overwrite" not in put.calls.last.request.url.params
+    assert _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"]) == 0
+    params = put.calls.last.request.url.params
+    assert params["overwrite"] == "false" and params["path"] == "/home/user/notes.txt"
+
+
+@respx.mock
+def test_scp_no_overwrite_says_the_path_is_taken(tmp_path) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(409, json={"error": "already exists", "reason": "exists"})
+    )
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hi")
+
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"])
+    message = str(caught.value)
+    assert "dev:/home/user/notes.txt already exists" in message
+    assert "nothing was written" in message and "Drop --no-overwrite" in message
+
+
+def test_scp_no_overwrite_is_refused_on_a_download(tmp_path) -> None:
+    with pytest.raises(SystemExit, match="applies to an upload, not a download"):
+        _cli.main(["scp", "--no-overwrite", "dev:/home/user/report.csv", str(tmp_path / "r")])
+    assert list(tmp_path.iterdir()) == []
+
+
+@respx.mock
 def test_scp_download_writes_local_file(tmp_path) -> None:
     respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
     respx.get(f"{BASE}/computers/vm-1/files").mock(

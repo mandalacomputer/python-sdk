@@ -27,6 +27,7 @@ from ._exceptions import (
     ConflictError,
     ConnectionError,
     ConnectionInterruptedError,
+    FileExistsError,
     FileTooLargeError,
     GatewayTimeoutError,
     MandalaError,
@@ -42,6 +43,7 @@ from ._exceptions import (
     RateLimitError,
     TimeoutError,
     UnavailableError,
+    _refusal_reason,
 )
 from ._sse import SSEDecoder, SSEEvent, feed_chunk
 
@@ -937,6 +939,17 @@ class _BaseTransport:
                     status=resp.status_code,
                     body=body,
                     move_possible=offer,
+                    retry_after=_retry_after(resp),
+                    **metadata,
+                )
+            # The create-only upload whose path was taken. Told apart by the
+            # word the platform put on the body rather than by the sentence,
+            # which is prose.
+            if _refusal_reason(body) == "exists":
+                return FileExistsError(
+                    message,
+                    status=resp.status_code,
+                    body=body,
                     retry_after=_retry_after(resp),
                     **metadata,
                 )

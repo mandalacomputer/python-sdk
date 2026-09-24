@@ -2759,19 +2759,30 @@ class Computer(ComputerFields):
                 _continues(path, asked, part, was)
         return written
 
-    def write_file(self, path: str, data: bytes | str) -> None:
+    def write_file(self, path: str, data: bytes | str, *, overwrite: bool = True) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
         A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
         The bytes land exactly as given — this is how a credential reaches a
         guest ``.env`` without echoing it through a shell command line.
         Bodies over 64 MiB are refused before any request is made.
+
+        ``overwrite=False`` makes the write create-only: the file is written
+        only if nothing is at ``path`` yet. When something is, the platform
+        refuses with :class:`~mandala_computer.FileExistsError` (a 409 whose
+        ``reason`` is ``"exists"``) and nothing is written — the file already
+        there is untouched. The default, ``True``, replaces whatever is at
+        ``path``, as this method always has. Linux computers only: a Windows
+        computer refuses ``overwrite=False`` with a 400. A host that cannot do
+        create-only yet refuses it with a 409 whose ``reason`` is
+        ``"unsupported"``, and one whose support could not be confirmed with a
+        503; in both cases nothing was sent to the guest.
         """
         body = _file_body(data)
         self._t.request(
             "PUT",
             _api.files(self.id),
-            params=_api.files_params(path),
+            params=_api.upload_params(path, overwrite),
             content=body,
             timeout=FILE_TIMEOUT,
         )

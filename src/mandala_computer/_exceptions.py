@@ -14,6 +14,7 @@ __all__ = [
     "ConflictError",
     "ConnectionError",
     "ConnectionInterruptedError",
+    "FileExistsError",
     "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
@@ -71,7 +72,15 @@ _REASON_CLEARS = frozenset({"contention", "starting"})
 #: today. What changes is that a future status for this refusal cannot quietly make
 #: it look replayable. The status still says what to do about it — 401 present a
 #: credential again, 403 the role changed and signing in again will not help.
-_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked"})
+#:
+#: ``exists`` is a create-only upload (``write_file(..., overwrite=False)``)
+#: refused because something is already at the path (OPL-4994). Nothing was
+#: written, and the same request answers the same way until whatever is there is
+#: moved or the caller agrees to replace it — so it is permanent, and has to be
+#: said: without it this would be an ordinary :class:`ConflictError`, which
+#: :func:`is_transient` calls worth sending again. :class:`FileExistsError` is
+#: the class it arrives as.
+_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked", "exists"})
 
 
 def _refusal_reason(body: object) -> str | None:
@@ -120,8 +129,8 @@ class APIError(MandalaError):
         #: A delay alone does not mean that replaying the request is safe.
         self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
-        #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"`` or
-        #: ``"unsupported"`` (OPL-3898). ``None`` where it sent nothing, which
+        #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
+        #: ``"unsupported"`` (OPL-3898), ``"revoked"`` or ``"exists"``. ``None`` where it sent nothing, which
         #: is most errors and always will be — not every refusal has one of
         #: those four answers, and the platform is explicit that absent means
         #: unclassified rather than "none of them".
@@ -527,6 +536,28 @@ class MoveRequiredError(ConflictError):
         )
         #: Whether a host in this region could run the size that was asked for.
         self.move_possible = move_possible
+
+
+class FileExistsError(ConflictError, builtins.FileExistsError):
+    """A create-only upload found something already at the path (409).
+
+    ``write_file(path, data, overwrite=False)`` asks the platform to create the
+    file only if nothing is at ``path``. When something is, the answer is 409
+    with ``reason`` ``"exists"`` and NOTHING was written — the file that was
+    there is untouched.
+
+    Its own class for the reason :class:`MoveRequiredError` has one: it is a
+    :class:`ConflictError` by status and the opposite of one by nature. A
+    conflict clears by waiting; this clears only when the caller decides — pick
+    another path, or send the write again without ``overwrite=False`` to replace
+    the file on purpose. :func:`is_transient` says ``False`` to it.
+
+    A subclass of :class:`ConflictError`, so ``except ConflictError`` written
+    before this existed still catches it, and of Python's built-in
+    :class:`FileExistsError`, so an ordinary handler for that catches it too —
+    the same pairing :class:`ConnectionError` and :class:`TimeoutError` make
+    with their built-ins.
+    """
 
 
 class UnavailableError(APIError):

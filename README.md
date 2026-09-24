@@ -2337,6 +2337,24 @@ Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
 directory. A transfer resumes a suspended computer, like any other use.
 
+A write replaces whatever is at the path. Pass `overwrite=False` to create the
+file only if nothing is there:
+
+```python
+try:
+    c.write_file("/home/user/app/config.toml", "debug = false\n", overwrite=False)
+except mc.FileExistsError:
+    pass  # something was already there, and it is untouched: nothing was written
+```
+
+A path that is taken raises `FileExistsError` — a `ConflictError` whose
+`reason` is `"exists"`, and also Python's built-in `FileExistsError`. It is not
+transient: waiting does not change it. Create-only is for Linux computers; a
+Windows computer refuses it with a 400. A host that cannot do it yet answers a
+`ConflictError` with `reason` `"unsupported"`, and one whose support could not
+be confirmed an `UnavailableError`. In every one of those cases nothing was
+written.
+
 **One request moves at most 64 MiB**, and that is a limit on the request rather
 than on the file. An oversized write is refused locally, before anything is
 sent; an oversized `read_file()` raises `FileTooLargeError`, which is a signpost
@@ -2754,6 +2772,8 @@ without any shell in the guest at all. A download is paged, so a file larger
 than the 64 MiB one request moves copies like any other, and a copy that is
 refused leaves the local file alone. An upload is one request, and one larger
 than the limit is refused before it is read.
+`--no-overwrite` makes an upload create-only: a guest path that is already
+taken is refused, and nothing is written. It is refused on a download.
 
 Two answers worth recognizing: a computer that predates the terminal feature
 answers 409 until it is stopped and started again (a restart is not enough,

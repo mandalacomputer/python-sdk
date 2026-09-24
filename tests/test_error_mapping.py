@@ -52,6 +52,7 @@ BRANCHES = [
     (409, {"move": {"required": True, "possible": True}}, mc.MoveRequiredError),
     (409, {"move": {"required": True, "possible": False}}, mc.MoveRequiredError),
     (409, {"code": "template_image_preparing"}, mc.ConflictError),
+    (409, {"reason": "exists"}, mc.FileExistsError),
     (416, {}, mc.RangeNotSatisfiableError),
     (504, {}, mc.GatewayTimeoutError),
     (520, {}, mc.OriginResponseError),

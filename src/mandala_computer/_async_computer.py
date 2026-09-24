@@ -1341,16 +1341,17 @@ class AsyncComputer(ComputerFields):
                 _continues(path, asked, part, was)
         return written
 
-    async def write_file(self, path: str, data: bytes | str) -> None:
+    async def write_file(self, path: str, data: bytes | str, *, overwrite: bool = True) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
-        See :meth:`mandala_computer.Computer.write_file`.
+        See :meth:`mandala_computer.Computer.write_file`, including
+        ``overwrite=False`` for a create-only write.
         """
         body = _file_body(data)
         await self._t.request(
             "PUT",
             _api.files(self.id),
-            params=_api.files_params(path),
+            params=_api.upload_params(path, overwrite),
             content=body,
             timeout=FILE_TIMEOUT,
         )
