@@ -419,7 +419,7 @@ async def test_async_create_only_409_with_no_usable_reason_is_never_transient(bo
         computer = mc.AsyncComputer(client._t, computer_row)
         with pytest.raises(mc.FileExistsError) as caught:
             await computer.write_file("/tmp/a", b"hi", overwrite=False)
-    assert not (caught.value.reason or "").strip()
+    assert caught.value.reason is None
     assert "refused as a conflict, reason unknown" in str(caught.value)
     assert "already exists" not in str(caught.value)
     assert not mc.is_transient(caught.value)

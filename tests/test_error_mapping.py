@@ -594,7 +594,7 @@ def test_a_create_only_409_with_no_usable_reason_is_never_transient(body):
     """JSON that arrived but carries no string word is as unclassified as a lost body."""
     error = _upload_answering(lambda: httpx.Response(409, json=body), overwrite=False)
     assert isinstance(error, mc.FileExistsError)
-    assert error.status == 409 and not (error.reason or "").strip()
+    assert error.status == 409 and error.reason is None
     assert "refused as a conflict, reason unknown" in str(error)
     assert "already exists" not in str(error)
     assert not mc.is_transient(error)

@@ -255,7 +255,7 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
     """
     if isinstance(err, FileExistsError) or (isinstance(err.reason, str) and err.reason.strip()):
         return err
-    return FileExistsError(
+    refusal = FileExistsError(
         # Neutral on purpose, and not the body's own text: a reasonless body whose
         # ``error`` says "already exists" would carry the very claim this avoids.
         # The body is kept on the error for diagnostics.
@@ -269,6 +269,10 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
         allow=err.allow,
         www_authenticate=err.www_authenticate,
     )
+    # The constructor reads the body again, and would keep a blank word. Unknown
+    # is ``None`` here, as documented on FileExistsError.
+    refusal.reason = None
+    return refusal
 
 
 def _file_body(data: bytes | str) -> bytes:
