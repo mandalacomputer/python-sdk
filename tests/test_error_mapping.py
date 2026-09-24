@@ -528,3 +528,55 @@ def test_ordinary_string_message_remains_verbatim():
     ):
         client.computers.list()
     assert str(caught.value) == "  "
+
+
+# --- a create-only upload's unreadable 409 (OPL-4994, Codex review) ----------
+
+_CREATE_ONLY_COMPUTER = {"id": "vm-1", "name": "dev", "status": "running"}
+
+
+def _upload_answering(response, *, overwrite):
+    def handler(request):
+        if request.method == "PUT":
+            return response()
+        return httpx.Response(200, json=_CREATE_ONLY_COMPUTER)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        computer = mc.Computer(client._t, _CREATE_ONLY_COMPUTER)
+        with pytest.raises(mc.ConflictError) as caught:
+            computer.write_file("/tmp/a", b"hi", overwrite=overwrite)
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        lambda: httpx.Response(409, stream=Broken()),
+        lambda: httpx.Response(409, content=b""),
+        lambda: httpx.Response(409, content=b"<html>conflict</html>"),
+    ],
+    ids=["interrupted", "empty", "not-json"],
+)
+def test_a_create_only_409_that_cannot_be_read_is_never_transient(response):
+    """The lost body is the one thing that said ``exists``; the request still knows."""
+    error = _upload_answering(response, overwrite=False)
+    assert isinstance(error, mc.FileExistsError)
+    assert error.status == 409 and error.reason is None
+    assert "reason could not be read" in str(error)
+    assert not mc.is_transient(error)
+
+
+def test_an_unreadable_409_on_an_ordinary_upload_is_left_as_it_was():
+    error = _upload_answering(lambda: httpx.Response(409, content=b""), overwrite=True)
+    assert type(error) is mc.ConflictError
+
+
+def test_a_readable_create_only_409_keeps_the_platforms_word():
+    error = _upload_answering(
+        lambda: httpx.Response(409, json={"error": "busy", "reason": "contention"}),
+        overwrite=False,
+    )
+    assert type(error) is mc.ConflictError and error.reason == "contention"

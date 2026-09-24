@@ -361,3 +361,22 @@ async def test_async_all_response_readers_preserve_headers(mode):
                     **({"max_bytes": 4096} if mode.startswith("bounded") else {}),
                 )
     assert_metadata(caught.value)
+
+
+async def test_async_create_only_409_with_an_interrupted_body_is_never_transient():
+    """The async half of the sync test of the same name (OPL-4994, Codex review)."""
+    computer_row = {"id": "vm-1", "name": "dev", "status": "running"}
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(409, stream=Broken())
+        return httpx.Response(200, json=computer_row)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        computer = mc.AsyncComputer(client._t, computer_row)
+        with pytest.raises(mc.FileExistsError) as caught:
+            await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    assert caught.value.reason is None and not mc.is_transient(caught.value)

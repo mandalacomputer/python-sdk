@@ -164,7 +164,10 @@ def test_scp_no_overwrite_says_the_path_is_taken(tmp_path) -> None:
         _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"])
     message = str(caught.value)
     assert "dev:/home/user/notes.txt already exists" in message
-    assert "nothing was written" in message and "Drop --no-overwrite" in message
+    assert "this upload wrote nothing" in message
+    # A retry after a lost answer meets its own file; only THIS attempt is known.
+    assert "If an earlier attempt's outcome was unknown, the file may be yours" in message
+    assert "read it and compare" in message and "--no-overwrite" in message
 
 
 def test_scp_no_overwrite_is_refused_on_a_download(tmp_path) -> None:

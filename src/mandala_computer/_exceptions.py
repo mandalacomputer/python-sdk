@@ -543,7 +543,7 @@ class FileExistsError(ConflictError, builtins.FileExistsError):
 
     ``write_file(path, data, overwrite=False)`` asks the platform to create the
     file only if nothing is at ``path``. When something is, the answer is 409
-    with ``reason`` ``"exists"`` and NOTHING was written — the file that was
+    with ``reason`` ``"exists"`` and this request wrote NOTHING — the file that was
     there is untouched.
 
     Its own class for the reason :class:`MoveRequiredError` has one: it is a
@@ -557,6 +557,21 @@ class FileExistsError(ConflictError, builtins.FileExistsError):
     :class:`FileExistsError`, so an ordinary handler for that catches it too —
     the same pairing :class:`ConnectionError` and :class:`TimeoutError` make
     with their built-ins.
+
+    "Nothing was written" is about THIS request. A create-only upload whose
+    earlier attempt lost its response may well have written the file itself, and
+    the retry then meets its own file here. If an earlier attempt's outcome was
+    unknown, read the file and compare it before choosing another path or
+    overwriting.
+
+    :attr:`~APIError.reason` is ``"exists"`` when the platform's body said so.
+    It is ``None`` when the 409 answering a create-only upload could not be read
+    — a body interrupted in flight, empty, or not the platform's JSON. That
+    refusal is raised as this class too, with a message saying the reason was
+    unreadable: on this route a 409 is ``exists`` or ``unsupported``, neither of
+    which clears by waiting, and an unreadable one must not be read as a
+    conflict worth sending again. :func:`is_transient` answers ``False`` to this
+    class either way.
     """
 
 
@@ -739,6 +754,11 @@ def is_transient(err: BaseException) -> bool:
     """
     if isinstance(err, MoveRequiredError):
         return False
+    # By class as well as by word: a create-only upload whose 409 body could not
+    # be read carries no ``reason`` at all, and would otherwise fall through to
+    # the ConflictError branch below and be called worth sending again.
+    if isinstance(err, FileExistsError):
+        return False
     # A lost RESPONSE is not a request that never left, and only one of the two
     # is safe to replay blind. Same shape as the line above and the same reason:
     # a subclass of a branch below that would otherwise say yes (OPL-3855).
@@ -867,7 +887,7 @@ def _is_transient_for_poll(err: BaseException) -> bool:
     """
     if not isinstance(err, (APIError, ConnectionError, TimeoutError)):
         return False
-    if isinstance(err, (MoveRequiredError, OriginTLSError)):
+    if isinstance(err, (MoveRequiredError, FileExistsError, OriginTLSError)):
         return False
     if isinstance(err, APIError):
         if err.status == 524:

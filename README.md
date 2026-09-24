@@ -2344,7 +2344,7 @@ file only if nothing is there:
 try:
     c.write_file("/home/user/app/config.toml", "debug = false\n", overwrite=False)
 except mc.FileExistsError:
-    pass  # something was already there, and it is untouched: nothing was written
+    pass  # something was already there, and this call wrote nothing
 ```
 
 A path that is taken raises `FileExistsError` — a `ConflictError` whose
@@ -2352,8 +2352,14 @@ A path that is taken raises `FileExistsError` — a `ConflictError` whose
 transient: waiting does not change it. Create-only is for Linux computers; a
 Windows computer refuses it with a 400. A host that cannot do it yet answers a
 `ConflictError` with `reason` `"unsupported"`, and one whose support could not
-be confirmed an `UnavailableError`. In every one of those cases nothing was
-written.
+be confirmed an `UnavailableError`. In every one of those cases this request
+wrote nothing. A 409 whose body could not be read is raised as
+`FileExistsError` too, with `reason` `None`, so it is never called transient.
+
+"Nothing written" is about the request that was refused. If an earlier attempt
+lost its response, it may have written the file itself, and the retry then
+meets that file: read it and compare before choosing another path or
+overwriting.
 
 **One request moves at most 64 MiB**, and that is a limit on the request rather
 than on the file. An oversized write is refused locally, before anything is
@@ -2773,7 +2779,7 @@ than the 64 MiB one request moves copies like any other, and a copy that is
 refused leaves the local file alone. An upload is one request, and one larger
 than the limit is refused before it is read.
 `--no-overwrite` makes an upload create-only: a guest path that is already
-taken is refused, and nothing is written. It is refused on a download.
+taken is refused, and that upload writes nothing. It is refused on a download.
 
 Two answers worth recognizing: a computer that predates the terminal feature
 answers 409 until it is stopped and started again (a restart is not enough,

@@ -847,10 +847,18 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     with _client() as client:
         try:
             _resolve(client, target).write_file(remote_path, data, overwrite=not args.no_overwrite)
-        except FileExistsError:
+        except FileExistsError as e:
+            # Only THIS upload is known to have written nothing: an earlier
+            # attempt whose answer was lost may have written the file itself.
+            said = (
+                f"{target}:{remote_path} already exists"
+                if e.reason == "exists"
+                else f"{e} — {target}:{remote_path}"
+            )
             _die(
-                f"{target}:{remote_path} already exists, and --no-overwrite left it "
-                "untouched; nothing was written. Drop --no-overwrite to replace it."
+                f"{said}; this upload wrote nothing. If an earlier attempt's outcome "
+                "was unknown, the file may be yours: read it and compare before "
+                "choosing another path or dropping --no-overwrite to replace it."
             )
     print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0

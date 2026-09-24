@@ -47,6 +47,7 @@ from ._computer import (
     _attach_agent_partial,
     _clipboard_text,
     _continues,
+    _create_only_refusal,
     _cursor,
     _download_sink,
     _empty_guest_file,
@@ -76,6 +77,7 @@ from ._events import (
 )
 from ._exceptions import (
     APIError,
+    ConflictError,
     ConnectionError,
     MandalaError,
     RangeNotSatisfiableError,
@@ -1348,13 +1350,19 @@ class AsyncComputer(ComputerFields):
         ``overwrite=False`` for a create-only write.
         """
         body = _file_body(data)
-        await self._t.request(
-            "PUT",
-            _api.files(self.id),
-            params=_api.upload_params(path, overwrite),
-            content=body,
-            timeout=FILE_TIMEOUT,
-        )
+        params = _api.upload_params(path, overwrite)
+        try:
+            await self._t.request(
+                "PUT",
+                _api.files(self.id),
+                params=params,
+                content=body,
+                timeout=FILE_TIMEOUT,
+            )
+        except ConflictError as err:
+            if overwrite:
+                raise
+            raise _create_only_refusal(err) from err
 
     # --- windows --------------------------------------------------------
 

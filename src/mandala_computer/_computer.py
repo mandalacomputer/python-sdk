@@ -46,7 +46,9 @@ from ._events import (
 )
 from ._exceptions import (
     APIError,
+    ConflictError,
     ConnectionError,
+    FileExistsError,
     MandalaError,
     RangeNotSatisfiableError,
     RateLimitError,
@@ -230,6 +232,34 @@ def _attach_agent_partial(exc: APIError) -> None:
     failure = to_agent_event("error", {**exc.body, "status": exc.status}, 0)
     if isinstance(failure, AgentFailed):  # defensive: the converter owns this shape
         exc.agent = failure
+
+
+def _create_only_refusal(err: ConflictError) -> ConflictError:
+    """A create-only upload's 409, never left looking like a passing conflict.
+
+    The platform answers a create-only upload's taken path with 409 ``exists``,
+    and the transport maps that body to
+    :class:`FileExistsError`. But the body can fail to arrive: interrupted in
+    flight, empty, or a proxy's page instead of the platform's JSON. The
+    transport then keeps the status and nothing else, and a bare
+    :class:`ConflictError` is what :func:`is_transient` calls worth sending
+    again. On this route a 409 is ``exists`` or ``unsupported``, neither of which
+    clears, so the request's own context — create-only — decides here what the
+    status alone cannot. A body that DID arrive keeps its classification.
+    """
+    if isinstance(err, FileExistsError) or isinstance(err.body, dict):
+        return err
+    return FileExistsError(
+        f"{err} (a create-only upload was refused with 409, and the refusal's reason "
+        "could not be read; on this route that is a taken path or a host that cannot "
+        "do create-only, and neither clears by waiting)",
+        status=err.status,
+        body=err.body,
+        retry_after=err.retry_after,
+        request_id=err.request_id,
+        allow=err.allow,
+        www_authenticate=err.www_authenticate,
+    )
 
 
 def _file_body(data: bytes | str) -> bytes:
@@ -2770,8 +2800,13 @@ class Computer(ComputerFields):
         ``overwrite=False`` makes the write create-only: the file is written
         only if nothing is at ``path`` yet. When something is, the platform
         refuses with :class:`~mandala_computer.FileExistsError` (a 409 whose
-        ``reason`` is ``"exists"``) and nothing is written — the file already
-        there is untouched. The default, ``True``, replaces whatever is at
+        ``reason`` is ``"exists"``) and this request writes nothing — the file
+        already there is untouched. If an earlier attempt's outcome was unknown
+        (its response was lost), that file may be the one it wrote: read it and
+        compare before choosing another path or overwriting. A 409 whose body
+        could not be read is raised as :class:`~mandala_computer.FileExistsError`
+        too, with ``reason`` ``None``, so it is never taken for a passing
+        conflict. The default, ``True``, replaces whatever is at
         ``path``, as this method always has. Linux computers only: a Windows
         computer refuses ``overwrite=False`` with a 400. A host that cannot do
         create-only yet refuses it with a 409 whose ``reason`` is
@@ -2779,13 +2814,19 @@ class Computer(ComputerFields):
         503; in both cases nothing was sent to the guest.
         """
         body = _file_body(data)
-        self._t.request(
-            "PUT",
-            _api.files(self.id),
-            params=_api.upload_params(path, overwrite),
-            content=body,
-            timeout=FILE_TIMEOUT,
-        )
+        params = _api.upload_params(path, overwrite)
+        try:
+            self._t.request(
+                "PUT",
+                _api.files(self.id),
+                params=params,
+                content=body,
+                timeout=FILE_TIMEOUT,
+            )
+        except ConflictError as err:
+            if overwrite:
+                raise
+            raise _create_only_refusal(err) from err
 
     # --- windows --------------------------------------------------------
 

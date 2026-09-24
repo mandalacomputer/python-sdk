@@ -15,9 +15,12 @@ This is the summary you read to decide whether to upgrade.
   (sync and async) writes the file only if nothing is at `path`. A path that is
   taken raises the new `FileExistsError` — a `ConflictError` whose `reason` is
   `"exists"`, and Python's built-in `FileExistsError` too, which `is_transient`
-  calls permanent — and nothing is written. The default is unchanged: a write
-  replaces the file. Linux computers only. `mandala-py scp` gains
-  `--no-overwrite` for uploads.
+  calls permanent — and that request writes nothing. A create-only upload's
+  409 whose body could not be read is raised as `FileExistsError` too, never as
+  a transient conflict. If an earlier attempt's outcome was unknown, the file
+  may be yours: read it and compare before choosing another path or
+  overwriting. The default is unchanged: a write replaces the file. Linux
+  computers only. `mandala-py scp` gains `--no-overwrite` for uploads.
 
 ### Changed
 
