@@ -1,27 +1,35 @@
-"""The ``mandala`` command — a computer's shell and files from your own terminal,
-and the account's webhooks.
+"""The ``mandala-py`` command — a computer's shell and files from your own
+terminal, and the account's webhooks.
+
+Named ``mandala-py`` rather than ``mandala`` since OPL-4985. The npm package
+``mandala-computer`` installs the full ``mandala`` CLI — every command below
+plus ``login``, ``computers``, ``snapshots``, ``templates``, ``--json`` and a
+manifest — and while both packages installed a ``mandala``, whichever came
+first on PATH won and the other's docs described a command that was not there.
+This one stays for a machine with Python and no Node; the commands and their
+behaviour are unchanged, only the name.
 
 Two subcommands address a computer by name or id:
 
-``mandala terminal <computer>``
+``mandala-py terminal <computer>``
     An interactive shell in the guest, over the platform's terminal websocket —
     a PTY the platform keeps alive server-side. Disconnecting detaches the
     session rather than ending it; running the same command reattaches and
     replays recent output. ``--session`` names one of several.
 
-``mandala scp <src> <dst>``
+``mandala-py scp <src> <dst>``
     Copy one file in or out, ``scp``-style: the side spelled
     ``<computer>:/path`` is the guest. Rides the files API, so it needs no
     shell in the guest at all. A download is paged, so a file larger than the
     64 MiB one request moves copies like any other; an upload is one request,
     and one over the limit is refused before it is read.
 
-``mandala webhooks <list|create|get|update|delete|rotate|test|deliveries>``
+``mandala-py webhooks <list|create|get|update|delete|rotate|test|deliveries>``
     The account's webhook subscriptions — the CRUD only. The CLI does not
     receive webhooks; a receiver is a server, and :func:`mandala_computer.verify`
     is what it calls. ``create`` and ``rotate`` print the secret ONCE.
 
-``mandala ssh <computer> [ssh-args…]``
+``mandala-py ssh <computer> [ssh-args…]``
     Real OpenSSH, through the platform's SSH gateway, with the gateway's host
     key pinned. ``--setup`` registers a public key and switches SSH on;
     ``ssh-key``, ``ssh-access`` and ``ssh-config`` manage the pieces. It never
@@ -63,6 +71,10 @@ if TYPE_CHECKING:
 
     from mandala_computer import Client
 
+#: This command's name, in usage lines and in every message that tells a person
+#: what to run next. ``mandala`` is the npm CLI's; see the module docstring.
+PROG = "mandala-py"
+
 # The whole guest-side scrollback is smaller than this; anything bigger in one
 # frame is not the terminal protocol.
 _MAX_FRAME = 1 << 22
@@ -73,7 +85,7 @@ LOCAL_WINDOWS = os.name == "nt"
 
 
 def _die(message: str) -> NoReturn:
-    raise SystemExit(f"mandala: {message}")
+    raise SystemExit(f"{PROG}: {message}")
 
 
 #: How long a write to stdout may hold the local terminal before it gives it back.
@@ -325,7 +337,7 @@ def _unknown_status(why: str, report: Callable[[str], None] | None) -> int:
     terminal is its own again (second review pass, OPL-4479).
     """
     if report is not None:
-        report(f"mandala: {why}; reporting {EXIT_STATUS_UNKNOWN}")
+        report(f"{PROG}: {why}; reporting {EXIT_STATUS_UNKNOWN}")
     return EXIT_STATUS_UNKNOWN
 
 
@@ -585,7 +597,7 @@ def _interact(url: str) -> int:
         with suppress(OSError, ValueError):
             if sys.stderr is not None and sys.stderr.isatty():
                 print(
-                    "mandala: nothing is reading stdout — the terminal is no "
+                    f"{PROG}: nothing is reading stdout — the terminal is no "
                     "longer raw; Ctrl-C ends the session",
                     file=sys.stderr,
                     flush=True,
@@ -730,8 +742,7 @@ def _interact(url: str) -> int:
         # a wrapper gating on this status must not ship on a build whose end
         # nobody saw (OPL-4479).
         print(
-            "mandala: detached — run the same command to reattach; "
-            f"reporting {EXIT_STATUS_UNKNOWN}",
+            f"{PROG}: detached — run the same command to reattach; reporting {EXIT_STATUS_UNKNOWN}",
             file=sys.stderr,
         )
         return EXIT_STATUS_UNKNOWN
@@ -878,8 +889,8 @@ def _delivery_rows(deliveries: Sequence[WebhookDelivery]) -> str:
 
 def _secret_once(kind: str) -> None:
     print(
-        f"mandala: the secret above is shown once — store it now. {kind} it is not "
-        "readable again; `mandala webhooks rotate` mints another.",
+        f"{PROG}: the secret above is shown once — store it now. {kind} it is not "
+        f"readable again; `{PROG} webhooks rotate` mints another.",
         file=sys.stderr,
     )
 
@@ -956,7 +967,7 @@ def _cmd_webhooks_test(args: argparse.Namespace) -> int:
         delivery = client.webhooks.test(args.id)
     _json(delivery.raw)
     print(
-        f"mandala: queued, not finished — `mandala webhooks deliveries {args.id}` says what "
+        f"{PROG}: queued, not finished — `{PROG} webhooks deliveries {args.id}` says what "
         "the endpoint answered.",
         file=sys.stderr,
     )
@@ -1045,21 +1056,21 @@ def _webhooks_parser(sub: Any) -> None:
 # --- ssh -------------------------------------------------------------------
 
 SSH_USAGE = """\
-usage: mandala ssh <computer> [ssh-args ...]
-       mandala ssh --setup <computer> [--key PATH] [--json]
+usage: mandala-py ssh <computer> [ssh-args ...]
+       mandala-py ssh --setup <computer> [--key PATH] [--json]
 
 Real OpenSSH to a computer, through the platform's SSH gateway, as `user`.
 Everything after the computer goes to ssh unchanged:
 
-  mandala ssh dev
-  mandala ssh dev -L 8080:localhost:8080
-  mandala ssh dev -- uname -a
+  mandala-py ssh dev
+  mandala-py ssh dev -L 8080:localhost:8080
+  mandala-py ssh dev -- uname -a
 
 --setup registers your public key (--key PATH, or the first of
 ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub) unless it already is, and
 switches SSH on for the computer. Run it once per computer.
 
-mandala ssh never falls back to `mandala terminal`, which needs no key.
+mandala-py ssh never falls back to `mandala-py terminal`, which needs no key.
 
 environment:
   MANDALA_SSH_GATEWAY               gateway host[:port] (default ssh.mandala.computer:2222)
@@ -1069,12 +1080,12 @@ environment:
 
 def _ssh_usage_error(message: str) -> int:
     print(SSH_USAGE.split("\n\n", 1)[0], file=sys.stderr)
-    print(f"mandala ssh: error: {message}", file=sys.stderr)
+    print(f"{PROG} ssh: error: {message}", file=sys.stderr)
     return 2
 
 
 def _terminal_hint(target: str) -> str:
-    return f'or use "mandala terminal {shlex.quote(target)}" for a shell without a key'
+    return f'or use "{PROG} terminal {shlex.quote(target)}" for a shell without a key'
 
 
 def _ssh_binary() -> str:
@@ -1082,8 +1093,8 @@ def _ssh_binary() -> str:
     found = shutil.which("ssh")
     if found is None:
         print(
-            "mandala: no ssh command found on PATH; install OpenSSH, "
-            'or use "mandala terminal <computer>" for a shell without it',
+            f"{PROG}: no ssh command found on PATH; install OpenSSH, "
+            f'or use "{PROG} terminal <computer>" for a shell without it',
             file=sys.stderr,
         )
         raise SystemExit(127)
@@ -1179,12 +1190,12 @@ def _ssh_connect(target: str, extra: list[str]) -> int:
             )
         if not access.enabled:
             _die(
-                f'SSH is off for {label}; run "mandala ssh --setup {quoted}" to turn it on, '
+                f'SSH is off for {label}; run "{PROG} ssh --setup {quoted}" to turn it on, '
                 f"{_terminal_hint(target)}"
             )
         if not client.ssh_keys.list():
             _die(
-                f'you have no SSH keys registered; run "mandala ssh --setup {quoted}" to add '
+                f'you have no SSH keys registered; run "{PROG} ssh --setup {quoted}" to add '
                 f"one, {_terminal_hint(target)}"
             )
     known_hosts = _openssh.known_hosts_path()
@@ -1240,7 +1251,7 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
     if access.error:
         _die(f"the computer's host refused the SSH setting: {access.error}")
     _openssh.ensure_known_hosts(gw, _openssh.known_hosts_path())
-    command = f"mandala ssh {shlex.quote(target)}"
+    command = f"{PROG} ssh {shlex.quote(target)}"
     if as_json:
         _json(
             {
@@ -1259,7 +1270,7 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
         print(f"connect with: {command}")
     if access.pending:
         print(
-            f"mandala: {label} has not received the setting yet; it is sent again "
+            f"{PROG}: {label} has not received the setting yet; it is sent again "
             "automatically, and connecting sends it first",
             file=sys.stderr,
         )
@@ -1355,12 +1366,12 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     host = c.id if unchecked or shared else _openssh.host_alias(c.name, c.id)
     if unchecked:
         print(
-            f"mandala: could not check other computers' names; using Host {c.id} instead",
+            f"{PROG}: could not check other computers' names; using Host {c.id} instead",
             file=sys.stderr,
         )
     elif shared and host != c.name:
         print(
-            f"mandala: another computer is also named {c.name}; using Host {c.id} instead",
+            f"{PROG}: another computer is also named {c.name}; using Host {c.id} instead",
             file=sys.stderr,
         )
     snippet = _openssh.config_snippet(host, c.id, gw, known_hosts)
@@ -1390,7 +1401,7 @@ def _ssh_parsers(sub: Any) -> None:
     # Listed for --help only: `main` answers every `mandala ssh …` itself.
     sub.add_parser(
         "ssh",
-        help="real OpenSSH to a computer, through the gateway (mandala ssh --help)",
+        help=f"real OpenSSH to a computer, through the gateway ({PROG} ssh --help)",
         add_help=False,
     )
 
@@ -1430,7 +1441,7 @@ def _ssh_parsers(sub: Any) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mandala",
+        prog=PROG,
         description="Your own terminal, against a Mandala computer.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1465,10 +1476,10 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(words)
         return int(args.fn(args))
     except (MandalaError, ValueError) as e:
-        print(f"mandala: {e}", file=sys.stderr)
+        print(f"{PROG}: {e}", file=sys.stderr)
         return 1
     except OSError as e:
-        print(f"mandala: {e}", file=sys.stderr)
+        print(f"{PROG}: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         # Ctrl-C is how a person ends a transfer or a wait, not a fault, and
@@ -1479,7 +1490,7 @@ def main(argv: list[str] | None = None) -> int:
         # verb run outside that handler and ended in a traceback and a 1
         # instead (adversarial review, OPL-4479). A `BaseException`, so it
         # reaches this clause past the three above rather than through them.
-        print("mandala: interrupted", file=sys.stderr)
+        print(f"{PROG}: interrupted", file=sys.stderr)
         return 130
 
 

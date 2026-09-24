@@ -43,7 +43,7 @@ _RESERVED = frozenset(
 _MESSAGES = {
     "invalid_explicit_key": "api_key must be a nonempty string.",
     "invalid_profile": "Credential profile names must be 1–64 allowed ASCII characters.",
-    "missing_credentials": "No API key. Pass api_key=..., set MANDALA_API_KEY, or run login with the TypeScript CLI.",
+    "missing_credentials": "No API key. Pass api_key=..., set MANDALA_API_KEY, or run `mandala login` (npm install -g mandala-computer).",
     "unsupported_file_protection": "Credential files require verified POSIX protection; pass api_key or set MANDALA_API_KEY on this system.",
     "unsafe_directory": "The credential directory must be a real current-owner directory with mode 0700.",
     "unsafe_file": "The credential file must be a current-owner regular file with mode 0600 and one link.",

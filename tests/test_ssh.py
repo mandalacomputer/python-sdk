@@ -524,24 +524,24 @@ def test_ssh_honours_the_gateway_override(
             OFF,
             [KEY],
             (
-                'mandala: SSH is off for dev; run "mandala ssh --setup dev" to turn it on, '
-                'or use "mandala terminal dev" for a shell without a key'
+                'mandala-py: SSH is off for dev; run "mandala-py ssh --setup dev" to turn it on, '
+                'or use "mandala-py terminal dev" for a shell without a key'
             ),
         ),
         (
             {**ON, "available": False},
             [KEY],
             (
-                "mandala: dev was made from a template that predates SSH; create a new computer "
-                'to use SSH, or use "mandala terminal dev" for a shell without a key'
+                "mandala-py: dev was made from a template that predates SSH; create a new computer "
+                'to use SSH, or use "mandala-py terminal dev" for a shell without a key'
             ),
         ),
         (
             ON,
             [],
             (
-                'mandala: you have no SSH keys registered; run "mandala ssh --setup dev" to add '
-                'one, or use "mandala terminal dev" for a shell without a key'
+                'mandala-py: you have no SSH keys registered; run "mandala-py ssh --setup dev" to add '
+                'one, or use "mandala-py terminal dev" for a shell without a key'
             ),
         ),
     ],
@@ -571,8 +571,8 @@ def test_ssh_without_an_ssh_binary_exits_127(
         _cli.main(["ssh", "dev"])
     assert caught.value.code == 127
     assert capsys.readouterr().err == (
-        "mandala: no ssh command found on PATH; install OpenSSH, "
-        'or use "mandala terminal <computer>" for a shell without it\n'
+        "mandala-py: no ssh command found on PATH; install OpenSSH, "
+        'or use "mandala-py terminal <computer>" for a shell without it\n'
     )
     assert execs == []
 
@@ -600,7 +600,7 @@ def test_ssh_usage_errors_exit_2(
     assert _cli.main(argv) == 2
     out, err = capsys.readouterr()
     assert out == ""
-    assert f"mandala ssh: error: {message}" in err
+    assert f"mandala-py ssh: error: {message}" in err
     assert execs == []
 
 
@@ -608,7 +608,7 @@ def test_ssh_help(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.Monkey
     monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
     assert _cli.main(["ssh", "--help"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("usage: mandala ssh <computer> [ssh-args ...]")
+    assert out.startswith("usage: mandala-py ssh <computer> [ssh-args ...]")
     assert "MANDALA_SSH_GATEWAY" in out
 
 
@@ -672,7 +672,7 @@ def test_setup_registers_the_default_key_and_switches_ssh_on(
     assert json.loads(add.calls.last.request.content) == {"public_key": f"{PUBLIC_KEY} me@laptop"}
     assert json.loads(put.calls.last.request.content) == {"enabled": True}
     assert capsys.readouterr().out == (
-        f"key {FINGERPRINT} (laptop) registered\nSSH is on for dev\nconnect with: mandala ssh dev\n"
+        f"key {FINGERPRINT} (laptop) registered\nSSH is on for dev\nconnect with: mandala-py ssh dev\n"
     )
     assert kh(env).read_text() == PIN + "\n"
 
@@ -700,7 +700,7 @@ def test_setup_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         "key": KEY,
         "key_added": True,
         "ssh": ON,
-        "command": "mandala ssh dev",
+        "command": "mandala-py ssh dev",
     }
 
 
@@ -718,13 +718,13 @@ def test_setup_without_a_key_says_how_to_make_one(env: Path) -> None:
         (
             {**ON, "available": False},
             (
-                "mandala: dev was made from a template that predates SSH; "
+                "mandala-py: dev was made from a template that predates SSH; "
                 "create a new computer to use SSH"
             ),
         ),
         (
             {**ON, "error": "no room"},
-            "mandala: the computer's host refused the SSH setting: no room",
+            "mandala-py: the computer's host refused the SSH setting: no room",
         ),
     ],
 )
@@ -758,7 +758,7 @@ def test_setup_refuses_a_computer_that_predates_ssh_before_changing_anything(
     with pytest.raises(SystemExit) as caught:
         _cli.main(["ssh", "--setup", "dev", "--json"])
     assert caught.value.code == (
-        "mandala: dev was made from a template that predates SSH; create a new computer to use SSH"
+        "mandala-py: dev was made from a template that predates SSH; create a new computer to use SSH"
     )
     assert not add.called
     assert not put.called
@@ -809,7 +809,7 @@ def test_setup_refuses_a_key_somebody_else_owns(
     out, err = capsys.readouterr()
     assert out == ""
     assert err == (
-        "mandala: That key is already registered. A key can belong to one person only.\n"
+        "mandala-py: That key is already registered. A key can belong to one person only.\n"
     )
 
 
@@ -864,7 +864,7 @@ def test_ssh_key_rm_of_an_unknown_key_fails(capsys: pytest.CaptureFixture[str]) 
         return_value=httpx.Response(404, json={"error": "ssh key not found"})
     )
     assert _cli.main(["ssh-key", "rm", "sshk-x"]) == 1
-    assert capsys.readouterr().err == "mandala: ssh key not found\n"
+    assert capsys.readouterr().err == "mandala-py: ssh key not found\n"
 
 
 @respx.mock
@@ -944,7 +944,7 @@ def test_ssh_config_uses_the_id_when_another_computer_shares_the_name(
     )
     assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
     out, err = capsys.readouterr()
-    assert err == "mandala: another computer is also named dev; using Host vm-9 instead\n"
+    assert err == "mandala-py: another computer is also named dev; using Host vm-9 instead\n"
     config = env / ".ssh" / "config"
     assert out == f"wrote Host vm-9 in {config}\nconnect with: ssh vm-9\n"
     assert config.read_text() == snippet("vm-9", home=env)
@@ -968,7 +968,7 @@ def test_ssh_config_uses_the_id_when_the_listing_is_incomplete(
     )
     assert _cli.main(["ssh-config", "vm-9", "--json"]) == 0
     out, err = capsys.readouterr()
-    assert err == "mandala: could not check other computers' names; using Host vm-9 instead\n"
+    assert err == "mandala-py: could not check other computers' names; using Host vm-9 instead\n"
     printed = json.loads(out)
     assert printed["host"] == "vm-9"
     assert printed["config"] == snippet("vm-9", home=env)
