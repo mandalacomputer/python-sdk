@@ -12,8 +12,9 @@ AI agents.
 pip install mandala-computer
 ```
 
-Python 3.10 or newer. The install also puts a `mandala` command on your PATH —
-see [The `mandala` CLI](#the-mandala-cli).
+Python 3.10 or newer. The install also puts a `mandala-py` command on your
+PATH — see [The `mandala-py` CLI](#the-mandala-py-cli). The full `mandala` CLI,
+with `login`, is the npm package's.
 
 If that command answers `error: externally-managed-environment`, nothing is
 wrong: the Python you are asking is managed by something else — Homebrew on a
@@ -27,7 +28,7 @@ source .venv/bin/activate   # fish: source .venv/bin/activate.fish
 pip install mandala-computer
 ```
 
-For the `mandala` command on your PATH rather than the library in a project,
+For the `mandala-py` command on your PATH rather than the library in a project,
 let a tool manager own the environment:
 
 ```sh
@@ -47,8 +48,8 @@ npx -y mandala-computer login --profile Work --workspace Research
 ```
 
 The npm package supplies `mandala login`; the Python package does not implement
-login. Both packages install an executable named `mandala`, so use the explicit
-`npx` invocation above when both are installed. Omitting `--workspace` requests
+login. The npm package's command is `mandala`, and this package's is
+`mandala-py`, so the two can be installed together. Omitting `--workspace` requests
 account scope. Review the device and scope shown in the browser before approving.
 
 ```python
@@ -2705,18 +2706,24 @@ except mc.ConflictError:
     c.snapshot()
 ```
 
-## The `mandala` CLI
+## The `mandala-py` CLI
 
 Your own terminal against a computer, addressed by name or id. Authentication
 is the SDK's: `MANDALA_API_KEY` in the environment.
 
+`mandala-py` is the Python package's command. The npm package
+(`npm install -g mandala-computer`) installs `mandala`, which has every command
+below plus `login`, `computers`, `snapshots`, `templates` and `--json`; reach
+for it where Node is available. Through 0.5.0 both packages installed `mandala`,
+and whichever came first on PATH won.
+
 ```sh
-mandala terminal dev               # an interactive shell in the guest
-mandala ssh --setup dev            # once: register your key, switch SSH on
-mandala ssh dev                    # real OpenSSH, through the platform's gateway
-mandala scp .env dev:/home/user/app/.env
-mandala scp dev:/home/user/report.csv .
-mandala webhooks list              # and create, get, update, delete, rotate, test, deliveries
+mandala-py terminal dev               # an interactive shell in the guest
+mandala-py ssh --setup dev            # once: register your key, switch SSH on
+mandala-py ssh dev                    # real OpenSSH, through the platform's gateway
+mandala-py scp .env dev:/home/user/app/.env
+mandala-py scp dev:/home/user/report.csv .
+mandala-py webhooks list              # and create, get, update, delete, rotate, test, deliveries
 ```
 
 `terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
@@ -2729,7 +2736,7 @@ several; the shell's exit code becomes the command's own. Inside, plain
 Where the shell's status cannot be had — the link dropped before the exit frame
 arrived, or the frame carried no readable code — `terminal` exits **255** and says
 why on stderr, the same status ssh itself uses for that. It never exits 0 for a
-status it did not read, so a wrapper that gates on it — `mandala terminal dev <
+status it did not read, so a wrapper that gates on it — `mandala-py terminal dev <
 build.sh && ./deploy.sh` — will not ship on a build whose end nobody saw. Pipe
 a script in and it must end with `exit`: the guest shell is on a PTY the
 platform keeps alive, so it never sees the EOF that ends `ssh host < script`
@@ -2762,14 +2769,14 @@ and `--all-events`/`--all-computers` clear one; `--enable`/`--disable` switch
 deliveries.
 
 ```sh
-mandala webhooks create https://ci.example.com/mandala --event process.exited
-mandala webhooks update whk-2b7d4c809f3c1a7e --all-events --enable
-mandala webhooks test whk-2b7d4c809f3c1a7e && mandala webhooks deliveries whk-2b7d4c809f3c1a7e
+mandala-py webhooks create https://ci.example.com/mandala --event process.exited
+mandala-py webhooks update whk-2b7d4c809f3c1a7e --all-events --enable
+mandala-py webhooks test whk-2b7d4c809f3c1a7e && mandala-py webhooks deliveries whk-2b7d4c809f3c1a7e
 ```
 
 ### SSH access
 
-`mandala ssh` is real OpenSSH: your own `ssh` binary, your own key, port
+`mandala-py ssh` is real OpenSSH: your own `ssh` binary, your own key, port
 forwarding, `scp` and `sftp`. Connections go through the platform's SSH gateway
 (`ssh.mandala.computer`, port 2222), a jump host that checks your key; the
 computer's own sshd then logs you in as `user`.
@@ -2777,19 +2784,19 @@ computer's own sshd then logs you in as `user`.
 Once per computer, register a public key and switch SSH on:
 
 ```sh
-mandala ssh --setup dev            # uses ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub
-mandala ssh --setup dev --key ~/.ssh/work.pub
+mandala-py ssh --setup dev            # uses ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub
+mandala-py ssh --setup dev --key ~/.ssh/work.pub
 ```
 
 `--setup` is safe to repeat: a key whose fingerprint is already registered is
 not uploaded again. Then connect. Everything after the computer goes to `ssh`
-unchanged, and `mandala ssh` exits with `ssh`'s own status:
+unchanged, and `mandala-py ssh` exits with `ssh`'s own status:
 
 ```sh
-mandala ssh dev
-mandala ssh dev -- uname -a
-mandala ssh dev -L 8080:localhost:8080     # the guest's port 8080 on yours
-mandala ssh dev -i ~/.ssh/work             # the key is offered to the gateway too
+mandala-py ssh dev
+mandala-py ssh dev -- uname -a
+mandala-py ssh dev -L 8080:localhost:8080     # the guest's port 8080 on yours
+mandala-py ssh dev -i ~/.ssh/work             # the key is offered to the gateway too
 ```
 
 The CLI fills in the jump and pins the gateway's host key, in a known_hosts
@@ -2797,7 +2804,7 @@ file it keeps at `~/.mandala/ssh_known_hosts`. Each computer's own host key is
 trusted the first time you connect and stored in the same file under the
 computer's id, so renaming the computer does not look like a new machine.
 
-`mandala ssh` never falls back to `mandala terminal`. If SSH is off for the
+`mandala-py ssh` never falls back to `mandala-py terminal`. If SSH is off for the
 computer, you have no key registered, the computer was made from a template
 that predates SSH (create a new computer), or there is no `ssh` on your PATH
 (exit 127), it exits non-zero with one line saying what to do.
@@ -2805,11 +2812,11 @@ that predates SSH (create a new computer), or there is no `ssh` on your PATH
 The pieces, one at a time:
 
 ```sh
-mandala ssh-key list               # --json for the rows
-mandala ssh-key add [PATH] [--name NAME]
-mandala ssh-key rm sshk-74025eba1b658b99
-mandala ssh-access dev             # the status; --json for the object
-mandala ssh-access dev on          # or off
+mandala-py ssh-key list               # --json for the rows
+mandala-py ssh-key add [PATH] [--name NAME]
+mandala-py ssh-key rm sshk-74025eba1b658b99
+mandala-py ssh-access dev             # the status; --json for the object
+mandala-py ssh-access dev on          # or off
 ```
 
 A key belongs to you rather than to an account, and reaches the computers of
@@ -2817,7 +2824,7 @@ every account you are an owner or member of. Each person holds eight.
 
 #### Without the CLI: `ssh-config`, VS Code, scp and sftp
 
-`mandala ssh-config dev` prints a `~/.ssh/config` entry: a `Host` block for the
+`mandala-py ssh-config dev` prints a `~/.ssh/config` entry: a `Host` block for the
 gateway, with its pinned key, and a `Host dev` block that jumps through it.
 `--write` adds it to `~/.ssh/config` between marker comments, replacing the
 block it wrote before for that computer and leaving everything else alone (a
@@ -2825,7 +2832,7 @@ missing file is created with mode 0600). After that, every OpenSSH tool knows
 the computer by name:
 
 ```sh
-mandala ssh-config dev --write
+mandala-py ssh-config dev --write
 ssh dev
 scp report.csv dev:/home/user/
 sftp dev
@@ -2848,9 +2855,9 @@ The gateway's host key fingerprint is
 
 #### `terminal` or `ssh`?
 
-`mandala terminal` needs no key and no SSH setting: it is a shell over the
+`mandala-py terminal` needs no key and no SSH setting: it is a shell over the
 platform's own websocket, on a PTY the platform keeps alive, so a disconnect
-detaches rather than ends it. `mandala ssh` is OpenSSH end to end, so it has
+detaches rather than ends it. `mandala-py ssh` is OpenSSH end to end, so it has
 forwarding, `scp`, `sftp`, agent forwarding and every editor that speaks SSH,
 and a session ends when the connection does.
 

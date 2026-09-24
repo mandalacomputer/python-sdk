@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mandala-computer"
-version = "0.5.0"
+version = "0.5.1"
 description = "Python SDK for Mandala Computer — cloud desktops for AI agents"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,7 +31,9 @@ classifiers = [
 dependencies = ["httpx>=0.27", "websockets>=14"]
 
 [project.scripts]
-mandala = "mandala_computer._cli:main"
+# Not "mandala": that is the npm package's full CLI, and two commands of one
+# name made PATH order decide which one a person got (OPL-4985).
+mandala-py = "mandala_computer._cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "ruff>=0.6", "mypy>=1.11", "h2>=4,<5", "openai==3.14.1"]

@@ -7,6 +7,17 @@ project is pre-1.0, so a minor version may carry a behaviour change.
 The reasoning behind a change lives in its commit message rather than here.
 This is the summary you read to decide whether to upgrade.
 
+## [0.5.1] — unreleased
+
+### Changed
+
+- **The command is `mandala-py`.** The package no longer installs `mandala`,
+  which is the npm package's full CLI (`npm install -g mandala-computer`), with
+  `login`, `computers`, `snapshots`, `templates` and `--json`. Both installed a
+  `mandala`, and whichever came first on PATH won. `mandala-py` has the same
+  commands as before: `terminal`, `scp`, `ssh`, `ssh-key`, `ssh-access`,
+  `ssh-config` and `webhooks`. SSH config blocks written by either keep working.
+
 ## [0.5.0] — 2026-09-23
 
 ### Added
