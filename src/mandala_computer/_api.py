@@ -665,6 +665,22 @@ def files_params(path: str) -> dict[str, str]:
     return {"path": text}
 
 
+def upload_params(path: str, overwrite: bool) -> dict[str, str]:
+    """The query for an upload: :func:`files_params`, plus create-only if asked.
+
+    ``overwrite=False`` sends ``overwrite=false``, which makes the platform
+    write the file only if nothing is at ``path`` (OPL-4994). ``True`` sends
+    nothing: absent means replace on every platform version, so the default
+    request is the one this client always sent. Checked with :func:`flag`,
+    because ``"false"`` is a non-empty string and would read as true — replacing
+    the very file the caller asked to keep.
+    """
+    params = files_params(path)
+    if not flag(overwrite, "overwrite"):
+        params["overwrite"] = "false"
+    return params
+
+
 def files_range(offset: int, length: int | None) -> dict[str, str]:
     """The ``Range`` header for one window of a guest file.
 

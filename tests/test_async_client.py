@@ -727,6 +727,22 @@ async def test_async_write_file_refuses_an_oversized_body_before_the_request(
 
 
 @respx.mock
+async def test_async_write_file_is_create_only_when_asked(client: mc.AsyncClient) -> None:
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, json={}))
+    computer = mc.AsyncComputer(client._t, COMPUTER)
+    await computer.write_file("/tmp/a", b"hi")
+    assert dict(put.calls.last.request.url.params) == {"path": "/tmp/a"}
+    await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    assert dict(put.calls.last.request.url.params) == {"path": "/tmp/a", "overwrite": "false"}
+
+    put.mock(httpx.Response(409, json={"error": "already exists", "reason": "exists"}))
+    with pytest.raises(mc.FileExistsError) as caught:
+        await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    assert caught.value.reason == "exists" and not mc.is_transient(caught.value)
+    await client.aclose()
+
+
+@respx.mock
 async def test_async_download_file_pages_until_the_file_ends(
     client: mc.AsyncClient, tmp_path
 ) -> None:

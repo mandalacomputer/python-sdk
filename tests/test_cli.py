@@ -137,6 +137,72 @@ def test_scp_upload_to_directory_keeps_basename(tmp_path) -> None:
 
 
 @respx.mock
+def test_scp_no_overwrite_sends_create_only(tmp_path) -> None:
+    """``--no-overwrite`` sends ``overwrite=false``; without it nothing extra (OPL-4994)."""
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(return_value=httpx.Response(200))
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hi")
+
+    assert _cli.main(["scp", str(src), "dev:/home/user/notes.txt"]) == 0
+    assert "overwrite" not in put.calls.last.request.url.params
+    assert _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"]) == 0
+    params = put.calls.last.request.url.params
+    assert params["overwrite"] == "false" and params["path"] == "/home/user/notes.txt"
+
+
+@respx.mock
+def test_scp_no_overwrite_says_the_path_is_taken(tmp_path) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(409, json={"error": "already exists", "reason": "exists"})
+    )
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hi")
+
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"])
+    message = str(caught.value)
+    assert "dev:/home/user/notes.txt already exists" in message
+    assert "this upload wrote nothing" in message
+    # A retry after a lost answer meets its own file; only THIS attempt is known.
+    assert "If an earlier attempt's outcome was unknown, the file may be yours" in message
+    assert "read it and compare" in message and "--no-overwrite" in message
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        lambda: httpx.Response(409, json={"error": "a file already exists"}),
+        lambda: httpx.Response(409, content=b""),
+        lambda: httpx.Response(409, content=b"<html>conflict</html>"),
+    ],
+    ids=["reasonless-json", "empty", "proxy-page"],
+)
+@respx.mock
+def test_scp_no_overwrite_never_says_taken_without_the_word(tmp_path, answer) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(side_effect=lambda request: answer())
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hi")
+
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["scp", "--no-overwrite", str(src), "dev:/home/user/notes.txt"])
+    message = str(caught.value)
+    assert "refused as a conflict, reason unknown" in message
+    assert "already exists" not in message
+    # Even the JSON one: a reasonless 409 does not prove the write never landed.
+    assert "wrote nothing" not in message
+    assert "whether this upload wrote anything is unconfirmed" in message
+
+
+def test_scp_no_overwrite_is_refused_on_a_download(tmp_path) -> None:
+    with pytest.raises(SystemExit, match="applies to an upload, not a download"):
+        _cli.main(["scp", "--no-overwrite", "dev:/home/user/report.csv", str(tmp_path / "r")])
+    assert list(tmp_path.iterdir()) == []
+
+
+@respx.mock
 def test_scp_download_writes_local_file(tmp_path) -> None:
     respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
     respx.get(f"{BASE}/computers/vm-1/files").mock(

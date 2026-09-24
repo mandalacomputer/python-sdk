@@ -4675,6 +4675,61 @@ def test_write_file_refuses_an_unpaired_surrogate_as_value_error(client: mc.Clie
     assert not put.called
 
 
+@respx.mock
+def test_write_file_sends_overwrite_false_only_when_asked(client: mc.Client) -> None:
+    """Create-only is opt-in; the default request is the one always sent (OPL-4994)."""
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200, json={}))
+    c = _computer(client)
+
+    c.write_file("/tmp/a", b"hi")
+    assert dict(put.calls.last.request.url.params) == {"path": "/tmp/a"}
+    c.write_file("/tmp/a", b"hi", overwrite=True)
+    assert dict(put.calls.last.request.url.params) == {"path": "/tmp/a"}
+    c.write_file("/tmp/a", b"hi", overwrite=False)
+    assert dict(put.calls.last.request.url.params) == {"path": "/tmp/a", "overwrite": "false"}
+    assert put.calls.last.request.content == b"hi"
+
+
+@respx.mock
+def test_write_file_refuses_an_overwrite_that_is_not_a_bool(client: mc.Client) -> None:
+    """``"false"`` is truthy; read as a bool it would replace the file it meant to keep."""
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200))
+    with pytest.raises(ValueError, match="overwrite must be True or False"):
+        _computer(client).write_file("/tmp/a", b"hi", overwrite="false")  # type: ignore[arg-type]
+    assert not put.called
+
+
+@respx.mock
+def test_write_file_raises_file_exists_when_the_path_is_taken(client: mc.Client) -> None:
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(409, json={"error": "a file already exists at /tmp/a", "reason": "exists"})
+    )
+    with pytest.raises(mc.FileExistsError) as caught:
+        _computer(client).write_file("/tmp/a", b"hi", overwrite=False)
+    error = caught.value
+    # Still a ConflictError, and the built-in too, so older handlers catch it.
+    assert isinstance(error, mc.ConflictError)
+    assert isinstance(error, FileExistsError)
+    assert error.status == 409 and error.reason == "exists"
+    assert "already exists" in str(error)
+    # A plain ConflictError is transient; this is a decision, not a moment.
+    assert not mc.is_transient(error)
+
+
+@respx.mock
+@pytest.mark.parametrize("reason", ["unsupported", "some-future-word"])
+def test_write_file_leaves_other_create_only_refusals_as_their_words(
+    client: mc.Client, reason: str
+) -> None:
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        httpx.Response(409, json={"error": "refused", "reason": reason})
+    )
+    with pytest.raises(mc.ConflictError) as caught:
+        _computer(client).write_file("/tmp/a", b"hi", overwrite=False)
+    assert not isinstance(caught.value, mc.FileExistsError)
+    assert caught.value.reason == reason
+
+
 def test_the_sdk_timeout_is_also_the_builtin_timeout() -> None:
     error = mc.TimeoutError("gave up")
     assert isinstance(error, mc.MandalaError)

@@ -1,6 +1,8 @@
 """Async transport diagnostics and stream ownership match the sync public API."""
 
 import asyncio
+import builtins
+import traceback
 
 import httpx
 import pytest
@@ -361,3 +363,72 @@ async def test_async_all_response_readers_preserve_headers(mode):
                     **({"max_bytes": 4096} if mode.startswith("bounded") else {}),
                 )
     assert_metadata(caught.value)
+
+
+async def test_async_create_only_409_with_an_interrupted_body_is_never_transient():
+    """The async half of the sync test of the same name (OPL-4994, Codex review)."""
+    computer_row = {"id": "vm-1", "name": "dev", "status": "running"}
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(409, stream=Broken())
+        return httpx.Response(200, json=computer_row)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        computer = mc.AsyncComputer(client._t, computer_row)
+        with pytest.raises(mc.CreateOnlyConflictError) as caught:
+            await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    assert not isinstance(caught.value, builtins.FileExistsError)
+    assert caught.value.reason is None and not mc.is_transient(caught.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "conflict"},
+        {"reason": 5},
+        {"error": "conflict", "reason": None},
+        {"reason": ""},
+        {"reason": "   "},
+        {},
+        {"error": "a file already exists at that path"},
+    ],
+    ids=[
+        "missing",
+        "numeric",
+        "null",
+        "empty-string",
+        "blank-string",
+        "empty-object",
+        "existence-text",
+    ],
+)
+async def test_async_create_only_409_with_no_usable_reason_is_never_transient(body):
+    """The async half of the sync test of the same name (OPL-4994, Codex review)."""
+    computer_row = {"id": "vm-1", "name": "dev", "status": "running"}
+
+    def handler(request):
+        if request.method == "PUT":
+            return httpx.Response(409, json=body)
+        return httpx.Response(200, json=computer_row)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        computer = mc.AsyncComputer(client._t, computer_row)
+        with pytest.raises(mc.CreateOnlyConflictError) as caught:
+            await computer.write_file("/tmp/a", b"hi", overwrite=False)
+    error = caught.value
+    assert not isinstance(error, (mc.FileExistsError, builtins.FileExistsError))
+    assert error.reason is None
+    assert "refused as a conflict, reason unknown" in str(error)
+    assert "already exists" not in str(error)
+    assert not mc.is_transient(error)
+    # Not chained to the original, whose message is the body's own text.
+    assert error.__cause__ is None and error.__suppress_context__
+    assert "already exists" not in "".join(traceback.format_exception(error))
+    assert error.body == body

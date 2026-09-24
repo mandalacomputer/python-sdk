@@ -9,6 +9,21 @@ This is the summary you read to decide whether to upgrade.
 
 ## [0.5.1] — unreleased
 
+### Added
+
+- **Create-only uploads.** `computer.write_file(path, data, overwrite=False)`
+  (sync and async) writes the file only if nothing is at `path`. A path that is
+  taken raises the new `FileExistsError` — a `ConflictError` whose `reason` is
+  `"exists"`, and Python's built-in `FileExistsError` too, which `is_transient`
+  calls permanent — and that request writes nothing. A create-only upload's
+  409 with no usable reason (a body that could not be read, or JSON without a
+  string `reason`) raises the new `CreateOnlyConflictError`, a `ConflictError`
+  that `is_transient` calls permanent and that claims nothing about the path;
+  `FileExistsError` is only the platform's explicit `exists`. If an earlier attempt's outcome was unknown, the file
+  may be yours: read it and compare before choosing another path or
+  overwriting. The default is unchanged: a write replaces the file. Linux
+  computers only. `mandala-py scp` gains `--no-overwrite` for uploads.
+
 ### Changed
 
 - **The command is `mandala-py`.** The package no longer installs `mandala`,

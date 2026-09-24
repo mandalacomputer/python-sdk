@@ -47,6 +47,7 @@ from ._computer import (
     _attach_agent_partial,
     _clipboard_text,
     _continues,
+    _create_only_refusal,
     _cursor,
     _download_sink,
     _empty_guest_file,
@@ -76,6 +77,7 @@ from ._events import (
 )
 from ._exceptions import (
     APIError,
+    ConflictError,
     ConnectionError,
     MandalaError,
     RangeNotSatisfiableError,
@@ -1341,19 +1343,29 @@ class AsyncComputer(ComputerFields):
                 _continues(path, asked, part, was)
         return written
 
-    async def write_file(self, path: str, data: bytes | str) -> None:
+    async def write_file(self, path: str, data: bytes | str, *, overwrite: bool = True) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
-        See :meth:`mandala_computer.Computer.write_file`.
+        See :meth:`mandala_computer.Computer.write_file`, including
+        ``overwrite=False`` for a create-only write.
         """
         body = _file_body(data)
-        await self._t.request(
-            "PUT",
-            _api.files(self.id),
-            params=_api.files_params(path),
-            content=body,
-            timeout=FILE_TIMEOUT,
-        )
+        params = _api.upload_params(path, overwrite)
+        try:
+            await self._t.request(
+                "PUT",
+                _api.files(self.id),
+                params=params,
+                content=body,
+                timeout=FILE_TIMEOUT,
+            )
+        except ConflictError as err:
+            if overwrite:
+                raise
+            refusal = _create_only_refusal(err)
+            if refusal is err:
+                raise
+            raise refusal from None
 
     # --- windows --------------------------------------------------------
 

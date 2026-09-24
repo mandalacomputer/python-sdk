@@ -23,6 +23,8 @@ Two subcommands address a computer by name or id:
     shell in the guest at all. A download is paged, so a file larger than the
     64 MiB one request moves copies like any other; an upload is one request,
     and one over the limit is refused before it is read.
+    ``--no-overwrite`` makes an upload create-only: a guest path that is
+    already taken is refused and nothing is written.
 
 ``mandala-py webhooks <list|create|get|update|delete|rotate|test|deliveries>``
     The account's webhook subscriptions — the CRUD only. The CLI does not
@@ -63,7 +65,7 @@ from . import _openssh
 from ._api import looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
-from ._exceptions import ConflictError, MandalaError
+from ._exceptions import ConflictError, CreateOnlyConflictError, FileExistsError, MandalaError
 from ._models import Listing, SshAccess, SshKey, Webhook, WebhookDelivery
 
 if TYPE_CHECKING:
@@ -796,6 +798,11 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     src, dst = _remote_side(args.src), _remote_side(args.dst)
     if (src is None) == (dst is None):
         _die("exactly one side must be a computer, spelled <computer>:/path")
+    # The flag is the platform's create-only upload. A download writes a LOCAL
+    # file, which that option says nothing about, and quietly ignoring the flag
+    # there would replace a file the caller asked to keep.
+    if src is not None and args.no_overwrite:
+        _die("--no-overwrite applies to an upload, not a download")
 
     if src is not None:
         target, remote_path = src
@@ -838,7 +845,27 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     if len(data) > FILE_SIZE_LIMIT:
         _die(f"{args.src} exceeds the 64 MiB file-transfer limit")
     with _client() as client:
-        _resolve(client, target).write_file(remote_path, data)
+        try:
+            _resolve(client, target).write_file(remote_path, data, overwrite=not args.no_overwrite)
+        except FileExistsError:
+            # Only THIS upload is known to have written nothing: an earlier
+            # attempt whose answer was lost may have written the file itself.
+            _die(
+                f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
+                "earlier attempt's outcome was unknown, the file may be yours: read it and "
+                "compare before choosing another path or dropping --no-overwrite to replace it."
+            )
+        except CreateOnlyConflictError:
+            # No usable reason, so nothing here says the path is taken, nor that
+            # this upload wrote nothing: without the platform's word, a 409 (JSON
+            # or not) may come from a hop that had already forwarded the write.
+            _die(
+                f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
+                "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
+                "send the same upload again blind: read "
+                "the remote path to see what is there before choosing another path or "
+                "dropping --no-overwrite."
+            )
     print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0
 
@@ -1459,6 +1486,11 @@ def _parser() -> argparse.ArgumentParser:
     scp = sub.add_parser("scp", help="copy one file in or out of the guest")
     scp.add_argument("src", metavar="SRC", help="local path, or <computer>:/path")
     scp.add_argument("dst", metavar="DST", help="local path, or <computer>:/path")
+    scp.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="upload only: create the guest file, refusing if something is there",
+    )
     scp.set_defaults(fn=_cmd_scp)
 
     _ssh_parsers(sub)

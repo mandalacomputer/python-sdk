@@ -14,6 +14,8 @@ __all__ = [
     "ConflictError",
     "ConnectionError",
     "ConnectionInterruptedError",
+    "CreateOnlyConflictError",
+    "FileExistsError",
     "FileTooLargeError",
     "GatewayTimeoutError",
     "MandalaError",
@@ -71,7 +73,15 @@ _REASON_CLEARS = frozenset({"contention", "starting"})
 #: today. What changes is that a future status for this refusal cannot quietly make
 #: it look replayable. The status still says what to do about it — 401 present a
 #: credential again, 403 the role changed and signing in again will not help.
-_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked"})
+#:
+#: ``exists`` is a create-only upload (``write_file(..., overwrite=False)``)
+#: refused because something is already at the path (OPL-4994). Nothing was
+#: written, and the same request answers the same way until whatever is there is
+#: moved or the caller agrees to replace it — so it is permanent, and has to be
+#: said: without it this would be an ordinary :class:`ConflictError`, which
+#: :func:`is_transient` calls worth sending again. :class:`FileExistsError` is
+#: the class it arrives as.
+_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked", "exists"})
 
 
 def _refusal_reason(body: object) -> str | None:
@@ -120,8 +130,8 @@ class APIError(MandalaError):
         #: A delay alone does not mean that replaying the request is safe.
         self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
-        #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"`` or
-        #: ``"unsupported"`` (OPL-3898). ``None`` where it sent nothing, which
+        #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
+        #: ``"unsupported"`` (OPL-3898), ``"revoked"`` or ``"exists"``. ``None`` where it sent nothing, which
         #: is most errors and always will be — not every refusal has one of
         #: those four answers, and the platform is explicit that absent means
         #: unclassified rather than "none of them".
@@ -529,6 +539,60 @@ class MoveRequiredError(ConflictError):
         self.move_possible = move_possible
 
 
+class FileExistsError(ConflictError, builtins.FileExistsError):
+    """A create-only upload found something already at the path (409).
+
+    ``write_file(path, data, overwrite=False)`` asks the platform to create the
+    file only if nothing is at ``path``. When something is, the answer is 409
+    with ``reason`` ``"exists"`` and this request wrote NOTHING — the file that was
+    there is untouched.
+
+    Its own class for the reason :class:`MoveRequiredError` has one: it is a
+    :class:`ConflictError` by status and the opposite of one by nature. A
+    conflict clears by waiting; this clears only when the caller decides — pick
+    another path, or send the write again without ``overwrite=False`` to replace
+    the file on purpose. :func:`is_transient` says ``False`` to it.
+
+    A subclass of :class:`ConflictError`, so ``except ConflictError`` written
+    before this existed still catches it, and of Python's built-in
+    :class:`FileExistsError`, so an ordinary handler for that catches it too —
+    the same pairing :class:`ConnectionError` and :class:`TimeoutError` make
+    with their built-ins.
+
+    "Nothing was written" is about THIS request. A create-only upload whose
+    earlier attempt lost its response may well have written the file itself, and
+    the retry then meets its own file here. If an earlier attempt's outcome was
+    unknown, read the file and compare it before choosing another path or
+    overwriting.
+
+    Raised only for the platform's explicit ``reason`` ``"exists"``, so the
+    class is the claim: something is at the path. A create-only 409 whose
+    reason could not be read is :class:`CreateOnlyConflictError` instead, which
+    claims nothing about the path.
+    """
+
+
+class CreateOnlyConflictError(ConflictError):
+    """A create-only upload refused with 409 whose reason could not be read.
+
+    ``write_file(path, data, overwrite=False)`` is answered 409 ``exists``
+    (:class:`FileExistsError`) or 409 ``unsupported`` when it is refused. A 409
+    can also arrive with no usable reason: the body interrupted in flight,
+    empty, a proxy's page instead of the platform's JSON, or JSON whose
+    ``reason`` is missing, not a string, or blank. That refusal is raised as
+    this class, with :attr:`~APIError.reason` ``None`` and a message saying the
+    reason is unknown. It does NOT say the path is taken, and it is NOT
+    Python's built-in :class:`FileExistsError`, so a handler for that does not
+    swallow it.
+
+    Final, not transient: :func:`is_transient` says ``False`` to it. Sending the
+    same create-only write again repeats a refusal that was not said to clear,
+    and a delayed retry after the path is cleared could create the file when no
+    one expected it. Read the path to find out what is there before deciding.
+    The raw body stays on :attr:`~APIError.body` for diagnostics.
+    """
+
+
 class UnavailableError(APIError):
     """Something between the request and a hypervisor could not be reached (503).
 
@@ -708,6 +772,11 @@ def is_transient(err: BaseException) -> bool:
     """
     if isinstance(err, MoveRequiredError):
         return False
+    # By class as well as by word: a create-only upload whose 409 carried no
+    # usable reason has no ``reason`` at all, and would otherwise fall through to
+    # the ConflictError branch below and be called worth sending again.
+    if isinstance(err, (FileExistsError, CreateOnlyConflictError)):
+        return False
     # A lost RESPONSE is not a request that never left, and only one of the two
     # is safe to replay blind. Same shape as the line above and the same reason:
     # a subclass of a branch below that would otherwise say yes (OPL-3855).
@@ -836,7 +905,9 @@ def _is_transient_for_poll(err: BaseException) -> bool:
     """
     if not isinstance(err, (APIError, ConnectionError, TimeoutError)):
         return False
-    if isinstance(err, (MoveRequiredError, OriginTLSError)):
+    if isinstance(
+        err, (MoveRequiredError, FileExistsError, CreateOnlyConflictError, OriginTLSError)
+    ):
         return False
     if isinstance(err, APIError):
         if err.status == 524:

@@ -46,7 +46,10 @@ from ._events import (
 )
 from ._exceptions import (
     APIError,
+    ConflictError,
     ConnectionError,
+    CreateOnlyConflictError,
+    FileExistsError,
     MandalaError,
     RangeNotSatisfiableError,
     RateLimitError,
@@ -230,6 +233,50 @@ def _attach_agent_partial(exc: APIError) -> None:
     failure = to_agent_event("error", {**exc.body, "status": exc.status}, 0)
     if isinstance(failure, AgentFailed):  # defensive: the converter owns this shape
         exc.agent = failure
+
+
+def _create_only_refusal(err: ConflictError) -> ConflictError:
+    """A create-only upload's 409, never left looking like a passing conflict.
+
+    The platform answers a create-only upload's taken path with 409 ``exists``,
+    and the transport maps that body to :class:`FileExistsError`. But a 409 can
+    arrive without a word this SDK can read: the body interrupted in flight,
+    empty, a proxy's page instead of the platform's JSON, or JSON with no
+    ``reason``, a ``reason`` that is not a string, or a blank one. A bare
+    :class:`ConflictError` is what :func:`is_transient` calls worth sending
+    again — a retry of a refusal that was not said to clear, and one that could
+    create the file later if the path were cleared in between. So the request's
+    own context, create-only, decides here what the status alone cannot: the
+    refusal is a :class:`CreateOnlyConflictError`, final, with a message that
+    says only that it was a conflict whose reason is unknown. A 409 that DID
+    carry a string reason is returned as it is, whatever the word.
+
+    The caller raises the result ``from None`` when it is new: the original
+    error's message is the body's own text, which could say "already exists"
+    without the platform's ``exists`` reason, and a chained traceback would
+    print it. The body stays on the new error.
+    """
+    if isinstance(err, (FileExistsError, CreateOnlyConflictError)) or (
+        isinstance(err.reason, str) and err.reason.strip()
+    ):
+        return err
+    refusal = CreateOnlyConflictError(
+        # Neutral on purpose, and not the body's own text: a reasonless body whose
+        # ``error`` says "already exists" would carry the very claim this avoids.
+        "a create-only upload was refused as a conflict, reason unknown: the 409 "
+        "carried no reason that could be read, so whether the path is taken was not said; "
+        "treat it as final rather than sending the same write again",
+        status=err.status,
+        body=err.body,
+        retry_after=err.retry_after,
+        request_id=err.request_id,
+        allow=err.allow,
+        www_authenticate=err.www_authenticate,
+    )
+    # The constructor reads the body again, and would keep a blank word. Unknown
+    # is ``None``, as documented on CreateOnlyConflictError.
+    refusal.reason = None
+    return refusal
 
 
 def _file_body(data: bytes | str) -> bytes:
@@ -2759,22 +2806,49 @@ class Computer(ComputerFields):
                 _continues(path, asked, part, was)
         return written
 
-    def write_file(self, path: str, data: bytes | str) -> None:
+    def write_file(self, path: str, data: bytes | str, *, overwrite: bool = True) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
         A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
         The bytes land exactly as given — this is how a credential reaches a
         guest ``.env`` without echoing it through a shell command line.
         Bodies over 64 MiB are refused before any request is made.
+
+        ``overwrite=False`` makes the write create-only: the file is written
+        only if nothing is at ``path`` yet. When something is, the platform
+        refuses with :class:`~mandala_computer.FileExistsError` (a 409 whose
+        ``reason`` is ``"exists"``) and this request writes nothing — the file
+        already there is untouched. If an earlier attempt's outcome was unknown
+        (its response was lost), that file may be the one it wrote: read it and
+        compare before choosing another path or overwriting. A 409 with no
+        usable reason (a body that could not be read, or JSON without a string
+        ``reason``) is raised as
+        :class:`~mandala_computer.CreateOnlyConflictError`, with ``reason``
+        ``None`` and a message saying the reason is unknown: final, and not a
+        claim that the path is taken. The default, ``True``, replaces whatever is at
+        ``path``, as this method always has. Linux computers only: a Windows
+        computer refuses ``overwrite=False`` with a 400. A host that cannot do
+        create-only yet refuses it with a 409 whose ``reason`` is
+        ``"unsupported"``, and one whose support could not be confirmed with a
+        503; in both cases nothing was sent to the guest.
         """
         body = _file_body(data)
-        self._t.request(
-            "PUT",
-            _api.files(self.id),
-            params=_api.files_params(path),
-            content=body,
-            timeout=FILE_TIMEOUT,
-        )
+        params = _api.upload_params(path, overwrite)
+        try:
+            self._t.request(
+                "PUT",
+                _api.files(self.id),
+                params=params,
+                content=body,
+                timeout=FILE_TIMEOUT,
+            )
+        except ConflictError as err:
+            if overwrite:
+                raise
+            refusal = _create_only_refusal(err)
+            if refusal is err:
+                raise
+            raise refusal from None
 
     # --- windows --------------------------------------------------------
 
