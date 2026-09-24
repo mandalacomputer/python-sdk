@@ -86,6 +86,12 @@ UNIMPLEMENTED = {
     ("GET", "computers/:id/activities/:activity/results"),
     # Passive platform signals have no SDK convenience method yet.
     ("GET", "computers/:id/signals"),
+    # The account's secret store (OPL-4984); no SDK method yet.
+    ("GET", "secrets"),
+    ("POST", "secrets"),
+    ("GET", "secrets/:id"),
+    ("PUT", "secrets/:id"),
+    ("DELETE", "secrets/:id"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -109,6 +115,17 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/activities  query:changes",
     "GET computers/:id/signals  query:since",
     "GET computers/:id/signals  query:limit",
+    # The account's secret store (OPL-4984) is not wrapped yet; see UNIMPLEMENTED.
+    "GET secrets  query:workspace_id",
+    "POST secrets  body:name",
+    "POST secrets  body:value",
+    "POST secrets  body:workspace_id",
+    "GET secrets/:id  query:workspace_id",
+    "PUT secrets/:id  body:revision_id",
+    "PUT secrets/:id  body:value",
+    "PUT secrets/:id  body:workspace_id",
+    "DELETE secrets/:id  query:revision_id",
+    "DELETE secrets/:id  query:workspace_id",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",

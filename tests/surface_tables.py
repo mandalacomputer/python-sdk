@@ -115,6 +115,12 @@ ALLOWED = {
     # A computer's secret bindings, read and replaced whole (OPL-4963).
     ("GET", "computers/:id/secrets"),
     ("PUT", "computers/:id/secrets"),
+    # The account's secret store (OPL-4984).
+    ("GET", "secrets"),
+    ("POST", "secrets"),
+    ("GET", "secrets/:id"),
+    ("PUT", "secrets/:id"),
+    ("DELETE", "secrets/:id"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -327,4 +333,10 @@ PARAMETERS: dict[str, set[str]] = {
     # The replace takes the whole list and the version it was read at.
     "GET computers/:id/secrets": set(),
     "PUT computers/:id/secrets": {"body:secrets", "body:version"},
+    # The account's secret store (OPL-4984).
+    "GET secrets": {"query:workspace_id"},
+    "POST secrets": {"body:name", "body:value", "body:workspace_id"},
+    "GET secrets/:id": {"query:workspace_id"},
+    "PUT secrets/:id": {"body:revision_id", "body:value", "body:workspace_id"},
+    "DELETE secrets/:id": {"query:revision_id", "query:workspace_id"},
 }
