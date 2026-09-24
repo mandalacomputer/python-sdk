@@ -23,9 +23,58 @@ This is the summary you read to decide whether to upgrade.
   may be yours: read it and compare before choosing another path or
   overwriting. The default is unchanged: a write replaces the file. Linux
   computers only. `mandala-py scp` gains `--no-overwrite` for uploads.
+- **The account's secret store.** `client.secrets.list/get/create/replace/delete`
+  (sync and async) over `GET/POST /secrets` and `GET/PUT/DELETE /secrets/{id}`,
+  each taking `workspace_id` for a workspace's scope. Values are write-only: a
+  `Secret` carries its name, id, scope and `revision_id`, never a value. A
+  replace and a delete send the `revision_id` a read answered, and a delete
+  requires it. `client.secrets.set(name, value)` creates the name or replaces
+  its value, matching names ignoring ASCII case as the platform does, and reads
+  again up to three times on a conflict. `SecretList` carries the store's
+  `limits` and whether `delivery` is available.
+- **`mandala-py secrets list | set NAME | rm NAME`**, with `--workspace`. `set`
+  reads the value from stdin (one trailing newline dropped; `--keep-newline`
+  keeps it) or a prompt that does not echo — never from the command line.
+- **A computer's secret state.** `Computer.secret_bindings`,
+  `secrets_generation`, `secrets_applied` (a `SecretsReceipt`),
+  `secrets_error`, and `secrets_pending`, which is `True`, `False` or `None`
+  when the platform could not check — never folded into `False`.
+- **`no_wake=True`** on `read_file`, `read_text_file`, `read_file_part`,
+  `download_file` and `write_file`: require a running computer rather than
+  resume one. The refusal is the new `ComputerNotRunningError`, a
+  `ConflictError` that `is_transient` calls permanent.
+- **`Computer.list_directory(path)`** lists a guest directory (a bounded
+  `GuestDirectory`, with `truncated` and `skipped`).
+- **Passive history.** `Computer.signals()` reads the host's passive signals
+  from a cursor; `activities()`, `activity()` and `activity_results()` read the
+  computer's API activity history. None of them wakes the guest.
+- **`Computer.paste(text, shift=False)`**, the input `paste` action.
+- **`Computer.delete(..., detailed=True)`** returns a `ComputerDeletion` with
+  `ok`, `computer_deleted`, `error` and the per-copy `purge` tally; a queued
+  purge answers 202 with `ok` false. The plain form is unchanged.
+- `Snapshot.restore_available` and `computer_unreachable`;
+  `SnapshotHoldings.computer_present`, `capturing` and `deleting`;
+  `Computer.desktop` and `running_ram_mb`; `APIError.method`. A clone's
+  `memory_dropped_reason` documents `"capture unrecorded"` and is an open set.
 
 ### Changed
 
+- **`is_transient` no longer calls a 503 on a change worth sending again.** The
+  platform documents that a change answered 503 may or may not have happened,
+  so an `UnavailableError` is transient only when its request was a `GET` or a
+  `HEAD` — and one built without a `method` is treated as a change. A create,
+  command, delete or secret change answered 503 needs a look at the current
+  state first. The SDK's own `retries` already never replayed one.
+- **`Computer.type()` returns the platform's `mechanism`** (`"physical"`,
+  `"unicode"` or `"mixed"`, or `None`), and waits long enough for a Unicode
+  request, which can take over a minute. Its docs used to say unmappable
+  characters were skipped; the platform types Unicode text where it is
+  supported and refuses it before typing anything where it is not.
+- **Refusal words, documented as the platform has them.** `APIError.reason` is
+  an open set: `contention` and `starting` are transient; `unavailable`,
+  `unsupported`, `exists` and `revoked` are not; an unknown word falls back to
+  the exception type. The `ConflictError` and `UnavailableError` docs no longer
+  say nearly every 409 clears or that a 503 is simply worth retrying.
 - **The command is `mandala-py`.** The package no longer installs `mandala`,
   which is the npm package's full CLI (`npm install -g mandala-computer`), with
   `login`, `computers`, `snapshots`, `templates` and `--json`. Both installed a
@@ -43,8 +92,9 @@ This is the summary you read to decide whether to upgrade.
   computer's bindings with the `version` to send back, and
   `computer.set_secrets(bindings, version=...)` replaces them. A binding's
   `revision_id` is the revision last delivered: every start and restart
-  delivers each secret's latest value, and a secret bound as a file is replaced
-  on a running computer as soon as its value is. On the async client too.
+  delivers each secret's latest value, and a replaced value is also sent to a
+  running computer bound to it as a file, asynchronously and on a best-effort
+  basis. On the async client too.
 - **Memory snapshot clone options.** `snapshots.clone(id, memory=False)` builds a
   memory snapshot's clone from its disk alone, as a fresh boot with its own
   network identity. `inherit_secrets=True` consents to resuming a memory

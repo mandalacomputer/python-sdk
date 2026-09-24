@@ -78,20 +78,6 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # The SDK can read and write files, but has no directory-listing method yet.
-    ("GET", "computers/:id/files/list"),
-    # Retained API history has no SDK convenience methods yet.
-    ("GET", "computers/:id/activities"),
-    ("GET", "computers/:id/activities/:activity"),
-    ("GET", "computers/:id/activities/:activity/results"),
-    # Passive platform signals have no SDK convenience method yet.
-    ("GET", "computers/:id/signals"),
-    # The account's secret store (OPL-4984); no SDK method yet.
-    ("GET", "secrets"),
-    ("POST", "secrets"),
-    ("GET", "secrets/:id"),
-    ("PUT", "secrets/:id"),
-    ("DELETE", "secrets/:id"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -101,27 +87,6 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
-    # File transfers cannot yet opt out of waking a suspended computer.
-    "GET computers/:id/files  query:no_wake",
-    "PUT computers/:id/files  query:no_wake",
-    # Directory listing is not wrapped yet; see UNIMPLEMENTED.
-    "GET computers/:id/files/list  query:path",
-    # Retained API history is not wrapped yet; see UNIMPLEMENTED.
-    "GET computers/:id/activities  query:cursor",
-    "GET computers/:id/activities  query:changes",
-    "GET computers/:id/signals  query:since",
-    "GET computers/:id/signals  query:limit",
-    # The account's secret store (OPL-4984) is not wrapped yet; see UNIMPLEMENTED.
-    "GET secrets  query:workspace_id",
-    "POST secrets  body:name",
-    "POST secrets  body:value",
-    "POST secrets  body:workspace_id",
-    "GET secrets/:id  query:workspace_id",
-    "PUT secrets/:id  body:revision_id",
-    "PUT secrets/:id  body:value",
-    "PUT secrets/:id  body:workspace_id",
-    "DELETE secrets/:id  query:revision_id",
-    "DELETE secrets/:id  query:workspace_id",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
@@ -191,6 +156,75 @@ SECRET_BINDINGS = {
     ],
     "version": 3,
 }
+# The account's secret store (OPL-4984): one secret, never with a value, and the
+# listing that carries it with the store's limits.
+SECRET = {
+    "id": "csec-0123456789abcdef",
+    "name": "OPENAI_API_KEY",
+    "workspace_id": None,
+    "revision_id": "csr-0123456789abcdef01234567",
+    "created_at": "2026-09-20T12:00:00Z",
+    "updated_at": "2026-09-20T12:00:00Z",
+    "last_used_at": None,
+}
+SECRET_LIST = {
+    "secrets": [SECRET],
+    "delivery": True,
+    "limits": {
+        "name_max_chars": 60,
+        "value_max_bytes": 4096,
+        "active_per_account": 100,
+        "created_per_account": 1000,
+    },
+}
+GUEST_DIRECTORY = {
+    "path": "/home/user",
+    "entries": [{"name": "notes.txt", "type": "file", "size_bytes": 5}],
+    "truncated": False,
+    "skipped": 0,
+}
+SIGNAL_PAGE = {
+    "computer": "vm-1",
+    "from": "c-0",
+    "cursor": "c-1",
+    "events": [],
+    "more": False,
+    "baseline": True,
+    "supported": ["computer.started"],
+    "retention": "ephemeral",
+}
+ACTIVITY_ID = "act_0123456789abcdef0123456789abcdef"
+ACTIVITY = {
+    "activity_id": ACTIVITY_ID,
+    "account_id": "acc-1",
+    "computer_id": "vm-1",
+    "workspace_id": None,
+    "channel": "api",
+    "route": "exec",
+    "action": "exec",
+    "state": "completed",
+    "received_at": "2026-09-20T12:00:00Z",
+    "observed_at": "2026-09-20T12:00:01Z",
+    "revision": 2,
+    "has_results": True,
+}
+ACTIVITY_PAGE = {
+    "items": [ACTIVITY],
+    "next_cursor": None,
+    "changes_cursor": "chg-1",
+    "gap": False,
+    "health": {
+        "recording_started_at": "2026-09-01T00:00:00Z",
+        "earliest_retained_at": None,
+        "count_truncated": False,
+        "age_truncated": False,
+        "capture": "available",
+        "completeness": "best-effort",
+        "gap_at": None,
+        "recovered_at": None,
+    },
+}
+ACTIVITY_RESULTS = {"activity_id": ACTIVITY_ID, "revision": 2, "more": False, "items": []}
 WEBHOOK = {
     "id": "whk-2b7d4c809f3c1a7e",
     "url": "https://ci.example.com/mandala",
@@ -362,8 +396,21 @@ def pattern_for(path: str) -> str:
     parts = [p for p in path.strip("/").split("/") if p]
 
     def one(i: int, seg: str) -> str:
-        if i and parts[i - 1] in ("computers", "snapshots", "builds", "webhooks", "ssh-keys"):
+        if i and parts[i - 1] in (
+            "computers",
+            "snapshots",
+            "builds",
+            "webhooks",
+            "ssh-keys",
+            "secrets",
+        ):
+            # `computers/:id/secrets` is a literal third segment, never an id:
+            # only the account store's `secrets/:id` is at position 1.
+            if parts[i - 1] == "secrets" and i != 1:
+                return seg
             return ":id"
+        if i == 3 and parts[0] == "computers" and parts[2] == "activities":
+            return ":activity"
         if i == 3 and parts[0] == "computers" and parts[2] == "windows":
             return ":window"
         if i == 3 and parts[0] == "computers" and parts[2] == "exec":
@@ -401,6 +448,23 @@ def async_client() -> mc.AsyncClient:
 def api_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     get = request.method == "GET"
+    if path.endswith("/files/list"):
+        return httpx.Response(200, json=GUEST_DIRECTORY)
+    if path.endswith("/signals"):
+        return httpx.Response(200, json=SIGNAL_PAGE)
+    if "/activities" in path:
+        if path.endswith("/activities"):
+            return httpx.Response(200, json=ACTIVITY_PAGE)
+        if path.endswith("/results"):
+            return httpx.Response(200, json=ACTIVITY_RESULTS)
+        return httpx.Response(200, json=ACTIVITY)
+    # The account's store, which is `secrets` at the root; a computer's
+    # bindings are the `/secrets` under `computers/:id`, further down.
+    store = path.replace("/api/v1", "", 1)
+    if store == "/secrets":
+        return httpx.Response(200 if get else 201, json=SECRET_LIST if get else SECRET)
+    if store.startswith("/secrets/"):
+        return httpx.Response(200, json={"ok": True} if request.method == "DELETE" else SECRET)
     if path.endswith("/screenshot"):
         return httpx.Response(200, content=b"png")
     if path.endswith("/files"):
@@ -705,6 +769,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.scroll(1, 2, direction="up")
     c.scroll(1, 2, direction="right", modifiers=("shift",))
     c.type("hi")
+    c.paste("Café")
+    c.paste("ls", shift=True)
     c.key("ctrl", "c")
     c.hold_key("shift", seconds=1)
     c.wait(1)
@@ -772,6 +838,17 @@ def exercise_everything(client: mc.Client) -> None:
     c.write_file("/home/user/in.txt", b"hello")
     # Create-only: sent only when asked for (OPL-4994).
     c.write_file("/home/user/new.txt", b"hello", overwrite=False)
+    # A transfer that refuses to resume the computer (OPL-5026), both halves.
+    c.read_file("/home/user/out.txt", no_wake=True)
+    c.write_file("/home/user/in.txt", b"hello", no_wake=True)
+    c.list_directory("/home/user")
+    # Passive history (OPL-5026): signals and API activity.
+    c.signals()
+    c.signals("c-1", limit=10)
+    c.activities()
+    c.activities("chg-1", changes=True)
+    c.activity(ACTIVITY_ID)
+    c.activity_results(ACTIVITY_ID)
     c.snapshot()
     c.snapshot(memory=True, name="before-upgrade")
     c.snapshots()
@@ -848,6 +925,22 @@ def exercise_everything(client: mc.Client) -> None:
     c.set_secrets(
         [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
     )
+    # The account's secret store (OPL-4984): every field on every route, and the
+    # create-or-replace convenience on top of the list, the create and the
+    # replace.
+    client.secrets.list()
+    client.secrets.list(workspace_id="ws-1")
+    client.secrets.get(SECRET["id"])
+    client.secrets.get(SECRET["id"], workspace_id="ws-1")
+    client.secrets.create("OPENAI_API_KEY", "sk-test")
+    client.secrets.create("OPENAI_API_KEY", "sk-test", workspace_id="ws-1")
+    client.secrets.replace(SECRET["id"], "sk-new", revision_id=SECRET["revision_id"])
+    client.secrets.replace(
+        SECRET["id"], "sk-new", revision_id=SECRET["revision_id"], workspace_id="ws-1"
+    )
+    client.secrets.set("OPENAI_API_KEY", "sk-new")
+    client.secrets.delete(SECRET["id"], revision_id=SECRET["revision_id"])
+    client.secrets.delete(SECRET["id"], revision_id=SECRET["revision_id"], workspace_id="ws-1")
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -925,6 +1018,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.scroll(1, 2, direction="up")
     await c.scroll(1, 2, direction="right", modifiers=("shift",))
     await c.type("hi")
+    await c.paste("Café")
+    await c.paste("ls", shift=True)
     await c.key("ctrl", "c")
     await c.hold_key("shift", seconds=1)
     await c.wait(1)
@@ -984,6 +1079,15 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.download_file("/home/user/out.txt", io.BytesIO())
     await c.write_file("/home/user/in.txt", b"hello")
     await c.write_file("/home/user/new.txt", b"hello", overwrite=False)
+    await c.read_file("/home/user/out.txt", no_wake=True)
+    await c.write_file("/home/user/in.txt", b"hello", no_wake=True)
+    await c.list_directory("/home/user")
+    await c.signals()
+    await c.signals("c-1", limit=10)
+    await c.activities()
+    await c.activities("chg-1", changes=True)
+    await c.activity(ACTIVITY_ID)
+    await c.activity_results(ACTIVITY_ID)
     await c.snapshot()
     await c.snapshot(memory=True, name="before-upgrade")
     await c.snapshots()
@@ -1045,6 +1149,21 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     bound = await c.secrets()
     await c.set_secrets(
         [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
+    )
+    await client.secrets.list()
+    await client.secrets.list(workspace_id="ws-1")
+    await client.secrets.get(SECRET["id"])
+    await client.secrets.get(SECRET["id"], workspace_id="ws-1")
+    await client.secrets.create("OPENAI_API_KEY", "sk-test")
+    await client.secrets.create("OPENAI_API_KEY", "sk-test", workspace_id="ws-1")
+    await client.secrets.replace(SECRET["id"], "sk-new", revision_id=SECRET["revision_id"])
+    await client.secrets.replace(
+        SECRET["id"], "sk-new", revision_id=SECRET["revision_id"], workspace_id="ws-1"
+    )
+    await client.secrets.set("OPENAI_API_KEY", "sk-new")
+    await client.secrets.delete(SECRET["id"], revision_id=SECRET["revision_id"])
+    await client.secrets.delete(
+        SECRET["id"], revision_id=SECRET["revision_id"], workspace_id="ws-1"
     )
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
@@ -1408,7 +1527,13 @@ def test_retained_path_placeholders_do_not_hide_literal_segments() -> None:
     )
     assert pattern_for("/computers/results/start") == "computers/:id/start"
     assert pattern_for("/computers/artifacts/start") == "computers/:id/start"
+    # An activity id is an id now that the SDK reaches the route (OPL-5026),
+    # and `results` after it stays the literal the platform's pattern has.
     assert (
         pattern_for("/computers/vm-1/activities/act-1/results")
-        == "computers/:id/activities/act-1/results"
+        == "computers/:id/activities/:activity/results"
     )
+    # The account store's id is at position 1; a computer's bindings route is
+    # a literal `secrets` at position 2 and must not become an id.
+    assert pattern_for("/secrets/csec-1") == "secrets/:id"
+    assert pattern_for("/computers/vm-1/secrets") == "computers/:id/secrets"

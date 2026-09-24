@@ -31,6 +31,12 @@ Two subcommands address a computer by name or id:
     receive webhooks; a receiver is a server, and :func:`mandala_computer.verify`
     is what it calls. ``create`` and ``rotate`` print the secret ONCE.
 
+``mandala-py secrets <list|set|rm>``
+    The account's secret store. ``set NAME`` reads the value from stdin, or
+    prompts for it without echo — never from the command line, where it would
+    land in shell history and ``ps`` — and creates the secret or replaces its
+    value. No command ever prints a value: the platform returns none.
+
 ``mandala-py ssh <computer> [ssh-args…]``
     Real OpenSSH, through the platform's SSH gateway, with the gateway's host
     key pinned. ``--setup`` registers a public key and switches SSH on;
@@ -66,7 +72,8 @@ from ._api import looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
 from ._exceptions import ConflictError, CreateOnlyConflictError, FileExistsError, MandalaError
-from ._models import Listing, SshAccess, SshKey, Webhook, WebhookDelivery
+from ._models import Listing, Secret, SshAccess, SshKey, Webhook, WebhookDelivery
+from ._resources import _named_secret
 
 if TYPE_CHECKING:
     from websockets.sync.client import ClientConnection
@@ -1013,6 +1020,134 @@ def _cmd_webhooks_deliveries(args: argparse.Namespace) -> int:
     return 0
 
 
+def _secret_rows(secrets: Sequence[Secret]) -> str:
+    rows = [
+        (x.id, x.name, x.workspace_id or "account", x.last_used_at or "never", x.updated_at)
+        for x in secrets
+    ]
+    return _table(("ID", "NAME", "SCOPE", "LAST USED", "UPDATED"), rows)
+
+
+def _cmd_secrets_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        listed = client.secrets.list(workspace_id=args.workspace)
+    if args.json:
+        _json(listed.raw)
+    elif listed.secrets:
+        print(_secret_rows(listed.secrets))
+    else:
+        print("no secrets", file=sys.stderr)
+    return 0
+
+
+def _secret_value(keep_newline: bool) -> str:
+    """The value to store: stdin when it is not a terminal, else a silent prompt.
+
+    Never an argument. A value on the command line is in the shell's history
+    and in every process listing for as long as the command runs.
+
+    One trailing newline is taken off what stdin carried, because ``echo`` and
+    a file saved by an editor both add one that is not part of the value;
+    ``--keep-newline`` keeps it.
+    """
+    if sys.stdin is None or not sys.stdin.isatty():
+        data = sys.stdin.buffer.read() if sys.stdin is not None else b""
+        try:
+            value = data.decode("utf-8")
+        except UnicodeDecodeError:
+            _die("the value on stdin is not UTF-8 text")
+        if not keep_newline:
+            value = value.removesuffix("\n").removesuffix("\r")
+    else:
+        import getpass
+
+        value = getpass.getpass("value (not echoed): ")
+    # Strict in both modes, and before any request: a prompt can hand back
+    # undecodable bytes as lone surrogates, and those must be refused here
+    # rather than stored as something the person did not type.
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        _die("the value is not valid UTF-8 text")
+    if not value:
+        _die("no value given — pipe it on stdin, or type it at the prompt")
+    return value
+
+
+def _cmd_secrets_set(args: argparse.Namespace) -> int:
+    value = _secret_value(args.keep_newline)
+    with _client() as client:
+        stored = client.secrets.set(args.name, value, workspace_id=args.workspace)
+    if args.json:
+        _json(stored.raw)
+    else:
+        print(f"stored {stored.name}  {stored.id}  revision {stored.revision_id}")
+    return 0
+
+
+def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
+    """The secret ``rm NAME`` means: an exact name first, and never a guess.
+
+    An exact name wins outright. Otherwise the name matched ignoring ASCII case
+    (how the platform keeps names unique) and a secret whose id is ``name`` are
+    both candidates, and two different candidates are refused rather than one
+    picked: a name can be spelled like another secret's id.
+    """
+    exact = next((x for x in listed if x.name == name), None)
+    if exact is not None:
+        return exact
+    by_name = _named_secret(listed, name)
+    by_id = next((x for x in listed if x.id == name), None)
+    if by_name is not None and by_id is not None and by_name.id != by_id.id:
+        _die(
+            f"{name!r} is both a name ({by_name.name}, {by_name.id}) and another secret's id; "
+            "give the exact name"
+        )
+    return by_name or by_id
+
+
+def _cmd_secrets_rm(args: argparse.Namespace) -> int:
+    with _client() as client:
+        listed = client.secrets.list(workspace_id=args.workspace).secrets
+        found = _secret_to_remove(listed, args.name)
+        if found is None:
+            scope = f"workspace {args.workspace}" if args.workspace else "the account-wide scope"
+            _die(f"no secret named {args.name!r} in {scope}")
+        client.secrets.delete(found.id, revision_id=found.revision_id, workspace_id=args.workspace)
+    print(f"deleted {found.name}  {found.id}")
+    return 0
+
+
+def _secrets_parser(sub: Any) -> None:
+    store = sub.add_parser("secrets", help="the account's secret store")
+    verbs = store.add_subparsers(dest="verb", required=True)
+    scope = "the workspace (default: the account-wide secrets)"
+
+    listing = verbs.add_parser("list", help="names, ids and revisions — never values")
+    listing.add_argument("--workspace", metavar="ID", help=scope)
+    listing.add_argument("--json", action="store_true", help="the listing as JSON")
+    listing.set_defaults(fn=_cmd_secrets_list)
+
+    put = verbs.add_parser(
+        "set",
+        help="create a secret, or replace its value; the value is read from stdin or a prompt",
+    )
+    put.add_argument("name", metavar="NAME")
+    put.add_argument("--workspace", metavar="ID", help=scope)
+    put.add_argument(
+        "--keep-newline",
+        action="store_true",
+        help="keep a trailing newline on the value read from stdin",
+    )
+    put.add_argument("--json", action="store_true", help="the stored secret as JSON")
+    put.set_defaults(fn=_cmd_secrets_set)
+
+    rm = verbs.add_parser("rm", help="delete a secret, by name or id")
+    rm.add_argument("name", metavar="NAME")
+    rm.add_argument("--workspace", metavar="ID", help=scope)
+    rm.set_defaults(fn=_cmd_secrets_rm)
+
+
 def _webhooks_parser(sub: Any) -> None:
     hooks = sub.add_parser("webhooks", help="the account's webhook subscriptions")
     verbs = hooks.add_subparsers(dest="verb", required=True)
@@ -1495,6 +1630,7 @@ def _parser() -> argparse.ArgumentParser:
 
     _ssh_parsers(sub)
     _webhooks_parser(sub)
+    _secrets_parser(sub)
     return parser
 
 

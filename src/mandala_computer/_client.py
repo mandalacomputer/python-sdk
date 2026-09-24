@@ -495,7 +495,11 @@ class _BaseTransport:
     ) -> MandalaError:
         if resp is not None and not resp.is_success:
             # An interrupted error body cannot erase a known non-retryable status.
-            return self._error(httpx.Response(resp.status_code, headers=resp.headers, content=b""))
+            return self._error(
+                httpx.Response(
+                    resp.status_code, headers=resp.headers, request=resp.request, content=b""
+                )
+            )
         return _request_failed(method, path, exc)
 
     @staticmethod
@@ -884,6 +888,7 @@ class _BaseTransport:
             "request_id": resp.headers.get("x-request-id"),
             "allow": resp.headers.get("allow"),
             "www_authenticate": resp.headers.get("www-authenticate"),
+            "method": _request_method(resp),
         }
         cls = _STATUS_ERRORS.get(resp.status_code, APIError)
 
@@ -976,6 +981,18 @@ class _BaseTransport:
         return cls(
             message, status=resp.status_code, body=body, retry_after=_retry_after(resp), **metadata
         )
+
+
+def _request_method(resp: httpx.Response) -> str | None:
+    """The method of the request ``resp`` answers, or ``None`` if it has none.
+
+    Carried onto the error because a 503 means two different things by method:
+    a read can be read again, and a change may or may not have happened.
+    """
+    try:
+        return resp.request.method
+    except RuntimeError:
+        return None
 
 
 def _move_offer(body: object) -> bool | None:
@@ -1388,7 +1405,12 @@ class Transport(_BaseTransport):
                     # Error decoding must not inflate or accumulate an arbitrary proxy body.
                     if resp.headers.get("content-encoding", "identity").lower() != "identity":
                         raise self._error(
-                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                            httpx.Response(
+                                resp.status_code,
+                                headers=resp.headers,
+                                request=resp.request,
+                                content=b"",
+                            )
                         )
                 body = bytearray()
                 chunks = resp.iter_bytes() if resp.is_stream_consumed else resp.iter_raw()
@@ -1397,12 +1419,22 @@ class Transport(_BaseTransport):
                         if success:
                             raise MandalaError("retained response exceeds the byte limit")
                         raise self._error(
-                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                            httpx.Response(
+                                resp.status_code,
+                                headers=resp.headers,
+                                request=resp.request,
+                                content=b"",
+                            )
                         )
                     body.extend(chunk)
                 if not success:
                     raise self._error(
-                        httpx.Response(resp.status_code, headers=resp.headers, content=bytes(body))
+                        httpx.Response(
+                            resp.status_code,
+                            headers=resp.headers,
+                            request=resp.request,
+                            content=bytes(body),
+                        )
                     )
                 if (length is not None and len(body) != length) or (
                     exact_bytes is not None and len(body) != exact_bytes
@@ -1585,7 +1617,12 @@ class Transport(_BaseTransport):
                         raise self._not_a_stream(
                             method,
                             path,
-                            httpx.Response(resp.status_code, headers=resp.headers, content=b""),
+                            httpx.Response(
+                                resp.status_code,
+                                headers=resp.headers,
+                                request=resp.request,
+                                content=b"",
+                            ),
                         ) from None
                     raise self._not_a_stream(method, path, resp)
                 decoder = SSEDecoder()
@@ -1788,7 +1825,12 @@ class AsyncTransport(_BaseTransport):
                     # Error decoding must not inflate or accumulate an arbitrary proxy body.
                     if resp.headers.get("content-encoding", "identity").lower() != "identity":
                         raise self._error(
-                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                            httpx.Response(
+                                resp.status_code,
+                                headers=resp.headers,
+                                request=resp.request,
+                                content=b"",
+                            )
                         )
                 body = bytearray()
                 chunks = resp.aiter_bytes() if resp.is_stream_consumed else resp.aiter_raw()
@@ -1797,12 +1839,22 @@ class AsyncTransport(_BaseTransport):
                         if success:
                             raise MandalaError("retained response exceeds the byte limit")
                         raise self._error(
-                            httpx.Response(resp.status_code, headers=resp.headers, content=b"")
+                            httpx.Response(
+                                resp.status_code,
+                                headers=resp.headers,
+                                request=resp.request,
+                                content=b"",
+                            )
                         )
                     body.extend(chunk)
                 if not success:
                     raise self._error(
-                        httpx.Response(resp.status_code, headers=resp.headers, content=bytes(body))
+                        httpx.Response(
+                            resp.status_code,
+                            headers=resp.headers,
+                            request=resp.request,
+                            content=bytes(body),
+                        )
                     )
                 if (length is not None and len(body) != length) or (
                     exact_bytes is not None and len(body) != exact_bytes
@@ -1985,7 +2037,12 @@ class AsyncTransport(_BaseTransport):
                         raise self._not_a_stream(
                             method,
                             path,
-                            httpx.Response(resp.status_code, headers=resp.headers, content=b""),
+                            httpx.Response(
+                                resp.status_code,
+                                headers=resp.headers,
+                                request=resp.request,
+                                content=b"",
+                            ),
                         ) from None
                     raise self._not_a_stream(method, path, resp)
                 decoder = SSEDecoder()

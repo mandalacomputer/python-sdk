@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import math
 import os
 import time
@@ -9,7 +10,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import IO, Any
+from typing import IO, Any, Literal, overload
 
 from . import _api
 from ._agent import (
@@ -46,6 +47,7 @@ from ._events import (
 )
 from ._exceptions import (
     APIError,
+    ComputerNotRunningError,
     ConflictError,
     ConnectionError,
     CreateOnlyConflictError,
@@ -58,13 +60,21 @@ from ._exceptions import (
 )
 from ._executions import ExecutionMetadata, ExecutionOutput, decode_metadata, decode_output
 from ._models import (
+    Activity,
+    ActivityPage,
+    ActivityResults,
+    ComputerDeletion,
     ExecResult,
     ExecStatus,
     FilePart,
+    GuestDirectory,
     Listing,
     Move,
+    SecretBinding,
     SecretBindingArgs,
     SecretBindings,
+    SecretsReceipt,
+    SignalPage,
     Snapshot,
     SnapshotHoldings,
     SshAccess,
@@ -272,11 +282,57 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
         request_id=err.request_id,
         allow=err.allow,
         www_authenticate=err.www_authenticate,
+        method=err.method,
     )
     # The constructor reads the body again, and would keep a blank word. Unknown
     # is ``None``, as documented on CreateOnlyConflictError.
     refusal.reason = None
     return refusal
+
+
+def _no_wake_refusal(err: ConflictError) -> ConflictError:
+    """A no-wake transfer's 409, as what it says: the computer is not running.
+
+    The reference documents that refusal as carrying no ``reason`` (and a
+    platform change gives it ``unavailable``); either way nothing but a start
+    changes it, and a bare :class:`ConflictError` would be called worth sending
+    again. A 409 carrying any other word, or already classified, is returned as
+    it is.
+    """
+    if isinstance(err, (FileExistsError, CreateOnlyConflictError, ComputerNotRunningError)):
+        return err
+    reason = err.reason.strip() if isinstance(err.reason, str) else ""
+    if reason and reason != "unavailable":
+        return err
+    refusal = ComputerNotRunningError(
+        str(err),
+        status=err.status,
+        body=err.body,
+        retry_after=err.retry_after,
+        request_id=err.request_id,
+        allow=err.allow,
+        www_authenticate=err.www_authenticate,
+        method=err.method,
+    )
+    refusal.reason = reason or None
+    return refusal
+
+
+def _upload_refusal(err: ConflictError, *, overwrite: bool, no_wake: bool) -> ConflictError:
+    """An upload's 409, classified by what the request asked for.
+
+    ``unavailable`` under ``no_wake`` is the computer not running whichever
+    else was asked. A 409 with no word at all is ambiguous when the upload was
+    both create-only and no-wake, and there it is the create-only refusal,
+    which claims nothing about the path or the computer.
+    """
+    if no_wake and err.reason == "unavailable":
+        return _no_wake_refusal(err)
+    if not overwrite:
+        return _create_only_refusal(err)
+    if no_wake:
+        return _no_wake_refusal(err)
+    return err
 
 
 def _file_body(data: bytes | str) -> bytes:
@@ -472,6 +528,22 @@ def _started_key(stamp: str) -> tuple[int, float]:
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     return (1, when.timestamp())
+
+
+#: How long a Unicode ``type`` may take: the platform gives the guest 75
+#: seconds for the whole request and its proxy 95, and this adds the slack every
+#: guest deadline gets.
+UNICODE_TYPE_TIMEOUT = 95.0 + DEADLINE_SLACK
+
+
+def _mechanism(res: Mapping[str, Any]) -> str | None:
+    """``mechanism`` off a ``type`` answer: a word, or ``None`` when absent.
+
+    An open set by position: the platform documents three words, and a fourth
+    is shown as sent rather than refused.
+    """
+    value = res.get("mechanism")
+    return value if isinstance(value, str) and value else None
 
 
 def _cursor(res: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -922,10 +994,132 @@ class ComputerFields:
         """Why :attr:`memory_dropped`: ``"secrets"`` for a snapshot of a
         computer that held secrets, cloned without ``inherit_secrets``;
         ``"bindings unrecorded"`` for one taken before its bindings were
-        recorded, which cannot be resumed with them. ``None`` when nothing was
-        dropped.
+        recorded, which cannot be resumed with them; ``"capture unrecorded"``
+        for one taken before the platform recorded which capture each snapshot
+        is. An open set: show a word this version does not know as it is.
+        ``None`` when nothing was dropped.
         """
         return self._memory_dropped_reason
+
+    @property
+    def desktop(self) -> str:
+        """The display protocol this computer's desktop speaks: ``"wayland"``,
+        or ``""`` for X11.
+
+        Screenshots, input and ``exec`` behave the same either way. On Wayland
+        a window id is the compositor's address rather than an X window id,
+        and moving or resizing a window the compositor is tiling is refused.
+        """
+        value = self._data.get("desktop")
+        return value if isinstance(value, str) else ""
+
+    @property
+    def running_ram_mb(self) -> int | None:
+        """The memory this computer holds against the plan's running pool.
+
+        :attr:`ram_mb` while it runs, or while a start or resume has been
+        admitted and has not launched yet — so it can be non-zero BEFORE
+        :attr:`status` reads ``"running"`` — and ``0`` otherwise. ``None``
+        wherever the platform could not say: an unreachable host, a response
+        written before the computer was read back (a create that failed to
+        start, a rename, a clone), or an older host. ``None`` means unknown,
+        never zero.
+        """
+        value = self._data.get("running_ram_mb")
+        if value is None or isinstance(value, bool):
+            return None
+        return _num(value) if isinstance(value, (int, float)) else None
+
+    @property
+    def secret_bindings(self) -> builtins.list[SecretBinding]:
+        """The secrets bound to this computer, as carried on the computer itself.
+
+        The same rows :meth:`Computer.secrets` reads, without its ``version``:
+        which secret, which revision was last delivered, and the variable or
+        file each lands under. Never a value. Empty on a computer that holds
+        none. Raises :class:`~mandala_computer.MandalaError` for a row it
+        cannot read rather than hand back a list that looks complete.
+        """
+        rows = self._data.get("secrets")
+        if rows is None:
+            return []
+        if not isinstance(rows, builtins.list):
+            raise MandalaError(f"{self.id}: secrets is not a list of bindings")
+        bound = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise MandalaError(f"{self.id}: a secret binding is not an object")
+            bound.append(SecretBinding.from_api(row, f"computer {self.id}"))
+        return bound
+
+    @property
+    def secrets_generation(self) -> int | None:
+        """How many delivering starts this computer has had, or ``None``.
+
+        Each cold start of a computer that holds secrets is one generation.
+        :attr:`secrets_applied` names the generation it confirms.
+        """
+        value = self._data.get("secrets_generation")
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return _num(value)
+
+    @property
+    def secrets_applied(self) -> SecretsReceipt | None:
+        """The receipt that the bound values reached the desktop session, or
+        ``None`` before the first delivery.
+
+        A start that was taken but whose delivery did not land has no receipt
+        for its generation; :attr:`secrets_error` says why.
+        """
+        return SecretsReceipt.from_api(self._data.get("secrets_applied"))
+
+    @property
+    def secrets_error(self) -> str | None:
+        """Why the last delivering start was stopped, or ``None``.
+
+        One fixed sentence naming the class of failure, never a value. A start
+        whose delivery fails is stopped by its host and stays stopped until it
+        is started again. Cleared when the next delivering start begins.
+        """
+        value = self._data.get("secrets_error")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def secrets_pending(self) -> bool | None:
+        """Whether this computer is missing a change to its secrets that a
+        restart would deliver.
+
+        Three answers, and the third matters:
+
+        * ``True`` — a binding, a name or a newer value has not reached it, or
+          every secret was removed and its running or saved session still holds
+          the old values. Only ever true of a running or suspended computer.
+        * ``False`` — nothing is pending. Also what a computer with no secrets
+          bound reads, since the platform sends the field there only while it
+          is true.
+        * ``None`` — the platform could not check: the current values could not
+          be read, or the last delivery predates its record of the names. A
+          restart makes it known. Never folded into ``False``. Also what a
+          computer with bindings reads when the field is missing, which the
+          platform documents it never is.
+
+        A value replaced for a secret bound as a file reaches a running
+        computer live and is pending only if that did not land; one bound as a
+        variable is live for new shells on images that support it, and waits
+        for a restart otherwise.
+        """
+        said = _wire(self._data, "secrets_pending")
+        if said is _Wire.TRUE:
+            return True
+        if said is _Wire.FALSE:
+            return False
+        # Absent is "not pending" only where the platform says it leaves the
+        # field out: a computer with no secrets bound. Beside bindings it is
+        # always sent, so its absence there is not an answer.
+        if said is _Wire.ABSENT and not self._data.get("secrets"):
+            return False
+        return None
 
     @property
     def is_suspended(self) -> bool:
@@ -1826,7 +2020,31 @@ class Computer(ComputerFields):
         data = self._t.json_object("PUT", path, json=body)
         return SecretBindings.from_api(data, f"PUT {path}")
 
-    def delete(self, *, purge_snapshots: bool = False, expect: str | None = None) -> int | None:
+    @overload
+    def delete(
+        self,
+        *,
+        purge_snapshots: bool = ...,
+        expect: str | None = ...,
+        detailed: Literal[False] = ...,
+    ) -> int | None: ...
+
+    @overload
+    def delete(
+        self,
+        *,
+        purge_snapshots: bool = ...,
+        expect: str | None = ...,
+        detailed: Literal[True],
+    ) -> ComputerDeletion: ...
+
+    def delete(
+        self,
+        *,
+        purge_snapshots: bool = False,
+        expect: str | None = None,
+        detailed: bool = False,
+    ) -> int | ComputerDeletion | None:
         """Destroy this computer and its disk.
 
         Snapshots taken from it **survive by default** and become orphans, which
@@ -1854,6 +2072,15 @@ class Computer(ComputerFields):
         call on this object, and reporting "nothing was destroyed" because the
         server was quiet is the one wrong answer worth going out of the way to
         avoid.
+
+        ``detailed=True`` returns the whole answer instead, as a
+        :class:`~mandala_computer.ComputerDeletion`, and a purge wants it: the
+        platform answers 202 when work remains queued, and reports
+        ``computer_deleted`` and a per-copy ``purge`` tally that the count alone
+        cannot carry. A purge partly refused is a
+        :class:`~mandala_computer.ConflictError`; one whose outcome is unknown
+        is a 503 :class:`~mandala_computer.UnavailableError`, which is not safe
+        to send again blind — read :meth:`snapshot_holdings` first.
         """
         data = self._t.json_object_or_empty(
             "DELETE",
@@ -1864,6 +2091,8 @@ class Computer(ComputerFields):
         # a real answer here and stays one. What no longer reaches this line is a
         # NON-empty body that is not an object: that used to arrive as `None` too,
         # so a proxy's HTML login page read as a successful delete (OPL-4232).
+        if detailed:
+            return ComputerDeletion.from_api(data)
         if data is None:
             return None
         return _snapshots_deleted(data)
@@ -2234,13 +2463,45 @@ class Computer(ComputerFields):
         """
         self._input(_api.scroll_body(x, y, direction, amount, modifiers))
 
-    def type(self, text: str) -> None:
-        """Type text as keystrokes.
+    def type(self, text: str) -> str | None:
+        """Type text as keystrokes, and say how it was typed.
 
-        Characters with no key mapping are skipped rather than raising, so a
-        stray emoji in a prompt cannot fail the whole call.
+        Plain ASCII is typed as US-layout key events. Text with any other
+        character — accents, CJK, emoji — is typed whole, in order, by a guest
+        helper using GTK Unicode composition, which works in supported GTK3
+        applications (Chromium, the Xfce terminal) on Linux X11 and is refused
+        elsewhere. At most 400 characters; bare CR and other control characters
+        are refused. The platform checks all of this before it resumes a
+        suspended computer or presses anything.
+
+        Returns the platform's ``mechanism``: ``"physical"``, ``"unicode"`` or
+        ``"mixed"``, or ``None`` from a platform that does not report one.
+        Delivery is not acceptance: check the target received the exact text.
+        For fast insertion of long or non-ASCII text, :meth:`paste` is the
+        better tool.
+
+        A Unicode request can take over a minute, so the request is given that
+        long. A failure or a lost response part way through can leave partial
+        text: look before typing again, and never replay one blind.
         """
-        self._input(_api.type_body(text))
+        body = _api.type_body(text)
+        timeout = None if body["text"].isascii() else UNICODE_TYPE_TIMEOUT
+        return _mechanism(self._input(body, timeout=timeout))
+
+    def paste(self, text: str, *, shift: bool = False) -> None:
+        """Put ``text`` on the desktop clipboard and press Ctrl+V.
+
+        The fast way to insert text, Unicode included: 1 to 8192 bytes of UTF-8,
+        no NUL. ``shift=True`` presses Ctrl+Shift+V, which terminals want.
+        Linux only; a guest without working clipboard support refuses it.
+
+        The clipboard is replaced and left that way. Success means the write and
+        the shortcut were delivered, not that the application inserted the
+        text — a paste-disabled field ignores it. An interrupted request can
+        still have pasted: look before sending it again, and do not fall back to
+        :meth:`type` without looking.
+        """
+        self._input(_api.paste_body(text, shift))
 
     def key(self, *keys: str) -> None:
         """Press a chord, e.g. ``key("ctrl", "c")`` or ``key("Return")``.
@@ -2632,13 +2893,16 @@ class Computer(ComputerFields):
 
     # --- files ----------------------------------------------------------
 
-    def read_file(self, path: str) -> bytes:
+    def read_file(self, path: str, *, no_wake: bool = False) -> bytes:
         """Read one file out of the guest, as bytes.
 
         ``path`` is absolute, inside the guest — there is no shell and no
         working directory behind this, so a relative path is refused before the
         request is made. Works while the computer is running or suspended
-        (a transfer resumes a suspended computer, like any other use).
+        (a transfer resumes a suspended computer, like any other use, and a
+        resume is charged). ``no_wake=True`` requires a running computer
+        instead: one that is not is refused with a
+        :class:`~mandala_computer.ComputerNotRunningError` rather than resumed.
 
         The whole file crosses in one request, so a file past the 64 MiB that
         one request moves raises :class:`~mandala_computer.FileTooLargeError`.
@@ -2646,16 +2910,21 @@ class Computer(ComputerFields):
         :meth:`download_file` fetches one of any size by asking for it a window
         at a time, and :meth:`read_file_part` is the single window underneath.
         """
-        return self._t.binary(
-            "GET",
-            _api.files(self.id),
-            params=_api.files_params(path),
-            timeout=FILE_TIMEOUT,
-            accept="application/octet-stream",
-            content_types=("application/octet-stream",),
-        )
+        try:
+            return self._t.binary(
+                "GET",
+                _api.files(self.id),
+                params=_api.files_params(path, no_wake),
+                timeout=FILE_TIMEOUT,
+                accept="application/octet-stream",
+                content_types=("application/octet-stream",),
+            )
+        except ConflictError as err:
+            if not no_wake or _no_wake_refusal(err) is err:
+                raise
+            raise _no_wake_refusal(err) from None
 
-    def read_text_file(self, path: str) -> str:
+    def read_text_file(self, path: str, *, no_wake: bool = False) -> str:
         """:meth:`read_file`, decoded as UTF-8, for a file you know is text.
 
         ``errors="replace"``, so this never raises on a file that turns out not
@@ -2678,7 +2947,7 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.FileTooLargeError` and
         :meth:`download_file` is what fetches one of any size.
         """
-        return self.read_file(path).decode("utf-8", "replace")
+        return self.read_file(path, no_wake=no_wake).decode("utf-8", "replace")
 
     def read_file_part(
         self,
@@ -2686,6 +2955,7 @@ class Computer(ComputerFields):
         *,
         offset: int = 0,
         length: int | None = None,
+        no_wake: bool = False,
     ) -> FilePart:
         """Read one window of a guest file, and where that window sits in it.
 
@@ -2718,17 +2988,22 @@ class Computer(ComputerFields):
         have to guess.
 
         :meth:`download_file` is this in a loop, and is what a whole large file
-        wants.
+        wants. ``no_wake`` is :meth:`read_file`'s.
         """
-        data, at, total, partial = self._t.binary_part(
-            "GET",
-            _api.files(self.id),
-            params=_api.files_params(path),
-            headers=_api.files_range(offset, length),
-            timeout=FILE_TIMEOUT,
-            accept="application/octet-stream",
-            content_types=("application/octet-stream",),
-        )
+        try:
+            data, at, total, partial = self._t.binary_part(
+                "GET",
+                _api.files(self.id),
+                params=_api.files_params(path, no_wake),
+                headers=_api.files_range(offset, length),
+                timeout=FILE_TIMEOUT,
+                accept="application/octet-stream",
+                content_types=("application/octet-stream",),
+            )
+        except ConflictError as err:
+            if not no_wake or _no_wake_refusal(err) is err:
+                raise
+            raise _no_wake_refusal(err) from None
         return FilePart(data=data, offset=at, total=total, partial=partial)
 
     def download_file(
@@ -2737,6 +3012,7 @@ class Computer(ComputerFields):
         dest: str | os.PathLike[str] | IO[bytes],
         *,
         part_size: int = FILE_PART_SIZE,
+        no_wake: bool = False,
     ) -> int:
         """Fetch a whole guest file of any size, a window at a time::
 
@@ -2770,7 +3046,8 @@ class Computer(ComputerFields):
         it and the length it reports has dropped, which is a
         :class:`~mandala_computer.MandalaError` naming both lengths.
 
-        An empty file is not an error and writes nothing.
+        An empty file is not an error and writes nothing. ``no_wake`` is
+        :meth:`read_file`'s, and applies to every window.
         """
         if part_size < 1:
             raise ValueError(f"part_size must be at least 1 byte, not {part_size}")
@@ -2782,7 +3059,7 @@ class Computer(ComputerFields):
         # letter of "nothing was written" and none of the point.
         first: FilePart | None
         try:
-            first = self.read_file_part(path, offset=0, length=part_size)
+            first = self.read_file_part(path, offset=0, length=part_size, no_wake=no_wake)
         except RangeNotSatisfiableError as exc:
             if not _empty_guest_file(exc):
                 raise
@@ -2802,11 +3079,13 @@ class Computer(ComputerFields):
                 # and advancing by part_size would leave holes in the file with
                 # nothing raised.
                 asked, was = part.end, part.total
-                part = self.read_file_part(path, offset=asked, length=part_size)
+                part = self.read_file_part(path, offset=asked, length=part_size, no_wake=no_wake)
                 _continues(path, asked, part, was)
         return written
 
-    def write_file(self, path: str, data: bytes | str, *, overwrite: bool = True) -> None:
+    def write_file(
+        self, path: str, data: bytes | str, *, overwrite: bool = True, no_wake: bool = False
+    ) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
         A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
@@ -2831,9 +3110,12 @@ class Computer(ComputerFields):
         create-only yet refuses it with a 409 whose ``reason`` is
         ``"unsupported"``, and one whose support could not be confirmed with a
         503; in both cases nothing was sent to the guest.
+
+        ``no_wake`` is :meth:`read_file`'s: refuse a computer that is not
+        running rather than resume it.
         """
         body = _file_body(data)
-        params = _api.upload_params(path, overwrite)
+        params = _api.upload_params(path, overwrite, no_wake)
         try:
             self._t.request(
                 "PUT",
@@ -2843,12 +3125,91 @@ class Computer(ComputerFields):
                 timeout=FILE_TIMEOUT,
             )
         except ConflictError as err:
-            if overwrite:
-                raise
-            refusal = _create_only_refusal(err)
+            refusal = _upload_refusal(err, overwrite=overwrite, no_wake=no_wake)
             if refusal is err:
                 raise
             raise refusal from None
+
+    def list_directory(self, path: str) -> GuestDirectory:
+        """List one directory inside the guest: names, types and file sizes.
+
+        ``path`` is an absolute directory. The computer must already be
+        running: a listing never resumes one, and never extends its idle
+        timer. Linux images with ``/usr/bin/python3`` only.
+
+        Bounded, and not a page: a large directory answers
+        :attr:`~mandala_computer.GuestDirectory.truncated` with an unordered
+        sample and no way to ask for the rest — list a narrower directory
+        instead. Symbolic links are not followed, and a path whose last
+        component is one is refused. Names that cannot be used by the file API
+        are counted in :attr:`~mandala_computer.GuestDirectory.skipped`.
+        """
+        data = self._t.json_object(
+            "GET", _api.files_list(self.id), params=_api.list_dir_params(path)
+        )
+        return GuestDirectory.from_api(data)
+
+    # --- passive history ------------------------------------------------
+
+    def signals(self, since: str | None = None, *, limit: int | None = None) -> SignalPage:
+        """Read the passive platform signals for this computer.
+
+        Facts its host observed — started, stopped, suspended, idle, a
+        background process exited — read without touching the guest, waking it
+        or capturing anything. With no ``since`` the answer is a baseline at the
+        current head with no history; keep its
+        :attr:`~mandala_computer.SignalPage.cursor` and pass it as ``since`` to
+        read what happened after. A cursor that expired or whose host restarted
+        or moved answers :attr:`~mandala_computer.SignalPage.gap` and a new
+        head. ``limit`` is 1 to 100 events; the platform's default is 50.
+
+        Ephemeral observations, not durable history or proof that a task
+        succeeded. A host that does not produce signals answers 501; one that
+        cannot be reached answers 503 — keep the checkpoint you had.
+        """
+        data = self._t.json_object(
+            "GET",
+            _api.computer_action(self.id, "signals"),
+            params=_api.signals_params(since, limit),
+        )
+        return SignalPage.from_api(data)
+
+    def activities(self, cursor: str | None = None, *, changes: bool = False) -> ActivityPage:
+        """Read this computer's API activity history, newest first.
+
+        Selected requests sent through the computer API, as safe metadata: no
+        command, output, input text or error prose is kept. It does not
+        identify an agent and does not show guest work. Works while the
+        computer is stopped or suspended, without waking it.
+
+        Pass a page's :attr:`~mandala_computer.ActivityPage.next_cursor` as
+        ``cursor`` for older rows. ``changes=True`` with a page's
+        :attr:`~mandala_computer.ActivityPage.changes_cursor` reads the rows
+        added and finished since; a change page with
+        :attr:`~mandala_computer.ActivityPage.gap` set means the cursor
+        expired, and the history should be read again. An unavailable store is
+        a 503, never an empty page.
+        """
+        data = self._t.json_object(
+            "GET", _api.activities(self.id), params=_api.activities_params(cursor, changes)
+        )
+        return ActivityPage.from_api(data)
+
+    def activity(self, activity_id: str) -> Activity:
+        """One retained API activity. Missing, expired and out-of-scope rows
+        all raise the same :class:`~mandala_computer.NotFoundError`."""
+        return Activity.from_api(self._t.json_object("GET", _api.activity(self.id, activity_id)))
+
+    def activity_results(self, activity_id: str) -> ActivityResults:
+        """The retained results and artifacts one activity links to.
+
+        References only — ids, availability, sizes and expiry, for at most the
+        eight newest versions — and never content: read that with
+        :meth:`result` or the artifact methods. Nothing here wakes the
+        guest or reads its files.
+        """
+        data = self._t.json_object("GET", f"{_api.activity(self.id, activity_id)}/results")
+        return ActivityResults.from_api(data)
 
     # --- windows --------------------------------------------------------
 

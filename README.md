@@ -453,9 +453,11 @@ The refusals beside them mean something else. A `409` — `ConflictError` — sa
 no verified image for this exact document is available yet: finish the build,
 or restore an image that has gone missing or is still being verified. A `503`
 — `UnavailableError` — says no hypervisor has an image for that template *right
-now*, which is the one to retry as it stands. A create can answer `503` for
+now*, which is the one that can clear as it stands. A create can answer `503` for
 capacity as well, and that one is worth a smaller size rather than only a
-wait.
+wait. A create answered `503` may still have made a computer, though — the
+platform answers a failure after the request was sent the same way — so list
+your computers before sending it again.
 
 Everything here has an async twin: `await client.templates.publish(doc)`,
 `await client.builds.wait(build.id)`, and `async for p in client.builds.events(...)`.
@@ -739,7 +741,8 @@ c.double_click(x, y)
 c.triple_click(x, y)
 c.drag(900, 480, from_x=x, from_y=y)  # press, move through, release
 c.scroll(x, y, direction="up", amount=3)  # also "left"/"right"
-c.type("some text")
+c.type("some text")  # returns "physical", "unicode" or "mixed"
+c.paste("Café — 東京 😀")  # clipboard + Ctrl+V; shift=True for Ctrl+Shift+V
 c.key("ctrl", "c")  # SDK names and X11 keysyms both work: "Return", "Page_Down"
 c.hold_key("Down", seconds=2)  # for keys that mean something while held
 c.wait(1.5)  # a pause inside the platform; what a model's `wait` action maps to
@@ -755,6 +758,19 @@ res.ok, res.exit_code, res.stdout, res.stderr  # output is bytes
 res.stdout_text  # ...and this is the text reading of it
 res.output_unreadable  # check before believing an empty output
 ```
+
+`type()` types plain ASCII as key events, and text with any other character
+whole, by GTK Unicode composition — supported in GTK3 applications such as
+Chromium and the Xfce terminal on Linux X11, and refused elsewhere. At most 400
+characters; bare CR and other control characters are refused. The platform
+checks the text before it resumes a suspended computer or presses anything, so a
+refusal types nothing. It returns the `mechanism` the platform reports, or
+`None` from one that reports none. Delivery is not acceptance: check the target
+received the text. A Unicode request can take over a minute, and the SDK waits
+that long. `paste()` is the fast way to insert text (1 to 8192 bytes of UTF-8):
+it replaces the clipboard, leaves it replaced, and succeeds when the shortcut was
+delivered, not when the application took it. Neither is safe to replay blind
+after an interrupted request — look first.
 
 With no coordinate, a click lands wherever the pointer already is, and a `drag`
 with no `from_x`/`from_y` starts there too — refused if nothing has moved it
@@ -1735,6 +1751,10 @@ for d in client.webhooks.deliveries(hook.id):  # newest hundred, newest first
         print(d.id, d.event_type, d.state, d.attempts, d.last_error or d.last_status)
 ```
 
+`last_error` is a line for a person — `timeout`, `dns`, `refused`, `reset`,
+`tls`, `status 503` and others the platform may add — not a vocabulary to
+switch on. Branch on `state`, `last_status` and `attempts`.
+
 An endpoint that keeps failing is switched off: once a delivery runs out of
 attempts and nothing has been accepted for a day, the subscription reads
 `enabled=False` with `disabled_reason="failing"` — `hook.is_failing` — and
@@ -1748,6 +1768,106 @@ outcome is read from `deliveries`.
 Ten subscriptions per account on every paid plan, none without one; the
 eleventh is a `ConflictError` naming the cap. The endpoint must resolve to a
 public address — a private, loopback or link-local one is a 400 at create.
+
+### Secrets
+
+The account keeps secrets — API keys, tokens, kubeconfigs — encrypted, and
+delivers them into the computers bound to them. Values are **write-only**: no
+route returns one, so every `Secret` this SDK hands back is a name, an id and a
+`revision_id`, never the value.
+
+```python
+key = client.secrets.create("OPENAI_API_KEY", os.environ["OPENAI_API_KEY"])
+listed = client.secrets.list()  # the account-wide scope
+listed.secrets, listed.limits, listed.delivery
+
+# Every change names the revision it read; a moved one is a ConflictError
+# and nothing changed.
+key = client.secrets.replace(key.id, "sk-new", revision_id=key.revision_id)
+client.secrets.delete(key.id, revision_id=key.revision_id)  # required on a delete
+
+# Create the name, or replace its value — reading the revision for you.
+client.secrets.set("OPENAI_API_KEY", "sk-new")
+```
+
+A secret is account-wide unless it was created with `workspace_id`, and every
+call takes `workspace_id` to name that scope; an API key confined to a workspace
+works in that workspace only. Names are unique in a scope, ignoring ASCII case,
+and a value is 1 to 4096 bytes of UTF-8. Owners may change secrets; members may
+only read them. `set()` reads again and retries up to three times when the name
+or its revision moves under it, and never re-sends a 503.
+
+Bind secrets to a computer at create, or later, as an environment variable in
+the desktop session or as a file under `/run/mandala-secrets/user/files`:
+
+```python
+key = client.secrets.set("OPENAI_API_KEY", os.environ["OPENAI_API_KEY"])
+kube = client.secrets.set("KUBECONFIG", open(os.path.expanduser("~/.kube/config")).read())
+c = client.computers.create(
+    template="base",
+    secrets=[
+        {"secret_id": key.id, "env": "OPENAI_API_KEY"},
+        {"secret_id": kube.id, "file": "kubeconfig"},
+    ],
+)
+
+# A computer made without secrets is bound for the first time while STOPPED,
+# and gets them when it starts. A restart does not deliver a first binding.
+plain = client.computers.create(template="base", start=False)
+plain.set_secrets([{"secret_id": key.id, "env": "OPENAI_API_KEY"}])
+plain.start()
+
+# A bound computer's list is replaced whole, against the version read; the new
+# values arrive at its next start or restart.
+bound = c.secrets()
+c.set_secrets([{"secret_id": key.id, "env": "OPENAI_API_KEY"}], version=bound.version)
+```
+
+A replaced value is sent to a running computer asynchronously and on a
+best-effort basis — to a file binding always, and to an environment binding for
+new shells on images that support it — and the answer does not say whether it
+landed. The computer does:
+
+```python
+c.refresh()
+c.secret_bindings  # which secret, which revision, which variable or file
+c.secrets_applied  # the receipt: generation, when, and each revision delivered
+c.secrets_error  # why the last delivering start was stopped, or None
+c.secrets_pending  # True, False, or None when the platform could not check
+```
+
+`secrets_pending` is three answers on purpose: `None` means unknown, and is
+never folded into `False`. A start or a restart always delivers the latest
+values. Deleting a secret does not recall a value already delivered, but nothing
+more is delivered after it, so a computer still bound to it cannot start again
+until the binding is removed.
+
+`mandala-py secrets list | set NAME | rm NAME` does the same from a shell; see
+[the CLI](#the-mandala-py-cli).
+
+### Activity and signals
+
+Two read-only histories, neither of which wakes the guest:
+
+```python
+page = c.signals()  # a baseline at the current head, no history
+page = c.signals(page.cursor)  # what the host observed since
+for event in page.events:
+    print(event["type"], event["data"])
+
+history = c.activities()  # API requests against this computer, newest first
+older = c.activities(history.next_cursor) if history.next_cursor else None
+changes = c.activities(history.changes_cursor, changes=True)  # added or finished since
+one = c.activity(history.items[0].activity_id)
+links = c.activity_results(one.activity_id)  # retained results it produced
+```
+
+Signals are ephemeral observations — started, stopped, suspended, idle, a
+background process exited — not durable history, and not proof a task
+succeeded; a `gap` means some were missed and the cursor is a new head. Activity
+is safe metadata about requests: no command, output or input text is kept, and
+a row does not prove what the guest did. Both answer 503 rather than an empty
+page when they cannot be read, so keep the checkpoint you had.
 
 ### Readiness
 
@@ -2061,6 +2181,22 @@ platform did not say. `None` rather than `0`: reporting "nothing was destroyed"
 because the server was quiet is the one wrong answer worth going out of the way
 to avoid.
 
+A purge wants the whole answer, which `detailed=True` returns as a
+`ComputerDeletion`: the platform answers 202 with `ok` false when work remains
+queued, says whether the computer's deletion is confirmed (`computer_deleted`,
+`None` when unknown), and tallies the selected copies in `purge` — confirmed,
+queued, failed, unknown, and any new copies it did not select.
+
+```python
+done = c.delete(purge_snapshots=True, expect=held.fingerprint, detailed=True)
+if not done.ok or (done.purge and not done.purge.complete):
+    print(done.error, done.purge)  # read the holdings again before any retry
+```
+
+A purge partly refused is a `ConflictError`; one whose outcome is unknown is a
+503 `UnavailableError`. Neither is replayed for you, and neither is safe to send
+again without reading `snapshot_holdings()` first.
+
 ### Account quota
 
 `client.account.read()` returns a frozen `AccountQuota`: instantaneous plan
@@ -2335,7 +2471,28 @@ one call away.
 
 Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
-directory. A transfer resumes a suspended computer, like any other use.
+directory. A transfer resumes a suspended computer, like any other use, and a
+resume is charged. Pass `no_wake=True` to any transfer to require a running
+computer instead: one that is not running raises `ComputerNotRunningError`, a
+`ConflictError` that is not transient, since only a start changes it.
+
+```python
+try:
+    log = c.read_file("/var/log/app.log", no_wake=True)
+except mc.ComputerNotRunningError:
+    log = None  # stopped or suspended, and left that way
+```
+
+`list_directory()` lists one directory of a running computer — names, types and
+regular-file sizes — without resuming it. It is bounded, not paged: a large
+directory answers `truncated=True` with an unordered sample, and the way to see
+more is a narrower directory. Linux images with `/usr/bin/python3` only.
+
+```python
+listing = c.list_directory("/home/user/Desktop")
+for entry in listing.entries:
+    print(entry.type, entry.name, entry.size_bytes)
+```
 
 A write replaces whatever is at the path. Pass `overwrite=False` to create the
 file only if nothing is there:
@@ -2499,12 +2656,15 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `PermissionDeniedError` | 403 — suspended or unverified account |
 | `NotFoundError` | 404 — no such computer, snapshot, guest file, or route |
 | `MethodNotAllowedError` | 405 — method unsupported; see `allow` |
-| `ConflictError` | 409 — right request, wrong moment; retry, except the two cases below |
-| `MoveRequiredError` | 409 — …except this one: the size needs a host that can run it |
+| `ConflictError` | 409 — refused for the state something is in; `reason` says whether waiting helps |
+| `MoveRequiredError` | 409 — the size needs a host that can run it |
+| `FileExistsError` | 409 `exists` — a create-only upload found its path taken |
+| `CreateOnlyConflictError` | 409 — a create-only upload refused with no readable reason |
+| `ComputerNotRunningError` | 409 — a `no_wake` transfer found the computer stopped or suspended |
 | `FileTooLargeError` | 413 — past what one request carries. A file over 64 MiB: ask for a window. A clipboard over 128 KiB: there is no window to ask for |
 | `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
-| `UnavailableError` | 503 — a hypervisor could not be reached; retry |
+| `UnavailableError` | 503 — something could not answer now; retry a read, but a change may or may not have happened |
 | `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on |
 | `OriginResponseError` | 520 — it was reached; the exchange broke on the way back |
 | `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
@@ -2639,9 +2799,11 @@ at a hypervisor, so any call naming a computer on a host that cannot be reached
 raises it — `start()`, `exec()`, `screenshot()` — rather than a `NotFoundError`,
 because the computer has not gone anywhere. Creates and resizes raise it when
 the fan-out that checks your plan comes back short, and so does a host with no
-room left for another guest. Retrying is the fix; `allow_partial=True` applies
-only to the fan-out listings, which are the one case where a partial answer
-exists (see [Partial listings](#partial-listings)).
+room left for another guest. Retrying a read is the fix. A change answered this
+way may or may not have happened, so read the current state before sending it
+again (see `is_transient` below). `allow_partial=True` applies only to the
+fan-out listings, which are the one case where a partial answer exists (see
+[Partial listings](#partial-listings)).
 
 These four are the edge failing rather than the platform refusing, and they are
 four classes rather than one because a caller asking *did my work happen* needs
@@ -2682,10 +2844,19 @@ that creates deserves a look first.
 
 `is_transient(err)` is that rule as a function, and it answers for the riskiest
 caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
-`ConflictError` (except `MoveRequiredError` and `template_image_preparing`),
-`RateLimitError`, `UnavailableError` and `ConnectionError` (except
-`ConnectionInterruptedError`), and no to everything above whose outcome is
-unknown, 502 and 504 included.
+`ConflictError` (except `MoveRequiredError`, `FileExistsError`,
+`CreateOnlyConflictError`, `ComputerNotRunningError` and
+`template_image_preparing`), `RateLimitError`, `UnavailableError` **on a read**
+and `ConnectionError` (except `ConnectionInterruptedError`), and no to
+everything above whose outcome is unknown, 502 and 504 included.
+
+A 503 on a change is one of those. The platform documents that a change answered
+503 may or may not have happened — a failure after the request was sent is
+answered the same way — so `is_transient()` answers `False` for an
+`UnavailableError` whose request was not a `GET` or `HEAD`, and every error
+carries the request's `method` so you can see which it was. Read the current
+state before sending a create, a command, a delete or a secret change again.
+The SDK's own `retries` never replays a change either.
 
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during
@@ -2700,24 +2871,26 @@ as a plain `APIError` — the stream having been delivered is proof no proxy
 abandoned anything. So `except GatewayTimeoutError` around `agent()` will not
 catch a 504 the platform is *reporting*; catch `APIError` and read `.status`.
 
-`ConflictError` is the one worth catching separately, because nearly every one
-clears itself: something is in flight that the operation cannot run alongside —
-a disk still being copied, a snapshot being taken, a delete already under way, a
-guest agent that has not finished coming up, or a suspend committed to the
-computer a moment before your call. Waiting and retrying is the fix; changing
-the request is not. Template preparation is an exception: inspect its state
-and error, then deliberately continue with the returned token and the original
-create arguments when appropriate, as shown above.
+`ConflictError` is the one worth catching separately, and **whether retrying
+helps is in the body, not the status**. Many clear by themselves: something is
+in flight that the operation cannot run alongside — a disk still being copied,
+a snapshot being taken, a delete already under way, a guest agent that has not
+finished coming up, or a suspend committed to the computer a moment before your
+call. Others describe a decision about the request, and no amount of waiting
+changes them. Template preparation is an exception of its own: inspect its
+state and error, then deliberately continue with the returned token and the
+original create arguments when appropriate, as shown above.
 
-Some require a different action. `MoveRequiredError` is one, and it has a class
-you can catch. For clipboard refusals, read `APIError.reason`:
-`unavailable` and `unsupported` make `is_transient()` answer `False`, while
-`contention` and `starting` answer `True`. A suspended computer's read is refused,
-but its status alone does not determine the reason; follow the returned
-classification. An absent or unknown reason is deliberately treated as
-unclassified and falls back to the exception type, so a legacy `ConflictError`
-still answers `True`. If you support such
-responses, check the computer state and keep the retry loop bounded.
+Read `APIError.reason`, one word the platform puts beside the sentence:
+`contention` (something in flight) and `starting` (the guest agent's boot
+window, two minutes after a start, a restart or a reboot inside the guest)
+make `is_transient()` answer `True`; `unavailable` (the computer is not
+running — start it), `unsupported`, `exists` and `revoked` make it answer
+`False`. The set is open: an absent or unknown word is treated as unclassified
+and falls back to the exception type, so a `ConflictError` without one still
+answers `True`. Not every 409 has a word yet — a seventeenth background command
+on one computer is refused without one, and waiting does not necessarily help —
+so keep a retry loop bounded.
 
 A retry loop on it terminates because it has a deadline, not because of any
 status: a guest agent that stays silent past its boot window does stop being a
@@ -2752,6 +2925,7 @@ mandala-py ssh dev                    # real OpenSSH, through the platform's gat
 mandala-py scp .env dev:/home/user/app/.env
 mandala-py scp dev:/home/user/report.csv .
 mandala-py webhooks list              # and create, get, update, delete, rotate, test, deliveries
+mandala-py secrets list               # names and revisions, never values
 ```
 
 `terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
@@ -2802,6 +2976,21 @@ deliveries.
 mandala-py webhooks create https://ci.example.com/mandala --event process.exited
 mandala-py webhooks update whk-2b7d4c809f3c1a7e --all-events --enable
 mandala-py webhooks test whk-2b7d4c809f3c1a7e && mandala-py webhooks deliveries whk-2b7d4c809f3c1a7e
+```
+
+`secrets` manages the account's [secret store](#secrets). `set NAME` creates the
+secret or replaces its value, and reads the value from stdin — dropping one
+trailing newline, which `--keep-newline` keeps — or, at a terminal, from a prompt
+that does not echo. Never from the command line, where it would land in shell
+history and in every process listing. `rm NAME` deletes by name at the revision
+it read. `--workspace ID` names a workspace's scope on all three; without it
+they work on the account-wide secrets. No command prints a value, because the
+platform returns none.
+
+```sh
+printf %s "$OPENAI_API_KEY" | mandala-py secrets set OPENAI_API_KEY
+mandala-py secrets set KUBECONFIG --keep-newline < ~/.kube/config
+mandala-py secrets rm OPENAI_API_KEY
 ```
 
 ### SSH access

@@ -13,7 +13,7 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport
-from ._exceptions import MandalaError, TimeoutError
+from ._exceptions import ConflictError, MandalaError, TimeoutError
 from ._models import (
     AccountQuota,
     BuildProgress,
@@ -22,7 +22,9 @@ from ._models import (
     PublishedTemplate,
     Retention,
     RetiredTemplates,
+    Secret,
     SecretBindingArgs,
+    SecretList,
     Size,
     Snapshot,
     SshKey,
@@ -69,13 +71,16 @@ from ._computer import _poll_delay, _ride_out, check_wait_args
 from ._exceptions import _is_transient_for_poll
 from ._resources import (
     EPHEMERAL_DOC,
+    SECRET_SET_RETRIES,
     Builds,
+    Secrets,
     SshKeys,
     Templates,
     Webhooks,
     _LastPoll,
     _launch_start_admitted,
     _named,
+    _named_secret,
     _wait_timed_out,
     classify_poll_failure,
     deletion_timed_out,
@@ -89,6 +94,7 @@ __all__ = [
     "AsyncBuilds",
     "AsyncComputers",
     "AsyncMoves",
+    "AsyncSecrets",
     "AsyncSizes",
     "AsyncSnapshots",
     "AsyncSshKeys",
@@ -992,6 +998,75 @@ class AsyncWebhooks:
     rotate.__doc__ = Webhooks.rotate.__doc__
     test.__doc__ = Webhooks.test.__doc__
     deliveries.__doc__ = Webhooks.deliveries.__doc__
+
+
+class AsyncSecrets:
+    __doc__ = Secrets.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self, *, workspace_id: str | None = None) -> SecretList:
+        data = await self._t.json_object(
+            "GET", _api.SECRETS, params=_api.secret_scope_params(workspace_id)
+        )
+        return SecretList.from_api(data)
+
+    async def get(self, secret_id: str, *, workspace_id: str | None = None) -> Secret:
+        data = await self._t.json_object(
+            "GET", _api.secret(secret_id), params=_api.secret_scope_params(workspace_id)
+        )
+        return Secret.from_api(data, "GET secrets/:id")
+
+    async def create(self, name: str, value: str, *, workspace_id: str | None = None) -> Secret:
+        body = _api.secret_create_body(name, value, workspace_id)
+        data = await self._t.json_object("POST", _api.SECRETS, json=body)
+        return Secret.from_api(data, "POST secrets")
+
+    async def replace(
+        self,
+        secret_id: str,
+        value: str,
+        *,
+        revision_id: str,
+        workspace_id: str | None = None,
+    ) -> Secret:
+        body = _api.secret_replace_body(value, revision_id, workspace_id)
+        data = await self._t.json_object("PUT", _api.secret(secret_id), json=body)
+        return Secret.from_api(data, "PUT secrets/:id")
+
+    async def delete(
+        self, secret_id: str, *, revision_id: str, workspace_id: str | None = None
+    ) -> None:
+        await self._t.request(
+            "DELETE",
+            _api.secret(secret_id),
+            params=_api.secret_delete_params(revision_id, workspace_id),
+        )
+
+    async def set(self, name: str, value: str, *, workspace_id: str | None = None) -> Secret:
+        # Everything checked before the first request, the read included.
+        _api.secret_create_body(name, value, workspace_id)
+        for attempt in range(SECRET_SET_RETRIES + 1):
+            listed = await self.list(workspace_id=workspace_id)
+            found = _named_secret(listed.secrets, name)
+            try:
+                if found is None:
+                    return await self.create(name, value, workspace_id=workspace_id)
+                return await self.replace(
+                    found.id, value, revision_id=found.revision_id, workspace_id=workspace_id
+                )
+            except ConflictError:
+                if attempt == SECRET_SET_RETRIES:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    list.__doc__ = Secrets.list.__doc__
+    get.__doc__ = Secrets.get.__doc__
+    create.__doc__ = Secrets.create.__doc__
+    replace.__doc__ = Secrets.replace.__doc__
+    delete.__doc__ = Secrets.delete.__doc__
+    set.__doc__ = Secrets.set.__doc__
 
 
 class AsyncSshKeys:

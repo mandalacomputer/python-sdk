@@ -1268,7 +1268,8 @@ async def test_read_text_file_awaits_read_file_once_on_the_async_half(
     c = await client.computers.get("vm-1")
     calls: list[str] = []
 
-    async def fake(path: str) -> bytes:
+    async def fake(path: str, *, no_wake: bool = False) -> bytes:
+        assert no_wake is False
         calls.append(path)
         return b"config\n"
 
@@ -1278,7 +1279,7 @@ async def test_read_text_file_awaits_read_file_once_on_the_async_half(
 
     sentinel = RuntimeError("from read_file")
 
-    async def raiser(path: str) -> bytes:
+    async def raiser(path: str, *, no_wake: bool = False) -> bytes:
         raise sentinel
 
     with (
