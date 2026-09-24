@@ -855,18 +855,14 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                 "earlier attempt's outcome was unknown, the file may be yours: read it and "
                 "compare before choosing another path or dropping --no-overwrite to replace it."
             )
-        except CreateOnlyConflictError as e:
-            # No usable reason, so nothing here says the path is taken. And only a
-            # refusal the platform wrote out (a JSON object) says this upload
-            # wrote nothing; an empty, cut-off or proxy body leaves that unconfirmed.
-            outcome = (
-                "this upload wrote nothing"
-                if isinstance(e.body, dict)
-                else "whether this upload wrote anything is unconfirmed"
-            )
+        except CreateOnlyConflictError:
+            # No usable reason, so nothing here says the path is taken, nor that
+            # this upload wrote nothing: without the platform's word, a 409 (JSON
+            # or not) may come from a hop that had already forwarded the write.
             _die(
                 f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
-                f"reason unknown; {outcome}. Do not send the same upload again blind: read "
+                "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
+                "send the same upload again blind: read "
                 "the remote path to see what is there before choosing another path or "
                 "dropping --no-overwrite."
             )

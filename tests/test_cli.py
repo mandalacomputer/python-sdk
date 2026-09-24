@@ -171,16 +171,16 @@ def test_scp_no_overwrite_says_the_path_is_taken(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("answer", "structured"),
+    "answer",
     [
-        (lambda: httpx.Response(409, json={"error": "a file already exists"}), True),
-        (lambda: httpx.Response(409, content=b""), False),
-        (lambda: httpx.Response(409, content=b"<html>conflict</html>"), False),
+        lambda: httpx.Response(409, json={"error": "a file already exists"}),
+        lambda: httpx.Response(409, content=b""),
+        lambda: httpx.Response(409, content=b"<html>conflict</html>"),
     ],
-    ids=["platform-json", "empty", "proxy-page"],
+    ids=["reasonless-json", "empty", "proxy-page"],
 )
 @respx.mock
-def test_scp_no_overwrite_never_says_taken_without_the_word(tmp_path, answer, structured) -> None:
+def test_scp_no_overwrite_never_says_taken_without_the_word(tmp_path, answer) -> None:
     respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=COMPUTERS))
     respx.put(f"{BASE}/computers/vm-1/files").mock(side_effect=lambda request: answer())
     src = tmp_path / "notes.txt"
@@ -191,11 +191,9 @@ def test_scp_no_overwrite_never_says_taken_without_the_word(tmp_path, answer, st
     message = str(caught.value)
     assert "refused as a conflict, reason unknown" in message
     assert "already exists" not in message
-    if structured:
-        assert "this upload wrote nothing" in message
-    else:
-        assert "wrote nothing" not in message
-        assert "whether this upload wrote anything is unconfirmed" in message
+    # Even the JSON one: a reasonless 409 does not prove the write never landed.
+    assert "wrote nothing" not in message
+    assert "whether this upload wrote anything is unconfirmed" in message
 
 
 def test_scp_no_overwrite_is_refused_on_a_download(tmp_path) -> None:
