@@ -7,7 +7,7 @@ project is pre-1.0, so a minor version may carry a behaviour change.
 The reasoning behind a change lives in its commit message rather than here.
 This is the summary you read to decide whether to upgrade.
 
-## [Unreleased]
+## [0.5.1] — unreleased
 
 ### Changed
 
