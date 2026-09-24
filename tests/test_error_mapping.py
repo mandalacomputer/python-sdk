@@ -576,8 +576,17 @@ _REASONLESS_JSON = [
     {"reason": ""},
     {"reason": "   "},
     {},
+    {"error": "a file already exists at that path"},
 ]
-_REASONLESS_IDS = ["missing", "numeric", "null", "empty-string", "blank-string", "empty-object"]
+_REASONLESS_IDS = [
+    "missing",
+    "numeric",
+    "null",
+    "empty-string",
+    "blank-string",
+    "empty-object",
+    "existence-text",
+]
 
 
 @pytest.mark.parametrize("body", _REASONLESS_JSON, ids=_REASONLESS_IDS)

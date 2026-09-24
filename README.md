@@ -2343,8 +2343,10 @@ file only if nothing is there:
 ```python
 try:
     c.write_file("/home/user/app/config.toml", "debug = false\n", overwrite=False)
-except mc.FileExistsError:
-    pass  # something was already there, and this call wrote nothing
+except mc.FileExistsError as e:
+    # This call wrote nothing. e.reason == "exists" means something was already
+    # there; None means the refusal's reason is unknown, so do not say it was.
+    pass
 ```
 
 A path that is taken raises `FileExistsError` — a `ConflictError` whose

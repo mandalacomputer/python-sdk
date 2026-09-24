@@ -391,8 +391,17 @@ async def test_async_create_only_409_with_an_interrupted_body_is_never_transient
         {"reason": ""},
         {"reason": "   "},
         {},
+        {"error": "a file already exists at that path"},
     ],
-    ids=["missing", "numeric", "null", "empty-string", "blank-string", "empty-object"],
+    ids=[
+        "missing",
+        "numeric",
+        "null",
+        "empty-string",
+        "blank-string",
+        "empty-object",
+        "existence-text",
+    ],
 )
 async def test_async_create_only_409_with_no_usable_reason_is_never_transient(body):
     """The async half of the sync test of the same name (OPL-4994, Codex review)."""

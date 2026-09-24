@@ -248,15 +248,20 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
     the file later if the path were cleared in between. So the request's own
     context, create-only, decides here what the status alone cannot: the
     refusal is final, and the message says only that it was a conflict whose
-    reason is unknown, not that the path exists. A 409 that DID carry a string
-    reason keeps the platform's classification, whatever the word.
+    reason is unknown, not that the path exists. Callers that tell anyone the
+    path is taken test ``reason == "exists"``, not the class. A 409 that DID
+    carry a string reason keeps the platform's classification, whatever the
+    word.
     """
     if isinstance(err, FileExistsError) or (isinstance(err.reason, str) and err.reason.strip()):
         return err
     return FileExistsError(
-        f"{err} (a create-only upload was refused as a conflict, reason unknown: the 409 "
+        # Neutral on purpose, and not the body's own text: a reasonless body whose
+        # ``error`` says "already exists" would carry the very claim this avoids.
+        # The body is kept on the error for diagnostics.
+        "a create-only upload was refused as a conflict, reason unknown: the 409 "
         "carried no reason that could be read, so whether the path is taken was not said; "
-        "treat it as final rather than sending the same write again)",
+        "treat it as final rather than sending the same write again",
         status=err.status,
         body=err.body,
         retry_after=err.retry_after,
