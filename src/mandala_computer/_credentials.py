@@ -470,6 +470,9 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
                     raise CredentialError("writer_lock_timeout") from None
                 time.sleep(0.05)
         descriptors.append(lock_fd)
+        # Owned from the moment it exists: whatever fails next, the finally
+        # below removes this lock, or no later writer could ever take it.
+        lock_info = os.fstat(lock_fd)
         os.fchmod(lock_fd, 0o600)
         lock_info = os.fstat(lock_fd)
         _check_stat(lock_info, directory=False)

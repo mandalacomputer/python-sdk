@@ -431,6 +431,31 @@ def test_logout_waits_for_and_never_steals_a_held_lock(home: Path) -> None:
     assert path.exists()
 
 
+def test_logout_removes_its_own_lock_when_securing_it_fails(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _store(home, "home", home=_profile("com_one", "key-000000000001"))
+    lock = home / ".mandala" / ".credentials.lock"
+    real = os.fchmod
+    calls = 0
+
+    def failing_once(fd: int, mode: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("fchmod failed")
+        real(fd, mode)
+
+    monkeypatch.setattr(credentials.os, "fchmod", failing_once)
+    with pytest.raises(credentials.CredentialError) as caught:
+        credentials.remove_profile(lock_timeout=0.1)
+    assert caught.value.rule == "credential_remove_failed"
+    # A lock left behind would time out every later writer for good.
+    assert not lock.exists()
+    assert path.exists()
+    assert credentials.remove_profile(lock_timeout=0.1).removed
+
+
 def test_logout_refuses_an_unsafe_store(home: Path) -> None:
     path = _store(home, "home", home=_profile("com_one", "key-000000000001"))
     path.chmod(0o644)
