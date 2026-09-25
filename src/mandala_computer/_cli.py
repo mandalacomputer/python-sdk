@@ -37,6 +37,16 @@ Two subcommands address a computer by name or id:
     land in shell history and ``ps`` — and creates the secret or replaces its
     value. No command ever prints a value: the platform returns none.
 
+``mandala-py whoami`` / ``mandala-py api-keys <list|create|revoke>``
+    Who the credential is, and the holder's own API keys. The ``api-keys``
+    verbs need the calling key's "Manage keys" permission, which only a
+    dashboard session turns on; without it the platform's own sentence is
+    printed, and it says exactly that. ``create`` prints the new key ONCE.
+
+``mandala-py logout [--profile NAME]``
+    Forget a profile saved in ``~/.mandala/credentials.json`` by
+    ``mandala login``. The key it held stays valid until it is revoked.
+
 ``mandala-py ssh <computer> [ssh-args…]``
     Real OpenSSH, through the platform's SSH gateway, with the gateway's host
     key pinned. ``--setup`` registers a public key and switches SSH on;
@@ -97,7 +107,16 @@ from ._exceptions import (
     TimeoutError,
     UnavailableError,
 )
-from ._models import Listing, Secret, SshAccess, SshKey, Webhook, WebhookDelivery
+from ._models import (
+    ApiKey,
+    Listing,
+    Secret,
+    SshAccess,
+    SshKey,
+    Webhook,
+    WebhookDelivery,
+    Whoami,
+)
 from ._resources import _named_secret
 
 if TYPE_CHECKING:
@@ -1354,6 +1373,186 @@ def _secrets_parser(sub: Any) -> None:
     rm.set_defaults(fn=_cmd_secrets_rm)
 
 
+# --- who you are, API keys, logout (platform OPL-5053) -----------------------
+
+
+def _key_scope(k: ApiKey) -> str:
+    if k.workspace_id is None:
+        return "account-wide"
+    return f"workspace {k.workspace_name or '?'} ({k.workspace_id})"
+
+
+def _api_key_rows(keys: Sequence[ApiKey]) -> str:
+    rows = [
+        (
+            k.id,
+            k.name or "(unnamed)",
+            k.prefix,
+            _key_scope(k),
+            "yes" if k.manage_keys else "no",
+            k.last_used_at or "never",
+        )
+        for k in keys
+    ]
+    return _table(("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED"), rows)
+
+
+def _whoami_lines(w: Whoami) -> list[str]:
+    who = f"{w.user.name} <{w.user.email}>" if w.user.name else f"<{w.user.email}>"
+    scope = (
+        f"workspace {w.workspace.name} ({w.workspace.id})" if w.workspace else "the whole account"
+    )
+    lines = [
+        f"{who} ({w.user.id})",
+        (
+            f"Account: {w.account.name or '(unnamed)'} ({w.account.id}), "
+            f"plan {w.account.plan}, {w.account.status}"
+        ),
+        f"Role: {w.role}",
+        f"Scope: {scope}",
+    ]
+    if w.key is None:
+        lines.append("Key: not reported")
+    else:
+        can = "can" if w.key.manage_keys else "cannot"
+        lines.append(
+            f"Key: {w.key.name or '(unnamed)'} ({w.key.id}, {w.key.prefix}); {can} manage API keys"
+        )
+    return lines
+
+
+def _cmd_whoami(args: argparse.Namespace) -> int:
+    with _client() as client:
+        who = client.account.whoami()
+    if args.json:
+        _json(who.raw)
+    else:
+        print("\n".join(_whoami_lines(who)))
+    if who.account.status == "suspended":
+        print(
+            f"{PROG}: this account is suspended; other commands will be refused.", file=sys.stderr
+        )
+    return 0
+
+
+def _cmd_api_keys_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        keys = client.api_keys.list()
+    if args.json:
+        _json([k.raw for k in keys])
+    elif keys:
+        print(_api_key_rows(keys))
+    else:
+        print("no API keys this key can reach", file=sys.stderr)
+    return 0
+
+
+def _cmd_api_keys_create(args: argparse.Namespace) -> int:
+    with _client() as client:
+        created = client.api_keys.create(name=args.name, workspace_id=args.workspace)
+    # The key alone on stdout, so `KEY=$(mandala-py api-keys create)` captures
+    # it and nothing else; what it is and the warning go to stderr.
+    if args.json:
+        _json(created.raw)
+    else:
+        print(created.key)
+    print(
+        f"{PROG}: created {created.id} ({created.name or 'unnamed'}, {_key_scope(created)}). "
+        "Store the key now: it is shown once and cannot be read again.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_api_keys_revoke(args: argparse.Namespace) -> int:
+    with _client() as client:
+        client.api_keys.revoke(args.id)
+    if args.json:
+        _json({"id": args.id, "revoked": True})
+    else:
+        print(f"revoked {args.id}")
+    return 0
+
+
+def _cmd_logout(args: argparse.Namespace) -> int:
+    from ._credentials import remove_profile
+
+    removed = remove_profile(args.profile)
+    if not removed.removed:
+        also = (
+            f" The default profile is {removed.default_profile}." if removed.default_profile else ""
+        )
+        _die(
+            f"no saved profile named {removed.profile}; nothing was removed.{also}",
+            "not_logged_in",
+        )
+    notes = [
+        f"removed profile {removed.profile} from {removed.path}.",
+        (
+            f"Its key {removed.key_id} still works until it is revoked: revoke it under "
+            f"Credentials in the dashboard, or run `{PROG} api-keys revoke {removed.key_id}` "
+            "with a key that can manage keys."
+        ),
+    ]
+    if removed.default_profile is not None and removed.default_profile != removed.profile:
+        notes.append(f"The default profile is {removed.default_profile}.")
+    if os.environ.get("MANDALA_API_KEY", "").strip():
+        notes.append(
+            "MANDALA_API_KEY is set in this environment, and it still authenticates every command."
+        )
+    for note in notes:
+        print(f"{PROG}: {note}", file=sys.stderr)
+    if args.json:
+        _json(
+            {
+                "profile": removed.profile,
+                "removed": True,
+                "path": removed.path,
+                "key_id": removed.key_id,
+                "default_profile": removed.default_profile,
+            }
+        )
+    return 0
+
+
+def _keys_parsers(sub: Any) -> None:
+    who = sub.add_parser("whoami", help="who the credential is: person, account, role, key")
+    who.add_argument("--json", action="store_true", help="the platform's answer as JSON")
+    who.set_defaults(fn=_cmd_whoami)
+
+    keys = sub.add_parser("api-keys", help="your API keys (needs the key's Manage keys permission)")
+    verbs = keys.add_subparsers(dest="verb", required=True)
+    listing = verbs.add_parser("list", help="your keys this key can reach — never the keys")
+    listing.add_argument("--json", action="store_true", help="the keys as JSON")
+    listing.set_defaults(fn=_cmd_api_keys_list)
+    create = verbs.add_parser(
+        "create", help="mint a key and print it ONCE; the new key cannot manage keys"
+    )
+    create.add_argument("--name", help="a label, up to 60 characters")
+    create.add_argument(
+        "--workspace",
+        metavar="ID",
+        help="confine the key to this workspace (default: the calling key's own scope)",
+    )
+    create.add_argument("--json", action="store_true", help="the new key as JSON, under raw")
+    create.set_defaults(fn=_cmd_api_keys_create)
+    revoke = verbs.add_parser("revoke", help="revoke a key by id")
+    revoke.add_argument("id", metavar="ID")
+    revoke.add_argument("--json", action="store_true", help="the result as JSON")
+    revoke.set_defaults(fn=_cmd_api_keys_revoke)
+
+    logout = sub.add_parser(
+        "logout", help="forget a saved profile on this machine; its key stays valid"
+    )
+    logout.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="the profile to forget (default: MANDALA_PROFILE, then the saved default)",
+    )
+    logout.add_argument("--json", action="store_true", help="the result as JSON")
+    logout.set_defaults(fn=_cmd_logout)
+
+
 def _webhooks_parser(sub: Any) -> None:
     hooks = sub.add_parser("webhooks", help="the account's webhook subscriptions")
     verbs = hooks.add_subparsers(dest="verb", required=True)
@@ -1838,10 +2037,13 @@ def _ssh_parsers(sub: Any) -> None:
 def _parser() -> argparse.ArgumentParser:
     # _Parser throughout: add_subparsers makes every subcommand's parser the
     # same class as its parent's, so each one prints its own whole help.
+    from mandala_computer import __version__
+
     parser = _Parser(
         prog=PROG,
         description="Your own terminal, against a Mandala computer.",
     )
+    parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     terminal = sub.add_parser("terminal", help="an interactive shell in the guest")
@@ -1867,6 +2069,7 @@ def _parser() -> argparse.ArgumentParser:
     _ssh_parsers(sub)
     _webhooks_parser(sub)
     _secrets_parser(sub)
+    _keys_parsers(sub)
     return parser
 
 

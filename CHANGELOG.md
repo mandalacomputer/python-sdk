@@ -11,6 +11,18 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **`client.api_keys.list()`, `create(name=, workspace_id=)` and
+  `revoke(key_id)`**, and **`client.account.whoami()`** (sync and async), over
+  the platform's new `GET whoami` and `GET|POST api-keys`,
+  `DELETE api-keys/{id}`. The key routes need the calling key's opt-in "Manage
+  keys" permission, granted only from a dashboard session; without it they
+  raise `PermissionDeniedError` carrying the platform's sentence. A minted key
+  is answered once, as `ApiKeyCreated.key`, and never has the permission
+  itself.
+- **`mandala-py whoami`, `api-keys list | create | revoke`, `logout` and
+  `--version`.** `logout` forgets one profile saved by `mandala login`, under
+  the same lock file, and prints the id of the key it held, which stays valid
+  until revoked; `api-keys create` prints only the new key on stdout.
 - **`computer.wait_for_secrets()`** and **`computer.secrets_delivering`** (sync
   and async). A computer comes back `running`, and its guest answers, a few
   seconds before its secrets land. The wait polls until the platform's

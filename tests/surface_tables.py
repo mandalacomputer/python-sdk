@@ -125,6 +125,11 @@ ALLOWED = {
     ("GET", "workspaces"),
     ("GET", "workspaces/:id"),
     ("GET", "workspaces/:id/members"),
+    # Who the credential is, and the holder's own API keys (OPL-5053).
+    ("GET", "whoami"),
+    ("GET", "api-keys"),
+    ("POST", "api-keys"),
+    ("DELETE", "api-keys/:id"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -354,4 +359,9 @@ PARAMETERS: dict[str, set[str]] = {
     "GET workspaces": set(),
     "GET workspaces/:id": set(),
     "GET workspaces/:id/members": set(),
+    # Who the credential is, and the holder's own API keys (OPL-5053).
+    "GET whoami": set(),
+    "GET api-keys": set(),
+    "POST api-keys": {"body:manage_keys", "body:name", "body:workspace_id"},
+    "DELETE api-keys/:id": set(),
 }

@@ -64,6 +64,14 @@ WEBHOOKS = "webhooks"
 #: The caller's own SSH public keys. A key belongs to a person rather than to an
 #: account, so the collection is the same whichever account a key acts on.
 SSH_KEYS = "ssh-keys"
+#: Who the credential is (platform OPL-5053): the person, the account and role
+#: it acts with, the workspace it is confined to, and the key itself. Needs no
+#: permission, and answers a suspended account too.
+WHOAMI = "whoami"
+#: The holder's own API keys (platform OPL-5053). Every verb needs the key's
+#: opt-in "Manage keys" permission, which only a dashboard session turns on;
+#: without it the platform answers 403 with a sentence that says so.
+API_KEYS = "api-keys"
 
 
 def canonical(value: object, what: str) -> str:
@@ -1991,6 +1999,33 @@ def webhook_body(
 
 def ssh_key(key_id: str) -> str:
     return f"ssh-keys/{seg(key_id)}"
+
+
+def api_key(key_id: str) -> str:
+    return f"api-keys/{seg(key_id)}"
+
+
+def api_key_body(name: object, workspace_id: object) -> dict[str, Any]:
+    """``POST api-keys``: a label and a workspace, each only when given.
+
+    Never ``manage_keys``: the platform refuses ``true`` from every API key
+    (403) and grants the permission only from a dashboard session, so there is
+    nothing for this SDK to ask for. A workspace of ``""`` or with spaces around
+    it is refused here — the platform keeps "absent" (the caller's own scope)
+    and a workspace id apart, and would answer it as no such workspace.
+    """
+    body: dict[str, Any] = {}
+    if name is not None:
+        body["name"] = canonical(name, "name")
+    if workspace_id is not None:
+        ws = canonical(workspace_id, "workspace_id")
+        if not ws.strip() or ws != ws.strip():
+            raise ValueError(
+                "workspace_id must be a workspace id, with no spaces around it; "
+                "omit it for a key in your own scope"
+            )
+        body["workspace_id"] = ws
+    return body
 
 
 def computer_ssh(computer_id: str) -> str:

@@ -43,6 +43,7 @@ from ._artifacts import Artifact, ArtifactAssociation
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import (
     AsyncAccount,
+    AsyncApiKeys,
     AsyncBuilds,
     AsyncComputers,
     AsyncMoves,
@@ -108,6 +109,8 @@ from ._models import (
     ActivityHealth,
     ActivityPage,
     ActivityResults,
+    ApiKey,
+    ApiKeyCreated,
     BuildProgress,
     BuildStep,
     ComputerDeletion,
@@ -146,11 +149,16 @@ from ._models import (
     Webhook,
     WebhookCreated,
     WebhookDelivery,
+    Whoami,
+    WhoamiAccount,
+    WhoamiUser,
+    WhoamiWorkspace,
     Window,
     WindowResult,
 )
 from ._resources import (
     Account,
+    ApiKeys,
     Builds,
     Computers,
     Moves,
@@ -210,6 +218,8 @@ __all__ = [
     "AgentStepEvent",
     "AgentText",
     "AgentUsage",
+    "ApiKey",
+    "ApiKeyCreated",
     "Artifact",
     "ArtifactAssociation",
     "AsyncAccount",
@@ -296,6 +306,10 @@ __all__ = [
     "Webhook",
     "WebhookCreated",
     "WebhookDelivery",
+    "Whoami",
+    "WhoamiAccount",
+    "WhoamiUser",
+    "WhoamiWorkspace",
     "Window",
     "WindowResult",
     "__version__",
@@ -342,6 +356,7 @@ class Client:
         self.webhooks = Webhooks(self._t)
         self.ssh_keys = SshKeys(self._t)
         self.secrets = Secrets(self._t)
+        self.api_keys = ApiKeys(self._t)
 
     @property
     def base_url(self) -> str:
@@ -399,6 +414,7 @@ class AsyncClient:
         self.webhooks = AsyncWebhooks(self._t)
         self.ssh_keys = AsyncSshKeys(self._t)
         self.secrets = AsyncSecrets(self._t)
+        self.api_keys = AsyncApiKeys(self._t)
 
     @property
     def base_url(self) -> str:

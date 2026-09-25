@@ -99,6 +99,10 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET computers/:id/screenshot  query:quality",
     "GET computers/:id/screenshot  query:region",
     "GET computers/:id/screenshot  query:scale",
+    # `manage_keys: true` is refused from every API key (403): the permission
+    # is granted only from a dashboard session, and false is the default. There
+    # is nothing for this SDK to send.
+    "POST api-keys  body:manage_keys",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
@@ -134,6 +138,26 @@ RETENTION = {"daily": 7, "weekly": 4, "monthly": 12}
 # One subscription (platform OPL-4300), and the same one as a create answers
 # it: the secret is on exactly that shape and on no read, so the handler below
 # serves WEBHOOK to the reads and WEBHOOK_CREATED to the create and the rotate.
+# One API key as the listing shows it, and the mint's answer with the raw key
+# once (OPL-5053); whoami for an account-wide key that manages keys.
+API_KEY = {
+    "id": "key-a1b2c3d4e5f6",
+    "name": "ci",
+    "prefix": "com_1a2b3c4d…",
+    "created_at": "2026-09-20T08:00:00.000Z",
+    "last_used_at": None,
+    "workspace_id": None,
+    "workspace_name": None,
+    "manage_keys": False,
+}
+API_KEY_CREATED = {**API_KEY, "raw": "com_" + "ab" * 24}
+WHOAMI = {
+    "user": {"id": "usr-1", "email": "dana@example.com", "name": "Dana"},
+    "account": {"id": "acc-1", "name": "Acme", "plan": "team", "status": "active"},
+    "role": "owner",
+    "workspace": None,
+    "key": {**API_KEY, "manage_keys": True},
+}
 SSH_KEY = {
     "id": "sshk-74025eba1b658b99",
     "name": "laptop",
@@ -414,6 +438,7 @@ def pattern_for(path: str) -> str:
             "builds",
             "webhooks",
             "ssh-keys",
+            "api-keys",
             "secrets",
         ):
             # `computers/:id/secrets` is a literal third segment, never an id:
@@ -644,6 +669,12 @@ def api_handler(request: httpx.Request) -> httpx.Response:
     # The caller's keys: the collection lists on GET and answers the one key it
     # registered on POST; a delete answers an ack. A computer's SSH setting is
     # one shape on both verbs.
+    if path.endswith("/whoami"):
+        return httpx.Response(200, json=WHOAMI)
+    if path.endswith("/api-keys"):
+        return httpx.Response(200 if get else 201, json=[API_KEY] if get else API_KEY_CREATED)
+    if "/api-keys/" in path:
+        return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh-keys"):
         return httpx.Response(200 if get else 201, json=[SSH_KEY] if get else SSH_KEY)
     if "/ssh-keys/" in path:
@@ -954,6 +985,12 @@ def exercise_everything(client: mc.Client) -> None:
     client.secrets.set("OPENAI_API_KEY", "sk-new")
     client.secrets.delete(SECRET["id"], revision_id=SECRET["revision_id"])
     client.secrets.delete(SECRET["id"], revision_id=SECRET["revision_id"], workspace_id="ws-1")
+    # Who the credential is, and the holder's keys (OPL-5053).
+    client.account.whoami()
+    client.api_keys.list()
+    client.api_keys.create()
+    client.api_keys.create(name="ci", workspace_id="wsp-1")
+    client.api_keys.revoke(API_KEY["id"])
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -1179,6 +1216,11 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.secrets.delete(
         SECRET["id"], revision_id=SECRET["revision_id"], workspace_id="ws-1"
     )
+    await client.account.whoami()
+    await client.api_keys.list()
+    await client.api_keys.create()
+    await client.api_keys.create(name="ci", workspace_id="wsp-1")
+    await client.api_keys.revoke(API_KEY["id"])
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 

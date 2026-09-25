@@ -23,6 +23,8 @@ from ._exceptions import (
 )
 from ._models import (
     AccountQuota,
+    ApiKey,
+    ApiKeyCreated,
     BuildProgress,
     Listing,
     Move,
@@ -42,6 +44,7 @@ from ._models import (
     Webhook,
     WebhookCreated,
     WebhookDelivery,
+    Whoami,
     build_contradiction,
     move_rows,
 )
@@ -49,6 +52,7 @@ from ._sse import SSEEvent
 
 __all__ = [
     "Account",
+    "ApiKeys",
     "Builds",
     "Computers",
     "Moves",
@@ -1276,7 +1280,8 @@ class Sizes:
 
 
 class Account:
-    """Instantaneous account-wide quota; historical metering is on Usage."""
+    """Instantaneous account-wide quota, and who the credential is; historical
+    metering is on Usage."""
 
     def __init__(self, transport: Transport) -> None:
         self._t = transport
@@ -1289,6 +1294,18 @@ class Account:
         stale immediately. Snapshot headroom excludes in-flight reservations.
         """
         return AccountQuota.from_api(self._t.json_object("GET", _api.ACCOUNT))
+
+    def whoami(self) -> Whoami:
+        """Who this client's credential is: the person it was issued to, the
+        account and role it acts with (the role as it is now), the workspace it
+        is confined to, and the key itself — whether it can manage keys
+        included.
+
+        Needs no permission and any role, and a suspended account can ask it:
+        ``account.status`` is how such a caller finds out why nothing else
+        works.
+        """
+        return Whoami.from_api(self._t.json_object("GET", _api.WHOAMI))
 
 
 class Usage:
@@ -1694,3 +1711,50 @@ def _named(**fields: Any) -> dict[str, Any]:
     from a value, and refuse an update that mentions nothing.
     """
     return {name: value for name, value in fields.items() if value is not None}
+
+
+class ApiKeys:
+    """The API keys of the person this key belongs to (platform OPL-5053).
+
+    EVERY CALL HERE NEEDS THE KEY'S "MANAGE KEYS" PERMISSION. It is off for
+    every key until its holder turns it on from a signed-in dashboard session
+    (Credentials, "Manage keys"), and nothing a key can call turns it on —
+    without it each method raises :class:`~mandala_computer.PermissionDeniedError`
+    whose message says so. A key minted here never has the permission, so a
+    leaked key that manages keys cannot mint a family of keys that do.
+
+    Reach: the holder's own keys on the account this key acts on — never
+    another person's, which answer like an id that does not exist. A key
+    confined to a workspace sees, mints and revokes only keys confined to that
+    same workspace. Listing needs the viewer role; minting and revoking need
+    member.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self) -> builtins.list[ApiKey]:
+        """The keys this key may reach, newest first. Never a raw key."""
+        rows = self._t.json_array("GET", _api.API_KEYS)
+        return [ApiKey.from_api(k, f"API key {i}") for i, k in enumerate(rows)]
+
+    def create(self, *, name: str | None = None, workspace_id: str | None = None) -> ApiKeyCreated:
+        """Mint a key. The answer carries it ONCE, as
+        :attr:`~mandala_computer.ApiKeyCreated.key`: store it before doing
+        anything else.
+
+        ``workspace_id`` omitted mints into the caller's own scope — the whole
+        account, or the workspace the caller is confined to; a workspace-scoped
+        caller naming another is refused. Not retried on a 503: a mint that may
+        already have happened is a key nobody holds, so list and revoke rather
+        than send it again. An account holds at most 1000 keys.
+        """
+        body = _api.api_key_body(name, workspace_id)
+        return ApiKeyCreated.from_api(self._t.json_object("POST", _api.API_KEYS, json=body))
+
+    def revoke(self, key_id: str) -> None:
+        """Revoke one key; it is refused from its next request. A key may revoke
+        itself, and the call that does so is the last it makes. An id out of
+        this key's reach is a :class:`~mandala_computer.NotFoundError`, the same
+        as one that does not exist."""
+        self._t.request("DELETE", _api.api_key(key_id))

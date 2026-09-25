@@ -16,6 +16,8 @@ from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport
 from ._exceptions import ConflictError, MandalaError, TimeoutError
 from ._models import (
     AccountQuota,
+    ApiKey,
+    ApiKeyCreated,
     BuildProgress,
     Listing,
     Move,
@@ -35,6 +37,7 @@ from ._models import (
     Webhook,
     WebhookCreated,
     WebhookDelivery,
+    Whoami,
     build_contradiction,
     move_rows,
 )
@@ -72,6 +75,8 @@ from ._exceptions import _is_transient_for_poll
 from ._resources import (
     EPHEMERAL_DOC,
     SECRET_SET_RETRIES,
+    Account,
+    ApiKeys,
     Builds,
     Secrets,
     SshKeys,
@@ -91,6 +96,7 @@ from ._sse import SSEEvent
 
 __all__ = [
     "AsyncAccount",
+    "AsyncApiKeys",
     "AsyncBuilds",
     "AsyncComputers",
     "AsyncMoves",
@@ -889,6 +895,11 @@ class AsyncAccount:
         """
         return AccountQuota.from_api(await self._t.json_object("GET", _api.ACCOUNT))
 
+    async def whoami(self) -> Whoami:
+        return Whoami.from_api(await self._t.json_object("GET", _api.WHOAMI))
+
+    whoami.__doc__ = Account.whoami.__doc__
+
 
 class AsyncUsage:
     """What this account has used.
@@ -1100,3 +1111,27 @@ class AsyncSshKeys:
     list.__doc__ = SshKeys.list.__doc__
     add.__doc__ = SshKeys.add.__doc__
     remove.__doc__ = SshKeys.remove.__doc__
+
+
+class AsyncApiKeys:
+    __doc__ = ApiKeys.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self) -> builtins.list[ApiKey]:
+        rows = await self._t.json_array("GET", _api.API_KEYS)
+        return [ApiKey.from_api(k, f"API key {i}") for i, k in enumerate(rows)]
+
+    async def create(
+        self, *, name: str | None = None, workspace_id: str | None = None
+    ) -> ApiKeyCreated:
+        body = _api.api_key_body(name, workspace_id)
+        return ApiKeyCreated.from_api(await self._t.json_object("POST", _api.API_KEYS, json=body))
+
+    async def revoke(self, key_id: str) -> None:
+        await self._t.request("DELETE", _api.api_key(key_id))
+
+    list.__doc__ = ApiKeys.list.__doc__
+    create.__doc__ = ApiKeys.create.__doc__
+    revoke.__doc__ = ApiKeys.revoke.__doc__

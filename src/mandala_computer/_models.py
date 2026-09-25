@@ -34,6 +34,8 @@ __all__ = [
     "ActivityHealth",
     "ActivityPage",
     "ActivityResults",
+    "ApiKey",
+    "ApiKeyCreated",
     "BuildProgress",
     "BuildStep",
     "ComputerDeletion",
@@ -72,6 +74,10 @@ __all__ = [
     "Webhook",
     "WebhookCreated",
     "WebhookDelivery",
+    "Whoami",
+    "WhoamiAccount",
+    "WhoamiUser",
+    "WhoamiWorkspace",
     "Window",
     "WindowResult",
 ]
@@ -3821,5 +3827,183 @@ class ComputerDeletion:
             computer_deleted=_opt_flag(d, "computer_deleted"),
             error=error if isinstance(error, str) and error else None,
             purge=SnapshotPurge.from_api(d.get("purge")),
+            raw=dict(d),
+        )
+
+
+# --- API keys and whoami (platform OPL-5053) ----------------------------------
+
+
+def _key_text(d: Mapping[str, Any], key: str, where: str) -> str:
+    value = d.get(key)
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise MandalaError(f"{where}: no usable {key}")
+    return str.__str__(value)
+
+
+def _nullable_text(d: Mapping[str, Any], key: str, where: str) -> str | None:
+    value = d.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise MandalaError(f"{where}: {key} is neither a string nor null")
+    return str.__str__(value)
+
+
+@dataclass(frozen=True)
+class ApiKey:
+    """One API key, as the platform lists it — never the key itself.
+
+    From :attr:`mandala_computer.Client.api_keys`. The raw key is on
+    :class:`ApiKeyCreated` and nowhere else, answered once by the mint.
+    """
+
+    #: ``key-`` and twelve hex characters. What :meth:`~mandala_computer.ApiKeys.revoke` takes.
+    id: str
+    #: The label it was minted with; ``None`` when it has none.
+    name: str | None
+    #: The first characters of the key and an ellipsis, for telling keys apart.
+    #: Display only. ``oauth`` for a Connected app's key.
+    prefix: str
+    created_at: str
+    #: When it last authenticated a request. ``None`` until it has.
+    last_used_at: str | None
+    #: The workspace it is confined to, or ``None`` for one that acts on the whole account.
+    workspace_id: str | None
+    workspace_name: str | None
+    #: Whether it may list, mint and revoke keys. Only a dashboard session turns
+    #: this on, and a key minted over the API never has it.
+    manage_keys: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "API key") -> ApiKey:
+        """Refuses a row without a usable id, or that cannot say whether it manages keys.
+
+        The id is what a revoke sends back, and ``manage_keys`` is a
+        permission: a key this cannot read it on is not one to report as
+        holding none.
+        """
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: not an object")
+        manage = d.get("manage_keys")
+        if not isinstance(manage, bool):
+            raise MandalaError(f"{where}: manage_keys is not true or false")
+        last_used = d.get("last_used_at")
+        return cls(
+            id=_key_text(d, "id", where),
+            name=_nullable_text(d, "name", where),
+            prefix=_text(d.get("prefix")),
+            created_at=_text(d.get("created_at")),
+            last_used_at=str(last_used) if isinstance(last_used, str) and last_used else None,
+            workspace_id=_nullable_text(d, "workspace_id", where),
+            workspace_name=_nullable_text(d, "workspace_name", where),
+            manage_keys=manage,
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class ApiKeyCreated(ApiKey):
+    """:class:`ApiKey` with the one thing only the mint answers."""
+
+    #: The key: ``com_`` and 48 hex characters. SHOWN HERE AND NEVER AGAIN —
+    #: store it now. Named ``key`` because ``raw`` is the wire object on every
+    #: model here; on the wire it is ``raw``.
+    key: str = field(default="", repr=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "POST api-keys") -> ApiKeyCreated:
+        """Refused when the key is not in it: shown once, so an answer without
+        it is a key nobody can ever use, reported as made."""
+        base = ApiKey.from_api(d, where)
+        secret = d.get("raw")
+        if not isinstance(secret, str) or not secret.startswith("com_"):
+            raise MandalaError(
+                f"{where}: expected the new key, which the platform answers once, and it is not here"
+            )
+        return cls(**{f: getattr(base, f) for f in base.__dataclass_fields__}, key=secret)
+
+
+@dataclass(frozen=True)
+class WhoamiUser:
+    """The person a credential was issued to."""
+
+    id: str
+    email: str
+    name: str | None
+
+
+@dataclass(frozen=True)
+class WhoamiAccount:
+    """The account a credential acts on."""
+
+    id: str
+    name: str | None
+    plan: str
+    #: ``active`` or ``suspended``. A suspended account can still ask who it is.
+    status: str
+
+
+@dataclass(frozen=True)
+class WhoamiWorkspace:
+    """The workspace a credential is confined to."""
+
+    id: str
+    name: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Whoami:
+    """Who a credential is: :meth:`mandala_computer.Account.whoami`."""
+
+    user: WhoamiUser
+    account: WhoamiAccount
+    #: ``owner``, ``member`` or ``viewer`` — as it is NOW, not as it was when
+    #: the key was minted. An open set: show one this client does not know.
+    role: str
+    #: ``None`` for a key that acts on the whole account.
+    workspace: WhoamiWorkspace | None
+    #: The key itself. ``None`` is possible but not expected. On a Connected
+    #: app's access token this is the app's hidden key: ``prefix`` is ``oauth``.
+    key: ApiKey | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "GET whoami") -> Whoami:
+        user = d.get("user")
+        account = d.get("account")
+        if not isinstance(user, Mapping) or not isinstance(account, Mapping):
+            raise MandalaError(f"{where}: expected a user and an account")
+        role = d.get("role")
+        if not isinstance(role, str) or not role:
+            raise MandalaError(f"{where}: no role")
+        ws = d.get("workspace")
+        workspace: WhoamiWorkspace | None = None
+        if ws is not None:
+            if not isinstance(ws, Mapping):
+                raise MandalaError(f"{where}: the workspace is neither an object nor null")
+            workspace = WhoamiWorkspace(
+                id=_key_text(ws, "id", f"{where} workspace"),
+                name=_text(ws.get("name")),
+                created_at=_text(ws.get("created_at")),
+            )
+        key = d.get("key")
+        return cls(
+            user=WhoamiUser(
+                id=_key_text(user, "id", f"{where} user"),
+                email=_text(user.get("email")),
+                name=_nullable_text(user, "name", f"{where} user"),
+            ),
+            account=WhoamiAccount(
+                id=_key_text(account, "id", f"{where} account"),
+                name=_nullable_text(account, "name", f"{where} account"),
+                plan=_text(account.get("plan")),
+                status=_text(account.get("status")),
+            ),
+            role=str.__str__(role),
+            workspace=workspace,
+            key=None if key is None else ApiKey.from_api(key, f"{where} key"),
             raw=dict(d),
         )
