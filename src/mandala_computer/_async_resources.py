@@ -341,7 +341,9 @@ class AsyncComputers:
             # The sync twin says why: a bound computer's guest answers seconds
             # before its secrets land.
             if secrets or computer.raw.get("secrets"):
-                await computer.wait_for_secrets(timeout=remaining(), poll=poll)
+                # Told they are bound, so a read that leaves them out is not
+                # taken for "nothing bound" and returned on before they arrived.
+                await computer.wait_for_secrets(timeout=remaining(), poll=poll, expect_secrets=True)
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.

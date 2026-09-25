@@ -782,7 +782,9 @@ class AsyncComputer(ComputerFields):
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             await asyncio.sleep(min(delay, remaining))
 
-    async def wait_for_secrets(self, timeout: float = 180.0, poll: float = 2.0) -> AsyncComputer:
+    async def wait_for_secrets(
+        self, timeout: float = 180.0, poll: float = 2.0, *, expect_secrets: bool = False
+    ) -> AsyncComputer:
         """Await until the secrets bound to this computer have reached its desktop.
 
         A computer comes back ``running``, and its guest answers, a few seconds
@@ -793,6 +795,7 @@ class AsyncComputer(ComputerFields):
         deadline = time.monotonic() + timeout
         observed = False
         fresh = False
+        state: str | MandalaError = "delivering"
         while True:
             remaining = deadline - time.monotonic()
             delay = poll
@@ -804,14 +807,14 @@ class AsyncComputer(ComputerFields):
                     delay = _ride_out(err, deadline, poll)
                     fresh = False
             if observed:
-                state = self._secrets_state()
+                state = self._secrets_state(expect_secrets)
                 if state == "delivered":
                     return self
                 if isinstance(state, MandalaError):
                     raise state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh))
+                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh, state))
             await asyncio.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------

@@ -47,6 +47,37 @@ def failed_steps():
     ]
 
 
+def unreported(**extra):
+    """A running record that leaves the ``secrets`` group out, as one served
+    without its host's answer does."""
+    row = bound(False, **extra)
+    del row["secrets"]
+    return row
+
+
+def unreported_steps():
+    return [
+        step("POST", "", bound(True)),
+        step("GET", "/launch-42", bound(True)),
+        step("POST", "/launch-42/exec", GUEST),
+        step("GET", "/launch-42", unreported()),
+        step("GET", "/launch-42", unreported()),
+        step("GET", "/launch-42", bound(False, secrets_applied=RECEIPT)),
+    ]
+
+
+def silent_admission_steps():
+    """Stopped, with no ``running_ram_mb``: a host that did not say whether a
+    start is admitted — then running."""
+    silent = bound(False, status="stopped")
+    del silent["running_ram_mb"]
+    return [
+        step("GET", "/launch-42", silent),
+        step("GET", "/launch-42", silent),
+        step("GET", "/launch-42", bound(False)),
+    ]
+
+
 FAILED_MESSAGE = (
     f"launch of launch-42 failed: launch-42's secrets were not delivered: {FAILED}. "
     "The platform stopped it; call start() to try again"
@@ -156,6 +187,39 @@ def test_wait_rides_through_an_admitted_start(monkeypatch):
     assert not scenario.steps
 
 
+def test_wait_rides_through_a_host_that_does_not_say_what_it_admitted(monkeypatch):
+    # Absent is "cannot tell", not zero: refusing would tell the caller to
+    # start a computer that may already be starting.
+    scenario, c = wait_sync(monkeypatch, silent_admission_steps(), poll=0.5)
+    assert c.status == "running"
+    assert not scenario.steps
+
+
+def test_launch_waits_past_a_read_that_leaves_the_bindings_out(monkeypatch):
+    scenario, c = run_sync(
+        monkeypatch,
+        unreported_steps(),
+        secrets=[{"secret_id": BINDING["secret_id"], "env": "TOKEN"}],
+    )
+    assert not scenario.steps
+    assert c.secrets_applied is not None
+
+
+def test_wait_times_out_saying_the_bindings_went_unreported(monkeypatch):
+    with pytest.raises(mc.TimeoutError) as caught:
+        wait_sync(
+            monkeypatch,
+            [step("GET", "/launch-42", unreported()) for _ in range(4)],
+            timeout=2,
+            poll=1,
+            expect_secrets=True,
+        )
+    assert str(caught.value) == (
+        "launch-42 was read for 2s without reporting its bindings, so whether its secrets "
+        "arrived is unknown"
+    )
+
+
 def test_wait_reads_the_receipt_on_a_platform_without_the_field(monkeypatch):
     scenario, c = wait_sync(
         monkeypatch,
@@ -208,6 +272,28 @@ async def test_async_launch_raises_naming_why_when_the_delivery_failed(monkeypat
     with pytest.raises(mc.MandalaError) as caught:
         await run_async(monkeypatch, failed_steps())
     assert str(caught.value) == FAILED_MESSAGE
+
+
+async def test_async_launch_waits_past_a_read_that_leaves_the_bindings_out(monkeypatch):
+    scenario, _ = await run_async(
+        monkeypatch,
+        unreported_steps(),
+        secrets=[{"secret_id": BINDING["secret_id"], "env": "TOKEN"}],
+    )
+    assert not scenario.steps
+
+
+async def test_async_wait_rides_through_a_host_that_does_not_say_what_it_admitted(monkeypatch):
+    scenario = Scenario(silent_admission_steps())
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.get("launch-42")
+        await c.wait_for_secrets(poll=0.5)
+    assert c.status == "running"
+    assert not scenario.steps
 
 
 async def test_async_wait_refuses_a_stopped_computer_nobody_is_starting(monkeypatch):

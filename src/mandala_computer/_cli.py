@@ -54,6 +54,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import select
 import shlex
 import shutil
@@ -200,6 +201,56 @@ def _json_failure(info: dict[str, Any]) -> None:
     nothing a script reads there can be mistaken for an answer.
     """
     print(json.dumps({"error": info}, sort_keys=True), file=sys.stderr)
+
+
+#: What an option name looks like: ``-x`` or ``--some-name``.
+_OPTION_NAME = re.compile(r"-[A-Za-z0-9]|--[A-Za-z][A-Za-z0-9-]{0,39}")
+
+
+def _unknown_option(word: str) -> str:
+    """The message for an option nobody declared, naming it only when it is
+    shaped like an option name.
+
+    Anything else that starts with a dash is as likely to be a value — a key
+    or a token that happens to begin with one — as a mistyped flag.
+    """
+    if _OPTION_NAME.fullmatch(word):
+        return f"unrecognized option {word}"
+    return 'unrecognized option: an argument starts with "-" but is not an option name'
+
+
+def _unexpected(extra: Sequence[str]) -> str:
+    """The message for words no command took: options shaped like option names
+    are named, and every other word is counted, never quoted.
+
+    Most often such a word is a value typed where a prompt or stdin was meant
+    to read it — ``mandala-py secrets set NAME "$TOKEN"`` — and printing it
+    would copy the credential into whatever log captures stderr.
+    """
+    named = [word for word in extra if _OPTION_NAME.fullmatch(word)]
+    others = len(extra) - len(named)
+    parts = []
+    if named:
+        parts.append(f"unrecognized option{'s' if len(named) > 1 else ''}: {' '.join(named)}")
+    if others:
+        parts.append(
+            f"{others} argument{'s' if others > 1 else ''} too many "
+            "(quote a value that has spaces in it)"
+        )
+    return "; ".join(parts)
+
+
+def _asks_for_json(words: Sequence[str]) -> bool:
+    """Whether ``words`` spell ``--json``, in full or as the abbreviation
+    argparse accepts for it (``--j``, ``--js``, ``--jso``: no other option
+    begins that way). Read before parsing, for the usage errors parsing
+    itself reports; past a bare ``--`` a word is an operand."""
+    for word in words:
+        if word == "--":
+            return False
+        if len(word) >= 3 and "--json".startswith(word):
+            return True
+    return False
 
 
 class _Parser(argparse.ArgumentParser):
@@ -1395,7 +1446,10 @@ environment:
 """
 
 
-def _ssh_usage_error(message: str) -> int:
+def _ssh_usage_error(message: str, *, as_json: bool = False) -> int:
+    if as_json:
+        _json_failure({"code": "invalid_arguments", "message": message, "usage": SSH_USAGE})
+        return 2
     print(SSH_USAGE.split("\n\n", 1)[0], file=sys.stderr)
     print(f"{PROG} ssh: error: {message}", file=sys.stderr)
     return 2
@@ -1428,68 +1482,93 @@ def _exec(argv: list[str]) -> int:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _parse_ssh(words: list[str]) -> tuple[dict[str, Any], str | None, list[str]] | int:
+class _SshWords:
+    """``mandala ssh``'s own options, the computer, what goes to ssh, and the
+    first usage error in them, if any."""
+
+    def __init__(self) -> None:
+        self.setup = False
+        self.key: str | None = None
+        self.json = False
+        self.help = False
+        self.target: str | None = None
+        self.rest: list[str] = []
+        self.error: str | None = None
+
+    @property
+    def as_json(self) -> bool:
+        """Whether a failure is reported as JSON: ``--json`` read as OUR flag,
+        which it is only with ``--setup``. After the computer of a plain
+        ``ssh`` it is the remote command's, and says nothing about ours."""
+        return self.json and self.setup
+
+    def fail(self, message: str) -> None:
+        if self.error is None:
+            self.error = message
+
+
+def _parse_ssh(words: list[str]) -> _SshWords:
     """``mandala ssh``'s own options, the computer, and what goes to ssh.
 
     Our options come before the computer; everything after it is ssh's. With
     ``--setup`` nothing goes to ssh, so ``--key`` and ``--json`` may follow the
     computer too.
+
+    A usage error is recorded and the reading goes on, so whether it is reported
+    as JSON follows every flag given — a ``--json`` after the mistake included.
     """
-    opts: dict[str, Any] = {"setup": False, "key": None, "json": False, "help": False}
-    target: str | None = None
-    rest: list[str] = []
+    parsed = _SshWords()
     i = 0
     while i < len(words):
         word = words[i]
-        if target is not None and not opts["setup"]:
-            rest = words[i:]
+        if parsed.target is not None and not parsed.setup:
+            parsed.rest = words[i:]
             break
         if word in ("-h", "--help"):
-            opts["help"] = True
+            parsed.help = True
         elif word == "--setup":
-            opts["setup"] = True
+            parsed.setup = True
         elif word == "--json":
-            opts["json"] = True
+            parsed.json = True
         elif word == "--key":
             if i + 1 >= len(words):
-                return _ssh_usage_error("--key needs a PATH")
-            opts["key"] = words[i + 1]
-            i += 1
+                parsed.fail("--key needs a PATH")
+            else:
+                parsed.key = words[i + 1]
+                i += 1
         elif word.startswith("--key="):
-            opts["key"] = word.removeprefix("--key=")
+            parsed.key = word.removeprefix("--key=")
         elif word.startswith("-"):
-            where = "with --setup" if target is not None else "before the computer"
-            return _ssh_usage_error(
-                f"unrecognized option {word} {where}; ssh's own options go after the computer"
-            )
-        elif target is None:
-            target = word
+            where = "with --setup" if parsed.target is not None else "before the computer"
+            parsed.fail(f"{_unknown_option(word)} {where}; ssh's own options go after the computer")
+        elif parsed.target is None:
+            parsed.target = word
         else:
-            return _ssh_usage_error(f"--setup takes one computer, not {word!r} as well")
+            # Counted, not quoted: see _unexpected.
+            parsed.fail("--setup takes one computer and nothing more")
         i += 1
-    return opts, target, rest
+    return parsed
 
 
-def _cmd_ssh(words: list[str]) -> int:
-    parsed = _parse_ssh(words)
-    if isinstance(parsed, int):
-        return parsed
-    opts, target, rest = parsed
-    if opts["help"]:
+def _cmd_ssh(parsed: _SshWords) -> int:
+    if parsed.error is not None:
+        return _ssh_usage_error(parsed.error, as_json=parsed.as_json)
+    if parsed.help:
         print(SSH_USAGE, end="")
         return 0
+    target = parsed.target
     if target is None:
-        return _ssh_usage_error("name a computer")
-    if opts["setup"]:
-        return _ssh_setup(target, opts["key"], as_json=opts["json"])
-    if opts["json"]:
+        return _ssh_usage_error("name a computer", as_json=parsed.as_json)
+    if parsed.setup:
+        return _ssh_setup(target, parsed.key, as_json=parsed.json)
+    if parsed.json:
         return _ssh_usage_error("ssh is interactive and has no --json output")
-    if opts["key"] is not None:
+    if parsed.key is not None:
         return _ssh_usage_error(
             "--key goes with --setup; to connect with a particular key, pass -i PATH "
             "after the computer"
         )
-    return _ssh_connect(target, rest)
+    return _ssh_connect(target, parsed.rest)
 
 
 def _ssh_connect(target: str, extra: list[str]) -> int:
@@ -1793,15 +1872,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     words = list(sys.argv[1:] if argv is None else argv)
-    # Whether a failure is reported as JSON. ssh reads it by hand, and only
-    # with --setup: everything after its computer otherwise belongs to ssh.
-    as_json = "--json" in words and (words[:1] != ["ssh"] or "--setup" in words)
-    _Parser.json_errors = as_json
+    as_json = False
     try:
         if words[:1] == ["ssh"]:
             # Parsed by hand: everything after the computer belongs to ssh,
-            # verbatim, and argparse would read `-L` or `--` as its own.
-            return _cmd_ssh(words[1:])
+            # verbatim, and argparse would read `-L` or `--` as its own. So
+            # whether a failure is JSON is the parse's answer, not a scan of
+            # words that may be the remote command's.
+            ssh = _parse_ssh(words[1:])
+            as_json = ssh.as_json
+            return _cmd_ssh(ssh)
+        # Whether a usage error is reported as JSON, before parsing can say.
+        as_json = _asks_for_json(words)
+        _Parser.json_errors = as_json
         parser = _parser()
         args, extra = parser.parse_known_args(words)
         # Past parsing, the command's own flag decides: one that has no --json
@@ -1811,11 +1894,7 @@ def main(argv: list[str] | None = None) -> int:
             # parse_args reports these against the TOP parser, whose usage says
             # nothing about the command that was typed. Reported against that
             # command instead, with its whole help.
-            _leaf(parser, args).error(
-                f"unrecognized argument{'s' if len(extra) > 1 else ''}: "
-                f"{' '.join(shlex.quote(word) for word in extra)} "
-                "(quote a value that has spaces in it)"
-            )
+            _leaf(parser, args).error(_unexpected(extra))
         return int(args.fn(args))
     except _Failure as e:
         if not as_json:

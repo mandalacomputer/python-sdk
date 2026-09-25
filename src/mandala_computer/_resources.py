@@ -369,7 +369,9 @@ class Computers:
             # and a command run in between sees them unset. Asked of the record
             # as well as the arguments, so a binding it reports is waited on too.
             if secrets or computer.raw.get("secrets"):
-                computer.wait_for_secrets(timeout=remaining(), poll=poll)
+                # Told they are bound, so a read that leaves them out is not
+                # taken for "nothing bound" and returned on before they arrived.
+                computer.wait_for_secrets(timeout=remaining(), poll=poll, expect_secrets=True)
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.

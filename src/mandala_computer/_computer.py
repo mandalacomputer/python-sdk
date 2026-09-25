@@ -933,18 +933,29 @@ def _guest_not_running(err: BaseException) -> bool:
     return isinstance(err, APIError) and err.status == 400
 
 
-def _secrets_timeout(computer_id: str, timeout: float, observed: bool, fresh: bool) -> str:
+def _secrets_timeout(
+    computer_id: str, timeout: float, observed: bool, fresh: bool, state: object = "delivering"
+) -> str:
     """What a ``wait_for_secrets`` that ran out of time says, on both handles."""
     if not observed:
         return (
             f"{computer_id} could not be observed within {timeout:g}s, so whether its "
             "secrets arrived is unknown"
         )
+    unreported = state == "unreported"
     if fresh:
+        if unreported:
+            return (
+                f"{computer_id} was read for {timeout:g}s without reporting its bindings, so "
+                "whether its secrets arrived is unknown"
+            )
         return f"{computer_id}'s secrets were still being delivered after {timeout:g}s"
+    last = (
+        "it did not report its bindings" if unreported else "its secrets were still being delivered"
+    )
     return (
         f"{computer_id} could not be reached for the last part of {timeout:g}s; when it last "
-        "answered its secrets were still being delivered"
+        f"answered {last}"
     )
 
 
@@ -1174,10 +1185,12 @@ class ComputerFields:
         value = self._data.get("secrets_delivering")
         return value if isinstance(value, bool) else None
 
-    def _secrets_state(self) -> str | MandalaError:
+    def _secrets_state(self, expect_secrets: bool = False) -> str | MandalaError:
         """Where this computer's secrets are, as ``wait_for_secrets`` reads it:
-        ``"delivered"``, ``"delivering"``, or the error a wait should raise
-        because no delivery is coming."""
+        ``"delivered"``, ``"delivering"``, ``"unreported"`` (a read that left
+        the bindings out when the caller knows some are bound: no answer either
+        way, so it is waited past), or the error a wait should raise because no
+        delivery is coming."""
         if self.secrets_delivering is True:
             return "delivering"
         if self.secrets_error:
@@ -1186,15 +1199,22 @@ class ComputerFields:
                 "stopped it; call start() to try again"
             )
         bound = self._data.get("secrets")
+        # The platform leaves the whole group out on a computer that holds none
+        # — and also on a record served without its host's answer. A caller
+        # that knows secrets are bound reads that second case as silence.
+        if bound is None and expect_secrets:
+            return "unreported"
         if not isinstance(bound, builtins.list) or not bound:
             return "delivered"
         if self.is_building:
             return "delivering"
         if self.status != "running":
             # A start admitted but not yet booted reads stopped or suspended;
-            # its delivery is ahead of it. Nothing admitted is nothing coming.
-            held = self._data.get("running_ram_mb")
-            if isinstance(held, (int, float)) and not isinstance(held, bool) and held > 0:
+            # its delivery is ahead of it. Only the platform saying it has
+            # admitted nothing is nothing coming: a host that did not say is
+            # waited on, as every other wait here reads that silence (see
+            # _nothing_admitted).
+            if not self._nothing_admitted():
                 return "delivering"
             return MandalaError(
                 f"{self.id} is {self.status!r}, and secrets are delivered only as it starts: "
@@ -2439,7 +2459,9 @@ class Computer(ComputerFields):
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             time.sleep(min(delay, remaining))
 
-    def wait_for_secrets(self, timeout: float = 180.0, poll: float = 2.0) -> Computer:
+    def wait_for_secrets(
+        self, timeout: float = 180.0, poll: float = 2.0, *, expect_secrets: bool = False
+    ) -> Computer:
         """Block until the secrets bound to this computer have reached its desktop.
 
         A computer comes back ``running``, and its guest answers, a few seconds
@@ -2456,8 +2478,14 @@ class Computer(ComputerFields):
         Raises :class:`~mandala_computer.MandalaError` rather than waiting out
         the timeout when no delivery is coming: a delivery that failed (its host
         stops the computer, and the error carries :attr:`secrets_error`), and a
-        computer that is stopped or suspended with no start under way —
-        :meth:`start` is what delivers its secrets.
+        computer that is stopped or suspended while the platform says it has
+        admitted no start — :meth:`start` is what delivers its secrets. A host
+        that does not say whether a start is under way is waited on.
+
+        ``expect_secrets`` is for a caller that knows secrets are bound, such as
+        one that just created the computer with them. A read that leaves the
+        bindings out then counts as "cannot tell" and is waited past, rather
+        than as "nothing bound", which would return before anything arrived.
         """
         check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
@@ -2465,6 +2493,7 @@ class Computer(ComputerFields):
         # says whether the last read answered — wait_until_running's rules.
         observed = False
         fresh = False
+        state: str | MandalaError = "delivering"
         while True:
             remaining = deadline - time.monotonic()
             delay = poll
@@ -2476,14 +2505,14 @@ class Computer(ComputerFields):
                     delay = _ride_out(err, deadline, poll)
                     fresh = False
             if observed:
-                state = self._secrets_state()
+                state = self._secrets_state(expect_secrets)
                 if state == "delivered":
                     return self
                 if isinstance(state, MandalaError):
                     raise state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh))
+                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh, state))
             time.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------

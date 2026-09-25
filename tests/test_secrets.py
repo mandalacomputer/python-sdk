@@ -171,6 +171,11 @@ def test_launch_carries_the_bindings_to_its_create(api: Any) -> None:
     api.post("/computers/vm-1/exec").mock(
         return_value=httpx.Response(200, json={"exit_code": 0, "stdout": "", "stderr": ""})
     )
+    # Read back as the platform reports a bound computer, bindings included:
+    # launch knows it bound some, so a record without them is waited past.
+    api["get"].mock(
+        return_value=httpx.Response(200, json={**COMPUTER, **BINDINGS, "secrets_delivering": False})
+    )
     with mc.Client(api_key="com_test", base_url=BASE) as client:
         client.computers.launch(template="base", secrets=BOTH_KINDS, poll=0.01)
     assert sent(api["create"])["secrets"] == BOTH_KINDS
