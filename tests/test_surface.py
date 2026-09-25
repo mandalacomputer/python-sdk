@@ -87,6 +87,13 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # OPL-5051: `format` (png or jpeg), `quality`, `region` (x,y,w,h) and
+    # `scale` shape the screenshot. Listed to stay in step with the surface;
+    # not yet sent.
+    "GET computers/:id/screenshot  query:format",
+    "GET computers/:id/screenshot  query:quality",
+    "GET computers/:id/screenshot  query:region",
+    "GET computers/:id/screenshot  query:scale",
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",

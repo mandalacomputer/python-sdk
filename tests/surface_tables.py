@@ -200,7 +200,14 @@ PARAMETERS: dict[str, set[str]] = {
     "POST computers/:id/move": {"body:cpu", "body:ram_mb", "body:disk_gb"},
     "GET moves": set(),
     # Computer use.
-    "GET computers/:id/screenshot": {"query:w", "query:fresh"},
+    "GET computers/:id/screenshot": {
+        "query:w",
+        "query:fresh",
+        "query:format",
+        "query:quality",
+        "query:region",
+        "query:scale",
+    },
     "POST computers/:id/input": {
         "body:action",
         "body:x",
