@@ -7,6 +7,42 @@ project is pre-1.0, so a minor version may carry a behaviour change.
 The reasoning behind a change lives in its commit message rather than here.
 This is the summary you read to decide whether to upgrade.
 
+## [Unreleased]
+
+### Added
+
+- **`computer.wait_for_secrets()`** and **`computer.secrets_delivering`** (sync
+  and async). A computer comes back `running`, and its guest answers, a few
+  seconds before its secrets land. The wait polls until the platform's
+  `secrets_delivering` is false (or, on a platform that predates it, until the
+  receipt names the latest delivering start), and raises instead of waiting out
+  its timeout for a delivery that failed or a stopped computer the platform
+  says has no start admitted; a host that does not say is waited on.
+  `expect_secrets=True` tells it secrets are bound, so a read that leaves the
+  bindings out is waited past rather than taken for "nothing bound".
+- **`mandala-py --json` failures carry an error code.** A failure under `--json`
+  writes `{"error": {"code", "message", "status"?, "reason"?}}` as one line on
+  stderr, with nothing on stdout. `code` is one snake_case word, the same
+  vocabulary as the npm `mandala` CLI (`not_found`, `unauthenticated`,
+  `conflict`, `invalid_arguments`, …). A usage error is one too, `ssh --setup`
+  included, and `--json` counts however argparse lets it be abbreviated.
+
+### Changed
+
+- **`computers.launch()` waits for bound secrets** (sync and async). With
+  secrets bound it now returns only once they have reached the desktop, inside
+  the same readiness budget, so the first command on the returned computer sees
+  them. A delivery that failed raises, naming why. A launch with nothing bound
+  makes no extra request.
+- **`computer.write_file()` returns the byte count** the platform reports, or
+  `None` if it did not say (sync and async), as the TypeScript SDK's
+  `writeFile` does. It returned `None` always.
+- **A mistyped `mandala-py` command prints that command's whole help** under the
+  message. An extra argument was reported against the top-level parser, whose
+  one-line usage said nothing about the command typed. Extra arguments are now
+  counted, never quoted, and an unknown option is named only when it is shaped
+  like one: either could be a secret typed where `secrets set` reads stdin.
+
 ## [0.6.0] — 2026-09-25
 
 0.5.1 was never released; everything listed for it is here. Three behaviour

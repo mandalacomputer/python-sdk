@@ -739,13 +739,19 @@ def test_setup_that_cannot_work_prints_no_success(
 ) -> None:
     """A failed setup looks like every other CLI failure, --json included:
     one line on stderr, exit 1, and nothing on stdout a script could parse
-    as success."""
+    as success. Under --json that line is the error object, with its code."""
     with respx.mock:
         mock_setup([KEY], access)
         argv = ["ssh", "--setup", "dev", *(["--json"] if as_json else [])]
-        with pytest.raises(SystemExit) as caught:
-            _cli.main(argv)
-    assert caught.value.code == message
+        if as_json:
+            assert _cli.main(argv) == 1
+            err = capsys.readouterr().err
+            assert err.count("\n") == 1
+            assert json.loads(err)["error"]["message"] == message.removeprefix("mandala-py: ")
+        else:
+            with pytest.raises(SystemExit) as caught:
+                _cli.main(argv)
+            assert caught.value.code == message
     assert capsys.readouterr().out == ""
     assert not kh(env).exists()
 
@@ -755,14 +761,14 @@ def test_setup_refuses_a_computer_that_predates_ssh_before_changing_anything(
     pub: Path, env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     add, put = mock_setup([], before={**OFF, "available": False})
-    with pytest.raises(SystemExit) as caught:
-        _cli.main(["ssh", "--setup", "dev", "--json"])
-    assert caught.value.code == (
-        "mandala-py: dev was made from a template that predates SSH; create a new computer to use SSH"
+    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert json.loads(err)["error"]["message"] == (
+        "dev was made from a template that predates SSH; create a new computer to use SSH"
     )
     assert not add.called
     assert not put.called
-    assert capsys.readouterr().out == ""
+    assert out == ""
     assert not kh(env).exists()
 
 

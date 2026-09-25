@@ -262,8 +262,13 @@ class AsyncComputers:
         until the disk is built; launch still starts it before returning.
         An admitted start is waited on, and a failed start is never retried.
 
+        With ``secrets`` bound it also waits until they have reached the
+        desktop (:meth:`AsyncComputer.wait_for_secrets`), so a command run on
+        the returned computer sees them; a delivery that failed raises, naming
+        why.
+
         ``timeout`` is one readiness budget in seconds, beginning after create
-        returns. Disk, running and guest waits share the remaining time, and
+        returns. Disk, running, guest and secrets waits share the remaining time, and
         elapsed start work consumes it too. Create and start retain their usual
         transport deadlines: this is not a total wall-clock limit on launch.
         ``poll`` is the delay in seconds between polls in every stage.
@@ -333,6 +338,12 @@ class AsyncComputers:
                 await computer.start()
             await computer.wait_until_running(timeout=remaining(), poll=poll)
             await computer.wait_for_guest(timeout=remaining(), poll=poll)
+            # The sync twin says why: a bound computer's guest answers seconds
+            # before its secrets land.
+            if secrets or computer.raw.get("secrets"):
+                # Told they are bound, so a read that leaves them out is not
+                # taken for "nothing bound" and returned on before they arrived.
+                await computer.wait_for_secrets(timeout=remaining(), poll=poll, expect_secrets=True)
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.

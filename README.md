@@ -121,10 +121,12 @@ returns when its guest agent answers. Guest readiness does not guarantee that
 the visible desktop has finished logging in. Every `create()` option is accepted;
 `start=False` is sent unchanged to create, then launch starts the computer after
 its disk is ready. An already admitted start is waited on, and failed starts are
-reported without retrying them.
+reported without retrying them. With `secrets` bound, it also waits until they
+have reached the desktop, so the first command on the returned computer sees
+them; a delivery that failed raises, naming why.
 
 `launch(timeout=600)` allows a longer build. The default readiness budget is 180
-seconds, beginning after create returns. Disk, running and guest waits share the
+seconds, beginning after create returns. Disk, running, guest and secrets waits share the
 remaining budget, including elapsed start work. Create and start retain their
 usual transport deadlines, so this is not a total wall-clock limit on launch.
 `poll` defaults to 3 seconds for every stage. The async equivalent is
@@ -1803,7 +1805,8 @@ the desktop session or as a file under `/run/mandala-secrets/user/files`:
 ```python
 key = client.secrets.set("OPENAI_API_KEY", os.environ["OPENAI_API_KEY"])
 kube = client.secrets.set("KUBECONFIG", open(os.path.expanduser("~/.kube/config")).read())
-c = client.computers.create(
+# launch() returns once the values have landed, not just once it runs.
+c = client.computers.launch(
     template="base",
     secrets=[
         {"secret_id": key.id, "env": "OPENAI_API_KEY"},
@@ -1816,6 +1819,7 @@ c = client.computers.create(
 plain = client.computers.create(template="base", start=False)
 plain.set_secrets([{"secret_id": key.id, "env": "OPENAI_API_KEY"}])
 plain.start()
+plain.wait_for_secrets()  # running comes a few seconds before the values land
 
 # A bound computer's list is replaced whole, against the version read; the new
 # values arrive at its next start or restart.
@@ -1834,6 +1838,7 @@ c.secret_bindings  # which secret, which revision, which variable or file
 c.secrets_applied  # the receipt: generation, when, and each revision delivered
 c.secrets_error  # why the last delivering start was stopped, or None
 c.secrets_pending  # True, False, or None when the platform could not check
+c.secrets_delivering  # True while values are on their way in; wait_for_secrets() waits on it
 ```
 
 `secrets_pending` is three answers on purpose: `None` means unknown, and is
@@ -1888,6 +1893,10 @@ page when they cannot be read, so keep the checkpoint you had.
   a stopped computer nobody is starting, is reported immediately. A suspended
   computer is different: the probe is an `exec()`, so it resumes the session as
   use normally does.
+- `wait_for_secrets()` — the secrets bound to it have reached its desktop. A
+  computer runs, and its guest answers, a few seconds before they do. Returns at
+  once when nothing is bound; a delivery that failed, or a stopped computer
+  nobody is starting, is reported immediately.
 
 Both waits read `running_ram_mb` to tell those apart, and treat its ABSENCE as
 unknown rather than as zero: a host too old to report it, or one that could not
@@ -2451,9 +2460,12 @@ One file in or out of the guest, no shell involved — the way a credential
 reaches a `.env` without echoing it through a command line:
 
 ```python
-c.write_file("/home/user/app/.env", "API_TOKEN=hunter2\n")
+written = c.write_file("/home/user/app/.env", "API_TOKEN=hunter2\n")  # bytes, or None
 report = c.read_file("/home/user/report.csv")
 ```
+
+`write_file()` returns how many bytes the platform says it wrote, or `None` if
+it did not say — never what was sent, which would claim everything landed.
 
 `read_file()` answers **bytes**, because a guest file is not promised to be
 text and decoding one that is not would put replacement characters at the SDK
@@ -2927,6 +2939,16 @@ mandala-py scp dev:/home/user/report.csv .
 mandala-py webhooks list              # and create, get, update, delete, rotate, test, deliveries
 mandala-py secrets list               # names and revisions, never values
 ```
+
+With `--json`, a command's result is printed as the API's own record, in its
+snake_case. A failure prints nothing on stdout: it writes its `error` object as
+one JSON line on stderr and exits nonzero. `code` is one snake_case word naming
+the kind of failure, the same word the npm `mandala` CLI reports — `not_found`,
+`unauthenticated`, `permission_denied`, `conflict`, `rate_limited`,
+`unavailable`, `invalid_arguments`, `ambiguous_computer`, `exists`, `timeout`,
+`io_error` (with `details.errno`) and the rest listed in that package's README —
+never a class name. `status` and the platform's `reason` word ride beside it
+when there are any. A mistyped command prints its whole help, not one line.
 
 `terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
 server-side, running as the desktop user. Disconnecting *detaches* rather than

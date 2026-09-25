@@ -54,6 +54,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import select
 import shlex
 import shutil
@@ -71,7 +72,31 @@ from . import _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
-from ._exceptions import ConflictError, CreateOnlyConflictError, FileExistsError, MandalaError
+from ._exceptions import (
+    APIError,
+    AuthenticationError,
+    ComputerNotRunningError,
+    ConflictError,
+    ConnectionError,
+    ConnectionInterruptedError,
+    CreateOnlyConflictError,
+    FileExistsError,
+    FileTooLargeError,
+    GatewayTimeoutError,
+    MandalaError,
+    MethodNotAllowedError,
+    MoveRequiredError,
+    NotFoundError,
+    OriginResponseError,
+    OriginTLSError,
+    OriginUnreachableError,
+    PermissionDeniedError,
+    PlanLimitError,
+    RangeNotSatisfiableError,
+    RateLimitError,
+    TimeoutError,
+    UnavailableError,
+)
 from ._models import Listing, Secret, SshAccess, SshKey, Webhook, WebhookDelivery
 from ._resources import _named_secret
 
@@ -93,8 +118,173 @@ _MAX_FRAME = 1 << 22
 LOCAL_WINDOWS = os.name == "nt"
 
 
-def _die(message: str) -> NoReturn:
-    raise SystemExit(f"{PROG}: {message}")
+class _Failure(SystemExit):
+    """A refusal of this CLI's own, carrying the ``error.code`` word ``--json`` reports.
+
+    A ``SystemExit`` still, so everything that already exits on one — a test,
+    a thread that ends the session — reads it exactly as before.
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(f"{PROG}: {message}")
+        self.message = message
+        self.reason = reason
+
+
+def _die(message: str, code: str = "failed") -> NoReturn:
+    raise _Failure(message, code)
+
+
+#: The ``error.code`` an SDK failure is reported under with ``--json``: one
+#: snake_case word naming the KIND of failure, the same words the ``mandala``
+#: CLI uses. Never a class name — those differ between the two SDKs. Most
+#: specific first: every conflict is a ``ConflictError``.
+_API_CODES: tuple[tuple[type[APIError], str], ...] = (
+    (FileExistsError, "exists"),
+    (CreateOnlyConflictError, "conflict"),
+    (MoveRequiredError, "move_required"),
+    (ComputerNotRunningError, "not_running"),
+    (ConflictError, "conflict"),
+    (AuthenticationError, "unauthenticated"),
+    (PlanLimitError, "plan_limit"),
+    (PermissionDeniedError, "permission_denied"),
+    (NotFoundError, "not_found"),
+    (MethodNotAllowedError, "method_not_allowed"),
+    (FileTooLargeError, "too_large"),
+    (RangeNotSatisfiableError, "range_not_satisfiable"),
+    (RateLimitError, "rate_limited"),
+    (UnavailableError, "unavailable"),
+    (GatewayTimeoutError, "gateway_timeout"),
+    (OriginUnreachableError, "origin_unreachable"),
+    (OriginTLSError, "origin_tls"),
+    (OriginResponseError, "origin_error"),
+)
+
+
+def _error_info(err: BaseException) -> dict[str, Any]:
+    """The ``error`` object ``--json`` prints for a failure: ``code`` and
+    ``message`` always; the HTTP ``status`` and the platform's ``reason`` word
+    when there are any."""
+    if isinstance(err, _Failure):
+        return {"code": err.reason, "message": err.message}
+    if isinstance(err, APIError):
+        code = next((word for cls, word in _API_CODES if isinstance(err, cls)), "api_error")
+        info: dict[str, Any] = {"code": code, "message": str(err), "status": err.status}
+        if err.reason is not None:
+            info["reason"] = err.reason
+        return info
+    if isinstance(err, ConnectionInterruptedError):
+        return {"code": "connection_interrupted", "message": str(err)}
+    if isinstance(err, ConnectionError):
+        return {"code": "connection_failed", "message": str(err)}
+    if isinstance(err, TimeoutError):
+        return {"code": "timeout", "message": str(err)}
+    if isinstance(err, MandalaError):
+        return {"code": "failed", "message": str(err)}
+    if isinstance(err, ValueError):
+        return {"code": "invalid_arguments", "message": str(err)}
+    if isinstance(err, OSError):
+        info = {"code": "io_error", "message": str(err)}
+        if err.errno is not None:
+            import errno
+
+            info["details"] = {"errno": errno.errorcode.get(err.errno, str(err.errno))}
+        return info
+    return {"code": "failed", "message": str(err)}
+
+
+def _json_failure(info: dict[str, Any]) -> None:
+    """A failure under ``--json``: its ``error`` object as ONE line on stderr.
+
+    Not stdout. What this CLI prints there under ``--json`` is the result
+    itself, with no envelope around it, so a failure leaves stdout empty and
+    nothing a script reads there can be mistaken for an answer.
+    """
+    print(json.dumps({"error": info}, sort_keys=True), file=sys.stderr)
+
+
+#: What an option name looks like: ``-x`` or ``--some-name``.
+_OPTION_NAME = re.compile(r"-[A-Za-z0-9]|--[A-Za-z][A-Za-z0-9-]{0,39}")
+
+
+def _unknown_option(word: str) -> str:
+    """The message for an option nobody declared, naming it only when it is
+    shaped like an option name.
+
+    Anything else that starts with a dash is as likely to be a value — a key
+    or a token that happens to begin with one — as a mistyped flag.
+    """
+    if _OPTION_NAME.fullmatch(word):
+        return f"unrecognized option {word}"
+    return 'unrecognized option: an argument starts with "-" but is not an option name'
+
+
+def _unexpected(extra: Sequence[str]) -> str:
+    """The message for words no command took: options shaped like option names
+    are named, and every other word is counted, never quoted.
+
+    Most often such a word is a value typed where a prompt or stdin was meant
+    to read it — ``mandala-py secrets set NAME "$TOKEN"`` — and printing it
+    would copy the credential into whatever log captures stderr.
+    """
+    named = [word for word in extra if _OPTION_NAME.fullmatch(word)]
+    others = len(extra) - len(named)
+    parts = []
+    if named:
+        parts.append(f"unrecognized option{'s' if len(named) > 1 else ''}: {' '.join(named)}")
+    if others:
+        parts.append(
+            f"{others} argument{'s' if others > 1 else ''} too many "
+            "(quote a value that has spaces in it)"
+        )
+    return "; ".join(parts)
+
+
+def _asks_for_json(words: Sequence[str]) -> bool:
+    """Whether ``words`` spell ``--json``, in full or as the abbreviation
+    argparse accepts for it (``--j``, ``--js``, ``--jso``: no other option
+    begins that way). Read before parsing, for the usage errors parsing
+    itself reports; past a bare ``--`` a word is an operand."""
+    for word in words:
+        if word == "--":
+            return False
+        if len(word) >= 3 and "--json".startswith(word):
+            return True
+    return False
+
+
+class _Parser(argparse.ArgumentParser):
+    """A parser whose usage errors print the command's whole help, not one line.
+
+    ``json_errors`` is set by :func:`main` when ``--json`` was asked for, so a
+    mistyped command is reported as the same ``error`` object as any other.
+    """
+
+    json_errors = False
+
+    def error(self, message: str) -> NoReturn:
+        if _Parser.json_errors:
+            _json_failure(
+                {"code": "invalid_arguments", "message": message, "usage": self.format_help()}
+            )
+            self.exit(2)
+        self.exit(2, f"{self.prog}: error: {message}\n\n{self.format_help()}")
+
+
+def _leaf(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.ArgumentParser:
+    """The parser of the command ``args`` names, following each subcommand chosen."""
+    while True:
+        chosen = next(
+            (
+                action.choices.get(getattr(args, action.dest, None) or "")
+                for action in parser._actions
+                if isinstance(action, argparse._SubParsersAction)
+            ),
+            None,
+        )
+        if not isinstance(chosen, argparse.ArgumentParser):
+            return parser
+        parser = chosen
 
 
 #: How long a write to stdout may hold the local terminal before it gives it back.
@@ -240,7 +430,7 @@ def _resolve(client: Client, target: str, computers: Listing[Computer] | None = 
         return named[0]
     if named:
         ids = ", ".join(c.id for c in named)
-        _die(f"{target!r} names {len(named)} computers — use an id: {ids}")
+        _die(f"{target!r} names {len(named)} computers — use an id: {ids}", "ambiguous_computer")
     if not computers.is_complete:
         if computers:
             have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
@@ -253,9 +443,9 @@ def _resolve(client: Client, target: str, computers: Listing[Computer] | None = 
             "retry when every host is reachable"
         )
     if not computers:
-        _die(f"no computer named {target!r}; the account has no computers")
+        _die(f"no computer named {target!r}; the account has no computers", "not_found")
     have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
-    _die(f"no computer named {target!r}. You have:\n{have}")
+    _die(f"no computer named {target!r}. You have:\n{have}", "not_found")
 
 
 # --- terminal --------------------------------------------------------------
@@ -804,22 +994,24 @@ def _guest_basename(path: str) -> str:
 def _cmd_scp(args: argparse.Namespace) -> int:
     src, dst = _remote_side(args.src), _remote_side(args.dst)
     if (src is None) == (dst is None):
-        _die("exactly one side must be a computer, spelled <computer>:/path")
+        _die("exactly one side must be a computer, spelled <computer>:/path", "invalid_arguments")
     # The flag is the platform's create-only upload. A download writes a LOCAL
     # file, which that option says nothing about, and quietly ignoring the flag
     # there would replace a file the caller asked to keep.
     if src is not None and args.no_overwrite:
-        _die("--no-overwrite applies to an upload, not a download")
+        _die("--no-overwrite applies to an upload, not a download", "invalid_arguments")
 
     if src is not None:
         target, remote_path = src
         if not remote_path:
-            _die(f"say which file: {target}:/absolute/path")
+            _die(f"say which file: {target}:/absolute/path", "invalid_arguments")
         local = args.dst
         if os.path.isdir(local):
             basename = _guest_basename(remote_path)
             if not basename or basename in (".", "..") or os.path.basename(basename) != basename:
-                _die(f"{target}:{remote_path} does not name a downloadable file")
+                _die(
+                    f"{target}:{remote_path} does not name a downloadable file", "invalid_arguments"
+                )
             local = os.path.join(local, basename)
         # Paged rather than read whole: the ceiling is on what one request
         # moves, so a whole-file read makes anything past 64 MiB uncopyable, and
@@ -835,7 +1027,7 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     assert dst is not None
     target, remote_path = dst
     if not remote_path:
-        _die(f"say where in the guest: {target}:/absolute/path")
+        _die(f"say where in the guest: {target}:/absolute/path", "invalid_arguments")
     # The guest's separator, not this machine's: `win:C:\Users\me\` names a
     # directory just as `box:/tmp/` does, and appending to a path that already
     # ends in a separator joins with whichever one the caller wrote.
@@ -845,12 +1037,12 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
         if os.fstat(f.fileno()).st_size > FILE_SIZE_LIMIT:
-            _die(f"{args.src} exceeds the 64 MiB file-transfer limit")
+            _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
         # The bounded read also covers files that grow after fstat and special
         # files whose reported size is zero.
         data = f.read(FILE_SIZE_LIMIT + 1)
     if len(data) > FILE_SIZE_LIMIT:
-        _die(f"{args.src} exceeds the 64 MiB file-transfer limit")
+        _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
     with _client() as client:
         try:
             _resolve(client, target).write_file(remote_path, data, overwrite=not args.no_overwrite)
@@ -860,7 +1052,8 @@ def _cmd_scp(args: argparse.Namespace) -> int:
             _die(
                 f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
                 "earlier attempt's outcome was unknown, the file may be yours: read it and "
-                "compare before choosing another path or dropping --no-overwrite to replace it."
+                "compare before choosing another path or dropping --no-overwrite to replace it.",
+                "exists",
             )
         except CreateOnlyConflictError:
             # No usable reason, so nothing here says the path is taken, nor that
@@ -871,7 +1064,8 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                 "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
                 "send the same upload again blind: read "
                 "the remote path to see what is there before choosing another path or "
-                "dropping --no-overwrite."
+                "dropping --no-overwrite.",
+                "conflict",
             )
     print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0
@@ -1058,7 +1252,7 @@ def _secret_value(keep_newline: bool) -> str:
         except UnicodeDecodeError:
             pass
         if decoded is None:
-            _die("the value on stdin is not UTF-8 text")
+            _die("the value on stdin is not UTF-8 text", "invalid_arguments")
         value = decoded
         if not keep_newline:
             # "\n" or "\r\n", and never a lone "\r": that one is part of the value.
@@ -1079,9 +1273,9 @@ def _secret_value(keep_newline: bool) -> str:
     except UnicodeEncodeError:
         valid = False
     if not valid:
-        _die("the value is not valid UTF-8 text")
+        _die("the value is not valid UTF-8 text", "invalid_arguments")
     if not value:
-        _die("no value given — pipe it on stdin, or type it at the prompt")
+        _die("no value given — pipe it on stdin, or type it at the prompt", "invalid_arguments")
     return value
 
 
@@ -1112,7 +1306,8 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
     if by_name is not None and by_id is not None and by_name.id != by_id.id:
         _die(
             f"{name!r} is both a name ({by_name.name}, {by_name.id}) and another secret's id; "
-            "give the exact name"
+            "give the exact name",
+            "ambiguous_secret",
         )
     return by_name or by_id
 
@@ -1123,7 +1318,7 @@ def _cmd_secrets_rm(args: argparse.Namespace) -> int:
         found = _secret_to_remove(listed, args.name)
         if found is None:
             scope = f"workspace {args.workspace}" if args.workspace else "the account-wide scope"
-            _die(f"no secret named {args.name!r} in {scope}")
+            _die(f"no secret named {args.name!r} in {scope}", "not_found")
         client.secrets.delete(found.id, revision_id=found.revision_id, workspace_id=args.workspace)
     print(f"deleted {found.name}  {found.id}")
     return 0
@@ -1251,7 +1446,10 @@ environment:
 """
 
 
-def _ssh_usage_error(message: str) -> int:
+def _ssh_usage_error(message: str, *, as_json: bool = False) -> int:
+    if as_json:
+        _json_failure({"code": "invalid_arguments", "message": message, "usage": SSH_USAGE})
+        return 2
     print(SSH_USAGE.split("\n\n", 1)[0], file=sys.stderr)
     print(f"{PROG} ssh: error: {message}", file=sys.stderr)
     return 2
@@ -1284,68 +1482,93 @@ def _exec(argv: list[str]) -> int:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _parse_ssh(words: list[str]) -> tuple[dict[str, Any], str | None, list[str]] | int:
+class _SshWords:
+    """``mandala ssh``'s own options, the computer, what goes to ssh, and the
+    first usage error in them, if any."""
+
+    def __init__(self) -> None:
+        self.setup = False
+        self.key: str | None = None
+        self.json = False
+        self.help = False
+        self.target: str | None = None
+        self.rest: list[str] = []
+        self.error: str | None = None
+
+    @property
+    def as_json(self) -> bool:
+        """Whether a failure is reported as JSON: ``--json`` read as OUR flag,
+        which it is only with ``--setup``. After the computer of a plain
+        ``ssh`` it is the remote command's, and says nothing about ours."""
+        return self.json and self.setup
+
+    def fail(self, message: str) -> None:
+        if self.error is None:
+            self.error = message
+
+
+def _parse_ssh(words: list[str]) -> _SshWords:
     """``mandala ssh``'s own options, the computer, and what goes to ssh.
 
     Our options come before the computer; everything after it is ssh's. With
     ``--setup`` nothing goes to ssh, so ``--key`` and ``--json`` may follow the
     computer too.
+
+    A usage error is recorded and the reading goes on, so whether it is reported
+    as JSON follows every flag given — a ``--json`` after the mistake included.
     """
-    opts: dict[str, Any] = {"setup": False, "key": None, "json": False, "help": False}
-    target: str | None = None
-    rest: list[str] = []
+    parsed = _SshWords()
     i = 0
     while i < len(words):
         word = words[i]
-        if target is not None and not opts["setup"]:
-            rest = words[i:]
+        if parsed.target is not None and not parsed.setup:
+            parsed.rest = words[i:]
             break
         if word in ("-h", "--help"):
-            opts["help"] = True
+            parsed.help = True
         elif word == "--setup":
-            opts["setup"] = True
+            parsed.setup = True
         elif word == "--json":
-            opts["json"] = True
+            parsed.json = True
         elif word == "--key":
             if i + 1 >= len(words):
-                return _ssh_usage_error("--key needs a PATH")
-            opts["key"] = words[i + 1]
-            i += 1
+                parsed.fail("--key needs a PATH")
+            else:
+                parsed.key = words[i + 1]
+                i += 1
         elif word.startswith("--key="):
-            opts["key"] = word.removeprefix("--key=")
+            parsed.key = word.removeprefix("--key=")
         elif word.startswith("-"):
-            where = "with --setup" if target is not None else "before the computer"
-            return _ssh_usage_error(
-                f"unrecognized option {word} {where}; ssh's own options go after the computer"
-            )
-        elif target is None:
-            target = word
+            where = "with --setup" if parsed.target is not None else "before the computer"
+            parsed.fail(f"{_unknown_option(word)} {where}; ssh's own options go after the computer")
+        elif parsed.target is None:
+            parsed.target = word
         else:
-            return _ssh_usage_error(f"--setup takes one computer, not {word!r} as well")
+            # Counted, not quoted: see _unexpected.
+            parsed.fail("--setup takes one computer and nothing more")
         i += 1
-    return opts, target, rest
+    return parsed
 
 
-def _cmd_ssh(words: list[str]) -> int:
-    parsed = _parse_ssh(words)
-    if isinstance(parsed, int):
-        return parsed
-    opts, target, rest = parsed
-    if opts["help"]:
+def _cmd_ssh(parsed: _SshWords) -> int:
+    if parsed.error is not None:
+        return _ssh_usage_error(parsed.error, as_json=parsed.as_json)
+    if parsed.help:
         print(SSH_USAGE, end="")
         return 0
+    target = parsed.target
     if target is None:
-        return _ssh_usage_error("name a computer")
-    if opts["setup"]:
-        return _ssh_setup(target, opts["key"], as_json=opts["json"])
-    if opts["json"]:
+        return _ssh_usage_error("name a computer", as_json=parsed.as_json)
+    if parsed.setup:
+        return _ssh_setup(target, parsed.key, as_json=parsed.json)
+    if parsed.json:
         return _ssh_usage_error("ssh is interactive and has no --json output")
-    if opts["key"] is not None:
+    if parsed.key is not None:
         return _ssh_usage_error(
             "--key goes with --setup; to connect with a particular key, pass -i PATH "
             "after the computer"
         )
-    return _ssh_connect(target, rest)
+    return _ssh_connect(target, parsed.rest)
 
 
 def _ssh_connect(target: str, extra: list[str]) -> int:
@@ -1422,7 +1645,7 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
             f"{label} was made from a template that predates SSH; create a new computer to use SSH"
         )
     if access.error:
-        _die(f"the computer's host refused the SSH setting: {access.error}")
+        _die(f"the computer's host refused the SSH setting: {access.error}", "ssh_refused")
     _openssh.ensure_known_hosts(gw, _openssh.known_hosts_path())
     command = f"{PROG} ssh {shlex.quote(target)}"
     if as_json:
@@ -1613,7 +1836,9 @@ def _ssh_parsers(sub: Any) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    # _Parser throughout: add_subparsers makes every subcommand's parser the
+    # same class as its parent's, so each one prints its own whole help.
+    parser = _Parser(
         prog=PROG,
         description="Your own terminal, against a Mandala computer.",
     )
@@ -1647,18 +1872,40 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     words = list(sys.argv[1:] if argv is None else argv)
+    as_json = False
     try:
         if words[:1] == ["ssh"]:
             # Parsed by hand: everything after the computer belongs to ssh,
-            # verbatim, and argparse would read `-L` or `--` as its own.
-            return _cmd_ssh(words[1:])
-        args = _parser().parse_args(words)
+            # verbatim, and argparse would read `-L` or `--` as its own. So
+            # whether a failure is JSON is the parse's answer, not a scan of
+            # words that may be the remote command's.
+            ssh = _parse_ssh(words[1:])
+            as_json = ssh.as_json
+            return _cmd_ssh(ssh)
+        # Whether a usage error is reported as JSON, before parsing can say.
+        as_json = _asks_for_json(words)
+        _Parser.json_errors = as_json
+        parser = _parser()
+        args, extra = parser.parse_known_args(words)
+        # Past parsing, the command's own flag decides: one that has no --json
+        # was never going to answer in JSON.
+        as_json = bool(getattr(args, "json", False))
+        if extra:
+            # parse_args reports these against the TOP parser, whose usage says
+            # nothing about the command that was typed. Reported against that
+            # command instead, with its whole help.
+            _leaf(parser, args).error(_unexpected(extra))
         return int(args.fn(args))
-    except (MandalaError, ValueError) as e:
-        print(f"{PROG}: {e}", file=sys.stderr)
+    except _Failure as e:
+        if not as_json:
+            raise
+        _json_failure(_error_info(e))
         return 1
-    except OSError as e:
-        print(f"{PROG}: {e}", file=sys.stderr)
+    except (MandalaError, ValueError, OSError) as e:
+        if as_json:
+            _json_failure(_error_info(e))
+        else:
+            print(f"{PROG}: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         # Ctrl-C is how a person ends a transfer or a wait, not a fault, and

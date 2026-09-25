@@ -46,6 +46,7 @@ from ._computer import (
     _agent_once_outcome,
     _agent_outcome,
     _attach_agent_partial,
+    _bytes_written,
     _clipboard_text,
     _continues,
     _cursor,
@@ -59,6 +60,7 @@ from ._computer import (
     _require_background_pid,
     _require_model_key,
     _ride_out,
+    _secrets_timeout,
     _snapshots_deleted,
     _upload_refusal,
     _windows_from_response,
@@ -780,6 +782,41 @@ class AsyncComputer(ComputerFields):
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             await asyncio.sleep(min(delay, remaining))
 
+    async def wait_for_secrets(
+        self, timeout: float = 180.0, poll: float = 2.0, *, expect_secrets: bool = False
+    ) -> AsyncComputer:
+        """Await until the secrets bound to this computer have reached its desktop.
+
+        A computer comes back ``running``, and its guest answers, a few seconds
+        before its secrets land. See :meth:`Computer.wait_for_secrets`: this is
+        its twin, and :meth:`AsyncComputers.launch` calls it for you.
+        """
+        check_wait_args(timeout, poll)
+        deadline = time.monotonic() + timeout
+        observed = False
+        fresh = False
+        state: str | MandalaError = "delivering"
+        while True:
+            remaining = deadline - time.monotonic()
+            delay = poll
+            if remaining > 0:
+                try:
+                    await self._refresh(timeout_cap=remaining)
+                    observed = fresh = True
+                except MandalaError as err:
+                    delay = _ride_out(err, deadline, poll)
+                    fresh = False
+            if observed:
+                state = self._secrets_state(expect_secrets)
+                if state == "delivered":
+                    return self
+                if isinstance(state, MandalaError):
+                    raise state
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh, state))
+            await asyncio.sleep(min(delay, remaining))
+
     # --- observing ------------------------------------------------------
 
     async def screenshot(self, width: int | None = None, *, fresh: bool = False) -> bytes:
@@ -1409,16 +1446,17 @@ class AsyncComputer(ComputerFields):
 
     async def write_file(
         self, path: str, data: bytes | str, *, overwrite: bool = True, no_wake: bool = False
-    ) -> None:
+    ) -> int | None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
         See :meth:`mandala_computer.Computer.write_file`, including
-        ``overwrite=False`` for a create-only write.
+        ``overwrite=False`` for a create-only write. Returns how many bytes the
+        platform says it wrote, or ``None`` if it did not say.
         """
         body = _file_body(data)
         params = _api.upload_params(path, overwrite, no_wake)
         try:
-            await self._t.request(
+            resp = await self._t.request(
                 "PUT",
                 _api.files(self.id),
                 params=params,
@@ -1430,6 +1468,7 @@ class AsyncComputer(ComputerFields):
             if refusal is err:
                 raise
             raise refusal from None
+        return _bytes_written(resp)
 
     async def list_directory(self, path: str) -> GuestDirectory:
         """List one directory inside the guest: names, types and file sizes.
