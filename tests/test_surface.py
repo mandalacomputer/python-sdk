@@ -78,6 +78,11 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # The account's workspaces, read only (OPL-5057). Listed to stay in step
+    # with the surface; no SDK method yet.
+    ("GET", "workspaces"),
+    ("GET", "workspaces/:id"),
+    ("GET", "workspaces/:id/members"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
