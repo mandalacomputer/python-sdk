@@ -1,11 +1,14 @@
 """Construction-time authentication from options, environment, or a private store.
 
-Only the TypeScript CLI writes the store. Paths and parsed values never appear
-in errors: both can contain credentials supplied by an untrusted local file.
+The TypeScript CLI's ``mandala login`` adds to the store; the one write made
+here is :func:`remove_profile` (``mandala-py logout``), under the same lock
+file and the same checks. Paths and parsed values never appear in errors: both
+can contain credentials supplied by an untrusted local file.
 """
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import math
@@ -58,6 +61,9 @@ _MESSAGES = {
     "too_many_profiles": "The credential file exceeds 100 profiles.",
     "invalid_base_url": "Credential base URLs must be canonical HTTPS URLs (or explicit HTTP loopback targets), without credentials, query, or fragment.",
     "base_binding_mismatch": "The selected credential belongs to a different base URL; remove the override or choose a matching profile.",
+    "writer_lock_timeout": "Another process holds the credential file's lock (~/.mandala/.credentials.lock); try again when it finishes.",
+    "credential_remove_failed": "Could not remove the profile; the credential file was not changed.",
+    "credential_remove_unconfirmed": "The profile was removed, but durable persistence could not be confirmed. Check ~/.mandala/credentials.json.",
 }
 
 
@@ -353,3 +359,189 @@ def resolve_credentials(
     if override is not None and canonical_base(override) != entry["base_url"]:
         raise CredentialError("base_binding_mismatch")
     return Credentials(_trim(entry["api_key"]), entry["base_url"], "file", selected)
+
+
+_LOCK = ".credentials.lock"
+_STORE = "credentials.json"
+
+
+@dataclass(frozen=True)
+class RemovedProfile:
+    """What :func:`remove_profile` did."""
+
+    #: The profile asked for: the named one, or the default.
+    profile: str
+    #: False when the store held no such profile; nothing was written then.
+    removed: bool
+    path: str
+    #: The removed profile's key id, which still authenticates until revoked.
+    key_id: str | None
+    #: The default afterwards: unchanged, or — when the default itself was
+    #: removed and others remain — the first of them by name. ``None`` when no
+    #: profile remains and the file is gone.
+    default_profile: str | None
+
+
+def _same(a: os.stat_result, b: os.stat_result) -> bool:
+    return a.st_dev == b.st_dev and a.st_ino == b.st_ino
+
+
+def _read_in(directory_fd: int) -> bytes | None:
+    """The store's bytes, read relative to an already-checked directory, or
+    ``None`` when there is no store."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        fd = os.open(_STORE, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    try:
+        _check_stat(os.fstat(fd), directory=False)
+        result = bytearray()
+        while True:
+            chunk = os.read(fd, min(8192, _MAX_BYTES + 1 - len(result)))
+            result.extend(chunk)
+            if len(result) > _MAX_BYTES:
+                raise CredentialError("file_too_large")
+            if not chunk:
+                break
+        _check_stat(os.fstat(fd), directory=False)
+        return bytes(result)
+    finally:
+        os.close(fd)
+
+
+def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> RemovedProfile:
+    """Forget one saved profile — ``mandala-py logout``.
+
+    ``profile`` defaults to ``MANDALA_PROFILE``, then the store's default. The
+    key it held stays valid on the platform: this changes only this machine.
+
+    Held to the TypeScript CLI's writer: the same exclusive lock file, never
+    stolen from another writer; the store re-read under it and checked unchanged
+    just before the swap; the new store written to a private temporary file,
+    flushed, and renamed over the old one. A default removed while others
+    remain is replaced by the first of them by name, because the store has to
+    name one; the last profile removed takes the file with it, because its
+    schema has no spelling for an empty store.
+    """
+    selected = (
+        profile if profile is not None else _trim(os.environ.get("MANDALA_PROFILE", "")) or None
+    )
+    if selected is not None:
+        selected = _profile(selected)
+    if not _supported():
+        raise CredentialError("unsupported_file_protection")
+    home = Path.home()
+    if not home.is_absolute():
+        raise CredentialError("unsafe_directory")
+    path = str(home / ".mandala" / _STORE)
+    descriptors: list[int] = []
+    lock_info: os.stat_result | None = None
+    temp: str | None = None
+    committed = False
+    directory_fd = -1
+    try:
+        try:
+            home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK)
+            descriptors.append(home_fd)
+            directory_fd = os.open(
+                ".mandala",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=home_fd,
+            )
+        except FileNotFoundError:
+            return RemovedProfile(selected or "default", False, path, None, None)
+        descriptors.append(directory_fd)
+        _check_stat(os.fstat(directory_fd), directory=True)
+
+        deadline = time.monotonic() + lock_timeout
+        while True:
+            try:
+                lock_fd = os.open(
+                    _LOCK,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                # Never removed on a timeout: the lock may be a live writer's.
+                if time.monotonic() >= deadline:
+                    raise CredentialError("writer_lock_timeout") from None
+                time.sleep(0.05)
+        descriptors.append(lock_fd)
+        os.fchmod(lock_fd, 0o600)
+        lock_info = os.fstat(lock_fd)
+        _check_stat(lock_info, directory=False)
+
+        old = _read_in(directory_fd)
+        data = None if old is None else _parse_store(old)
+        name = selected or (data["default_profile"] if data else "default")
+        if data is None or name not in data["profiles"]:
+            return RemovedProfile(
+                name, False, path, None, data["default_profile"] if data else None
+            )
+        key_id = str(data["profiles"][name]["key_id"])
+        profiles = {k: v for k, v in data["profiles"].items() if k != name}
+        left = sorted(profiles)
+        default = None
+        if left:
+            default = left[0] if data["default_profile"] == name else data["default_profile"]
+            payload = (
+                json.dumps(
+                    {"version": 1, "default_profile": default, "profiles": profiles},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            _parse_store(payload)
+            if len(payload) > _MAX_BYTES:
+                raise CredentialError("file_too_large")
+            temp = f".credentials-{os.urandom(16).hex()}.tmp"
+            temp_fd = os.open(
+                temp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            descriptors.append(temp_fd)
+            os.fchmod(temp_fd, 0o600)
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(temp_fd, view) :]
+            os.fsync(temp_fd)
+        # The store was read under the lock; it must still be exactly that.
+        if _read_in(directory_fd) != old:
+            raise CredentialError("unsafe_file")
+        if not _same(os.stat(_LOCK, dir_fd=directory_fd, follow_symlinks=False), lock_info):
+            raise CredentialError("unsafe_file")
+        if temp is not None:
+            os.replace(temp, _STORE, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            temp = None
+        else:
+            os.unlink(_STORE, dir_fd=directory_fd)
+        committed = True
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            raise CredentialError("credential_remove_unconfirmed") from None
+        return RemovedProfile(name, True, path, key_id, default)
+    except CredentialError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise CredentialError(
+            "credential_remove_unconfirmed" if committed else "credential_remove_failed"
+        ) from None
+    finally:
+        if directory_fd >= 0:
+            if temp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp, dir_fd=directory_fd)
+            if lock_info is not None:
+                with contextlib.suppress(OSError):
+                    if _same(os.stat(_LOCK, dir_fd=directory_fd, follow_symlinks=False), lock_info):
+                        os.unlink(_LOCK, dir_fd=directory_fd)
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)

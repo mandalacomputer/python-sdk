@@ -2274,6 +2274,46 @@ not a check of host capacity. Read again for a fresh observation. Both clients
 use their existing transport and context-manager lifetimes; cancelling the async
 read cancels its transport request.
 
+### Who you are, and API keys
+
+`client.account.whoami()` answers who the client's credential is: the person
+it was issued to, the account and role it acts with (the role as it is now,
+not as it was when the key was minted), the workspace it is confined to, and
+the key itself. It needs no permission and any role, and a suspended account
+can ask it — `account.status` is how such a caller finds out why nothing else
+works.
+
+```python
+with Client() as client:
+    who = client.account.whoami()
+    print(who.user.email, who.account.name, who.role)
+    print(f"confined to {who.workspace.name}" if who.workspace else "account-wide")
+
+    keys = client.api_keys.list()                # newest first; never a raw key
+    ci = client.api_keys.create(name="ci")
+    vault.put("mandala-ci", ci.key)              # shown ONCE: store it now
+    client.api_keys.revoke(ci.id)
+```
+
+**Every `api_keys` call needs the calling key's "Manage keys" permission.** It
+is off for every key until its holder turns it on in a signed-in dashboard
+session (**Credentials** in the dashboard, the **Manage keys** checkbox), and no
+API call turns it on. Without it each call raises `PermissionDeniedError` whose
+message says exactly that. A key minted here never has the permission — asking
+for one is refused, so the SDK has no argument for it — which keeps a leaked
+key that manages keys from minting a family of keys that survive its
+revocation.
+
+Reach follows the key: its holder's own keys only (anybody else's answers like
+an id that does not exist, `NotFoundError`), and a key confined to a workspace
+lists, mints and revokes only keys confined to that same workspace. Omitting
+`workspace_id` on `create` mints into the caller's own scope; a workspace-scoped
+key naming any other scope raises `PermissionDeniedError`. Listing needs the
+viewer role, minting and revoking the member role. A key may revoke itself; the
+call that does so is the last it makes. A mint answered 503 is not retried: it
+may have happened, so list and revoke rather than send it again. `AsyncClient`
+has the same methods, awaited.
+
 ### Usage
 
 What the account has spent, in the same figures the dashboard shows and the
@@ -2938,6 +2978,10 @@ mandala-py scp .env dev:/home/user/app/.env
 mandala-py scp dev:/home/user/report.csv .
 mandala-py webhooks list              # and create, get, update, delete, rotate, test, deliveries
 mandala-py secrets list               # names and revisions, never values
+mandala-py whoami                     # person, account, role, workspace, key
+mandala-py api-keys list              # and create, revoke; needs Manage keys
+mandala-py logout                     # forget the saved profile; the key stays valid
+mandala-py --version
 ```
 
 With `--json`, a command's result is printed as the API's own record, in its
@@ -3014,6 +3058,24 @@ printf %s "$OPENAI_API_KEY" | mandala-py secrets set OPENAI_API_KEY
 mandala-py secrets set KUBECONFIG --keep-newline < ~/.kube/config
 mandala-py secrets rm OPENAI_API_KEY
 ```
+
+`whoami` prints who the credential is. `api-keys list | create | revoke` manage
+the holder's keys and need the calling key's **Manage keys** permission, which
+only a dashboard session turns on; without it the platform's own sentence is
+printed, which names the page and the checkbox (`--json`: `code`
+`permission_denied`, `status` 403). `create` prints only the new key on stdout,
+so `KEY=$(mandala-py api-keys create --name ci)` captures it, and says what it
+made on stderr; `--json` prints the platform's object with the key under `raw`.
+It is shown once.
+
+`logout [--profile NAME]` forgets one profile that `mandala login` saved in
+`~/.mandala/credentials.json` — the one `--profile` or `MANDALA_PROFILE` names,
+else the default — under the same lock the npm CLI's login takes. **The key it
+held stays valid** until it is revoked, and logout prints its id for that.
+Removing the default while other profiles remain makes the first of them by name
+the default, and says so; removing the last removes the file. A profile that is
+not saved is an error (`not_logged_in`) and nothing is written. An API key in
+`MANDALA_API_KEY` is untouched and still authenticates every command.
 
 ### SSH access
 
