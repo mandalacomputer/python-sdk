@@ -2181,41 +2181,104 @@ SECRET_UNENCODABLE = "the secret request could not be encoded; its value is not 
 def sealed(call: Callable[[], T]) -> T:
     """Run a secret-bearing request, and never let its value out in an error.
 
-    Two ways a value could leave in an exception, and both are closed here:
+    EXHAUSTIVE on purpose. Every exception but control flow (``Exception`` and
+    not ``BaseException``, so ``KeyboardInterrupt``, ``SystemExit``,
+    ``GeneratorExit`` and ``asyncio.CancelledError`` pass untouched) is replaced
+    by a sanitized one — see :func:`_sanitized` — raised OUTSIDE the ``except``
+    block, so neither ``__cause__`` nor ``__context__`` reaches the request.
 
-    * An encoding or serialization failure while the client writes the body.
-      Everything is validated first, so this should never fire; if it does, it
-      becomes a fixed message.
-    * A transport failure — a timeout, a refused connection, a dropped
-      response. The SDK error for one is chained to the httpx exception, and
-      that exception keeps the REQUEST, whose content is the body, value
-      included. The error is re-raised as a copy of itself — the same class,
-      message and fields, so ``except`` clauses and :func:`is_transient` answer
-      as before — with no cause, no context and no httpx object on it.
-
-    Both are raised OUTSIDE the ``except`` block that caught the original, so
-    ``__context__`` is empty as well as ``__cause__``.
+    The ways a value got out before this: an encoder failing on the body; the
+    SDK's transport errors, chained to an httpx exception that keeps the
+    request; and an ``httpx.HTTPStatusError`` from a caller-supplied client
+    whose response hook calls ``raise_for_status()`` — raised before this SDK
+    maps anything, and holding the request and the response.
     """
-    scrubbed: BaseException
+    safe: Exception
     try:
         return call()
-    except MandalaError as err:
-        scrubbed = _scrubbed(err)
-    except (UnicodeError, TypeError, ValueError):
-        scrubbed = ValueError(SECRET_UNENCODABLE)
-    raise scrubbed
+    except Exception as err:  # noqa: BLE001 — exhaustive by design; see above
+        safe = _sanitized(err)
+    raise safe
 
 
 async def asealed(call: Callable[[], Awaitable[T]]) -> T:
     """:func:`sealed`, awaited."""
-    scrubbed: BaseException
+    safe: Exception
     try:
         return await call()
-    except MandalaError as err:
-        scrubbed = _scrubbed(err)
-    except (UnicodeError, TypeError, ValueError):
-        scrubbed = ValueError(SECRET_UNENCODABLE)
-    raise scrubbed
+    except Exception as err:  # noqa: BLE001 — exhaustive by design; see sealed
+        safe = _sanitized(err)
+    raise safe
+
+
+def _sanitized(err: Exception) -> Exception:
+    """An exception that says what ``err`` said, and holds nothing of the request.
+
+    * An SDK error: a copy of it — same class, ``args`` and fields, so
+      ``except`` clauses and :func:`is_transient` answer as before — minus any
+      httpx object or exception among its attributes.
+    * ``httpx.HTTPStatusError``: it cannot be built without a request and a
+      response, so it becomes the SDK error its status maps to, as if the SDK
+      had read the response itself, with the method kept.
+    * An encoding or serialization failure: a fixed ``ValueError``.
+    * Anything else: the same type built from a fixed message, if it can be and
+      the result holds nothing it should not; otherwise a
+      :class:`~mandala_computer.MandalaError` naming the original class.
+    """
+    if isinstance(err, MandalaError):
+        return _scrubbed(err)
+    if isinstance(err, httpx.HTTPStatusError):
+        return _from_status(err)
+    if isinstance(err, (UnicodeError, TypeError, ValueError)):
+        return ValueError(SECRET_UNENCODABLE)
+    name = type(err).__name__
+    message = (
+        f"{name} during a secret write; its details are withheld because they may hold the value"
+    )
+    try:
+        rebuilt = type(err)(message)
+    except Exception:  # noqa: BLE001 — any failure to rebuild falls back below
+        rebuilt = None
+    if rebuilt is not None and _clean(rebuilt):
+        return rebuilt
+    return MandalaError(message)
+
+
+def _clean(err: BaseException) -> bool:
+    """Whether a freshly built exception holds no request, response or chain."""
+    if err.__cause__ is not None or err.__context__ is not None:
+        return False
+    for name in ("request", "response"):
+        try:
+            if getattr(err, name, None) is not None:
+                return False
+        except RuntimeError:  # httpx: "the .request property has not been set"
+            pass
+    return not any(
+        isinstance(v, (httpx.Request, httpx.Response, BaseException)) for v in vars(err).values()
+    )
+
+
+def _from_status(err: httpx.HTTPStatusError) -> MandalaError:
+    """The SDK's own error for a status a caller's response hook raised on.
+
+    Built from a new response carrying only the status, the headers and the
+    body the platform sent — no request — through the same mapping every
+    other failure goes through.
+    """
+    from ._client import _BaseTransport  # a cycle at import time; not at call time
+
+    response = err.response
+    method = err.request.method
+    try:
+        content = response.content
+    except httpx.ResponseNotRead:
+        content = b""
+    mapped = _BaseTransport._error(
+        httpx.Response(response.status_code, headers=response.headers, content=content)
+    )
+    mapped.method = method
+    return _scrubbed(mapped)
 
 
 def _scrubbed(err: MandalaError) -> MandalaError:

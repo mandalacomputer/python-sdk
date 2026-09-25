@@ -719,3 +719,106 @@ def test_an_http_refusal_on_a_secret_write_carries_no_value(client: mc.Client) -
         client.secrets.replace(ID, VALUE, revision_id=REV)
     assert caught.value.status == 409 and caught.value.method == "PUT"
     assert not _holds_value(caught.value)
+
+
+# --- a caller's own httpx client, whose hooks raise (OPL-5026 re-review 2) ------
+
+
+class HeldRequest(Exception):
+    """A caller's exception that keeps the request — and so the body."""
+
+    def __init__(self, request: object) -> None:
+        super().__init__("hook refused")
+        self.request = request
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    response.raise_for_status()
+
+
+async def _araise_for_status(response: httpx.Response) -> None:
+    response.raise_for_status()
+
+
+def _hold(response: httpx.Response) -> None:
+    # Only on the write: the read `set` makes first carries no value.
+    if response.request.method != "GET":
+        raise HeldRequest(response.request)
+
+
+async def _ahold(response: httpx.Response) -> None:
+    # Only on the write: the read `set` makes first carries no value.
+    if response.request.method != "GET":
+        raise HeldRequest(response.request)
+
+
+HOOK_CASES = [
+    (409, "raise_for_status", mc.ConflictError),
+    (500, "raise_for_status", mc.APIError),
+    (409, "hold", mc.MandalaError),
+]
+
+
+def _hooked_store(status: int) -> None:
+    respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json=LISTING))
+    for route in (respx.post(f"{BASE}/secrets"), respx.put(f"{BASE}/secrets/{ID}")):
+        route.mock(httpx.Response(status, json={"error": "refused", "reason": "contention"}))
+
+
+@pytest.mark.parametrize(("status", "hook", "cls"), HOOK_CASES)
+@pytest.mark.parametrize("write", WRITES)
+@respx.mock
+def test_a_response_hook_that_raises_leaks_no_value(
+    status: int, hook: str, cls: type[Exception], write: Any
+) -> None:
+    fn = _raise_for_status if hook == "raise_for_status" else _hold
+    http = httpx.Client(event_hooks={"response": [fn]})
+    client = mc.Client("gck_test", base_url=BASE, http_client=http)
+    _hooked_store(status)
+    with pytest.raises(Exception) as caught:
+        write(client)
+    err = caught.value
+    assert isinstance(err, cls)
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+    if isinstance(err, mc.APIError):
+        assert err.status == status and err.method in ("POST", "PUT")
+
+
+@pytest.mark.parametrize(("status", "hook", "cls"), HOOK_CASES)
+@pytest.mark.parametrize("write", WRITES)
+@respx.mock
+async def test_async_a_response_hook_that_raises_leaks_no_value(
+    status: int, hook: str, cls: type[Exception], write: Any
+) -> None:
+    fn = _araise_for_status if hook == "raise_for_status" else _ahold
+    http = httpx.AsyncClient(event_hooks={"response": [fn]})
+    client = mc.AsyncClient("gck_test", base_url=BASE, http_client=http)
+    _hooked_store(status)
+    with pytest.raises(Exception) as caught:
+        await write(client)
+    err = caught.value
+    assert isinstance(err, cls)
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+
+
+def test_control_flow_is_not_sanitized() -> None:
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _api.sealed(interrupted)
+
+
+def test_an_unbuildable_exception_becomes_a_mandala_error_naming_it() -> None:
+    class NeedsTwo(Exception):
+        def __init__(self, a: object, b: object) -> None:
+            super().__init__(a, b)
+
+    def fail() -> None:
+        raise NeedsTwo(VALUE, VALUE)
+
+    with pytest.raises(mc.MandalaError, match="NeedsTwo") as caught:
+        _api.sealed(fail)
+    assert not _holds_value(caught.value)
