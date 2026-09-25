@@ -7,7 +7,15 @@ project is pre-1.0, so a minor version may carry a behaviour change.
 The reasoning behind a change lives in its commit message rather than here.
 This is the summary you read to decide whether to upgrade.
 
-## [0.5.1] — unreleased
+## [0.6.0] — 2026-09-25
+
+0.5.1 was never released; everything listed for it is here. Three behaviour
+changes to read before upgrading, all under **Changed**: the command is now
+`mandala-py` (the package no longer installs `mandala`), a 503 on a change is
+no longer transient, and `Computer.type()` now returns the platform's
+`mechanism`. A create-only upload's refusals arrive as two new `ConflictError`
+subclasses, `FileExistsError` and `CreateOnlyConflictError`; `no_wake`'s
+refusal as `ComputerNotRunningError`.
 
 ### Added
 
@@ -240,5 +248,6 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
+[0.6.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.3.0...v0.4.0
