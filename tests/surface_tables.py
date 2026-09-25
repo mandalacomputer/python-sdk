@@ -121,6 +121,10 @@ ALLOWED = {
     ("GET", "secrets/:id"),
     ("PUT", "secrets/:id"),
     ("DELETE", "secrets/:id"),
+    # The account's workspaces, read only (OPL-5057).
+    ("GET", "workspaces"),
+    ("GET", "workspaces/:id"),
+    ("GET", "workspaces/:id/members"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -346,4 +350,8 @@ PARAMETERS: dict[str, set[str]] = {
     "GET secrets/:id": {"query:workspace_id"},
     "PUT secrets/:id": {"body:revision_id", "body:value", "body:workspace_id"},
     "DELETE secrets/:id": {"query:revision_id", "query:workspace_id"},
+    # The account's workspaces, read only (OPL-5057). None takes a parameter.
+    "GET workspaces": set(),
+    "GET workspaces/:id": set(),
+    "GET workspaces/:id/members": set(),
 }
