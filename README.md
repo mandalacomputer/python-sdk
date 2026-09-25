@@ -2291,7 +2291,7 @@ with Client() as client:
 
     keys = client.api_keys.list()  # newest first; never a raw key
     ci = client.api_keys.create(name="ci")
-    vault.put("mandala-ci", ci.key)  # shown ONCE: store it now
+    new_key = ci.key  # shown ONCE: store it now
     client.api_keys.revoke(ci.id)
 ```
 
