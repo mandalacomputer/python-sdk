@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -592,3 +593,129 @@ def test_cli_rm_finds_a_padded_name(cli_env: None) -> None:
     gone = respx.delete(f"{BASE}/secrets/{ID}").mock(httpx.Response(200, json={"ok": True}))
     assert _cli.main(["secrets", "rm", "  OPENAI_API_KEY "]) == 0
     assert gone.call_count == 1
+
+
+# --- transport failures on a secret write (OPL-5026 re-review) -------------------
+
+TRANSPORT_FAILURES = [
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+]
+
+
+def _holds_value(obj: object, seen: set[int] | None = None, depth: int = 0) -> bool:
+    """Whether ``obj``, or anything reachable from it, carries the value.
+
+    Walks exceptions through ``__cause__`` and ``__context__``, every attribute,
+    and an httpx request's or response's CONTENT — which a repr omits, and which
+    is where the leak this guards against lived.
+    """
+    seen = set() if seen is None else seen
+    if id(obj) in seen or depth > 6:
+        return False
+    seen.add(id(obj))
+    if isinstance(obj, (bytes, bytearray)):
+        return VALUE.encode() in obj
+    if isinstance(obj, str):
+        return VALUE in obj
+    if isinstance(obj, httpx.Request):
+        try:
+            content = obj.content
+        except httpx.RequestNotRead:
+            content = b""
+        return VALUE.encode() in content or _holds_value(str(obj.url), seen, depth + 1)
+    if isinstance(obj, httpx.Response):
+        return _holds_value(obj.content, seen, depth + 1) or _holds_value(
+            obj.request, seen, depth + 1
+        )
+    if isinstance(obj, BaseException):
+        parts: list[object] = [
+            repr(obj),
+            str(obj),
+            *obj.args,
+            obj.__cause__,
+            obj.__context__,
+            *vars(obj).values(),
+        ]
+        for name in ("request", "response"):
+            try:
+                parts.append(getattr(obj, name))
+            except (RuntimeError, AttributeError):
+                pass
+        return any(_holds_value(p, seen, depth + 1) for p in parts if p is not None)
+    if isinstance(obj, Mapping):
+        return any(_holds_value(v, seen, depth + 1) for v in (*obj.keys(), *obj.values()))
+    if isinstance(obj, (list, tuple, set)):
+        return any(_holds_value(v, seen, depth + 1) for v in obj)
+    return VALUE in repr(obj)
+
+
+def _secret_writes(failure: type[Exception]) -> None:
+    respx.post(f"{BASE}/secrets").mock(side_effect=failure)
+    respx.put(f"{BASE}/secrets/{ID}").mock(side_effect=failure)
+    respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json=LISTING))
+
+
+WRITES = [
+    lambda c: c.secrets.create("A", VALUE),
+    lambda c: c.secrets.replace(ID, VALUE, revision_id=REV),
+    lambda c: c.secrets.set("OPENAI_API_KEY", VALUE),
+]
+
+
+@pytest.mark.parametrize("failure", TRANSPORT_FAILURES)
+@pytest.mark.parametrize("write", WRITES)
+@respx.mock
+def test_a_transport_failure_on_a_secret_write_carries_no_value(
+    failure: type[Exception], write: Any
+) -> None:
+    client = mc.Client("gck_test", base_url=BASE, retries={"idempotent": 2})
+    _secret_writes(failure)
+    with pytest.raises(mc.MandalaError) as caught:
+        write(client)
+    err = caught.value
+    # The type and meaning are kept: a connect-phase failure is still one.
+    assert isinstance(err, (mc.ConnectionError, mc.TimeoutError))
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+
+
+@pytest.mark.parametrize("failure", TRANSPORT_FAILURES)
+@pytest.mark.parametrize("write", WRITES)
+@respx.mock
+async def test_async_a_transport_failure_on_a_secret_write_carries_no_value(
+    failure: type[Exception], write: Any
+) -> None:
+    client = mc.AsyncClient("gck_test", base_url=BASE, retries={"idempotent": 2})
+    _secret_writes(failure)
+    with pytest.raises(mc.MandalaError) as caught:
+        await write(client)
+    err = caught.value
+    assert isinstance(err, (mc.ConnectionError, mc.TimeoutError))
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+
+
+@respx.mock
+def test_a_scrubbed_error_keeps_its_class_and_meaning(client: mc.Client) -> None:
+    respx.post(f"{BASE}/secrets").mock(side_effect=httpx.ConnectError)
+    with pytest.raises(mc.ConnectionError) as caught:
+        client.secrets.create("A", VALUE)
+    assert type(caught.value) is mc.ConnectionError and mc.is_transient(caught.value)
+    respx.post(f"{BASE}/secrets").mock(side_effect=httpx.ReadError)
+    with pytest.raises(mc.ConnectionInterruptedError) as lost:
+        client.secrets.create("A", VALUE)
+    assert not mc.is_transient(lost.value)
+
+
+@respx.mock
+def test_an_http_refusal_on_a_secret_write_carries_no_value(client: mc.Client) -> None:
+    respx.put(f"{BASE}/secrets/{ID}").mock(httpx.Response(409, json={"error": "moved"}))
+    with pytest.raises(mc.ConflictError) as caught:
+        client.secrets.replace(ID, VALUE, revision_id=REV)
+    assert caught.value.status == 409 and caught.value.method == "PUT"
+    assert not _holds_value(caught.value)

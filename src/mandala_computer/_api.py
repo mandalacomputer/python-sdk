@@ -16,6 +16,10 @@ from datetime import datetime
 from typing import Any, TypeVar
 from urllib.parse import quote
 
+import httpx
+
+from ._exceptions import MandalaError
+
 T = TypeVar("T")
 
 # --- paths ----------------------------------------------------------------
@@ -2177,26 +2181,56 @@ SECRET_UNENCODABLE = "the secret request could not be encoded; its value is not 
 def sealed(call: Callable[[], T]) -> T:
     """Run a secret-bearing request, and never let its value out in an error.
 
-    Everything is validated before the body is built, so this should never
-    fire. It is the backstop: an encoding or serialization failure raised while
-    the client writes the body is replaced by a fixed message, raised OUTSIDE
-    the ``except`` block so it has neither a cause nor a context that could
-    carry the original, value and all.
+    Two ways a value could leave in an exception, and both are closed here:
+
+    * An encoding or serialization failure while the client writes the body.
+      Everything is validated first, so this should never fire; if it does, it
+      becomes a fixed message.
+    * A transport failure — a timeout, a refused connection, a dropped
+      response. The SDK error for one is chained to the httpx exception, and
+      that exception keeps the REQUEST, whose content is the body, value
+      included. The error is re-raised as a copy of itself — the same class,
+      message and fields, so ``except`` clauses and :func:`is_transient` answer
+      as before — with no cause, no context and no httpx object on it.
+
+    Both are raised OUTSIDE the ``except`` block that caught the original, so
+    ``__context__`` is empty as well as ``__cause__``.
     """
+    scrubbed: BaseException
     try:
         return call()
+    except MandalaError as err:
+        scrubbed = _scrubbed(err)
     except (UnicodeError, TypeError, ValueError):
-        pass
-    raise ValueError(SECRET_UNENCODABLE)
+        scrubbed = ValueError(SECRET_UNENCODABLE)
+    raise scrubbed
 
 
 async def asealed(call: Callable[[], Awaitable[T]]) -> T:
     """:func:`sealed`, awaited."""
+    scrubbed: BaseException
     try:
         return await call()
+    except MandalaError as err:
+        scrubbed = _scrubbed(err)
     except (UnicodeError, TypeError, ValueError):
-        pass
-    raise ValueError(SECRET_UNENCODABLE)
+        scrubbed = ValueError(SECRET_UNENCODABLE)
+    raise scrubbed
+
+
+def _scrubbed(err: MandalaError) -> MandalaError:
+    """A copy of ``err`` with nothing that could hold a request body.
+
+    Same class, same ``args``, same attributes — minus any httpx request or
+    response — and, being a new object, no ``__cause__``, ``__context__`` or
+    traceback from the exchange that failed.
+    """
+    copy = type(err).__new__(type(err))
+    copy.args = err.args
+    for key, value in vars(err).items():
+        if not isinstance(value, (httpx.Request, httpx.Response, BaseException)):
+            setattr(copy, key, value)
+    return copy
 
 
 def _workspace(workspace_id: object) -> str | None:
