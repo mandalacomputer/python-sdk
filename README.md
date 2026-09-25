@@ -2980,7 +2980,7 @@ mandala-py webhooks test whk-2b7d4c809f3c1a7e && mandala-py webhooks deliveries 
 
 `secrets` manages the account's [secret store](#secrets). `set NAME` creates the
 secret or replaces its value, and reads the value from stdin — dropping one
-trailing newline, which `--keep-newline` keeps — or, at a terminal, from a prompt
+trailing newline (`\n` or `\r\n`, never a lone `\r`), which `--keep-newline` keeps — or, at a terminal, from a prompt
 that does not echo. Never from the command line, where it would land in shell
 history and in every process listing. `rm NAME` deletes by name at the revision
 it read. `--workspace ID` names a workspace's scope on all three; without it

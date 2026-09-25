@@ -428,3 +428,167 @@ def test_cli_rm_prefers_an_exact_name_and_refuses_ambiguity(cli_env: None) -> No
     with pytest.raises(SystemExit):
         _cli.main(["secrets", "rm", ID])
     assert gone.call_count == calls
+
+
+# --- review findings (OPL-5026) -------------------------------------------------
+
+VALUE = "sk-live-DO-NOT-LEAK-0123456789"
+LONE = "\ud800"
+
+
+def _leaks(err: BaseException) -> bool:
+    """Whether the submitted value is anywhere an exception can show it."""
+    seen: list[BaseException] = []
+    cur: BaseException | None = err
+    while cur is not None and cur not in seen:
+        seen.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    text = " ".join(f"{e!r} {e!s} {e.args!r} {vars(e)!r}" for e in seen)
+    return VALUE in text
+
+
+SYNC_CALLS = [
+    lambda c: c.secrets.create(f"A{LONE}", VALUE),
+    lambda c: c.secrets.create("A", VALUE, workspace_id=f"ws{LONE}"),
+    lambda c: c.secrets.create("A", f"{VALUE}{LONE}"),
+    lambda c: c.secrets.replace(ID, VALUE, revision_id=f"{REV}{LONE}"),
+    lambda c: c.secrets.replace(ID, VALUE, revision_id=REV, workspace_id=f"ws{LONE}"),
+    lambda c: c.secrets.replace(f"csec-{LONE}", VALUE, revision_id=REV),
+    lambda c: c.secrets.set(f"A{LONE}", VALUE),
+    lambda c: c.secrets.set("A", VALUE, workspace_id=f"ws{LONE}"),
+    lambda c: c.secrets.create("A", VALUE + "x" * 4096),
+]
+
+
+@pytest.mark.parametrize("call", SYNC_CALLS)
+@respx.mock
+def test_no_error_from_a_secret_write_carries_the_value(client: mc.Client, call: Any) -> None:
+    """A lone surrogate beside the value used to fail inside the HTTP client's
+    body encoder, whose exception held the whole body — value included."""
+    with pytest.raises(ValueError) as caught:
+        call(client)
+    assert not _leaks(caught.value)
+    assert not respx.calls
+
+
+@pytest.mark.parametrize("call", SYNC_CALLS)
+@respx.mock
+async def test_async_no_error_from_a_secret_write_carries_the_value(
+    async_client: mc.AsyncClient, call: Any
+) -> None:
+    with pytest.raises(ValueError) as caught:
+        await call(async_client)
+    assert not _leaks(caught.value)
+    assert not respx.calls
+
+
+def test_the_backstop_replaces_an_encoder_failure_with_no_context() -> None:
+    """Should validation ever miss one, the error raised is fixed and unchained."""
+
+    def encode() -> None:
+        raise UnicodeEncodeError("utf-8", f'{{"value": "{VALUE}"}}', 0, 1, "surrogates")
+
+    with pytest.raises(ValueError) as caught:
+        _api.sealed(encode)
+    assert str(caught.value) == _api.SECRET_UNENCODABLE
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert not _leaks(caught.value)
+
+
+async def test_the_async_backstop_is_unchained_too() -> None:
+    async def encode() -> None:
+        raise TypeError(VALUE)
+
+    with pytest.raises(ValueError) as caught:
+        await _api.asealed(encode)
+    assert caught.value.__context__ is None and not _leaks(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("given", "stored"),
+    [
+        ("  TOKEN  ", "TOKEN"),
+        ("\tTOKEN\n", "TOKEN"),
+        (" TOKEN﻿", "TOKEN"),  # JavaScript's trim, not str.strip()
+        ("　TOKEN ", "TOKEN"),
+    ],
+)
+def test_a_name_is_trimmed_as_the_platform_trims_it(given: str, stored: str) -> None:
+    assert _api.secret_name(given) == stored
+
+
+def test_a_name_is_not_trimmed_of_what_the_platform_keeps() -> None:
+    """U+001C is whitespace to Python and a control character to the platform."""
+    with pytest.raises(ValueError, match="control"):
+        _api.secret_name("\x1cTOKEN")
+    with pytest.raises(ValueError):
+        _api.secret_name("   ")
+    assert _api.secret_name(" " + "x" * 60 + " ") == "x" * 60
+
+
+def _store_that_trims() -> tuple[respx.Route, respx.Route]:
+    """A store the way the platform keeps one: the trimmed name, once."""
+    held: list[dict[str, Any]] = []
+
+    def listing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={**LISTING, "secrets": held})
+
+    def create(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content)
+        if any(s["name"].lower() == sent["name"].strip().lower() for s in held):
+            return httpx.Response(409, json={"error": "name taken"})
+        held.append({**SECRET, "name": sent["name"].strip()})
+        return httpx.Response(201, json=held[-1])
+
+    respx.get(f"{BASE}/secrets").mock(side_effect=listing)
+    made = respx.post(f"{BASE}/secrets").mock(side_effect=create)
+    put = respx.put(f"{BASE}/secrets/{ID}").mock(httpx.Response(200, json=SECRET))
+    return made, put
+
+
+@respx.mock
+def test_set_twice_with_a_padded_name_creates_then_replaces(client: mc.Client) -> None:
+    made, put = _store_that_trims()
+    client.secrets.set("  TOKEN ", "one")
+    client.secrets.set("  TOKEN ", "two")
+    assert made.call_count == 1 and put.call_count == 1
+    assert json.loads(made.calls.last.request.content)["name"] == "TOKEN"
+
+
+@respx.mock
+async def test_async_set_twice_with_a_padded_name_creates_then_replaces(
+    async_client: mc.AsyncClient,
+) -> None:
+    made, put = _store_that_trims()
+    await async_client.secrets.set("\tTOKEN\n", "one")
+    await async_client.secrets.set(" token ", "two")
+    assert made.call_count == 1 and put.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("stdin", "sent"),
+    [
+        (b"v\n", "v"),
+        (b"v\r\n", "v"),
+        (b"v\r", "v\r"),  # a lone CR is part of the value, as in the TypeScript CLI
+        (b"v\n\n", "v\n"),
+        (b"v", "v"),
+    ],
+)
+@respx.mock
+def test_cli_set_drops_only_one_lf_or_crlf(
+    cli_env: None, monkeypatch: pytest.MonkeyPatch, stdin: bytes, sent: str
+) -> None:
+    respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json={**LISTING, "secrets": []}))
+    made = respx.post(f"{BASE}/secrets").mock(httpx.Response(201, json=SECRET))
+    monkeypatch.setattr(sys, "stdin", _stdin(stdin))
+    assert _cli.main(["secrets", "set", "A"]) == 0
+    assert body(made)["value"] == sent
+
+
+@respx.mock
+def test_cli_rm_finds_a_padded_name(cli_env: None) -> None:
+    respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json=LISTING))
+    gone = respx.delete(f"{BASE}/secrets/{ID}").mock(httpx.Response(200, json={"ok": True}))
+    assert _cli.main(["secrets", "rm", "  OPENAI_API_KEY "]) == 0
+    assert gone.call_count == 1

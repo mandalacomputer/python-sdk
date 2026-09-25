@@ -1020,7 +1020,7 @@ class AsyncSecrets:
 
     async def create(self, name: str, value: str, *, workspace_id: str | None = None) -> Secret:
         body = _api.secret_create_body(name, value, workspace_id)
-        data = await self._t.json_object("POST", _api.SECRETS, json=body)
+        data = await _api.asealed(lambda: self._t.json_object("POST", _api.SECRETS, json=body))
         return Secret.from_api(data, "POST secrets")
 
     async def replace(
@@ -1032,7 +1032,8 @@ class AsyncSecrets:
         workspace_id: str | None = None,
     ) -> Secret:
         body = _api.secret_replace_body(value, revision_id, workspace_id)
-        data = await self._t.json_object("PUT", _api.secret(secret_id), json=body)
+        path = _api.secret(secret_id)
+        data = await _api.asealed(lambda: self._t.json_object("PUT", path, json=body))
         return Secret.from_api(data, "PUT secrets/:id")
 
     async def delete(
@@ -1045,8 +1046,8 @@ class AsyncSecrets:
         )
 
     async def set(self, name: str, value: str, *, workspace_id: str | None = None) -> Secret:
-        # Everything checked before the first request, the read included.
-        _api.secret_create_body(name, value, workspace_id)
+        # See Secrets.set: checked first, and the name normalized.
+        name = _api.secret_create_body(name, value, workspace_id)["name"]
         for attempt in range(SECRET_SET_RETRIES + 1):
             listed = await self.list(workspace_id=workspace_id)
             found = _named_secret(listed.secrets, name)

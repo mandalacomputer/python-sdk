@@ -406,3 +406,60 @@ def test_a_create_only_no_wake_upload_keeps_the_create_only_reading(client: mc.C
     respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(409, json={"error": "?"}))
     with pytest.raises(mc.CreateOnlyConflictError):
         computer(client).write_file("/tmp/a", b"x", overwrite=False, no_wake=True)
+
+
+# --- positional compatibility (OPL-5026 review) --------------------------------
+
+
+def test_snapshot_keeps_its_earlier_positional_signature() -> None:
+    """New fields were appended, so a pre-change positional call means the same."""
+    raw = {"id": "snap-1"}
+    snap = mc.Snapshot(
+        "snap-1",
+        "vm-1",
+        "n",
+        "disk",
+        "durable",
+        5,
+        "t",
+        False,
+        True,  # through auto
+        "name",
+        True,
+        True,  # computer_name, orphaned, unreachable
+        "linux",
+        "base",
+        2,
+        4096,
+        40,
+        "1280x800x24",
+        raw,
+    )
+    assert snap.unreachable is True and snap.orphaned is True
+    assert (snap.os, snap.template, snap.cpu, snap.resolution) == (
+        "linux",
+        "base",
+        2,
+        "1280x800x24",
+    )
+    assert snap.raw == raw
+    assert snap.computer_unreachable is False and snap.restore_available is None
+
+
+def test_holdings_keep_their_earlier_positional_signature() -> None:
+    raw = {"count": 1}
+    held = mc.SnapshotHoldings(1, 2, "fp", raw)
+    assert held.raw == raw and held.computer_present is None
+    assert (held.capturing, held.deleting) == (0, 0)
+
+
+def test_computer_keeps_its_constructor(client: mc.Client) -> None:
+    c = mc.Computer(client._t, COMPUTER)
+    assert c.id == "vm-1" and c.secrets_pending is False and c.secret_bindings == []
+
+
+def test_api_errors_keep_their_constructors() -> None:
+    err = mc.UnavailableError("away", status=503, body={"reason": "x"}, retry_after=1.0)
+    assert err.method is None and err.reason == "x"
+    moved = mc.MoveRequiredError("move", status=409, move_possible=True)
+    assert moved.method is None

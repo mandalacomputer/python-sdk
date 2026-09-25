@@ -33,7 +33,7 @@ This is the summary you read to decide whether to upgrade.
   again up to three times on a conflict. `SecretList` carries the store's
   `limits` and whether `delivery` is available.
 - **`mandala-py secrets list | set NAME | rm NAME`**, with `--workspace`. `set`
-  reads the value from stdin (one trailing newline dropped; `--keep-newline`
+  reads the value from stdin (one trailing `\n` or `\r\n` dropped; `--keep-newline`
   keeps it) or a prompt that does not echo — never from the command line.
 - **A computer's secret state.** `Computer.secret_bindings`,
   `secrets_generation`, `secrets_applied` (a `SecretsReceipt`),

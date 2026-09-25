@@ -11,10 +11,12 @@ from __future__ import annotations
 import math
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote
+
+T = TypeVar("T")
 
 # --- paths ----------------------------------------------------------------
 
@@ -2039,10 +2041,28 @@ def _secret_ref(value: object, what: str) -> str:
     Refused rather than stripped: an id the caller padded is one it did not
     copy from a read, and trimming it would decide which secret it meant.
     """
-    text = canonical(value, what)
+    text = _encodable(canonical(value, what), what)
     if not text or text != text.strip():
         raise ValueError(f"{what} must be a nonempty id with no surrounding whitespace")
     return text
+
+
+def _encodable(text: str, what: str) -> str:
+    """``text``, if it can go on the wire as UTF-8 at all.
+
+    A lone surrogate is a ``str`` that no encoder will write. Refused here, by
+    name and without the text, because the alternative is the HTTP client
+    failing to encode the WHOLE body — and on a secret's create or replace that
+    body holds the value, which the encoder's exception then carries in its
+    ``repr``.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        pass
+    else:
+        return text
+    raise ValueError(f"{what} must be valid Unicode text")
 
 
 def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[str, str]]:
@@ -2146,13 +2166,43 @@ SECRET_VALUE_MAX_BYTES = 4096
 
 
 def secret(secret_id: str) -> str:
-    return f"secrets/{seg(secret_id)}"
+    return f"secrets/{seg(_encodable(canonical(secret_id, 'id'), 'id'))}"
+
+
+#: The one thing said about a secret-bearing request that could not be encoded.
+#: Fixed, because the failure it replaces carries the body — value included.
+SECRET_UNENCODABLE = "the secret request could not be encoded; its value is not shown"
+
+
+def sealed(call: Callable[[], T]) -> T:
+    """Run a secret-bearing request, and never let its value out in an error.
+
+    Everything is validated before the body is built, so this should never
+    fire. It is the backstop: an encoding or serialization failure raised while
+    the client writes the body is replaced by a fixed message, raised OUTSIDE
+    the ``except`` block so it has neither a cause nor a context that could
+    carry the original, value and all.
+    """
+    try:
+        return call()
+    except (UnicodeError, TypeError, ValueError):
+        pass
+    raise ValueError(SECRET_UNENCODABLE)
+
+
+async def asealed(call: Callable[[], Awaitable[T]]) -> T:
+    """:func:`sealed`, awaited."""
+    try:
+        return await call()
+    except (UnicodeError, TypeError, ValueError):
+        pass
+    raise ValueError(SECRET_UNENCODABLE)
 
 
 def _workspace(workspace_id: object) -> str | None:
     if workspace_id is None:
         return None
-    text = canonical(workspace_id, "workspace_id")
+    text = _encodable(canonical(workspace_id, "workspace_id"), "workspace_id")
     if not text or text != text.strip():
         raise ValueError("workspace_id must be a nonempty id with no surrounding whitespace")
     return text
@@ -2164,10 +2214,27 @@ def secret_scope_params(workspace_id: object) -> dict[str, str] | None:
     return None if workspace is None else {"workspace_id": workspace}
 
 
-def _secret_name(name: object) -> str:
-    text = canonical(name, "name")
+#: What the platform trims off a secret's name before it stores or looks one
+#: up: JavaScript's ``String.prototype.trim`` set, which is neither
+#: ``str.strip()``'s (that one also strips U+001C-U+001F and keeps U+FEFF) nor
+#: ASCII whitespace alone.
+_JS_TRIM = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
+
+def secret_name(name: object) -> str:
+    """A secret's name as the platform keeps it: trimmed, 1 to 60 code points,
+    no control characters (C0, DEL or C1).
+
+    Normalized the way the platform normalizes it, so a name sent with padding
+    is the name it was stored under — and a later lookup of the same padded
+    name finds it.
+    """
+    text = _encodable(canonical(name, "name"), "name").strip(_JS_TRIM)
     if not text or len(text) > SECRET_NAME_MAX:
-        raise ValueError(f"name must be 1 to {SECRET_NAME_MAX} characters")
+        raise ValueError(f"name must be 1 to {SECRET_NAME_MAX} characters once trimmed")
     if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in text):
         raise ValueError("name must not contain control characters")
     return text
@@ -2179,17 +2246,25 @@ def secret_value(value: object) -> str:
     ``bytes`` are accepted when they are UTF-8, and refused when they are not,
     rather than decoded with replacement characters the caller never wrote.
     """
+    # Every refusal is raised OUTSIDE the ``except`` that noticed it: a codec
+    # error carries the text it failed on, and ``from None`` only hides the
+    # context from a traceback — ``__context__`` would still hold the value.
+    text: str | None = None
     if isinstance(value, (bytes, bytearray)):
         try:
             text = bytes(value).decode("utf-8")
         except UnicodeDecodeError:
-            raise ValueError("value must be UTF-8 text") from None
+            pass
     else:
         text = canonical(value, "value")
-    try:
-        size = len(text.encode("utf-8"))
-    except UnicodeEncodeError:
-        raise ValueError("value must be UTF-8 text") from None
+    size: int | None = None
+    if text is not None:
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            pass
+    if text is None or size is None:
+        raise ValueError("value must be UTF-8 text")
     if not 1 <= size <= SECRET_VALUE_MAX_BYTES:
         raise ValueError(f"value must be 1 to {SECRET_VALUE_MAX_BYTES} bytes of UTF-8, not {size}")
     return text
@@ -2204,7 +2279,7 @@ def secret_revision(revision_id: object) -> str:
 
 def secret_create_body(name: object, value: object, workspace_id: object) -> dict[str, Any]:
     """``POST secrets``: a name and a value, and a workspace only when one was named."""
-    body: dict[str, Any] = {"name": _secret_name(name), "value": secret_value(value)}
+    body: dict[str, Any] = {"name": secret_name(name), "value": secret_value(value)}
     workspace = _workspace(workspace_id)
     if workspace is not None:
         body["workspace_id"] = workspace

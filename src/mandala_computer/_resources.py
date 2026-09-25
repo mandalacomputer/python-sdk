@@ -1571,7 +1571,8 @@ class Secrets:
         stored. Read the list before retrying.
         """
         body = _api.secret_create_body(name, value, workspace_id)
-        return Secret.from_api(self._t.json_object("POST", _api.SECRETS, json=body), "POST secrets")
+        data = _api.sealed(lambda: self._t.json_object("POST", _api.SECRETS, json=body))
+        return Secret.from_api(data, "POST secrets")
 
     def replace(
         self,
@@ -1594,7 +1595,8 @@ class Secrets:
         whether one landed. A start or restart always delivers the latest.
         """
         body = _api.secret_replace_body(value, revision_id, workspace_id)
-        data = self._t.json_object("PUT", _api.secret(secret_id), json=body)
+        path = _api.secret(secret_id)
+        data = _api.sealed(lambda: self._t.json_object("PUT", path, json=body))
         return Secret.from_api(data, "PUT secrets/:id")
 
     def delete(self, secret_id: str, *, revision_id: str, workspace_id: str | None = None) -> None:
@@ -1620,8 +1622,9 @@ class Secrets:
 
         The one call to reach for when the caller means "this name should hold
         this value" and does not care which. It reads the scope, then creates
-        or replaces with the ``revision_id`` it read. Names match the way the
-        platform keeps them unique: ignoring ASCII case.
+        or replaces with the ``revision_id`` it read. Names are trimmed as the
+        platform trims them, and match the way it keeps them unique: ignoring
+        ASCII case.
 
         If the name is created, or its revision moves, between the read and the
         write — a :class:`~mandala_computer.ConflictError` — it reads again and
@@ -1630,8 +1633,10 @@ class Secrets:
         other failure is raised at once; in particular a 503, whose outcome is
         unknown, is never sent again.
         """
-        # Everything checked before the first request, the read included.
-        _api.secret_create_body(name, value, workspace_id)
+        # Everything checked before the first request, the read included, and
+        # the name normalized the way the platform stores it, so a padded name
+        # finds the secret it created last time.
+        name = _api.secret_create_body(name, value, workspace_id)["name"]
         for attempt in range(SECRET_SET_RETRIES + 1):
             found = _named_secret(self.list(workspace_id=workspace_id).secrets, name)
             try:
@@ -1664,7 +1669,7 @@ def _named_secret(secrets: Sequence[Secret], name: str) -> Secret | None:
     Ignoring ASCII case, because that is how the platform keeps names unique in
     a scope: ``openai_api_key`` is taken when ``OPENAI_API_KEY`` exists.
     """
-    wanted = _ascii_fold(_api.canonical(name, "name"))
+    wanted = _ascii_fold(_api.secret_name(name))
     return next((s for s in secrets if _ascii_fold(s.name) == wanted), None)
 
 

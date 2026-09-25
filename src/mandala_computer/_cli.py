@@ -68,7 +68,7 @@ from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import _openssh
-from ._api import looks_windows_guest_path
+from ._api import _JS_TRIM, looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
 from ._exceptions import ConflictError, CreateOnlyConflictError, FileExistsError, MandalaError
@@ -1052,12 +1052,20 @@ def _secret_value(keep_newline: bool) -> str:
     """
     if sys.stdin is None or not sys.stdin.isatty():
         data = sys.stdin.buffer.read() if sys.stdin is not None else b""
+        decoded: str | None = None
         try:
-            value = data.decode("utf-8")
+            decoded = data.decode("utf-8")
         except UnicodeDecodeError:
+            pass
+        if decoded is None:
             _die("the value on stdin is not UTF-8 text")
+        value = decoded
         if not keep_newline:
-            value = value.removesuffix("\n").removesuffix("\r")
+            # "\n" or "\r\n", and never a lone "\r": that one is part of the value.
+            if value.endswith("\r\n"):
+                value = value[:-2]
+            elif value.endswith("\n"):
+                value = value[:-1]
     else:
         import getpass
 
@@ -1065,9 +1073,12 @@ def _secret_value(keep_newline: bool) -> str:
     # Strict in both modes, and before any request: a prompt can hand back
     # undecodable bytes as lone surrogates, and those must be refused here
     # rather than stored as something the person did not type.
+    valid = True
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
+        valid = False
+    if not valid:
         _die("the value is not valid UTF-8 text")
     if not value:
         _die("no value given — pipe it on stdin, or type it at the prompt")
@@ -1093,7 +1104,7 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
     both candidates, and two different candidates are refused rather than one
     picked: a name can be spelled like another secret's id.
     """
-    exact = next((x for x in listed if x.name == name), None)
+    exact = next((x for x in listed if x.name == name.strip(_JS_TRIM)), None)
     if exact is not None:
         return exact
     by_name = _named_secret(listed, name)

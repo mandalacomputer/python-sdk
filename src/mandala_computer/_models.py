@@ -1467,17 +1467,6 @@ class Snapshot:
     #: that — see :attr:`computer_unreachable` — and an omitted one reads
     #: ``False`` here, so ``False`` is not proof that the computer exists.
     orphaned: bool = False
-    #: The source computer's presence could not be established, so
-    #: :attr:`orphaned` was not decided. The snapshot's bytes may well still be
-    #: usable.
-    computer_unreachable: bool = False
-    #: Whether this snapshot has a usable copy on the host its computer is on
-    #: now, which is what :meth:`~mandala_computer.Snapshots.restore` needs.
-    #: ``False`` for a copy left on a computer's old host after a move: restore
-    #: is refused, and :meth:`~mandala_computer.Snapshots.clone` still works
-    #: while the snapshot itself is reachable. ``None`` when the platform did
-    #: not say.
-    restore_available: bool | None = None
     #: This is a placeholder standing in for a snapshot nobody could read, seen
     #: only in a listing taken with ``allow_partial=True``. The platform does
     #: not merely omit what it could not reach — it appends one of these per
@@ -1500,6 +1489,19 @@ class Snapshot:
     disk_gb: int = 0
     resolution: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    # New fields go AFTER every existing one, so a positional construction
+    # written against an earlier version keeps its meaning.
+    #: The source computer's presence could not be established, so
+    #: :attr:`orphaned` was not decided. The snapshot's bytes may well still be
+    #: usable.
+    computer_unreachable: bool = False
+    #: Whether this snapshot has a usable copy on the host its computer is on
+    #: now, which is what :meth:`~mandala_computer.Snapshots.restore` needs.
+    #: ``False`` for a copy left on a computer's old host after a move: restore
+    #: is refused, and :meth:`~mandala_computer.Snapshots.clone` still works
+    #: while the snapshot itself is reachable. ``None`` when the platform did
+    #: not say.
+    restore_available: bool | None = None
 
     @property
     def is_memory(self) -> bool:
@@ -1617,6 +1619,8 @@ class SnapshotHoldings:
     count: int
     size_bytes: int
     fingerprint: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    # New fields go after ``raw``, so an earlier positional call keeps its meaning.
     #: Whether the source computer is present now. Bound into
     #: :attr:`fingerprint`; ``None`` when the platform did not say.
     computer_present: bool | None = None
@@ -1624,7 +1628,6 @@ class SnapshotHoldings:
     capturing: int = 0
     #: Copies whose deletion has not finished.
     deleting: int = 0
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SnapshotHoldings:
