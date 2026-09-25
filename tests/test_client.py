@@ -489,8 +489,14 @@ def test_the_public_retry_predicate_is_safe_for_a_create() -> None:
     """
     assert mc.is_transient(mc.ConflictError("busy", status=409)) is True
     assert mc.is_transient(mc.RateLimitError("slow down", status=429)) is True
-    assert mc.is_transient(mc.UnavailableError("no host", status=503)) is True
+    assert mc.is_transient(mc.UnavailableError("no host", status=503, method="GET")) is True
+    assert mc.is_transient(mc.UnavailableError("no host", status=503, method="head")) is True
     assert mc.is_transient(mc.ConnectionError("connection reset")) is True
+
+    # A 503 on a CHANGE is an unknown outcome, and so is one whose method
+    # nobody recorded (OPL-5026).
+    for method in ("POST", "PUT", "PATCH", "DELETE", None):
+        assert mc.is_transient(mc.UnavailableError("no host", status=503, method=method)) is False
 
     assert (
         mc.is_transient(mc.MoveRequiredError("needs a move", status=409, move_possible=True))
@@ -5795,7 +5801,8 @@ def test_read_text_file_is_read_file_and_makes_no_request_of_its_own(
     c = _computer(client)
     calls: list[str] = []
 
-    def fake(path: str) -> bytes:
+    def fake(path: str, *, no_wake: bool = False) -> bytes:
+        assert no_wake is False
         calls.append(path)
         return b"config\n"
 
@@ -5805,7 +5812,7 @@ def test_read_text_file_is_read_file_and_makes_no_request_of_its_own(
 
     sentinel = RuntimeError("from read_file")
 
-    def raiser(path: str) -> bytes:
+    def raiser(path: str, *, no_wake: bool = False) -> bytes:
         raise sentinel
 
     with (
@@ -5913,3 +5920,23 @@ def test_snapshot_clone_says_when_the_session_was_dropped(client: mc.Client) -> 
     odd = client.snapshots.clone("snap-3")
     assert odd.memory_dropped is False
     assert odd.memory_dropped_reason is None
+
+
+@respx.mock
+def test_a_503_on_a_change_is_an_unknown_outcome_and_one_on_a_read_is_not(
+    client: mc.Client,
+) -> None:
+    """The platform: a change answered 503 may or may not have happened.
+
+    So the error carries the method it answered, and `is_transient` calls only
+    the read worth sending again — a create answered 503 replayed blind is how
+    one computer becomes two (OPL-5026).
+    """
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(503, json={"error": "away"}))
+    respx.post(f"{BASE}/computers").mock(httpx.Response(503, json={"error": "away"}))
+    with pytest.raises(mc.UnavailableError) as read:
+        client.computers.get("vm-1")
+    assert read.value.method == "GET" and mc.is_transient(read.value)
+    with pytest.raises(mc.UnavailableError) as change:
+        client.computers.create(template="base")
+    assert change.value.method == "POST" and not mc.is_transient(change.value)

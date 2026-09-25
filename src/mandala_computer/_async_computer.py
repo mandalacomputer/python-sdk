@@ -14,7 +14,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import replace
-from typing import IO, Any
+from typing import IO, Any, Literal, overload
 
 from . import _api
 from ._agent import (
@@ -40,6 +40,7 @@ from ._client import (
 from ._computer import (
     CAPTURING,
     GUEST_PROBE,
+    UNICODE_TYPE_TIMEOUT,
     BackgroundCommandFields,
     ComputerFields,
     _agent_once_outcome,
@@ -47,17 +48,19 @@ from ._computer import (
     _attach_agent_partial,
     _clipboard_text,
     _continues,
-    _create_only_refusal,
     _cursor,
     _download_sink,
     _empty_guest_file,
     _file_body,
     _guest_not_running,
+    _mechanism,
+    _no_wake_refusal,
     _poll_delay,
     _require_background_pid,
     _require_model_key,
     _ride_out,
     _snapshots_deleted,
+    _upload_refusal,
     _windows_from_response,
     _write_all,
     capture_accepted_without_id,
@@ -86,13 +89,19 @@ from ._exceptions import (
 )
 from ._executions import ExecutionMetadata, ExecutionOutput, decode_metadata, decode_output
 from ._models import (
+    Activity,
+    ActivityPage,
+    ActivityResults,
+    ComputerDeletion,
     ExecResult,
     ExecStatus,
     FilePart,
+    GuestDirectory,
     Listing,
     Move,
     SecretBindingArgs,
     SecretBindings,
+    SignalPage,
     Snapshot,
     SnapshotHoldings,
     SshAccess,
@@ -478,9 +487,31 @@ class AsyncComputer(ComputerFields):
         data = await self._t.json_object("PUT", path, json=body)
         return SecretBindings.from_api(data, f"PUT {path}")
 
+    @overload
     async def delete(
-        self, *, purge_snapshots: bool = False, expect: str | None = None
-    ) -> int | None:
+        self,
+        *,
+        purge_snapshots: bool = ...,
+        expect: str | None = ...,
+        detailed: Literal[False] = ...,
+    ) -> int | None: ...
+
+    @overload
+    async def delete(
+        self,
+        *,
+        purge_snapshots: bool = ...,
+        expect: str | None = ...,
+        detailed: Literal[True],
+    ) -> ComputerDeletion: ...
+
+    async def delete(
+        self,
+        *,
+        purge_snapshots: bool = False,
+        expect: str | None = None,
+        detailed: bool = False,
+    ) -> int | ComputerDeletion | None:
         """Destroy this computer and its disk.
 
         Snapshots taken from it **survive by default** and become orphans, which
@@ -508,6 +539,15 @@ class AsyncComputer(ComputerFields):
         call on this object, and reporting "nothing was destroyed" because the
         server was quiet is the one wrong answer worth going out of the way to
         avoid.
+
+        ``detailed=True`` returns the whole answer instead, as a
+        :class:`~mandala_computer.ComputerDeletion`, and a purge wants it: the
+        platform answers 202 when work remains queued, and reports
+        ``computer_deleted`` and a per-copy ``purge`` tally that the count alone
+        cannot carry. A purge partly refused is a
+        :class:`~mandala_computer.ConflictError`; one whose outcome is unknown
+        is a 503 :class:`~mandala_computer.UnavailableError`, which is not safe
+        to send again blind — read :meth:`snapshot_holdings` first.
         """
         data = await self._t.json_object_or_empty(
             "DELETE",
@@ -518,6 +558,8 @@ class AsyncComputer(ComputerFields):
         # a real answer here and stays one. What no longer reaches this line is a
         # NON-empty body that is not an object: that used to arrive as `None` too,
         # so a proxy's HTML login page read as a successful delete (OPL-4232).
+        if detailed:
+            return ComputerDeletion.from_api(data)
         if data is None:
             return None
         return _snapshots_deleted(data)
@@ -862,13 +904,21 @@ class AsyncComputer(ComputerFields):
         """
         await self._input(_api.scroll_body(x, y, direction, amount, modifiers))
 
-    async def type(self, text: str) -> None:
-        """Type text as keystrokes.
+    async def type(self, text: str) -> str | None:
+        """Type text as keystrokes, and say how it was typed.
 
-        Characters with no key mapping are skipped rather than raising, so a
-        stray emoji in a prompt cannot fail the whole call.
+        See :meth:`mandala_computer.Computer.type`.
         """
-        await self._input(_api.type_body(text))
+        body = _api.type_body(text)
+        timeout = None if body["text"].isascii() else UNICODE_TYPE_TIMEOUT
+        return _mechanism(await self._input(body, timeout=timeout))
+
+    async def paste(self, text: str, *, shift: bool = False) -> None:
+        """Put ``text`` on the desktop clipboard and press Ctrl+V.
+
+        See :meth:`mandala_computer.Computer.paste`.
+        """
+        await self._input(_api.paste_body(text, shift))
 
     async def key(self, *keys: str) -> None:
         """Press a chord, e.g. ``await key("ctrl", "c")``.
@@ -1259,26 +1309,31 @@ class AsyncComputer(ComputerFields):
 
     # --- files ----------------------------------------------------------
 
-    async def read_file(self, path: str) -> bytes:
+    async def read_file(self, path: str, *, no_wake: bool = False) -> bytes:
         """Read one file out of the guest, as bytes.
 
         See :meth:`mandala_computer.Computer.read_file`.
         """
-        return await self._t.binary(
-            "GET",
-            _api.files(self.id),
-            params=_api.files_params(path),
-            timeout=FILE_TIMEOUT,
-            accept="application/octet-stream",
-            content_types=("application/octet-stream",),
-        )
+        try:
+            return await self._t.binary(
+                "GET",
+                _api.files(self.id),
+                params=_api.files_params(path, no_wake),
+                timeout=FILE_TIMEOUT,
+                accept="application/octet-stream",
+                content_types=("application/octet-stream",),
+            )
+        except ConflictError as err:
+            if not no_wake or _no_wake_refusal(err) is err:
+                raise
+            raise _no_wake_refusal(err) from None
 
-    async def read_text_file(self, path: str) -> str:
+    async def read_text_file(self, path: str, *, no_wake: bool = False) -> str:
         """:meth:`read_file`, decoded as UTF-8, for a file you know is text.
 
         See :meth:`mandala_computer.Computer.read_text_file`.
         """
-        return (await self.read_file(path)).decode("utf-8", "replace")
+        return (await self.read_file(path, no_wake=no_wake)).decode("utf-8", "replace")
 
     async def read_file_part(
         self,
@@ -1286,20 +1341,26 @@ class AsyncComputer(ComputerFields):
         *,
         offset: int = 0,
         length: int | None = None,
+        no_wake: bool = False,
     ) -> FilePart:
         """Read one window of a guest file, and where that window sits in it.
 
         See :meth:`mandala_computer.Computer.read_file_part`.
         """
-        data, at, total, partial = await self._t.binary_part(
-            "GET",
-            _api.files(self.id),
-            params=_api.files_params(path),
-            headers=_api.files_range(offset, length),
-            timeout=FILE_TIMEOUT,
-            accept="application/octet-stream",
-            content_types=("application/octet-stream",),
-        )
+        try:
+            data, at, total, partial = await self._t.binary_part(
+                "GET",
+                _api.files(self.id),
+                params=_api.files_params(path, no_wake),
+                headers=_api.files_range(offset, length),
+                timeout=FILE_TIMEOUT,
+                accept="application/octet-stream",
+                content_types=("application/octet-stream",),
+            )
+        except ConflictError as err:
+            if not no_wake or _no_wake_refusal(err) is err:
+                raise
+            raise _no_wake_refusal(err) from None
         return FilePart(data=data, offset=at, total=total, partial=partial)
 
     async def download_file(
@@ -1308,6 +1369,7 @@ class AsyncComputer(ComputerFields):
         dest: str | os.PathLike[str] | IO[bytes],
         *,
         part_size: int = FILE_PART_SIZE,
+        no_wake: bool = False,
     ) -> int:
         """Fetch a whole guest file of any size, a window at a time.
 
@@ -1323,7 +1385,7 @@ class AsyncComputer(ComputerFields):
             raise ValueError(f"part_size must be at least 1 byte, not {part_size}")
         first: FilePart | None
         try:
-            first = await self.read_file_part(path, offset=0, length=part_size)
+            first = await self.read_file_part(path, offset=0, length=part_size, no_wake=no_wake)
         except RangeNotSatisfiableError as exc:
             if not _empty_guest_file(exc):
                 raise
@@ -1339,18 +1401,22 @@ class AsyncComputer(ComputerFields):
                 if part.at_end:
                     break
                 asked, was = part.end, part.total
-                part = await self.read_file_part(path, offset=asked, length=part_size)
+                part = await self.read_file_part(
+                    path, offset=asked, length=part_size, no_wake=no_wake
+                )
                 _continues(path, asked, part, was)
         return written
 
-    async def write_file(self, path: str, data: bytes | str, *, overwrite: bool = True) -> None:
+    async def write_file(
+        self, path: str, data: bytes | str, *, overwrite: bool = True, no_wake: bool = False
+    ) -> None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
         See :meth:`mandala_computer.Computer.write_file`, including
         ``overwrite=False`` for a create-only write.
         """
         body = _file_body(data)
-        params = _api.upload_params(path, overwrite)
+        params = _api.upload_params(path, overwrite, no_wake)
         try:
             await self._t.request(
                 "PUT",
@@ -1360,12 +1426,60 @@ class AsyncComputer(ComputerFields):
                 timeout=FILE_TIMEOUT,
             )
         except ConflictError as err:
-            if overwrite:
-                raise
-            refusal = _create_only_refusal(err)
+            refusal = _upload_refusal(err, overwrite=overwrite, no_wake=no_wake)
             if refusal is err:
                 raise
             raise refusal from None
+
+    async def list_directory(self, path: str) -> GuestDirectory:
+        """List one directory inside the guest: names, types and file sizes.
+
+        See :meth:`mandala_computer.Computer.list_directory`.
+        """
+        data = await self._t.json_object(
+            "GET", _api.files_list(self.id), params=_api.list_dir_params(path)
+        )
+        return GuestDirectory.from_api(data)
+
+    # --- passive history ------------------------------------------------
+
+    async def signals(self, since: str | None = None, *, limit: int | None = None) -> SignalPage:
+        """Read the passive platform signals for this computer.
+
+        See :meth:`mandala_computer.Computer.signals`.
+        """
+        data = await self._t.json_object(
+            "GET",
+            _api.computer_action(self.id, "signals"),
+            params=_api.signals_params(since, limit),
+        )
+        return SignalPage.from_api(data)
+
+    async def activities(self, cursor: str | None = None, *, changes: bool = False) -> ActivityPage:
+        """Read this computer's API activity history, newest first.
+
+        See :meth:`mandala_computer.Computer.activities`.
+        """
+        data = await self._t.json_object(
+            "GET", _api.activities(self.id), params=_api.activities_params(cursor, changes)
+        )
+        return ActivityPage.from_api(data)
+
+    async def activity(self, activity_id: str) -> Activity:
+        """One retained API activity.
+
+        See :meth:`mandala_computer.Computer.activity`.
+        """
+        data = await self._t.json_object("GET", _api.activity(self.id, activity_id))
+        return Activity.from_api(data)
+
+    async def activity_results(self, activity_id: str) -> ActivityResults:
+        """The retained results and artifacts one activity links to.
+
+        See :meth:`mandala_computer.Computer.activity_results`.
+        """
+        data = await self._t.json_object("GET", f"{_api.activity(self.id, activity_id)}/results")
+        return ActivityResults.from_api(data)
 
     # --- windows --------------------------------------------------------
 

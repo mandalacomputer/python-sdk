@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 __all__ = [
     "APIError",
     "AuthenticationError",
+    "ComputerNotRunningError",
     "ConflictError",
     "ConnectionError",
     "ConnectionInterruptedError",
@@ -122,19 +123,27 @@ class APIError(MandalaError):
         request_id: str | None = None,
         allow: str | None = None,
         www_authenticate: str | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
+        #: The HTTP method of the request this answered — ``"GET"``, ``"POST"``
+        #: and so on — when the SDK sent it, and ``None`` on an error built by
+        #: hand. :func:`is_transient` reads it: a 503 on a read can simply be
+        #: read again, and a 503 on a change may or may not have happened.
+        self.method = method.upper() if isinstance(method, str) and method else None
         self.body = body
         #: Seconds indicated by ``Retry-After``, or ``None`` if absent or malformed.
         #: A delay alone does not mean that replaying the request is safe.
         self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
         #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
-        #: ``"unsupported"`` (OPL-3898), ``"revoked"`` or ``"exists"``. ``None`` where it sent nothing, which
-        #: is most errors and always will be — not every refusal has one of
-        #: those four answers, and the platform is explicit that absent means
-        #: unclassified rather than "none of them".
+        #: ``"unsupported"`` (OPL-3898), ``"revoked"`` or ``"exists"``. ``None``
+        #: where it sent nothing, which is most errors and always will be — not
+        #: every refusal has a word, and the platform is explicit that absent
+        #: means unclassified rather than "none of them". An OPEN set: a word
+        #: this version does not know is kept here as sent, and
+        #: :func:`is_transient` reads it as no answer.
         #:
         #: Read on the base class rather than on the one 409 it was filed for,
         #: because the platform sends it as a property of the ERROR and not of
@@ -240,6 +249,7 @@ class RangeNotSatisfiableError(APIError):
         request_id: str | None = None,
         allow: str | None = None,
         www_authenticate: str | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -249,6 +259,7 @@ class RangeNotSatisfiableError(APIError):
             request_id=request_id,
             allow=allow,
             www_authenticate=www_authenticate,
+            method=method,
         )
         #: The file's length in bytes, or ``None`` if the refusal did not carry it.
         self.size = size
@@ -403,6 +414,7 @@ class RateLimitError(APIError):
         request_id: str | None = None,
         allow: str | None = None,
         www_authenticate: str | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -412,6 +424,7 @@ class RateLimitError(APIError):
             request_id=request_id,
             allow=allow,
             www_authenticate=www_authenticate,
+            method=method,
         )
         #: Seconds to wait before retrying, from ``Retry-After``.
         #:
@@ -431,9 +444,15 @@ class MethodNotAllowedError(APIError):
 class ConflictError(APIError):
     """The request was fine; the moment was not (409).
 
-    Nearly every one of these clears itself without anybody doing anything, so
-    the answer is to wait and try again rather than to change the request. It
-    means something is in flight that this operation cannot run alongside:
+    WHETHER RETRYING HELPS IS IN THE BODY, NOT THE STATUS. Read
+    :attr:`~APIError.reason` first: ``contention`` and ``starting`` clear on
+    their own; ``unavailable`` means the computer is not running and only
+    starting it helps; ``unsupported`` means this computer cannot do it at all;
+    ``exists`` is a create-only upload whose path is taken. Absent, or a word
+    this version does not know, means no classification was given.
+
+    Many of these describe something in flight that this operation cannot run
+    alongside, and clear by waiting:
 
     - the computer's disk is still being copied from a snapshot or another
       computer (see :meth:`Computer.wait_until_built`)
@@ -465,20 +484,26 @@ class ConflictError(APIError):
     502 :class:`APIError`, so a retry loop on this exception terminates rather
     than being told "still booting" forever.
 
-    NEARLY every one, and there are two exceptions. Whether a 409 clears is a
-    property of the body rather than of the status: a refusal that clears
-    describes a passing state, and one that does not describes a decision about
-    the request, or a state that only a different call will change. This
-    docstring said "every one" of them, which made a resize past what a host can
-    run something to retry forever.
+    Not all of them, and the platform says so: a refusal that clears describes
+    a passing state, and one that does not describes a decision about the
+    request, or a state that only a different call will change. This docstring
+    once said "every one" of them, which made a resize past what a host can run
+    something to retry forever.
 
-    The first is :class:`MoveRequiredError`, which has a class of its own. The
-    second is a clipboard read or write against a computer that is stopped or
-    suspended: it answers 409, and no amount of waiting resolves it because the
-    computer will not start itself. It has no class of its own and does not need
-    one — the body carries :attr:`APIError.reason` = ``"unavailable"``, which
-    :func:`is_transient` reads, so it answers ``False`` for this one without a
-    caller having to match on the sentence (OPL-3898).
+    - :class:`MoveRequiredError`, which has a class of its own.
+    - :class:`FileExistsError` and :class:`CreateOnlyConflictError`, a
+      create-only upload refused.
+    - A refusal carrying ``unavailable`` — a guest route against a computer
+      that is stopped or suspended — or ``unsupported``. Neither has a class of
+      its own and neither needs one: :func:`is_transient` reads the word and
+      answers ``False`` without a caller matching on the sentence (OPL-3898).
+    - A seventeenth background command on one computer answers 409 with no
+      ``reason``. The sixteen already running may be long-lived servers, so
+      waiting does not necessarily help: stop one of the handles you hold.
+
+    :func:`is_transient` still answers ``True`` for a 409 with no word, as it
+    always has, because most of them clear; a loop built on it should be bounded
+    in attempts or by a deadline.
     """
 
 
@@ -525,6 +550,7 @@ class MoveRequiredError(ConflictError):
         request_id: str | None = None,
         allow: str | None = None,
         www_authenticate: str | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -534,6 +560,7 @@ class MoveRequiredError(ConflictError):
             request_id=request_id,
             allow=allow,
             www_authenticate=www_authenticate,
+            method=method,
         )
         #: Whether a host in this region could run the size that was asked for.
         self.move_possible = move_possible
@@ -593,6 +620,23 @@ class CreateOnlyConflictError(ConflictError):
     """
 
 
+class ComputerNotRunningError(ConflictError):
+    """A ``no_wake`` transfer found the computer not running (409).
+
+    ``read_file(..., no_wake=True)`` and its siblings ask the platform to refuse
+    rather than resume a computer that is stopped or suspended, and it refuses
+    with a 409. The reference documents that refusal as carrying no ``reason``,
+    so without this class it would be an ordinary :class:`ConflictError` —
+    which :func:`is_transient` calls worth sending again, while nothing but a
+    start will change the answer.
+
+    Raised for a no-wake request's 409 whose ``reason`` is missing or
+    ``"unavailable"``. Final: :func:`is_transient` says ``False``. Start the
+    computer, or send the transfer without ``no_wake`` to let it resume one.
+    A subclass of :class:`ConflictError`, so existing handlers still catch it.
+    """
+
+
 class UnavailableError(APIError):
     """Something between the request and a hypervisor could not be reached (503).
 
@@ -623,10 +667,17 @@ class UnavailableError(APIError):
       on it stops.
 
     None of these is a fault on the caller's side, which is why this is its own
-    class rather than a bare :class:`APIError`: the answer is to wait and try
-    again rather than to change the request. Unlike :class:`ConflictError`,
+    class rather than a bare :class:`APIError`. Unlike :class:`ConflictError`,
     which is about something in flight on your own resources, this is about
     something we have to clear.
+
+    A READ answered this way can be sent again shortly. A CHANGE answered this
+    way may or may not have happened — a failure after the request was sent is
+    answered the same way, with or without a warning in the message — so read
+    the current state before sending anything that is not safe to repeat, such
+    as a create, a command or a delete. :attr:`~APIError.method` says which the
+    request was, and :func:`is_transient` answers ``True`` only for a read.
+    This SDK's own ``retries`` never replays a change, whatever it answered.
     """
 
 
@@ -728,7 +779,13 @@ def is_transient(err: BaseException) -> bool:
       minus :class:`MoveRequiredError`, which is a decision rather than a moment
       and ``template_image_preparing``, which requires an explicit continuation
     * :class:`RateLimitError` — a cadence, and the response usually says how long
-    * :class:`UnavailableError` — a hypervisor briefly out of reach
+    * :class:`UnavailableError` ON A READ — a hypervisor briefly out of reach.
+      A 503 answering a CHANGE is not in the set: the platform documents that a
+      change answered 503 may or may not have happened, since a failure after
+      the request was sent is answered the same way. Read the current state
+      before sending a create, a command, a delete or any other change again.
+      An error whose request method is unknown (one built by hand, with no
+      ``method``) is treated as a change.
     * :class:`ConnectionError` — the request never left
 
     One 409 used to escape that first bullet, and this predicate could not be
@@ -739,13 +796,18 @@ def is_transient(err: BaseException) -> bool:
     attempts, which is prose-matching of exactly the kind OPL-3724 got three
     clients out of.
 
-    The platform now says which kind it is. :attr:`APIError.reason` carries one
-    of four words when one was sent — ``contention`` and ``starting`` clear on
-    their own, ``unavailable`` and ``unsupported`` never do — and it is
-    consulted BEFORE the types below, because it is the more specific answer.
-    Where it is absent, or is a word this version does not know, the type answer
-    stands unchanged; the platform is explicit that an unrecognised value means
-    no answer given, which is what makes a fifth word safe to add later.
+    The platform now says which kind it is. :attr:`APIError.reason` carries a
+    word when one was sent — ``contention`` and ``starting`` clear on their
+    own; ``unavailable`` (start the computer), ``unsupported``, ``exists`` and
+    ``revoked`` never do — and it is consulted BEFORE the types below, because
+    it is the more specific answer. Where it is absent, or is a word this
+    version does not know, the type answer stands unchanged; the platform is
+    explicit that an unrecognised value means no answer given, which is what
+    makes a new word safe to add later.
+
+    ``starting`` is the two minutes after a start, a restart or a reboot from
+    inside the guest, while its agent has not answered yet. A guest agent that
+    is still silent after that is a 502, which is not in the set.
 
     That last line is now literally true, and it was not always. The class used
     to cover every ``httpx.RequestError``, a lost response body included, so
@@ -775,7 +837,7 @@ def is_transient(err: BaseException) -> bool:
     # By class as well as by word: a create-only upload whose 409 carried no
     # usable reason has no ``reason`` at all, and would otherwise fall through to
     # the ConflictError branch below and be called worth sending again.
-    if isinstance(err, (FileExistsError, CreateOnlyConflictError)):
+    if isinstance(err, (FileExistsError, CreateOnlyConflictError, ComputerNotRunningError)):
         return False
     # A lost RESPONSE is not a request that never left, and only one of the two
     # is safe to replay blind. Same shape as the line above and the same reason:
@@ -819,7 +881,16 @@ def is_transient(err: BaseException) -> bool:
             return True
         if reason in _REASON_PERMANENT:
             return False
-    return isinstance(err, (ConflictError, RateLimitError, UnavailableError, ConnectionError))
+    if isinstance(err, UnavailableError):
+        # A 503 on a change is an UNKNOWN outcome, not a refusal: the platform
+        # answers a failure after the request was sent the same way. Only a
+        # read can be replayed blind.
+        return err.method in _READ_METHODS
+    return isinstance(err, (ConflictError, RateLimitError, ConnectionError))
+
+
+#: The methods whose 503 :func:`is_transient` calls worth sending again.
+_READ_METHODS = frozenset({"GET", "HEAD"})
 
 
 def _is_transient_for_poll(err: BaseException) -> bool:
@@ -906,7 +977,14 @@ def _is_transient_for_poll(err: BaseException) -> bool:
     if not isinstance(err, (APIError, ConnectionError, TimeoutError)):
         return False
     if isinstance(
-        err, (MoveRequiredError, FileExistsError, CreateOnlyConflictError, OriginTLSError)
+        err,
+        (
+            MoveRequiredError,
+            FileExistsError,
+            CreateOnlyConflictError,
+            ComputerNotRunningError,
+            OriginTLSError,
+        ),
     ):
         return False
     if isinstance(err, APIError):

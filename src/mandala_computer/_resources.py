@@ -16,6 +16,7 @@ from . import _api
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport
 from ._computer import Computer, _poll_delay, _ride_out, check_wait_args
 from ._exceptions import (
+    ConflictError,
     MandalaError,
     TimeoutError,
     _is_transient_for_poll,
@@ -28,7 +29,9 @@ from ._models import (
     PublishedTemplate,
     Retention,
     RetiredTemplates,
+    Secret,
     SecretBindingArgs,
+    SecretList,
     Size,
     Snapshot,
     SshKey,
@@ -49,6 +52,7 @@ __all__ = [
     "Builds",
     "Computers",
     "Moves",
+    "Secrets",
     "Sizes",
     "Snapshots",
     "SshKeys",
@@ -1509,6 +1513,164 @@ class SshKeys:
         a session already open goes on until it disconnects. An unknown id is a
         :class:`~mandala_computer.NotFoundError`."""
         self._t.request("DELETE", _api.ssh_key(key_id))
+
+
+class Secrets:
+    """The account's secret store: values stored encrypted, for binding to
+    computers (OPL-4984).
+
+    A secret is a name and a value in a scope — account-wide by default, or one
+    workspace's with ``workspace_id``. Values are WRITE-ONLY: no route returns
+    one, so what comes back here is always a :class:`~mandala_computer.Secret`
+    without it. A value reaches a computer only through a binding —
+    :meth:`~mandala_computer.Computer.set_secrets`, or ``secrets=`` at create.
+
+    Every change is guarded by the secret's ``revision_id``: a replace or a
+    delete sends the one a read answered, and a
+    :class:`~mandala_computer.ConflictError` means it has moved since and
+    nothing changed. Read again and decide.
+
+    Owners and members may read; only owners may change. An API key confined
+    to a workspace works in that workspace, and naming any other scope is a
+    :class:`~mandala_computer.PermissionDeniedError`. A platform with the store
+    switched off answers every call with a 503.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self, *, workspace_id: str | None = None) -> SecretList:
+        """The secrets in one scope, with the store's limits and whether
+        delivery into computers is available on this platform."""
+        data = self._t.json_object(
+            "GET", _api.SECRETS, params=_api.secret_scope_params(workspace_id)
+        )
+        return SecretList.from_api(data)
+
+    def get(self, secret_id: str, *, workspace_id: str | None = None) -> Secret:
+        """One secret's name, scope and current ``revision_id``, never its value.
+
+        A secret in a workspace is found only with that ``workspace_id``; for
+        any other it is a :class:`~mandala_computer.NotFoundError`.
+        """
+        data = self._t.json_object(
+            "GET", _api.secret(secret_id), params=_api.secret_scope_params(workspace_id)
+        )
+        return Secret.from_api(data, "GET secrets/:id")
+
+    def create(self, name: str, value: str, *, workspace_id: str | None = None) -> Secret:
+        """Store ``value`` under ``name``. Owners only.
+
+        ``name`` is up to 60 characters with no control characters, unique in
+        its scope — a name already taken is a
+        :class:`~mandala_computer.ConflictError`. ``value`` is 1 to 4096 bytes
+        of UTF-8. The account may hold 100 secrets at once and create 1000 over
+        its lifetime, deleted ones included; past either is a 400.
+
+        Not safe to send again blind if it answers 503: it may have been
+        stored. Read the list before retrying.
+        """
+        body = _api.secret_create_body(name, value, workspace_id)
+        data = _api.sealed(lambda: self._t.json_object("POST", _api.SECRETS, json=body))
+        return Secret.from_api(data, "POST secrets")
+
+    def replace(
+        self,
+        secret_id: str,
+        value: str,
+        *,
+        revision_id: str,
+        workspace_id: str | None = None,
+    ) -> Secret:
+        """Replace the value, and move ``revision_id``. Owners only.
+
+        ``revision_id`` is the one a read answered: if it has moved since, this
+        raises :class:`~mandala_computer.ConflictError` and nothing changed.
+
+        A computer bound to it as a FILE is sent the new value while it runs; one
+        bound as an environment variable gets it at its next start or restart,
+        and — on an image that supports it — in new shells and ``exec(...,
+        desktop=True)`` commands at once. Both are sent asynchronously and
+        best-effort; :attr:`~mandala_computer.Computer.secrets_pending` says
+        whether one landed. A start or restart always delivers the latest.
+        """
+        body = _api.secret_replace_body(value, revision_id, workspace_id)
+        path = _api.secret(secret_id)
+        data = _api.sealed(lambda: self._t.json_object("PUT", path, json=body))
+        return Secret.from_api(data, "PUT secrets/:id")
+
+    def delete(self, secret_id: str, *, revision_id: str, workspace_id: str | None = None) -> None:
+        """Delete a secret. ``revision_id`` is required; a stale one raises
+        :class:`~mandala_computer.ConflictError` with nothing deleted. Owners only.
+
+        Deleting does not recall a value already delivered, and is not refused
+        while computers are bound to it. But nothing more is delivered after it,
+        so a computer still bound cannot be given its secrets again: its next
+        start is refused, a restart or a reboot inside it stops it, and a
+        suspended one cannot resume its session. Unbind it with
+        :meth:`~mandala_computer.Computer.set_secrets` first — or on the stopped
+        computer afterwards — to start it again.
+        """
+        self._t.request(
+            "DELETE",
+            _api.secret(secret_id),
+            params=_api.secret_delete_params(revision_id, workspace_id),
+        )
+
+    def set(self, name: str, value: str, *, workspace_id: str | None = None) -> Secret:
+        """Create ``name`` in the scope, or replace its value if it exists.
+
+        The one call to reach for when the caller means "this name should hold
+        this value" and does not care which. It reads the scope, then creates
+        or replaces with the ``revision_id`` it read. Names are trimmed as the
+        platform trims them, and match the way it keeps them unique: ignoring
+        ASCII case.
+
+        If the name is created, or its revision moves, between the read and the
+        write — a :class:`~mandala_computer.ConflictError` — it reads again and
+        tries again, up to :data:`SECRET_SET_RETRIES` times, and then raises. So
+        a concurrent writer is overwritten, never silently lost track of. Any
+        other failure is raised at once; in particular a 503, whose outcome is
+        unknown, is never sent again.
+        """
+        # Everything checked before the first request, the read included, and
+        # the name normalized the way the platform stores it, so a padded name
+        # finds the secret it created last time.
+        name = _api.secret_create_body(name, value, workspace_id)["name"]
+        for attempt in range(SECRET_SET_RETRIES + 1):
+            found = _named_secret(self.list(workspace_id=workspace_id).secrets, name)
+            try:
+                if found is None:
+                    return self.create(name, value, workspace_id=workspace_id)
+                return self.replace(
+                    found.id, value, revision_id=found.revision_id, workspace_id=workspace_id
+                )
+            except ConflictError:
+                if attempt == SECRET_SET_RETRIES:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+#: How many times :meth:`Secrets.set` reads again after a conflict.
+SECRET_SET_RETRIES = 3
+
+
+def _ascii_fold(text: str) -> str:
+    """``text`` with A-Z lowered and nothing else: the platform's name collation."""
+    return text.translate(_ASCII_LOWER)
+
+
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _named_secret(secrets: Sequence[Secret], name: str) -> Secret | None:
+    """The secret called ``name`` in a listing of one scope, or ``None``.
+
+    Ignoring ASCII case, because that is how the platform keeps names unique in
+    a scope: ``openai_api_key`` is taken when ``OPENAI_API_KEY`` exists.
+    """
+    wanted = _ascii_fold(_api.secret_name(name))
+    return next((s for s in secrets if _ascii_fold(s.name) == wanted), None)
 
 
 def _named(**fields: Any) -> dict[str, Any]:

@@ -30,23 +30,36 @@ __all__ = [
     "AccountQuota",
     "AccountRemaining",
     "AccountUsage",
+    "Activity",
+    "ActivityHealth",
+    "ActivityPage",
+    "ActivityResults",
     "BuildProgress",
     "BuildStep",
+    "ComputerDeletion",
     "ComputerUsage",
+    "DirectoryEntry",
     "ExecResult",
     "ExecStatus",
     "FilePart",
+    "GuestDirectory",
     "Listing",
     "Move",
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
+    "Secret",
     "SecretBinding",
     "SecretBindingArgs",
     "SecretBindings",
+    "SecretLimits",
+    "SecretList",
+    "SecretsReceipt",
+    "SignalPage",
     "Size",
     "Snapshot",
     "SnapshotHoldings",
+    "SnapshotPurge",
     "SshAccess",
     "SshKey",
     "Template",
@@ -322,6 +335,12 @@ def _wire(d: Mapping[str, Any], key: str) -> _Wire:
 #: belonged to. Shared rather than written twice — the sync and async filters had
 #: identical copies, which is a drift waiting to happen and a test that only ever
 #: covered one of them (adversarial review, OPL-3835).
+def _opt_flag(d: Mapping[str, Any], key: str) -> bool | None:
+    """A boolean the platform may leave out: ``None`` unless it plainly said."""
+    said = _wire(d, key)
+    return True if said is _Wire.TRUE else False if said is _Wire.FALSE else None
+
+
 def is_unreachable_stub(row: Mapping[str, Any]) -> bool:
     """Whether a snapshot row stands in for one nobody could read.
 
@@ -1442,6 +1461,11 @@ class Snapshot:
     #: disk back on the source and has nowhere to put it. Snapshots outlive
     #: their computers on purpose, so an ordinary account's listing has these in
     #: it as a matter of course rather than as a fault.
+    #:
+    #: ``True`` only when a complete inventory of the fleet found the source
+    #: computer absent. The platform omits the field when it cannot establish
+    #: that — see :attr:`computer_unreachable` — and an omitted one reads
+    #: ``False`` here, so ``False`` is not proof that the computer exists.
     orphaned: bool = False
     #: This is a placeholder standing in for a snapshot nobody could read, seen
     #: only in a listing taken with ``allow_partial=True``. The platform does
@@ -1465,6 +1489,19 @@ class Snapshot:
     disk_gb: int = 0
     resolution: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    # New fields go AFTER every existing one, so a positional construction
+    # written against an earlier version keeps its meaning.
+    #: The source computer's presence could not be established, so
+    #: :attr:`orphaned` was not decided. The snapshot's bytes may well still be
+    #: usable.
+    computer_unreachable: bool = False
+    #: Whether this snapshot has a usable copy on the host its computer is on
+    #: now, which is what :meth:`~mandala_computer.Snapshots.restore` needs.
+    #: ``False`` for a copy left on a computer's old host after a move: restore
+    #: is refused, and :meth:`~mandala_computer.Snapshots.clone` still works
+    #: while the snapshot itself is reachable. ``None`` when the platform did
+    #: not say.
+    restore_available: bool | None = None
 
     @property
     def is_memory(self) -> bool:
@@ -1533,6 +1570,8 @@ class Snapshot:
             auto=_wire(d, "auto") is _Wire.TRUE,
             computer_name=_text(d.get("computer_name")),
             orphaned=_wire(d, "orphaned") is _Wire.TRUE,
+            computer_unreachable=_wire(d, "computer_unreachable") is _Wire.TRUE,
+            restore_available=_opt_flag(d, "restore_available"),
             # The same reading `is_unreachable_stub` uses, and it did not match:
             # the filter kept a row whose flag was null or unreadable and then
             # this decoded it False, so a caller told to check `unreachable`
@@ -1575,10 +1614,20 @@ class SnapshotHoldings:
     otherwise destroy something nobody agreed to.
     """
 
+    #: Physical snapshot copies across the whole fleet — a snapshot held on two
+    #: hosts counts twice — including captures and unfinished deletions.
     count: int
     size_bytes: int
     fingerprint: str
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    # New fields go after ``raw``, so an earlier positional call keeps its meaning.
+    #: Whether the source computer is present now. Bound into
+    #: :attr:`fingerprint`; ``None`` when the platform did not say.
+    computer_present: bool | None = None
+    #: Captures in flight. A purge is refused while any remain.
+    capturing: int = 0
+    #: Copies whose deletion has not finished.
+    deleting: int = 0
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SnapshotHoldings:
@@ -1586,6 +1635,9 @@ class SnapshotHoldings:
             count=_num(d.get("count")),
             size_bytes=_num(d.get("size_bytes")),
             fingerprint=_text(d.get("fingerprint")),
+            computer_present=_opt_flag(d, "computer_present"),
+            capturing=_num(d.get("capturing")),
+            deleting=_num(d.get("deleting")),
             raw=dict(d),
         )
 
@@ -2968,10 +3020,11 @@ class WebhookDelivery:
     #: success and before any attempt.
     #:
     #: An **open** set, not an enumeration. What a delivery failed on is most
-    #: often the transport — ``timeout``, ``dns``, ``refused``, ``tls``,
-    #: ``redirect``, ``address refused``, ``status NNN`` — but the platform also
-    #: reports a delivery it could not finish bookkeeping for, and those read as a
-    #: prefix and a cause (``attempt failed: …``, ``settle failed: …``). New
+    #: often the transport — ``timeout``, ``dns``, ``refused``, ``reset``,
+    #: ``unreachable``, ``tls``, ``redirect``, ``address refused``, ``status
+    #: NNN`` — and a ``dropped`` delivery says why it was dropped. The platform
+    #: documents that other values are possible, and some read as a prefix and a
+    #: cause (``attempt failed: …``, ``settle failed: …``). New
     #: wordings arrive without warning, because this field describes an operator's
     #: failure rather than a client's contract. Branch on :attr:`state`,
     #: :attr:`last_status` and :attr:`attempts`, which do not move; show this one.
@@ -3120,8 +3173,10 @@ class SecretBindingArgs(_SecretBindingId, total=False):
     ``file`` is the file the value is published as,
     ``/run/mandala-secrets/user/files/<file>``: lowercase letters, digits, ``-``
     and ``_``, starting with a letter, at most 48 characters. For what a program
-    reads from a path. A file may hold any bytes, and a replaced value reaches a
-    running computer's file within seconds.
+    reads from a path. A file may hold any bytes. A replaced value is also sent
+    to a running computer's file, asynchronously and on a best-effort basis:
+    :attr:`~mandala_computer.Computer.secrets_pending` says whether it landed,
+    and the next start or restart always delivers the latest.
 
     ``revision_id`` is for a rebind only: naming the revision the computer holds
     now keeps it; leaving it out records the latest. Every start and restart
@@ -3158,10 +3213,10 @@ class SecretBinding:
     """One secret a computer is bound to, as the platform records it.
 
     ``revision_id`` is the revision last delivered to the computer: every start
-    and restart delivers the secret's latest value and moves it there, and a
-    secret bound as a file is replaced on a running computer as soon as its
-    value is. Exactly one of ``env`` and ``file`` is set. Names and revisions
-    only: no value is ever returned.
+    and restart delivers the secret's latest value and moves it there, and so
+    does a replaced value that reaches the running computer live — sent
+    asynchronously and best-effort, so it may not. Exactly one of ``env`` and
+    ``file`` is set. Names and revisions only: no value is ever returned.
     """
 
     secret_id: str
@@ -3227,3 +3282,544 @@ class SecretBindings:
         if number < 0:
             raise MandalaError(f"{where}: version must be a non-negative whole number")
         return cls(secrets=bindings, version=number, raw=dict(d))
+
+
+@dataclass(frozen=True)
+class SecretsReceipt:
+    """The confirmation that a computer's bound values reached its desktop session.
+
+    :attr:`~mandala_computer.Computer.secrets_applied`. A start whose delivery
+    did not land has no receipt for its generation, and
+    :attr:`~mandala_computer.Computer.secrets_error` says why.
+    """
+
+    #: The delivering start this receipt is for. Behind
+    #: :attr:`~mandala_computer.Computer.secrets_generation` means it is from an
+    #: earlier start.
+    generation: int
+    #: RFC 3339: when the values reached the desktop session.
+    applied_at: str
+    #: Secret id to the revision id that was delivered, for every binding.
+    revisions: dict[str, str]
+
+    @classmethod
+    def from_api(cls, value: object) -> SecretsReceipt | None:
+        if not isinstance(value, Mapping):
+            return None
+        revisions = value.get("revisions")
+        return cls(
+            generation=_num(value.get("generation")),
+            applied_at=_text(value.get("applied_at")),
+            revisions=(
+                {str(k): _text(v) for k, v in revisions.items()}
+                if isinstance(revisions, Mapping)
+                else {}
+            ),
+        )
+
+
+# --- the account's secret store ---------------------------------------------
+
+
+def _store_text(d: Mapping[str, Any], key: str, where: str) -> str:
+    value = d.get(key)
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise MandalaError(f"{where}: a secret has no usable {key}")
+    return str.__str__(value)
+
+
+@dataclass(frozen=True)
+class Secret:
+    """One secret in the account's store — never its value.
+
+    From :attr:`mandala_computer.Client.secrets`. No route ever returns a value:
+    a value goes in with :meth:`~mandala_computer.Secrets.create` or
+    :meth:`~mandala_computer.Secrets.replace` and comes out only inside the
+    computers bound to it.
+    """
+
+    #: ``csec-`` and sixteen hex characters. What a binding names as ``secret_id``.
+    id: str
+    #: Unique within its scope. Up to 60 characters.
+    name: str
+    #: The workspace it belongs to, or ``None`` for one available account-wide.
+    workspace_id: str | None
+    #: ``csr-`` and twenty-four hex characters. Moves every time the value is
+    #: replaced; a replace or a delete sends back the one it read, and is
+    #: refused with a :class:`~mandala_computer.ConflictError` if it has moved.
+    revision_id: str
+    created_at: str
+    #: The last replace, or the create.
+    updated_at: str
+    #: When it was last delivered to a computer. ``None`` until it has been.
+    last_used_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "secret") -> Secret:
+        """Refuses a row without a usable id, name or revision.
+
+        A revision this invented would be sent back by a replace or a delete
+        as if a read had answered it.
+        """
+        workspace = d.get("workspace_id")
+        return cls(
+            id=_store_text(d, "id", where),
+            name=_store_text(d, "name", where),
+            workspace_id=str.__str__(workspace)
+            if isinstance(workspace, str) and workspace
+            else None,
+            revision_id=_store_text(d, "revision_id", where),
+            created_at=_text(d.get("created_at")),
+            updated_at=_text(d.get("updated_at")),
+            last_used_at=_opt_text(d.get("last_used_at")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class SecretLimits:
+    """The store's limits, as ``GET /secrets`` reports them."""
+
+    #: The longest name, in characters.
+    name_max_chars: int
+    #: The largest value, in bytes of UTF-8.
+    value_max_bytes: int
+    #: How many secrets the account may hold at once, across every workspace.
+    #: Deleting one frees a place.
+    active_per_account: int
+    #: How many the account may create over its lifetime, deleted ones included.
+    #: Deleting does not free a place; support can raise it.
+    created_per_account: int
+
+    @classmethod
+    def from_api(cls, value: object) -> SecretLimits | None:
+        if not isinstance(value, Mapping):
+            return None
+        return cls(
+            name_max_chars=_num(value.get("name_max_chars")),
+            value_max_bytes=_num(value.get("value_max_bytes")),
+            active_per_account=_num(value.get("active_per_account")),
+            created_per_account=_num(value.get("created_per_account")),
+        )
+
+
+@dataclass(frozen=True)
+class SecretList:
+    """The secrets in one scope, and the store's limits.
+
+    From :meth:`~mandala_computer.Secrets.list`. Names, ids and revisions only.
+    """
+
+    secrets: builtins.list[Secret]
+    #: Whether a secret can be bound to a computer on this platform. While
+    #: ``False`` secrets can be stored, but a binding is refused. ``None`` when
+    #: the platform did not say.
+    delivery: bool | None
+    limits: SecretLimits | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "GET secrets") -> SecretList:
+        """Refuses an answer without a whole list: a short one would look complete."""
+        rows = d.get("secrets")
+        if not isinstance(rows, builtins.list):
+            raise MandalaError(f"expected a secret list from {where}")
+        secrets = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise MandalaError(f"{where}: a secret is not an object")
+            secrets.append(Secret.from_api(row, where))
+        return cls(
+            secrets=secrets,
+            delivery=_opt_flag(d, "delivery"),
+            limits=SecretLimits.from_api(d.get("limits")),
+            raw=dict(d),
+        )
+
+
+# --- guest directories ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DirectoryEntry:
+    """One name in a guest directory."""
+
+    #: The exact filename. Keep its Unicode, spaces and punctuation when
+    #: building a path from it.
+    name: str
+    #: ``"file"``, ``"directory"``, ``"symlink"``, ``"special"`` or
+    #: ``"unavailable"``. Read as an open set.
+    type: str
+    #: A regular file's size, when known. ``None`` for every other type.
+    size_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class GuestDirectory:
+    """A bounded listing of one directory inside a guest.
+
+    From :meth:`~mandala_computer.Computer.list_directory`. Not a page: when
+    :attr:`truncated` is set, :attr:`entries` is an unordered sample with no
+    continuation, and the way to see more is to list a narrower directory.
+    """
+
+    #: The directory that was listed.
+    path: str
+    entries: builtins.list[DirectoryEntry]
+    #: The directory was larger than one listing examines, so :attr:`entries`
+    #: is partial.
+    truncated: bool
+    #: Names left out because their encoding or control characters cannot be
+    #: used by the file API.
+    skipped: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> GuestDirectory:
+        """Refuses an answer without an entry list, which would read as empty."""
+        rows = d.get("entries")
+        if not isinstance(rows, builtins.list):
+            raise MandalaError("expected directory entries from GET computers/:id/files/list")
+        entries = [
+            DirectoryEntry(
+                name=_text(row.get("name")),
+                type=_text(row.get("type")),
+                size_bytes=_opt_whole(row.get("size_bytes")),
+            )
+            for row in rows
+            if isinstance(row, Mapping)
+        ]
+        # A partial listing read as complete is the one misreading that matters,
+        # so anything but a plain "false" leaves the flag set.
+        return cls(
+            path=_text(d.get("path")),
+            entries=entries,
+            truncated=_wire(d, "truncated") is not _Wire.FALSE,
+            skipped=_num(d.get("skipped")),
+            raw=dict(d),
+        )
+
+
+# --- passive signals and API activity ---------------------------------------
+
+
+@dataclass(frozen=True)
+class SignalPage:
+    """One read of a computer's passive platform signals.
+
+    From :meth:`~mandala_computer.Computer.signals`. Ephemeral observations
+    the host made — a computer started, stopped, suspended or went idle, a
+    background process exited — not durable history, and not proof that a task
+    succeeded. Keep :attr:`cursor` and pass it as ``since`` on the next read.
+    """
+
+    computer: str
+    #: The checkpoint this page starts from, or the current head on a baseline
+    #: or a reset. Named ``from`` on the wire.
+    from_cursor: str
+    #: The next checkpoint. Pass it as ``since`` to read on.
+    cursor: str
+    #: The events, each exactly as the platform sent it: ``type``, ``seq``,
+    #: ``cursor``, ``at``, ``computer``, ``source`` and ``data``.
+    events: builtins.list[Mapping[str, Any]]
+    #: Another event is owed: read again with :attr:`cursor`.
+    more: bool
+    #: The first read, which starts at the current head with no history.
+    baseline: bool
+    #: Present when the cursor had expired, was malformed, or its host
+    #: restarted or moved: events were missed, and :attr:`cursor` is a new head.
+    gap: Mapping[str, Any] | None
+    #: The signal types this host produces.
+    supported: builtins.list[str]
+    #: ``"ephemeral"``.
+    retention: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> SignalPage:
+        """Refuses a page without a cursor or an event list.
+
+        A failure must never read as an empty history: the platform keeps that
+        promise on its side, and a decoder that filled in an empty list would
+        break it on this one.
+        """
+        cursor = d.get("cursor")
+        events = d.get("events")
+        if not isinstance(cursor, str) or not isinstance(events, builtins.list):
+            raise MandalaError("expected a signal page from GET computers/:id/signals")
+        gap = d.get("gap")
+        return cls(
+            computer=_text(d.get("computer")),
+            from_cursor=_text(d.get("from")),
+            cursor=str.__str__(cursor),
+            events=[dict(e) for e in events if isinstance(e, Mapping)],
+            more=_wire(d, "more") is _Wire.TRUE,
+            baseline=_wire(d, "baseline") is _Wire.TRUE,
+            gap=dict(gap) if isinstance(gap, Mapping) else None,
+            supported=_texts(d.get("supported")),
+            retention=_text(d.get("retention")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class Activity:
+    """One request sent through the computer API, as the platform retained it.
+
+    From :meth:`~mandala_computer.Computer.activities` and
+    :meth:`~mandala_computer.Computer.activity`. Safe metadata only: no command,
+    output, input text or error prose is ever retained. It does not identify an
+    agent, and it does not prove what happened in the guest.
+
+    ``channel``, ``route``, ``action``, ``state`` and ``reason`` are the
+    platform's vocabularies; read them as open sets.
+    """
+
+    #: Immutable. A request's identity, never an idempotency key.
+    activity_id: str
+    account_id: str
+    computer_id: str
+    #: The workspace when the request was admitted, or ``None``.
+    workspace_id: str | None
+    channel: str
+    route: str
+    action: str
+    state: str
+    #: When the platform received the request, UTC.
+    received_at: str
+    #: When the platform observed its outcome, UTC.
+    observed_at: str
+    #: Moves on every change to the row, late result links included.
+    revision: int | None = None
+    #: A hint that :meth:`~mandala_computer.Computer.activity_results` may
+    #: have something.
+    has_results: bool = False
+    #: The first transport attempt, when one was observed. Not proof that the
+    #: guest ran anything.
+    dispatched_at: str | None = None
+    #: The request's elapsed time, network and admission included — not how
+    #: long the guest took.
+    elapsed_ms: int | None = None
+    reason: str | None = None
+    #: The response status, when known. An error after dispatch does not prove
+    #: the action had no effect.
+    http_status: int | None = None
+    #: A known synchronous command exit.
+    exit_code: int | None = None
+    #: The execution id the original request returned.
+    execution_id: str | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> Activity:
+        workspace = d.get("workspace_id")
+        return cls(
+            activity_id=_text(d.get("activity_id")),
+            account_id=_text(d.get("account_id")),
+            computer_id=_text(d.get("computer_id")),
+            workspace_id=str(workspace) if isinstance(workspace, str) and workspace else None,
+            channel=_text(d.get("channel")),
+            route=_text(d.get("route")),
+            action=_text(d.get("action")),
+            state=_text(d.get("state")),
+            received_at=_text(d.get("received_at")),
+            observed_at=_text(d.get("observed_at")),
+            revision=_opt_whole(d.get("revision")),
+            has_results=_wire(d, "has_results") is _Wire.TRUE,
+            dispatched_at=_opt_text(d.get("dispatched_at")),
+            elapsed_ms=_opt_whole(d.get("elapsed_ms")),
+            reason=_opt_text(d.get("reason")),
+            http_status=_opt_whole(d.get("http_status")),
+            exit_code=_opt_whole(d.get("exit_code")),
+            execution_id=_opt_text(d.get("execution_id")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class ActivityHealth:
+    """How much of an account's API activity history is there to read."""
+
+    #: When recording began. Earlier requests are not reconstructed.
+    recording_started_at: str
+    #: The earliest retained row in this scope, or ``None``.
+    earliest_retained_at: str | None
+    #: History has crossed a row-count retention boundary.
+    count_truncated: bool
+    #: History has crossed an age retention boundary.
+    age_truncated: bool
+    #: ``"available"`` or ``"degraded"``.
+    capture: str
+    #: ``"best-effort"``: operational history, not an audit record.
+    completeness: str
+    #: The most recent capture gap within retention, or ``None``.
+    gap_at: str | None
+    #: The last recovery from a capture gap, or ``None``.
+    recovered_at: str | None
+
+    @classmethod
+    def from_api(cls, value: object) -> ActivityHealth | None:
+        if not isinstance(value, Mapping):
+            return None
+        return cls(
+            recording_started_at=_text(value.get("recording_started_at")),
+            earliest_retained_at=_opt_text(value.get("earliest_retained_at")),
+            count_truncated=_wire(value, "count_truncated") is _Wire.TRUE,
+            age_truncated=_wire(value, "age_truncated") is _Wire.TRUE,
+            capture=_text(value.get("capture")),
+            completeness=_text(value.get("completeness")),
+            gap_at=_opt_text(value.get("gap_at")),
+            recovered_at=_opt_text(value.get("recovered_at")),
+        )
+
+
+@dataclass(frozen=True)
+class ActivityPage:
+    """A page of a computer's API activity, newest first, or a page of changes.
+
+    From :meth:`~mandala_computer.Computer.activities`. Follow
+    :attr:`next_cursor` for older rows; pass :attr:`changes_cursor` with
+    ``changes=True`` later to receive new rows and rows that have since
+    finished. :attr:`gap` on a change page means the cursor expired: discard it
+    and read the history again.
+    """
+
+    items: builtins.list[Activity]
+    next_cursor: str | None
+    changes_cursor: str
+    gap: bool
+    health: ActivityHealth | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> ActivityPage:
+        """Refuses a page without its rows, which would read as no activity."""
+        rows = d.get("items")
+        if not isinstance(rows, builtins.list):
+            raise MandalaError("expected an activity page from GET computers/:id/activities")
+        next_cursor = d.get("next_cursor")
+        return cls(
+            items=[Activity.from_api(r) for r in rows if isinstance(r, Mapping)],
+            next_cursor=next_cursor if isinstance(next_cursor, str) and next_cursor else None,
+            changes_cursor=_text(d.get("changes_cursor")),
+            gap=_wire(d, "gap") is _Wire.TRUE,
+            health=ActivityHealth.from_api(d.get("health")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class ActivityResults:
+    """The retained results one activity links to, as references only.
+
+    From :meth:`~mandala_computer.Computer.activity_results`. Each item is a
+    retained result or artifact, as the platform sent it — ``id``, ``kind``,
+    ``association``, ``availability`` and, when available, its sizes and
+    expiry. Read the content itself with
+    :meth:`~mandala_computer.Computer.result` or the artifact
+    methods. An artifact linked here does not prove that anything succeeded.
+    """
+
+    activity_id: str
+    revision: int | None
+    #: More versions exist than the newest eight shown.
+    more: bool
+    items: builtins.list[Mapping[str, Any]]
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> ActivityResults:
+        rows = d.get("items")
+        if not isinstance(rows, builtins.list):
+            raise MandalaError(
+                "expected activity results from GET computers/:id/activities/:activity/results"
+            )
+        return cls(
+            activity_id=_text(d.get("activity_id")),
+            revision=_opt_whole(d.get("revision")),
+            more=_wire(d, "more") is _Wire.TRUE,
+            items=[dict(r) for r in rows if isinstance(r, Mapping)],
+            raw=dict(d),
+        )
+
+
+# --- deleting a computer ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SnapshotPurge:
+    """What a delete with ``purge_snapshots=True`` did to the selected copies.
+
+    Counts of physical copies: a snapshot held on two hosts counts twice.
+    """
+
+    #: Copies the confirmation selected.
+    selected: int
+    #: Selected copies confirmed gone.
+    confirmed: int
+    #: Selected copies still listed as being deleted. Unknown outcome.
+    queued: int
+    #: Selected copies whose deletion was refused.
+    failed: int
+    #: Selected copies with an unknown outcome.
+    unknown: int
+    #: Selected copies still visible in the final inventory, or ``None`` when
+    #: that inventory could not be read.
+    remaining: int | None
+    #: New copies this request did not select, or ``None`` when unknown. They
+    #: need a new confirmation to delete.
+    unselected: int | None
+    #: Every selected copy was confirmed gone in a complete final inventory.
+    complete: bool
+
+    @classmethod
+    def from_api(cls, value: object) -> SnapshotPurge | None:
+        if not isinstance(value, Mapping):
+            return None
+        return cls(
+            selected=_num(value.get("selected")),
+            confirmed=_num(value.get("confirmed")),
+            queued=_num(value.get("queued")),
+            failed=_num(value.get("failed")),
+            unknown=_num(value.get("unknown")),
+            remaining=_opt_whole(value.get("remaining")),
+            unselected=_opt_whole(value.get("unselected")),
+            complete=_wire(value, "complete") is _Wire.TRUE,
+        )
+
+
+@dataclass(frozen=True)
+class ComputerDeletion:
+    """Everything a computer delete answered.
+
+    From ``Computer.delete(..., detailed=True)``. The platform answers 202
+    when work remains queued, so read :attr:`ok`, :attr:`computer_deleted` and
+    :attr:`purge` even on success.
+    """
+
+    #: Whether the requested cleanup completed. ``None`` when not said.
+    ok: bool | None
+    #: Physical snapshot copies confirmed deleted, or ``None`` when not said.
+    snapshots_deleted: int | None
+    #: On a purge: ``True`` records a confirmed deletion, ``False`` means it is
+    #: unconfirmed or the computer was seen again, and ``None`` means unknown.
+    computer_deleted: bool | None
+    #: An explanation of a partial, queued, refused or unknown outcome.
+    error: str | None
+    purge: SnapshotPurge | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any] | None) -> ComputerDeletion:
+        d = d or {}
+        deleted = d.get("snapshots_deleted")
+        error = d.get("error")
+        return cls(
+            ok=_opt_flag(d, "ok"),
+            snapshots_deleted=None if deleted is None else _opt_whole(deleted),
+            computer_deleted=_opt_flag(d, "computer_deleted"),
+            error=error if isinstance(error, str) and error else None,
+            purge=SnapshotPurge.from_api(d.get("purge")),
+            raw=dict(d),
+        )

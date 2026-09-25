@@ -11,10 +11,16 @@ from __future__ import annotations
 import math
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote
+
+import httpx
+
+from ._exceptions import APIError, MandalaError
+
+T = TypeVar("T")
 
 # --- paths ----------------------------------------------------------------
 
@@ -649,12 +655,16 @@ def looks_windows_guest_path(path: str) -> bool:
     return len(path) >= 2 and path[0].isascii() and path[0].isalpha() and path[1] == ":"
 
 
-def files_params(path: str) -> dict[str, str]:
+def files_params(path: str, no_wake: bool = False) -> dict[str, str]:
     """The query naming which guest file, checked before the round trip.
 
     The path must be absolute: nothing about a transfer runs in a shell, so a
     relative path has no working directory to be relative to. The daemon
     refuses it too, but this mistake is knowable without the round trip.
+
+    ``no_wake`` sends ``no_wake=1``: the platform then requires a running
+    computer and refuses one that is not with a 409 rather than resuming it —
+    and billing the resume. Checked with :func:`flag`, like every arming flag.
     """
     # Canonical first, for the reason :func:`canonical` gives. ``startswith`` is
     # overridable, so a str subclass could satisfy the absoluteness check and
@@ -662,10 +672,82 @@ def files_params(path: str) -> dict[str, str]:
     text = canonical(path, "guest path")
     if not is_absolute_guest_path(text):
         raise ValueError(f"guest path must be absolute: {text!r}")
-    return {"path": text}
+    params = {"path": text}
+    if flag(no_wake, "no_wake"):
+        params["no_wake"] = "1"
+    return params
 
 
-def upload_params(path: str, overwrite: bool) -> dict[str, str]:
+def files_list(computer_id: str) -> str:
+    """A guest directory listing, beside the file transfer route."""
+    return f"computers/{seg(computer_id)}/files/list"
+
+
+def list_dir_params(path: str) -> dict[str, str]:
+    """``GET computers/:id/files/list``: one absolute directory path.
+
+    Only ``path``: the listing never resumes a computer, so it has no
+    ``no_wake`` to send.
+    """
+    return {"path": files_params(path)["path"]}
+
+
+#: The most signal events one page may hold. The platform's default is 50.
+SIGNAL_PAGE_MAX = 100
+
+
+def signals_params(since: object, limit: object) -> dict[str, str] | None:
+    """``GET computers/:id/signals``: an opaque ``since`` and a page ``limit``.
+
+    An empty or absent ``since`` asks for a baseline at the current head. The
+    platform refuses a query it does not understand, so only what was given is
+    sent.
+    """
+    params: dict[str, str] = {}
+    if since is not None:
+        cursor = canonical(since, "since")
+        if cursor:
+            params["since"] = cursor
+    if limit is not None:
+        number = whole(limit, "limit", exc=ValueError)
+        if not 1 <= number <= SIGNAL_PAGE_MAX:
+            raise ValueError(f"limit must be between 1 and {SIGNAL_PAGE_MAX}, not {number}")
+        params["limit"] = str(number)
+    return params or None
+
+
+#: The longest activity cursor the platform accepts.
+ACTIVITY_CURSOR_MAX = 2048
+
+
+def activities(computer_id: str) -> str:
+    return f"computers/{seg(computer_id)}/activities"
+
+
+def activity(computer_id: str, activity_id: str) -> str:
+    return f"computers/{seg(computer_id)}/activities/{seg(activity_id)}"
+
+
+def activities_params(cursor: object, changes: object) -> dict[str, str] | None:
+    """``GET computers/:id/activities``: a cursor, and ``changes=1`` to read changes.
+
+    A change read needs a ``changes_cursor`` to read from; one without is
+    refused here, where the platform would refuse it after the round trip.
+    """
+    params: dict[str, str] = {}
+    if cursor is not None:
+        text = canonical(cursor, "cursor")
+        if not text or len(text) > ACTIVITY_CURSOR_MAX:
+            raise ValueError(f"cursor must be 1 to {ACTIVITY_CURSOR_MAX} characters")
+        params["cursor"] = text
+    if flag(changes, "changes"):
+        if "cursor" not in params:
+            raise ValueError("changes=True needs the changes_cursor a page answered")
+        params["changes"] = "1"
+    return params or None
+
+
+def upload_params(path: str, overwrite: bool, no_wake: bool = False) -> dict[str, str]:
     """The query for an upload: :func:`files_params`, plus create-only if asked.
 
     ``overwrite=False`` sends ``overwrite=false``, which makes the platform
@@ -675,7 +757,7 @@ def upload_params(path: str, overwrite: bool) -> dict[str, str]:
     because ``"false"`` is a non-empty string and would read as true — replacing
     the very file the caller asked to keep.
     """
-    params = files_params(path)
+    params = files_params(path, no_wake)
     if not flag(overwrite, "overwrite"):
         params["overwrite"] = "false"
     return params
@@ -1620,6 +1702,34 @@ def type_body(text: str) -> dict[str, Any]:
     return {"action": "type", "text": canonical(text, "text")}
 
 
+#: The most characters ``type`` takes in one request, and the most UTF-8
+#: bytes ``paste`` does.
+TYPE_MAX_CHARS = 400
+PASTE_MAX_BYTES = 8192
+
+
+def paste_body(text: str, shift: object) -> dict[str, Any]:
+    """``{"action": "paste"}``: write the desktop clipboard, then press Ctrl+V.
+
+    ``shift`` presses Ctrl+Shift+V instead, which terminals want. Sent as
+    ``keys``, the chord as separate keys, like every other chord this SDK sends;
+    without it the platform's default, Ctrl+V, is left to apply.
+    """
+    value = canonical(text, "text")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValueError("text must be valid Unicode") from None
+    if not 1 <= size <= PASTE_MAX_BYTES:
+        raise ValueError(f"paste text must be 1 to {PASTE_MAX_BYTES} bytes of UTF-8, not {size}")
+    if "\x00" in value:
+        raise ValueError("paste text must not contain NUL")
+    body: dict[str, Any] = {"action": "paste", "text": value}
+    if flag(shift, "shift"):
+        body["keys"] = ["ctrl", "shift", "v"]
+    return body
+
+
 def key_body(keys: tuple[str, ...]) -> dict[str, Any]:
     if not keys:
         raise ValueError("key() needs at least one key")
@@ -1935,10 +2045,28 @@ def _secret_ref(value: object, what: str) -> str:
     Refused rather than stripped: an id the caller padded is one it did not
     copy from a read, and trimming it would decide which secret it meant.
     """
-    text = canonical(value, what)
+    text = _encodable(canonical(value, what), what)
     if not text or text != text.strip():
         raise ValueError(f"{what} must be a nonempty id with no surrounding whitespace")
     return text
+
+
+def _encodable(text: str, what: str) -> str:
+    """``text``, if it can go on the wire as UTF-8 at all.
+
+    A lone surrogate is a ``str`` that no encoder will write. Refused here, by
+    name and without the text, because the alternative is the HTTP client
+    failing to encode the WHOLE body — and on a secret's create or replace that
+    body holds the value, which the encoder's exception then carries in its
+    ``repr``.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        pass
+    else:
+        return text
+    raise ValueError(f"{what} must be valid Unicode text")
 
 
 def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[str, str]]:
@@ -2027,3 +2155,305 @@ def secrets_body(bindings: object, version: object = None) -> dict[str, Any]:
             raise ValueError(message)
         body["version"] = number
     return body
+
+
+# --- the account's secret store ---------------------------------------------
+
+#: The account's secret store (OPL-4984): names, ids and revisions — never a
+#: value on the way out.
+SECRETS = "secrets"
+#: The platform's bounds on a name and a value, refused here so the mistake is
+#: named before the round trip rather than as a 400 after it. ``GET secrets``
+#: reports the live numbers in ``limits``.
+SECRET_NAME_MAX = 60
+SECRET_VALUE_MAX_BYTES = 4096
+
+
+def secret(secret_id: str) -> str:
+    return f"secrets/{seg(_encodable(canonical(secret_id, 'id'), 'id'))}"
+
+
+#: The one thing said about a secret-bearing request that could not be encoded.
+#: Fixed, because the failure it replaces carries the body — value included.
+SECRET_UNENCODABLE = "the secret request could not be encoded; its value is not shown"
+
+
+def sealed(call: Callable[[], T]) -> T:
+    """Run a secret-bearing request, and never let its value out in an error.
+
+    EXHAUSTIVE on purpose. Every exception but control flow (``Exception`` and
+    not ``BaseException``, so ``KeyboardInterrupt``, ``SystemExit``,
+    ``GeneratorExit`` and ``asyncio.CancelledError`` pass untouched) is replaced
+    by a sanitized one — see :func:`_sanitized` — raised OUTSIDE the ``except``
+    block, so neither ``__cause__`` nor ``__context__`` reaches the request.
+
+    The ways a value got out before this: an encoder failing on the body; the
+    SDK's transport errors, chained to an httpx exception that keeps the
+    request; and an ``httpx.HTTPStatusError`` from a caller-supplied client
+    whose response hook calls ``raise_for_status()`` — raised before this SDK
+    maps anything, and holding the request and the response.
+    """
+    safe: Exception
+    try:
+        return call()
+    except Exception as err:  # noqa: BLE001 — exhaustive by design; see above
+        safe = _total(err)
+    raise safe
+
+
+async def asealed(call: Callable[[], Awaitable[T]]) -> T:
+    """:func:`sealed`, awaited."""
+    safe: Exception
+    try:
+        return await call()
+    except Exception as err:  # noqa: BLE001 — exhaustive by design; see sealed
+        safe = _total(err)
+    raise safe
+
+
+#: What a secret write raises when even sanitizing its failure failed.
+SECRET_WRITE_FAILED = (
+    "a secret write failed, and its details are withheld because they may hold the value"
+)
+
+
+def _total(err: Exception) -> Exception:
+    """:func:`_sanitized`, which cannot fail.
+
+    Sanitizing is code, and code can raise — a response rebuilt from a body
+    already decoded once was decoded again, and the error that raised was
+    chained to the original, request and all. So a failure here is caught and
+    answered with a fixed exception built from nothing but the status and the
+    method, read defensively. This returns rather than raises: the caller
+    raises the result outside every ``except`` block, so no path chains to the
+    original.
+    """
+    try:
+        return _sanitized(err)
+    except Exception:  # noqa: BLE001, S110 — the fallback below is the answer
+        pass
+    status: int | None = None
+    method: str | None = None
+    try:
+        if isinstance(err, httpx.HTTPStatusError):
+            status = int(err.response.status_code)
+            method = str(err.request.method)
+        elif isinstance(err, MandalaError):
+            found = getattr(err, "status", None)
+            status = found if type(found) is int else None
+            said = getattr(err, "method", None)
+            method = said if type(said) is str else None
+    except Exception:  # noqa: BLE001, S110 — status and method are best-effort
+        pass
+    if status is not None:
+        return APIError(SECRET_WRITE_FAILED, status=status, method=method)
+    return MandalaError(SECRET_WRITE_FAILED)
+
+
+def _sanitized(err: Exception) -> Exception:
+    """An exception that says what ``err`` said, and holds nothing of the request.
+
+    * An SDK error: a copy of it — same class, ``args`` and fields, so
+      ``except`` clauses and :func:`is_transient` answer as before — minus any
+      httpx object or exception among its attributes.
+    * ``httpx.HTTPStatusError``: it cannot be built without a request and a
+      response, so it becomes the SDK error its status maps to, as if the SDK
+      had read the response itself, with the method kept.
+    * An encoding or serialization failure: a fixed ``ValueError``.
+    * Anything else: the same type built from a fixed message, if it can be and
+      the result holds nothing it should not; otherwise a
+      :class:`~mandala_computer.MandalaError` naming the original class.
+    """
+    if isinstance(err, MandalaError):
+        return _scrubbed(err)
+    if isinstance(err, httpx.HTTPStatusError):
+        return _from_status(err)
+    if isinstance(err, (UnicodeError, TypeError, ValueError)):
+        return ValueError(SECRET_UNENCODABLE)
+    name = type(err).__name__
+    message = (
+        f"{name} during a secret write; its details are withheld because they may hold the value"
+    )
+    try:
+        rebuilt = type(err)(message)
+    except Exception:  # noqa: BLE001 — any failure to rebuild falls back below
+        rebuilt = None
+    if rebuilt is not None and _clean(rebuilt):
+        return rebuilt
+    return MandalaError(message)
+
+
+def _clean(err: BaseException) -> bool:
+    """Whether a freshly built exception holds no request, response or chain."""
+    if err.__cause__ is not None or err.__context__ is not None:
+        return False
+    for name in ("request", "response"):
+        try:
+            if getattr(err, name, None) is not None:
+                return False
+        except RuntimeError:  # httpx: "the .request property has not been set"
+            pass
+    return not any(
+        isinstance(v, (httpx.Request, httpx.Response, BaseException)) for v in vars(err).values()
+    )
+
+
+def _from_status(err: httpx.HTTPStatusError) -> MandalaError:
+    """The SDK's own error for a status a caller's response hook raised on.
+
+    Built from a new response carrying only the status, the headers and the
+    body the platform sent — no request — through the same mapping every
+    other failure goes through.
+
+    ``response.content`` is already decoded, so the headers that describe the
+    wire encoding are left off: a ``Content-Encoding: gzip`` beside decoded
+    bytes makes httpx decode them a second time, and fail.
+    """
+    from ._client import _BaseTransport  # a cycle at import time; not at call time
+
+    response = err.response
+    method = err.request.method
+    try:
+        content = response.content
+    except httpx.ResponseNotRead:
+        content = b""
+    # The raw byte pairs, untouched: decoding a value to text and encoding it
+    # back refuses a header that is not ASCII, and that sent every such refusal
+    # to the fixed fallback — a 429 lost its class and Retry-After.
+    headers = [
+        (key, value)
+        for key, value in response.headers.raw
+        if key.lower() not in _WIRE_ENCODING_HEADERS
+    ]
+    mapped = _BaseTransport._error(
+        httpx.Response(response.status_code, headers=headers, content=content)
+    )
+    mapped.method = method
+    return _scrubbed(mapped)
+
+
+#: Headers about how the body was carried, which no longer describe decoded bytes.
+_WIRE_ENCODING_HEADERS = frozenset({b"content-encoding", b"content-length", b"transfer-encoding"})
+
+
+def _scrubbed(err: MandalaError) -> MandalaError:
+    """A copy of ``err`` with nothing that could hold a request body.
+
+    Same class, same ``args``, same attributes — minus any httpx request or
+    response — and, being a new object, no ``__cause__``, ``__context__`` or
+    traceback from the exchange that failed.
+    """
+    copy = type(err).__new__(type(err))
+    copy.args = err.args
+    for key, value in vars(err).items():
+        if not isinstance(value, (httpx.Request, httpx.Response, BaseException)):
+            setattr(copy, key, value)
+    return copy
+
+
+def _workspace(workspace_id: object) -> str | None:
+    if workspace_id is None:
+        return None
+    text = _encodable(canonical(workspace_id, "workspace_id"), "workspace_id")
+    if not text or text != text.strip():
+        raise ValueError("workspace_id must be a nonempty id with no surrounding whitespace")
+    return text
+
+
+def secret_scope_params(workspace_id: object) -> dict[str, str] | None:
+    """``workspace_id`` on a read: absent for the account-wide scope."""
+    workspace = _workspace(workspace_id)
+    return None if workspace is None else {"workspace_id": workspace}
+
+
+#: What the platform trims off a secret's name before it stores or looks one
+#: up: JavaScript's ``String.prototype.trim`` set, which is neither
+#: ``str.strip()``'s (that one also strips U+001C-U+001F and keeps U+FEFF) nor
+#: ASCII whitespace alone.
+_JS_TRIM = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
+
+def secret_name(name: object) -> str:
+    """A secret's name as the platform keeps it: trimmed, 1 to 60 code points,
+    no control characters (C0, DEL or C1).
+
+    Normalized the way the platform normalizes it, so a name sent with padding
+    is the name it was stored under — and a later lookup of the same padded
+    name finds it.
+    """
+    text = _encodable(canonical(name, "name"), "name").strip(_JS_TRIM)
+    if not text or len(text) > SECRET_NAME_MAX:
+        raise ValueError(f"name must be 1 to {SECRET_NAME_MAX} characters once trimmed")
+    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in text):
+        raise ValueError("name must not contain control characters")
+    return text
+
+
+def secret_value(value: object) -> str:
+    """A value as the store takes it: 1 to 4096 bytes of UTF-8, as text.
+
+    ``bytes`` are accepted when they are UTF-8, and refused when they are not,
+    rather than decoded with replacement characters the caller never wrote.
+    """
+    # Every refusal is raised OUTSIDE the ``except`` that noticed it: a codec
+    # error carries the text it failed on, and ``from None`` only hides the
+    # context from a traceback — ``__context__`` would still hold the value.
+    text: str | None = None
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    else:
+        text = canonical(value, "value")
+    size: int | None = None
+    if text is not None:
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            pass
+    if text is None or size is None:
+        raise ValueError("value must be UTF-8 text")
+    if not 1 <= size <= SECRET_VALUE_MAX_BYTES:
+        raise ValueError(f"value must be 1 to {SECRET_VALUE_MAX_BYTES} bytes of UTF-8, not {size}")
+    return text
+
+
+def secret_revision(revision_id: object) -> str:
+    """The ``revision_id`` a read answered: required on a replace and a delete."""
+    if revision_id is None:
+        raise ValueError("revision_id is required: read the secret and send the one it answered")
+    return _secret_ref(revision_id, "revision_id")
+
+
+def secret_create_body(name: object, value: object, workspace_id: object) -> dict[str, Any]:
+    """``POST secrets``: a name and a value, and a workspace only when one was named."""
+    body: dict[str, Any] = {"name": secret_name(name), "value": secret_value(value)}
+    workspace = _workspace(workspace_id)
+    if workspace is not None:
+        body["workspace_id"] = workspace
+    return body
+
+
+def secret_replace_body(value: object, revision_id: object, workspace_id: object) -> dict[str, Any]:
+    """``PUT secrets/:id``: the new value and the revision it replaces."""
+    body: dict[str, Any] = {
+        "value": secret_value(value),
+        "revision_id": secret_revision(revision_id),
+    }
+    workspace = _workspace(workspace_id)
+    if workspace is not None:
+        body["workspace_id"] = workspace
+    return body
+
+
+def secret_delete_params(revision_id: object, workspace_id: object) -> dict[str, str]:
+    """``DELETE secrets/:id``: ``revision_id`` is required, a workspace optional."""
+    params = {"revision_id": secret_revision(revision_id)}
+    workspace = _workspace(workspace_id)
+    if workspace is not None:
+        params["workspace_id"] = workspace
+    return params
