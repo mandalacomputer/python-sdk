@@ -12,6 +12,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import IO, Any, Literal, overload
 
+import httpx
+
 from . import _api
 from ._agent import (
     AgentDone,
@@ -333,6 +335,25 @@ def _upload_refusal(err: ConflictError, *, overwrite: bool, no_wake: bool) -> Co
     if no_wake:
         return _no_wake_refusal(err)
     return err
+
+
+def _bytes_written(resp: httpx.Response) -> int | None:
+    """The byte count an upload's answer reports, or ``None`` where it says none.
+
+    Lenient where the rest of this file is strict, and deliberately: the write
+    has already happened, so an answer this client cannot read is "the platform
+    did not say" rather than a failure to raise over a file that landed.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    written = data.get("bytes") if isinstance(data, Mapping) else None
+    if isinstance(written, bool) or not isinstance(written, (int, float)):
+        return None
+    if isinstance(written, float) and not written.is_integer():
+        return None
+    return int(written) if written >= 0 else None
 
 
 def _file_body(data: bytes | str) -> bytes:
@@ -912,6 +933,21 @@ def _guest_not_running(err: BaseException) -> bool:
     return isinstance(err, APIError) and err.status == 400
 
 
+def _secrets_timeout(computer_id: str, timeout: float, observed: bool, fresh: bool) -> str:
+    """What a ``wait_for_secrets`` that ran out of time says, on both handles."""
+    if not observed:
+        return (
+            f"{computer_id} could not be observed within {timeout:g}s, so whether its "
+            "secrets arrived is unknown"
+        )
+    if fresh:
+        return f"{computer_id}'s secrets were still being delivered after {timeout:g}s"
+    return (
+        f"{computer_id} could not be reached for the last part of {timeout:g}s; when it last "
+        "answered its secrets were still being delivered"
+    )
+
+
 def _ride_out(err: MandalaError, deadline: float, poll: float) -> float:
     """How long to sleep past a failed poll — or a re-raise, if it is not one.
 
@@ -1120,6 +1156,60 @@ class ComputerFields:
         if said is _Wire.ABSENT and not self._data.get("secrets"):
             return False
         return None
+
+    @property
+    def secrets_delivering(self) -> bool | None:
+        """Whether values are on their way into this computer's desktop now.
+
+        A computer comes back ``running`` a few seconds before its secrets land,
+        and a command run in between sees them unset. True from a delivering
+        start until the values are applied; also while a reboot inside it, or a
+        replaced file, has them delivered again. :meth:`Computer.wait_for_secrets`
+        waits on it.
+
+        ``False`` on a computer that is not running and after a delivery that
+        failed (:attr:`secrets_error` says why). ``None`` when not reported: a
+        computer with no secrets bound, or a platform that predates the field.
+        """
+        value = self._data.get("secrets_delivering")
+        return value if isinstance(value, bool) else None
+
+    def _secrets_state(self) -> str | MandalaError:
+        """Where this computer's secrets are, as ``wait_for_secrets`` reads it:
+        ``"delivered"``, ``"delivering"``, or the error a wait should raise
+        because no delivery is coming."""
+        if self.secrets_delivering is True:
+            return "delivering"
+        if self.secrets_error:
+            return MandalaError(
+                f"{self.id}'s secrets were not delivered: {self.secrets_error}. The platform "
+                "stopped it; call start() to try again"
+            )
+        bound = self._data.get("secrets")
+        if not isinstance(bound, builtins.list) or not bound:
+            return "delivered"
+        if self.is_building:
+            return "delivering"
+        if self.status != "running":
+            # A start admitted but not yet booted reads stopped or suspended;
+            # its delivery is ahead of it. Nothing admitted is nothing coming.
+            held = self._data.get("running_ram_mb")
+            if isinstance(held, (int, float)) and not isinstance(held, bool) and held > 0:
+                return "delivering"
+            return MandalaError(
+                f"{self.id} is {self.status!r}, and secrets are delivered only as it starts: "
+                "call start()"
+            )
+        if self.secrets_delivering is None:
+            # A platform that predates the field: the receipt names the
+            # delivering start it is for, so one behind the latest is a delivery
+            # still on its way.
+            generation = self.secrets_generation
+            receipt = self.secrets_applied
+            applied = receipt.generation if receipt is not None else -1
+            if generation is not None and generation > 0 and applied < generation:
+                return "delivering"
+        return "delivered"
 
     @property
     def is_suspended(self) -> bool:
@@ -2349,6 +2439,53 @@ class Computer(ComputerFields):
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             time.sleep(min(delay, remaining))
 
+    def wait_for_secrets(self, timeout: float = 180.0, poll: float = 2.0) -> Computer:
+        """Block until the secrets bound to this computer have reached its desktop.
+
+        A computer comes back ``running``, and its guest answers, a few seconds
+        before its secrets land; a command run in between sees them unset. This
+        polls until the platform says nothing is on its way
+        (:attr:`secrets_delivering`), and returns at once for a computer with no
+        secrets bound. :meth:`Computers.launch` calls it for you.
+
+        Always reads the computer again before answering, so it is safe straight
+        after :meth:`start` or :meth:`restart`. On a platform that predates
+        ``secrets_delivering`` it waits for the receipt (:attr:`secrets_applied`)
+        to name the latest delivering start instead.
+
+        Raises :class:`~mandala_computer.MandalaError` rather than waiting out
+        the timeout when no delivery is coming: a delivery that failed (its host
+        stops the computer, and the error carries :attr:`secrets_error`), and a
+        computer that is stopped or suspended with no start under way —
+        :meth:`start` is what delivers its secrets.
+        """
+        check_wait_args(timeout, poll)
+        deadline = time.monotonic() + timeout
+        # No verdict on state read before this call, and the timeout sentence
+        # says whether the last read answered — wait_until_running's rules.
+        observed = False
+        fresh = False
+        while True:
+            remaining = deadline - time.monotonic()
+            delay = poll
+            if remaining > 0:
+                try:
+                    self._refresh(timeout_cap=remaining)
+                    observed = fresh = True
+                except MandalaError as err:
+                    delay = _ride_out(err, deadline, poll)
+                    fresh = False
+            if observed:
+                state = self._secrets_state()
+                if state == "delivered":
+                    return self
+                if isinstance(state, MandalaError):
+                    raise state
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh))
+            time.sleep(min(delay, remaining))
+
     # --- observing ------------------------------------------------------
 
     def screenshot(self, width: int | None = None, *, fresh: bool = False) -> bytes:
@@ -3085,7 +3222,7 @@ class Computer(ComputerFields):
 
     def write_file(
         self, path: str, data: bytes | str, *, overwrite: bool = True, no_wake: bool = False
-    ) -> None:
+    ) -> int | None:
         """Write ``data`` to one file inside the guest, creating it if needed.
 
         A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
@@ -3113,11 +3250,16 @@ class Computer(ComputerFields):
 
         ``no_wake`` is :meth:`read_file`'s: refuse a computer that is not
         running rather than resume it.
+
+        Returns how many bytes the platform says it wrote, or ``None`` if it
+        did not say. Not defaulted to what was sent: that would turn "it did not
+        say" into the claim that everything landed, which is the one thing a
+        caller checks this number to find out.
         """
         body = _file_body(data)
         params = _api.upload_params(path, overwrite, no_wake)
         try:
-            self._t.request(
+            resp = self._t.request(
                 "PUT",
                 _api.files(self.id),
                 params=params,
@@ -3129,6 +3271,7 @@ class Computer(ComputerFields):
             if refusal is err:
                 raise
             raise refusal from None
+        return _bytes_written(resp)
 
     def list_directory(self, path: str) -> GuestDirectory:
         """List one directory inside the guest: names, types and file sizes.
