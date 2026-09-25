@@ -2289,9 +2289,9 @@ with Client() as client:
     print(who.user.email, who.account.name, who.role)
     print(f"confined to {who.workspace.name}" if who.workspace else "account-wide")
 
-    keys = client.api_keys.list()                # newest first; never a raw key
+    keys = client.api_keys.list()  # newest first; never a raw key
     ci = client.api_keys.create(name="ci")
-    vault.put("mandala-ci", ci.key)              # shown ONCE: store it now
+    vault.put("mandala-ci", ci.key)  # shown ONCE: store it now
     client.api_keys.revoke(ci.id)
 ```
 
