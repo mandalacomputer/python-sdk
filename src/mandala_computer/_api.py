@@ -2317,9 +2317,12 @@ def _from_status(err: httpx.HTTPStatusError) -> MandalaError:
         content = response.content
     except httpx.ResponseNotRead:
         content = b""
+    # The raw byte pairs, untouched: decoding a value to text and encoding it
+    # back refuses a header that is not ASCII, and that sent every such refusal
+    # to the fixed fallback — a 429 lost its class and Retry-After.
     headers = [
         (key, value)
-        for key, value in response.headers.items()
+        for key, value in response.headers.raw
         if key.lower() not in _WIRE_ENCODING_HEADERS
     ]
     mapped = _BaseTransport._error(
@@ -2330,7 +2333,7 @@ def _from_status(err: httpx.HTTPStatusError) -> MandalaError:
 
 
 #: Headers about how the body was carried, which no longer describe decoded bytes.
-_WIRE_ENCODING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
+_WIRE_ENCODING_HEADERS = frozenset({b"content-encoding", b"content-length", b"transfer-encoding"})
 
 
 def _scrubbed(err: MandalaError) -> MandalaError:

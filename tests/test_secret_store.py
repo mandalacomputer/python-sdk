@@ -922,3 +922,69 @@ async def test_async_a_sanitizer_that_throws_falls_back_to_a_fixed_error(
     assert str(caught.value) == _api.SECRET_WRITE_FAILED
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert not _holds_value(caught.value)
+
+
+# --- non-ASCII headers on a hooked refusal (OPL-5026 re-review 4) ----------------
+
+#: A header value no ASCII codec will round-trip: Latin-1 bytes on the wire.
+ODD_HEADER = ("X-Note", "caf\xe9".encode("latin-1"))
+
+
+def _odd(status: int, **extra: str) -> httpx.Response:
+    headers = [ODD_HEADER, (b"Content-Type", b"application/json")]
+    headers += [(k.encode(), v.encode()) for k, v in extra.items()]
+    return httpx.Response(status, headers=headers, content=b'{"error": "refused"}')
+
+
+@respx.mock
+def test_set_recovers_from_a_conflict_with_a_non_ascii_header() -> None:
+    http = httpx.Client(event_hooks={"response": [_raise_for_status]})
+    client = mc.Client("gck_test", base_url=BASE, http_client=http)
+    respx.get(f"{BASE}/secrets").mock(
+        side_effect=[
+            httpx.Response(200, json={**LISTING, "secrets": []}),
+            httpx.Response(200, json=LISTING),
+        ]
+    )
+    respx.post(f"{BASE}/secrets").mock(_odd(409))
+    put = respx.put(f"{BASE}/secrets/{ID}").mock(httpx.Response(200, json=SECRET))
+    client.secrets.set("OPENAI_API_KEY", VALUE)
+    assert put.call_count == 1
+
+
+@respx.mock
+async def test_async_set_recovers_from_a_conflict_with_a_non_ascii_header() -> None:
+    http = httpx.AsyncClient(event_hooks={"response": [_araise_for_status]})
+    client = mc.AsyncClient("gck_test", base_url=BASE, http_client=http)
+    respx.get(f"{BASE}/secrets").mock(
+        side_effect=[
+            httpx.Response(200, json={**LISTING, "secrets": []}),
+            httpx.Response(200, json=LISTING),
+        ]
+    )
+    respx.post(f"{BASE}/secrets").mock(_odd(409))
+    put = respx.put(f"{BASE}/secrets/{ID}").mock(httpx.Response(200, json=SECRET))
+    await client.secrets.set("OPENAI_API_KEY", VALUE)
+    assert put.call_count == 1
+
+
+@respx.mock
+def test_a_rate_limit_with_a_non_ascii_header_stays_a_rate_limit() -> None:
+    http = httpx.Client(event_hooks={"response": [_raise_for_status]})
+    client = mc.Client("gck_test", base_url=BASE, http_client=http)
+    respx.post(f"{BASE}/secrets").mock(_odd(429, **{"Retry-After": "7"}))
+    with pytest.raises(mc.RateLimitError) as caught:
+        client.secrets.create("A", VALUE)
+    assert caught.value.retry_after == 7.0
+    assert caught.value.__context__ is None and not _holds_value(caught.value)
+
+
+@respx.mock
+async def test_async_a_rate_limit_with_a_non_ascii_header_stays_a_rate_limit() -> None:
+    http = httpx.AsyncClient(event_hooks={"response": [_araise_for_status]})
+    client = mc.AsyncClient("gck_test", base_url=BASE, http_client=http)
+    respx.put(f"{BASE}/secrets/{ID}").mock(_odd(429, **{"Retry-After": "7"}))
+    with pytest.raises(mc.RateLimitError) as caught:
+        await client.secrets.replace(ID, VALUE, revision_id=REV)
+    assert caught.value.retry_after == 7.0
+    assert caught.value.__context__ is None and not _holds_value(caught.value)
