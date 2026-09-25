@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ._exceptions import MandalaError
+from ._exceptions import APIError, MandalaError
 
 T = TypeVar("T")
 
@@ -2197,7 +2197,7 @@ def sealed(call: Callable[[], T]) -> T:
     try:
         return call()
     except Exception as err:  # noqa: BLE001 — exhaustive by design; see above
-        safe = _sanitized(err)
+        safe = _total(err)
     raise safe
 
 
@@ -2207,8 +2207,47 @@ async def asealed(call: Callable[[], Awaitable[T]]) -> T:
     try:
         return await call()
     except Exception as err:  # noqa: BLE001 — exhaustive by design; see sealed
-        safe = _sanitized(err)
+        safe = _total(err)
     raise safe
+
+
+#: What a secret write raises when even sanitizing its failure failed.
+SECRET_WRITE_FAILED = (
+    "a secret write failed, and its details are withheld because they may hold the value"
+)
+
+
+def _total(err: Exception) -> Exception:
+    """:func:`_sanitized`, which cannot fail.
+
+    Sanitizing is code, and code can raise — a response rebuilt from a body
+    already decoded once was decoded again, and the error that raised was
+    chained to the original, request and all. So a failure here is caught and
+    answered with a fixed exception built from nothing but the status and the
+    method, read defensively. This returns rather than raises: the caller
+    raises the result outside every ``except`` block, so no path chains to the
+    original.
+    """
+    try:
+        return _sanitized(err)
+    except Exception:  # noqa: BLE001, S110 — the fallback below is the answer
+        pass
+    status: int | None = None
+    method: str | None = None
+    try:
+        if isinstance(err, httpx.HTTPStatusError):
+            status = int(err.response.status_code)
+            method = str(err.request.method)
+        elif isinstance(err, MandalaError):
+            found = getattr(err, "status", None)
+            status = found if type(found) is int else None
+            said = getattr(err, "method", None)
+            method = said if type(said) is str else None
+    except Exception:  # noqa: BLE001, S110 — status and method are best-effort
+        pass
+    if status is not None:
+        return APIError(SECRET_WRITE_FAILED, status=status, method=method)
+    return MandalaError(SECRET_WRITE_FAILED)
 
 
 def _sanitized(err: Exception) -> Exception:
@@ -2265,6 +2304,10 @@ def _from_status(err: httpx.HTTPStatusError) -> MandalaError:
     Built from a new response carrying only the status, the headers and the
     body the platform sent — no request — through the same mapping every
     other failure goes through.
+
+    ``response.content`` is already decoded, so the headers that describe the
+    wire encoding are left off: a ``Content-Encoding: gzip`` beside decoded
+    bytes makes httpx decode them a second time, and fail.
     """
     from ._client import _BaseTransport  # a cycle at import time; not at call time
 
@@ -2274,11 +2317,20 @@ def _from_status(err: httpx.HTTPStatusError) -> MandalaError:
         content = response.content
     except httpx.ResponseNotRead:
         content = b""
+    headers = [
+        (key, value)
+        for key, value in response.headers.items()
+        if key.lower() not in _WIRE_ENCODING_HEADERS
+    ]
     mapped = _BaseTransport._error(
-        httpx.Response(response.status_code, headers=response.headers, content=content)
+        httpx.Response(response.status_code, headers=headers, content=content)
     )
     mapped.method = method
     return _scrubbed(mapped)
+
+
+#: Headers about how the body was carried, which no longer describe decoded bytes.
+_WIRE_ENCODING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
 
 def _scrubbed(err: MandalaError) -> MandalaError:

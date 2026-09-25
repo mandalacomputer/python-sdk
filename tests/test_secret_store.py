@@ -822,3 +822,103 @@ def test_an_unbuildable_exception_becomes_a_mandala_error_naming_it() -> None:
     with pytest.raises(mc.MandalaError, match="NeedsTwo") as caught:
         _api.sealed(fail)
     assert not _holds_value(caught.value)
+
+
+# --- a sanitizer that cannot fail (OPL-5026 re-review 3) -------------------------
+
+
+def _read_then_raise(response: httpx.Response) -> None:
+    response.read()
+    response.raise_for_status()
+
+
+async def _aread_then_raise(response: httpx.Response) -> None:
+    await response.aread()
+    response.raise_for_status()
+
+
+def _gzipped_store(status: int) -> None:
+    import gzip
+
+    packed = gzip.compress(json.dumps({"error": "refused", "reason": "contention"}).encode())
+    answer = httpx.Response(
+        status,
+        content=packed,
+        headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+    )
+    respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json=LISTING))
+    respx.post(f"{BASE}/secrets").mock(answer)
+    respx.put(f"{BASE}/secrets/{ID}").mock(answer)
+
+
+@pytest.mark.parametrize(("status", "cls"), [(409, mc.ConflictError), (500, mc.APIError)])
+@pytest.mark.parametrize("write", WRITES)
+@respx.mock
+def test_a_gzipped_refusal_read_by_a_hook_leaks_no_value(
+    status: int, cls: type[Exception], write: Any
+) -> None:
+    """The body is already decoded; decoding it again used to fail mid-sanitize."""
+    http = httpx.Client(event_hooks={"response": [_read_then_raise]})
+    client = mc.Client("gck_test", base_url=BASE, http_client=http)
+    _gzipped_store(status)
+    with pytest.raises(cls) as caught:
+        write(client)
+    err = caught.value
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+    assert isinstance(err, mc.APIError) and err.status == status
+
+
+@pytest.mark.parametrize(("status", "cls"), [(409, mc.ConflictError), (500, mc.APIError)])
+@pytest.mark.parametrize("write", WRITES)
+@respx.mock
+async def test_async_a_gzipped_refusal_read_by_a_hook_leaks_no_value(
+    status: int, cls: type[Exception], write: Any
+) -> None:
+    http = httpx.AsyncClient(event_hooks={"response": [_aread_then_raise]})
+    client = mc.AsyncClient("gck_test", base_url=BASE, http_client=http)
+    _gzipped_store(status)
+    with pytest.raises(cls) as caught:
+        await write(client)
+    err = caught.value
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+
+
+@respx.mock
+def test_a_sanitizer_that_throws_falls_back_to_a_fixed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(err: Exception) -> Exception:
+        raise RuntimeError(f"sanitizer broke on {VALUE}")
+
+    monkeypatch.setattr(_api, "_from_status", broken)
+    monkeypatch.setattr(_api, "_scrubbed", broken)
+    http = httpx.Client(event_hooks={"response": [_raise_for_status]})
+    client = mc.Client("gck_test", base_url=BASE, http_client=http)
+    respx.post(f"{BASE}/secrets").mock(httpx.Response(409, json={"error": "taken"}))
+    with pytest.raises(mc.APIError) as caught:
+        client.secrets.create("A", VALUE)
+    err = caught.value
+    assert str(err) == _api.SECRET_WRITE_FAILED
+    assert (err.status, err.method) == (409, "POST")
+    assert err.__cause__ is None and err.__context__ is None
+    assert not _holds_value(err)
+
+
+async def test_async_a_sanitizer_that_throws_falls_back_to_a_fixed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(err: Exception) -> Exception:
+        raise RuntimeError(VALUE)
+
+    monkeypatch.setattr(_api, "_sanitized", broken)
+
+    async def fail() -> None:
+        raise HeldRequest(VALUE)
+
+    with pytest.raises(mc.MandalaError) as caught:
+        await _api.asealed(fail)
+    assert str(caught.value) == _api.SECRET_WRITE_FAILED
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert not _holds_value(caught.value)
