@@ -753,6 +753,8 @@ c.cursor_position()  # (x, y), or None before anything has placed the pointer
 png = c.screenshot()  # full-resolution PNG
 jpg = c.screenshot(width=320)  # downscaled JPEG — cheap enough to poll
 now = c.screenshot(fresh=True)  # skip the cache; what a drive loop wants
+# A crop in screen pixels, halved, as a JPEG: the cheaper frame to hand a model
+corner = c.screenshot(fresh=True, region=(0, 0, 640, 400), scale=0.5, format="jpeg", quality=60)
 
 res = c.exec("ls /tmp")  # native shell: bash on Linux, cmd.exe on Windows
 res = c.exec("make", timeout=90, cwd="/root/src", env={"CC": "clang"})
@@ -785,6 +787,20 @@ button is held, so pair them in `try`/`finally`.
 right trade for a thumbnail and the wrong one for a loop: a model shown the
 screen from before its own click concludes the click missed and clicks again,
 and the second one lands on whatever the first one opened.
+
+`region`, `scale`, `format` and `quality` shape the picture: a crop, a smaller
+image and a cheaper encoding, applied in that order to the same capture.
+`region` is `(x, y, width, height)` in screen pixels, before any scaling, and
+has to lie inside the screen (one past an edge is a 400 naming the screen size,
+not a clipped picture). `scale` is greater than 0 and at most 1, and is not
+given with `width`. `format` is `"png"` (the default) or `"jpeg"` (the default
+with a width), and `quality` is 1 to 100 for a JPEG only. The value checks
+raise `ValueError` before anything is sent. A cropped or scaled picture is in
+its own pixel space: to click on something in it, divide its position by the
+scale and add the region's `x` and `y` — (100, 50) in `corner` above is
+(200, 100) on the screen. A suspended computer has only its saved JPEG and
+cannot shape it: a crop, a scale, `format="png"` or a quality raises
+`ConflictError` with `reason == "unavailable"`, which does not clear by waiting.
 
 A non-zero exit is returned, not raised — check `res.ok`.
 

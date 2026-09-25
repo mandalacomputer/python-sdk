@@ -92,13 +92,6 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
-    # OPL-5051: `format` (png or jpeg), `quality`, `region` (x,y,w,h) and
-    # `scale` shape the screenshot. Listed to stay in step with the surface;
-    # not yet sent.
-    "GET computers/:id/screenshot  query:format",
-    "GET computers/:id/screenshot  query:quality",
-    "GET computers/:id/screenshot  query:region",
-    "GET computers/:id/screenshot  query:scale",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
@@ -799,6 +792,7 @@ def exercise_everything(client: mc.Client) -> None:
     c.screenshot()
     c.screenshot(width=320)
     c.screenshot(fresh=True)
+    c.screenshot(region=(0, 0, 640, 400), scale=0.5, format="jpeg", quality=60)
     c.move(1, 2)
     c.click(1, 2)
     c.right_click(1, 2)
@@ -1055,6 +1049,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.screenshot()
     await c.screenshot(width=320)
     await c.screenshot(fresh=True)
+    await c.screenshot(region=(0, 0, 640, 400), scale=0.5, format="jpeg", quality=60)
     await c.move(1, 2)
     await c.click(1, 2)
     await c.right_click(1, 2)

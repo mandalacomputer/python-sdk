@@ -218,6 +218,25 @@ async def test_screenshot_returns_bytes(client: mc.AsyncClient) -> None:
 
 
 @respx.mock
+async def test_screenshot_shaping_becomes_query_params(client: mc.AsyncClient) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(200, content=b"jpg", headers={"Content-Type": "image/jpeg"})
+    )
+    await mc.AsyncComputer(client._t, COMPUTER).screenshot(
+        region=(0, 0, 640, 400), scale=0.25, format="jpg", quality=30
+    )
+    assert dict(route.calls.last.request.url.params) == {
+        "region": "0,0,640,400",
+        "scale": "0.25",
+        "format": "jpg",
+        "quality": "30",
+    }
+    with pytest.raises(ValueError, match="JPEG only"):
+        await mc.AsyncComputer(client._t, COMPUTER).screenshot(quality=30)
+    assert route.call_count == 1
+
+
+@respx.mock
 async def test_exec_nonzero_exit_is_returned_not_raised(client: mc.AsyncClient) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         httpx.Response(
