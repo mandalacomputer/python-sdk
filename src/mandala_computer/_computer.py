@@ -1185,12 +1185,15 @@ class ComputerFields:
         value = self._data.get("secrets_delivering")
         return value if isinstance(value, bool) else None
 
-    def _secrets_state(self, expect_secrets: bool = False) -> str | MandalaError:
+    def _secrets_state(
+        self, expect_secrets: bool = False, start_failed: str = ""
+    ) -> str | MandalaError:
         """Where this computer's secrets are, as ``wait_for_secrets`` reads it:
         ``"delivered"``, ``"delivering"``, ``"unreported"`` (a read that left
         the bindings out when the caller knows some are bound: no answer either
         way, so it is waited past), or the error a wait should raise because no
-        delivery is coming."""
+        delivery is coming. ``start_failed`` is why a create's first start
+        failed, if it did."""
         if self.secrets_delivering is True:
             return "delivering"
         if self.secrets_error:
@@ -1202,24 +1205,39 @@ class ComputerFields:
         # The platform leaves the whole group out on a computer that holds none
         # — and also on a record served without its host's answer. A caller
         # that knows secrets are bound reads that second case as silence.
-        if bound is None and expect_secrets:
-            return "unreported"
-        if not isinstance(bound, builtins.list) or not bound:
+        unreported = bound is None and expect_secrets
+        if not unreported and (not isinstance(bound, builtins.list) or not bound):
             return "delivered"
         if self.is_building:
-            return "delivering"
+            return "unreported" if unreported else "delivering"
         if self.status != "running":
+            # Both refusals come before the silence about bindings is waited
+            # past: whatever is bound, a machine nobody is starting delivers
+            # nothing, and a read that says so outright is an answer.
+            #
+            # A known failed boot first, on wait_until_running's weaker
+            # evidence: the response that carries `start_error` does not report
+            # the pool, so requiring an explicit zero would poll out the budget
+            # and lose the one sentence that says why. Only a reservation
+            # overturns it.
+            if start_failed and self.status == "stopped" and not self._start_admitted():
+                return MandalaError(
+                    f"{self.id} is stopped after it failed to start, so its secrets were not "
+                    f"delivered: {start_failed}. Call start() to try again"
+                )
             # A start admitted but not yet booted reads stopped or suspended;
             # its delivery is ahead of it. Only the platform saying it has
             # admitted nothing is nothing coming: a host that did not say is
             # waited on, as every other wait here reads that silence (see
             # _nothing_admitted).
-            if not self._nothing_admitted():
-                return "delivering"
-            return MandalaError(
-                f"{self.id} is {self.status!r}, and secrets are delivered only as it starts: "
-                "call start()"
-            )
+            if self._nothing_admitted():
+                return MandalaError(
+                    f"{self.id} is {self.status!r}, and secrets are delivered only as it "
+                    "starts: call start()"
+                )
+            return "unreported" if unreported else "delivering"
+        if unreported:
+            return "unreported"
         if self.secrets_delivering is None:
             # A platform that predates the field: the receipt names the
             # delivering start it is for, so one behind the latest is a delivery
@@ -1322,6 +1340,17 @@ class ComputerFields:
         """
         held = self._data.get("running_ram_mb")
         return isinstance(held, (int, float)) and not isinstance(held, bool) and held == 0
+
+    def _start_admitted(self) -> bool:
+        """The other end of :meth:`_nothing_admitted`: the platform is holding
+        memory for this computer, so something IS on its way up.
+
+        Not ``not _nothing_admitted()``, and the difference is the absent case:
+        a host that did not answer has neither admitted a start nor said it
+        will not, so both questions answer it no.
+        """
+        held = self._data.get("running_ram_mb")
+        return isinstance(held, (int, float)) and not isinstance(held, bool) and held > 0
 
     def _not_starting(self) -> MandalaError | None:
         """The states that will not become "running" without another call.
@@ -1858,6 +1887,15 @@ class Computer(ComputerFields):
         that session or throw it away. Start it or stop it first.
 
         Desktop credentials do not survive this — see :attr:`vnc`.
+
+        A computer with secrets bound has them delivered again as it comes
+        back, and reads ``running`` a few seconds before they land: a command
+        run in between sees them unset. :meth:`wait_for_secrets` after this
+        waits for them on a platform that reports that redelivery, as
+        :attr:`secrets_delivering` true until they are applied. On one that
+        does not, ``secrets_delivering`` reads false from the moment the restart
+        answers and the wait returns at once, so a command that must not run
+        without its secrets checks for them itself.
         """
         self._t.request("POST", _api.computer_action(self.id, "restart"))
         return self.refresh()
@@ -2477,10 +2515,12 @@ class Computer(ComputerFields):
 
         Raises :class:`~mandala_computer.MandalaError` rather than waiting out
         the timeout when no delivery is coming: a delivery that failed (its host
-        stops the computer, and the error carries :attr:`secrets_error`), and a
+        stops the computer, and the error carries :attr:`secrets_error`), a
         computer that is stopped or suspended while the platform says it has
-        admitted no start — :meth:`start` is what delivers its secrets. A host
-        that does not say whether a start is under way is waited on.
+        admitted no start — :meth:`start` is what delivers its secrets — and a
+        create's computer that is stopped because its first start failed
+        (:attr:`start_error`). A host that does not say whether a start is under
+        way is waited on.
 
         ``expect_secrets`` is for a caller that knows secrets are bound, such as
         one that just created the computer with them. A read that leaves the
@@ -2493,6 +2533,13 @@ class Computer(ComputerFields):
         # says whether the last read answered — wait_until_running's rules.
         observed = False
         fresh = False
+        # A create's failed first start, kept past the refresh that clears it:
+        # the create's answer is the one response that carries both
+        # `start_error` and no `running_ram_mb`, and a stopped read with the
+        # pool left out is otherwise waited on to the end of the budget.
+        # Retired the moment a reservation is seen, since that is a start
+        # somebody made after the one that failed.
+        start_failed = self.start_error
         state: str | MandalaError = "delivering"
         while True:
             remaining = deadline - time.monotonic()
@@ -2501,11 +2548,13 @@ class Computer(ComputerFields):
                 try:
                     self._refresh(timeout_cap=remaining)
                     observed = fresh = True
+                    if self._start_admitted():
+                        start_failed = ""
                 except MandalaError as err:
                     delay = _ride_out(err, deadline, poll)
                     fresh = False
             if observed:
-                state = self._secrets_state(expect_secrets)
+                state = self._secrets_state(expect_secrets, self.start_error or start_failed)
                 if state == "delivered":
                     return self
                 if isinstance(state, MandalaError):
