@@ -83,6 +83,10 @@ UNIMPLEMENTED = {
     ("GET", "workspaces"),
     ("GET", "workspaces/:id"),
     ("GET", "workspaces/:id/members"),
+    # Lifecycle operations, read only (OPL-5055). Listed to stay in step with
+    # the surface; no SDK method yet.
+    ("GET", "operations"),
+    ("GET", "operations/:id"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -91,6 +95,10 @@ UNIMPLEMENTED = {
 # platform, so without this the difference between "documented" and "sent" would
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
+#
+# Parameters of a route in UNIMPLEMENTED are not listed, the TypeScript SDK's
+# rule: a route nobody calls sends none of its parameters, and that route's own
+# line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
@@ -105,14 +113,10 @@ UNIMPLEMENTED_PARAMETERS = {
     "POST computers/:id/input  body:button",
     # `amount` is sent instead. Same value, two names.
     "POST computers/:id/input  body:scroll_amount",
-    # The OpenAI-shaped door, whole. See UNIMPLEMENTED for why it stays shut.
-    "POST chat/completions  header:X-Model-Key",
-    "POST chat/completions  body:computer_id",
-    "POST chat/completions  body:messages",
-    "POST chat/completions  body:model",
-    "POST chat/completions  body:max_steps",
-    "POST chat/completions  body:stream",
 }
+
+#: UNIMPLEMENTED in the spelling PARAMETERS is keyed by.
+UNIMPLEMENTED_WHERE = {f"{method} {pattern}" for method, pattern in UNIMPLEMENTED}
 
 #: Header names the platform documents anywhere — the ones worth looking for on
 #: a recorded request. Every call also carries an Authorization and an Accept
@@ -1286,12 +1290,31 @@ def test_every_documented_parameter_is_sent_or_pinned_as_unsent(client: mc.Clien
         f"{name} on {where}"
         for where, names in PARAMETERS.items()
         for name in names - sent.get(where, set())
-        if f"{where}  {name}" not in UNIMPLEMENTED_PARAMETERS
+        if where not in UNIMPLEMENTED_WHERE and f"{where}  {name}" not in UNIMPLEMENTED_PARAMETERS
     }
     assert not unsent, (
         f"documented parameters this SDK never sends: {sorted(unsent)}. "
         "Send them, or pin them in UNIMPLEMENTED_PARAMETERS with the reason."
     )
+
+
+def test_every_unsent_parameter_pin_is_a_documented_parameter_of_a_called_route() -> None:
+    """UNIMPLEMENTED_PARAMETERS holds only what its rule says it holds.
+
+    A pin for a route in UNIMPLEMENTED is a second place to edit when the route
+    gains a method, and one that goes stale silently when it does; a pin for a
+    parameter the platform no longer documents is a gap nobody can close.
+    """
+    misplaced = sorted(
+        pin for pin in UNIMPLEMENTED_PARAMETERS if pin.split("  ")[0] in UNIMPLEMENTED_WHERE
+    )
+    assert not misplaced, f"parameters of routes already in UNIMPLEMENTED: {misplaced}"
+    stale = sorted(
+        pin
+        for pin in UNIMPLEMENTED_PARAMETERS
+        if pin.split("  ")[1] not in PARAMETERS.get(pin.split("  ")[0], set())
+    )
+    assert not stale, f"pinned parameters the platform does not document: {stale}"
 
 
 @respx.mock
