@@ -73,7 +73,7 @@ import subprocess
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 from types import FrameType
@@ -274,6 +274,66 @@ def _takes(known: Collection[str], word: str) -> bool:
     return word.startswith("--") and sum(k.startswith(word) for k in known) == 1
 
 
+def _misplaced(known: Mapping[str, argparse.Action], word: str) -> str | None:
+    """The name of the command's own option that ``word``, typed before the
+    command's name, spells: a name the command declares, or, for one that
+    takes a value, that name joined to its value with ``=``
+    (``--workspace=ws_1``). None for any other word. Only the name is
+    returned, so saying where the option belongs never repeats its value."""
+    if word in known:
+        return word
+    name, joined, _ = word.partition("=")
+    action = known.get(name) if joined else None
+    return name if action is not None and action.nargs != 0 else None
+
+
+def _subcommands(
+    parser: argparse.ArgumentParser,
+) -> argparse._SubParsersAction[argparse.ArgumentParser] | None:
+    """The action that reads ``parser``'s subcommand, or None for a command."""
+    return next((a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None)
+
+
+def _without_early_values(parser: argparse.ArgumentParser, words: Sequence[str]) -> list[str]:
+    """``words`` less the value of each option typed, with its value as the
+    next word, before the name of the command that declares it:
+    ``--workspace ws_1 secrets list``.
+
+    No parser above a command declares that option, so argparse leaves it over
+    and reads its value as the command's name instead, failing on it as an
+    invalid choice that quotes the value. With the value dropped, the option
+    alone is left over, and :func:`_unexpected` says it belongs after the
+    command, naming nothing but the option. The option is still left over, so
+    the command never runs on what remains.
+
+    A word is dropped only once the command's whole name has been read after
+    it, since only then is it known that the option takes a value, and only
+    when it is not itself a subcommand's name at the point it was typed.
+    """
+    cut = words.index("--") if "--" in words else len(words)
+    # (an option no parser declares where it was typed, where its value is)
+    values: list[tuple[str, int]] = []
+    for at, word in enumerate(words[:cut]):
+        subcommands = _subcommands(parser)
+        if subcommands is None:
+            break
+        if word in subcommands.choices:
+            parser = subcommands.choices[word]
+        elif (
+            word.startswith("-")
+            and not _takes(parser._option_string_actions, word)
+            and at + 1 < cut
+            and not words[at + 1].startswith("-")
+            and words[at + 1] not in subcommands.choices
+        ):
+            values.append((word, at + 1))
+    if _subcommands(parser) is not None:
+        return list(words)
+    known = parser._option_string_actions
+    dropped = {at for option, at in values if option in known and known[option].nargs != 0}
+    return [word for at, word in enumerate(words) if at not in dropped]
+
+
 #: argparse's message for a word that is none of a subcommand's names. The
 #: list it ends with is the declared names; argparse puts it after the word
 #: typed, so a parenthesis in that word cannot stand in for it.
@@ -287,7 +347,7 @@ def _unexpected(
     words: Sequence[str],
     *,
     command: Sequence[str] = (),
-    known: Collection[str] = (),
+    known: Mapping[str, argparse.Action] | None = None,
     quotes: bool = True,
     hint: str = "",
     prog: str = PROG,
@@ -308,16 +368,20 @@ def _unexpected(
     - Before the ``command``'s name, only the parsers above it read, and none
       of them declares what the command does. An option the command ``known``
       declares, typed there, was simply typed too early — ``--json secrets
-      list`` — and is said so. Naming it quotes nothing but a declared name.
+      list``, ``--workspace=ws_1 secrets list`` — and is said so. Naming it
+      quotes nothing but a declared name, never the value joined to it. (A
+      value typed as the next word, ``--workspace ws_1``, never gets here:
+      :func:`_without_early_values` drops it before parsing.)
     - Between the name and the first ``--``, a spelling the command declares
       was taken by it, so one reported is not that word.
     - Past a bare ``--`` a word is an operand however it is spelled — that is
       how a value starting with a dash is passed — so it is counted.
     """
+    known = known or {}
     cut = words.index("--") if "--" in words else len(words)
     start = _command_end(words[:cut], command)
     early, late = words[:start], words[start:cut]
-    misplaced = Counter(w for w in early if w in known)
+    misplaced = Counter(w for w in early if _misplaced(known, w))
     options = Counter(w for w in early if _OPTION_NAME.fullmatch(w) and w not in known)
     options.update(w for w in late if _OPTION_NAME.fullmatch(w) and not _takes(known, w))
     rest = list(extra)
@@ -327,7 +391,7 @@ def _unexpected(
     for word in rest:
         if misplaced[word]:
             misplaced[word] -= 1
-            early_words.append(word)
+            early_words.append(_misplaced(known, word) or word)
         elif options[word]:
             options[word] -= 1
             named.append(word)
@@ -406,9 +470,7 @@ def _leaf(parser: _Parser, args: argparse.Namespace) -> tuple[_Parser, list[str]
     chosen, and the words of that command's name (``["secrets", "list"]``)."""
     command: list[str] = []
     while True:
-        subcommands = next(
-            (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None
-        )
+        subcommands = _subcommands(parser)
         name = (getattr(args, subcommands.dest, None) or "") if subcommands else ""
         chosen = subcommands.choices.get(name) if subcommands else None
         if not isinstance(chosen, _Parser):
@@ -2203,6 +2265,7 @@ def main(argv: list[str] | None = None) -> int:
         as_json = _asks_for_json(words)
         _Parser.json_errors = as_json
         parser = _parser()
+        words = _without_early_values(parser, words)
         args, extra = parser.parse_known_args(words)
         # Past parsing, the command's own flag decides: one that has no --json
         # was never going to answer in JSON.

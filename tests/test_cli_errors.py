@@ -185,7 +185,10 @@ def test_an_unknown_verb_under_secrets_is_not_repeated(
         (["--json", "secrets", "list"], "secrets list"),
         (["secrets", "--json", "list"], "secrets list"),
         (["secrets", "--json", "set", "A"], "secrets set"),
-        (["--workspace", "secrets", "list"], "secrets list"),
+        (["--workspace", "ws_1", "secrets", "list"], "secrets list"),
+        (["--workspace=ws_1", "secrets", "list"], "secrets list"),
+        (["secrets", "--workspace", "ws_1", "list"], "secrets list"),
+        (["secrets", "--workspace=ws_1", "list"], "secrets list"),
     ],
 )
 def test_an_option_typed_before_its_command_is_said_to_be(
@@ -198,10 +201,54 @@ def test_an_option_typed_before_its_command_is_said_to_be(
     assert caught.value.code == 2
     out, err = capsys.readouterr()
     assert "too many" not in out + err
-    assert f"{argv[0] if argv[0].startswith('-') else argv[1]} must come after the command, " in (
-        out + err
-    )
+    option = (argv[0] if argv[0].startswith("-") else argv[1]).split("=")[0]
+    assert f"{option} must come after the command, " in out + err
     assert f"mandala-py {command}" in out + err
+    # The value typed with it is neither quoted nor read as the command.
+    assert "ws_1" not in out + err
+    assert "invalid choice" not in out + err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--workspace", SECRET, "secrets", "list"],
+        [f"--workspace={SECRET}", "secrets", "list"],
+        ["--json", "--workspace", SECRET, "secrets", "list"],
+    ],
+)
+def test_an_option_typed_before_its_command_names_only_itself(
+    capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(argv)
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert SECRET not in out + err
+    early = " ".join(w.split("=")[0] for w in argv if w.startswith("--"))
+    message = f"{early} must come after the command, mandala-py secrets list"
+    if "--json" in argv:
+        assert json.loads(err)["error"]["message"] == message
+    else:
+        assert err.startswith(f"mandala-py secrets list: error: {message}\n")
+
+
+def test_a_value_is_dropped_only_for_an_option_the_command_declares_with_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --json takes no value, so the word after it is still read as a command
+    # name, and argparse says it is none.
+    with pytest.raises(SystemExit):
+        _cli.main(["--json", "nosuch", "secrets", "list"])
+    assert "invalid choice" in json.dumps(failure(capsys))
+    # Nor is a value dropped when no command is named after it.
+    with pytest.raises(SystemExit):
+        _cli.main(["--workspace", "ws_1"])
+    assert "invalid choice" in capsys.readouterr().err
+    # A flag joined to a value is not one the command would take there either.
+    with pytest.raises(SystemExit):
+        _cli.main(["--json=yes", "webhooks", "list"])
+    assert "must come after" not in capsys.readouterr().err
 
 
 def test_an_option_before_the_command_is_still_not_named_under_secrets(
