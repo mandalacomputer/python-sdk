@@ -192,6 +192,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:start",
         "body:secrets",
         "body:browser_proxy",
+        "body:egress_proxy",
     },
     "GET computers/:id": set(),
     "PATCH computers/:id": {
@@ -201,6 +202,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:disk_gb",
         "body:idle_suspend_min",
         "body:browser_proxy",
+        "body:egress_proxy",
     },
     "DELETE computers/:id": {"query:snapshots", "query:expect"},
     "POST computers/:id/start": {"query:resume_only"},
