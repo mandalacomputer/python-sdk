@@ -397,7 +397,11 @@ class Computers:
             # policy is on disk, and a browser opened in between goes out
             # directly.
             if browser_proxy is not None or computer.raw.get("browser_proxy") is not None:
-                computer.wait_for_browser_proxy(timeout=remaining(), poll=poll)
+                # Told one is set, as the secrets wait is, so a read that leaves
+                # the setting out is not taken for "none" and returned on.
+                computer.wait_for_browser_proxy(
+                    timeout=remaining(), poll=poll, expect_browser_proxy=True
+                )
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.

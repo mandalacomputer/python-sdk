@@ -2271,14 +2271,38 @@ def _ssh_parsers(sub: Any) -> None:
 
 
 def _bypass_list(values: Sequence[str] | None) -> list[str] | None:
-    """A bypass list as typed: each value comma-separated, repeatable, blanks
-    dropped, so ``--bypass a.com,b.com`` and ``--bypass a.com --bypass b.com``
-    say the same thing. ``None`` when none was given, so the setting is sent
-    without one. Nothing else is checked here: which entries are valid is the
-    platform's rule, and its refusal names the entry."""
+    """A bypass list as typed: each value comma-separated and repeatable, so
+    ``--bypass a.com,b.com`` and ``--bypass a.com --bypass b.com`` say the
+    same thing. ``None`` when none was given, so the setting is sent without
+    one. An empty entry is refused, as the SDK refuses one: ``--bypass ''``
+    would otherwise send an empty list and look like it had said something.
+    Nothing else is checked here: which entries are valid is the platform's
+    rule, and its refusal names the entry."""
     if values is None:
         return None
-    return [e.strip() for v in values for e in v.split(",") if e.strip()]
+    entries = [e.strip() for v in values for e in v.split(",")]
+    if not all(entries):
+        _die("--bypass has an empty entry; name each host, comma-separated", "invalid_arguments")
+    return entries
+
+
+def _wait_for_proxy(c: Computer) -> None:
+    """``--wait``: until the computer's browsers have the change.
+
+    A computer that is not running and that no start is under way for runs no
+    browser, and is given the setting as it starts; the change is stored. That
+    is said rather than reported as a failure of a change that was made, and
+    rather than waited on until a start nobody asked for. Read first, so the
+    answer is about the computer now and not the PATCH's reply."""
+    c.refresh()
+    running_ram = c.running_ram_mb
+    if c.status in ("stopped", "suspended") and not (running_ram is not None and running_ram > 0):
+        print(
+            f"{c.name or c.id} is {c.status}: the change is stored and applied as it starts",
+            file=sys.stderr,
+        )
+        return
+    c.wait_for_browser_proxy()
 
 
 def _proxy_result(args: argparse.Namespace, c: Computer) -> int:
@@ -2323,7 +2347,7 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
     with _client() as client:
         c = _resolve(client, args.target).set_browser_proxy(proxy)
         if args.wait:
-            c.wait_for_browser_proxy()
+            _wait_for_proxy(c)
     return _proxy_result(args, c)
 
 
@@ -2331,7 +2355,7 @@ def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
     with _client() as client:
         c = _resolve(client, args.target).set_browser_proxy(None)
         if args.wait:
-            c.wait_for_browser_proxy()
+            _wait_for_proxy(c)
     return _proxy_result(args, c)
 
 
@@ -2354,7 +2378,9 @@ def _browser_proxy_parser(sub: Any) -> None:
         help="hosts the browsers reach directly, comma-separated; repeat for more",
     )
     put.add_argument(
-        "--wait", action="store_true", help="return once the computer's browsers have it"
+        "--wait",
+        action="store_true",
+        help="return once the computer's browsers have it (a stopped one gets it as it starts)",
     )
     put.add_argument("--json", action="store_true", help="the setting as JSON")
     put.set_defaults(fn=_cmd_browser_proxy_set)
@@ -2363,7 +2389,9 @@ def _browser_proxy_parser(sub: Any) -> None:
     )
     clear.add_argument("target", metavar="computer", help="computer name or id")
     clear.add_argument(
-        "--wait", action="store_true", help="return once the computer's browsers no longer use it"
+        "--wait",
+        action="store_true",
+        help="return once the computer's browsers no longer use it (a stopped one: as it starts)",
     )
     clear.add_argument("--json", action="store_true", help="the setting as JSON")
     clear.set_defaults(fn=_cmd_browser_proxy_clear)

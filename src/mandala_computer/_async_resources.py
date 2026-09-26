@@ -369,7 +369,10 @@ class AsyncComputers:
             # policy is on disk, and a browser opened in between goes out
             # directly.
             if browser_proxy is not None or computer.raw.get("browser_proxy") is not None:
-                await computer.wait_for_browser_proxy(timeout=remaining(), poll=poll)
+                # Told one is set, as the secrets wait is: see the sync twin.
+                await computer.wait_for_browser_proxy(
+                    timeout=remaining(), poll=poll, expect_browser_proxy=True
+                )
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.

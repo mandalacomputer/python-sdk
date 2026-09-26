@@ -16,12 +16,16 @@ This is the summary you read to decide whether to upgrade.
   `computer.set_browser_proxy(proxy)` where `None` removes it (sync and
   async); `computer.browser_proxy` (a `BrowserProxy`) and
   `computer.browser_proxy_pending` read it back, and
-  `computer.wait_for_browser_proxy()` waits until the guest has it. `launch()`
-  waits for it when the create carried one. Which proxies are accepted is the
-  platform's rule, so a refused value is its 400, not a check here. The CLI
-  takes `mandala-py browser-proxy get | set COMPUTER URL [--bypass LIST]
-  [--wait] | clear COMPUTER [--wait]`. New exports: `BrowserProxy` and
-  `BrowserProxyArgs`.
+  `computer.wait_for_browser_proxy()` waits until the guest has it (its
+  `expect_browser_proxy` option waits past a read that leaves the setting out,
+  and a computer with none whose start is admitted is waited on until it runs,
+  so a proxy removed while it was stopped is gone first). `launch()` waits for
+  it when the create carried one. Which proxies are accepted is the platform's
+  rule, so a refused value is its 400, not a check here. The CLI takes
+  `mandala-py browser-proxy get | set COMPUTER URL [--bypass LIST] [--wait] |
+  clear COMPUTER [--wait]`; `--wait` on a stopped computer with no start under
+  way says the change is stored rather than failing, and an empty bypass entry
+  is refused. New exports: `BrowserProxy` and `BrowserProxyArgs`.
 - **Screenshot shaping: `region`, `scale`, `format` and `quality`** on
   `computer.screenshot()` (sync and async), over the platform's new query
   parameters — a crop `(x, y, width, height)` in screen pixels, a shrink factor

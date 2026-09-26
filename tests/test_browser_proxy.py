@@ -212,6 +212,48 @@ def test_wait_rides_through_an_admitted_start(monkeypatch):
     assert not scenario.steps
 
 
+def test_wait_rides_through_an_admitted_start_after_a_removal(monkeypatch):
+    # Cleared while stopped, then started: the old policy is still on the disk,
+    # and the platform reports that pending only once the machine runs. The
+    # admitted start is not "nothing to remove".
+    admitted = {**COMPUTER, "status": "stopped", "running_ram_mb": 1024}
+    scenario, c = wait_sync(
+        monkeypatch,
+        [
+            step("GET", "/launch-42", admitted),
+            step("GET", "/launch-42", admitted),
+            step("GET", "/launch-42", {**COMPUTER, "browser_proxy_pending": True}),
+            step("GET", "/launch-42", COMPUTER),
+        ],
+        poll=0.5,
+    )
+    assert c.status == "running"
+    assert not scenario.steps
+
+
+def test_wait_answers_at_once_for_a_stopped_computer_with_none(monkeypatch):
+    stopped = {**COMPUTER, "status": "stopped", "running_ram_mb": 0}
+    scenario, _ = wait_sync(
+        monkeypatch, [step("GET", "/launch-42", stopped), step("GET", "/launch-42", stopped)]
+    )
+    assert not scenario.steps
+
+
+def test_wait_expecting_a_proxy_waits_past_a_read_that_leaves_it_out(monkeypatch):
+    with pytest.raises(mc.TimeoutError) as caught:
+        wait_sync(
+            monkeypatch,
+            [step("GET", "/launch-42", COMPUTER) for _ in range(4)],
+            timeout=2,
+            poll=1,
+            expect_browser_proxy=True,
+        )
+    assert str(caught.value) == (
+        "launch-42 was read for 2s without reporting its browser proxy, so whether its "
+        "browsers have it is unknown"
+    )
+
+
 def test_wait_names_a_create_whose_first_start_failed(monkeypatch):
     silent = proxied(None, status="stopped")
     del silent["running_ram_mb"]
@@ -297,6 +339,28 @@ def test_launch_waits_for_the_guest_to_have_it(monkeypatch):
     assert json.loads(scenario.requests[0].content)["browser_proxy"] == PROXY
 
 
+def test_launch_waits_past_a_read_that_leaves_the_setting_out(monkeypatch):
+    # A running read with no browser_proxy is "none" to a caller who does not
+    # know better; launch does, since the create carried one.
+    scenario = Scenario(
+        [
+            step("POST", "", proxied(True)),
+            step("GET", "/launch-42", proxied(True)),
+            step("POST", "/launch-42/exec", GUEST),
+            step("GET", "/launch-42", COMPUTER),
+            step("GET", "/launch-42", proxied(False)),
+        ]
+    )
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.launch(poll=0.5, browser_proxy=PROXY)
+    assert not scenario.steps
+    assert c.browser_proxy == mc.BrowserProxy(server=SERVER, bypass=("<local>",))
+
+
 def test_launch_adds_no_request_for_none(monkeypatch):
     scenario = Scenario(
         [
@@ -350,6 +414,47 @@ async def test_async_set_and_wait(monkeypatch):
         await c.set_browser_proxy(None)
     assert not scenario.steps
     assert json.loads(scenario.requests[4].content) == {"browser_proxy": None}
+
+
+async def test_async_wait_rides_through_an_admitted_start_after_a_removal(monkeypatch):
+    admitted = {**COMPUTER, "status": "stopped", "running_ram_mb": 1024}
+    scenario = Scenario(
+        [
+            step("GET", "/launch-42", admitted),
+            step("GET", "/launch-42", admitted),
+            step("GET", "/launch-42", {**COMPUTER, "browser_proxy_pending": True}),
+            step("GET", "/launch-42", COMPUTER),
+        ]
+    )
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.get("launch-42")
+        await c.wait_for_browser_proxy(poll=0.5)
+    assert not scenario.steps
+    assert c.status == "running"
+
+
+async def test_async_launch_waits_past_a_read_that_leaves_the_setting_out(monkeypatch):
+    scenario = Scenario(
+        [
+            step("POST", "", proxied(True)),
+            step("GET", "/launch-42", proxied(True)),
+            step("POST", "/launch-42/exec", GUEST),
+            step("GET", "/launch-42", COMPUTER),
+            step("GET", "/launch-42", proxied(False)),
+        ]
+    )
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.launch(poll=0.5, browser_proxy=PROXY)
+    assert not scenario.steps
+    assert c.browser_proxy is not None
 
 
 async def test_async_wait_refuses_a_stopped_computer_nobody_is_starting(monkeypatch):
@@ -455,3 +560,47 @@ def test_cli_prints_the_platforms_refusal_as_it_is(cli_env, capsys):
 def test_cli_refuses_an_empty_url_before_any_request(cli_env, monkeypatch):
     monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
     assert _cli.main(["browser-proxy", "set", "dev", " "]) == 1
+
+
+@pytest.mark.parametrize("bypass", ["", ",", "a.com,", " , b.com"])
+def test_cli_refuses_an_empty_bypass_entry_before_any_request(cli_env, monkeypatch, bypass):
+    # The SDK refuses a blank entry; the CLI does too, rather than sending an
+    # empty list that looks like it said something.
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    with pytest.raises(SystemExit, match="--bypass has an empty entry"):
+        _cli.main(["browser-proxy", "set", "dev", SERVER, "--bypass", bypass])
+
+
+@respx.mock
+def test_cli_wait_on_a_stopped_computer_reports_the_change_stored(cli_env, capsys):
+    # Nothing will apply it until a start, and the PATCH worked: exit 0 and say
+    # so, rather than a failure for a change that was made.
+    listing()
+    stopped = proxied(None, name="dev", status="stopped", running_ram_mb=0)
+    respx.patch(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=stopped))
+    reads = respx.get(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json=stopped)
+    )
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--wait"]) == 0
+    assert reads.call_count == 1
+    captured = capsys.readouterr()
+    assert f"dev: browsers through {SERVER}" in captured.out
+    assert "dev is stopped: the change is stored and applied as it starts" in captured.err
+
+
+@respx.mock
+def test_cli_wait_rides_through_an_admitted_start(cli_env, capsys, monkeypatch):
+    monkeypatch.setattr(computers.time, "sleep", lambda _: None)
+    listing()
+    admitted = proxied(None, name="dev", status="stopped", running_ram_mb=1024)
+    respx.patch(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=admitted))
+    reads = respx.get(f"{BASE}/computers/launch-42").mock(
+        side_effect=[
+            httpx.Response(200, json=admitted),
+            httpx.Response(200, json=proxied(True, name="dev")),
+            httpx.Response(200, json=proxied(False, name="dev")),
+        ]
+    )
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--wait"]) == 0
+    assert reads.call_count == 3
+    assert "stored" not in capsys.readouterr().err
