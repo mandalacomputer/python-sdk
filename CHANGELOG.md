@@ -75,11 +75,14 @@ This is the summary you read to decide whether to upgrade.
   `--workspace='a b'`, `-ss1`, an abbreviation such as `--work`), naming the
   option in full and never the value. With the verb left off or mistyped
   (`--workspace ws_1 secrets lis`), the value is dropped too and the verb is
-  what is said to be missing or unknown; only when no command follows it at
-  all (`mandala-py --workspace ws_1`) is the value still read as the command
-  name. Under
-  `secrets`, no usage error repeats what was typed: not an option-shaped word
-  such as `--sk-live-0123`, and not argparse's own messages that quote a value
+  what is said to be missing or unknown. A value typed as a separate word is
+  still read as the command name, and named as an unknown one, when no
+  command follows it at all (`mandala-py --workspace ws_1`) or when the
+  command after it is mistyped (`mandala-py --workspace ws_1 secretz list`),
+  since there a value and a mistyped command cannot be told apart; typed
+  joined (`--workspace=ws_1 secretz list`), it is dropped and the mistyped
+  command is what is named. Under `secrets`, no usage error repeats what was
+  typed: not an option-shaped word such as `--sk-live-0123`, and not argparse's own messages that quote a value
   (`--keep-newline=VALUE`, an ambiguous abbreviation, an unknown verb, which
   now lists the verbs instead).
 

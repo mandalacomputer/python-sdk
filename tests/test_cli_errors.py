@@ -275,26 +275,30 @@ def test_an_early_option_is_named_alone_however_its_value_is_typed(
     assert "too many" not in out + err
 
 
+# Some Python versions quote argparse's choices and some do not.
+_VERB_CHOICES = r"'?list'?, '?set'?, '?rm'?"
+
+
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
         # The verb mistyped: the command it names is the one said unknown.
         (
             ["--workspace", SECRET, "secrets", "lis"],
-            "mandala-py secrets: error: unknown command; choose from 'list', 'set', 'rm'",
+            r"mandala-py secrets: error: unknown command; choose from " + _VERB_CHOICES,
         ),
         (
             ["--workspace", SECRET, "--json", "secrets", "lis"],
-            "unknown command; choose from 'list', 'set', 'rm'",
+            r"unknown command; choose from " + _VERB_CHOICES,
         ),
         # The verb left off.
         (
             ["--workspace", SECRET, "secrets"],
-            "mandala-py secrets: error: the following arguments are required: verb",
+            r"mandala-py secrets: error: the following arguments are required: verb",
         ),
         (
             [f"--workspace={SECRET}", "secrets"],
-            "mandala-py secrets: error: the following arguments are required: verb",
+            r"mandala-py secrets: error: the following arguments are required: verb",
         ),
     ],
 )
@@ -306,7 +310,8 @@ def test_an_early_value_is_dropped_when_the_command_name_is_incomplete(
     assert caught.value.code == 2
     out, err = capsys.readouterr()
     assert SECRET not in out + err
-    assert message in (json.loads(err)["error"]["message"] if "--json" in argv else err)
+    said = json.loads(err)["error"]["message"] if "--json" in argv else err
+    assert re.search(message, said), said
 
 
 def test_a_value_is_dropped_only_for_an_option_the_command_declares_with_one(
