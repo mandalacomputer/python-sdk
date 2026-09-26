@@ -219,9 +219,12 @@ class AsyncComputer(ComputerFields):
 
         A computer with secrets bound has them delivered again as it comes
         back, and reads ``running`` a few seconds before they land: a command
-        run in between sees them unset. :attr:`secrets_delivering` is true until
-        they are applied, so a caller whose commands need their secrets awaits
-        :meth:`wait_for_secrets` after this.
+        run in between sees them unset. :meth:`wait_for_secrets` after this
+        waits for them on a platform that reports that redelivery, as
+        :attr:`secrets_delivering` true until they are applied. On one that
+        does not, ``secrets_delivering`` reads false from the moment the restart
+        answers and the wait returns at once, so a command that must not run
+        without its secrets checks for them itself.
         """
         await self._t.request("POST", _api.computer_action(self.id, "restart"))
         return await self.refresh()

@@ -374,6 +374,33 @@ def test_wait_after_restart_waits_until_the_secrets_are_applied_again(monkeypatc
     assert not scenario.steps
 
 
+def unreported_restart_steps():
+    """A platform that does not report a restart's redelivery: delivering
+    reads false from the restart's own answer, with the old receipt current."""
+    return [
+        step("GET", "/launch-42", bound(False, secrets_applied=RECEIPT)),
+        step("POST", "/launch-42/restart", {}),
+        step("GET", "/launch-42", bound(False, secrets_applied=RECEIPT)),
+        step("GET", "/launch-42", bound(False, secrets_applied=RECEIPT)),
+    ]
+
+
+def test_wait_after_restart_returns_at_once_where_the_redelivery_is_not_reported(monkeypatch):
+    # What restart()'s docstring says of such a platform: the wait has
+    # nothing to wait on and must not invent a delivery.
+    scenario = Scenario(unreported_restart_steps())
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.get("launch-42")
+        c.restart()
+        assert c.secrets_delivering is False
+        c.wait_for_secrets(timeout=60, poll=0.5)
+    assert not scenario.steps
+
+
 # --- async --------------------------------------------------------------------
 
 
@@ -499,6 +526,22 @@ async def test_async_wait_after_restart_waits_until_the_secrets_are_applied_agai
         assert c.secrets_delivering is True
         await c.wait_for_secrets(poll=0.5)
     assert c.secrets_delivering is False
+    assert not scenario.steps
+
+
+async def test_async_wait_after_restart_returns_at_once_where_the_redelivery_is_not_reported(
+    monkeypatch,
+):
+    scenario = Scenario(unreported_restart_steps())
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.get("launch-42")
+        await c.restart()
+        assert c.secrets_delivering is False
+        await c.wait_for_secrets(timeout=60, poll=0.5)
     assert not scenario.steps
 
 
