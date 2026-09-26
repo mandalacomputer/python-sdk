@@ -47,6 +47,7 @@ from ._async_resources import (
     AsyncBuilds,
     AsyncComputers,
     AsyncMoves,
+    AsyncOperations,
     AsyncSecrets,
     AsyncSizes,
     AsyncSnapshots,
@@ -84,6 +85,7 @@ from ._exceptions import (
     MethodNotAllowedError,
     MoveRequiredError,
     NotFoundError,
+    OperationFailedError,
     OriginResponseError,
     OriginTLSError,
     OriginUnreachableError,
@@ -122,8 +124,12 @@ from ._models import (
     ExecStatus,
     FilePart,
     GuestDirectory,
+    LifecycleAck,
     Listing,
     Move,
+    Operation,
+    OperationError,
+    OperationPage,
     PublishedTemplate,
     Retention,
     RetiredTemplates,
@@ -164,6 +170,7 @@ from ._resources import (
     Builds,
     Computers,
     Moves,
+    Operations,
     Secrets,
     Sizes,
     Snapshots,
@@ -258,12 +265,17 @@ __all__ = [
     "GatewayTimeoutError",
     "GuestDirectory",
     "Hello",
+    "LifecycleAck",
     "Listing",
     "MandalaError",
     "MethodNotAllowedError",
     "Move",
     "MoveRequiredError",
     "NotFoundError",
+    "Operation",
+    "OperationError",
+    "OperationFailedError",
+    "OperationPage",
     "OriginResponseError",
     "OriginTLSError",
     "OriginUnreachableError",
@@ -353,6 +365,7 @@ class Client:
         self.builds = Builds(self._t)
         self.computers = Computers(self._t)
         self.moves = Moves(self._t)
+        self.operations = Operations(self._t)
         self.snapshots = Snapshots(self._t)
         self.templates = Templates(self._t)
         self.sizes = Sizes(self._t)
@@ -411,6 +424,7 @@ class AsyncClient:
         self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
         self.moves = AsyncMoves(self._t)
+        self.operations = AsyncOperations(self._t)
         self.snapshots = AsyncSnapshots(self._t)
         self.templates = AsyncTemplates(self._t)
         self.sizes = AsyncSizes(self._t)

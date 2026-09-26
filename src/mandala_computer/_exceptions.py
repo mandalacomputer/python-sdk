@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._agent import AgentFailed
+    from ._models import Operation
 
 __all__ = [
     "APIError",
@@ -23,6 +24,7 @@ __all__ = [
     "MethodNotAllowedError",
     "MoveRequiredError",
     "NotFoundError",
+    "OperationFailedError",
     "OriginResponseError",
     "OriginTLSError",
     "OriginUnreachableError",
@@ -765,6 +767,37 @@ class TimeoutError(MandalaError, builtins.TimeoutError):
     wants :meth:`~mandala_computer.Computer.start_exec` rather than a longer
     deadline.
     """
+
+
+class OperationFailedError(MandalaError):
+    """A lifecycle operation :meth:`~mandala_computer.Operations.wait` was
+    watching ended ``failed``.
+
+    Not an :class:`APIError`: every request succeeded, and what failed is the
+    step the platform was taking — a create that built a computer which would
+    not boot, a clone whose disk copy did not finish, a move that went nowhere.
+    So :func:`is_transient` says no to it, and waiting again answers the same.
+
+    :attr:`code` is the part to act on, and one of them is not a failure of
+    everything: ``resize_not_applied`` is a move that LANDED at the old size, so
+    the computer is on another host and an ordinary resize finishes the job.
+    """
+
+    def __init__(self, operation: Operation) -> None:
+        err = operation.error
+        #: The platform's code, e.g. ``start_failed``; ``""`` if it named none.
+        self.code: str = err.code if err is not None else ""
+        #: The platform's sentence about it, for a person; ``""`` if it gave none.
+        self.detail: str = err.message if err is not None else ""
+        #: The operation as the last poll read it.
+        self.operation = operation
+        about = f" of {operation.computer_id}" if operation.computer_id else ""
+        message = f"operation {operation.id} ({operation.kind}{about}) failed"
+        if self.code:
+            message += f": {self.code}"
+        if self.detail:
+            message += f" — {self.detail}"
+        super().__init__(message)
 
 
 def is_transient(err: BaseException) -> bool:

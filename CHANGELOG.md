@@ -11,6 +11,20 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **Lifecycle operations:** `client.operations.get(operation_id)`,
+  `list(computer_id=, limit=, cursor=)` and `wait(operation_or_id, timeout=,
+  poll=)`, sync and async, over the platform's `GET operations` and
+  `GET operations/{id}`. `wait` returns on `succeeded` and raises the new
+  `OperationFailedError` (with the platform's `code` and `detail`) on
+  `failed`. `succeeded` means the platform finished its step, not that the
+  desktop has booted: keep `wait_for_guest()` for that. `kind` and `state` are
+  open strings, since the platform adds kinds. The id is surfaced as
+  `computer.operation_id` (after a create, a clone, and each start, stop,
+  suspend, restart, rename or resize through the handle; a refresh keeps it),
+  `move.operation_id` on what `relocate` accepted, and on
+  `snapshots.restore()`, which now returns a `LifecycleAck` rather than
+  `None`. New exports: `Operation`, `OperationError`, `OperationPage`,
+  `LifecycleAck` and `OperationFailedError`.
 - **A proxy for a computer's browsers:** `browser_proxy={"server": ..., "bypass":
   [...]}` on `computers.create()` and `launch()`, and
   `computer.set_browser_proxy(proxy)` where `None` removes it (sync and

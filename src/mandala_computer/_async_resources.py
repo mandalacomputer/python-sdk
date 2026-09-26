@@ -21,8 +21,11 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
+    LifecycleAck,
     Listing,
     Move,
+    Operation,
+    OperationPage,
     PublishedTemplate,
     Retention,
     RetiredTemplates,
@@ -76,10 +79,13 @@ from ._computer import _poll_delay, _ride_out, check_wait_args
 from ._exceptions import _is_transient_for_poll
 from ._resources import (
     EPHEMERAL_DOC,
+    OPERATION_WAIT_POLL,
+    OPERATION_WAIT_TIMEOUT,
     SECRET_SET_RETRIES,
     Account,
     ApiKeys,
     Builds,
+    Operations,
     Secrets,
     SshKeys,
     Templates,
@@ -88,6 +94,9 @@ from ._resources import (
     _launch_start_admitted,
     _named,
     _named_secret,
+    _operation_id_arg,
+    _operation_settled,
+    _operation_timed_out,
     _wait_timed_out,
     classify_poll_failure,
     deletion_timed_out,
@@ -102,6 +111,7 @@ __all__ = [
     "AsyncBuilds",
     "AsyncComputers",
     "AsyncMoves",
+    "AsyncOperations",
     "AsyncSecrets",
     "AsyncSizes",
     "AsyncSnapshots",
@@ -448,9 +458,17 @@ class AsyncSnapshots:
         )
         return Listing.of([Snapshot.from_api(s) for s in data or []], incomplete)
 
-    async def restore(self, snapshot_id: str) -> None:
-        """Roll a computer back to a snapshot, replacing its current disk."""
-        await self._t.request("POST", _api.snapshot_action(snapshot_id, "restore"))
+    async def restore(self, snapshot_id: str) -> LifecycleAck:
+        """Roll a computer back to a snapshot, replacing its current disk.
+
+        Done when this returns. The answer's ``operation_id`` names the
+        operation the platform recorded for it, already ``succeeded``; it is
+        ``None`` where none could be recorded, and the restore happened either
+        way.
+        """
+        return LifecycleAck.from_response(
+            await self._t.request("POST", _api.snapshot_action(snapshot_id, "restore"))
+        )
 
     async def clone(
         self,
@@ -1158,3 +1176,59 @@ class AsyncApiKeys:
     list.__doc__ = ApiKeys.list.__doc__
     create.__doc__ = ApiKeys.create.__doc__
     revoke.__doc__ = ApiKeys.revoke.__doc__
+
+
+class AsyncOperations:
+    __doc__ = Operations.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def get(self, operation_id: str, *, timeout_cap: float | None = None) -> Operation:
+        path = _api.operation(operation_id)
+        data = await self._t.json_object("GET", path, timeout_cap=timeout_cap)
+        return Operation.from_api(data, f"GET {path}")
+
+    async def list(
+        self,
+        *,
+        computer_id: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> OperationPage:
+        params = _api.operations_params(computer_id, limit, cursor)
+        data = await self._t.json_object("GET", _api.OPERATIONS, params=params)
+        return OperationPage.from_api(data)
+
+    async def wait(
+        self,
+        operation: Operation | str,
+        timeout: float = OPERATION_WAIT_TIMEOUT,
+        poll: float = OPERATION_WAIT_POLL,
+    ) -> Operation:
+        check_wait_args(timeout, poll)
+        op_id = _operation_id_arg(operation)
+        deadline = time.monotonic() + timeout
+        last: Operation | None = None
+        answered = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_operation_timed_out(op_id, timeout, last, answered))
+            delay = poll
+            try:
+                last = await self.get(op_id, timeout_cap=remaining)
+                answered = True
+            except MandalaError as err:
+                answered = False
+                delay = _ride_out(err, deadline, poll)
+            if answered and last is not None and _operation_settled(last):
+                return last
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_operation_timed_out(op_id, timeout, last, answered))
+            await asyncio.sleep(min(delay, remaining))
+
+    get.__doc__ = Operations.get.__doc__
+    list.__doc__ = Operations.list.__doc__
+    wait.__doc__ = Operations.wait.__doc__

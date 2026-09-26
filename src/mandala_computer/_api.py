@@ -72,6 +72,12 @@ WHOAMI = "whoami"
 #: opt-in "Manage keys" permission, which only a dashboard session turns on;
 #: without it the platform answers 403 with a sentence that says so.
 API_KEYS = "api-keys"
+#: Lifecycle operations (platform OPL-5055): what each accepted create, clone,
+#: start, stop, suspend, restart, restore, resize and move started, and how it
+#: ended. Read only.
+OPERATIONS = "operations"
+#: The most one page of ``GET operations`` holds; the platform refuses more.
+OPERATIONS_PAGE_MAX = 100
 
 
 def canonical(value: object, what: str) -> str:
@@ -1042,7 +1048,13 @@ def computer_payload(data: Any) -> dict[str, Any]:
     # it survives into `raw` and cannot be dropped by a caller that only wanted
     # the computer. A refresh replaces the record and clears it, which is right:
     # it describes one start attempt, not the machine.
-    return {**inner, "start_error": data.get("start_error")}
+    #
+    # ``operation_id`` the same way (platform OPL-5055): on a create that would
+    # not boot it is on the envelope, beside ``start_error``, not on the computer.
+    out = {**inner, "start_error": data.get("start_error")}
+    if "operation_id" in data and "operation_id" not in inner:
+        out["operation_id"] = data["operation_id"]
+    return out
 
 
 # --- bodies ---------------------------------------------------------------
@@ -2173,6 +2185,37 @@ def ssh_key(key_id: str) -> str:
 
 def api_key(key_id: str) -> str:
     return f"api-keys/{seg(key_id)}"
+
+
+def operation(operation_id: str) -> str:
+    return f"operations/{seg(operation_id)}"
+
+
+def operations_params(computer_id: object, limit: object, cursor: object) -> dict[str, str] | None:
+    """``GET operations``: a computer, a page size and a cursor, each only when given.
+
+    An empty ``computer_id`` or ``cursor`` is refused rather than sent: the
+    platform answers 400 for either, and an empty ``computer_id`` dropped
+    instead would list the whole account's operations to a caller who believes
+    they asked about one computer.
+    """
+    params: dict[str, str] = {}
+    if computer_id is not None:
+        cid = canonical(computer_id, "computer_id")
+        if not cid or cid != cid.strip():
+            raise ValueError("computer_id must be a computer id, with no spaces around it")
+        params["computer_id"] = cid
+    if limit is not None:
+        number = whole(limit, "limit", exc=ValueError)
+        if not 1 <= number <= OPERATIONS_PAGE_MAX:
+            raise ValueError(f"limit must be between 1 and {OPERATIONS_PAGE_MAX}, not {number}")
+        params["limit"] = str(number)
+    if cursor is not None:
+        c = canonical(cursor, "cursor")
+        if not c:
+            raise ValueError("cursor must be the next_cursor of the page before, not empty")
+        params["cursor"] = c
+    return params or None
 
 
 def api_key_body(name: object, workspace_id: object) -> dict[str, Any]:

@@ -113,7 +113,9 @@ from ._models import (
     Window,
     WindowResult,
     _optional_result_id,
+    answered_operation_id,
     is_unreachable_stub,
+    operation_id_of,
     window_contradiction,
 )
 from ._results import (
@@ -139,6 +141,7 @@ class AsyncComputer(ComputerFields):
         self._t = transport
         self._data = dict(data)
         self._note_clone_answer(data)
+        self._operation_id = operation_id_of(data)
 
     # --- lifecycle ------------------------------------------------------
 
@@ -175,9 +178,10 @@ class AsyncComputer(ComputerFields):
         Requires a platform version that supports ``resume_only``. Older
         servers may ignore the parameter and cold-boot a stopped computer.
         """
-        await self._t.request(
+        resp = await self._t.request(
             "POST", _api.computer_action(self.id, "start"), params=_api.start_params(resume_only)
         )
+        self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
     async def stop(self, *, force: bool = False) -> AsyncComputer:
@@ -190,9 +194,10 @@ class AsyncComputer(ComputerFields):
         will not come down on its own, at the cost of whatever it had not
         written to disk.
         """
-        await self._t.request(
+        resp = await self._t.request(
             "POST", _api.computer_action(self.id, "stop"), params=_api.stop_params(force)
         )
+        self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
     async def suspend(self) -> AsyncComputer:
@@ -208,7 +213,8 @@ class AsyncComputer(ComputerFields):
         own — a capture or a clone reading the disk, a migration in flight, or
         somebody driving the guest at that moment.
         """
-        await self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        resp = await self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
     async def restart(self) -> AsyncComputer:
@@ -233,7 +239,8 @@ class AsyncComputer(ComputerFields):
         before the values land, so a command that must not run without its
         secrets checks for them itself.
         """
-        await self._t.request("POST", _api.computer_action(self.id, "restart"))
+        resp = await self._t.request("POST", _api.computer_action(self.id, "restart"))
+        self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
     async def clone(self, name: str | None = None) -> AsyncComputer:
@@ -268,6 +275,7 @@ class AsyncComputer(ComputerFields):
         self._data = _api.computer_payload(
             await self._t.json_object("PATCH", _api.computer(self.id), json=_api.rename_body(name))
         )
+        self._operation_id = operation_id_of(self._data)
         return self
 
     async def resize(
@@ -295,6 +303,7 @@ class AsyncComputer(ComputerFields):
                 json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
             )
         )
+        self._operation_id = operation_id_of(self._data)
         return self
 
     async def relocate(
