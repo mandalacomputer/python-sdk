@@ -102,6 +102,96 @@ def test_a_dashed_value_is_described_not_echoed(capsys: pytest.CaptureFixture[st
     assert error["message"] == "1 argument too many (quote a value that has spaces in it)"
 
 
+SECRET = "sk-demo-123"
+UNNAMED = (
+    "1 unrecognized option, not repeated here, as under secrets it may be a secret value; "
+    "secrets set reads the value from stdin or a prompt"
+)
+UNREAD = (
+    "an argument could not be read, and is not repeated here, "
+    "as under secrets it may be a secret value"
+)
+
+
+@pytest.mark.parametrize(
+    ("tail", "message"),
+    [
+        # After --, how a value that starts with a dash is passed: an operand
+        # however it is spelled, so counted, and not mislabelled an option.
+        (["--", f"--{SECRET}"], "1 argument too many (quote a value that has spaces in it)"),
+        (
+            ["--", SECRET, f"-{SECRET}"],
+            "2 arguments too many (quote a value that has spaces in it)",
+        ),
+        # Shaped exactly like an option name, which is named anywhere else.
+        ([f"--{SECRET}"], UNNAMED),
+        # Both at once, and the separator is not counted as an operand.
+        (
+            [f"--{SECRET}", "--", f"--{SECRET}"],
+            f"{UNNAMED}; 1 argument too many (quote a value that has spaces in it)",
+        ),
+        # argparse's own diagnostics, which quote the value.
+        ([f"--keep-newline={SECRET}"], UNREAD),
+        ([f"--k={SECRET}"], UNREAD),
+    ],
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_no_diagnostic_under_secrets_set_repeats_what_was_typed(
+    capsys: pytest.CaptureFixture[str], tail: list[str], message: str, as_json: bool
+) -> None:
+    # --json goes first: after -- it would be one more operand.
+    argv = ["secrets", "set", "OPENAI_API_KEY", *(["--json"] if as_json else []), *tail]
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(argv)
+    assert caught.value.code == 2
+    if as_json:
+        error = failure(capsys)
+        assert SECRET not in json.dumps(error)
+        assert error["message"] == message
+    else:
+        out, err = capsys.readouterr()
+        assert SECRET not in out + err
+        assert err.startswith(f"mandala-py secrets set: error: {message}\n")
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_an_unknown_verb_under_secrets_is_not_repeated(
+    capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    with pytest.raises(SystemExit):
+        _cli.main(["secrets", SECRET, *(["--json"] if as_json else [])])
+    out, err = capsys.readouterr()
+    assert SECRET not in out + err
+    assert UNREAD in err
+
+
+def test_a_diagnostic_that_quotes_only_declared_names_still_reads_under_secrets(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _cli.main(["secrets", "set", "A", "--workspace"])
+    assert "argument --workspace: expected one argument" in capsys.readouterr().err
+
+
+def test_an_option_is_named_only_when_typed_before_the_separator(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Outside secrets a mistyped flag is still named; the same spelling after
+    # -- is an operand, counted.
+    with pytest.raises(SystemExit):
+        _cli.main(["webhooks", "list", "--jsno", "--", "--jsno"])
+    assert capsys.readouterr().err.startswith(
+        "mandala-py webhooks list: error: unrecognized option: --jsno; "
+        "1 argument too many (quote a value that has spaces in it)\n"
+    )
+    # Nor is one spelled like an option the command took before the --.
+    with pytest.raises(SystemExit):
+        _cli.main(["webhooks", "list", "--json", "--", "--json"])
+    assert failure(capsys)["message"] == (
+        "1 argument too many (quote a value that has spaces in it)"
+    )
+
+
 def test_a_mistyped_option_is_still_named(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         _cli.main(["webhooks", "list", "--jsno"])

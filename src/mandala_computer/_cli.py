@@ -72,7 +72,8 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Collection, Sequence
 from contextlib import suppress
 from pathlib import Path
 from types import FrameType
@@ -238,19 +239,61 @@ def _unknown_option(word: str) -> str:
     return 'unrecognized option: an argument starts with "-" but is not an option name'
 
 
-def _unexpected(extra: Sequence[str]) -> str:
+#: Why a diagnostic under ``secrets`` does not repeat what was typed.
+_NOT_REPEATED = "not repeated here, as under secrets it may be a secret value"
+
+#: The argparse diagnostics that quote nothing typed, only names this CLI
+#: declared. Every other one (``ignored explicit argument 'VALUE'``, an
+#: ambiguous abbreviation, an invalid choice) repeats a word from the command
+#: line, and under ``secrets`` that word may be the secret.
+_QUOTES_NOTHING = re.compile(
+    r"the following arguments are required: [\w, /-]+|argument [\w/-]+: expected one argument"
+)
+
+
+def _unexpected(
+    extra: Sequence[str],
+    words: Sequence[str],
+    *,
+    known: Collection[str] = (),
+    quotes: bool = True,
+) -> str:
     """The message for words no command took: options shaped like option names
     are named, and every other word is counted, never quoted.
 
     Most often such a word is a value typed where a prompt or stdin was meant
     to read it — ``mandala-py secrets set NAME "$TOKEN"`` — and printing it
-    would copy the credential into whatever log captures stderr.
+    would copy the credential into whatever log captures stderr. Under
+    ``secrets`` (``quotes`` false) not even an option is named: a secret can be
+    shaped exactly like one, ``--sk-live-0123``.
+
+    A word after a bare ``--`` is an operand however it is spelled — that is
+    how a value starting with a dash is passed — so it is counted too. argparse
+    reports words from both sides of the ``--`` in one list, keeping the
+    separator in it on some paths and not others, so which side a word came
+    from is read off ``words``, everything that was typed: a word is an option
+    only if that spelling was typed before the first ``--`` and is not one of
+    the options the command ``known`` declares, which argparse took.
     """
-    named = [word for word in extra if _OPTION_NAME.fullmatch(word)]
-    others = len(extra) - len(named)
+    before = words[: words.index("--")] if "--" in words else words
+    options = Counter(w for w in before if _OPTION_NAME.fullmatch(w) and w not in known)
+    rest = list(extra)
+    if "--" in words and rest.count("--") == words.count("--"):
+        rest.remove("--")  # the separator itself, not an operand
+    named = []
+    for word in rest:
+        if options[word]:
+            options[word] -= 1
+            named.append(word)
+    others = len(rest) - len(named)
     parts = []
-    if named:
+    if named and quotes:
         parts.append(f"unrecognized option{'s' if len(named) > 1 else ''}: {' '.join(named)}")
+    elif named:
+        parts.append(
+            f"{len(named)} unrecognized option{'s' if len(named) > 1 else ''}, {_NOT_REPEATED}; "
+            "secrets set reads the value from stdin or a prompt"
+        )
     if others:
         parts.append(
             f"{others} argument{'s' if others > 1 else ''} too many "
@@ -281,7 +324,18 @@ class _Parser(argparse.ArgumentParser):
 
     json_errors = False
 
+    #: Whether this command's diagnostics may repeat what was typed. False for
+    #: ``secrets`` and its verbs; see :func:`_unexpected`.
+    quotes_input = True
+
     def error(self, message: str) -> NoReturn:
+        # argparse's own diagnostics, which quote what was typed freely.
+        if not self.quotes_input and not _QUOTES_NOTHING.fullmatch(message):
+            message = f"an argument could not be read, and is {_NOT_REPEATED}"
+        self.usage_error(message)
+
+    def usage_error(self, message: str) -> NoReturn:
+        """Report ``message`` as it is, over the command's whole help."""
         if _Parser.json_errors:
             _json_failure(
                 {"code": "invalid_arguments", "message": message, "usage": self.format_help()}
@@ -290,7 +344,7 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, f"{self.prog}: error: {message}\n\n{self.format_help()}")
 
 
-def _leaf(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.ArgumentParser:
+def _leaf(parser: _Parser, args: argparse.Namespace) -> _Parser:
     """The parser of the command ``args`` names, following each subcommand chosen."""
     while True:
         chosen = next(
@@ -301,7 +355,7 @@ def _leaf(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse
             ),
             None,
         )
-        if not isinstance(chosen, argparse.ArgumentParser):
+        if not isinstance(chosen, _Parser):
             return parser
         parser = chosen
 
@@ -1371,6 +1425,8 @@ def _secrets_parser(sub: Any) -> None:
     rm.add_argument("name", metavar="NAME")
     rm.add_argument("--workspace", metavar="ID", help=scope)
     rm.set_defaults(fn=_cmd_secrets_rm)
+    for verb in (store, listing, put, rm):
+        verb.quotes_input = False
 
 
 # --- who you are, API keys, logout (platform OPL-5053) -----------------------
@@ -2034,7 +2090,7 @@ def _ssh_parsers(sub: Any) -> None:
     config.set_defaults(fn=_cmd_ssh_config)
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser() -> _Parser:
     # _Parser throughout: add_subparsers makes every subcommand's parser the
     # same class as its parent's, so each one prints its own whole help.
     from mandala_computer import __version__
@@ -2097,7 +2153,12 @@ def main(argv: list[str] | None = None) -> int:
             # parse_args reports these against the TOP parser, whose usage says
             # nothing about the command that was typed. Reported against that
             # command instead, with its whole help.
-            _leaf(parser, args).error(_unexpected(extra))
+            leaf = _leaf(parser, args)
+            leaf.usage_error(
+                _unexpected(
+                    extra, words, known=leaf._option_string_actions, quotes=leaf.quotes_input
+                )
+            )
         return int(args.fn(args))
     except _Failure as e:
         if not as_json:
