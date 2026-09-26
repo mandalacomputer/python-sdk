@@ -247,6 +247,133 @@ def test_wait_rides_out_a_host_that_cannot_be_reached(monkeypatch):
     assert not scenario.steps
 
 
+def test_wait_refuses_nothing_admitted_even_when_the_bindings_are_left_out(monkeypatch):
+    # expect_secrets waits past a read that omits the bindings, but not one
+    # that says outright nothing is starting: that is an answer whatever is
+    # bound. The long timeout is the test: the scenario would run dry first.
+    stopped = unreported(status="stopped", running_ram_mb=0)
+    with pytest.raises(mc.MandalaError) as caught:
+        wait_sync(
+            monkeypatch,
+            [step("GET", "/launch-42", stopped), step("GET", "/launch-42", stopped)],
+            timeout=60,
+            expect_secrets=True,
+        )
+    assert not isinstance(caught.value, mc.TimeoutError)
+    assert str(caught.value) == (
+        "launch-42 is 'stopped', and secrets are delivered only as it starts: call start()"
+    )
+
+
+def test_wait_still_waits_past_left_out_bindings_when_admission_is_unsaid(monkeypatch):
+    silent = unreported(status="stopped")
+    del silent["running_ram_mb"]
+    with pytest.raises(mc.TimeoutError, match="without reporting its bindings"):
+        wait_sync(
+            monkeypatch,
+            [step("GET", "/launch-42", silent) for _ in range(4)],
+            timeout=2,
+            poll=1,
+            expect_secrets=True,
+        )
+
+
+START_ERROR = "no host had room"
+START_FAILED_MESSAGE = (
+    "launch-42 is stopped after it failed to start, so its secrets were not delivered: "
+    f"{START_ERROR}. Call start() to try again"
+)
+
+
+def silent_stopped(**extra):
+    """Stopped with bindings and no ``running_ram_mb``: the reads after a
+    create whose first start failed, from a host that does not report the
+    pool."""
+    row = bound(False, status="stopped", **extra)
+    if "running_ram_mb" not in extra:
+        del row["running_ram_mb"]
+    return row
+
+
+def created_with_start_error():
+    return step("POST", "", {"computer": silent_stopped(), "start_error": START_ERROR})
+
+
+def create_then_wait_sync(monkeypatch, steps, **wait):
+    scenario = Scenario([created_with_start_error(), *steps])
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.create(secrets=[{"secret_id": BINDING["secret_id"], "env": "TOKEN"}])
+        assert c.start_error == START_ERROR
+        return scenario, c.wait_for_secrets(**wait)
+
+
+def test_wait_refuses_a_create_whose_start_failed_rather_than_timing_out(monkeypatch):
+    with pytest.raises(mc.MandalaError) as caught:
+        create_then_wait_sync(
+            monkeypatch, [step("GET", "/launch-42", silent_stopped())], timeout=60
+        )
+    assert not isinstance(caught.value, mc.TimeoutError)
+    assert str(caught.value) == START_FAILED_MESSAGE
+
+
+def test_wait_refuses_a_failed_create_when_the_bindings_are_left_out_too(monkeypatch):
+    row = silent_stopped()
+    del row["secrets"]
+    with pytest.raises(mc.MandalaError) as caught:
+        create_then_wait_sync(
+            monkeypatch, [step("GET", "/launch-42", row)], timeout=60, expect_secrets=True
+        )
+    assert str(caught.value) == START_FAILED_MESSAGE
+
+
+def test_wait_retires_a_create_failure_once_a_start_is_admitted(monkeypatch):
+    # A reservation, then a read that does not report the pool: the old
+    # failure belongs to an earlier attempt and must not refuse this one.
+    scenario, c = create_then_wait_sync(
+        monkeypatch,
+        [
+            step("GET", "/launch-42", silent_stopped(running_ram_mb=1024)),
+            step("GET", "/launch-42", silent_stopped()),
+            step("GET", "/launch-42", bound(False)),
+        ],
+        poll=0.5,
+    )
+    assert c.status == "running"
+    assert not scenario.steps
+
+
+def restart_steps():
+    """A restart comes back running before its secrets are delivered again;
+    ``secrets_delivering`` reads true until they are."""
+    return [
+        step("GET", "/launch-42", bound(False, secrets_applied=RECEIPT)),
+        step("POST", "/launch-42/restart", {}),
+        step("GET", "/launch-42", bound(True)),
+        step("GET", "/launch-42", bound(True)),
+        step("GET", "/launch-42", bound(True)),
+        step("GET", "/launch-42", bound(False, secrets_applied=RECEIPT)),
+    ]
+
+
+def test_wait_after_restart_waits_until_the_secrets_are_applied_again(monkeypatch):
+    scenario = Scenario(restart_steps())
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.get("launch-42")
+        c.restart()
+        assert c.secrets_delivering is True
+        c.wait_for_secrets(poll=0.5)
+    assert c.secrets_delivering is False
+    assert not scenario.steps
+
+
 # --- async --------------------------------------------------------------------
 
 
@@ -307,6 +434,72 @@ async def test_async_wait_refuses_a_stopped_computer_nobody_is_starting(monkeypa
         c = await client.computers.get("launch-42")
         with pytest.raises(mc.MandalaError, match="secrets are delivered only as it starts"):
             await c.wait_for_secrets()
+
+
+async def test_async_wait_refuses_nothing_admitted_even_when_the_bindings_are_left_out(
+    monkeypatch,
+):
+    stopped = unreported(status="stopped", running_ram_mb=0)
+    scenario = Scenario([step("GET", "/launch-42", stopped), step("GET", "/launch-42", stopped)])
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.get("launch-42")
+        with pytest.raises(mc.MandalaError, match="secrets are delivered only as it starts"):
+            await c.wait_for_secrets(timeout=60, expect_secrets=True)
+
+
+async def create_then_wait_async(monkeypatch, steps, **wait):
+    scenario = Scenario([created_with_start_error(), *steps])
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.create(
+            secrets=[{"secret_id": BINDING["secret_id"], "env": "TOKEN"}]
+        )
+        return scenario, await c.wait_for_secrets(**wait)
+
+
+async def test_async_wait_refuses_a_create_whose_start_failed(monkeypatch):
+    with pytest.raises(mc.MandalaError) as caught:
+        await create_then_wait_async(
+            monkeypatch, [step("GET", "/launch-42", silent_stopped())], timeout=60
+        )
+    assert not isinstance(caught.value, mc.TimeoutError)
+    assert str(caught.value) == START_FAILED_MESSAGE
+
+
+async def test_async_wait_retires_a_create_failure_once_a_start_is_admitted(monkeypatch):
+    scenario, c = await create_then_wait_async(
+        monkeypatch,
+        [
+            step("GET", "/launch-42", silent_stopped(running_ram_mb=1024)),
+            step("GET", "/launch-42", silent_stopped()),
+            step("GET", "/launch-42", bound(False)),
+        ],
+        poll=0.5,
+    )
+    assert c.status == "running"
+    assert not scenario.steps
+
+
+async def test_async_wait_after_restart_waits_until_the_secrets_are_applied_again(monkeypatch):
+    scenario = Scenario(restart_steps())
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.get("launch-42")
+        await c.restart()
+        assert c.secrets_delivering is True
+        await c.wait_for_secrets(poll=0.5)
+    assert c.secrets_delivering is False
+    assert not scenario.steps
 
 
 # --- write_file ---------------------------------------------------------------

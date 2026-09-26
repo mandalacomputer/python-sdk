@@ -36,10 +36,14 @@ This is the summary you read to decide whether to upgrade.
   seconds before its secrets land. The wait polls until the platform's
   `secrets_delivering` is false (or, on a platform that predates it, until the
   receipt names the latest delivering start), and raises instead of waiting out
-  its timeout for a delivery that failed or a stopped computer the platform
-  says has no start admitted; a host that does not say is waited on.
-  `expect_secrets=True` tells it secrets are bound, so a read that leaves the
-  bindings out is waited past rather than taken for "nothing bound".
+  its timeout for a delivery that failed, a stopped computer the platform says
+  has no start admitted, or a create's computer whose first start failed
+  (`start_error`, kept past the refresh that clears it); a host that does not
+  say is waited on. `expect_secrets=True` tells it secrets are bound, so a read
+  that leaves the bindings out is waited past rather than taken for "nothing
+  bound" — unless that read says outright that nothing is starting, which is
+  refused as above. A restart delivers bound secrets again and reads `running`
+  before they land, so call it after `restart()` too.
 - **`mandala-py --json` failures carry an error code.** A failure under `--json`
   writes `{"error": {"code", "message", "status"?, "reason"?}}` as one line on
   stderr, with nothing on stdout. `code` is one snake_case word, the same

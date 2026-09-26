@@ -216,6 +216,12 @@ class AsyncComputer(ComputerFields):
         that session or throw it away. Start it or stop it first.
 
         Desktop credentials do not survive this — see :attr:`vnc`.
+
+        A computer with secrets bound has them delivered again as it comes
+        back, and reads ``running`` a few seconds before they land: a command
+        run in between sees them unset. :attr:`secrets_delivering` is true until
+        they are applied, so a caller whose commands need their secrets awaits
+        :meth:`wait_for_secrets` after this.
         """
         await self._t.request("POST", _api.computer_action(self.id, "restart"))
         return await self.refresh()
@@ -795,6 +801,9 @@ class AsyncComputer(ComputerFields):
         deadline = time.monotonic() + timeout
         observed = False
         fresh = False
+        # The create's failed start, kept past the refresh that clears it and
+        # retired by a reservation: Computer.wait_for_secrets says why.
+        start_failed = self.start_error
         state: str | MandalaError = "delivering"
         while True:
             remaining = deadline - time.monotonic()
@@ -803,11 +812,13 @@ class AsyncComputer(ComputerFields):
                 try:
                     await self._refresh(timeout_cap=remaining)
                     observed = fresh = True
+                    if self._start_admitted():
+                        start_failed = ""
                 except MandalaError as err:
                     delay = _ride_out(err, deadline, poll)
                     fresh = False
             if observed:
-                state = self._secrets_state(expect_secrets)
+                state = self._secrets_state(expect_secrets, self.start_error or start_failed)
                 if state == "delivered":
                     return self
                 if isinstance(state, MandalaError):
