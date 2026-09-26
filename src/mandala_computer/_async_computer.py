@@ -225,9 +225,13 @@ class AsyncComputer(ComputerFields):
         run in between sees them unset. :meth:`wait_for_secrets` after this
         waits for them on a platform that reports that redelivery, as
         :attr:`secrets_delivering` true until they are applied. On one that
-        does not, ``secrets_delivering`` reads false from the moment the restart
-        answers and the wait returns at once, so a command that must not run
-        without its secrets checks for them itself.
+        does not, ``secrets_delivering`` may read false before they land, and
+        the wait returns as soon as it does. On a platform that predates the
+        field it is ``None``, and the wait instead compares the receipt's
+        generation (:attr:`secrets_applied`) with :attr:`secrets_generation`,
+        returning once the receipt has caught up. Either way the wait can return
+        before the values land, so a command that must not run without its
+        secrets checks for them itself.
         """
         await self._t.request("POST", _api.computer_action(self.id, "restart"))
         return await self.refresh()
