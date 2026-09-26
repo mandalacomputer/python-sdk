@@ -6,6 +6,7 @@ The words are the ones the ``mandala`` CLI reports, so a script reading
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 
@@ -185,7 +186,10 @@ def test_an_unknown_verb_under_secrets_is_not_repeated(
         (["--json", "secrets", "list"], "secrets list"),
         (["secrets", "--json", "list"], "secrets list"),
         (["secrets", "--json", "set", "A"], "secrets set"),
-        (["--workspace", "secrets", "list"], "secrets list"),
+        (["--workspace", "ws_1", "secrets", "list"], "secrets list"),
+        (["--workspace=ws_1", "secrets", "list"], "secrets list"),
+        (["secrets", "--workspace", "ws_1", "list"], "secrets list"),
+        (["secrets", "--workspace=ws_1", "list"], "secrets list"),
     ],
 )
 def test_an_option_typed_before_its_command_is_said_to_be(
@@ -198,10 +202,164 @@ def test_an_option_typed_before_its_command_is_said_to_be(
     assert caught.value.code == 2
     out, err = capsys.readouterr()
     assert "too many" not in out + err
-    assert f"{argv[0] if argv[0].startswith('-') else argv[1]} must come after the command, " in (
-        out + err
-    )
+    option = (argv[0] if argv[0].startswith("-") else argv[1]).split("=")[0]
+    assert f"{option} must come after the command, " in out + err
     assert f"mandala-py {command}" in out + err
+    # The value typed with it is neither quoted nor read as the command.
+    assert "ws_1" not in out + err
+    assert "invalid choice" not in out + err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--workspace", SECRET, "secrets", "list"],
+        [f"--workspace={SECRET}", "secrets", "list"],
+        ["--json", "--workspace", SECRET, "secrets", "list"],
+    ],
+)
+def test_an_option_typed_before_its_command_names_only_itself(
+    capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(argv)
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert SECRET not in out + err
+    early = " ".join(w.split("=")[0] for w in argv if w.startswith("--"))
+    message = f"{early} must come after the command, mandala-py secrets list"
+    if "--json" in argv:
+        assert json.loads(err)["error"]["message"] == message
+    else:
+        assert err.startswith(f"mandala-py secrets list: error: {message}\n")
+
+
+@pytest.mark.parametrize(
+    ("argv", "option", "command", "value"),
+    [
+        # Joined with = to a value that has a space in it, which argparse reads
+        # as a positional word, and so as the command's name.
+        (["--workspace=ws 1", "secrets", "list"], "--workspace", "secrets list", "ws 1"),
+        (
+            ["--description=my hook", "webhooks", "create", "https://x"],
+            "--description",
+            "webhooks create",
+            "my hook",
+        ),
+        # The next word, starting with a dash, as argparse would still take it.
+        (["--workspace", "-1", "secrets", "list"], "--workspace", "secrets list", "-1"),
+        (["--workspace", "ws 1", "secrets", "list"], "--workspace", "secrets list", "ws 1"),
+        # Attached to a short option.
+        (["-ss1", "terminal", "comp"], "-s", "terminal", "s1"),
+        (["-s=s1", "terminal", "comp"], "-s", "terminal", "s1"),
+        # An abbreviation, named in full.
+        (["--work", "ws_1", "secrets", "list"], "--workspace", "secrets list", "ws_1"),
+        (["--work=ws_1", "secrets", "list"], "--workspace", "secrets list", "ws_1"),
+    ],
+)
+def test_an_early_option_is_named_alone_however_its_value_is_typed(
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    option: str,
+    command: str,
+    value: str,
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(argv)
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert err.startswith(
+        f"mandala-py {command}: error: {option} must come after the command, mandala-py {command}\n"
+    )
+    assert value not in out + err
+    assert "too many" not in out + err
+
+
+# Some Python versions quote argparse's choices and some do not.
+_VERB_CHOICES = r"'?list'?, '?set'?, '?rm'?"
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        # The verb mistyped: the command it names is the one said unknown.
+        (
+            ["--workspace", SECRET, "secrets", "lis"],
+            r"mandala-py secrets: error: unknown command; choose from " + _VERB_CHOICES,
+        ),
+        (
+            ["--workspace", SECRET, "--json", "secrets", "lis"],
+            r"unknown command; choose from " + _VERB_CHOICES,
+        ),
+        # The verb left off.
+        (
+            ["--workspace", SECRET, "secrets"],
+            r"mandala-py secrets: error: the following arguments are required: verb",
+        ),
+        (
+            [f"--workspace={SECRET}", "secrets"],
+            r"mandala-py secrets: error: the following arguments are required: verb",
+        ),
+    ],
+)
+def test_an_early_value_is_dropped_when_the_command_name_is_incomplete(
+    capsys: pytest.CaptureFixture[str], argv: list[str], message: str
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(argv)
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert SECRET not in out + err
+    said = json.loads(err)["error"]["message"] if "--json" in argv else err
+    assert re.search(message, said), said
+
+
+def test_a_value_is_dropped_only_for_an_option_the_command_declares_with_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --json takes no value, so the word after it is still read as a command
+    # name, and argparse says it is none.
+    with pytest.raises(SystemExit):
+        _cli.main(["--json", "nosuch", "secrets", "list"])
+    assert "invalid choice" in json.dumps(failure(capsys))
+    # Nor is a value dropped when no command is named after it.
+    with pytest.raises(SystemExit):
+        _cli.main(["--workspace", "ws_1"])
+    assert "invalid choice" in capsys.readouterr().err
+    # Nor a mistyped command name, when what follows it does not continue a
+    # command: it is the word said unknown, not taken for the value.
+    with pytest.raises(SystemExit):
+        _cli.main(["--workspace", "secretz", "list"])
+    assert "invalid choice: 'secretz'" in capsys.readouterr().err
+    # A flag joined to a value is not one the command would take there either.
+    with pytest.raises(SystemExit):
+        _cli.main(["--json=yes", "webhooks", "list"])
+    assert "must come after" not in capsys.readouterr().err
+
+
+def test_an_incomplete_command_name_drops_a_value_only_if_every_command_agrees() -> None:
+    # --x is a flag under one verb of grp and takes a value under the other.
+    top = argparse.ArgumentParser()
+    grp = top.add_subparsers(dest="command").add_parser("grp").add_subparsers(dest="verb")
+    grp.add_parser("flag").add_argument("--x", action="store_true")
+    grp.add_parser("value").add_argument("--x")
+    # Until the verb is read, whether v is a value is not known.
+    assert _cli._without_early_values(top, ["--x", "v", "grp"]) == ["--x", "v", "grp"]
+    assert _cli._without_early_values(top, ["--x", "v", "grp", "value"]) == [
+        "--x",
+        "grp",
+        "value",
+    ]
+    assert _cli._without_early_values(top, ["--x", "v", "grp", "flag"]) == [
+        "--x",
+        "v",
+        "grp",
+        "flag",
+    ]
+    # --y takes a value under every verb it is declared by, so an unfinished
+    # name is enough.
+    grp.choices["value"].add_argument("--y")
+    assert _cli._without_early_values(top, ["--y", "v", "grp"]) == ["--y", "grp"]
 
 
 def test_an_option_before_the_command_is_still_not_named_under_secrets(
