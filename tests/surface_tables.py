@@ -191,6 +191,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:resolution",
         "body:start",
         "body:secrets",
+        "body:browser_proxy",
     },
     "GET computers/:id": set(),
     "PATCH computers/:id": {
@@ -199,6 +200,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:ram_mb",
         "body:disk_gb",
         "body:idle_suspend_min",
+        "body:browser_proxy",
     },
     "DELETE computers/:id": {"query:snapshots", "query:expect"},
     "POST computers/:id/start": {"query:resume_only"},
