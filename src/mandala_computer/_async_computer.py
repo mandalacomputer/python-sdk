@@ -46,6 +46,7 @@ from ._computer import (
     _agent_once_outcome,
     _agent_outcome,
     _attach_agent_partial,
+    _browser_proxy_timeout,
     _bytes_written,
     _clipboard_text,
     _continues,
@@ -94,6 +95,8 @@ from ._models import (
     Activity,
     ActivityPage,
     ActivityResults,
+    BrowserProxy,
+    BrowserProxyArgs,
     ComputerDeletion,
     ExecResult,
     ExecStatus,
@@ -436,6 +439,21 @@ class AsyncComputer(ComputerFields):
         self._data = _api.computer_payload(
             await self._t.json_object(
                 "PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes)
+            )
+        )
+        return self
+
+    async def set_browser_proxy(
+        self, proxy: BrowserProxyArgs | BrowserProxy | None
+    ) -> AsyncComputer:
+        """Send this computer's browsers through a proxy, or stop doing so.
+
+        Replaces the setting whole; ``None`` removes it. See
+        :meth:`Computer.set_browser_proxy`: this is its twin.
+        """
+        self._data = _api.computer_payload(
+            await self._t.json_object(
+                "PATCH", _api.computer(self.id), json=_api.browser_proxy_update_body(proxy)
             )
         )
         return self
@@ -800,14 +818,51 @@ class AsyncComputer(ComputerFields):
         before its secrets land. See :meth:`Computer.wait_for_secrets`: this is
         its twin, and :meth:`AsyncComputers.launch` calls it for you.
         """
+        return await self._wait_for_state(
+            timeout,
+            poll,
+            "delivered",
+            lambda start_failed: self._secrets_state(expect_secrets, start_failed),
+            lambda observed, fresh, state: _secrets_timeout(
+                self.id, timeout, observed, fresh, state
+            ),
+        )
+
+    async def wait_for_browser_proxy(
+        self, timeout: float = 180.0, poll: float = 2.0, *, expect_browser_proxy: bool = False
+    ) -> AsyncComputer:
+        """Await until this computer's browsers have its browser proxy.
+
+        See :meth:`Computer.wait_for_browser_proxy`: this is its twin, and
+        :meth:`AsyncComputers.launch` calls it for you when the create carried
+        one.
+        """
+        return await self._wait_for_state(
+            timeout,
+            poll,
+            "applied",
+            lambda start_failed: self._browser_proxy_state(expect_browser_proxy, start_failed),
+            lambda observed, fresh, state: _browser_proxy_timeout(
+                self.id, timeout, observed, fresh, state
+            ),
+        )
+
+    async def _wait_for_state(
+        self,
+        timeout: float,
+        poll: float,
+        done: str,
+        judge: Callable[[str], str | MandalaError],
+        timed_out: Callable[[bool, bool, str], str],
+    ) -> AsyncComputer:
+        """The twin of :meth:`Computer._wait_for_state`, which says what it
+        keeps and why."""
         check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         observed = False
         fresh = False
-        # The create's failed start, kept past the refresh that clears it and
-        # retired by a reservation: Computer.wait_for_secrets says why.
         start_failed = self.start_error
-        state: str | MandalaError = "delivering"
+        state = ""
         while True:
             remaining = deadline - time.monotonic()
             delay = poll
@@ -821,14 +876,15 @@ class AsyncComputer(ComputerFields):
                     delay = _ride_out(err, deadline, poll)
                     fresh = False
             if observed:
-                state = self._secrets_state(expect_secrets, self.start_error or start_failed)
-                if state == "delivered":
+                verdict = judge(self.start_error or start_failed)
+                if isinstance(verdict, MandalaError):
+                    raise verdict
+                state = verdict
+                if state == done:
                     return self
-                if isinstance(state, MandalaError):
-                    raise state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh, state))
+                raise TimeoutError(timed_out(observed, fresh, state))
             await asyncio.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------

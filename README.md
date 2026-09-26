@@ -663,6 +663,33 @@ operator changes it.
 The screen is not part of this. `resolution` is fixed for the life of a
 computer — it is chosen at [create](#use) and nowhere else.
 
+### A proxy for the browsers
+
+`browser_proxy` sends a Linux computer's browsers — Chromium, Chrome and
+Firefox — through a proxy, as a locked policy each reads when it starts. Nothing
+else on the computer uses it: `exec()`, a terminal and every other program reach
+the network directly. Set it at create, or with `set_browser_proxy()`, which
+replaces the setting whole; `None` removes it. Which proxies are accepted is the
+platform's rule, and a value it refuses raises `APIError` (400) with its
+sentence; only the shape is checked here.
+
+```python
+c = client.computers.launch(
+    template="base",
+    browser_proxy={"server": "http://proxy.example.com:3128", "bypass": ["<local>", "*.internal"]},
+)  # launch waits for the guest to have it
+
+c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
+c.wait_for_browser_proxy()  # before starting a browser that must use it
+c.browser_proxy  # BrowserProxy(server='socks5://127.0.0.1:1080', bypass=())
+c.set_browser_proxy(None)  # browsers go out directly again
+```
+
+A running computer has a change within seconds; `browser_proxy_pending` is true
+until it does, and `wait_for_browser_proxy()` waits on it. A stopped or
+suspended computer is given the setting as it starts. A browser already running
+when the setting changes applies it at its next start.
+
 ### Growing past the host
 
 A resize is refused when the size asks for more RAM than the host the computer
@@ -1913,6 +1940,9 @@ page when they cannot be read, so keep the checkpoint you had.
   computer runs, and its guest answers, a few seconds before they do. Returns at
   once when nothing is bound; a delivery that failed, or a stopped computer
   nobody is starting, is reported immediately.
+- `wait_for_browser_proxy()` — its browsers have its
+  [browser proxy](#a-proxy-for-the-browsers). Returns at once for a computer
+  with none; a stopped computer nobody is starting is reported immediately.
 
 Both waits read `running_ram_mb` to tell those apart, and treat its ABSENCE as
 unknown rather than as zero: a host too old to report it, or one that could not
@@ -2996,6 +3026,8 @@ mandala-py webhooks list              # and create, get, update, delete, rotate,
 mandala-py secrets list               # names and revisions, never values
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
+mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
+mandala-py browser-proxy get dev      # and clear
 mandala-py logout                     # forget the saved profile; the key stays valid
 mandala-py --version
 ```

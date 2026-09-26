@@ -79,7 +79,7 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import _openssh
+from . import _api, _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
@@ -110,6 +110,7 @@ from ._exceptions import (
 )
 from ._models import (
     ApiKey,
+    BrowserProxyArgs,
     Listing,
     Secret,
     SshAccess,
@@ -2266,6 +2267,136 @@ def _ssh_parsers(sub: Any) -> None:
     config.set_defaults(fn=_cmd_ssh_config)
 
 
+# --- browser proxy ---------------------------------------------------------
+
+
+def _bypass_list(values: Sequence[str] | None) -> list[str] | None:
+    """A bypass list as typed: each value comma-separated and repeatable, so
+    ``--bypass a.com,b.com`` and ``--bypass a.com --bypass b.com`` say the
+    same thing. ``None`` when none was given, so the setting is sent without
+    one. An empty entry is refused, as the SDK refuses one: ``--bypass ''``
+    would otherwise send an empty list and look like it had said something.
+    Nothing else is checked here: which entries are valid is the platform's
+    rule, and its refusal names the entry."""
+    if values is None:
+        return None
+    entries = [e.strip() for v in values for e in v.split(",")]
+    if not all(entries):
+        _die("--bypass has an empty entry; name each host, comma-separated", "invalid_arguments")
+    return entries
+
+
+def _wait_for_proxy(c: Computer) -> None:
+    """``--wait``: until the computer's browsers have the change.
+
+    A computer that is not running and that no start is under way for runs no
+    browser, and is given the setting as it starts; the change is stored. That
+    is said rather than reported as a failure of a change that was made, and
+    rather than waited on until a start nobody asked for. Read first, so the
+    answer is about the computer now and not the PATCH's reply."""
+    c.refresh()
+    running_ram = c.running_ram_mb
+    if c.status in ("stopped", "suspended") and not (running_ram is not None and running_ram > 0):
+        print(
+            f"{c.name or c.id} is {c.status}: the change is stored and applied as it starts",
+            file=sys.stderr,
+        )
+        return
+    c.wait_for_browser_proxy()
+
+
+def _proxy_result(args: argparse.Namespace, c: Computer) -> int:
+    proxy = c.browser_proxy
+    pending = c.browser_proxy_pending
+    if args.json:
+        _json(
+            {
+                "id": c.id,
+                "name": c.name,
+                "browser_proxy": c.raw.get("browser_proxy"),
+                "browser_proxy_pending": pending,
+            }
+        )
+        return 0
+    label = c.name or c.id
+    if proxy is None:
+        print(f"{label}: no browser proxy; its browsers go out directly")
+    else:
+        print(f"{label}: browsers through {proxy.server}")
+        if proxy.bypass:
+            print(f"  bypass: {', '.join(proxy.bypass)}")
+    if pending:
+        print("  pending: the computer's browsers do not have this setting yet")
+    return 0
+
+
+def _cmd_browser_proxy_get(args: argparse.Namespace) -> int:
+    with _client() as client:
+        c = _resolve(client, args.target).refresh()
+    return _proxy_result(args, c)
+
+
+def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
+    proxy: BrowserProxyArgs = {"server": args.url}
+    bypass = _bypass_list(args.bypass)
+    if bypass is not None:
+        proxy["bypass"] = bypass
+    # Checked before the computer is looked up, so a malformed value costs no
+    # request. The platform's rules on the URL itself are its own to apply.
+    _api.browser_proxy_body(proxy)
+    with _client() as client:
+        c = _resolve(client, args.target).set_browser_proxy(proxy)
+        if args.wait:
+            _wait_for_proxy(c)
+    return _proxy_result(args, c)
+
+
+def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
+    with _client() as client:
+        c = _resolve(client, args.target).set_browser_proxy(None)
+        if args.wait:
+            _wait_for_proxy(c)
+    return _proxy_result(args, c)
+
+
+def _browser_proxy_parser(sub: Any) -> None:
+    proxy = sub.add_parser("browser-proxy", help="a proxy for a computer's browsers")
+    verbs = proxy.add_subparsers(dest="verb", required=True)
+    get = verbs.add_parser("get", help="show a computer's browser proxy")
+    get.add_argument("target", metavar="computer", help="computer name or id")
+    get.add_argument("--json", action="store_true", help="the setting as JSON")
+    get.set_defaults(fn=_cmd_browser_proxy_get)
+    put = verbs.add_parser(
+        "set", help="send a computer's browsers through a proxy, replacing any it has"
+    )
+    put.add_argument("target", metavar="computer", help="computer name or id")
+    put.add_argument("url", metavar="URL", help="the proxy, e.g. http://proxy.example.com:3128")
+    put.add_argument(
+        "--bypass",
+        action="append",
+        metavar="LIST",
+        help="hosts the browsers reach directly, comma-separated; repeat for more",
+    )
+    put.add_argument(
+        "--wait",
+        action="store_true",
+        help="return once the computer's browsers have it (a stopped one gets it as it starts)",
+    )
+    put.add_argument("--json", action="store_true", help="the setting as JSON")
+    put.set_defaults(fn=_cmd_browser_proxy_set)
+    clear = verbs.add_parser(
+        "clear", help="remove a computer's browser proxy; its browsers go out directly"
+    )
+    clear.add_argument("target", metavar="computer", help="computer name or id")
+    clear.add_argument(
+        "--wait",
+        action="store_true",
+        help="return once the computer's browsers no longer use it (a stopped one: as it starts)",
+    )
+    clear.add_argument("--json", action="store_true", help="the setting as JSON")
+    clear.set_defaults(fn=_cmd_browser_proxy_clear)
+
+
 def _parser() -> _Parser:
     # _Parser throughout: add_subparsers makes every subcommand's parser the
     # same class as its parent's, so each one prints its own whole help.
@@ -2299,6 +2430,7 @@ def _parser() -> _Parser:
     scp.set_defaults(fn=_cmd_scp)
 
     _ssh_parsers(sub)
+    _browser_proxy_parser(sub)
     _webhooks_parser(sub)
     _secrets_parser(sub)
     _keys_parsers(sub)

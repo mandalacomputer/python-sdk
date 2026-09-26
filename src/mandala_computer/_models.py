@@ -11,7 +11,7 @@ import binascii
 import builtins
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -36,6 +36,8 @@ __all__ = [
     "ActivityResults",
     "ApiKey",
     "ApiKeyCreated",
+    "BrowserProxy",
+    "BrowserProxyArgs",
     "BuildProgress",
     "BuildStep",
     "ComputerDeletion",
@@ -3157,6 +3159,67 @@ class SshAccess:
             error=_opt_text(d.get("error")),
             raw=dict(d),
         )
+
+
+# --- browser proxy ----------------------------------------------------------
+
+
+class _BrowserProxyServer(TypedDict):
+    server: str
+
+
+class BrowserProxyArgs(_BrowserProxyServer, total=False):
+    """A proxy for a computer's browsers, for
+    :meth:`~mandala_computer.Computers.create` and
+    :meth:`~mandala_computer.Computer.set_browser_proxy`.
+
+    ``server`` is the proxy's URL, such as ``http://proxy.example.com:3128`` or
+    ``socks5://127.0.0.1:1080``. Which schemes and hosts are accepted is the
+    platform's rule, not this client's: a value it refuses raises
+    :class:`~mandala_computer.BadRequestError` with its sentence. ``bypass``
+    names the hosts the browsers reach directly — ``example.com``,
+    ``*.example.com``, an address or a range, or ``<local>``.
+    """
+
+    bypass: Sequence[str]
+
+
+@dataclass(frozen=True)
+class BrowserProxy:
+    """The proxy a computer's browsers are sent through, as the platform reports it.
+
+    ``server`` is in its stored spelling (lower-cased), and ``bypass`` is the
+    list as stored, duplicates dropped; empty when there is none. Can be passed
+    back to :meth:`~mandala_computer.Computer.set_browser_proxy` as it is.
+    """
+
+    server: str
+    bypass: tuple[str, ...] = ()
+
+    @classmethod
+    def from_api(cls, d: object, where: str = "computer") -> BrowserProxy | None:
+        """Refuses rather than guesses, for :meth:`SecretBinding.from_api`'s reason.
+
+        A change replaces the setting whole, so what is read here is what a
+        caller edits and sends back: a bypass entry dropped or a server coerced
+        on the read is one the caller never saw, removed by an update that
+        looked like it kept everything. Keys this client does not know are
+        left out rather than refused, so a platform that grows the setting is
+        still readable. ``None`` when there is none.
+        """
+        if d is None:
+            return None
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: browser_proxy is not an object")
+        server = d.get("server")
+        if not isinstance(server, str) or not server:
+            raise MandalaError(f"{where}: browser_proxy does not name its server")
+        bypass = d.get("bypass")
+        if bypass is None:
+            return cls(server=str.__str__(server))
+        if not isinstance(bypass, list) or not all(isinstance(e, str) and e for e in bypass):
+            raise MandalaError(f"{where}: browser_proxy bypass is not a list of hosts")
+        return cls(server=str.__str__(server), bypass=tuple(str.__str__(e) for e in bypass))
 
 
 # --- secret bindings --------------------------------------------------------

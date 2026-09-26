@@ -1060,6 +1060,7 @@ def create_body(
     size: str | None = None,
     template_transfer: str | None = None,
     secrets: object = None,
+    browser_proxy: object = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -1072,7 +1073,8 @@ def create_body(
     refusal exists for callers who are not this SDK.
 
     ``secrets`` goes through :func:`secret_bindings_body`, and no ``secrets``
-    key is sent when it is ``None``.
+    key is sent when it is ``None``. ``browser_proxy`` goes through
+    :func:`browser_proxy_body` the same way.
     """
     if size is not None and any(
         v is not None for v in (template, template_transfer, cpu, ram_mb, disk_gb)
@@ -1112,7 +1114,71 @@ def create_body(
             body[key] = whole(count, key, exc=ValueError)
     if secrets is not None:
         body["secrets"] = secret_bindings_body(secrets)
+    if browser_proxy is not None:
+        body["browser_proxy"] = browser_proxy_body(browser_proxy)
     return body
+
+
+_BROWSER_PROXY_KEYS = frozenset({"server", "bypass"})
+
+
+def browser_proxy_body(proxy: object, what: str = "browser_proxy") -> dict[str, Any]:
+    """A browser proxy as the wire takes it, checked for shape only.
+
+    A :class:`~mandala_computer.BrowserProxyArgs` mapping, or a
+    :class:`~mandala_computer.BrowserProxy` read off another computer. The
+    shape is this client's to know; the rules on the values are not. Which
+    schemes a proxy may use, which hosts it may name and how many bypass
+    entries there may be are the platform's, and they are growing, so they are
+    left to its 400, which names the rule that was broken. A copy here would
+    refuse a value the platform has since learned to accept.
+
+    A key this does not know is refused rather than dropped, as a secret
+    binding's is: a misspelt ``bypass`` left out would send the browsers
+    through the proxy for every host.
+    """
+    from ._models import BrowserProxy  # a cycle at import time; not at call time
+
+    if isinstance(proxy, BrowserProxy):
+        proxy = {"server": proxy.server, "bypass": list(proxy.bypass)}
+    if not isinstance(proxy, Mapping):
+        raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
+            f"{what} must be a mapping {{server, bypass}}, not {type(proxy).__name__}"
+        )
+    unknown = sorted(str(k) for k in proxy if k not in _BROWSER_PROXY_KEYS)
+    if unknown:
+        raise ValueError(f"{what} has unknown keys {unknown}")
+    server = canonical(proxy.get("server"), f"{what}.server")
+    if not server.strip():
+        raise ValueError(f"{what}.server must not be empty")
+    body: dict[str, Any] = {"server": server}
+    bypass = proxy.get("bypass")
+    if bypass is None:
+        return body
+    # A bare string is a sequence of characters, and would go out as one
+    # bypass entry per letter.
+    if isinstance(bypass, (str, bytes, Mapping)) or not isinstance(bypass, (list, tuple)):
+        raise ValueError(  # noqa: TRY004
+            f"{what}.bypass must be a list of hosts, not {type(bypass).__name__}"
+        )
+    entries = []
+    for i, entry in enumerate(bypass):
+        text = canonical(entry, f"{what}.bypass[{i}]")
+        if not text.strip():
+            raise ValueError(f"{what}.bypass[{i}] must not be empty")
+        entries.append(text)
+    body["bypass"] = entries
+    return body
+
+
+def browser_proxy_update_body(proxy: object) -> dict[str, Any]:
+    """The PATCH that replaces a computer's browser proxy, or removes it.
+
+    ``None`` is sent, not omitted, for :func:`idle_suspend_body`'s reason: an
+    explicit null is how the setting is removed. The platform requires this to
+    be the only field in the request, which is why it has a method of its own.
+    """
+    return {"browser_proxy": None if proxy is None else browser_proxy_body(proxy)}
 
 
 def snapshot_clone_body(
