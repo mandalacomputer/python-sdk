@@ -62,6 +62,13 @@ This is the summary you read to decide whether to upgrade.
   one-line usage said nothing about the command typed. Extra arguments are now
   counted, never quoted, and an unknown option is named only when it is shaped
   like one: either could be a secret typed where `secrets set` reads stdin.
+  A word after `--` is an operand however it is spelled, counted and never
+  named as an option, and an option typed before the command that declares it
+  (`mandala-py --json secrets list`) is said to belong after it. Under
+  `secrets`, no usage error repeats what was typed: not an option-shaped word
+  such as `--sk-live-0123`, and not argparse's own messages that quote a value
+  (`--keep-newline=VALUE`, an ambiguous abbreviation, an unknown verb, which
+  now lists the verbs instead).
 
 ## [0.6.0] — 2026-09-25
 

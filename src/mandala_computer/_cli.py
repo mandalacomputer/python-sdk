@@ -72,7 +72,8 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Collection, Sequence
 from contextlib import suppress
 from pathlib import Path
 from types import FrameType
@@ -238,19 +239,109 @@ def _unknown_option(word: str) -> str:
     return 'unrecognized option: an argument starts with "-" but is not an option name'
 
 
-def _unexpected(extra: Sequence[str]) -> str:
+#: Why a diagnostic under ``secrets`` does not repeat what was typed.
+_NOT_REPEATED = "not repeated here, as under secrets it may be a secret value"
+
+#: The argparse diagnostics that quote nothing typed, only names this CLI
+#: declared. Every other one (``ignored explicit argument 'VALUE'``, an
+#: ambiguous abbreviation, an invalid choice) repeats a word from the command
+#: line, and under ``secrets`` that word may be the secret.
+_QUOTES_NOTHING = re.compile(
+    r"the following arguments are required: [\w, /-]+|argument [\w/-]+: expected one argument"
+)
+
+
+def _command_end(words: Sequence[str], command: Sequence[str]) -> int:
+    """Where in ``words`` the command's own arguments begin: just past the last
+    word of its name (``secrets``, ``list``), or 0 when that name cannot be
+    found in them. No parser above a command takes a value, so its name is the
+    first run of non-option words, read in order."""
+    found = 0
+    for at, word in enumerate(words):
+        if found < len(command) and word == command[found]:
+            found += 1
+            if found == len(command):
+                return at + 1
+    return 0
+
+
+def _takes(known: Collection[str], word: str) -> bool:
+    """Whether a command that declares ``known`` accepts ``word`` as one of its
+    options: that exact spelling, or the unambiguous abbreviation argparse
+    expands."""
+    if word in known:
+        return True
+    return word.startswith("--") and sum(k.startswith(word) for k in known) == 1
+
+
+#: argparse's message for a word that is none of a subcommand's names. The
+#: list it ends with is the declared names; argparse puts it after the word
+#: typed, so a parenthesis in that word cannot stand in for it.
+_INVALID_CHOICE = re.compile(
+    r"argument \S+: invalid choice: .*\(choose from (?P<choices>[^()]*)\)", re.DOTALL
+)
+
+
+def _unexpected(
+    extra: Sequence[str],
+    words: Sequence[str],
+    *,
+    command: Sequence[str] = (),
+    known: Collection[str] = (),
+    quotes: bool = True,
+    hint: str = "",
+    prog: str = PROG,
+) -> str:
     """The message for words no command took: options shaped like option names
     are named, and every other word is counted, never quoted.
 
     Most often such a word is a value typed where a prompt or stdin was meant
     to read it — ``mandala-py secrets set NAME "$TOKEN"`` — and printing it
-    would copy the credential into whatever log captures stderr.
+    would copy the credential into whatever log captures stderr. Under
+    ``secrets`` (``quotes`` false) not even an option is named: a secret can be
+    shaped exactly like one, ``--sk-live-0123``.
+
+    Which words are options is read off ``words``, everything that was typed,
+    because argparse reports words from every part of it in one list, keeping a
+    ``--`` in it on some paths and not others:
+
+    - Before the ``command``'s name, only the parsers above it read, and none
+      of them declares what the command does. An option the command ``known``
+      declares, typed there, was simply typed too early — ``--json secrets
+      list`` — and is said so. Naming it quotes nothing but a declared name.
+    - Between the name and the first ``--``, a spelling the command declares
+      was taken by it, so one reported is not that word.
+    - Past a bare ``--`` a word is an operand however it is spelled — that is
+      how a value starting with a dash is passed — so it is counted.
     """
-    named = [word for word in extra if _OPTION_NAME.fullmatch(word)]
-    others = len(extra) - len(named)
+    cut = words.index("--") if "--" in words else len(words)
+    start = _command_end(words[:cut], command)
+    early, late = words[:start], words[start:cut]
+    misplaced = Counter(w for w in early if w in known)
+    options = Counter(w for w in early if _OPTION_NAME.fullmatch(w) and w not in known)
+    options.update(w for w in late if _OPTION_NAME.fullmatch(w) and not _takes(known, w))
+    rest = list(extra)
+    if "--" in words and rest.count("--") == words.count("--"):
+        rest.remove("--")  # the separator itself, not an operand
+    early_words, named = [], []
+    for word in rest:
+        if misplaced[word]:
+            misplaced[word] -= 1
+            early_words.append(word)
+        elif options[word]:
+            options[word] -= 1
+            named.append(word)
+    others = len(rest) - len(named) - len(early_words)
     parts = []
-    if named:
+    if early_words:
+        parts.append(f"{' '.join(early_words)} must come after the command, {prog}")
+    if named and quotes:
         parts.append(f"unrecognized option{'s' if len(named) > 1 else ''}: {' '.join(named)}")
+    elif named:
+        parts.append(
+            f"{len(named)} unrecognized option{'s' if len(named) > 1 else ''}, {_NOT_REPEATED}"
+            + (f"; {hint}" if hint else "")
+        )
     if others:
         parts.append(
             f"{others} argument{'s' if others > 1 else ''} too many "
@@ -281,7 +372,27 @@ class _Parser(argparse.ArgumentParser):
 
     json_errors = False
 
+    #: Whether this command's diagnostics may repeat what was typed. False for
+    #: ``secrets`` and its verbs; see :func:`_unexpected`.
+    quotes_input = True
+
+    #: Said after an option this command could not name: where the value it
+    #: may have been is read instead.
+    unnamed_hint = ""
+
     def error(self, message: str) -> NoReturn:
+        # argparse's own diagnostics, which quote what was typed freely.
+        if not self.quotes_input and not _QUOTES_NOTHING.fullmatch(message):
+            choices = _INVALID_CHOICE.fullmatch(message)
+            message = (
+                f"unknown command; choose from {choices['choices']} (the word typed is {_NOT_REPEATED})"
+                if choices
+                else f"an argument could not be read, and is {_NOT_REPEATED}"
+            )
+        self.usage_error(message)
+
+    def usage_error(self, message: str) -> NoReturn:
+        """Report ``message`` as it is, over the command's whole help."""
         if _Parser.json_errors:
             _json_failure(
                 {"code": "invalid_arguments", "message": message, "usage": self.format_help()}
@@ -290,19 +401,19 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, f"{self.prog}: error: {message}\n\n{self.format_help()}")
 
 
-def _leaf(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.ArgumentParser:
-    """The parser of the command ``args`` names, following each subcommand chosen."""
+def _leaf(parser: _Parser, args: argparse.Namespace) -> tuple[_Parser, list[str]]:
+    """The parser of the command ``args`` names, following each subcommand
+    chosen, and the words of that command's name (``["secrets", "list"]``)."""
+    command: list[str] = []
     while True:
-        chosen = next(
-            (
-                action.choices.get(getattr(args, action.dest, None) or "")
-                for action in parser._actions
-                if isinstance(action, argparse._SubParsersAction)
-            ),
-            None,
+        subcommands = next(
+            (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None
         )
-        if not isinstance(chosen, argparse.ArgumentParser):
-            return parser
+        name = (getattr(args, subcommands.dest, None) or "") if subcommands else ""
+        chosen = subcommands.choices.get(name) if subcommands else None
+        if not isinstance(chosen, _Parser):
+            return parser, command
+        command.append(name)
         parser = chosen
 
 
@@ -1366,11 +1477,14 @@ def _secrets_parser(sub: Any) -> None:
     )
     put.add_argument("--json", action="store_true", help="the stored secret as JSON")
     put.set_defaults(fn=_cmd_secrets_set)
+    put.unnamed_hint = "secrets set reads the value from stdin or a prompt"
 
     rm = verbs.add_parser("rm", help="delete a secret, by name or id")
     rm.add_argument("name", metavar="NAME")
     rm.add_argument("--workspace", metavar="ID", help=scope)
     rm.set_defaults(fn=_cmd_secrets_rm)
+    for verb in (store, listing, put, rm):
+        verb.quotes_input = False
 
 
 # --- who you are, API keys, logout (platform OPL-5053) -----------------------
@@ -2034,7 +2148,7 @@ def _ssh_parsers(sub: Any) -> None:
     config.set_defaults(fn=_cmd_ssh_config)
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser() -> _Parser:
     # _Parser throughout: add_subparsers makes every subcommand's parser the
     # same class as its parent's, so each one prints its own whole help.
     from mandala_computer import __version__
@@ -2097,7 +2211,18 @@ def main(argv: list[str] | None = None) -> int:
             # parse_args reports these against the TOP parser, whose usage says
             # nothing about the command that was typed. Reported against that
             # command instead, with its whole help.
-            _leaf(parser, args).error(_unexpected(extra))
+            leaf, command = _leaf(parser, args)
+            leaf.usage_error(
+                _unexpected(
+                    extra,
+                    words,
+                    command=command,
+                    known=leaf._option_string_actions,
+                    quotes=leaf.quotes_input,
+                    hint=leaf.unnamed_hint,
+                    prog=leaf.prog,
+                )
+            )
         return int(args.fn(args))
     except _Failure as e:
         if not as_json:
