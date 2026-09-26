@@ -60,8 +60,9 @@ This is the summary you read to decide whether to upgrade.
   refused as above. A restart delivers bound secrets again and reads `running`
   before they land. Called after `restart()`, it waits for them on a platform
   that reports that redelivery as `secrets_delivering`; on one that does not,
-  `secrets_delivering` may read false (or be absent on an older platform)
-  before the values land, and the wait can return before they do.
+  `secrets_delivering` may read false before the values land, and on a
+  platform that predates the field the wait falls back to the receipt as
+  above. Either way the wait can return before the values land.
 - **`mandala-py --json` failures carry an error code.** A failure under `--json`
   writes `{"error": {"code", "message", "status"?, "reason"?}}` as one line on
   stderr, with nothing on stdout. `code` is one snake_case word, the same
