@@ -83,6 +83,10 @@ UNIMPLEMENTED = {
     ("GET", "workspaces"),
     ("GET", "workspaces/:id"),
     ("GET", "workspaces/:id/members"),
+    # Lifecycle operations, read only (OPL-5055). Listed to stay in step with
+    # the surface; no SDK method yet.
+    ("GET", "operations"),
+    ("GET", "operations/:id"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -92,6 +96,12 @@ UNIMPLEMENTED = {
 # have nowhere to be written down and no test could tell a parameter nobody got
 # round to from one nobody wants.
 UNIMPLEMENTED_PARAMETERS = {
+    # The operations listing's parameters (OPL-5055). The route itself is in
+    # UNIMPLEMENTED, and this check reads every documented parameter whether or
+    # not its route is called, so they are pinned here with it.
+    "GET operations  query:computer_id",
+    "GET operations  query:cursor",
+    "GET operations  query:limit",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.

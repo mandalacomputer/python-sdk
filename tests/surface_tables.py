@@ -130,6 +130,9 @@ ALLOWED = {
     ("GET", "api-keys"),
     ("POST", "api-keys"),
     ("DELETE", "api-keys/:id"),
+    # Lifecycle operations, read only (OPL-5055).
+    ("GET", "operations"),
+    ("GET", "operations/:id"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
 }
@@ -364,4 +367,7 @@ PARAMETERS: dict[str, set[str]] = {
     "GET api-keys": set(),
     "POST api-keys": {"body:manage_keys", "body:name", "body:workspace_id"},
     "DELETE api-keys/:id": set(),
+    # Lifecycle operations, read only (OPL-5055).
+    "GET operations": {"query:computer_id", "query:cursor", "query:limit"},
+    "GET operations/:id": set(),
 }
