@@ -11,6 +11,14 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **Screenshot shaping: `region`, `scale`, `format` and `quality`** on
+  `computer.screenshot()` (sync and async), over the platform's new query
+  parameters — a crop `(x, y, width, height)` in screen pixels, a shrink factor
+  in (0, 1], `"png"` or `"jpeg"`, and a JPEG quality of 1-100 — for a cheaper
+  frame to hand a model. A scale beside a width, a quality on a PNG and
+  malformed values raise `ValueError` before anything is sent. A suspended
+  computer refuses a crop, a scale, a PNG or a quality with `ConflictError`
+  whose `reason` is `"unavailable"`.
 - **`client.api_keys.list()`, `create(name=, workspace_id=)` and
   `revoke(key_id)`**, and **`client.account.whoami()`** (sync and async), over
   the platform's new `GET whoami` and `GET|POST api-keys`,

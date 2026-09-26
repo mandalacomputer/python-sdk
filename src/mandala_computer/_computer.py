@@ -2517,7 +2517,16 @@ class Computer(ComputerFields):
 
     # --- observing ------------------------------------------------------
 
-    def screenshot(self, width: int | None = None, *, fresh: bool = False) -> bytes:
+    def screenshot(
+        self,
+        width: int | None = None,
+        *,
+        fresh: bool = False,
+        region: Sequence[int] | None = None,
+        scale: float | None = None,
+        format: str | None = None,
+        quality: int | None = None,
+    ) -> bytes:
         """Capture the screen.
 
         Full-resolution PNG by default. Passing ``width`` returns a downscaled
@@ -2536,11 +2545,39 @@ class Computer(ComputerFields):
         from under it after the host's idle window; anything that drives the
         desktop — :meth:`click`, :meth:`type`, :meth:`exec` — both counts as use
         and resumes it.
+
+        **Shaping the picture.** ``region``, ``scale``, ``format`` and
+        ``quality`` are a crop, a smaller image and a cheaper encoding, applied
+        in that order to the same capture — the cheaper frame to hand a model::
+
+            # The top-left quarter of a 1280x800 screen, halved, as a JPEG.
+            c.screenshot(fresh=True, region=(0, 0, 640, 400), scale=0.5,
+                         format="jpeg", quality=60)
+
+        A cropped or scaled picture is in its OWN pixel space. To click on
+        something in it, divide its position by the scale and add the region's
+        ``x`` and ``y``: above, (100, 50) in the picture is (200, 100) on the
+        screen. ``region`` is ``(x, y, width, height)`` in screen pixels, before
+        any scaling, and has to lie inside the screen; ``scale`` is greater than
+        0 and at most 1 and is not given with ``width``; ``format`` is ``png``
+        or ``jpeg`` (``jpg`` too); ``quality`` is 1 to 100 and only for a JPEG.
+        The value checks are made here and raise :class:`ValueError` before
+        anything is sent; a region past the screen's edge is the platform's to
+        refuse, with a 400 naming the screen size.
+
+        A suspended computer has only its saved picture, a JPEG, and cannot
+        shape it: a crop, a scale, ``format="png"`` or a quality raises
+        :class:`~mandala_computer.ConflictError` with ``reason`` set to
+        ``"unavailable"`` — not transient; start the computer for a screen that
+        can be shaped. ``width`` and ``format="jpeg"`` alone are still answered
+        with the saved picture.
         """
         return self._t.binary(
             "GET",
             _api.computer_action(self.id, "screenshot"),
-            params=_api.screenshot_params(width, fresh),
+            params=_api.screenshot_params(
+                width, fresh, region=region, scale=scale, format=format, quality=quality
+            ),
             accept="image/png, image/jpeg",
             content_types=("image/", "application/octet-stream"),
         )

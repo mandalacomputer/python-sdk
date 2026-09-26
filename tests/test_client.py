@@ -296,6 +296,80 @@ def test_screenshot_is_cached_unless_asked_otherwise(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_screenshot_shaping_becomes_query_params(client: mc.Client) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(200, content=b"jpg", headers={"Content-Type": "image/jpeg"})
+    )
+    c = mc.Computer(client._t, COMPUTER)
+    c.screenshot(fresh=True, region=(10, 20, 300, 200), scale=0.5, format="jpeg", quality=60)
+    assert dict(route.calls.last.request.url.params) == {
+        "fresh": "1",
+        "region": "10,20,300,200",
+        "scale": "0.5",
+        "format": "jpeg",
+        "quality": "60",
+    }
+    # A width keeps its own default encoding, JPEG, and a quality rides on it.
+    c.screenshot(width=320, quality=40)
+    assert dict(route.calls.last.request.url.params) == {"w": "320", "quality": "40"}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"width": 320, "scale": 0.5}, "width or a scale"),
+        ({"scale": 0}, "greater than 0"),
+        ({"scale": 1.5}, "at most 1"),
+        ({"scale": math.nan}, "scale"),
+        ({"scale": "0.5"}, "scale"),
+        ({"quality": 60}, "JPEG only"),
+        ({"format": "png", "quality": 60}, "in place of png"),
+        ({"format": "jpeg", "quality": 0}, "1 to 100"),
+        ({"format": "jpeg", "quality": 101}, "1 to 100"),
+        ({"format": "jpeg", "quality": 50.5}, "1 to 100"),
+        ({"format": "webp"}, "format must be one of"),
+        ({"region": (0, 0, 0, 10)}, "region width"),
+        ({"region": (-1, 0, 10, 10)}, "region x"),
+        ({"region": (0, 0, 10)}, "x, y, width, height"),
+        ({"region": "0,0,10,10"}, "x, y, width, height"),
+        ({"region": (0, 0, 10.5, 10)}, "region width"),
+    ],
+)
+@respx.mock
+def test_screenshot_refuses_a_shape_before_sending(
+    client: mc.Client, kwargs: dict[str, object], match: str
+) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(httpx.Response(200, content=b"x"))
+    with pytest.raises(ValueError, match=match):
+        mc.Computer(client._t, COMPUTER).screenshot(**kwargs)  # type: ignore[arg-type]
+    assert not route.called
+
+
+@respx.mock
+def test_a_suspended_computers_refusal_to_shape_is_a_permanent_conflict(
+    client: mc.Client,
+) -> None:
+    """A suspended computer has only its saved JPEG, and answers a crop, a
+    scale, a PNG or a quality with 409 `unavailable`. That is the typed refusal:
+    a ConflictError carrying the platform's word, not transient, and not sent
+    again by the client's own retries."""
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(
+            409,
+            json={
+                "error": "this computer is suspended and has only its saved desktop picture",
+                "reason": "unavailable",
+            },
+        )
+    )
+    with pytest.raises(mc.ConflictError) as caught:
+        mc.Computer(client._t, COMPUTER).screenshot(region=(0, 0, 10, 10))
+    assert caught.value.reason == "unavailable"
+    assert mc.is_transient(caught.value) is False
+    assert route.call_count == 1
+
+
+@respx.mock
 def test_stop_force_becomes_query_param(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/stop").mock(httpx.Response(200, json={"ok": True}))
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))

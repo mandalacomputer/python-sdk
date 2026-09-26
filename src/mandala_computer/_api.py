@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import re
 import shlex
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, TypeVar
 from urllib.parse import quote
@@ -1777,8 +1777,16 @@ def cursor_body() -> dict[str, Any]:
     return {"action": "cursor_position"}
 
 
-def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] | None:
-    """``w`` downscales, ``fresh`` skips the cache.
+def screenshot_params(
+    width: int | None,
+    fresh: bool = False,
+    *,
+    region: Sequence[int] | None = None,
+    scale: float | None = None,
+    format: str | None = None,
+    quality: int | None = None,
+) -> dict[str, Any] | None:
+    """``w`` downscales, ``fresh`` skips the cache; the rest shape the picture.
 
     A bare screenshot may be served from a frame up to 1.5 seconds old, which is
     right for a thumbnail and wrong for a loop: a model shown the frame from
@@ -1789,6 +1797,10 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
 
     Sent as ``1`` rather than ``true``: the platform documents the parameter as
     that single value and matches on it.
+
+    ``region``, ``scale``, ``format`` and ``quality`` are :func:`screenshot_shape`'s,
+    and absent from the query when not given, so every call that predates them
+    builds the URL it always did.
     """
     params: dict[str, Any] = {}
     if width is not None:
@@ -1798,7 +1810,99 @@ def screenshot_params(width: int | None, fresh: bool = False) -> dict[str, Any] 
         params["w"] = width
     if flag(fresh, "fresh"):
         params["fresh"] = 1
+    params.update(
+        screenshot_shape(width, region=region, scale=scale, format=format, quality=quality)
+    )
     return params or None
+
+
+#: The encodings a screenshot can be asked for. ``jpg`` is the platform's other
+#: spelling of ``jpeg``.
+SCREENSHOT_FORMATS = ("png", "jpeg", "jpg")
+
+
+def screenshot_shape(
+    width: int | None,
+    *,
+    region: Sequence[int] | None = None,
+    scale: float | None = None,
+    format: str | None = None,
+    quality: int | None = None,
+) -> dict[str, Any]:
+    """The crop, scale and encoding a screenshot can be shaped into.
+
+    Applied by the platform in that order to the same capture a bare call would
+    return. Only what is cheap and cannot be wrong is checked here: the shape of
+    each value, a scale beside a width, and a quality on a picture that will be
+    a PNG. Whether a region fits the screen is the platform's to say, since it
+    is the one that knows the screen, and it says so with the size in the
+    message.
+
+    The answer is a PNG when ``format`` says ``png``, or when it says nothing
+    and no width was given; the platform refuses a quality on one with a 400,
+    and so does this, before anything is sent.
+    """
+    params: dict[str, Any] = {}
+    if format is not None:
+        if not isinstance(format, str) or format not in SCREENSHOT_FORMATS:
+            raise ValueError(
+                f"format must be one of {', '.join(SCREENSHOT_FORMATS)}, not {format!r}"
+            )
+        params["format"] = format
+    if scale is not None:
+        # The same question as a width, answered twice. The platform refuses the
+        # pair rather than picking one, and so does this.
+        if width is not None:
+            raise ValueError("give a width or a scale, not both: each sets the size of the picture")
+        factor = real(
+            scale,
+            "scale",
+            message=f"scale must be a number greater than 0 and at most 1, not {scale!r}",
+        )
+        if not 0 < factor <= 1:
+            raise ValueError(
+                f"scale must be a number greater than 0 and at most 1, not {scale!r}; "
+                "a screenshot is only ever made smaller"
+            )
+        params["scale"] = factor
+    if region is not None:
+        params["region"] = screenshot_region(region)
+    if quality is not None:
+        q = whole(
+            quality,
+            "quality",
+            exc=ValueError,
+            message=f"quality must be a whole number from 1 to 100, not {quality!r}",
+        )
+        if not 1 <= q <= 100:
+            raise ValueError(f"quality must be a whole number from 1 to 100, not {quality!r}")
+        if format == "png" or (format is None and width is None):
+            raise ValueError(
+                "quality applies to a JPEG only; pass format='jpeg' with it"
+                + (" in place of png" if format == "png" else "")
+            )
+        params["quality"] = q
+    return params
+
+
+def screenshot_region(region: Sequence[int]) -> str:
+    """``(x, y, width, height)`` as the wire spells it, ``x,y,width,height``.
+
+    In the screen pixels :attr:`resolution` reports, before any scaling. Whole
+    numbers, and the size at least 1: the platform reads each with an integer
+    parser, and a fraction — the natural result of dividing a coordinate by a
+    scale — would be a 400 that could have been named here.
+    """
+    if isinstance(region, (str, bytes)) or not isinstance(region, Sequence) or len(region) != 4:
+        raise ValueError(f"region must be (x, y, width, height), not {region!r}")
+    parts = []
+    for name, value, least in zip(("x", "y", "width", "height"), region, (0, 0, 1, 1)):
+        message = f"region {name} must be a whole number of at least {least}, not {value!r}"
+        n = whole(value, f"region {name}", exc=ValueError, message=message)
+        if n < least:
+            raise ValueError(message)
+        parts.append(str(n))
+    return ",".join(parts)
 
 
 #: The platform's ceiling on ``max_steps``, mirrored.
