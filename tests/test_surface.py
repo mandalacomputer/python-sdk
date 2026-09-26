@@ -96,6 +96,11 @@ UNIMPLEMENTED = {
 # rule: a route nobody calls sends none of its parameters, and that route's own
 # line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
+    # OPL-5142: `egress_proxy` ({server}) sends ALL of a computer's outbound
+    # TCP through a proxy, set at create or by PATCH (null clears it). Listed to
+    # stay in step with the surface; not yet sent.
+    "POST computers  body:egress_proxy",
+    "PATCH computers/:id  body:egress_proxy",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
