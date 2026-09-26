@@ -60,7 +60,8 @@ This is the summary you read to decide whether to upgrade.
   refused as above. A restart delivers bound secrets again and reads `running`
   before they land. Called after `restart()`, it waits for them on a platform
   that reports that redelivery as `secrets_delivering`; on one that does not,
-  `secrets_delivering` reads false throughout and the wait returns at once.
+  `secrets_delivering` may read false (or be absent on an older platform)
+  before the values land, and the wait can return before they do.
 - **`mandala-py --json` failures carry an error code.** A failure under `--json`
   writes `{"error": {"code", "message", "status"?, "reason"?}}` as one line on
   stderr, with nothing on stdout. `code` is one snake_case word, the same
@@ -97,9 +98,9 @@ This is the summary you read to decide whether to upgrade.
   since there a value and a mistyped command cannot be told apart; typed
   joined (`--workspace=ws_1 secretz list`), it is dropped and the mistyped
   command is what is named. Under `secrets`, no usage error repeats what was
-  typed: not an option-shaped word such as `--sk-live-0123`, and not argparse's own messages that quote a value
-  (`--keep-newline=VALUE`, an ambiguous abbreviation, an unknown verb, which
-  now lists the verbs instead).
+  typed: not an option-shaped word such as `--sk-live-0123`, and not
+  argparse's own messages that quote a value (`--keep-newline=VALUE`, an
+  ambiguous abbreviation, an unknown verb, which now lists the verbs instead).
 
 ## [0.6.0] — 2026-09-25
 
@@ -121,10 +122,11 @@ refusal as `ComputerNotRunningError`.
   409 with no usable reason (a body that could not be read, or JSON without a
   string `reason`) raises the new `CreateOnlyConflictError`, a `ConflictError`
   that `is_transient` calls permanent and that claims nothing about the path;
-  `FileExistsError` is only the platform's explicit `exists`. If an earlier attempt's outcome was unknown, the file
-  may be yours: read it and compare before choosing another path or
-  overwriting. The default is unchanged: a write replaces the file. Linux
-  computers only. `mandala-py scp` gains `--no-overwrite` for uploads.
+  `FileExistsError` is only the platform's explicit `exists`. If an earlier
+  attempt's outcome was unknown, the file may be yours: read it and compare
+  before choosing another path or overwriting. The default is unchanged: a
+  write replaces the file. Linux computers only. `mandala-py scp` gains
+  `--no-overwrite` for uploads.
 - **The account's secret store.** `client.secrets.list/get/create/replace/delete`
   (sync and async) over `GET/POST /secrets` and `GET/PUT/DELETE /secrets/{id}`,
   each taking `workspace_id` for a workspace's scope. Values are write-only: a
