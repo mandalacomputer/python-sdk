@@ -65,6 +65,8 @@ from ._models import (
     Activity,
     ActivityPage,
     ActivityResults,
+    BrowserProxy,
+    BrowserProxyArgs,
     ComputerDeletion,
     ExecResult,
     ExecStatus,
@@ -959,6 +961,21 @@ def _secrets_timeout(
     )
 
 
+def _browser_proxy_timeout(computer_id: str, timeout: float, observed: bool, fresh: bool) -> str:
+    """What a ``wait_for_browser_proxy`` that ran out of time says, on both handles."""
+    if not observed:
+        return (
+            f"{computer_id} could not be observed within {timeout:g}s, so whether its browsers "
+            "have its proxy is unknown"
+        )
+    if fresh:
+        return f"{computer_id}'s browser proxy was still being applied after {timeout:g}s"
+    return (
+        f"{computer_id} could not be reached for the last part of {timeout:g}s; when it last "
+        "answered its browser proxy was still being applied"
+    )
+
+
 def _ride_out(err: MandalaError, deadline: float, poll: float) -> float:
     """How long to sleep past a failed poll — or a re-raise, if it is not one.
 
@@ -1248,6 +1265,81 @@ class ComputerFields:
             if generation is not None and generation > 0 and applied < generation:
                 return "delivering"
         return "delivered"
+
+    # --- browser proxy ----------------------------------------------------
+
+    @property
+    def browser_proxy(self) -> BrowserProxy | None:
+        """The proxy this computer's browsers are sent through, or ``None``.
+
+        Chromium, Chrome and Firefox, as a locked policy each reads when it
+        starts. Nothing else on the computer uses it: ``exec``, a terminal and
+        every other program reach the network directly.
+
+        Raises :class:`~mandala_computer.MandalaError` for a value it cannot
+        read rather than dropping it: :meth:`Computer.set_browser_proxy`
+        replaces the setting whole, and this is what a caller would edit and
+        send back.
+        """
+        return BrowserProxy.from_api(self._data.get("browser_proxy"), f"computer {self.id}")
+
+    @property
+    def browser_proxy_pending(self) -> bool:
+        """Whether this running computer's browsers are still waiting for its
+        :attr:`browser_proxy` — just after a create, a start or a change — or
+        its guest still holds the files of one just removed.
+        :meth:`Computer.wait_for_browser_proxy` waits on it.
+
+        ``False`` on a computer that is not running, where the setting is
+        applied as it starts, and on a platform that predates the field. A
+        browser already running when the setting changes applies it at its
+        next start.
+        """
+        value = self._data.get("browser_proxy_pending")
+        if value is None:
+            return False
+        # Strict, since a wait decides on it: a value that is not a boolean is
+        # not a "no" this client can honestly read into it.
+        if not isinstance(value, bool):
+            raise MandalaError(f"computer {self.id}: browser_proxy_pending is not a boolean")
+        return value
+
+    def _browser_proxy_state(self, start_failed: str = "") -> str | MandalaError:
+        """Where this computer's browser proxy is, as ``wait_for_browser_proxy``
+        reads it: ``"applied"``, ``"applying"``, or the error a wait should
+        raise because nothing will apply it. ``start_failed`` is why a create's
+        first start failed, if it did."""
+        if self.browser_proxy_pending:
+            return "applying"
+        # Nothing set and nothing pending: there is nothing for a guest to
+        # have, and a removal that has landed reads exactly like this too.
+        if self.browser_proxy is None:
+            return "applied"
+        if self.build_failed:
+            return MandalaError(
+                f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+            )
+        # The platform never reports the setting pending on a computer that is
+        # not running, so a False here means only "not running yet" until it is.
+        if self.is_building:
+            return "applying"
+        if self.status != "running":
+            # The refusals _secrets_state makes, for its reasons: a known failed
+            # boot on the weaker evidence, and a machine the platform says
+            # nobody is starting. A start admitted but not yet booted reads
+            # stopped or suspended, and its proxy is ahead of it.
+            if start_failed and self.status == "stopped" and not self._start_admitted():
+                return MandalaError(
+                    f"{self.id} is stopped after it failed to start, so its browser proxy was "
+                    f"not applied: {start_failed}. Call start() to try again"
+                )
+            if self._nothing_admitted():
+                return MandalaError(
+                    f"{self.id} is {self.status!r}, and its browser proxy is applied only as it "
+                    "starts: call start()"
+                )
+            return "applying"
+        return "applied"
 
     @property
     def is_suspended(self) -> bool:
@@ -2110,6 +2202,29 @@ class Computer(ComputerFields):
         )
         return self
 
+    def set_browser_proxy(self, proxy: BrowserProxyArgs | BrowserProxy | None) -> Computer:
+        """Send this computer's browsers through a proxy, or stop doing so.
+
+        Replaces the setting whole; ``None`` removes it and takes its files out
+        of the computer. A :class:`~mandala_computer.BrowserProxy` read off
+        another computer can be passed as it is. The platform requires this to
+        be the only change in its request, which is why it is a method of its
+        own. Linux only.
+
+        A running computer has the change within seconds —
+        :meth:`wait_for_browser_proxy` before starting a browser that must use
+        it — and a stopped or suspended one is given it as it starts. Which
+        proxies are accepted is the platform's rule: a value it refuses raises
+        :class:`~mandala_computer.APIError` (400) carrying its sentence, and
+        only the shape is checked here (:class:`ValueError`).
+        """
+        self._data = _api.computer_payload(
+            self._t.json_object(
+                "PATCH", _api.computer(self.id), json=_api.browser_proxy_update_body(proxy)
+            )
+        )
+        return self
+
     def ssh_access(self) -> SshAccess:
         """Whether SSH is on for this computer, and whether it can work here.
 
@@ -2562,6 +2677,56 @@ class Computer(ComputerFields):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh, state))
+            time.sleep(min(delay, remaining))
+
+    def wait_for_browser_proxy(self, timeout: float = 180.0, poll: float = 2.0) -> Computer:
+        """Block until this computer's browsers have its browser proxy.
+
+        The setting reaches a running computer a few seconds after a create, a
+        start or a change, and a browser started in between goes out directly.
+        This polls until the platform says the guest has it
+        (:attr:`browser_proxy_pending` is false on a running computer), and
+        returns at once for a computer with no proxy and nothing left to
+        remove. :meth:`Computers.launch` calls it for you when the create
+        carried one.
+
+        Always reads the computer again before answering, so it is safe
+        straight after :meth:`set_browser_proxy`, :meth:`start` or a create.
+
+        Raises :class:`~mandala_computer.MandalaError` rather than waiting out
+        the timeout when nothing will apply it: a computer that is stopped or
+        suspended while the platform says it has admitted no start — the proxy
+        is applied as it starts, so :meth:`start` is the fix — a create's
+        computer whose first start failed, and a failed build. A host that does
+        not say whether a start is under way is waited on.
+        """
+        check_wait_args(timeout, poll)
+        deadline = time.monotonic() + timeout
+        # wait_for_secrets' three pieces of state, for its reasons.
+        observed = False
+        fresh = False
+        start_failed = self.start_error
+        while True:
+            remaining = deadline - time.monotonic()
+            delay = poll
+            if remaining > 0:
+                try:
+                    self._refresh(timeout_cap=remaining)
+                    observed = fresh = True
+                    if self._start_admitted():
+                        start_failed = ""
+                except MandalaError as err:
+                    delay = _ride_out(err, deadline, poll)
+                    fresh = False
+            if observed:
+                state = self._browser_proxy_state(self.start_error or start_failed)
+                if state == "applied":
+                    return self
+                if isinstance(state, MandalaError):
+                    raise state
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_browser_proxy_timeout(self.id, timeout, observed, fresh))
             time.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------

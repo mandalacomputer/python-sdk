@@ -18,6 +18,8 @@ from ._models import (
     AccountQuota,
     ApiKey,
     ApiKeyCreated,
+    BrowserProxy,
+    BrowserProxyArgs,
     BuildProgress,
     Listing,
     Move,
@@ -173,6 +175,7 @@ class AsyncComputers:
         start: bool = True,
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
+        browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
     ) -> AsyncComputer:
         """Provision a computer.
 
@@ -221,6 +224,14 @@ class AsyncComputers:
         :class:`ValueError` before any request is made. Omitted, no ``secrets``
         key is sent.
 
+        ``browser_proxy`` sends the computer's browsers — Chromium, Chrome and
+        Firefox, nothing else on it — through a proxy, a
+        :class:`~mandala_computer.BrowserProxyArgs`. Linux only. A create
+        carrying one is always a cold boot; wait with
+        :meth:`Computer.wait_for_browser_proxy` before starting a browser that
+        must use it. Which proxies are accepted is the platform's rule, and a
+        value it refuses is its 400; only the shape is checked here.
+
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
 
@@ -241,6 +252,7 @@ class AsyncComputers:
             start=start,
             resolution=resolution,
             secrets=secrets,
+            browser_proxy=browser_proxy,
             size=size,
         )
         data = await self._t.json_object("POST", _api.COMPUTERS, json=body)
@@ -259,6 +271,7 @@ class AsyncComputers:
         start: bool = True,
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
+        browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
     ) -> AsyncComputer:
@@ -271,10 +284,11 @@ class AsyncComputers:
         With ``secrets`` bound it also waits until they have reached the
         desktop (:meth:`AsyncComputer.wait_for_secrets`), so a command run on
         the returned computer sees them; a delivery that failed raises, naming
-        why.
+        why. With ``browser_proxy`` it also waits until the guest has it
+        (:meth:`AsyncComputer.wait_for_browser_proxy`).
 
         ``timeout`` is one readiness budget in seconds, beginning after create
-        returns. Disk, running, guest and secrets waits share the remaining time, and
+        returns. Disk, running, guest, secrets and browser proxy waits share the remaining time, and
         elapsed start work consumes it too. Create and start retain their usual
         transport deadlines: this is not a total wall-clock limit on launch.
         ``poll`` is the delay in seconds between polls in every stage.
@@ -296,6 +310,7 @@ class AsyncComputers:
             start=start,
             resolution=resolution,
             secrets=secrets,
+            browser_proxy=browser_proxy,
         )
         computer_id = computer.id
         deadline = time.monotonic() + timeout
@@ -350,6 +365,11 @@ class AsyncComputers:
                 # Told they are bound, so a read that leaves them out is not
                 # taken for "nothing bound" and returned on before they arrived.
                 await computer.wait_for_secrets(timeout=remaining(), poll=poll, expect_secrets=True)
+            # The same gap for a browser proxy: the guest answers before the
+            # policy is on disk, and a browser opened in between goes out
+            # directly.
+            if browser_proxy is not None or computer.raw.get("browser_proxy") is not None:
+                await computer.wait_for_browser_proxy(timeout=remaining(), poll=poll)
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.

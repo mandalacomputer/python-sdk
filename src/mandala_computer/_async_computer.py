@@ -46,6 +46,7 @@ from ._computer import (
     _agent_once_outcome,
     _agent_outcome,
     _attach_agent_partial,
+    _browser_proxy_timeout,
     _bytes_written,
     _clipboard_text,
     _continues,
@@ -94,6 +95,8 @@ from ._models import (
     Activity,
     ActivityPage,
     ActivityResults,
+    BrowserProxy,
+    BrowserProxyArgs,
     ComputerDeletion,
     ExecResult,
     ExecStatus,
@@ -436,6 +439,21 @@ class AsyncComputer(ComputerFields):
         self._data = _api.computer_payload(
             await self._t.json_object(
                 "PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes)
+            )
+        )
+        return self
+
+    async def set_browser_proxy(
+        self, proxy: BrowserProxyArgs | BrowserProxy | None
+    ) -> AsyncComputer:
+        """Send this computer's browsers through a proxy, or stop doing so.
+
+        Replaces the setting whole; ``None`` removes it. See
+        :meth:`Computer.set_browser_proxy`: this is its twin.
+        """
+        self._data = _api.computer_payload(
+            await self._t.json_object(
+                "PATCH", _api.computer(self.id), json=_api.browser_proxy_update_body(proxy)
             )
         )
         return self
@@ -829,6 +847,43 @@ class AsyncComputer(ComputerFields):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_secrets_timeout(self.id, timeout, observed, fresh, state))
+            await asyncio.sleep(min(delay, remaining))
+
+    async def wait_for_browser_proxy(
+        self, timeout: float = 180.0, poll: float = 2.0
+    ) -> AsyncComputer:
+        """Await until this computer's browsers have its browser proxy.
+
+        See :meth:`Computer.wait_for_browser_proxy`: this is its twin, and
+        :meth:`AsyncComputers.launch` calls it for you when the create carried
+        one.
+        """
+        check_wait_args(timeout, poll)
+        deadline = time.monotonic() + timeout
+        observed = False
+        fresh = False
+        start_failed = self.start_error
+        while True:
+            remaining = deadline - time.monotonic()
+            delay = poll
+            if remaining > 0:
+                try:
+                    await self._refresh(timeout_cap=remaining)
+                    observed = fresh = True
+                    if self._start_admitted():
+                        start_failed = ""
+                except MandalaError as err:
+                    delay = _ride_out(err, deadline, poll)
+                    fresh = False
+            if observed:
+                state = self._browser_proxy_state(self.start_error or start_failed)
+                if state == "applied":
+                    return self
+                if isinstance(state, MandalaError):
+                    raise state
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_browser_proxy_timeout(self.id, timeout, observed, fresh))
             await asyncio.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------

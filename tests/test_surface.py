@@ -100,11 +100,6 @@ UNIMPLEMENTED = {
 # rule: a route nobody calls sends none of its parameters, and that route's own
 # line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
-    # OPL-5056: `browser_proxy` ({server, bypass}) sends a computer's browsers
-    # through a proxy, set at create or by PATCH (null clears it). Listed to
-    # stay in step with the surface; not yet sent.
-    "POST computers  body:browser_proxy",
-    "PATCH computers/:id  body:browser_proxy",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
@@ -778,6 +773,11 @@ def exercise_everything(client: mc.Client) -> None:
             {"secret_id": "csec-0123456789abcde0", "file": "kubeconfig"},
         ],
     )
+    # A browser proxy at create, with its bypass list (OPL-5144).
+    client.computers.create(
+        template="base",
+        browser_proxy={"server": "http://proxy.example.com:3128", "bypass": ["<local>"]},
+    )
     # The create/delete pair as one scope. Both its routes are reached by their
     # own methods elsewhere here, so nothing but the inventory sees this line.
     with client.computers.ephemeral(template="base"):
@@ -790,6 +790,7 @@ def exercise_everything(client: mc.Client) -> None:
     c.wait_until_running()
     c.wait_for_guest()
     c.wait_for_secrets()
+    c.wait_for_browser_proxy()
     c.start()
     c.start(resume_only=True)
     c.stop()
@@ -877,6 +878,8 @@ def exercise_everything(client: mc.Client) -> None:
     client.usage.read(since=datetime(2026, 8, 1, tzinfo=timezone.utc), until="2026-08-22T00:00:00Z")
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
+    c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
+    c.set_browser_proxy(None)
     c.read_file("/home/user/out.txt")
     c.read_text_file("/home/user/out.txt")
     c.read_file_part("/home/user/out.txt", offset=0, length=1024)
@@ -1040,6 +1043,11 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
             {"secret_id": "csec-0123456789abcde0", "file": "kubeconfig"},
         ],
     )
+    # A browser proxy at create, with its bypass list (OPL-5144).
+    await client.computers.create(
+        template="base",
+        browser_proxy={"server": "http://proxy.example.com:3128", "bypass": ["<local>"]},
+    )
     async with client.computers.ephemeral(template="base"):
         pass
     await c.refresh()
@@ -1047,6 +1055,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.wait_until_running()
     await c.wait_for_guest()
     await c.wait_for_secrets()
+    await c.wait_for_browser_proxy()
     await c.start()
     await c.start(resume_only=True)
     await c.stop()
@@ -1127,6 +1136,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     )
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
+    await c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
+    await c.set_browser_proxy(None)
     await c.read_file("/home/user/out.txt")
     await c.read_text_file("/home/user/out.txt")
     await c.read_file_part("/home/user/out.txt", offset=0, length=1024)
