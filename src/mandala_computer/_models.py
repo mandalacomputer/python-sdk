@@ -47,8 +47,12 @@ __all__ = [
     "ExecStatus",
     "FilePart",
     "GuestDirectory",
+    "LifecycleAck",
     "Listing",
     "Move",
+    "Operation",
+    "OperationError",
+    "OperationPage",
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
@@ -2135,6 +2139,13 @@ class Move:
     started_at: str = ""
     #: ``None`` while :attr:`live`.
     finished_at: str | None = None
+    #: The move's lifecycle operation, on the answer to
+    #: :meth:`~mandala_computer.Computer.relocate` only — never on a row of
+    #: :meth:`~mandala_computer.Moves.list`. ``client.operations.wait(id)`` is
+    #: the same wait as :meth:`~mandala_computer.Computer.wait_for_move`.
+    #: ``None`` where the platform could not record one; the move was accepted
+    #: either way.
+    operation_id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     #: The states this model's own docstring calls live. Consulted ONLY when the
@@ -2177,6 +2188,7 @@ class Move:
             disk_gb=_opt_num(d.get("disk_gb")),
             started_at=_text(d.get("started_at")),
             finished_at=_text(d["finished_at"]) if d.get("finished_at") is not None else None,
+            operation_id=operation_id_of(d),
             raw=dict(d),
         )
 
@@ -4069,4 +4081,178 @@ class Whoami:
             workspace=workspace,
             key=None if key is None else ApiKey.from_api(key, f"{where} key"),
             raw=dict(d),
+        )
+
+
+# --- lifecycle operations -----------------------------------------------------
+
+
+def operation_id_of(data: Any) -> str | None:
+    """The ``operation_id`` a lifecycle answer carried, or ``None`` for none.
+
+    Absent is ordinary and never an error: the platform leaves it out, with the
+    call still done, when it could not record the operation, and an older
+    platform never sends one. Anything that is not a non-empty string reads as
+    absent for the same reason — the call it came back on already happened.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    value = data.get("operation_id")
+    return str.__str__(value) if isinstance(value, str) and value else None
+
+
+def answered_operation_id(resp: Any) -> str | None:
+    """:func:`operation_id_of`, off a lifecycle acknowledgement's raw response.
+
+    The start, stop, suspend and restart calls never read their answer, and a
+    body this cannot parse is no reason to fail a call that has already been
+    done — so anything unreadable is ``None`` here rather than an error.
+    """
+    if not getattr(resp, "content", b""):
+        return None
+    try:
+        return operation_id_of(resp.json())
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class OperationError:
+    """Why an operation failed."""
+
+    #: The part to act on: ``start_failed``, ``build_failed``,
+    #: ``computer_gone``, ``move_failed``, ``resize_not_applied``, ``lost``, and
+    #: more may be added.
+    code: str
+    #: A sentence about it, for a person.
+    message: str
+
+
+@dataclass(frozen=True)
+class Operation:
+    """One lifecycle operation (platform OPL-5055): what an accepted create,
+    clone, start, stop, suspend, restart, restore, resize or move started, and
+    how it ended. :meth:`~mandala_computer.Operations.wait` polls one to its end.
+
+    ``succeeded`` MEANS THE PLATFORM FINISHED ITS STEP, not that the desktop
+    inside has booted: a create or a start that succeeded is a guest that was
+    started. :meth:`~mandala_computer.Computer.wait_for_guest` is still the wait
+    for a desktop that answers.
+
+    Most operations are already ``succeeded`` when the call that started them
+    answers, because the platform did the step before answering. A clone is
+    ``running`` until its disk is copied, and a move until it lands.
+    """
+
+    #: ``op_`` and 24 hex characters: the ``operation_id`` a lifecycle call answered.
+    id: str
+    #: The call that started it. An open set: the platform adds kinds, and one
+    #: this version does not know is a kind, not a malformed answer.
+    kind: str
+    #: The computer it is about — for a create or a clone, the new one.
+    #: ``None`` only for a restore whose computer could not be named.
+    computer_id: str | None
+    #: ``pending`` or ``running`` while live; ``succeeded`` or ``failed`` once
+    #: final. Open, for the reason :attr:`kind` is.
+    state: str
+    #: Why a ``failed`` one failed; ``None`` otherwise.
+    error: OperationError | None
+    created_at: str
+    #: When :attr:`state` or :attr:`error` last changed.
+    updated_at: str
+    #: ``None`` while it is live.
+    finished_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "operation") -> Operation:
+        """Strict on the three fields a wait decides on — the id it polls, the
+        state it ends on, and the error it raises — and on the error's shape,
+        because a ``failed`` operation whose reason was silently dropped would
+        be raised as a failure with nothing to say about why."""
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: not an object")
+        state = d.get("state")
+        if not isinstance(state, str) or not state:
+            raise MandalaError(f"{where}: no usable state")
+        kind = d.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise MandalaError(f"{where}: no usable kind")
+        error: OperationError | None = None
+        raw_error = d.get("error")
+        if raw_error is not None:
+            if (
+                not isinstance(raw_error, Mapping)
+                or not isinstance(raw_error.get("code"), str)
+                or not isinstance(raw_error.get("message"), str)
+            ):
+                raise MandalaError(f"{where}: error is neither null nor a code and a message")
+            error = OperationError(
+                code=str.__str__(raw_error["code"]), message=str.__str__(raw_error["message"])
+            )
+        finished = d.get("finished_at")
+        return cls(
+            id=_key_text(d, "id", where),
+            kind=str.__str__(kind),
+            computer_id=_nullable_text(d, "computer_id", where),
+            state=str.__str__(state),
+            error=error,
+            created_at=_text(d.get("created_at")),
+            updated_at=_text(d.get("updated_at")),
+            finished_at=_text(finished) if finished else None,
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class OperationPage:
+    """One page of :meth:`~mandala_computer.Operations.list`, newest first."""
+
+    operations: builtins.list[Operation]
+    #: Pass as ``cursor`` for the page after this one; ``None`` on the last page.
+    next_cursor: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "GET operations") -> OperationPage:
+        """Refuses a page whose cursor could not be walked: one that is not a
+        string would be sent back as its ``repr``, and one silently read as
+        ``None`` would end the walk early and call the listing complete."""
+        rows = d.get("operations") if isinstance(d, Mapping) else None
+        if not isinstance(rows, builtins.list):
+            raise MandalaError(f"{where}: expected a list of operations")
+        nxt = d.get("next_cursor")
+        if nxt is not None and (not isinstance(nxt, str) or not nxt):
+            raise MandalaError(f"{where}: next_cursor is neither a string nor null")
+        return cls(
+            operations=[
+                Operation.from_api(row, f"operation {i} from {where}") for i, row in enumerate(rows)
+            ],
+            next_cursor=str.__str__(nxt) if nxt is not None else None,
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class LifecycleAck:
+    """What a lifecycle call that finishes before it answers returns:
+    ``{"ok": true}`` and the operation it recorded."""
+
+    #: The operation this call recorded, already ``succeeded``. ``None`` where
+    #: the platform could not record one or predates operations; the call is
+    #: done either way.
+    operation_id: str | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_response(cls, resp: Any) -> LifecycleAck:
+        data: Any = None
+        if getattr(resp, "content", b""):
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+        return cls(
+            operation_id=operation_id_of(data),
+            raw=dict(data) if isinstance(data, Mapping) else {},
         )

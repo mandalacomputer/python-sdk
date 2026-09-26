@@ -65,6 +65,7 @@ PAIRS = [
     (_resources.SshKeys, _async_resources.AsyncSshKeys),
     (_resources.Secrets, _async_resources.AsyncSecrets),
     (_resources.ApiKeys, _async_resources.AsyncApiKeys),
+    (_resources.Operations, _async_resources.AsyncOperations),
 ]
 
 

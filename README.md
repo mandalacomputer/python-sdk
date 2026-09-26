@@ -1999,6 +1999,41 @@ if c.build_failed:
 failed, and its `TimeoutError` means only that the wait stopped — the copy is
 still going.
 
+### Operations
+
+Every accepted create, clone, start, stop, suspend, restart, snapshot restore,
+resize and move records a **lifecycle operation**, and its answer carries the
+id: `computer.operation_id` after a create, a clone or any of those calls on the
+handle, `client.snapshots.restore(snapshot_id).operation_id`, and
+`move.operation_id` on what `relocate` accepted. It is `None` where the
+platform could not record one; the call happened either way.
+
+```python
+copy = c.clone("experiment")
+if copy.operation_id:
+    op = client.operations.wait(copy.operation_id)  # "succeeded", or raises
+    print(op.kind, op.finished_at)
+```
+
+`wait` returns on `succeeded` and raises `OperationFailedError` on `failed`,
+with the platform's `code` (`start_failed`, `build_failed`, `computer_gone`,
+`move_failed`, `resize_not_applied`, `lost`, and more may be added) and its
+sentence as `detail`. `resize_not_applied` is a move that landed at the old
+size: the computer has moved, and a plain `resize` finishes the job.
+
+**`succeeded` is not a booted desktop.** It means the platform finished its
+step — a started guest, a copied disk, a landed move. Most operations are
+already `succeeded` when their call returns; a clone is `running` until its disk
+is copied, and a move until it lands. Keep `wait_for_guest()` for a desktop
+that answers; see [Readiness](#readiness).
+
+`client.operations.get(operation_id)` reads one, and
+`client.operations.list(computer_id=..., limit=..., cursor=...)` pages through
+them newest first — pass `next_cursor` back as `cursor`. An API key confined to
+a workspace sees only its computers' operations, and anything else is a
+`NotFoundError`. Calls made from the dashboard record none. The async client
+has the same three, awaited.
+
 ### Snapshots
 
 ```python

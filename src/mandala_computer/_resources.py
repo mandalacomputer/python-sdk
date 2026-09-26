@@ -18,6 +18,7 @@ from ._computer import Computer, _poll_delay, _ride_out, check_wait_args
 from ._exceptions import (
     ConflictError,
     MandalaError,
+    OperationFailedError,
     TimeoutError,
     _is_transient_for_poll,
 )
@@ -28,8 +29,11 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
+    LifecycleAck,
     Listing,
     Move,
+    Operation,
+    OperationPage,
     PublishedTemplate,
     Retention,
     RetiredTemplates,
@@ -58,6 +62,7 @@ __all__ = [
     "Builds",
     "Computers",
     "Moves",
+    "Operations",
     "Secrets",
     "Sizes",
     "Snapshots",
@@ -595,9 +600,17 @@ class Snapshots:
         )
         return Listing.of([Snapshot.from_api(s) for s in data or []], incomplete)
 
-    def restore(self, snapshot_id: str) -> None:
-        """Roll a computer back to a snapshot, replacing its current disk."""
-        self._t.request("POST", _api.snapshot_action(snapshot_id, "restore"))
+    def restore(self, snapshot_id: str) -> LifecycleAck:
+        """Roll a computer back to a snapshot, replacing its current disk.
+
+        Done when this returns. The answer's ``operation_id`` names the
+        operation the platform recorded for it, already ``succeeded``; it is
+        ``None`` where none could be recorded, and the restore happened either
+        way.
+        """
+        return LifecycleAck.from_response(
+            self._t.request("POST", _api.snapshot_action(snapshot_id, "restore"))
+        )
 
     def clone(
         self,
@@ -1784,3 +1797,160 @@ class ApiKeys:
         this key's reach is a :class:`~mandala_computer.NotFoundError`, the same
         as one that does not exist."""
         self._t.request("DELETE", _api.api_key(key_id))
+
+
+#: How long :meth:`Operations.wait` waits by default: the length of a long clone.
+OPERATION_WAIT_TIMEOUT = 900.0
+#: Seconds between its polls by default.
+OPERATION_WAIT_POLL = 2.0
+
+
+def _operation_id_arg(operation: Operation | str) -> str:
+    """The id to wait on, refused with a sentence when there is none.
+
+    The usual way to pass nothing is ``wait(computer.operation_id)`` on an
+    answer that carried none, which is not the caller's typo and deserves a
+    sentence that says what happened.
+    """
+    op_id = operation.id if isinstance(operation, Operation) else operation
+    if not isinstance(op_id, str) or not op_id:
+        raise ValueError(
+            "operation id must be a non-empty string; a lifecycle call whose answer "
+            "carried no operation_id has no operation to wait on"
+        )
+    _api.operation(op_id)
+    return op_id
+
+
+def _operation_settled(op: Operation) -> bool:
+    """Whether a wait ends on this reading: ``True`` on ``succeeded``, a raise
+    on ``failed``, ``False`` while it is live.
+
+    A state this version does not know, on an operation the platform says has
+    FINISHED, is a final state added after this client was written. Polling it
+    would run to the deadline and then report it as still live, and neither
+    returning it nor raising it as a failure would be true.
+    """
+    if op.state == "succeeded":
+        return True
+    if op.state == "failed":
+        raise OperationFailedError(op)
+    if op.finished_at is not None and op.state not in ("pending", "running"):
+        raise MandalaError(
+            f"operation {op.id} finished in state {op.state!r}, which this version "
+            "does not know; read operations.get for it"
+        )
+    return False
+
+
+def _operation_timed_out(op_id: str, timeout: float, last: Operation | None, answered: bool) -> str:
+    if last is not None and answered:
+        return (
+            f"operation {op_id} ({last.kind}) was still {last.state} after {timeout}s; "
+            "the operation has not stopped, only this wait has"
+        )
+    if last is not None:
+        return (
+            f"operation {op_id} could not be read for the last part of {timeout}s; when it "
+            f"last answered it was {last.state}. Read operations.get for where it got to."
+        )
+    return f"operation {op_id} could not be read within {timeout}s"
+
+
+class Operations:
+    """The lifecycle operations this account's API calls started (platform
+    OPL-5055).
+
+    Every accepted create, clone, start, stop, suspend, restart, snapshot
+    restore, resize and move records one and answers its id: as
+    :attr:`~mandala_computer.Computer.operation_id`,
+    :attr:`~mandala_computer.LifecycleAck.operation_id` or
+    :attr:`~mandala_computer.Move.operation_id`. A refused call records
+    nothing, since its error is its outcome, and calls made from the dashboard
+    record none. Operations are kept for a limited time, after which a read is
+    a :class:`~mandala_computer.NotFoundError`.
+
+    An API key confined to a workspace sees the operations of computers in
+    that workspace only; any other id is a
+    :class:`~mandala_computer.NotFoundError`, the same as one that never
+    existed.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def get(self, operation_id: str, *, timeout_cap: float | None = None) -> Operation:
+        """One operation, brought up to date by the platform as it is read."""
+        path = _api.operation(operation_id)
+        data = self._t.json_object("GET", path, timeout_cap=timeout_cap)
+        return Operation.from_api(data, f"GET {path}")
+
+    def list(
+        self,
+        *,
+        computer_id: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> OperationPage:
+        """One page of operations, newest first. Pass the page's
+        ``next_cursor`` back as ``cursor`` for the next; it is ``None`` on the
+        last page.
+
+        ``computer_id`` keeps one computer's (for a clone, the NEW computer's);
+        ``limit`` is 1 to 100, and the platform's default is 20.
+        """
+        params = _api.operations_params(computer_id, limit, cursor)
+        data = self._t.json_object("GET", _api.OPERATIONS, params=params)
+        return OperationPage.from_api(data)
+
+    def wait(
+        self,
+        operation: Operation | str,
+        timeout: float = OPERATION_WAIT_TIMEOUT,
+        poll: float = OPERATION_WAIT_POLL,
+    ) -> Operation:
+        """Poll an operation until it is final, and answer it.
+
+        Returns on ``succeeded``, and raises
+        :class:`~mandala_computer.OperationFailedError` on ``failed``, carrying
+        the platform's ``code`` and sentence (``detail``). ``pending``,
+        ``running``, and a state this version does not know while the operation
+        is still live, are polled through.
+
+        ``succeeded`` IS NOT A BOOTED DESKTOP. It means the platform finished
+        its step: a create or a start that succeeded has a guest that was
+        started, not one that is ready. Follow with
+        :meth:`~mandala_computer.Computer.wait_for_guest` for that — the two
+        waits answer different questions and neither stands in for the other.
+
+        Raises :class:`~mandala_computer.TimeoutError` if it is still live when
+        ``timeout`` (seconds; default 15 minutes, the length of a long clone)
+        runs out; the operation is not stopped by that, only the waiting is. A
+        transient failure of a poll is ridden out, as every wait in this package
+        does; an id this credential cannot see, or one that has expired, is a
+        :class:`~mandala_computer.NotFoundError` at once.
+        """
+        check_wait_args(timeout, poll)
+        op_id = _operation_id_arg(operation)
+        deadline = time.monotonic() + timeout
+        last: Operation | None = None
+        answered = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_operation_timed_out(op_id, timeout, last, answered))
+            delay = poll
+            try:
+                last = self.get(op_id, timeout_cap=remaining)
+                answered = True
+            except MandalaError as err:
+                answered = False
+                delay = _ride_out(err, deadline, poll)
+            # Outside the handler, which rides out a bare MandalaError: the
+            # verdict on a reading that succeeded is not a failed poll.
+            if answered and last is not None and _operation_settled(last):
+                return last
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_operation_timed_out(op_id, timeout, last, answered))
+            time.sleep(min(delay, remaining))

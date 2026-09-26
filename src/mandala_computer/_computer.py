@@ -89,8 +89,10 @@ from ._models import (
     _optional_result_id,
     _Wire,
     _wire,
+    answered_operation_id,
     is_unreachable_stub,
     move_rows,
+    operation_id_of,
     window_contradiction,
 )
 from ._results import (
@@ -1025,6 +1027,12 @@ class ComputerFields:
     # handle made any other way reads "nothing dropped".
     _memory_dropped: bool = False
     _memory_dropped_reason: str | None = None
+    # The operation the last lifecycle call through this handle started
+    # (platform OPL-5055). Apart from ``_data`` for the same reason: a
+    # lifecycle answer is the only place it appears, and a start or stop that
+    # answers an acknowledgement is followed by a refresh that replaces
+    # ``_data``.
+    _operation_id: str | None = None
 
     def _note_clone_answer(self, data: Mapping[str, Any]) -> None:
         self._memory_dropped = data.get("memory_dropped") is True
@@ -1032,6 +1040,26 @@ class ComputerFields:
         self._memory_dropped_reason = (
             reason if self._memory_dropped and isinstance(reason, str) else None
         )
+
+    @property
+    def operation_id(self) -> str | None:
+        """The lifecycle operation the last lifecycle call made through this
+        handle started (platform OPL-5055): the create or clone that returned
+        it, or the latest ``start``, ``stop``, ``suspend``, ``restart``,
+        ``rename`` or ``resize`` since. ``client.operations.wait(id)`` polls it
+        to its end.
+
+        Each of those calls replaces it with what its answer carried, so a
+        ``rename`` — which starts no operation — leaves it ``None``. A refresh
+        leaves it alone: reads never carry one. ``None`` on a handle from
+        ``computers.get()`` or a listing, and wherever the platform could not
+        record the operation, with the call done either way.
+
+        Most are ``succeeded`` before the call returns. A clone's is ``running``
+        until its disk is copied, which is what ``wait_until_built`` also waits
+        for.
+        """
+        return self._operation_id
 
     @property
     def id(self) -> str:
@@ -1931,6 +1959,7 @@ class Computer(ComputerFields):
         self._t = transport
         self._data = dict(data)
         self._note_clone_answer(data)
+        self._operation_id = operation_id_of(data)
 
     # --- lifecycle ------------------------------------------------------
 
@@ -1967,9 +1996,10 @@ class Computer(ComputerFields):
         Requires a platform version that supports ``resume_only``. Older
         servers may ignore the parameter and cold-boot a stopped computer.
         """
-        self._t.request(
+        resp = self._t.request(
             "POST", _api.computer_action(self.id, "start"), params=_api.start_params(resume_only)
         )
+        self._operation_id = answered_operation_id(resp)
         return self.refresh()
 
     def stop(self, *, force: bool = False) -> Computer:
@@ -1982,9 +2012,10 @@ class Computer(ComputerFields):
         will not come down on its own, at the cost of whatever it had not
         written to disk.
         """
-        self._t.request(
+        resp = self._t.request(
             "POST", _api.computer_action(self.id, "stop"), params=_api.stop_params(force)
         )
+        self._operation_id = answered_operation_id(resp)
         return self.refresh()
 
     def suspend(self) -> Computer:
@@ -2000,7 +2031,8 @@ class Computer(ComputerFields):
         own — a capture or a clone reading the disk, a migration in flight, or
         somebody driving the guest at that moment.
         """
-        self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        resp = self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        self._operation_id = answered_operation_id(resp)
         return self.refresh()
 
     def restart(self) -> Computer:
@@ -2025,7 +2057,8 @@ class Computer(ComputerFields):
         before the values land, so a command that must not run without its
         secrets checks for them itself.
         """
-        self._t.request("POST", _api.computer_action(self.id, "restart"))
+        resp = self._t.request("POST", _api.computer_action(self.id, "restart"))
+        self._operation_id = answered_operation_id(resp)
         return self.refresh()
 
     def clone(self, name: str | None = None) -> Computer:
@@ -2060,6 +2093,7 @@ class Computer(ComputerFields):
         self._data = _api.computer_payload(
             self._t.json_object("PATCH", _api.computer(self.id), json=_api.rename_body(name))
         )
+        self._operation_id = operation_id_of(self._data)
         return self
 
     def resize(
@@ -2087,6 +2121,7 @@ class Computer(ComputerFields):
                 json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
             )
         )
+        self._operation_id = operation_id_of(self._data)
         return self
 
     def relocate(self, *, ram_mb: int, cpu: int | None = None, disk_gb: int | None = None) -> Move:

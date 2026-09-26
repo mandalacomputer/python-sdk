@@ -83,10 +83,6 @@ UNIMPLEMENTED = {
     ("GET", "workspaces"),
     ("GET", "workspaces/:id"),
     ("GET", "workspaces/:id/members"),
-    # Lifecycle operations, read only (OPL-5055). Listed to stay in step with
-    # the surface; no SDK method yet.
-    ("GET", "operations"),
-    ("GET", "operations/:id"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -154,6 +150,17 @@ WHOAMI = {
     "role": "owner",
     "workspace": None,
     "key": {**API_KEY, "manage_keys": True},
+}
+# A finished lifecycle operation, as `GET operations/:id` answers it (OPL-5055).
+OPERATION = {
+    "id": "op_0123456789abcdef01234567",
+    "kind": "clone",
+    "computer_id": "vm-2",
+    "state": "succeeded",
+    "error": None,
+    "created_at": "2026-09-26T08:00:00.000Z",
+    "updated_at": "2026-09-26T08:01:10.000Z",
+    "finished_at": "2026-09-26T08:01:10.000Z",
 }
 SSH_KEY = {
     "id": "sshk-74025eba1b658b99",
@@ -437,6 +444,7 @@ def pattern_for(path: str) -> str:
             "ssh-keys",
             "api-keys",
             "secrets",
+            "operations",
         ):
             # `computers/:id/secrets` is a literal third segment, never an id:
             # only the account store's `secrets/:id` is at position 1.
@@ -666,6 +674,10 @@ def api_handler(request: httpx.Request) -> httpx.Response:
     # The caller's keys: the collection lists on GET and answers the one key it
     # registered on POST; a delete answers an ack. A computer's SSH setting is
     # one shape on both verbs.
+    if path.endswith("/operations"):
+        return httpx.Response(200, json={"operations": [OPERATION], "next_cursor": None})
+    if "/operations/" in path:
+        return httpx.Response(200, json=OPERATION)
     if path.endswith("/whoami"):
         return httpx.Response(200, json=WHOAMI)
     if path.endswith("/api-keys"):
@@ -997,6 +1009,12 @@ def exercise_everything(client: mc.Client) -> None:
     client.api_keys.create()
     client.api_keys.create(name="ci", workspace_id="wsp-1")
     client.api_keys.revoke(API_KEY["id"])
+    # Lifecycle operations (OPL-5055): a read, a page with every parameter it
+    # sends, and the wait over the read.
+    client.operations.get(OPERATION["id"])
+    client.operations.list()
+    client.operations.list(computer_id="vm-1", limit=5, cursor="op_00000000000000000000000a")
+    client.operations.wait(OPERATION["id"])
     c.delete(purge_snapshots=True, expect="fp-abc")
     c.delete()
 
@@ -1236,6 +1254,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.api_keys.create()
     await client.api_keys.create(name="ci", workspace_id="wsp-1")
     await client.api_keys.revoke(API_KEY["id"])
+    await client.operations.get(OPERATION["id"])
+    await client.operations.list()
+    await client.operations.list(computer_id="vm-1", limit=5, cursor="op_00000000000000000000000a")
+    await client.operations.wait(OPERATION["id"])
     await c.delete(purge_snapshots=True, expect="fp-abc")
     await c.delete()
 
