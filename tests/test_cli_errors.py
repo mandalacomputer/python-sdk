@@ -7,6 +7,7 @@ The words are the ones the ``mandala`` CLI reports, so a script reading
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -154,15 +155,79 @@ def test_no_diagnostic_under_secrets_set_repeats_what_was_typed(
         assert err.startswith(f"mandala-py secrets set: error: {message}\n")
 
 
-@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("verb", [SECRET, "ls", "sk(choose from 'x', 'y')"])
 def test_an_unknown_verb_under_secrets_is_not_repeated(
-    capsys: pytest.CaptureFixture[str], as_json: bool
+    capsys: pytest.CaptureFixture[str], verb: str
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["secrets", verb])
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    first = err.splitlines()[0]
+    assert verb not in first
+    if verb != "ls":
+        assert verb not in out + err
+    # The verbs it could have been are declared names, so they are listed.
+    assert first.startswith("mandala-py secrets: error: unknown command; choose from ")
+    assert first.endswith(
+        " (the word typed is not repeated here, as under secrets it may be a secret value)"
+    )
+    # Some Python versions quote the choices and some do not.
+    assert re.search(r"choose from '?list'?, '?set'?, '?rm'? \(", first)
+    assert "'x'" not in err
+
+
+@pytest.mark.parametrize(
+    ("argv", "command"),
+    [
+        (["--json", "webhooks", "list"], "webhooks list"),
+        (["webhooks", "--json", "list"], "webhooks list"),
+        (["--json", "secrets", "list"], "secrets list"),
+        (["secrets", "--json", "list"], "secrets list"),
+        (["secrets", "--json", "set", "A"], "secrets set"),
+        (["--workspace", "secrets", "list"], "secrets list"),
+    ],
+)
+def test_an_option_typed_before_its_command_is_said_to_be(
+    capsys: pytest.CaptureFixture[str], argv: list[str], command: str
+) -> None:
+    # Only the command declares it, so the parsers above it cannot take it.
+    # It is not an extra argument, and naming it quotes only a declared name.
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(argv)
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert "too many" not in out + err
+    assert f"{argv[0] if argv[0].startswith('-') else argv[1]} must come after the command, " in (
+        out + err
+    )
+    assert f"mandala-py {command}" in out + err
+
+
+def test_an_option_before_the_command_is_still_not_named_under_secrets(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit):
-        _cli.main(["secrets", SECRET, *(["--json"] if as_json else [])])
-    out, err = capsys.readouterr()
-    assert SECRET not in out + err
-    assert UNREAD in err
+        _cli.main(["--json", f"--{SECRET}", "secrets", "list"])
+    error = failure(capsys)
+    assert SECRET not in json.dumps(error)
+    assert error["message"] == (
+        "--json must come after the command, mandala-py secrets list; "
+        "1 unrecognized option, not repeated here, as under secrets it may be a secret value"
+    )
+
+
+def test_only_secrets_set_points_at_stdin(capsys: pytest.CaptureFixture[str]) -> None:
+    # list and rm read no value, so the stdin hint would be beside the point.
+    for argv in (["secrets", "list", f"--{SECRET}"], ["secrets", "rm", "A", f"--{SECRET}"]):
+        with pytest.raises(SystemExit):
+            _cli.main(argv)
+        out, err = capsys.readouterr()
+        assert SECRET not in out + err
+        assert err.startswith(
+            f"mandala-py secrets {argv[1]}: error: 1 unrecognized option, not repeated here, "
+            "as under secrets it may be a secret value\n"
+        )
 
 
 def test_a_diagnostic_that_quotes_only_declared_names_still_reads_under_secrets(
@@ -187,6 +252,12 @@ def test_an_option_is_named_only_when_typed_before_the_separator(
     # Nor is one spelled like an option the command took before the --.
     with pytest.raises(SystemExit):
         _cli.main(["webhooks", "list", "--json", "--", "--json"])
+    assert failure(capsys)["message"] == (
+        "1 argument too many (quote a value that has spaces in it)"
+    )
+    # Nor one the command took as an abbreviation.
+    with pytest.raises(SystemExit):
+        _cli.main(["webhooks", "list", "--js", "--", "--js"])
     assert failure(capsys)["message"] == (
         "1 argument too many (quote a value that has spaces in it)"
     )
