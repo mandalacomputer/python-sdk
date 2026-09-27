@@ -75,7 +75,12 @@ This is the summary you read to decide whether to upgrade.
 - **`mandala-py whoami`, `api-keys list | create | revoke`, `logout` and
   `--version`.** `logout` forgets one profile saved by `mandala login`, under
   the same lock file, and prints the id of the key it held, which stays valid
-  until revoked; `api-keys create` prints only the new key on stdout.
+  until revoked; `api-keys create` prints only the new key on stdout. For a
+  workspace-scoped key, `whoami` names what the platform withholds from it
+  (the user's name and email, the account's name and plan) instead of
+  printing them empty: `User usr-1 (name and email withheld from a
+  workspace-scoped key)` rather than `<> (usr-1)`, and `Account: acc-1,
+  active (name and plan withheld …)` rather than `(unnamed)` and `plan ,`.
 - **`computer.wait_for_secrets()`** and **`computer.secrets_delivering`** (sync
   and async). A computer comes back `running`, and its guest answers, a few
   seconds before its secrets land. The wait polls until the platform's
