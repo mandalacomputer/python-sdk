@@ -83,6 +83,22 @@ This is the summary you read to decide whether to upgrade.
   vocabulary as the npm `mandala` CLI (`not_found`, `unauthenticated`,
   `conflict`, `invalid_arguments`, …). A usage error is one too, `ssh --setup`
   included, and `--json` counts however argparse lets it be abbreviated.
+- **A browser proxy's credentials:** `credentials_secret_id` on `BrowserProxy`
+  and `BrowserProxyArgs`, the id of a secret whose value is `user:password`
+  for an upstream that asks for one. It is read back and sent on, so
+  `set_browser_proxy(computer.browser_proxy)`, or a `dataclasses.replace()` of
+  it, keeps the credentials; before this the read dropped the id and a
+  mapping carrying it was refused, so that read-modify-write removed them and
+  every browser on the computer was then answered 407 by its upstream. The
+  secret must be bound to the computer as a file, and a change that leaves the
+  id out removes the credentials, since the setting is replaced whole. A value
+  that is not a secret's id raises `ValueError` before any request.
+  `mandala-py browser-proxy set` keeps the proxy's current credentials when
+  the server is unchanged, unless given `--credentials SECRET_ID` or
+  `--no-credentials`; a set that names a different server with neither is
+  refused before any change, since the credentials are sent to the proxy on
+  every request and belong to the server they were set for. `get` and `set`
+  print which secret it uses.
 
 ### Changed
 
