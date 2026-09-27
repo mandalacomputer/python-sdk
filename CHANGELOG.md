@@ -150,6 +150,14 @@ This is the summary you read to decide whether to upgrade.
   `is_transient` called it worth sending again, as it does any other
   `ConflictError`, so a caller looping on it resent the same resize until it
   gave up. It now answers `False`.
+- **The CLI escapes control characters in the names it prints.**
+  `mandala-py api-keys list`, `api-keys create` and `whoami` printed key,
+  workspace, user and account names (and a user's email) as they were stored,
+  so a name holding a newline could forge a row and one holding an escape
+  sequence could drive the terminal. Each control character (C0, DEL, C1,
+  U+2028, U+2029) now prints as a visible escape such as `\x0a`, `\x1b` or
+  ` `. `--json` output is unchanged. The platform now refuses such
+  characters in a new key's name; keys named before that keep their names.
 
 ## [0.6.0] — 2026-09-25
 
