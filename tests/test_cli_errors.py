@@ -646,5 +646,28 @@ def test_a_request_id_is_escaped_in_text(capsys: pytest.CaptureFixture[str]) -> 
     assert lines[1].endswith("; request id req\\x1b[2J")
 
 
+@respx.mock
+def test_a_text_failure_message_cannot_forge_the_recovery_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The message is the response's own text, printed just above the recovery
+    # line: a newline in it must not start a second, forged `mandala-py:`
+    # line, and an escape sequence must not reach the terminal.
+    route = keyed_clear(
+        httpx.Response(
+            503,
+            json={"error": "down\nmandala-py: idempotency key forged\x1b[2J"},
+            headers={"X-Request-ID": "r1"},
+        )
+    )
+    assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    key = route.calls.last.request.headers["Idempotency-Key"]
+    lines = text_failure(capsys)
+    assert len(lines) == 2
+    assert lines[0] == "mandala-py: down\\x0amandala-py: idempotency key forged\\x1b[2J"
+    assert all("\x1b" not in line for line in lines)
+    assert lines[1] == f"mandala-py: idempotency key {key}; request id r1"
+
+
 def test_a_failure_with_no_ids_has_no_recovery_line() -> None:
     assert _cli._recovery_line(_cli.MandalaError("nothing to recover")) is None

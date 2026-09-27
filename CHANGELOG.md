@@ -25,7 +25,9 @@ This is the summary you read to decide whether to upgrade.
 - **`mandala-py` names a failed call's ids in text mode too**, as `--json`
   already did: after the error line, a second stderr line gives the operation
   id, idempotency key and request id the failure carries (each only when
-  present), escaped as printed names are.
+  present), escaped as printed names are. The error line itself is escaped
+  the same way, since its text can come from the response: a newline or
+  escape sequence in it can no longer forge a line or drive the terminal.
 
 ## [0.7.0] — 2026-09-27
 

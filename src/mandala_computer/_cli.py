@@ -2832,7 +2832,9 @@ def main(argv: list[str] | None = None) -> int:
         if as_json:
             _json_failure(_error_info(e))
         else:
-            print(f"{PROG}: {e}", file=sys.stderr)
+            # The message can be the response's own text: escaped, so a
+            # newline in it cannot forge a recovery line below it.
+            print(f"{PROG}: {_printable(str(e))}", file=sys.stderr)
             recovery = _recovery_line(e) if isinstance(e, MandalaError) else None
             if recovery is not None:
                 print(recovery, file=sys.stderr)
