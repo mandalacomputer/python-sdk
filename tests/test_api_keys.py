@@ -274,6 +274,60 @@ def test_cli_whoami(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 @respx.mock
+def test_cli_whoami_names_what_a_scoped_key_is_not_told(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scoped = {
+        **WHOAMI,
+        "role": "member",
+        "user": {**WHOAMI["user"], "email": None, "name": None},
+        "account": {**WHOAMI["account"], "name": None, "plan": None},
+        "workspace": {"id": "ws-1", "name": "ci", "created_at": "2026-09-20T08:00:00.000Z"},
+    }
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=scoped))
+    assert _cli.main(["whoami"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines() == [
+        "User usr-1 (name and email withheld from a workspace-scoped key)",
+        "Account: acc-1, active (name and plan withheld from a workspace-scoped key)",
+        "Role: member",
+        "Scope: workspace ci (ws-1)",
+        "Key: laptop (key-000000000001, com_1a2b3c4d…); can manage API keys",
+    ]
+    assert "<>" not in out and "(unnamed)" not in out and "plan ," not in out
+
+
+@respx.mock
+def test_cli_whoami_names_only_what_a_scoped_key_is_not_told(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scoped = {
+        **WHOAMI,
+        "user": {**WHOAMI["user"], "email": None},
+        "account": {**WHOAMI["account"], "plan": None},
+        "workspace": {"id": "ws-1", "name": "ci", "created_at": "x"},
+    }
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=scoped))
+    assert _cli.main(["whoami"]) == 0
+    assert capsys.readouterr().out.splitlines()[:2] == [
+        "Dana (usr-1) (email withheld from a workspace-scoped key)",
+        "Account: Acme (acc-1), active (plan withheld from a workspace-scoped key)",
+    ]
+
+
+@respx.mock
+def test_cli_whoami_unscoped_account_with_no_name_is_unnamed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unnamed = {**WHOAMI, "account": {**WHOAMI["account"], "name": None}}
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=unnamed))
+    assert _cli.main(["whoami"]) == 0
+    assert capsys.readouterr().out.splitlines()[1] == (
+        "Account: (unnamed) (acc-1), plan team, active"
+    )
+
+
+@respx.mock
 def test_cli_api_keys_list(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[API_KEY]))
     assert _cli.main(["api-keys", "list"]) == 0

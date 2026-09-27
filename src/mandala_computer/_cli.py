@@ -1650,20 +1650,53 @@ def _api_key_rows(keys: Sequence[ApiKey]) -> str:
     return _table(("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED"), rows)
 
 
+def _whoami_person_account(w: Whoami) -> list[str]:
+    """The person and account lines of ``whoami``.
+
+    The platform withholds the user's name and email and the account's name and
+    plan from a workspace-scoped key (it is the credential handed to an end
+    customer), so for one of those an empty field is left out and named at the
+    end of its line rather than printed as ``<>``, ``(unnamed)`` or ``plan ,``.
+    An unscoped answer prints exactly as it always has.
+    """
+    user, account = w.user, w.account
+    if w.workspace is None:
+        email = _printable(user.email)
+        who = f"{_printable(user.name)} <{email}>" if user.name else f"<{email}>"
+        return [
+            f"{who} ({user.id})",
+            (
+                f"Account: {_printable(account.name or '(unnamed)')} ({account.id}), "
+                f"plan {account.plan}, {account.status}"
+            ),
+        ]
+
+    def withheld(fields: list[str]) -> str:
+        return f" ({' and '.join(fields)} withheld from a workspace-scoped key)" if fields else ""
+
+    if user.name or user.email:
+        name = f"{_printable(user.name)} " if user.name else ""
+        email = f"<{_printable(user.email)}> " if user.email else ""
+        person = f"{name}{email}({user.id})"
+    else:
+        person = f"User {user.id}"
+    acct = f"{_printable(account.name)} ({account.id})" if account.name else account.id
+    plan = f", plan {account.plan}" if account.plan else ""
+    return [
+        person + withheld([f for f, v in (("name", user.name), ("email", user.email)) if not v]),
+        f"Account: {acct}{plan}, {account.status}"
+        + withheld([f for f, v in (("name", account.name), ("plan", account.plan)) if not v]),
+    ]
+
+
 def _whoami_lines(w: Whoami) -> list[str]:
-    email = _printable(w.user.email)
-    who = f"{_printable(w.user.name)} <{email}>" if w.user.name else f"<{email}>"
     scope = (
         f"workspace {_printable(w.workspace.name)} ({w.workspace.id})"
         if w.workspace
         else "the whole account"
     )
     lines = [
-        f"{who} ({w.user.id})",
-        (
-            f"Account: {_printable(w.account.name or '(unnamed)')} ({w.account.id}), "
-            f"plan {w.account.plan}, {w.account.status}"
-        ),
+        *_whoami_person_account(w),
         f"Role: {w.role}",
         f"Scope: {scope}",
     ]
