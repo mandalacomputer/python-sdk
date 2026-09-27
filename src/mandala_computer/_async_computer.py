@@ -160,7 +160,9 @@ class AsyncComputer(ComputerFields):
         )
         return self
 
-    async def start(self, *, resume_only: bool = False) -> AsyncComputer:
+    async def start(
+        self, *, resume_only: bool = False, idempotency_key: str | None = None
+    ) -> AsyncComputer:
         """Start this computer, or resume it if its session was suspended.
 
         A suspended computer does not boot: its saved RAM is read back and the
@@ -179,12 +181,17 @@ class AsyncComputer(ComputerFields):
         servers may ignore the parameter and cold-boot a stopped computer.
         """
         resp = await self._t.request(
-            "POST", _api.computer_action(self.id, "start"), params=_api.start_params(resume_only)
+            "POST",
+            _api.computer_action(self.id, "start"),
+            params=_api.start_params(resume_only),
+            headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
-    async def stop(self, *, force: bool = False) -> AsyncComputer:
+    async def stop(
+        self, *, force: bool = False, idempotency_key: str | None = None
+    ) -> AsyncComputer:
         """Stop this computer, discarding a suspended session if it has one.
 
         Use :meth:`suspend` to keep it.
@@ -195,12 +202,15 @@ class AsyncComputer(ComputerFields):
         written to disk.
         """
         resp = await self._t.request(
-            "POST", _api.computer_action(self.id, "stop"), params=_api.stop_params(force)
+            "POST",
+            _api.computer_action(self.id, "stop"),
+            params=_api.stop_params(force),
+            headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
-    async def suspend(self) -> AsyncComputer:
+    async def suspend(self, *, idempotency_key: str | None = None) -> AsyncComputer:
         """Write this computer's RAM to disk and give the host its memory back.
 
         A pause rather than a stop: :meth:`start` afterwards resumes the same
@@ -213,11 +223,15 @@ class AsyncComputer(ComputerFields):
         own — a capture or a clone reading the disk, a migration in flight, or
         somebody driving the guest at that moment.
         """
-        resp = await self._t.request("POST", _api.computer_action(self.id, "suspend"))
+        resp = await self._t.request(
+            "POST",
+            _api.computer_action(self.id, "suspend"),
+            headers=_api.idempotency_headers(idempotency_key),
+        )
         self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
-    async def restart(self) -> AsyncComputer:
+    async def restart(self, *, idempotency_key: str | None = None) -> AsyncComputer:
         """Reset this computer.
 
         Raises :class:`~mandala_computer.ConflictError` while a suspended session is
@@ -239,11 +253,17 @@ class AsyncComputer(ComputerFields):
         before the values land, so a command that must not run without its
         secrets checks for them itself.
         """
-        resp = await self._t.request("POST", _api.computer_action(self.id, "restart"))
+        resp = await self._t.request(
+            "POST",
+            _api.computer_action(self.id, "restart"),
+            headers=_api.idempotency_headers(idempotency_key),
+        )
         self._operation_id = answered_operation_id(resp)
         return await self.refresh()
 
-    async def clone(self, name: str | None = None) -> AsyncComputer:
+    async def clone(
+        self, name: str | None = None, *, idempotency_key: str | None = None
+    ) -> AsyncComputer:
         """Copy this computer into a new one. The source must be stopped.
 
         Returns as soon as the new computer exists, which is before its disk
@@ -252,11 +272,14 @@ class AsyncComputer(ComputerFields):
         :meth:`wait_until_built` before starting it.
         """
         data = await self._t.json_object(
-            "POST", _api.computer_action(self.id, "clone"), json=_api.name_body(name)
+            "POST",
+            _api.computer_action(self.id, "clone"),
+            json=_api.name_body(name),
+            headers=_api.idempotency_headers(idempotency_key),
         )
         return AsyncComputer(self._t, _api.computer_payload(data))
 
-    async def rename(self, name: str) -> AsyncComputer:
+    async def rename(self, name: str, *, idempotency_key: str | None = None) -> AsyncComputer:
         """Give this computer a new name, and return it renamed.
 
         The name is a label. Nothing is derived from it — the id is what
@@ -273,13 +296,23 @@ class AsyncComputer(ComputerFields):
         all that is left of it.
         """
         self._data = _api.computer_payload(
-            await self._t.json_object("PATCH", _api.computer(self.id), json=_api.rename_body(name))
+            await self._t.json_object(
+                "PATCH",
+                _api.computer(self.id),
+                json=_api.rename_body(name),
+                headers=_api.idempotency_headers(idempotency_key),
+            )
         )
         self._operation_id = operation_id_of(self._data)
         return self
 
     async def resize(
-        self, *, cpu: int | None = None, ram_mb: int | None = None, disk_gb: int | None = None
+        self,
+        *,
+        cpu: int | None = None,
+        ram_mb: int | None = None,
+        disk_gb: int | None = None,
+        idempotency_key: str | None = None,
     ) -> AsyncComputer:
         """Give this computer a new shape, and return it resized.
 
@@ -301,13 +334,19 @@ class AsyncComputer(ComputerFields):
                 "PATCH",
                 _api.computer(self.id),
                 json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
+                headers=_api.idempotency_headers(idempotency_key),
             )
         )
         self._operation_id = operation_id_of(self._data)
         return self
 
     async def relocate(
-        self, *, ram_mb: int, cpu: int | None = None, disk_gb: int | None = None
+        self,
+        *,
+        ram_mb: int,
+        cpu: int | None = None,
+        disk_gb: int | None = None,
+        idempotency_key: str | None = None,
     ) -> Move:
         """Move this computer to another host in its region, so a resize its
         current host cannot run becomes possible.
@@ -353,6 +392,7 @@ class AsyncComputer(ComputerFields):
                 "POST",
                 _api.computer_action(self.id, "move"),
                 json=_api.move_body(ram_mb=ram_mb, cpu=cpu, disk_gb=disk_gb),
+                headers=_api.idempotency_headers(idempotency_key),
             )
         )
 
@@ -437,7 +477,9 @@ class AsyncComputer(ComputerFields):
                 )
             await asyncio.sleep(min(poll, remaining))
 
-    async def set_idle_suspend(self, minutes: int | None) -> AsyncComputer:
+    async def set_idle_suspend(
+        self, minutes: int | None, *, idempotency_key: str | None = None
+    ) -> AsyncComputer:
         """Set how long this computer may go untouched before it is suspended.
 
         ``None`` clears the override and returns it to its host's own sweep. See
@@ -451,13 +493,19 @@ class AsyncComputer(ComputerFields):
         """
         self._data = _api.computer_payload(
             await self._t.json_object(
-                "PATCH", _api.computer(self.id), json=_api.idle_suspend_body(minutes)
+                "PATCH",
+                _api.computer(self.id),
+                json=_api.idle_suspend_body(minutes),
+                headers=_api.idempotency_headers(idempotency_key),
             )
         )
         return self
 
     async def set_browser_proxy(
-        self, proxy: BrowserProxyArgs | BrowserProxy | None
+        self,
+        proxy: BrowserProxyArgs | BrowserProxy | None,
+        *,
+        idempotency_key: str | None = None,
     ) -> AsyncComputer:
         """Send this computer's browsers through a proxy, or stop doing so.
 
@@ -466,7 +514,10 @@ class AsyncComputer(ComputerFields):
         """
         self._data = _api.computer_payload(
             await self._t.json_object(
-                "PATCH", _api.computer(self.id), json=_api.browser_proxy_update_body(proxy)
+                "PATCH",
+                _api.computer(self.id),
+                json=_api.browser_proxy_update_body(proxy),
+                headers=_api.idempotency_headers(idempotency_key),
             )
         )
         return self
@@ -536,6 +587,7 @@ class AsyncComputer(ComputerFields):
         purge_snapshots: bool = ...,
         expect: str | None = ...,
         detailed: Literal[False] = ...,
+        idempotency_key: str | None = ...,
     ) -> int | None: ...
 
     @overload
@@ -545,6 +597,7 @@ class AsyncComputer(ComputerFields):
         purge_snapshots: bool = ...,
         expect: str | None = ...,
         detailed: Literal[True],
+        idempotency_key: str | None = ...,
     ) -> ComputerDeletion: ...
 
     async def delete(
@@ -553,6 +606,7 @@ class AsyncComputer(ComputerFields):
         purge_snapshots: bool = False,
         expect: str | None = None,
         detailed: bool = False,
+        idempotency_key: str | None = None,
     ) -> int | ComputerDeletion | None:
         """Destroy this computer and its disk.
 
@@ -595,6 +649,7 @@ class AsyncComputer(ComputerFields):
             "DELETE",
             _api.computer(self.id),
             params=_api.delete_params(purge_snapshots=purge_snapshots, expect=expect),
+            headers=_api.idempotency_headers(idempotency_key),
         )
         # `None` is an empty body — a 204, or a 200 with nothing in it — which is
         # a real answer here and stays one. What no longer reaches this line is a

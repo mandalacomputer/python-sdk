@@ -207,6 +207,7 @@ class Computers:
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
         browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        idempotency_key: str | None = None,
     ) -> Computer:
         """Provision a computer.
 
@@ -224,6 +225,15 @@ class Computers:
         Stop after success and never blindly replay an ambiguous or lost
         response. ``is_transient`` returns ``False`` for this refusal because
         continuation requires an explicit decision and the returned token.
+
+        Every create sends an ``Idempotency-Key`` (platform OPL-5127): a fresh
+        one per call, or ``idempotency_key`` if you pass it. An error that
+        leaves the outcome unknown — a dropped connection or timeout after the
+        request went out, a ``5xx`` — carries the key it was sent with as
+        :attr:`~mandala_computer.MandalaError.idempotency_key`; calling
+        ``create`` again with the same arguments and that key answers the first
+        call's result instead of building a second computer. Keys last 24 hours,
+        and a key sent with different arguments raises an ``APIError`` (422).
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -286,7 +296,9 @@ class Computers:
             browser_proxy=browser_proxy,
             size=size,
         )
-        data = self._t.json_object("POST", _api.COMPUTERS, json=body)
+        data = self._t.json_object(
+            "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
+        )
         return Computer(self._t, _api.computer_payload(data))
 
     def launch(
@@ -600,7 +612,7 @@ class Snapshots:
         )
         return Listing.of([Snapshot.from_api(s) for s in data or []], incomplete)
 
-    def restore(self, snapshot_id: str) -> LifecycleAck:
+    def restore(self, snapshot_id: str, *, idempotency_key: str | None = None) -> LifecycleAck:
         """Roll a computer back to a snapshot, replacing its current disk.
 
         Done when this returns. The answer's ``operation_id`` names the
@@ -609,7 +621,11 @@ class Snapshots:
         way.
         """
         return LifecycleAck.from_response(
-            self._t.request("POST", _api.snapshot_action(snapshot_id, "restore"))
+            self._t.request(
+                "POST",
+                _api.snapshot_action(snapshot_id, "restore"),
+                headers=_api.idempotency_headers(idempotency_key),
+            )
         )
 
     def clone(
@@ -619,6 +635,7 @@ class Snapshots:
         *,
         memory: bool | None = None,
         inherit_secrets: bool = False,
+        idempotency_key: str | None = None,
     ) -> Computer:
         """Create a new computer from a snapshot.
 
@@ -646,6 +663,7 @@ class Snapshots:
             "POST",
             _api.snapshot_action(snapshot_id, "clone"),
             json=_api.snapshot_clone_body(name, memory, inherit_secrets),
+            headers=_api.idempotency_headers(idempotency_key),
         )
         return Computer(self._t, _api.computer_payload(data))
 
@@ -1890,6 +1908,7 @@ class Operations:
         self,
         *,
         computer_id: str | None = None,
+        idempotency_key: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
     ) -> OperationPage:
@@ -1898,9 +1917,11 @@ class Operations:
         last page.
 
         ``computer_id`` keeps one computer's (for a clone, the NEW computer's);
-        ``limit`` is 1 to 100, and the platform's default is 20.
+        ``idempotency_key`` keeps the one a lifecycle call sent with that key
+        recorded — found even when its answer was lost — within the key's 24
+        hours; ``limit`` is 1 to 100, and the platform's default is 20.
         """
-        params = _api.operations_params(computer_id, limit, cursor)
+        params = _api.operations_params(computer_id, limit, cursor, idempotency_key)
         data = self._t.json_object("GET", _api.OPERATIONS, params=params)
         return OperationPage.from_api(data)
 

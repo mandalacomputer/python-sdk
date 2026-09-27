@@ -4158,8 +4158,15 @@ class OperationError:
 @dataclass(frozen=True)
 class Operation:
     """One lifecycle operation (platform OPL-5055): what an accepted create,
-    clone, start, stop, suspend, restart, restore, resize or move started, and
-    how it ended. :meth:`~mandala_computer.Operations.wait` polls one to its end.
+    clone, start, stop, suspend, restart, restore, resize, move or delete
+    started, and how it ended. :meth:`~mandala_computer.Operations.wait` polls
+    one to its end.
+
+    A call sent with an ``Idempotency-Key`` — every lifecycle call this SDK
+    makes — is recorded ``pending`` before the platform carries it out
+    (platform OPL-5127), so ``operations.list(idempotency_key=...)`` finds it
+    even when its answer was lost. It ends as that answer says, or ``failed``
+    with code ``lost`` when the platform never heard how it went.
 
     ``succeeded`` MEANS THE PLATFORM FINISHED ITS STEP, not that the desktop
     inside has booted: a create or a start that succeeded is a guest that was
@@ -4189,6 +4196,9 @@ class Operation:
     updated_at: str
     #: ``None`` while it is live.
     finished_at: str | None
+    #: The ``Idempotency-Key`` the call that started it was sent with; ``None``
+    #: for one sent without, or read from a platform that does not report it.
+    idempotency_key: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -4227,6 +4237,7 @@ class Operation:
             created_at=_text(d.get("created_at")),
             updated_at=_text(d.get("updated_at")),
             finished_at=_text(finished) if finished else None,
+            idempotency_key=_nullable_text(d, "idempotency_key", where),
             raw=dict(d),
         )
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 import shlex
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, TypeVar
@@ -2236,8 +2237,43 @@ def operation(operation_id: str) -> str:
     return f"operations/{seg(operation_id)}"
 
 
-def operations_params(computer_id: object, limit: object, cursor: object) -> dict[str, str] | None:
-    """``GET operations``: a computer, a page size and a cursor, each only when given.
+#: The header every lifecycle call carries so that sending it again cannot do
+#: it twice (platform OPL-5127). The platform records a call that carries one
+#: before carrying it out, and for 24 hours answers the same key with the same
+#: request from that record instead of doing the call again: ``409`` with
+#: ``code: "idempotency_in_progress"`` while it runs, the original answer once
+#: it has finished. A different request under the same key is a ``422``.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+_IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,255}")
+
+
+def idempotency_key(key: object, what: str = "idempotency_key") -> str:
+    """A caller's ``Idempotency-Key``, checked against the platform's rule: 1
+    to 255 characters, each printable ASCII other than a space."""
+    if not isinstance(key, str) or not _IDEMPOTENCY_KEY.fullmatch(key):
+        raise ValueError(
+            f"{what} must be 1 to 255 characters, each printable ASCII other than a space"
+        )
+    return str.__str__(key)
+
+
+def idempotency_headers(key: object = None) -> dict[str, str]:
+    """The ``Idempotency-Key`` header for ONE logical lifecycle call: the
+    caller's key, checked here rather than refused by the platform, or a fresh
+    random one.
+
+    Called once per call, before its first attempt, and passed in the call's
+    headers — so whatever re-sends that call re-sends the same key, and a
+    different call (the start a launch makes after its create) gets its own.
+    """
+    return {IDEMPOTENCY_KEY_HEADER: uuid.uuid4().hex if key is None else idempotency_key(key)}
+
+
+def operations_params(
+    computer_id: object, limit: object, cursor: object, idempotency_key_: object = None
+) -> dict[str, str] | None:
+    """``GET operations``: a computer, a key, a page size and a cursor, each only when given.
 
     An empty ``computer_id`` or ``cursor`` is refused rather than sent: the
     platform answers 400 for either, and an empty ``computer_id`` dropped
@@ -2250,6 +2286,8 @@ def operations_params(computer_id: object, limit: object, cursor: object) -> dic
         if not cid or cid != cid.strip():
             raise ValueError("computer_id must be a computer id, with no spaces around it")
         params["computer_id"] = cid
+    if idempotency_key_ is not None:
+        params["idempotency_key"] = idempotency_key(idempotency_key_)
     if limit is not None:
         number = whole(limit, "limit", exc=ValueError)
         if not 1 <= number <= OPERATIONS_PAGE_MAX:

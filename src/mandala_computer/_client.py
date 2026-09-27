@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from ._api import IDEMPOTENCY_KEY_HEADER
 from ._credentials import resolve_credentials
 from ._exceptions import (
     APIError,
@@ -1143,6 +1144,30 @@ def _request_failed(method: str, path: str, exc: httpx.RequestError) -> Connecti
     )
 
 
+#: The two refusals of a keyed call that say its outcome is not known yet.
+_KEY_UNSETTLED = frozenset({"idempotency_in_progress", "idempotency_outcome_unknown"})
+
+
+def _with_idempotency_key(exc: MandalaError, headers: Mapping[str, str] | None) -> None:
+    """Put a keyed call's key on the error it failed with, where the outcome is
+    unknown — a request that may have been received, a ``5xx``, or the
+    platform saying the keyed call is still running or was never heard to end
+    (OPL-5127) — so the caller can send the same call again with it and not do
+    it twice."""
+    key = (headers or {}).get(IDEMPOTENCY_KEY_HEADER)
+    if key is None:
+        return
+    unknown = isinstance(exc, (ConnectionInterruptedError, TimeoutError)) or (
+        isinstance(exc, APIError)
+        and (
+            exc.status >= 500
+            or (isinstance(exc.body, dict) and exc.body.get("code") in _KEY_UNSETTLED)
+        )
+    )
+    if unknown:
+        exc.idempotency_key = key
+
+
 def _retry_after(resp: httpx.Response, *, for_retry: bool = False) -> float | None:
     """``Retry-After`` in seconds, or ``None`` if it was not usable.
 
@@ -1541,6 +1566,7 @@ class Transport(_BaseTransport):
                 except httpx.RequestError as exc:
                     raise self._response_failed(method, path, resp, exc) from exc
             except MandalaError as exc:
+                _with_idempotency_key(exc, headers)
                 _retry_sleep(retry.delay(exc))
 
     def sse(
@@ -1963,6 +1989,7 @@ class AsyncTransport(_BaseTransport):
                 except httpx.RequestError as exc:
                     raise self._response_failed(method, path, resp, exc) from exc
             except MandalaError as exc:
+                _with_idempotency_key(exc, headers)
                 await _async_retry_sleep(retry.delay(exc))
 
     async def sse(
