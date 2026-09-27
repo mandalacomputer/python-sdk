@@ -288,3 +288,74 @@ async def test_async_operations_list_by_key() -> None:
         )
         await aclient().operations.list(idempotency_key="create-7f3a")
         assert dict(route.calls.last.request.url.params) == {"idempotency_key": "create-7f3a"}
+
+
+# --- the body's code and operation_id on the error (OPL-5322) -----------------
+
+OUTCOME_UNKNOWN: dict[str, Any] = {
+    "error": "x",
+    "code": "idempotency_outcome_unknown",
+    "operation_id": "op_0123456789abcdef01234567",
+}
+
+
+def test_the_error_reads_code_and_operation_id_off_the_body() -> None:
+    err = failing_start(httpx.Response(409, json=OUTCOME_UNKNOWN))()
+    assert isinstance(err, mc.ConflictError)
+    assert err.code == "idempotency_outcome_unknown"
+    assert err.operation_id == "op_0123456789abcdef01234567"
+    # A 5xx names the operation it reserved too.
+    err = failing_start(httpx.Response(503, json={**OUTCOME_UNKNOWN, "code": None}))()
+    assert isinstance(err, mc.APIError)
+    assert (err.code, err.operation_id) == (None, "op_0123456789abcdef01234567")
+
+
+@pytest.mark.parametrize("body", [None, "text", {"error": "x"}, {"code": 7, "operation_id": ""}])
+def test_the_error_has_neither_when_the_body_does_not(body: object) -> None:
+    err = error_for_status(409, "x", body)
+    assert (err.code, err.operation_id) == (None, None)
+
+
+def test_operation_failed_keeps_its_own_code() -> None:
+    failed = mc.Operation.from_api(
+        {**OPERATION, "state": "failed", "error": {"code": "lost", "message": "never heard"}}
+    )
+    assert mc.OperationFailedError(failed).code == "lost"
+
+
+async def test_async_error_reads_code_and_operation_id_off_the_body() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/computers/vm-1").mock(return_value=httpx.Response(200, json=COMPUTER))
+        mock.post(f"{BASE}/computers/vm-1/start").mock(
+            return_value=httpx.Response(409, json=OUTCOME_UNKNOWN)
+        )
+        vm = await aclient().computers.get("vm-1")
+        with pytest.raises(mc.ConflictError) as caught:
+            await vm.start(idempotency_key="k")
+    assert caught.value.code == "idempotency_outcome_unknown"
+    assert caught.value.operation_id == "op_0123456789abcdef01234567"
+
+
+def test_a_detailed_delete_carries_its_operation() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/computers/vm-1").mock(return_value=httpx.Response(200, json=COMPUTER))
+        mock.delete(f"{BASE}/computers/vm-1").mock(
+            return_value=httpx.Response(
+                200, json={"ok": True, "operation_id": "op_0123456789abcdef01234567"}
+            )
+        )
+        deletion = client().computers.get("vm-1").delete(detailed=True)
+    assert isinstance(deletion, mc.ComputerDeletion)
+    assert deletion.operation_id == "op_0123456789abcdef01234567"
+    assert mc.ComputerDeletion.from_api({"ok": True}).operation_id is None
+
+
+async def test_async_detailed_delete_carries_its_operation() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/computers/vm-1").mock(return_value=httpx.Response(200, json=COMPUTER))
+        mock.delete(f"{BASE}/computers/vm-1").mock(
+            return_value=httpx.Response(200, json={"ok": True, "operation_id": "op_x"})
+        )
+        deletion = await (await aclient().computers.get("vm-1")).delete(detailed=True)
+    assert isinstance(deletion, mc.ComputerDeletion)
+    assert deletion.operation_id == "op_x"

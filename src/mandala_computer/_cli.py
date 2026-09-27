@@ -184,10 +184,23 @@ _API_CODES: tuple[tuple[type[APIError], str], ...] = (
 )
 
 
+def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
+    """``info`` with each id the failure carries that is not ``None``."""
+    ids = {
+        "request_id": getattr(err, "request_id", None),
+        "idempotency_key": err.idempotency_key,
+        "operation_id": getattr(err, "operation_id", None),
+    }
+    info.update({key: value for key, value in ids.items() if value is not None})
+    return info
+
+
 def _error_info(err: BaseException) -> dict[str, Any]:
     """The ``error`` object ``--json`` prints for a failure: ``code`` and
     ``message`` always; the HTTP ``status`` and the platform's ``reason`` word
-    when there are any."""
+    when there are any, and the ``request_id``, ``idempotency_key`` and
+    ``operation_id`` a failure carries, which are what finding out how a call
+    ended needs."""
     if isinstance(err, _Failure):
         return {"code": err.reason, "message": err.message}
     if isinstance(err, APIError):
@@ -195,15 +208,15 @@ def _error_info(err: BaseException) -> dict[str, Any]:
         info: dict[str, Any] = {"code": code, "message": str(err), "status": err.status}
         if err.reason is not None:
             info["reason"] = err.reason
-        return info
+        return _with_ids(info, err)
     if isinstance(err, ConnectionInterruptedError):
-        return {"code": "connection_interrupted", "message": str(err)}
+        return _with_ids({"code": "connection_interrupted", "message": str(err)}, err)
     if isinstance(err, ConnectionError):
-        return {"code": "connection_failed", "message": str(err)}
+        return _with_ids({"code": "connection_failed", "message": str(err)}, err)
     if isinstance(err, TimeoutError):
-        return {"code": "timeout", "message": str(err)}
+        return _with_ids({"code": "timeout", "message": str(err)}, err)
     if isinstance(err, MandalaError):
-        return {"code": "failed", "message": str(err)}
+        return _with_ids({"code": "failed", "message": str(err)}, err)
     if isinstance(err, ValueError):
         return {"code": "invalid_arguments", "message": str(err)}
     if isinstance(err, OSError):
@@ -1614,12 +1627,14 @@ def _secrets_parser(sub: Any) -> None:
 def _printable(s: str) -> str:
     """``s`` with each control character written out as a visible escape.
 
-    C0, DEL, C1 and the two Unicode line separators become a ``\\x`` or
+    C0, DEL, C1, the two Unicode line separators and the bidi embeddings,
+    overrides and isolates (U+202A-U+202E, U+2066-U+2069) become a ``\\x`` or
     ``\\u`` escape (a newline prints as ``\\x0a``, ESC as ``\\x1b``, U+2028 as
     ``\\u2028``), with no quotes around the result; anything else is left
     alone. For names somebody chose (a key, a workspace, a person, an
-    account), printed to a terminal where a newline would forge a row and an
-    escape sequence would drive the terminal. ``--json`` output needs none of
+    account), printed to a terminal where a newline would forge a row, an
+    escape sequence would drive the terminal and a right-to-left override
+    would visually reverse the rest of the row. ``--json`` output needs none of
     this: JSON escapes them already.
     """
     return _CONTROL_CHARS.sub(
@@ -1627,7 +1642,7 @@ def _printable(s: str) -> str:
     )
 
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 
 def _key_scope(k: ApiKey) -> str:
@@ -1645,10 +1660,11 @@ def _api_key_rows(keys: Sequence[ApiKey]) -> str:
             _key_scope(k),
             "yes" if k.manage_keys else "no",
             k.last_used_at or "never",
+            _printable(k.minted_by_key_id) if k.minted_by_key_id else "-",
         )
         for k in keys
     ]
-    return _table(("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED"), rows)
+    return _table(("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED", "MINTED BY"), rows)
 
 
 def _whoami_person_account(w: Whoami) -> list[str]:
@@ -1662,13 +1678,14 @@ def _whoami_person_account(w: Whoami) -> list[str]:
     """
     user, account = w.user, w.account
     if w.workspace is None:
-        email = _printable(user.email)
+        # Never null for an unscoped key; "?" rather than "None" if it ever is.
+        email = _printable(user.email or "?")
         who = f"{_printable(user.name)} <{email}>" if user.name else f"<{email}>"
         return [
             f"{who} ({user.id})",
             (
                 f"Account: {_printable(account.name or '(unnamed)')} ({account.id}), "
-                f"plan {account.plan}, {account.status}"
+                f"plan {_printable(account.plan or '?')}, {account.status}"
             ),
         ]
 
@@ -1682,7 +1699,7 @@ def _whoami_person_account(w: Whoami) -> list[str]:
     else:
         person = f"User {user.id}"
     acct = f"{_printable(account.name)} ({account.id})" if account.name else account.id
-    plan = f", plan {account.plan}" if account.plan else ""
+    plan = f", plan {_printable(account.plan)}" if account.plan else ""
     return [
         person + withheld([f for f, v in (("name", user.name), ("email", user.email)) if not v]),
         f"Account: {acct}{plan}, {account.status}"

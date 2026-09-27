@@ -34,9 +34,14 @@ This is the summary you read to decide whether to upgrade.
   `ValueError` before a request is sent). An exception that leaves the outcome
   unknown — a dropped connection or timeout after the request went out, a
   `5xx`, or the platform's `409` `idempotency_in_progress` /
-  `idempotency_outcome_unknown` — carries the key as `idempotency_key`:
-  calling the same method again with it answers the first call's result
-  instead of doing it twice. `operations.list` takes `idempotency_key=`,
+  `idempotency_outcome_unknown` — carries the key as `idempotency_key`. After
+  a dropped connection, a timeout or `idempotency_in_progress`, calling the
+  same method again with it answers the first call's result instead of doing
+  it twice. After a `5xx` it never does: every resend under that key raises
+  `ConflictError` with code `idempotency_outcome_unknown`, so read the
+  computer, or the operation the error names, instead of resending — and do
+  not resend under a new key, which may do the call a second time.
+  `operations.list` takes `idempotency_key=`,
   `Operation.idempotency_key` says which key started one (`None` when none, or
   on an older platform), `delete` is a documented kind, and `is_transient` is
   `False` for `idempotency_outcome_unknown`.
@@ -135,8 +140,55 @@ This is the summary you read to decide whether to upgrade.
   every request and belong to the server they were set for. `get` and `set`
   print which secret it uses.
 
+- **Workspaces:** `client.workspaces.list()`, `get(workspace_id)` and
+  `members(workspace_id)`, sync and async, over the platform's
+  `GET workspaces`, `GET workspaces/{id}` and `GET workspaces/{id}/members`.
+  `get` of an id the key cannot see raises `NotFoundError`; `members` raises
+  `PermissionDeniedError` for a key confined to a workspace. New exports:
+  `Workspace`, `WorkspaceMember`.
+- **`NO_BROWSER_PROXY`:** `browser_proxy=NO_BROWSER_PROXY` on
+  `computers.create()` and `launch()` (sync and async) sends
+  `"browser_proxy": null`, creating the computer with no browser proxy even
+  when its template carries a default (`spec.browser_proxy`). Leaving
+  `browser_proxy` at `None` still omits the key, so the template's default is
+  inherited. New exports: `NO_BROWSER_PROXY` and its type, `NoBrowserProxy`.
+- **`computer.wait_for_egress_proxy()`** (sync and async) waits until the
+  computer's host holds its egress proxy's credentials
+  (`egress_proxy_pending` false on a running computer), and `launch()` calls
+  it when the create's `egress_proxy`, or the computer's, names
+  `credentials_secret_id`: until then every connection the computer opens is
+  closed.
+- **`modifiers=` on `drag()`** (sync and async), keys held for the whole
+  drag, sent as `click()` and `scroll()` send theirs.
+- **`ApiKey.minted_by_key_id`** (and so on `ApiKeyCreated` and
+  `Whoami.key`): the id of the key that minted this one over the API, kept
+  after that key is revoked; `None` for a dashboard key. Revoking a key does
+  not revoke the keys it minted, so this is how to find them.
+  `mandala-py api-keys list` prints it as `MINTED BY`. Keyword-only, at the
+  end of the constructor.
+- **`APIError.code` and `APIError.operation_id`**, read-only, from the error
+  body's `code` (such as `idempotency_in_progress` or
+  `idempotency_outcome_unknown`) and `operation_id`; `None` when absent.
+  `OperationFailedError.code` is unchanged.
+- **`ComputerDeletion.operation_id`**: the delete's lifecycle operation, from
+  `delete(detailed=True)`. Keyword-only, at the end of the constructor.
+- **`mandala-py --json` failures carry the call's ids:** `request_id`,
+  `idempotency_key` and `operation_id` in the `error` object when the failure
+  has them.
+
 ### Changed
 
+- **`set_schedule()` keeps the window it is not told about** (sync and
+  async). `hour`, `minute` and `tz` now default to `None`, meaning "keep the
+  current schedule's value": it reads the schedule first and sends it back,
+  falling back to 04:00 UTC only for a computer with no schedule. The
+  platform stores the window whole, so `set_schedule(enabled=False)` used to
+  move a 23:30 America/Chicago window to 04:00 UTC while switching it off.
+  Passing all three sends no read, as before.
+- **`WhoamiUser.email` and `WhoamiAccount.plan` are `str | None`.** The
+  platform sends `null` in both for a key confined to a workspace, and they
+  were decoded as `""`. A value that is neither a string nor `null` now
+  raises `MandalaError`.
 - **`computers.launch()` waits for bound secrets** (sync and async). With
   secrets bound it now returns only once they have reached the desktop, inside
   the same readiness budget, so the first command on the returned computer sees
@@ -170,6 +222,20 @@ This is the summary you read to decide whether to upgrade.
 
 ### Fixed
 
+- **Documentation corrected against the platform:** `BrowserProxyArgs` and
+  `EgressProxyArgs` named a `BadRequestError` that does not exist (a refused
+  value is an `APIError` with `status == 400`); revoking a manage-keys key
+  does NOT revoke the plain keys it minted; a memory clone gets its own
+  network identity before its network comes up and runs beside its source;
+  an `egress_proxy` create is never answered from the warm pool, not "always a
+  cold boot"; `Computer.clone()` needs the source stopped or suspended; a
+  suspended computer's `screenshot()` is its saved JPEG, at most 640 pixels
+  wide; `publish()`'s 400 carries every problem in `body["problems"]`;
+  `templates.schema()`'s URL needs a key, so save it to a file for an editor;
+  `doc_digest` does not change with comments, key order or whitespace;
+  `BuildStep.status` can be `unknown`; `PermissionDeniedError` covers a
+  missing role, membership or permission; `OriginUnreachableError` leaves the
+  outcome unknown; and a 409 reason `running` means stop the computer.
 - **`api_keys.revoke()` refuses an API key passed where its id goes** (sync
   and async, and `mandala-py api-keys revoke`). Revoking the key you hold by
   pasting it (`com_...`) put the live key into the request path, where access
@@ -191,7 +257,9 @@ This is the summary you read to decide whether to upgrade.
   so a name holding a newline could forge a row and one holding an escape
   sequence could drive the terminal. Each control character (C0, DEL, C1,
   U+2028, U+2029) now prints as a visible escape such as `\x0a`, `\x1b` or
-  `\u2028`. `--json` output is unchanged. The platform now refuses such
+  `\u2028`, and so does each bidi embedding, override and isolate
+  (U+202A-U+202E, U+2066-U+2069), which could visually reverse the rest of a
+  row. `--json` output is unchanged. The platform now refuses such
   characters in a new key's name; keys named before that keep their names.
 
 ## [0.6.0] — 2026-09-25

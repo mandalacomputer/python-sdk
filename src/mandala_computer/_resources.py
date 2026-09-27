@@ -34,6 +34,7 @@ from ._models import (
     LifecycleAck,
     Listing,
     Move,
+    NoBrowserProxy,
     Operation,
     OperationPage,
     PublishedTemplate,
@@ -53,6 +54,8 @@ from ._models import (
     WebhookCreated,
     WebhookDelivery,
     Whoami,
+    Workspace,
+    WorkspaceMember,
     build_contradiction,
     move_rows,
 )
@@ -72,6 +75,7 @@ __all__ = [
     "Templates",
     "Usage",
     "Webhooks",
+    "Workspaces",
 ]
 
 
@@ -135,6 +139,15 @@ raising, the computer is reported with a warning rather than a second exception,
 so what you catch is still your own error. That warning means a machine outlived
 its block and is still billable.
 """
+
+
+def _names_egress_credentials(proxy: object) -> bool:
+    """Whether an egress proxy — create's argument or a computer's record —
+    names ``credentials_secret_id``, which is what makes it pending until the
+    host holds the value."""
+    if isinstance(proxy, EgressProxy):
+        return proxy.credentials_secret_id is not None
+    return isinstance(proxy, Mapping) and bool(proxy.get("credentials_secret_id"))
 
 
 def _launch_start_admitted(data: Mapping[str, Any]) -> bool:
@@ -208,7 +221,7 @@ class Computers:
         start: bool = True,
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
-        browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         idempotency_key: str | None = None,
     ) -> Computer:
@@ -233,10 +246,20 @@ class Computers:
         one per call, or ``idempotency_key`` if you pass it. An error that
         leaves the outcome unknown — a dropped connection or timeout after the
         request went out, a ``5xx`` — carries the key it was sent with as
-        :attr:`~mandala_computer.MandalaError.idempotency_key`; calling
-        ``create`` again with the same arguments and that key answers the first
-        call's result instead of building a second computer. Keys last 24 hours,
-        and a key sent with different arguments raises an ``APIError`` (422).
+        :attr:`~mandala_computer.MandalaError.idempotency_key`. After a dropped
+        connection or a timeout, calling ``create`` again with the same
+        arguments and that key answers the first call's result instead of
+        building a second computer, or a :class:`~mandala_computer.ConflictError`
+        with :attr:`~mandala_computer.APIError.code` ``idempotency_in_progress``
+        while it is still running (send it again later). After a ``5xx``, the
+        key never answers the result: every resend raises a ``ConflictError``
+        with code ``idempotency_outcome_unknown``, and so does one sent after an
+        ``idempotency_in_progress`` the platform gave up on. Then read the
+        computer, or the operation the error's
+        :attr:`~mandala_computer.APIError.operation_id` names
+        (:attr:`Client.operations`), rather than sending the create again under
+        a new key, which may build a second computer. Keys last 24 hours, and a
+        key sent with different arguments raises an ``APIError`` (422).
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -274,7 +297,14 @@ class Computers:
         carrying one is always a cold boot; wait with
         :meth:`Computer.wait_for_browser_proxy` before starting a browser that
         must use it. Which proxies are accepted is the platform's rule, and a
-        value it refuses is its 400; only the shape is checked here.
+        value it refuses is its 400; only the shape is checked here. A template
+        you published can carry a default proxy (``spec.browser_proxy``), and a
+        create that leaves ``browser_proxy`` out (``None``) inherits it, exactly
+        as if it had been sent: a cold boot. Pass
+        :data:`~mandala_computer.NO_BROWSER_PROXY` to create the computer with
+        none instead. A create from such a template, whatever it sends here,
+        answers 409 with reason ``unsupported`` if its host cannot launch a
+        proxy yet.
 
         ``egress_proxy`` sends ALL of the computer's outbound TCP — ``exec``,
         terminals, package managers and browsers alike — through a proxy, an
@@ -284,8 +314,8 @@ class Computers:
         nothing goes direct), drops UDP to the internet and ICMP, and leaves DNS
         lookups to the platform's resolver. Its ``credentials_secret_id`` names
         a secret holding ``user:password`` that is not bound to the computer and
-        never reaches it. A create carrying one is always a cold boot, and a
-        clone does not inherit it. A host that cannot take one — or an
+        never reaches it. A create carrying one is never answered from the warm
+        pool, and a clone does not inherit it. A host that cannot take one — or an
         ``https://`` one, or one naming credentials — answers 409 with reason
         ``unsupported``.
 
@@ -331,7 +361,7 @@ class Computers:
         start: bool = True,
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
-        browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
@@ -345,12 +375,16 @@ class Computers:
         With ``secrets`` bound it also waits until they have reached the
         desktop (:meth:`Computer.wait_for_secrets`), so a command run on the
         returned computer sees them; a delivery that failed raises, naming why.
-        With ``browser_proxy`` it also waits until the guest has it
-        (:meth:`Computer.wait_for_browser_proxy`), so a browser opened on the
-        returned computer uses it.
+        With ``browser_proxy`` (or a template's default one) it also waits
+        until the guest has it (:meth:`Computer.wait_for_browser_proxy`), so a
+        browser opened on the returned computer uses it. With an
+        ``egress_proxy`` naming ``credentials_secret_id`` it also waits until
+        the computer's host holds them (:meth:`Computer.wait_for_egress_proxy`):
+        until then every connection the computer opens is closed.
 
         ``timeout`` is one readiness budget in seconds, beginning after create
-        returns. Disk, running, guest, secrets and browser proxy waits share the remaining time, and
+        returns. Disk, running, guest, secrets, browser proxy and egress proxy
+        waits share the remaining time, and
         elapsed start work consumes it too. Create and start retain their usual
         transport deadlines: this is not a total wall-clock limit on launch.
         ``poll`` is the delay in seconds between polls in every stage.
@@ -432,11 +466,22 @@ class Computers:
             # The same gap for a browser proxy: the guest answers before the
             # policy is on disk, and a browser opened in between goes out
             # directly.
-            if browser_proxy is not None or computer.raw.get("browser_proxy") is not None:
+            if (
+                browser_proxy is not None and browser_proxy is not NoBrowserProxy.NO_BROWSER_PROXY
+            ) or computer.raw.get("browser_proxy") is not None:
                 # Told one is set, as the secrets wait is, so a read that leaves
                 # the setting out is not taken for "none" and returned on.
                 computer.wait_for_browser_proxy(
                     timeout=remaining(), poll=poll, expect_browser_proxy=True
+                )
+            # And for an egress proxy naming credentials: until its host holds
+            # them every connection the computer opens is closed, so a command
+            # run on the returned computer would find no network.
+            if _names_egress_credentials(egress_proxy) or _names_egress_credentials(
+                computer.raw.get("egress_proxy")
+            ):
+                computer.wait_for_egress_proxy(
+                    timeout=remaining(), poll=poll, expect_credentials=True
                 )
             return computer
         except MandalaError as err:
@@ -659,8 +704,12 @@ class Snapshots:
         """Create a new computer from a snapshot.
 
         Cloning a memory snapshot forks it: the new machine resumes from the
-        captured RAM rather than booting, so it starts as a live twin of the
-        original — same hostname and network identity until it is re-identified.
+        captured RAM rather than booting, with the original's session. Before
+        its network comes up it is given an identity of its own — its own MAC
+        and address, its name as hostname, a new machine ID and SSH host keys,
+        and its own desktop password — so it runs beside its source. If that
+        cannot be done the copy is left stopped rather than running as its
+        source; starting it boots its disk fresh.
 
         Returns as soon as the computer exists, which is before its disk does.
         A snapshot has to be copied out — and a snapshot taken incrementally is
@@ -673,8 +722,8 @@ class Snapshots:
         boot with its own network identity, the way out when the saved session
         is what is broken. A memory snapshot of a computer that held secrets is
         resumed only with ``inherit_secrets=True`` — the copy then holds the
-        SAME credentials, lands in the source's workspace, and cannot run on the
-        same host while its source is running. Otherwise it too is built from
+        SAME credentials, bound to the same secrets, and lands in the source's
+        workspace. Otherwise it too is built from
         the disk, and the returned computer's :attr:`memory_dropped` says so;
         check it before assuming the session came across.
         """
@@ -885,8 +934,9 @@ class Templates:
         Returned as it arrives rather than wrapped in a type, because it is a
         schema: what a caller does with it is point an editor or a validator at
         it, and a shape of our own over the top would be a second, worse
-        description of the same thing. Its ``$id`` is the URL it came from, so a
-        ``$ref`` to it resolves.
+        description of the same thing. The URL it came from needs an API key,
+        which an editor fetching it will not send, so save it to a file
+        (``json.dump``) and point the editor at the file.
         """
         return self._t.json_object("GET", _api.TEMPLATE_SCHEMA)
 
@@ -895,8 +945,9 @@ class Templates:
 
         Side-effect free and claims no ref, so it is safe on a draft and safe to
         call repeatedly. Worth doing while iterating: a document that is wrong
-        comes back with EVERY problem at once, where :meth:`publish` reports the
-        first thing that stops it.
+        comes back with EVERY problem one pass can reach, at once — the same
+        list :meth:`publish`'s 400 carries in the error body's ``problems``,
+        without claiming a ref.
 
         Does not raise for an invalid document. That is not leniency — an
         invalid document is the answer to the question this method asks, and the
@@ -936,6 +987,10 @@ class Templates:
 
         A ref you have RETIRED stays spoken for and cannot be republished,
         identical bytes included. See :meth:`retire`.
+
+        An invalid document is refused with an
+        :class:`~mandala_computer.APIError` (400) whose ``body["problems"]``
+        lists every problem, as :meth:`validate` reports them.
         """
         data = self._t.json_object("POST", _api.TEMPLATES, content=_api.template_document(document))
         return PublishedTemplate.from_api(data)
@@ -1797,7 +1852,8 @@ class ApiKeys:
     (Credentials, "Manage keys"), and nothing a key can call turns it on —
     without it each method raises :class:`~mandala_computer.PermissionDeniedError`
     whose message says so. A key minted here never has the permission, so a
-    leaked key that manages keys cannot mint a family of keys that do.
+    leaked key that manages keys cannot pass the permission on — but the plain
+    keys it minted survive its revocation (see :meth:`revoke`).
 
     Reach: the holder's own keys on the account this key acts on — never
     another person's, which answer like an id that does not exist. A key
@@ -1833,8 +1889,52 @@ class ApiKeys:
         itself, and the call that does so is the last it makes. An id out of
         this key's reach is a :class:`~mandala_computer.NotFoundError`, the same
         as one that does not exist. An API key itself (``com_...``) is refused
-        with a ``ValueError`` before any request, so it never reaches a URL."""
+        with a ``ValueError`` before any request, so it never reaches a URL.
+
+        Revoking a key does NOT revoke the keys it minted: they keep working.
+        Each carries the minter's id in
+        :attr:`~mandala_computer.ApiKey.minted_by_key_id`, so find them in
+        :meth:`list` and revoke them too."""
         self._t.request("DELETE", _api.api_key(key_id))
+
+
+class Workspaces:
+    """The account's workspaces, read only (platform OPL-5057).
+
+    A workspace partitions the account's computers; a key confined to one
+    reaches that workspace's computers only. Workspaces are created, renamed
+    and deleted in the dashboard, so there is nothing here to change one.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self) -> builtins.list[Workspace]:
+        """The account's workspaces, oldest first. A key confined to a
+        workspace lists that one and no other; an account-wide key sees them
+        all, whatever its holder's role."""
+        rows = self._t.json_array("GET", _api.WORKSPACES)
+        return [Workspace.from_api(w, f"workspace {i}") for i, w in enumerate(rows)]
+
+    def get(self, workspace_id: str) -> Workspace:
+        """One workspace. An id this key cannot see raises
+        :class:`~mandala_computer.NotFoundError`, the same as one that does not
+        exist: another account's, any but its own for a key confined to a
+        workspace, and a deleted workspace a computer's ``workspace_id`` still
+        names."""
+        return Workspace.from_api(self._t.json_object("GET", _api.workspace(workspace_id)))
+
+    def members(self, workspace_id: str) -> builtins.list[WorkspaceMember]:
+        """The people who reach this workspace, oldest member first — the
+        account's accepted members, since everybody on the account reaches every
+        workspace at their account role.
+
+        A key confined to a workspace cannot list them: it raises
+        :class:`~mandala_computer.PermissionDeniedError` (403), because the list
+        is the whole account's. Use an account-wide key.
+        """
+        rows = self._t.json_array("GET", _api.workspace_members(workspace_id))
+        return [WorkspaceMember.from_api(m, f"workspace member {i}") for i, m in enumerate(rows)]
 
 
 #: How long :meth:`Operations.wait` waits by default: the length of a long clone.
@@ -1900,10 +2000,11 @@ class Operations:
     OPL-5055).
 
     Every accepted create, clone, start, stop, suspend, restart, snapshot
-    restore, resize and move records one and answers its id: as
+    restore, resize, move and delete records one and answers its id: as
     :attr:`~mandala_computer.Computer.operation_id`,
-    :attr:`~mandala_computer.LifecycleAck.operation_id` or
-    :attr:`~mandala_computer.Move.operation_id`. A refused call records
+    :attr:`~mandala_computer.LifecycleAck.operation_id`,
+    :attr:`~mandala_computer.Move.operation_id` or
+    :attr:`~mandala_computer.ComputerDeletion.operation_id`. A refused call records
     nothing, since its error is its outcome, and calls made from the dashboard
     record none. Operations are kept for a limited time, after which a read is
     a :class:`~mandala_computer.NotFoundError`.

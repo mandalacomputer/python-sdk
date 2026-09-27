@@ -255,6 +255,77 @@ async def test_the_async_half_matches() -> None:
     assert delete.called
 
 
+# --- minted_by_key_id and whoami's nulls (OPL-5322) --------------------------
+
+MINTED = {**API_KEY, "id": "key-0a0b0c0d0e0f", "minted_by_key_id": "key-000000000001"}
+SCOPED_WHOAMI: dict[str, Any] = {
+    **WHOAMI,
+    "user": {"id": "usr-1", "email": None, "name": None},
+    "account": {"id": "acc-1", "name": None, "plan": None, "status": "active"},
+    "workspace": {"id": "wsp-1", "name": "ci", "created_at": "2026-09-01T00:00:00Z"},
+    "key": {**MINTED, "workspace_id": "wsp-1", "workspace_name": "ci"},
+}
+
+
+def check_minted(keys: list[mc.ApiKey], created: mc.ApiKeyCreated, who: mc.Whoami) -> None:
+    # A key made in the dashboard has none, and an old platform sends none.
+    assert [k.minted_by_key_id for k in keys] == [None, "key-000000000001"]
+    assert created.minted_by_key_id == "key-000000000001"
+    assert who.key is not None and who.key.minted_by_key_id == "key-000000000001"
+    # Keyword-only at the end, so positional construction is unchanged.
+    positional = mc.ApiKey("key-1", None, "com_1…", "2026-09-20", None, None, None, False)
+    assert positional.minted_by_key_id is None
+
+
+def check_scoped(who: mc.Whoami) -> None:
+    # null for a workspace-scoped key, not "": an empty email is not a withheld one.
+    assert who.user.email is None and who.user.name is None
+    assert who.account.plan is None and who.account.name is None
+
+
+def mock_minted_and_scoped() -> None:
+    respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[API_KEY, MINTED]))
+    respx.post(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(
+            201, json={**API_KEY_CREATED, **MINTED, "raw": "com_" + "cd" * 24}
+        )
+    )
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=SCOPED_WHOAMI))
+
+
+@respx.mock
+def test_minted_by_key_id_and_scoped_nulls_are_read() -> None:
+    mock_minted_and_scoped()
+    c = client()
+    who = c.account.whoami()
+    check_minted(c.api_keys.list(), c.api_keys.create(name="ci"), who)
+    check_scoped(who)
+
+
+@respx.mock
+async def test_async_minted_by_key_id_and_scoped_nulls_are_read() -> None:
+    mock_minted_and_scoped()
+    async with mc.AsyncClient("com_test", base_url=BASE) as c:
+        who = await c.account.whoami()
+        check_minted(await c.api_keys.list(), await c.api_keys.create(name="ci"), who)
+    check_scoped(who)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {**WHOAMI, "user": {**WHOAMI["user"], "email": 7}},
+        {**WHOAMI, "account": {**WHOAMI["account"], "plan": ["team"]}},
+        {**WHOAMI, "key": {**API_KEY, "minted_by_key_id": 1}},
+    ],
+)
+@respx.mock
+def test_a_nullable_field_that_is_not_text_is_refused(body: dict[str, Any]) -> None:
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(mc.MandalaError):
+        client().account.whoami()
+
+
 # --- the CLI ----------------------------------------------------------------
 
 
@@ -352,6 +423,29 @@ def test_cli_api_keys_list(capsys: pytest.CaptureFixture[str]) -> None:
     assert "MANAGES KEYS" in out and API_KEY["id"] in out and "account-wide" in out
     assert _cli.main(["api-keys", "list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == [API_KEY]
+
+
+@respx.mock
+def test_cli_api_keys_list_names_the_minting_key(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[API_KEY, MINTED]))
+    assert _cli.main(["api-keys", "list"]) == 0
+    header, dashboard, minted = capsys.readouterr().out.splitlines()
+    assert header.split()[-2:] == ["MINTED", "BY"]
+    assert dashboard.split()[-1] == "-"
+    assert minted.split()[-1] == "key-000000000001"
+
+
+@respx.mock
+def test_cli_escapes_bidi_controls_in_names(capsys: pytest.CaptureFixture[str]) -> None:
+    # A right-to-left override visually reverses the rest of the row on a
+    # bidi-aware terminal; embeddings and isolates do the same.
+    controls = [chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))]
+    named = {**API_KEY, "name": "ci" + "".join(controls)}
+    respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[named]))
+    assert _cli.main(["api-keys", "list"]) == 0
+    out = capsys.readouterr().out
+    assert not any(c in out for c in controls)
+    assert "ci\\u202a\\u202b\\u202c\\u202d\\u202e\\u2066\\u2067\\u2068\\u2069" in out
 
 
 @respx.mock

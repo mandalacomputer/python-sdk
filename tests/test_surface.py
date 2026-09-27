@@ -78,11 +78,6 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # The account's workspaces, read only (OPL-5057). Listed to stay in step
-    # with the surface; no SDK method yet.
-    ("GET", "workspaces"),
-    ("GET", "workspaces/:id"),
-    ("GET", "workspaces/:id/members"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -150,6 +145,17 @@ WHOAMI = {
     "role": "owner",
     "workspace": None,
     "key": {**API_KEY, "manage_keys": True},
+}
+# A workspace and one of its members, as `GET workspaces/:id` and
+# `GET workspaces/:id/members` answer them (OPL-5057).
+WORKSPACE = {"id": "wsp-0123456789ab", "name": "acme", "created_at": "2026-09-01T00:00:00.000Z"}
+WORKSPACE_MEMBER = {
+    "user_id": "usr-0123456789abcdef",
+    "email": "dana@example.com",
+    "name": None,
+    "role": "member",
+    "accepted_at": "2026-09-02T00:00:00.000Z",
+    "suspended": False,
 }
 # A finished lifecycle operation, as `GET operations/:id` answers it (OPL-5055).
 OPERATION = {
@@ -445,6 +451,7 @@ def pattern_for(path: str) -> str:
             "api-keys",
             "secrets",
             "operations",
+            "workspaces",
         ):
             # `computers/:id/secrets` is a literal third segment, never an id:
             # only the account store's `secrets/:id` is at position 1.
@@ -680,6 +687,12 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=OPERATION)
     if path.endswith("/whoami"):
         return httpx.Response(200, json=WHOAMI)
+    if path.endswith("/workspaces"):
+        return httpx.Response(200, json=[WORKSPACE])
+    if "/workspaces/" in path:
+        return httpx.Response(
+            200, json=[WORKSPACE_MEMBER] if path.endswith("/members") else WORKSPACE
+        )
     if path.endswith("/api-keys"):
         return httpx.Response(200 if get else 201, json=[API_KEY] if get else API_KEY_CREATED)
     if "/api-keys/" in path:
@@ -811,6 +824,7 @@ def exercise_everything(client: mc.Client) -> None:
     c.wait_for_guest()
     c.wait_for_secrets()
     c.wait_for_browser_proxy()
+    c.wait_for_egress_proxy()
     c.start()
     c.start(resume_only=True)
     c.stop()
@@ -1019,6 +1033,10 @@ def exercise_everything(client: mc.Client) -> None:
     client.api_keys.create()
     client.api_keys.create(name="ci", workspace_id="wsp-1")
     client.api_keys.revoke(API_KEY["id"])
+    # The account's workspaces, read only (OPL-5057).
+    client.workspaces.list()
+    client.workspaces.get(WORKSPACE["id"])
+    client.workspaces.members(WORKSPACE["id"])
     # Lifecycle operations (OPL-5055): a read, a page with every parameter it
     # sends, and the wait over the read.
     client.operations.get(OPERATION["id"])
@@ -1093,6 +1111,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.wait_for_guest()
     await c.wait_for_secrets()
     await c.wait_for_browser_proxy()
+    await c.wait_for_egress_proxy()
     await c.start()
     await c.start(resume_only=True)
     await c.stop()
@@ -1275,6 +1294,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.api_keys.create()
     await client.api_keys.create(name="ci", workspace_id="wsp-1")
     await client.api_keys.revoke(API_KEY["id"])
+    await client.workspaces.list()
+    await client.workspaces.get(WORKSPACE["id"])
+    await client.workspaces.members(WORKSPACE["id"])
     await client.operations.get(OPERATION["id"])
     await client.operations.list()
     await client.operations.list(computer_id="vm-1", limit=5, cursor="op_00000000000000000000000a")

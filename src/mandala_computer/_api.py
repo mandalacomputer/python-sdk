@@ -74,9 +74,12 @@ WHOAMI = "whoami"
 #: without it the platform answers 403 with a sentence that says so.
 API_KEYS = "api-keys"
 #: Lifecycle operations (platform OPL-5055): what each accepted create, clone,
-#: start, stop, suspend, restart, restore, resize and move started, and how it
-#: ended. Read only.
+#: start, stop, suspend, restart, restore, resize, move and delete started, and
+#: how it ended. Read only.
 OPERATIONS = "operations"
+#: The account's workspaces (platform OPL-5057). Read only: they are created,
+#: renamed and deleted in the dashboard.
+WORKSPACES = "workspaces"
 #: The most one page of ``GET operations`` holds; the platform refuses more.
 OPERATIONS_PAGE_MAX = 100
 
@@ -1089,8 +1092,12 @@ def create_body(
     ``secrets`` goes through :func:`secret_bindings_body`, and no ``secrets``
     key is sent when it is ``None``. ``browser_proxy`` goes through
     :func:`browser_proxy_body` the same way, and ``egress_proxy`` through
-    :func:`egress_proxy_body`.
+    :func:`egress_proxy_body`. ``browser_proxy`` alone has an explicit "none":
+    :data:`~mandala_computer.NO_BROWSER_PROXY` sends ``null``, which opts out
+    of a template's default proxy that an omitted key inherits.
     """
+    from ._models import NO_BROWSER_PROXY  # a cycle at import time; not at call time
+
     if size is not None and any(
         v is not None for v in (template, template_transfer, cpu, ram_mb, disk_gb)
     ):
@@ -1129,7 +1136,9 @@ def create_body(
             body[key] = whole(count, key, exc=ValueError)
     if secrets is not None:
         body["secrets"] = secret_bindings_body(secrets)
-    if browser_proxy is not None:
+    if browser_proxy is NO_BROWSER_PROXY:
+        body["browser_proxy"] = None
+    elif browser_proxy is not None:
         body["browser_proxy"] = browser_proxy_body(browser_proxy)
     if egress_proxy is not None:
         body["egress_proxy"] = egress_proxy_body(egress_proxy)
@@ -1722,6 +1731,20 @@ def schedule_body(*, enabled: bool, hour: int, minute: int, tz: str) -> dict[str
     }
 
 
+def check_schedule_args(
+    *, enabled: bool, hour: int | None, minute: int | None, tz: str | None
+) -> None:
+    """:func:`schedule_body`'s checks on the parts a caller gave, for
+    ``set_schedule`` to make BEFORE it reads the current window for the rest:
+    a bad value is refused without any request, as it always was."""
+    schedule_body(
+        enabled=enabled,
+        hour=4 if hour is None else hour,
+        minute=0 if minute is None else minute,
+        tz="UTC" if tz is None else tz,
+    )
+
+
 # --- input ----------------------------------------------------------------
 #
 # The verb set is Anthropic's computer tool, in full. The platform accepts both
@@ -1785,8 +1808,15 @@ def click_body(
     return body
 
 
-def drag_body(from_x: int | None, from_y: int | None, to_x: int, to_y: int) -> dict[str, Any]:
-    """A press, a move, and a release — one gesture, not two clicks.
+def drag_body(
+    from_x: int | None,
+    from_y: int | None,
+    to_x: int,
+    to_y: int,
+    modifiers: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """A press, a move, and a release — one gesture, not two clicks, optionally
+    with keys held down for all of it (as a click and a scroll send them).
 
     ``start_coordinate`` is omitted when the caller did not give one, which asks
     the platform to drag from wherever the pointer is. It refuses that if nothing
@@ -1808,6 +1838,8 @@ def drag_body(from_x: int | None, from_y: int | None, to_x: int, to_y: int) -> d
     body: dict[str, Any] = {"action": "left_click_drag", "coordinate": [to_x, to_y]}
     if from_x is not None and from_y is not None:
         body["start_coordinate"] = [from_x, from_y]
+    if modifiers:
+        body["text"] = "+".join(modifiers)
     return body
 
 
@@ -2297,12 +2329,24 @@ def operation(operation_id: str) -> str:
     return f"operations/{seg(operation_id)}"
 
 
+def workspace(workspace_id: str) -> str:
+    return f"workspaces/{seg(workspace_id)}"
+
+
+def workspace_members(workspace_id: str) -> str:
+    return f"workspaces/{seg(workspace_id)}/members"
+
+
 #: The header every lifecycle call carries so that sending it again cannot do
 #: it twice (platform OPL-5127). The platform records a call that carries one
 #: before carrying it out, and for 24 hours answers the same key with the same
 #: request from that record instead of doing the call again: ``409`` with
 #: ``code: "idempotency_in_progress"`` while it runs, the original answer once
-#: it has finished. A different request under the same key is a ``422``.
+#: it has finished. A call the platform answered with a ``5xx`` is different:
+#: its outcome is unknown, and from then on the same key answers ``409`` with
+#: ``code: "idempotency_outcome_unknown"`` and never the result, so read the
+#: computer or its operation instead. A different request under the same key
+#: is a ``422``.
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
 _IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,255}")

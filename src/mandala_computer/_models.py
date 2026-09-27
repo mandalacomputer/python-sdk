@@ -22,6 +22,7 @@ from ._api import SECRET_ENV, SECRET_FILE
 from ._exceptions import MandalaError
 
 __all__ = [
+    "NO_BROWSER_PROXY",
     "AccountCapabilities",
     "AccountCompleteness",
     "AccountLimits",
@@ -52,6 +53,7 @@ __all__ = [
     "LifecycleAck",
     "Listing",
     "Move",
+    "NoBrowserProxy",
     "Operation",
     "OperationError",
     "OperationPage",
@@ -88,6 +90,8 @@ __all__ = [
     "WhoamiWorkspace",
     "Window",
     "WindowResult",
+    "Workspace",
+    "WorkspaceMember",
 ]
 
 T = TypeVar("T")
@@ -1013,8 +1017,9 @@ class TemplateCheck:
 
     Both outcomes are a 200 — an invalid document is an answer to the question,
     not a failed request — so nothing here raises for :attr:`valid` being False.
-    That is the point of validating: :attr:`problems` lists EVERY problem at
-    once, where publishing reports the first thing that stops it.
+    :attr:`problems` lists EVERY problem one pass can reach, at once. Publishing
+    an invalid document is refused with a 400 carrying the same list, in the
+    error body's ``problems``; validating gets it without claiming a ref.
 
     :attr:`build_digest` and :attr:`build_digest_needs` are ALTERNATIVES. A
     document with no parent gets the digest; one naming a parent in ``spec.from``
@@ -1028,15 +1033,18 @@ class TemplateCheck:
     problems: builtins.list[str]
     #: The ref the document claims, once it parsed far enough to have one.
     ref: str | None
-    #: ``sha256:…`` of the whole document. Changes with any edit, a label included.
+    #: ``sha256:…`` of the whole document, taken over :attr:`canonical`. Changes
+    #: with anything that changes what the document means, a label included,
+    #: and NOT with comments, key order, whitespace or YAML versus JSON.
     doc_digest: str | None
     #: ``sha256:…`` of only what decides the IMAGE.
     #:
     #: A new label or a version bump leaves it alone, so comparing it against a
-    #: previous run is how you tell whether an edit means a rebuild. ``None``
-    #: for a document naming a parent in ``spec.from``, which cannot be computed
-    #: without the parent's — and then :attr:`build_digest_needs` says so in
-    #: words, because the platform sends the two as alternatives.
+    #: previous run is how you tell whether an edit means a rebuild. Present
+    #: only for a document with no ``spec.from``, which builds nothing. ``None``
+    #: for a document naming a parent there, whose digest cannot be computed
+    #: without the parent's image — and then :attr:`build_digest_needs` says so
+    #: in words, because the platform sends the two as alternatives.
     build_digest: str | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -1056,11 +1064,9 @@ class TemplateCheck:
     #:     if check.build_digest is None and check.build_digest_needs:
     #:         print(check.build_digest_needs)
     #:
-    #: which prints, for a document naming a parent:
-    #:
-    #:     the contents of acme/base's image, which only a host holding it can
-    #:     supply. Run ``gorillad -build-template <file> -dry-run`` there to see
-    #:     this document's build digest
+    #: which prints, for a document naming a parent, what could not be
+    #: computed — the contents of that parent's image, which only a host
+    #: holding it can supply — and where it can be.
     #:
     #: ``None`` on an invalid document, on one with no parent — where
     #: :attr:`build_digest` is the answer instead — and from a host too old to
@@ -1220,7 +1226,10 @@ class BuildStep:
     #: first real line of the script.
     label: str
     #: ``pending``, ``running``, ``done``, ``failed``, or ``skipped`` for one an
-    #: earlier failure meant we never reached.
+    #: earlier failure meant we never reached. ``unknown`` is the rare one: the
+    #: build's step record was lost mid-build and rebuilt from the document, so
+    #: the step ran and what became of it cannot be recovered — neither
+    #: ``done`` nor ``pending`` would be true.
     status: str
     started_at: str | None
     finished_at: str | None
@@ -3190,7 +3199,8 @@ class BrowserProxyArgs(_BrowserProxyServer, total=False):
     ``server`` is the proxy's URL, such as ``http://proxy.example.com:3128`` or
     ``socks5://127.0.0.1:1080``. Which schemes and hosts are accepted is the
     platform's rule, not this client's: a value it refuses raises
-    :class:`~mandala_computer.BadRequestError` with its sentence. ``bypass``
+    :class:`~mandala_computer.APIError` with ``status == 400`` and the
+    platform's sentence. ``bypass``
     names the hosts the browsers reach directly — ``example.com``,
     ``*.example.com``, an address or a range, or ``<local>``.
 
@@ -3209,6 +3219,24 @@ class BrowserProxyArgs(_BrowserProxyServer, total=False):
 
     bypass: Sequence[str]
     credentials_secret_id: str | None
+
+
+class NoBrowserProxy(Enum):
+    """The type of :data:`NO_BROWSER_PROXY`, and its only value."""
+
+    NO_BROWSER_PROXY = "NO_BROWSER_PROXY"
+
+    def __repr__(self) -> str:
+        return "NO_BROWSER_PROXY"
+
+
+#: ``browser_proxy=NO_BROWSER_PROXY`` on :meth:`~mandala_computer.Computers.create`
+#: or :meth:`~mandala_computer.Computers.launch` creates a computer with NO browser
+#: proxy, sending ``"browser_proxy": null``. A template you published can carry
+#: a default proxy (``spec.browser_proxy``), which a create that leaves
+#: ``browser_proxy`` out (``None``, the default) inherits; this is how to opt
+#: out of it. ``None`` cannot say that, because it means "not mentioned".
+NO_BROWSER_PROXY = NoBrowserProxy.NO_BROWSER_PROXY
 
 
 @dataclass(frozen=True)
@@ -3279,8 +3307,9 @@ class EgressProxyArgs(_EgressProxyServer, total=False):
     (one that takes ``CONNECT``), ``https://host:port`` (the same, spoken to
     over TLS) or ``socks5://host:port``, never with a username or password in
     it. Which schemes and hosts are accepted is the platform's rule, not this
-    client's: a value it refuses raises :class:`~mandala_computer.BadRequestError`
-    with its sentence. There is no bypass list: every connection goes through
+    client's: a value it refuses raises :class:`~mandala_computer.APIError`
+    with ``status == 400`` and the platform's sentence. There is no bypass
+    list: every connection goes through
     the proxy.
 
     ``credentials_secret_id`` is for an upstream that asks for a username and
@@ -3994,6 +4023,11 @@ class ComputerDeletion:
     error: str | None
     purge: SnapshotPurge | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: The delete's lifecycle operation (``op_…``), which
+    #: :meth:`~mandala_computer.Operations.get` reads; ``None`` when the answer
+    #: carried none. Keyword-only at the end: this class is exported, and its
+    #: field order is its constructor.
+    operation_id: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any] | None) -> ComputerDeletion:
@@ -4007,6 +4041,7 @@ class ComputerDeletion:
             error=error if isinstance(error, str) and error else None,
             purge=SnapshotPurge.from_api(d.get("purge")),
             raw=dict(d),
+            operation_id=operation_id_of(d),
         )
 
 
@@ -4054,6 +4089,12 @@ class ApiKey:
     #: this on, and a key minted over the API never has it.
     manage_keys: bool
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: The id of the key that minted this one over the API, kept after that key
+    #: is revoked; ``None`` for a key made in the dashboard, and from a platform
+    #: too old to send it. Revoking a key does not revoke the keys it minted, so
+    #: this is how to find them. Keyword-only at the end because this class is
+    #: exported and its field order is its constructor.
+    minted_by_key_id: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "API key") -> ApiKey:
@@ -4079,6 +4120,7 @@ class ApiKey:
             workspace_name=_nullable_text(d, "workspace_name", where),
             manage_keys=manage,
             raw=dict(d),
+            minted_by_key_id=_nullable_text(d, "minted_by_key_id", where),
         )
 
 
@@ -4106,20 +4148,28 @@ class ApiKeyCreated(ApiKey):
 
 @dataclass(frozen=True)
 class WhoamiUser:
-    """The person a credential was issued to."""
+    """The person a credential was issued to.
+
+    ``email`` and ``name`` are ``None`` for a key confined to a workspace: the
+    platform does not tell such a key who the account's people are.
+    """
 
     id: str
-    email: str
+    email: str | None
     name: str | None
 
 
 @dataclass(frozen=True)
 class WhoamiAccount:
-    """The account a credential acts on."""
+    """The account a credential acts on.
+
+    ``name`` and ``plan`` are ``None`` for a key confined to a workspace (its
+    plan is still on :meth:`~mandala_computer.Account.read`).
+    """
 
     id: str
     name: str | None
-    plan: str
+    plan: str | None
     #: ``active`` or ``suspended``. A suspended account can still ask who it is.
     status: str
 
@@ -4172,18 +4222,94 @@ class Whoami:
         return cls(
             user=WhoamiUser(
                 id=_key_text(user, "id", f"{where} user"),
-                email=_text(user.get("email")),
+                email=_nullable_text(user, "email", f"{where} user"),
                 name=_nullable_text(user, "name", f"{where} user"),
             ),
             account=WhoamiAccount(
                 id=_key_text(account, "id", f"{where} account"),
                 name=_nullable_text(account, "name", f"{where} account"),
-                plan=_text(account.get("plan")),
+                plan=_nullable_text(account, "plan", f"{where} account"),
                 status=_text(account.get("status")),
             ),
             role=str.__str__(role),
             workspace=workspace,
             key=None if key is None else ApiKey.from_api(key, f"{where} key"),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """One of the account's workspaces, from :attr:`mandala_computer.Client.workspaces`.
+
+    A workspace partitions the account's computers: a key confined to one
+    reaches that workspace's computers only, and a computer's ``workspace_id``
+    names the workspace it is in. Read only here: workspaces are created,
+    renamed and deleted in the dashboard.
+    """
+
+    #: ``wsp-`` and twelve hex characters. What a computer's ``workspace_id`` names.
+    id: str
+    #: Unique within the account.
+    name: str
+    created_at: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "workspace") -> Workspace:
+        """Refuses a row without a usable id: it is what :meth:`get` and
+        :meth:`members` send back."""
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: not an object")
+        return cls(
+            id=_key_text(d, "id", where),
+            name=_text(d.get("name")),
+            created_at=_text(d.get("created_at")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class WorkspaceMember:
+    """Somebody who reaches a workspace: an accepted member of the account.
+
+    Workspaces do not divide people — everybody on the account reaches every
+    workspace at their account role — so a workspace's members are the
+    account's. Invitations not yet accepted are left out.
+    """
+
+    #: ``usr-`` and sixteen hex characters.
+    user_id: str
+    #: The address they sign in with.
+    email: str
+    #: Their display name, or ``None`` when they have not set one.
+    name: str | None
+    #: ``owner``, ``member`` or ``viewer``: their role on the account, which is
+    #: their role in every workspace. An open set.
+    role: str
+    #: When they joined the account.
+    accepted_at: str
+    #: ``True`` when this person cannot sign in at the moment. They are still
+    #: on the account.
+    suspended: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "workspace member") -> WorkspaceMember:
+        """Refuses a row that cannot say whether its person is suspended, rather
+        than reporting them as able to sign in."""
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: not an object")
+        suspended = d.get("suspended")
+        if not isinstance(suspended, bool):
+            raise MandalaError(f"{where}: suspended is not true or false")
+        return cls(
+            user_id=_key_text(d, "user_id", where),
+            email=_text(d.get("email")),
+            name=_nullable_text(d, "name", where),
+            role=_text(d.get("role")),
+            accepted_at=_text(d.get("accepted_at")),
+            suspended=suspended,
             raw=dict(d),
         )
 

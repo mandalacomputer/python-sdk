@@ -528,3 +528,40 @@ def test_a_local_file_error_keeps_its_errno_as_a_detail(
         "message": "[Errno 2] No such file: 'x'",
         "details": {"errno": "ENOENT"},
     }
+
+
+@respx.mock
+def test_a_json_failure_carries_the_calls_ids(capsys: pytest.CaptureFixture[str]) -> None:
+    # What finding out how a call ended needs: the request, the key it was
+    # sent with and the operation the platform reserved (OPL-5322).
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(
+            503,
+            json={"error": "gone quiet", "operation_id": "op_0123456789abcdef01234567"},
+            headers={"X-Request-ID": "req-42"},
+        )
+    )
+    assert _cli.main(["secrets", "list", "--json"]) == 1
+    error = failure(capsys)
+    assert error["request_id"] == "req-42"
+    assert error["operation_id"] == "op_0123456789abcdef01234567"
+    assert "idempotency_key" not in error
+
+
+def test_an_unknown_outcome_names_its_key() -> None:
+    interrupted = _cli.ConnectionInterruptedError("the answer was lost")
+    interrupted.idempotency_key = "k-1"
+    assert _cli._error_info(interrupted) == {
+        "code": "connection_interrupted",
+        "message": "the answer was lost",
+        "idempotency_key": "k-1",
+    }
+    refused = _cli.ConflictError(
+        "in flight",
+        status=409,
+        body={"error": "in flight", "code": "idempotency_in_progress"},
+    )
+    refused.idempotency_key = "k-2"
+    info = _cli._error_info(refused)
+    assert info["idempotency_key"] == "k-2"
+    assert "operation_id" not in info and "request_id" not in info

@@ -10,6 +10,7 @@ import math
 import shlex
 import time
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import httpx
@@ -1248,6 +1249,54 @@ def test_clear_schedule_is_a_delete_not_a_disable(client: mc.Client) -> None:
     assert not put.called, "clearing must not go through the set path"
 
 
+def schedule_server(stored: dict[str, Any]) -> tuple[respx.Route, respx.Route]:
+    """A schedule route that stores each PUT's body whole, as the platform does."""
+
+    def put(request: httpx.Request) -> httpx.Response:
+        stored.clear()
+        stored.update(json.loads(request.content))
+        return httpx.Response(200, json=stored)
+
+    get = respx.get(f"{BASE}/computers/vm-1/schedule").mock(
+        side_effect=lambda _: httpx.Response(200, json=stored)
+    )
+    return get, respx.put(f"{BASE}/computers/vm-1/schedule").mock(side_effect=put)
+
+
+CHICAGO = {"enabled": True, "hour": 23, "minute": 30, "tz": "America/Chicago"}
+
+
+@respx.mock
+def test_schedule_toggle_keeps_the_window(client: mc.Client) -> None:
+    """Disabling and re-enabling with only ``enabled`` keeps 23:30 Chicago.
+
+    The platform stores the PUT's body whole, so defaults of 4/0/UTC sent with
+    ``enabled=False`` moved the window while switching it off (OPL-5322).
+    """
+    stored = dict(CHICAGO)
+    get, put = schedule_server(stored)
+    c = mc.Computer(client._t, COMPUTER)
+    assert c.set_schedule(enabled=False) == {**CHICAGO, "enabled": False}
+    assert c.set_schedule(enabled=True) == CHICAGO
+    assert stored == CHICAGO
+    assert (get.call_count, put.call_count) == (2, 2)
+    # One part given: the others are kept.
+    assert c.set_schedule(enabled=True, hour=5) == {**CHICAGO, "hour": 5}
+
+
+@respx.mock
+def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.Client) -> None:
+    stored: dict[str, Any] = {}
+    schedule_server(stored)
+    c = mc.Computer(client._t, COMPUTER)
+    assert c.set_schedule(enabled=True, tz="Europe/Paris") == {
+        "enabled": True,
+        "hour": 4,
+        "minute": 0,
+        "tz": "Europe/Paris",
+    }
+
+
 @respx.mock
 def test_set_schedule_validates_before_sending(client: mc.Client) -> None:
     route = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
@@ -1257,7 +1306,7 @@ def test_set_schedule_validates_before_sending(client: mc.Client) -> None:
     with pytest.raises(ValueError, match="minute"):
         c.set_schedule(enabled=True, minute=60)
     with pytest.raises(ValueError, match="tz"):
-        c.set_schedule(enabled=True, tz=None)  # type: ignore[arg-type]
+        c.set_schedule(enabled=True, tz=5)  # type: ignore[arg-type]
     assert not route.called, "invalid input must not reach the API"
 
 
@@ -1406,6 +1455,23 @@ def test_a_drag_sends_both_ends(client: mc.Client) -> None:
     # is — it refuses if nothing has put it anywhere, rather than guessing.
     c.drag(90, 80)
     assert "start_coordinate" not in json.loads(route.calls[1].request.content)
+
+
+@respx.mock
+def test_modifiers_are_held_for_the_drag(client: mc.Client) -> None:
+    # The platform holds keys for a drag as for a click (OPL-5051); drag had no
+    # way to ask, so a shift-drag to extend a selection could not be sent.
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.drag(90, 80, from_x=10, from_y=20, modifiers=("shift", "ctrl"))
+    assert json.loads(route.calls[0].request.content) == {
+        "action": "left_click_drag",
+        "coordinate": [90, 80],
+        "start_coordinate": [10, 20],
+        "text": "shift+ctrl",
+    }
+    c.drag(90, 80)
+    assert "text" not in json.loads(route.calls[1].request.content)
 
 
 @respx.mock
@@ -5391,7 +5457,8 @@ def test_set_schedule_reads_its_own_answer(client: mc.Client) -> None:
     )
 
     c = mc.Computer(client._t, COMPUTER)
-    assert c.set_schedule(enabled=True) == stored
+    # The whole window given: nothing to read first (see test_schedule_toggle).
+    assert c.set_schedule(enabled=True, hour=4, minute=0, tz="UTC") == stored
     assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
 
