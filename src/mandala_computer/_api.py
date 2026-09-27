@@ -1074,6 +1074,7 @@ def create_body(
     template_transfer: str | None = None,
     secrets: object = None,
     browser_proxy: object = None,
+    egress_proxy: object = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -1087,7 +1088,8 @@ def create_body(
 
     ``secrets`` goes through :func:`secret_bindings_body`, and no ``secrets``
     key is sent when it is ``None``. ``browser_proxy`` goes through
-    :func:`browser_proxy_body` the same way.
+    :func:`browser_proxy_body` the same way, and ``egress_proxy`` through
+    :func:`egress_proxy_body`.
     """
     if size is not None and any(
         v is not None for v in (template, template_transfer, cpu, ram_mb, disk_gb)
@@ -1129,6 +1131,8 @@ def create_body(
         body["secrets"] = secret_bindings_body(secrets)
     if browser_proxy is not None:
         body["browser_proxy"] = browser_proxy_body(browser_proxy)
+    if egress_proxy is not None:
+        body["egress_proxy"] = egress_proxy_body(egress_proxy)
     return body
 
 
@@ -1207,6 +1211,62 @@ def browser_proxy_update_body(proxy: object) -> dict[str, Any]:
     be the only field in the request, which is why it has a method of its own.
     """
     return {"browser_proxy": None if proxy is None else browser_proxy_body(proxy)}
+
+
+_EGRESS_PROXY_KEYS = frozenset({"server", "credentials_secret_id"})
+
+
+def egress_proxy_body(proxy: object, what: str = "egress_proxy") -> dict[str, Any]:
+    """An egress proxy as the wire takes it, checked for shape only.
+
+    A :class:`~mandala_computer.EgressProxyArgs` mapping, or a
+    :class:`~mandala_computer.EgressProxy` read off another computer. The rules
+    on the server are the platform's, as :func:`browser_proxy_body` leaves
+    them. A key this does not know is refused rather than dropped: ``bypass``
+    copied over from a browser proxy has no meaning here, and saying so is
+    better than a proxy that silently covers the hosts its caller meant to
+    leave out.
+    """
+    from ._models import EgressProxy  # a cycle at import time; not at call time
+
+    if isinstance(proxy, EgressProxy):
+        proxy = {"server": proxy.server, "credentials_secret_id": proxy.credentials_secret_id}
+    if not isinstance(proxy, Mapping):
+        raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
+            f"{what} must be a mapping {{server, credentials_secret_id}}, "
+            f"not {type(proxy).__name__}"
+        )
+    if "bypass" in proxy:
+        raise ValueError(
+            f"{what} has no bypass list: every connection the computer opens goes through the proxy"
+        )
+    unknown = sorted(str(k) for k in proxy if k not in _EGRESS_PROXY_KEYS)
+    if unknown:
+        raise ValueError(f"{what} has unknown keys {unknown}")
+    server = canonical(proxy.get("server"), f"{what}.server")
+    if not server.strip():
+        raise ValueError(f"{what}.server must not be empty")
+    body: dict[str, Any] = {"server": server}
+    creds = proxy.get("credentials_secret_id")
+    if creds is not None:
+        creds = canonical(creds, f"{what}.credentials_secret_id")
+        if not _SECRET_ID.fullmatch(creds):
+            raise ValueError(
+                f"{what}.credentials_secret_id must be a secret's id: "
+                "csec- and sixteen hex characters"
+            )
+        body["credentials_secret_id"] = creds
+    return body
+
+
+def egress_proxy_update_body(proxy: object) -> dict[str, Any]:
+    """The PATCH that replaces a computer's egress proxy, or removes it.
+
+    ``None`` is sent, not omitted: an explicit null is how the setting is
+    removed. The platform requires this to be the only field in the request,
+    which is why it has a method of its own.
+    """
+    return {"egress_proxy": None if proxy is None else egress_proxy_body(proxy)}
 
 
 def snapshot_clone_body(

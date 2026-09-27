@@ -29,6 +29,8 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
+    EgressProxy,
+    EgressProxyArgs,
     LifecycleAck,
     Listing,
     Move,
@@ -207,6 +209,7 @@ class Computers:
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
         browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         idempotency_key: str | None = None,
     ) -> Computer:
         """Provision a computer.
@@ -273,6 +276,19 @@ class Computers:
         must use it. Which proxies are accepted is the platform's rule, and a
         value it refuses is its 400; only the shape is checked here.
 
+        ``egress_proxy`` sends ALL of the computer's outbound TCP — ``exec``,
+        terminals, package managers and browsers alike — through a proxy, an
+        :class:`~mandala_computer.EgressProxyArgs`, taken on its host so nothing
+        inside the computer can opt out. It fails closed (proxy down or
+        refusing, or its credentials not on the host yet: the connection fails,
+        nothing goes direct), drops UDP to the internet and ICMP, and leaves DNS
+        lookups to the platform's resolver. Its ``credentials_secret_id`` names
+        a secret holding ``user:password`` that is not bound to the computer and
+        never reaches it. A create carrying one is always a cold boot, and a
+        clone does not inherit it. A host that cannot take one — or an
+        ``https://`` one, or one naming credentials — answers 409 with reason
+        ``unsupported``.
+
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`Computer.wait_for_guest`.
 
@@ -294,6 +310,7 @@ class Computers:
             resolution=resolution,
             secrets=secrets,
             browser_proxy=browser_proxy,
+            egress_proxy=egress_proxy,
             size=size,
         )
         data = self._t.json_object(
@@ -315,6 +332,7 @@ class Computers:
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
         browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
     ) -> Computer:
@@ -355,6 +373,7 @@ class Computers:
             resolution=resolution,
             secrets=secrets,
             browser_proxy=browser_proxy,
+            egress_proxy=egress_proxy,
         )
         computer_id = computer.id
         deadline = time.monotonic() + timeout

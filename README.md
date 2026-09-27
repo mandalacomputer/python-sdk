@@ -690,6 +690,68 @@ until it does, and `wait_for_browser_proxy()` waits on it. A stopped or
 suspended computer is given the setting as it starts. A browser already running
 when the setting changes applies it at its next start.
 
+### A proxy for all outbound traffic
+
+`egress_proxy` sends ALL of a computer's outbound TCP through a proxy —
+`exec`, terminals, package managers and browsers alike. It is taken on the
+computer's host, so nothing inside the computer is configured and nothing there
+can opt out; `browser_proxy`, by contrast, covers only the browsers. The server
+is `http://host:port` (a proxy that takes `CONNECT`), `https://host:port` (the
+same, spoken to over TLS) or `socks5://host:port`, with an explicit port and no
+username or password in it. There is no bypass list. Set it at create, or with
+`set_egress_proxy()`, which replaces it whole; `None` removes it.
+
+```python
+c = client.computers.create(
+    template="base",
+    egress_proxy={
+        "server": "https://proxy.example.com:3128",
+        "credentials_secret_id": "csec-0123456789abcdef",  # a secret holding user:password
+    },
+)
+c.egress_proxy  # EgressProxy(server='https://proxy.example.com:3128', credentials_secret_id='csec-…')
+c.egress_proxy_pending  # True until the host holds the credentials
+c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})  # no credentials now
+c.set_egress_proxy(None)  # traffic goes out directly again
+```
+
+What to expect once it is set:
+
+- **It fails closed.** When the proxy is down or refuses, or its credentials
+  have not reached the host yet, the connection fails; nothing is sent
+  directly.
+- **UDP to the internet and ICMP are dropped.** QUIC falls back to TCP; NTP
+  and other UDP stop working.
+- **DNS lookups are not proxied.** They still go to the platform's resolver.
+- **Open connections are closed when the setting changes**, and when the
+  computer stops.
+- **A create carrying one is always a cold boot**, never a warm computer, and
+  a clone does not inherit it.
+
+`credentials_secret_id` names a secret in your store (in the computer's
+workspace, or account-wide) whose value is `user:password`. The secret is NOT
+bound to the computer and the computer never receives it: the computer's host
+holds the value and signs in to the proxy for it. With `http://` and
+`socks5://` the credentials cross the network to the proxy in clear text, so
+prefer `https://` when naming them. A secret that is not there, or does not
+hold `user:password`, is refused with a `400`. Replacing the secret's value
+reaches the host within seconds, for connections opened after it. While a
+running computer's host does not hold the value yet — just after a create or a
+change, after the host restarts, or once the secret is deleted —
+`egress_proxy_pending` is true and every connection is closed; it usually
+clears within seconds.
+
+The setting is replaced whole, so a `credentials_secret_id` left out is
+removed: pass the `EgressProxy` read off the computer, edited with
+`dataclasses.replace`, to keep it. A value the platform refuses raises its
+`400`. A host that cannot take the setting yet answers `409` with reason
+`unsupported` — as does one that cannot take an `https://` proxy or
+credentials yet — and one that cannot put it into effect now answers `503`,
+with nothing changed unless its message says the new setting was stored. A
+change answered with another `5xx`, or not answered at all, may or may not have
+taken effect: read the computer, and if it names credentials and
+`egress_proxy_pending` stays true, send the setting again.
+
 ### Growing past the host
 
 A resize is refused when the size asks for more RAM than the host the computer
@@ -2036,7 +2098,7 @@ dashboard record none. The async client has the same three, awaited.
 
 **Every lifecycle call sends an `Idempotency-Key`** — create, clone, start,
 stop, suspend, restart, rename, resize, `set_idle_suspend`,
-`set_browser_proxy`, relocate, delete and a snapshot's restore and clone — a
+`set_browser_proxy`, `set_egress_proxy`, relocate, delete and a snapshot's restore and clone — a
 fresh one per call unless you pass `idempotency_key=` yourself. The platform
 records the call before carrying it out, so if its answer is lost (a timeout,
 a dropped connection, a `5xx`) the exception carries the key as
@@ -3078,6 +3140,8 @@ mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
+mandala-py egress-proxy set dev https://proxy.example.com:3128 --credentials csec-0123456789abcdef
+mandala-py egress-proxy get dev       # and clear; set keeps the credentials for an unchanged server
 mandala-py logout                     # forget the saved profile; the key stays valid
 mandala-py --version
 ```

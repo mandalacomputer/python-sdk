@@ -112,6 +112,7 @@ from ._exceptions import (
 from ._models import (
     ApiKey,
     BrowserProxyArgs,
+    EgressProxyArgs,
     Listing,
     Secret,
     SshAccess,
@@ -2513,6 +2514,114 @@ def _browser_proxy_parser(sub: Any) -> None:
     clear.set_defaults(fn=_cmd_browser_proxy_clear)
 
 
+# --- egress proxy ----------------------------------------------------------
+
+
+def _egress_proxy_result(args: argparse.Namespace, c: Computer) -> int:
+    proxy = c.egress_proxy
+    pending = c.egress_proxy_pending
+    if args.json:
+        _json(
+            {
+                "id": c.id,
+                "name": c.name,
+                "egress_proxy": c.raw.get("egress_proxy"),
+                "egress_proxy_pending": pending,
+            }
+        )
+        return 0
+    label = c.name or c.id
+    if proxy is None:
+        print(f"{label}: no egress proxy; its traffic goes out directly")
+    else:
+        print(f"{label}: all outbound TCP through {proxy.server}")
+        if proxy.credentials_secret_id:
+            print(f"  credentials: secret {proxy.credentials_secret_id}")
+    if pending:
+        print(
+            "  pending: its host does not hold the proxy's credentials yet; "
+            "connections are closed until it does"
+        )
+    return 0
+
+
+def _cmd_egress_proxy_get(args: argparse.Namespace) -> int:
+    with _client() as client:
+        c = _resolve(client, args.target).refresh()
+    return _egress_proxy_result(args, c)
+
+
+def _cmd_egress_proxy_set(args: argparse.Namespace) -> int:
+    proxy: EgressProxyArgs = {"server": args.url}
+    if args.credentials is not None:
+        proxy["credentials_secret_id"] = args.credentials
+    # Checked before the computer is looked up, so a malformed value costs no
+    # request. The platform's rules on the URL itself are its own to apply.
+    _api.egress_proxy_body(proxy)
+    with _client() as client:
+        c = _resolve(client, args.target)
+        if args.credentials is None and not args.no_credentials:
+            # browser-proxy set's rule: the setting is replaced whole, so read
+            # fresh and carry the current id over, but only to the same server,
+            # since the proxy is signed in to with it.
+            current = c.refresh().egress_proxy
+            if current is not None and current.credentials_secret_id is not None:
+                if not _same_proxy_server(current.server, args.url):
+                    _die(
+                        f"the egress proxy's credentials ({current.credentials_secret_id}) are "
+                        f"for {current.server}, not {args.url}; give --credentials SECRET_ID to "
+                        "use credentials with the new server, or --no-credentials to set it "
+                        "without any",
+                        "invalid_arguments",
+                    )
+                proxy["credentials_secret_id"] = current.credentials_secret_id
+        c = c.set_egress_proxy(proxy)
+    return _egress_proxy_result(args, c)
+
+
+def _cmd_egress_proxy_clear(args: argparse.Namespace) -> int:
+    with _client() as client:
+        c = _resolve(client, args.target).set_egress_proxy(None)
+    return _egress_proxy_result(args, c)
+
+
+def _egress_proxy_parser(sub: Any) -> None:
+    proxy = sub.add_parser("egress-proxy", help="a proxy for ALL of a computer's outbound TCP")
+    verbs = proxy.add_subparsers(dest="verb", required=True)
+    get = verbs.add_parser("get", help="show a computer's egress proxy")
+    get.add_argument("target", metavar="computer", help="computer name or id")
+    get.add_argument("--json", action="store_true", help="the setting as JSON")
+    get.set_defaults(fn=_cmd_egress_proxy_get)
+    put = verbs.add_parser(
+        "set",
+        help="send ALL of a computer's outbound TCP through a proxy, replacing any it has; "
+        "its credentials are kept when the server is unchanged",
+    )
+    put.add_argument("target", metavar="computer", help="computer name or id")
+    put.add_argument("url", metavar="URL", help="the proxy, e.g. https://proxy.example.com:3128")
+    creds = put.add_mutually_exclusive_group()
+    creds.add_argument(
+        "--credentials",
+        metavar="SECRET_ID",
+        help="the id of a secret holding user:password for the proxy; not bound to the "
+        "computer (default: keep the proxy's current credentials when the server is "
+        "unchanged)",
+    )
+    creds.add_argument(
+        "--no-credentials",
+        action="store_true",
+        help="remove the proxy's credentials rather than keep them",
+    )
+    put.add_argument("--json", action="store_true", help="the setting as JSON")
+    put.set_defaults(fn=_cmd_egress_proxy_set)
+    clear = verbs.add_parser(
+        "clear", help="remove a computer's egress proxy; its traffic goes out directly"
+    )
+    clear.add_argument("target", metavar="computer", help="computer name or id")
+    clear.add_argument("--json", action="store_true", help="the setting as JSON")
+    clear.set_defaults(fn=_cmd_egress_proxy_clear)
+
+
 def _parser() -> _Parser:
     # _Parser throughout: add_subparsers makes every subcommand's parser the
     # same class as its parent's, so each one prints its own whole help.
@@ -2547,6 +2656,7 @@ def _parser() -> _Parser:
 
     _ssh_parsers(sub)
     _browser_proxy_parser(sub)
+    _egress_proxy_parser(sub)
     _webhooks_parser(sub)
     _secrets_parser(sub)
     _keys_parsers(sub)

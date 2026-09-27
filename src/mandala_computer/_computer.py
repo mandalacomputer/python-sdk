@@ -68,6 +68,8 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     ComputerDeletion,
+    EgressProxy,
+    EgressProxyArgs,
     ExecResult,
     ExecStatus,
     FilePart,
@@ -1345,6 +1347,43 @@ class ComputerFields:
             raise MandalaError(f"computer {self.id}: browser_proxy_pending is not a boolean")
         return value
 
+    # --- egress proxy -----------------------------------------------------
+
+    @property
+    def egress_proxy(self) -> EgressProxy | None:
+        """The proxy ALL of this computer's outbound TCP is sent through, or ``None``.
+
+        ``exec``, terminals, package managers and browsers alike, taken on the
+        computer's host, so nothing inside the computer can opt out. It fails
+        closed: when the proxy is down or refuses, the connection fails and
+        nothing is sent directly. UDP to the internet and ICMP are dropped, and
+        DNS lookups still go to the platform's resolver.
+
+        Raises :class:`~mandala_computer.MandalaError` for a value it cannot
+        read rather than dropping it: :meth:`Computer.set_egress_proxy`
+        replaces the setting whole, and this is what a caller would edit and
+        send back.
+        """
+        return EgressProxy.from_api(self._data.get("egress_proxy"), f"computer {self.id}")
+
+    @property
+    def egress_proxy_pending(self) -> bool:
+        """Whether this running computer's :attr:`egress_proxy` names
+        credentials its host does not hold yet — just after a create or a
+        change, after the host restarts, or once the secret is deleted. Every
+        connection the computer opens meanwhile is closed, never sent directly;
+        it usually clears within seconds.
+
+        ``False`` on a computer that is not running, and on a platform that
+        predates the field.
+        """
+        value = self._data.get("egress_proxy_pending")
+        if value is None:
+            return False
+        if not isinstance(value, bool):
+            raise MandalaError(f"computer {self.id}: egress_proxy_pending is not a boolean")
+        return value
+
     def _browser_proxy_state(
         self, expect_proxy: bool = False, start_failed: str = ""
     ) -> str | MandalaError:
@@ -2340,6 +2379,43 @@ class Computer(ComputerFields):
                 "PATCH",
                 _api.computer(self.id),
                 json=_api.browser_proxy_update_body(proxy),
+                headers=_api.idempotency_headers(idempotency_key),
+            )
+        )
+        return self
+
+    def set_egress_proxy(
+        self,
+        proxy: EgressProxyArgs | EgressProxy | None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Computer:
+        """Send ALL of this computer's outbound TCP through a proxy, or stop doing so.
+
+        Replaces the setting whole, credentials included; ``None`` removes it
+        and the computer's traffic goes directly again. A
+        :class:`~mandala_computer.EgressProxy` read off another computer can be
+        passed as it is. The platform requires this to be the only change in
+        its request, which is why it is a method of its own.
+
+        A running computer has the change when the answer arrives, and the
+        connections it had open through the proxy are closed; a stopped or
+        suspended one is given it before it starts. One naming
+        ``credentials_secret_id`` closes every connection until the host holds
+        the value (:attr:`egress_proxy_pending`). Which proxies are accepted is
+        the platform's rule: a value it refuses raises
+        :class:`~mandala_computer.APIError` (400) carrying its sentence; a host
+        that cannot take the setting — or an ``https://`` one, or credentials —
+        answers 409 with reason ``unsupported``, and one that cannot put it into
+        effect now 503. After any other 5xx, or no answer, it may or may not
+        have taken effect: :meth:`refresh`, and send the setting again if it
+        stays pending. Only the shape is checked here (:class:`ValueError`).
+        """
+        self._data = _api.computer_payload(
+            self._t.json_object(
+                "PATCH",
+                _api.computer(self.id),
+                json=_api.egress_proxy_update_body(proxy),
                 headers=_api.idempotency_headers(idempotency_key),
             )
         )

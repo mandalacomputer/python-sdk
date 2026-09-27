@@ -11,6 +11,20 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **An egress proxy for all of a computer's outbound TCP:** `egress_proxy=`
+  on `computers.create` and `launch` (an `EgressProxyArgs`: `server`, and
+  optionally `credentials_secret_id`), `Computer.set_egress_proxy(proxy |
+  None)` to replace or remove it, and the `egress_proxy` / `egress_proxy_pending`
+  properties, sync and async. The server is `http://`, `https://` or
+  `socks5://` with an explicit port; `credentials_secret_id` names a secret
+  holding `user:password` that the computer's host signs in with and the
+  computer never receives. It fails closed, drops UDP to the internet and
+  ICMP, and does not proxy DNS. A key an egress proxy does not have (such as
+  `bypass`) is a `ValueError` before a request is sent. The `mandala-py` CLI
+  gains `egress-proxy get|set|clear`, whose `set` keeps the current
+  credentials for an unchanged server as `browser-proxy set` does. New
+  exports: `EgressProxy`, `EgressProxyArgs`.
+
 - **`Idempotency-Key` on every lifecycle call:** `computers.create` (and so
   `launch`), `clone`, `start`, `stop`, `suspend`, `restart`, `rename`,
   `resize`, `set_idle_suspend`, `set_browser_proxy`, `relocate`, `delete`,
