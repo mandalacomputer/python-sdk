@@ -1610,18 +1610,37 @@ def _secrets_parser(sub: Any) -> None:
 # --- who you are, API keys, logout (platform OPL-5053) -----------------------
 
 
+def _printable(s: str) -> str:
+    """``s`` with each control character written out as a visible escape.
+
+    C0, DEL, C1 and the two Unicode line separators become a ``\\x`` or
+    ``\\u`` escape (a newline prints as ``\\x0a``, ESC as ``\\x1b``, U+2028 as
+    ``\\u2028``), with no quotes around the result; anything else is left
+    alone. For names somebody chose (a key, a workspace, a person, an
+    account), printed to a terminal where a newline would forge a row and an
+    escape sequence would drive the terminal. ``--json`` output needs none of
+    this: JSON escapes them already.
+    """
+    return _CONTROL_CHARS.sub(
+        lambda m: f"\\x{ord(m[0]):02x}" if ord(m[0]) < 0x100 else f"\\u{ord(m[0]):04x}", s
+    )
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
 def _key_scope(k: ApiKey) -> str:
     if k.workspace_id is None:
         return "account-wide"
-    return f"workspace {k.workspace_name or '?'} ({k.workspace_id})"
+    return f"workspace {_printable(k.workspace_name or '?')} ({k.workspace_id})"
 
 
 def _api_key_rows(keys: Sequence[ApiKey]) -> str:
     rows = [
         (
             k.id,
-            k.name or "(unnamed)",
-            k.prefix,
+            _printable(k.name or "(unnamed)"),
+            _printable(k.prefix),
             _key_scope(k),
             "yes" if k.manage_keys else "no",
             k.last_used_at or "never",
@@ -1632,14 +1651,17 @@ def _api_key_rows(keys: Sequence[ApiKey]) -> str:
 
 
 def _whoami_lines(w: Whoami) -> list[str]:
-    who = f"{w.user.name} <{w.user.email}>" if w.user.name else f"<{w.user.email}>"
+    email = _printable(w.user.email)
+    who = f"{_printable(w.user.name)} <{email}>" if w.user.name else f"<{email}>"
     scope = (
-        f"workspace {w.workspace.name} ({w.workspace.id})" if w.workspace else "the whole account"
+        f"workspace {_printable(w.workspace.name)} ({w.workspace.id})"
+        if w.workspace
+        else "the whole account"
     )
     lines = [
         f"{who} ({w.user.id})",
         (
-            f"Account: {w.account.name or '(unnamed)'} ({w.account.id}), "
+            f"Account: {_printable(w.account.name or '(unnamed)')} ({w.account.id}), "
             f"plan {w.account.plan}, {w.account.status}"
         ),
         f"Role: {w.role}",
@@ -1650,7 +1672,8 @@ def _whoami_lines(w: Whoami) -> list[str]:
     else:
         can = "can" if w.key.manage_keys else "cannot"
         lines.append(
-            f"Key: {w.key.name or '(unnamed)'} ({w.key.id}, {w.key.prefix}); {can} manage API keys"
+            f"Key: {_printable(w.key.name or '(unnamed)')} ({w.key.id}, {_printable(w.key.prefix)}); "
+            f"{can} manage API keys"
         )
     return lines
 
@@ -1691,7 +1714,8 @@ def _cmd_api_keys_create(args: argparse.Namespace) -> int:
     else:
         print(created.key)
     print(
-        f"{PROG}: created {created.id} ({created.name or 'unnamed'}, {_key_scope(created)}). "
+        f"{PROG}: created {created.id} ({_printable(created.name or 'unnamed')}, "
+        f"{_key_scope(created)}). "
         "Store the key now: it is shown once and cannot be read again.",
         file=sys.stderr,
     )

@@ -1662,3 +1662,109 @@ def test_O02_profile_cli_paths(
         assert str(call.request.url).startswith(base + "/")
     output = capsys.readouterr()
     assert all(key not in output.out + output.err for key in KEYS)
+
+
+# --- names with control characters (platform OPL-5264) ---------------------
+#
+# The platform now refuses a key name holding a control character, but a key
+# minted before it did keeps the name it was given, and a workspace, person or
+# account name reaches these printers too. Each is printed escaped, so a
+# newline cannot forge a row and an escape sequence cannot drive the terminal.
+
+HOSTILE_KEY = {
+    "id": "key-a1b2c3d4e5f6",
+    "name": "ci\x1b[2Jevil\nforged",
+    "prefix": "com_1a2b3c4d…",
+    "created_at": "2026-09-20T08:00:00.000Z",
+    "last_used_at": None,
+    "workspace_id": "wsp-1",
+    "workspace_name": "tenant\r x",
+    "manage_keys": False,
+}
+
+
+def _raw_controls(text: str) -> list[str]:
+    """The control characters in ``text``, the line breaks between lines aside."""
+    return [
+        c
+        for line in text.split("\n")
+        for c in line
+        if ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F or c in "  "
+    ]
+
+
+@pytest.mark.parametrize(
+    ("given", "want"),
+    [
+        ("ci\x1b[2Jevil\nforged", "ci\\x1b[2Jevil\\x0aforged"),
+        ("x\x7fy\x85z\x9b", "x\\x7fy\\x85z\\x9b"),
+        ("a b c", "a\\u2028b\\u2029c"),
+        ("CI – déploiement ✓ \\x1b", "CI – déploiement ✓ \\x1b"),
+    ],
+)
+def test_printable_escapes_control_characters_and_nothing_else(given: str, want: str) -> None:
+    assert _cli._printable(given) == want
+
+
+def test_changelog_shows_the_escapes_the_cli_prints() -> None:
+    # The release notes quote the escapes; a raw U+2028 there renders as an
+    # empty code span (or a line break) instead of the text the CLI prints.
+    changelog = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+    text = changelog.read_text(encoding="utf-8")
+    assert _raw_controls(text) == []
+    for given in ("\n", "\x1b", " "):
+        assert f"`{_cli._printable(given)}`" in text
+
+
+@respx.mock
+def test_api_keys_list_prints_a_hostile_name_on_its_own_row(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[HOSTILE_KEY]))
+    assert _cli.main(["api-keys", "list"]) == 0
+    out = capsys.readouterr().out
+    assert len(out.splitlines()) == 2  # the header and the one key
+    assert _raw_controls(out) == []
+    assert "ci\\x1b[2Jevil\\x0aforged" in out
+    assert "workspace tenant\\x0d\\u2028x (wsp-1)" in out
+
+
+@respx.mock
+def test_api_keys_create_escapes_the_name_it_reports(capsys: pytest.CaptureFixture[str]) -> None:
+    created = {**HOSTILE_KEY, "raw": "com_" + "ab" * 24}
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=created))
+    assert _cli.main(["api-keys", "create"]) == 0
+    out, err = capsys.readouterr()
+    assert out == created["raw"] + "\n"
+    assert _raw_controls(err) == [] and err.count("\n") == 1
+    assert "(ci\\x1b[2Jevil\\x0aforged, workspace tenant\\x0d\\u2028x (wsp-1))" in err
+
+
+@respx.mock
+def test_whoami_escapes_every_name(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.get(f"{BASE}/whoami").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "user": {"id": "usr-1", "email": "dana\n@example.com", "name": "Dana\x1b]0;x\x07"},
+                "account": {"id": "acc-1", "name": "Acme\x9b", "plan": "team", "status": "active"},
+                "role": "owner",
+                "workspace": {
+                    "id": "wsp-1",
+                    "name": "ws ",
+                    "created_at": "2026-09-20T08:00:00.000Z",
+                },
+                "key": HOSTILE_KEY,
+            },
+        )
+    )
+    assert _cli.main(["whoami"]) == 0
+    out = capsys.readouterr().out
+    assert _raw_controls(out) == []
+    assert out.splitlines() == [
+        "Dana\\x1b]0;x\\x07 <dana\\x0a@example.com> (usr-1)",
+        "Account: Acme\\x9b (acc-1), plan team, active",
+        "Role: owner",
+        "Scope: workspace ws\\u2029 (wsp-1)",
+        "Key: ci\\x1b[2Jevil\\x0aforged (key-a1b2c3d4e5f6, com_1a2b3c4d…); cannot manage API keys",
+    ]
