@@ -994,7 +994,7 @@ def _browser_proxy_timeout(
 
 
 def _schedule_window(
-    current: Mapping[str, Any] | None, hour: int | None, minute: int | None, tz: str | None
+    current: object, hour: int | None, minute: int | None, tz: str | None
 ) -> tuple[int, int, str]:
     """The window ``set_schedule`` sends: each part given, else the current
     schedule's, else the 04:00 UTC default for a computer that has none.
@@ -1003,13 +1003,20 @@ def _schedule_window(
     of ``GET .../schedule``: that route answers a computer with no schedule as
     ``{enabled: false, hour: 0, minute: 0, tz: "UTC"}``, which cannot be told
     apart from a disabled midnight-UTC schedule. The record omits the field
-    when there is none, so ``None`` here is "no schedule" and takes the default.
+    when there is none, so a missing, empty or non-mapping value is "no
+    schedule" and takes the default, as :attr:`ComputerFields.snapshot_schedule`
+    reads it.
+
+    The caller reads that record into a local and does NOT refresh the handle:
+    a refresh replaces the whole payload and so drops a create envelope's
+    ``start_error``, which ``wait_until_running`` and ``wait_for_guest`` fail
+    fast on (OPL-4222).
 
     The platform stores the PUT's body whole, so a part not sent is a part
     reset: this is what keeps ``set_schedule(enabled=False)`` from moving the
     window. A stored value is passed on as it is, for the body's own checks.
     """
-    if current is None:
+    if not isinstance(current, Mapping) or not current:
         return (
             4 if hour is None else hour,
             0 if minute is None else minute,
@@ -4381,10 +4388,12 @@ class Computer(ComputerFields):
         """Set the automatic daily snapshot window, in the given IANA timezone.
 
         The platform stores the window whole, so ``hour``, ``minute`` or ``tz``
-        left out (``None``) keeps the current schedule's value: this re-reads
-        the computer first (:meth:`refresh`) and sends its
-        :attr:`snapshot_schedule` back, falling back to 04:00 UTC only for a
-        computer with no schedule. So ``set_schedule(enabled=False)``
+        left out (``None``) keeps the current schedule's value: this reads
+        the computer record first and sends its ``snapshot_schedule`` back,
+        falling back to 04:00 UTC only for a computer with no schedule. The
+        read leaves this handle as it was (only the PUT's answer is written
+        to :attr:`snapshot_schedule`), so a create's :attr:`start_error`
+        survives it. So ``set_schedule(enabled=False)``
         switches the schedule off and keeps its time, and
         ``set_schedule(enabled=True)`` switches it back on at that time. Pass
         all three to skip the read.
@@ -4398,7 +4407,8 @@ class Computer(ComputerFields):
         if hour is None or minute is None or tz is None:
             _api.check_schedule_args(enabled=enabled, hour=hour, minute=minute, tz=tz)
             # The record, not GET .../schedule: see _schedule_window.
-            hour, minute, tz = _schedule_window(self._refresh().snapshot_schedule, hour, minute, tz)
+            record = _api.computer_payload(self._t.json_object("GET", _api.computer(self.id)))
+            hour, minute, tz = _schedule_window(record.get("snapshot_schedule"), hour, minute, tz)
         stored = dict(
             self._t.json_object(
                 "PUT",

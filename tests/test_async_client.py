@@ -1137,6 +1137,36 @@ async def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.AsyncCl
 
 
 @respx.mock
+async def test_set_schedule_keeps_a_creates_start_error(client: mc.AsyncClient) -> None:
+    """The sync twin's test: the schedule read leaves ``start_error`` alone."""
+    from tests.test_client import ScheduleServer
+
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(
+            201,
+            json={
+                "computer": {**COMPUTER, "status": "stopped"},
+                "start_error": "no host had room",
+            },
+        )
+    )
+    server = ScheduleServer(None)
+    server.get_computer.side_effect = lambda _: httpx.Response(
+        200, json={**COMPUTER, "status": "stopped"}
+    )
+    c = await client.computers.create(template="base")
+    assert c.start_error == "no host had room"
+    await c.set_schedule(enabled=True)
+    assert server.get_computer.call_count == 1
+    assert c.start_error == "no host had room"
+    assert c.snapshot_schedule == {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    with pytest.raises(mc.MandalaError, match="did not start: no host had room"):
+        await c.wait_until_running(timeout=30, poll=0)
+    assert server.get_computer.call_count == 1
+    await client.aclose()
+
+
+@respx.mock
 async def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.AsyncClient) -> None:
     """The sync twin's test: a real disabled 00:00 UTC schedule is kept."""
     from tests.test_client import NO_SCHEDULE_GET, ScheduleServer

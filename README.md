@@ -2243,8 +2243,9 @@ the same as one whose schedule is switched off.
 
 Disabling and clearing differ. `set_schedule(enabled=False)` keeps the chosen
 time: `hour`, `minute` and `tz` left out keep the current schedule's values
-(it re-reads the computer first and sends its `snapshot_schedule` back, since
-the platform stores the window whole), so
+(it reads the computer record first and sends its `snapshot_schedule` back,
+since the platform stores the window whole; the read does not refresh your
+handle, so a create's `start_error` survives it), so
 `set_schedule(enabled=True)` switches it back on at the same time. Only a
 computer with no schedule falls back to 04:00 UTC. (`c.schedule()` cannot tell
 you which case you are in: it answers a computer with no schedule as a disabled

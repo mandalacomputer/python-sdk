@@ -186,9 +186,10 @@ This is the summary you read to decide whether to upgrade.
 
 - **`set_schedule()` keeps the window it is not told about** (sync and
   async). `hour`, `minute` and `tz` now default to `None`, meaning "keep the
-  current schedule's value": it re-reads the computer first and sends its
-  `snapshot_schedule` back, falling back to 04:00 UTC only for a computer
-  with none. (It reads the record, not `schedule()`, because that route
+  current schedule's value": it reads the computer record first and sends
+  its `snapshot_schedule` back, falling back to 04:00 UTC only for a computer
+  with none. The read does not refresh the handle, so a create's
+  `start_error` survives it and `wait_until_running()` still fails fast. (It reads the record, not `schedule()`, because that route
   answers a computer with no schedule as a disabled 00:00 UTC one.) The
   platform stores the window whole, so `set_schedule(enabled=False)` used to
   move a 23:30 America/Chicago window to 04:00 UTC while switching it off.

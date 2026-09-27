@@ -1337,6 +1337,38 @@ def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.Client) -> No
 
 
 @respx.mock
+def test_set_schedule_keeps_a_creates_start_error(client: mc.Client) -> None:
+    """The schedule read must not refresh the handle (review round 2, OPL-5322).
+
+    A refresh replaces the whole payload, so it dropped the create envelope's
+    ``start_error``; ``wait_until_running`` then polled a stopped computer to
+    its deadline instead of failing fast (the OPL-4222 guard).
+    """
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(
+            201,
+            json={
+                "computer": {**COMPUTER, "status": "stopped"},
+                "start_error": "no host had room",
+            },
+        )
+    )
+    server = ScheduleServer(None)
+    server.get_computer.side_effect = lambda _: httpx.Response(
+        200, json={**COMPUTER, "status": "stopped"}
+    )
+    c = client.computers.create(template="base")
+    assert c.start_error == "no host had room"
+    c.set_schedule(enabled=True)
+    assert server.get_computer.call_count == 1
+    assert c.start_error == "no host had room"
+    assert c.snapshot_schedule == {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    with pytest.raises(mc.MandalaError, match="did not start: no host had room"):
+        c.wait_until_running(timeout=30, poll=0)
+    assert server.get_computer.call_count == 1
+
+
+@respx.mock
 def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.Client) -> None:
     """A real disabled 00:00 UTC schedule is kept, not replaced by 04:00.
 

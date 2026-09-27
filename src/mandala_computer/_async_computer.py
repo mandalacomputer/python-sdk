@@ -2117,15 +2117,16 @@ class AsyncComputer(ComputerFields):
         """Set the automatic daily snapshot window, in the given IANA timezone.
 
         ``hour``, ``minute`` or ``tz`` left out (``None``) keeps the current
-        schedule's value, read first from the computer record
-        (:meth:`refresh`); 04:00 UTC only for a computer with no schedule.
+        schedule's value, read first from the computer record (without
+        refreshing this handle, so a create's :attr:`start_error` survives);
+        04:00 UTC only for a computer with no schedule.
         See :meth:`mandala_computer.Computer.set_schedule`.
         """
         if hour is None or minute is None or tz is None:
             _api.check_schedule_args(enabled=enabled, hour=hour, minute=minute, tz=tz)
             # The record, not GET .../schedule: see _schedule_window.
-            current = (await self._refresh()).snapshot_schedule
-            hour, minute, tz = _schedule_window(current, hour, minute, tz)
+            record = _api.computer_payload(await self._t.json_object("GET", _api.computer(self.id)))
+            hour, minute, tz = _schedule_window(record.get("snapshot_schedule"), hour, minute, tz)
         stored = dict(
             await self._t.json_object(
                 "PUT",
