@@ -1698,6 +1698,9 @@ def _cmd_api_keys_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_api_keys_revoke(args: argparse.Namespace) -> int:
+    # Checked before a client exists, so a pasted key is refused (without being
+    # repeated) even where no credentials are configured.
+    _api.not_a_raw_key(args.id)
     with _client() as client:
         client.api_keys.revoke(args.id)
     if args.json:

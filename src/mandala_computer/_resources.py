@@ -1795,7 +1795,8 @@ class ApiKeys:
         """Revoke one key; it is refused from its next request. A key may revoke
         itself, and the call that does so is the last it makes. An id out of
         this key's reach is a :class:`~mandala_computer.NotFoundError`, the same
-        as one that does not exist."""
+        as one that does not exist. An API key itself (``com_...``) is refused
+        with a ``ValueError`` before any request, so it never reaches a URL."""
         self._t.request("DELETE", _api.api_key(key_id))
 
 

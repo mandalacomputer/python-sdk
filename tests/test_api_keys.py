@@ -184,6 +184,34 @@ def test_revoke_deletes_by_id() -> None:
     assert route.called
 
 
+RAW_KEY = "com_" + "ab" * 24
+RAW_KEY_SENTENCE = "that is an API key, not a key id; run api-keys list to find its id (key-...)"
+# A pasted key with a stray space or newline, or in capitals, is still one.
+RAW_KEY_SHAPES = [RAW_KEY, f" {RAW_KEY}\n", RAW_KEY.upper(), "com_short"]
+
+
+@pytest.mark.parametrize("raw", RAW_KEY_SHAPES)
+@respx.mock
+def test_revoke_refuses_an_api_key_before_any_request(raw: str) -> None:
+    anything = respx.route().mock(return_value=httpx.Response(404, json={"error": "no"}))
+    with pytest.raises(ValueError, match="not a key id") as caught:
+        client().api_keys.revoke(raw)
+    assert not anything.called
+    assert str(caught.value) == RAW_KEY_SENTENCE
+    assert raw.strip().lower() not in str(caught.value).lower()
+
+
+@pytest.mark.parametrize("raw", RAW_KEY_SHAPES)
+@respx.mock
+async def test_async_revoke_refuses_an_api_key_before_any_request(raw: str) -> None:
+    anything = respx.route().mock(return_value=httpx.Response(404, json={"error": "no"}))
+    async with mc.AsyncClient("com_test", base_url=BASE) as c:
+        with pytest.raises(ValueError, match="not a key id") as caught:
+            await c.api_keys.revoke(raw)
+    assert not anything.called
+    assert str(caught.value) == RAW_KEY_SENTENCE
+
+
 @respx.mock
 def test_a_missing_permission_is_permission_denied_with_the_platform_sentence() -> None:
     respx.get(f"{BASE}/api-keys").mock(
@@ -263,6 +291,35 @@ def test_cli_api_keys_revoke(capsys: pytest.CaptureFixture[str]) -> None:
     assert _cli.main(["api-keys", "revoke", "key-a1b2c3d4e5f6"]) == 0
     assert route.called
     assert capsys.readouterr().out == "revoked key-a1b2c3d4e5f6\n"
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("logged_in", [True, False])
+@respx.mock
+def test_cli_api_keys_revoke_refuses_an_api_key_without_repeating_it(
+    as_json: bool,
+    logged_in: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if not logged_in:
+        monkeypatch.delenv("MANDALA_API_KEY")
+        monkeypatch.setenv("HOME", str(tmp_path))
+    anything = respx.route().mock(return_value=httpx.Response(404, json={"error": "no"}))
+    argv = ["api-keys", "revoke", RAW_KEY, *(["--json"] if as_json else [])]
+    assert _cli.main(argv) == 1
+    out, err = capsys.readouterr()
+    assert not anything.called
+    assert out == ""
+    assert RAW_KEY not in err
+    if as_json:
+        assert json.loads(err)["error"] == {
+            "code": "invalid_arguments",
+            "message": RAW_KEY_SENTENCE,
+        }
+    else:
+        assert err == f"mandala-py: {RAW_KEY_SENTENCE}\n"
 
 
 @pytest.mark.parametrize(

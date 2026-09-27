@@ -2183,8 +2183,31 @@ def ssh_key(key_id: str) -> str:
     return f"ssh-keys/{seg(key_id)}"
 
 
+#: What :func:`api_key` says when handed an API key itself. It never contains
+#: the value: the whole point is that the key goes nowhere.
+RAW_KEY_AS_ID = "that is an API key, not a key id; run api-keys list to find its id (key-...)"
+
+
+def not_a_raw_key(key_id: object) -> str:
+    """*key_id*, refused if it is an API key rather than a key's id.
+
+    A key id is ``key-`` and hex; an API key is ``com_`` and hex, and nothing
+    that starts ``com_`` can be an id. Revoking the key you hold by pasting it
+    would otherwise put the live credential into the request path, where every
+    access log on the way records it in plain text, and the platform would
+    answer 404 and leave the key valid. Refused before any request, with a
+    message that does not repeat the value. Surrounding whitespace and letter
+    case are ignored for the check alone, so a pasted key with a stray space
+    or in capitals is caught too.
+    """
+    value = canonical(key_id, "id")
+    if value.strip().lower().startswith("com_"):
+        raise ValueError(RAW_KEY_AS_ID)
+    return value
+
+
 def api_key(key_id: str) -> str:
-    return f"api-keys/{seg(key_id)}"
+    return f"api-keys/{seg(not_a_raw_key(key_id))}"
 
 
 def operation(operation_id: str) -> str:
