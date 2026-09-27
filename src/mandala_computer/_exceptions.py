@@ -84,7 +84,15 @@ _REASON_CLEARS = frozenset({"contention", "starting"})
 #: said: without it this would be an ordinary :class:`ConflictError`, which
 #: :func:`is_transient` calls worth sending again. :class:`FileExistsError` is
 #: the class it arrives as.
-_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked", "exists"})
+#:
+#: ``running`` is a computer that IS running, asked for something only a stopped
+#: one can have: a resize, today (OPL-5050). The mirror of ``unavailable``, and
+#: kept apart from it for that reason: nothing clears either by waiting and both
+#: are fixed by an action on the computer, but the action is the opposite one.
+#: Stopping the computer is the fix. Without it here this would be an ordinary
+#: :class:`ConflictError`, which :func:`is_transient` calls worth sending again,
+#: and a caller looping on that would resend the same resize until it gave up.
+_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked", "exists", "running"})
 
 
 def _refusal_reason(body: object) -> str | None:
@@ -140,7 +148,8 @@ class APIError(MandalaError):
         self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
         #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
-        #: ``"unsupported"`` (OPL-3898), ``"revoked"`` or ``"exists"``. ``None``
+        #: ``"unsupported"`` (OPL-3898), ``"revoked"``, ``"exists"`` or
+        #: ``"running"``. ``None``
         #: where it sent nothing, which is most errors and always will be — not
         #: every refusal has a word, and the platform is explicit that absent
         #: means unclassified rather than "none of them". An OPEN set: a word
