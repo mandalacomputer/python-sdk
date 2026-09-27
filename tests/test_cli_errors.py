@@ -565,3 +565,86 @@ def test_an_unknown_outcome_names_its_key() -> None:
     info = _cli._error_info(refused)
     assert info["idempotency_key"] == "k-2"
     assert "operation_id" not in info and "request_id" not in info
+
+
+COMPUTER = {"id": "cmp-42", "name": "dev", "status": "running"}
+
+
+def keyed_clear(response: httpx.Response | Exception) -> respx.Route:
+    """``egress-proxy clear dev``, whose PATCH sends an ``Idempotency-Key``,
+    answered by ``response``."""
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[COMPUTER]))
+    route = respx.patch(f"{BASE}/computers/cmp-42")
+    if isinstance(response, Exception):
+        return route.mock(side_effect=response)
+    return route.mock(return_value=response)
+
+
+def text_failure(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    out, err = capsys.readouterr()
+    assert out == ""
+    return err.splitlines()
+
+
+@respx.mock
+def test_a_text_failure_names_the_key_it_was_sent_with(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A keyed call whose outcome is unknown: without the key a person has
+    # nothing to find out how it ended with (OPL-5331). --json already had it.
+    route = keyed_clear(
+        httpx.Response(503, json={"error": "gone quiet"}, headers={"X-Request-ID": "req-42"})
+    )
+    assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    key = route.calls.last.request.headers["Idempotency-Key"]
+    assert key
+    assert text_failure(capsys) == [
+        "mandala-py: gone quiet",
+        f"mandala-py: idempotency key {key}; request id req-42",
+    ]
+
+
+@respx.mock
+def test_a_text_failure_names_the_operation_first(capsys: pytest.CaptureFixture[str]) -> None:
+    route = keyed_clear(
+        httpx.Response(
+            503,
+            json={"error": "gone quiet", "operation_id": "op_0123456789abcdef01234567"},
+            headers={"X-Request-ID": "req-42"},
+        )
+    )
+    assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    key = route.calls.last.request.headers["Idempotency-Key"]
+    assert text_failure(capsys)[1:] == [
+        (
+            "mandala-py: operation op_0123456789abcdef01234567; "
+            f"idempotency key {key}; request id req-42"
+        ),
+    ]
+
+
+@respx.mock
+def test_a_lost_answer_names_its_key_in_text(capsys: pytest.CaptureFixture[str]) -> None:
+    route = keyed_clear(httpx.ReadTimeout("the answer was lost"))
+    assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    key = route.calls.last.request.headers["Idempotency-Key"]
+    lines = text_failure(capsys)
+    assert len(lines) == 2
+    assert lines[1] == f"mandala-py: idempotency key {key}"
+
+
+@respx.mock
+def test_a_request_id_is_escaped_in_text(capsys: pytest.CaptureFixture[str]) -> None:
+    # A header the response chose, printed to a terminal: an escape sequence
+    # in it must not drive the terminal.
+    keyed_clear(
+        httpx.Response(503, json={"error": "gone quiet"}, headers={"X-Request-ID": "req\x1b[2J"})
+    )
+    assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    lines = text_failure(capsys)
+    assert "\x1b" not in lines[1]
+    assert lines[1].endswith("; request id req\\x1b[2J")
+
+
+def test_a_failure_with_no_ids_has_no_recovery_line() -> None:
+    assert _cli._recovery_line(_cli.MandalaError("nothing to recover")) is None

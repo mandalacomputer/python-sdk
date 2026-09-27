@@ -203,6 +203,27 @@ def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
     return info
 
 
+def _recovery_line(err: MandalaError) -> str | None:
+    """The text-mode line naming the ids a failure carries, or ``None``.
+
+    Read from :func:`_with_ids`, so text and ``--json`` name the same ids.
+    What a person needs to find out how a call whose answer was lost ended.
+    Each value is escaped with :func:`_printable`: a request id is a response
+    header, and an operation id comes from the response body.
+    """
+    ids = _with_ids({}, err)
+    parts = [
+        f"{label} {_printable(str(ids[key]))}"
+        for key, label in (
+            ("operation_id", "operation"),
+            ("idempotency_key", "idempotency key"),
+            ("request_id", "request id"),
+        )
+        if key in ids
+    ]
+    return f"{PROG}: {'; '.join(parts)}" if parts else None
+
+
 def _error_info(err: BaseException) -> dict[str, Any]:
     """The ``error`` object ``--json`` prints for a failure: ``code`` and
     ``message`` always; the HTTP ``status`` and the platform's ``reason`` word
@@ -2812,6 +2833,9 @@ def main(argv: list[str] | None = None) -> int:
             _json_failure(_error_info(e))
         else:
             print(f"{PROG}: {e}", file=sys.stderr)
+            recovery = _recovery_line(e) if isinstance(e, MandalaError) else None
+            if recovery is not None:
+                print(recovery, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         # Ctrl-C is how a person ends a transfer or a wait, not a fault, and
