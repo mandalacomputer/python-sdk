@@ -1768,3 +1768,148 @@ def test_whoami_escapes_every_name(capsys: pytest.CaptureFixture[str]) -> None:
         "Scope: workspace ws\\u2029 (wsp-1)",
         "Key: ci\\x1b[2Jevil\\x0aforged (key-a1b2c3d4e5f6, com_1a2b3c4d…); cannot manage API keys",
     ]
+
+
+# --- workspaces (platform OPL-5057) ------------------------------------------
+
+WSP = {"id": "wsp-0123456789ab", "name": "acme", "created_at": "2026-09-01T00:00:00.000Z"}
+WSP_MEMBERS = [
+    {
+        "user_id": "usr-0123456789abcdef",
+        "email": "dana@example.com",
+        "name": "Dana\x1b[2J\nforged",
+        "role": "owner",
+        "accepted_at": "2026-09-02T00:00:00.000Z",
+        "suspended": False,
+    },
+    {
+        "user_id": "usr-fedcba9876543210",
+        "email": "lee@example.com",
+        "name": None,
+        "role": "viewer",
+        "accepted_at": "2026-09-03T00:00:00.000Z",
+        "suspended": True,
+    },
+]
+
+
+@respx.mock
+def test_workspaces_list_prints_one_row_each(capsys: pytest.CaptureFixture[str]) -> None:
+    hostile = {**WSP, "id": "wsp-ba9876543210", "name": "tenant\r\u202ex"}
+    respx.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP, hostile]))
+    assert _cli.main(["workspaces", "list"]) == 0
+    out = capsys.readouterr().out
+    assert _raw_controls(out) == [] and "\u202e" not in out
+    lines = out.splitlines()
+    assert lines[0].split() == ["ID", "NAME", "CREATED"]
+    assert lines[1].split() == ["wsp-0123456789ab", "acme", "2026-09-01T00:00:00.000Z"]
+    assert lines[2].split() == [
+        "wsp-ba9876543210",
+        "tenant\\x0d\\u202ex",
+        "2026-09-01T00:00:00.000Z",
+    ]
+
+
+@respx.mock
+def test_workspaces_list_json_is_the_platforms_rows(capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    respx.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
+    assert _cli.main(["workspaces", "list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [WSP]
+
+
+@respx.mock
+def test_workspaces_get_prints_the_one(capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    route = respx.get(f"{BASE}/workspaces/wsp-0123456789ab").mock(
+        return_value=httpx.Response(200, json=WSP)
+    )
+    assert _cli.main(["workspaces", "get", "wsp-0123456789ab"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [line.split() for line in lines] == [
+        ["ID", "NAME", "CREATED"],
+        ["wsp-0123456789ab", "acme", "2026-09-01T00:00:00.000Z"],
+    ]
+    assert _cli.main(["workspaces", "get", "wsp-0123456789ab", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == WSP
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_workspaces_get_of_one_it_cannot_see_is_not_found(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    respx.get(f"{BASE}/workspaces/wsp-000000000000").mock(
+        return_value=httpx.Response(404, json={"error": "No such workspace."})
+    )
+    assert _cli.main(["workspaces", "get", "wsp-000000000000", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    error = json.loads(err)["error"]
+    assert (error["code"], error["status"]) == ("not_found", 404)
+
+
+@respx.mock
+def test_workspaces_members_prints_each_person(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.get(f"{BASE}/workspaces/wsp-0123456789ab/members").mock(
+        return_value=httpx.Response(200, json=WSP_MEMBERS)
+    )
+    assert _cli.main(["workspaces", "members", "wsp-0123456789ab"]) == 0
+    out = capsys.readouterr().out
+    assert _raw_controls(out) == []
+    lines = out.splitlines()
+    assert len(lines) == 3  # the header and two people: a newline forges no row
+    assert lines[0].split() == ["USER", "ID", "EMAIL", "NAME", "ROLE", "ACCEPTED", "SUSPENDED"]
+    assert lines[1].split() == [
+        "usr-0123456789abcdef",
+        "dana@example.com",
+        "Dana\\x1b[2J\\x0aforged",
+        "owner",
+        "2026-09-02T00:00:00.000Z",
+        "no",
+    ]
+    assert lines[2].split() == [
+        "usr-fedcba9876543210",
+        "lee@example.com",
+        "-",
+        "viewer",
+        "2026-09-03T00:00:00.000Z",
+        "yes",
+    ]
+
+
+@respx.mock
+def test_workspaces_members_json_is_the_platforms_rows(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    respx.get(f"{BASE}/workspaces/wsp-0123456789ab/members").mock(
+        return_value=httpx.Response(200, json=WSP_MEMBERS)
+    )
+    assert _cli.main(["workspaces", "members", "wsp-0123456789ab", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == WSP_MEMBERS
+
+
+@respx.mock
+def test_workspaces_members_with_a_scoped_key_is_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    sentence = (
+        "An API key confined to a workspace cannot list members: the list is the whole account's."
+    )
+    respx.get(f"{BASE}/workspaces/wsp-0123456789ab/members").mock(
+        return_value=httpx.Response(403, json={"error": sentence})
+    )
+    assert _cli.main(["workspaces", "members", "wsp-0123456789ab"]) == 1
+    out, err = capsys.readouterr()
+    assert out == "" and err == f"mandala-py: {sentence}\n"
+    assert _cli.main(["workspaces", "members", "wsp-0123456789ab", "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert (error["code"], error["status"]) == ("permission_denied", 403)

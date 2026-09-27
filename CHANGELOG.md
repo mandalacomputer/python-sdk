@@ -146,6 +146,12 @@ This is the summary you read to decide whether to upgrade.
   `get` of an id the key cannot see raises `NotFoundError`; `members` raises
   `PermissionDeniedError` for a key confined to a workspace. New exports:
   `Workspace`, `WorkspaceMember`.
+- **`mandala-py workspaces list | get ID | members ID`:** the same three
+  reads from a shell, as tables (`--json` for the platform's rows), with
+  names and emails escaped as `api-keys list` escapes them. `list` gives the
+  id that `secrets --workspace` and `api-keys create --workspace` take;
+  `members` needs an account-wide key (`--json`: `code` `permission_denied`,
+  `status` 403), and `get` of a workspace the key cannot see is `not_found`.
 - **`NO_BROWSER_PROXY`:** `browser_proxy=NO_BROWSER_PROXY` on
   `computers.create()` and `launch()` (sync and async) sends
   `"browser_proxy": null`, creating the computer with no browser proxy even
@@ -180,8 +186,10 @@ This is the summary you read to decide whether to upgrade.
 
 - **`set_schedule()` keeps the window it is not told about** (sync and
   async). `hour`, `minute` and `tz` now default to `None`, meaning "keep the
-  current schedule's value": it reads the schedule first and sends it back,
-  falling back to 04:00 UTC only for a computer with no schedule. The
+  current schedule's value": it re-reads the computer first and sends its
+  `snapshot_schedule` back, falling back to 04:00 UTC only for a computer
+  with none. (It reads the record, not `schedule()`, because that route
+  answers a computer with no schedule as a disabled 00:00 UTC one.) The
   platform stores the window whole, so `set_schedule(enabled=False)` used to
   move a 23:30 America/Chicago window to 04:00 UTC while switching it off.
   Passing all three sends no read, as before.

@@ -1100,23 +1100,56 @@ async def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.AsyncCl
 @respx.mock
 async def test_schedule_toggle_keeps_the_window(client: mc.AsyncClient) -> None:
     """The sync twin's test: ``enabled`` alone keeps 23:30 Chicago (OPL-5322)."""
-    from tests.test_client import CHICAGO, schedule_server
+    from tests.test_client import CHICAGO, ScheduleServer
 
-    stored = dict(CHICAGO)
-    get, put = schedule_server(stored)
+    server = ScheduleServer(dict(CHICAGO))
     c = mc.AsyncComputer(client._t, COMPUTER)
     assert await c.set_schedule(enabled=False) == {**CHICAGO, "enabled": False}
     assert await c.set_schedule(enabled=True) == CHICAGO
-    assert stored == CHICAGO
-    assert (get.call_count, put.call_count) == (2, 2)
+    assert server.stored == CHICAGO
+    assert (server.get_computer.call_count, server.put.call_count) == (2, 2)
     assert await c.set_schedule(enabled=True, minute=5) == {**CHICAGO, "minute": 5}
-    stored.clear()
+    await client.aclose()
+
+
+@respx.mock
+async def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.AsyncClient) -> None:
+    """The sync twin's test: no schedule means 04:00, not the GET's zeros."""
+    from tests.test_client import NO_SCHEDULE_GET, ScheduleServer
+
+    server = ScheduleServer(None)
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.schedule() == NO_SCHEDULE_GET
     assert await c.set_schedule(enabled=True) == {
         "enabled": True,
         "hour": 4,
         "minute": 0,
         "tz": "UTC",
     }
+    server.stored = None
+    assert await c.set_schedule(enabled=True, tz="Europe/Paris") == {
+        "enabled": True,
+        "hour": 4,
+        "minute": 0,
+        "tz": "Europe/Paris",
+    }
+    await client.aclose()
+
+
+@respx.mock
+async def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.AsyncClient) -> None:
+    """The sync twin's test: a real disabled 00:00 UTC schedule is kept."""
+    from tests.test_client import NO_SCHEDULE_GET, ScheduleServer
+
+    server = ScheduleServer(dict(NO_SCHEDULE_GET))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.set_schedule(enabled=True) == {
+        "enabled": True,
+        "hour": 0,
+        "minute": 0,
+        "tz": "UTC",
+    }
+    assert server.put_bodies == [{"enabled": True, "hour": 0, "minute": 0, "tz": "UTC"}]
     await client.aclose()
 
 

@@ -43,6 +43,12 @@ Two subcommands address a computer by name or id:
     dashboard session turns on; without it the platform's own sentence is
     printed, and it says exactly that. ``create`` prints the new key ONCE.
 
+``mandala-py workspaces <list|get|members>``
+    The account's workspaces, read only: their ids (what ``secrets --workspace``
+    and ``api-keys create --workspace`` take) and the people who reach one.
+    ``members`` needs an account-wide key; a key confined to a workspace is
+    refused, since the list is the whole account's.
+
 ``mandala-py logout [--profile NAME]``
     Forget a profile saved in ``~/.mandala/credentials.json`` by
     ``mandala login``. The key it held stays valid until it is revoked.
@@ -120,6 +126,8 @@ from ._models import (
     Webhook,
     WebhookDelivery,
     Whoami,
+    Workspace,
+    WorkspaceMember,
 )
 from ._resources import _named_secret
 
@@ -1865,6 +1873,81 @@ def _keys_parsers(sub: Any) -> None:
     logout.set_defaults(fn=_cmd_logout)
 
 
+# --- workspaces (platform OPL-5057) ------------------------------------------
+
+
+def _workspace_rows(workspaces: Sequence[Workspace]) -> str:
+    rows = [(w.id, _printable(w.name), w.created_at) for w in workspaces]
+    return _table(("ID", "NAME", "CREATED"), rows)
+
+
+def _member_rows(members: Sequence[WorkspaceMember]) -> str:
+    rows = [
+        (
+            m.user_id,
+            _printable(m.email),
+            _printable(m.name) if m.name else "-",
+            _printable(m.role),
+            m.accepted_at,
+            "yes" if m.suspended else "no",
+        )
+        for m in members
+    ]
+    return _table(("USER ID", "EMAIL", "NAME", "ROLE", "ACCEPTED", "SUSPENDED"), rows)
+
+
+def _cmd_workspaces_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        workspaces = client.workspaces.list()
+    if args.json:
+        _json([w.raw for w in workspaces])
+    elif workspaces:
+        print(_workspace_rows(workspaces))
+    else:
+        print("no workspaces this key can reach", file=sys.stderr)
+    return 0
+
+
+def _cmd_workspaces_get(args: argparse.Namespace) -> int:
+    with _client() as client:
+        workspace = client.workspaces.get(args.id)
+    if args.json:
+        _json(workspace.raw)
+    else:
+        print(_workspace_rows([workspace]))
+    return 0
+
+
+def _cmd_workspaces_members(args: argparse.Namespace) -> int:
+    with _client() as client:
+        members = client.workspaces.members(args.id)
+    if args.json:
+        _json([m.raw for m in members])
+    elif members:
+        print(_member_rows(members))
+    else:
+        print("no members", file=sys.stderr)
+    return 0
+
+
+def _workspaces_parser(sub: Any) -> None:
+    spaces = sub.add_parser("workspaces", help="the account's workspaces, read only")
+    verbs = spaces.add_subparsers(dest="verb", required=True)
+    listing = verbs.add_parser("list", help="the workspaces this key can reach")
+    listing.add_argument("--json", action="store_true", help="the rows as JSON")
+    listing.set_defaults(fn=_cmd_workspaces_list)
+    get = verbs.add_parser("get", help="one workspace; one this key cannot see is not found")
+    get.add_argument("id", metavar="ID")
+    get.add_argument("--json", action="store_true", help="the workspace as JSON")
+    get.set_defaults(fn=_cmd_workspaces_get)
+    members = verbs.add_parser(
+        "members", help="who reaches a workspace (needs an account-wide key)"
+    )
+    members.add_argument("id", metavar="ID")
+    members.add_argument("--json", action="store_true", help="the rows as JSON")
+    members.set_defaults(fn=_cmd_workspaces_members)
+
+
 def _webhooks_parser(sub: Any) -> None:
     hooks = sub.add_parser("webhooks", help="the account's webhook subscriptions")
     verbs = hooks.add_subparsers(dest="verb", required=True)
@@ -2677,6 +2760,7 @@ def _parser() -> _Parser:
     _webhooks_parser(sub)
     _secrets_parser(sub)
     _keys_parsers(sub)
+    _workspaces_parser(sub)
     return parser
 
 

@@ -1249,21 +1249,51 @@ def test_clear_schedule_is_a_delete_not_a_disable(client: mc.Client) -> None:
     assert not put.called, "clearing must not go through the set path"
 
 
-def schedule_server(stored: dict[str, Any]) -> tuple[respx.Route, respx.Route]:
-    """A schedule route that stores each PUT's body whole, as the platform does."""
+def public_schedule(s: dict[str, Any]) -> dict[str, Any]:
+    """A stored schedule as the platform sends it back, gaps filled with 0/0/UTC."""
+    return {
+        "enabled": bool(s.get("enabled")),
+        "hour": int(s.get("hour") or 0),
+        "minute": int(s.get("minute") or 0),
+        "tz": s.get("tz") or "UTC",
+    }
 
-    def put(request: httpx.Request) -> httpx.Response:
-        stored.clear()
-        stored.update(json.loads(request.content))
-        return httpx.Response(200, json=stored)
 
-    get = respx.get(f"{BASE}/computers/vm-1/schedule").mock(
-        side_effect=lambda _: httpx.Response(200, json=stored)
-    )
-    return get, respx.put(f"{BASE}/computers/vm-1/schedule").mock(side_effect=put)
+class ScheduleServer:
+    """The schedule routes and the computer record, in the shapes the platform
+    sends them.
+
+    ``stored`` is ``None`` for a computer with no schedule. Then GET
+    ``.../schedule`` answers ``{enabled: false, hour: 0, minute: 0, tz: "UTC"}``
+    (an empty window with its gaps filled in), and the computer record carries
+    no ``snapshot_schedule`` at all. A PUT is stored whole, as the platform
+    stores it.
+    """
+
+    def __init__(self, stored: dict[str, Any] | None) -> None:
+        self.stored = stored
+        self.put_bodies: list[dict[str, Any]] = []
+        self.get_schedule = respx.get(f"{BASE}/computers/vm-1/schedule").mock(
+            side_effect=lambda _: httpx.Response(200, json=public_schedule(self.stored or {}))
+        )
+        self.get_computer = respx.get(f"{BASE}/computers/vm-1").mock(side_effect=self._record)
+        self.put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(side_effect=self._put)
+
+    def _record(self, _: httpx.Request) -> httpx.Response:
+        record = dict(COMPUTER)
+        if self.stored is not None:
+            record["snapshot_schedule"] = public_schedule(self.stored)
+        return httpx.Response(200, json=record)
+
+    def _put(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.put_bodies.append(body)
+        self.stored = dict(body)
+        return httpx.Response(200, json=public_schedule(self.stored))
 
 
 CHICAGO = {"enabled": True, "hour": 23, "minute": 30, "tz": "America/Chicago"}
+NO_SCHEDULE_GET = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"}
 
 
 @respx.mock
@@ -1273,28 +1303,50 @@ def test_schedule_toggle_keeps_the_window(client: mc.Client) -> None:
     The platform stores the PUT's body whole, so defaults of 4/0/UTC sent with
     ``enabled=False`` moved the window while switching it off (OPL-5322).
     """
-    stored = dict(CHICAGO)
-    get, put = schedule_server(stored)
+    server = ScheduleServer(dict(CHICAGO))
     c = mc.Computer(client._t, COMPUTER)
     assert c.set_schedule(enabled=False) == {**CHICAGO, "enabled": False}
     assert c.set_schedule(enabled=True) == CHICAGO
-    assert stored == CHICAGO
-    assert (get.call_count, put.call_count) == (2, 2)
+    assert server.stored == CHICAGO
+    assert (server.get_computer.call_count, server.put.call_count) == (2, 2)
     # One part given: the others are kept.
     assert c.set_schedule(enabled=True, hour=5) == {**CHICAGO, "hour": 5}
 
 
 @respx.mock
 def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.Client) -> None:
-    stored: dict[str, Any] = {}
-    schedule_server(stored)
+    """A computer with no schedule gets 04:00, not the GET's zeros.
+
+    GET .../schedule answers "no schedule" as a disabled 00:00 UTC window, so
+    reading the window from it armed backups at midnight UTC. The record omits
+    ``snapshot_schedule`` when there is none, and that is what decides.
+    """
+    server = ScheduleServer(None)
     c = mc.Computer(client._t, COMPUTER)
+    # The platform's own answer for this computer, as the fallback must not read it.
+    assert c.schedule() == NO_SCHEDULE_GET
+    assert c.set_schedule(enabled=True) == {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    server.stored = None
     assert c.set_schedule(enabled=True, tz="Europe/Paris") == {
         "enabled": True,
         "hour": 4,
         "minute": 0,
         "tz": "Europe/Paris",
     }
+    assert server.put_bodies[0] == {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+
+
+@respx.mock
+def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.Client) -> None:
+    """A real disabled 00:00 UTC schedule is kept, not replaced by 04:00.
+
+    Its GET answer is byte-for-byte the no-schedule one; only the record's
+    ``snapshot_schedule`` tells them apart.
+    """
+    server = ScheduleServer(dict(NO_SCHEDULE_GET))
+    c = mc.Computer(client._t, COMPUTER)
+    assert c.set_schedule(enabled=True) == {"enabled": True, "hour": 0, "minute": 0, "tz": "UTC"}
+    assert server.put_bodies == [{"enabled": True, "hour": 0, "minute": 0, "tz": "UTC"}]
 
 
 @respx.mock

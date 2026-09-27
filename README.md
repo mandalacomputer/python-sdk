@@ -2243,9 +2243,13 @@ the same as one whose schedule is switched off.
 
 Disabling and clearing differ. `set_schedule(enabled=False)` keeps the chosen
 time: `hour`, `minute` and `tz` left out keep the current schedule's values
-(it reads the schedule first, since the platform stores the window whole), so
+(it re-reads the computer first and sends its `snapshot_schedule` back, since
+the platform stores the window whole), so
 `set_schedule(enabled=True)` switches it back on at the same time. Only a
-computer with no schedule falls back to 04:00 UTC. `clear_schedule()` returns
+computer with no schedule falls back to 04:00 UTC. (`c.schedule()` cannot tell
+you which case you are in: it answers a computer with no schedule as a disabled
+00:00 UTC one. `snapshot_schedule` being `None` after `c.refresh()` can.)
+`clear_schedule()` returns
 the computer to never having had a schedule.
 
 The schedule describes the *window* and nothing else — there is no `last_run`.
@@ -3211,6 +3215,7 @@ mandala-py webhooks list              # and create, get, update, delete, rotate,
 mandala-py secrets list               # names and revisions, never values
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
+mandala-py workspaces list            # and get ID, members ID; read only
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
 mandala-py egress-proxy set dev https://proxy.example.com:3128 --credentials csec-0123456789abcdef
@@ -3302,6 +3307,14 @@ printed, which names the page and the checkbox (`--json`: `code`
 so `KEY=$(mandala-py api-keys create --name ci)` captures it, and says what it
 made on stderr; `--json` prints the platform's object with the key under `raw`.
 It is shown once.
+
+`workspaces list` prints the workspaces the key reaches, with the ids that
+`secrets --workspace` and `api-keys create --workspace` take; `workspaces get
+ID` prints one, and one the key cannot see is `not_found`. `workspaces members
+ID` lists the people who reach it (the account's accepted members, with their
+role and whether they are suspended) and needs an account-wide key: a key
+confined to a workspace gets the platform's 403 (`--json`: `code`
+`permission_denied`). Each takes `--json` for the platform's rows.
 
 `logout [--profile NAME]` forgets one profile that `mandala login` saved in
 `~/.mandala/credentials.json` — the one `--profile` or `MANDALA_PROFILE` names,
