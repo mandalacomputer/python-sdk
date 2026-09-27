@@ -1565,6 +1565,39 @@ def test_modifiers_are_held_for_the_drag(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_modifiers_given_as_one_string_are_refused_before_any_request(
+    client: mc.Client,
+) -> None:
+    # "+".join("shift") is "s+h+i+f+t": five held letter keys instead of Shift,
+    # and each letter is a key name the platform accepts, so nothing reports it.
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    with pytest.raises(ValueError, match="sequence of key names"):
+        c.drag(10, 10, from_x=0, from_y=0, modifiers="shift")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="sequence of key names"):
+        c.scroll(5, 5, modifiers="ctrl")  # type: ignore[arg-type]
+    # The click methods take *modifiers, so only a direct call reaches the
+    # helper with a string, but it shares the one refusal.
+    with pytest.raises(ValueError, match="sequence of key names"):
+        mc._api.click_body("left_click", 1, 2, "shift")  # type: ignore[arg-type]
+    assert not route.called
+
+
+@respx.mock
+def test_modifiers_given_as_a_tuple_are_still_joined(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    c.drag(10, 10, from_x=0, from_y=0, modifiers=("shift",))
+    assert json.loads(route.calls[0].request.content)["text"] == "shift"
+    c.scroll(5, 5, modifiers=("ctrl", "shift"))
+    assert json.loads(route.calls[1].request.content)["text"] == "ctrl+shift"
+    c.click(1, 2, "shift")
+    assert json.loads(route.calls[2].request.content)["text"] == "shift"
+    c.scroll(5, 5)
+    assert "text" not in json.loads(route.calls[3].request.content)
+
+
+@respx.mock
 def test_the_cursor_position_is_none_until_something_places_it(client: mc.Client) -> None:
     # The virtual pointing device takes coordinates and reports none back, so an
     # untouched pointer has no position anybody knows. Zeros here would be

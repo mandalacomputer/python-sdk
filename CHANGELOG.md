@@ -35,6 +35,12 @@ This is the summary you read to decide whether to upgrade.
   record's field: `refresh()`, `set_schedule()` and `clear_schedule()` update
   it.
 
+- **`drag()` and `scroll()` refuse `modifiers` given as a single string**,
+  sync and async, with a `ValueError` before any request, instead of holding
+  each of its letters: `modifiers="shift"` was sent as `s+h+i+f+t`. Pass a
+  tuple such as `("shift",)`. The click methods take their modifiers as
+  separate arguments and are unchanged.
+
 ## [0.7.0] — 2026-09-27
 
 ### Added

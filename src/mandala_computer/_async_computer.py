@@ -1141,7 +1141,8 @@ class AsyncComputer(ComputerFields):
         ``modifiers`` are held down for the whole drag, e.g.
         ``await c.drag(400, 300, from_x=100, from_y=200, modifiers=("shift",))`` to
         extend a selection. They are pressed before the pointer moves and
-        released after the button.
+        released after the button. Give a tuple of key names: a single string
+        such as ``"shift"`` is refused with ``ValueError``.
         """
         await self._input(_api.drag_body(from_x, from_y, to_x, to_y, modifiers))
 
@@ -1175,6 +1176,10 @@ class AsyncComputer(ComputerFields):
         ``direction`` is up, down, left or right. Horizontal scrolling needs a
         hypervisor running QEMU 7.1 or newer; an older one refuses it by name
         rather than scrolling the wrong way.
+
+        ``modifiers`` are held down for the scroll, e.g. ``modifiers=("ctrl",)``.
+        Give a tuple of key names: a single string such as ``"ctrl"`` is
+        refused with ``ValueError``.
         """
         await self._input(_api.scroll_body(x, y, direction, amount, modifiers))
 
