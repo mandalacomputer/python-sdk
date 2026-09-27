@@ -11,6 +11,22 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **`Idempotency-Key` on every lifecycle call:** `computers.create` (and so
+  `launch`), `clone`, `start`, `stop`, `suspend`, `restart`, `rename`,
+  `resize`, `set_idle_suspend`, `set_browser_proxy`, `relocate`, `delete`,
+  `snapshots.restore` and `snapshots.clone` send one, sync and async — a fresh
+  random key per call, or your own through the new `idempotency_key=` keyword
+  (1 to 255 printable ASCII characters, no spaces; anything else is a
+  `ValueError` before a request is sent). An exception that leaves the outcome
+  unknown — a dropped connection or timeout after the request went out, a
+  `5xx`, or the platform's `409` `idempotency_in_progress` /
+  `idempotency_outcome_unknown` — carries the key as `idempotency_key`:
+  calling the same method again with it answers the first call's result
+  instead of doing it twice. `operations.list` takes `idempotency_key=`,
+  `Operation.idempotency_key` says which key started one (`None` when none, or
+  on an older platform), `delete` is a documented kind, and `is_transient` is
+  `False` for `idempotency_outcome_unknown`.
+
 - **Lifecycle operations:** `client.operations.get(operation_id)`,
   `list(computer_id=, limit=, cursor=)` and `wait(operation_or_id, timeout=,
   poll=)`, sync and async, over the platform's `GET operations` and

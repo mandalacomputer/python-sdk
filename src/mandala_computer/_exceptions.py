@@ -55,6 +55,16 @@ class MandalaError(Exception):
     #: record over as an event and never needs this.
     agent: AgentFailed | None = None
 
+    #: The ``Idempotency-Key`` a lifecycle call was sent with, on an error that
+    #: leaves its outcome unknown: a request that may have been received before
+    #: the connection died or the deadline passed, a ``5xx``, or the platform's
+    #: ``409``\ s saying the keyed call is still running or was never heard to
+    #: end (platform OPL-5127). Send the same call again with this key —
+    #: ``computer.start(idempotency_key=err.idempotency_key)`` — to learn how it
+    #: went without doing it twice, or find its operation with
+    #: ``operations.list(idempotency_key=...)``. ``None`` on every other error.
+    idempotency_key: str | None = None
+
 
 #: The words the platform will put in a refusal's ``reason`` (OPL-3898, and
 #: OPL-4801 for the fifth), split by what a retry loop should do about each. ``error`` beside it stays a
@@ -903,6 +913,18 @@ def is_transient(err: BaseException) -> bool:
         if isinstance(err.body, dict) and err.body.get("code") == "template_image_preparing":
             # Continuation requires the returned token and original create arguments.
             # The same code can also describe failed preparation; inspect its body.
+            return False
+        if (
+            err.status == 409
+            and isinstance(err.body, dict)
+            and err.body.get("code") == "idempotency_outcome_unknown"
+        ):
+            # A keyed call the platform never heard end (OPL-5127). A 409 with no
+            # ``reason``, so the ConflictError branch below would call it worth
+            # sending again — and the same key answers the same thing forever:
+            # the computer is what says whether it happened. Its sibling
+            # ``idempotency_in_progress`` carries ``reason: "contention"`` and IS
+            # worth sending again: that is the wait for the first call's answer.
             return False
         reason = err.reason
         # The platform puts these words on the 409 that will clear (a guest

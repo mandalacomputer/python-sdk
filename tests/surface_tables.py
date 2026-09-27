@@ -193,6 +193,8 @@ PARAMETERS: dict[str, set[str]] = {
         "body:secrets",
         "body:browser_proxy",
         "body:egress_proxy",
+        # Every lifecycle call carries one (platform OPL-5127).
+        "header:Idempotency-Key",
     },
     "GET computers/:id": set(),
     "PATCH computers/:id": {
@@ -203,17 +205,23 @@ PARAMETERS: dict[str, set[str]] = {
         "body:idle_suspend_min",
         "body:browser_proxy",
         "body:egress_proxy",
+        "header:Idempotency-Key",
     },
-    "DELETE computers/:id": {"query:snapshots", "query:expect"},
-    "POST computers/:id/start": {"query:resume_only"},
-    "POST computers/:id/stop": {"query:force"},
-    "POST computers/:id/suspend": set(),
-    "POST computers/:id/restart": set(),
-    "POST computers/:id/clone": {"body:name"},
+    "DELETE computers/:id": {"query:snapshots", "query:expect", "header:Idempotency-Key"},
+    "POST computers/:id/start": {"query:resume_only", "header:Idempotency-Key"},
+    "POST computers/:id/stop": {"query:force", "header:Idempotency-Key"},
+    "POST computers/:id/suspend": {"header:Idempotency-Key"},
+    "POST computers/:id/restart": {"header:Idempotency-Key"},
+    "POST computers/:id/clone": {"body:name", "header:Idempotency-Key"},
     # The sizing group and nothing else. The platform reads only these three off
     # a move body and ignores the rest, so a name sent here would be dropped in
     # silence — which is why relocate() has no room for one.
-    "POST computers/:id/move": {"body:cpu", "body:ram_mb", "body:disk_gb"},
+    "POST computers/:id/move": {
+        "body:cpu",
+        "body:ram_mb",
+        "body:disk_gb",
+        "header:Idempotency-Key",
+    },
     "GET moves": set(),
     # Computer use.
     "GET computers/:id/screenshot": {
@@ -313,8 +321,13 @@ PARAMETERS: dict[str, set[str]] = {
     "GET snapshots": {"query:allow_partial", "query:include"},
     "GET computers/:id/snapshots": set(),
     "POST computers/:id/snapshots": {"body:name", "body:memory"},
-    "POST snapshots/:id/restore": set(),
-    "POST snapshots/:id/clone": {"body:name", "body:memory", "body:inherit_secrets"},
+    "POST snapshots/:id/restore": {"header:Idempotency-Key"},
+    "POST snapshots/:id/clone": {
+        "body:name",
+        "body:memory",
+        "body:inherit_secrets",
+        "header:Idempotency-Key",
+    },
     "DELETE snapshots/:id": set(),
     "GET computers/:id/schedule": set(),
     "PUT computers/:id/schedule": {"body:enabled", "body:hour", "body:minute", "body:tz"},
@@ -372,6 +385,6 @@ PARAMETERS: dict[str, set[str]] = {
     "POST api-keys": {"body:manage_keys", "body:name", "body:workspace_id"},
     "DELETE api-keys/:id": set(),
     # Lifecycle operations, read only (OPL-5055).
-    "GET operations": {"query:computer_id", "query:cursor", "query:limit"},
+    "GET operations": {"query:computer_id", "query:cursor", "query:limit", "query:idempotency_key"},
     "GET operations/:id": set(),
 }

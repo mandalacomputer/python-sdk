@@ -2028,11 +2028,23 @@ is copied, and a move until it lands. Keep `wait_for_guest()` for a desktop
 that answers; see [Readiness](#readiness).
 
 `client.operations.get(operation_id)` reads one, and
-`client.operations.list(computer_id=..., limit=..., cursor=...)` pages through
-them newest first — pass `next_cursor` back as `cursor`. An API key confined to
-a workspace sees only its computers' operations, and anything else is a
-`NotFoundError`. Calls made from the dashboard record none. The async client
-has the same three, awaited.
+`client.operations.list(computer_id=..., idempotency_key=..., limit=...,
+cursor=...)` pages through them newest first — pass `next_cursor` back as
+`cursor`. An API key confined to a workspace sees only its computers'
+operations, and anything else is a `NotFoundError`. Calls made from the
+dashboard record none. The async client has the same three, awaited.
+
+**Every lifecycle call sends an `Idempotency-Key`** — create, clone, start,
+stop, suspend, restart, rename, resize, `set_idle_suspend`,
+`set_browser_proxy`, relocate, delete and a snapshot's restore and clone — a
+fresh one per call unless you pass `idempotency_key=` yourself. The platform
+records the call before carrying it out, so if its answer is lost (a timeout,
+a dropped connection, a `5xx`) the exception carries the key as
+`err.idempotency_key`: call the same method again with it and it is not done
+twice — you get the first call's answer, or a `ConflictError` with `code:
+"idempotency_in_progress"` while it still runs — or find its operation with
+`client.operations.list(idempotency_key=...)`. Keys last 24 hours, and a key
+sent with different arguments is refused with a `422`.
 
 ### Snapshots
 
