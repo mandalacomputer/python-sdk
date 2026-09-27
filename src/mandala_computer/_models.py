@@ -43,6 +43,8 @@ __all__ = [
     "ComputerDeletion",
     "ComputerUsage",
     "DirectoryEntry",
+    "EgressProxy",
+    "EgressProxyArgs",
     "ExecResult",
     "ExecStatus",
     "FilePart",
@@ -3257,6 +3259,81 @@ class BrowserProxy:
         return cls(
             server=str.__str__(server),
             bypass=tuple(str.__str__(e) for e in bypass),
+            credentials_secret_id=None if creds is None else str.__str__(creds),
+        )
+
+
+# --- egress proxy -----------------------------------------------------------
+
+
+class _EgressProxyServer(TypedDict):
+    server: str
+
+
+class EgressProxyArgs(_EgressProxyServer, total=False):
+    """A proxy for ALL of a computer's outbound TCP, for
+    :meth:`~mandala_computer.Computers.create` and
+    :meth:`~mandala_computer.Computer.set_egress_proxy`.
+
+    ``server`` is the proxy's URL with an explicit port: ``http://host:port``
+    (one that takes ``CONNECT``), ``https://host:port`` (the same, spoken to
+    over TLS) or ``socks5://host:port``, never with a username or password in
+    it. Which schemes and hosts are accepted is the platform's rule, not this
+    client's: a value it refuses raises :class:`~mandala_computer.BadRequestError`
+    with its sentence. There is no bypass list: every connection goes through
+    the proxy.
+
+    ``credentials_secret_id`` is for an upstream that asks for a username and
+    password: the id of a secret (``csec-`` and sixteen hex characters) whose
+    value is ``user:password``. The secret is NOT bound to the computer and the
+    computer never receives it: the computer's host holds the value and signs
+    in to the proxy for it. With ``http://`` and ``socks5://`` the credentials
+    cross the network to the proxy in clear text, so prefer ``https://`` when
+    naming them. The setting is replaced whole, so leaving it out of a change
+    REMOVES the credentials: pass the :class:`EgressProxy` read off the
+    computer, edited, to keep them. ``None`` is the same as leaving it out.
+    """
+
+    credentials_secret_id: str | None
+
+
+@dataclass(frozen=True)
+class EgressProxy:
+    """The proxy ALL of a computer's outbound TCP is sent through, as the platform reports it.
+
+    ``server`` is in its stored spelling (lower-cased). ``credentials_secret_id``
+    is the id of the secret holding the proxy's ``user:password`` (see
+    :class:`EgressProxyArgs`), ``None`` when the proxy is used without
+    credentials. Can be passed back to
+    :meth:`~mandala_computer.Computer.set_egress_proxy` as it is, or with
+    :func:`dataclasses.replace` for one part: the credentials go with it.
+    """
+
+    server: str
+    credentials_secret_id: str | None = None
+
+    @classmethod
+    def from_api(cls, d: object, where: str = "computer") -> EgressProxy | None:
+        """Refuses rather than guesses, for :meth:`BrowserProxy.from_api`'s reason.
+
+        A change replaces the setting whole, so a credentials id dropped on the
+        read is one the caller's next change removes without knowing, and the
+        computer's connections are then refused by its upstream. Keys this
+        client does not know are left out rather than refused, so a platform
+        that grows the setting is still readable. ``None`` when there is none.
+        """
+        if d is None:
+            return None
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: egress_proxy is not an object")
+        server = d.get("server")
+        if not isinstance(server, str) or not server:
+            raise MandalaError(f"{where}: egress_proxy does not name its server")
+        creds = d.get("credentials_secret_id")
+        if creds is not None and (not isinstance(creds, str) or not creds):
+            raise MandalaError(f"{where}: egress_proxy credentials_secret_id is not a secret's id")
+        return cls(
+            server=str.__str__(server),
             credentials_secret_id=None if creds is None else str.__str__(creds),
         )
 

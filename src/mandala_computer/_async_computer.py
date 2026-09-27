@@ -98,6 +98,8 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     ComputerDeletion,
+    EgressProxy,
+    EgressProxyArgs,
     ExecResult,
     ExecStatus,
     FilePart,
@@ -517,6 +519,27 @@ class AsyncComputer(ComputerFields):
                 "PATCH",
                 _api.computer(self.id),
                 json=_api.browser_proxy_update_body(proxy),
+                headers=_api.idempotency_headers(idempotency_key),
+            )
+        )
+        return self
+
+    async def set_egress_proxy(
+        self,
+        proxy: EgressProxyArgs | EgressProxy | None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> AsyncComputer:
+        """Send ALL of this computer's outbound TCP through a proxy, or stop doing so.
+
+        Replaces the setting whole; ``None`` removes it. See
+        :meth:`Computer.set_egress_proxy`: this is its twin.
+        """
+        self._data = _api.computer_payload(
+            await self._t.json_object(
+                "PATCH",
+                _api.computer(self.id),
+                json=_api.egress_proxy_update_body(proxy),
                 headers=_api.idempotency_headers(idempotency_key),
             )
         )

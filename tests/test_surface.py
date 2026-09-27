@@ -96,11 +96,6 @@ UNIMPLEMENTED = {
 # rule: a route nobody calls sends none of its parameters, and that route's own
 # line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
-    # OPL-5142: `egress_proxy` ({server}) sends ALL of a computer's outbound
-    # TCP through a proxy, set at create or by PATCH (null clears it). Listed to
-    # stay in step with the surface; not yet sent.
-    "POST computers  body:egress_proxy",
-    "PATCH computers/:id  body:egress_proxy",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
@@ -795,6 +790,14 @@ def exercise_everything(client: mc.Client) -> None:
         template="base",
         browser_proxy={"server": "http://proxy.example.com:3128", "bypass": ["<local>"]},
     )
+    # An egress proxy at create, with its credentials (OPL-5246).
+    client.computers.create(
+        template="base",
+        egress_proxy={
+            "server": "https://proxy.example.com:3128",
+            "credentials_secret_id": "csec-0123456789abcdef",
+        },
+    )
     # The create/delete pair as one scope. Both its routes are reached by their
     # own methods elsewhere here, so nothing but the inventory sees this line.
     with client.computers.ephemeral(template="base"):
@@ -897,6 +900,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.set_idle_suspend(None)
     c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
     c.set_browser_proxy(None)
+    c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})
+    c.set_egress_proxy(None)
     c.read_file("/home/user/out.txt")
     c.read_text_file("/home/user/out.txt")
     c.read_file_part("/home/user/out.txt", offset=0, length=1024)
@@ -1072,6 +1077,14 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         template="base",
         browser_proxy={"server": "http://proxy.example.com:3128", "bypass": ["<local>"]},
     )
+    # An egress proxy at create, with its credentials (OPL-5246).
+    await client.computers.create(
+        template="base",
+        egress_proxy={
+            "server": "https://proxy.example.com:3128",
+            "credentials_secret_id": "csec-0123456789abcdef",
+        },
+    )
     async with client.computers.ephemeral(template="base"):
         pass
     await c.refresh()
@@ -1162,6 +1175,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.set_idle_suspend(None)
     await c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
     await c.set_browser_proxy(None)
+    await c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})
+    await c.set_egress_proxy(None)
     await c.read_file("/home/user/out.txt")
     await c.read_text_file("/home/user/out.txt")
     await c.read_file_part("/home/user/out.txt", offset=0, length=1024)
