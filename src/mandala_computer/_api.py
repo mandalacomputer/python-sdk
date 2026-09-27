@@ -2187,6 +2187,12 @@ def ssh_key(key_id: str) -> str:
 #: the value: the whole point is that the key goes nowhere.
 RAW_KEY_AS_ID = "that is an API key, not a key id; run api-keys list to find its id (key-...)"
 
+#: The exact shape of an API key, found anywhere in a value: a key saved with a
+#: byte-order mark, copied with a zero-width space, quoted or labelled
+#: (``Bearer com_...``, ``MANDALA_API_KEY=com_...``) is still the key. A key id
+#: (``key-`` and hex) can never contain it.
+_RAW_KEY_ANYWHERE = re.compile(r"com_[0-9a-f]{48}", re.IGNORECASE)
+
 
 def not_a_raw_key(key_id: object) -> str:
     """*key_id*, refused if it is an API key rather than a key's id.
@@ -2198,10 +2204,11 @@ def not_a_raw_key(key_id: object) -> str:
     answer 404 and leave the key valid. Refused before any request, with a
     message that does not repeat the value. Surrounding whitespace and letter
     case are ignored for the check alone, so a pasted key with a stray space
-    or in capitals is caught too.
+    or in capitals is caught too, and a full key anywhere in the value (behind
+    an invisible character, in quotes, after ``Bearer``) is refused as well.
     """
     value = canonical(key_id, "id")
-    if value.strip().lower().startswith("com_"):
+    if value.strip().lower().startswith("com_") or _RAW_KEY_ANYWHERE.search(value):
         raise ValueError(RAW_KEY_AS_ID)
     return value
 

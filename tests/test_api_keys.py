@@ -186,8 +186,20 @@ def test_revoke_deletes_by_id() -> None:
 
 RAW_KEY = "com_" + "ab" * 24
 RAW_KEY_SENTENCE = "that is an API key, not a key id; run api-keys list to find its id (key-...)"
-# A pasted key with a stray space or newline, or in capitals, is still one.
-RAW_KEY_SHAPES = [RAW_KEY, f" {RAW_KEY}\n", RAW_KEY.upper(), "com_short"]
+# A pasted key with a stray space or newline, or in capitals, is still one; so
+# is a full key behind a byte-order mark or a zero-width space (neither is
+# whitespace to str.strip), in quotes, or after a label.
+RAW_KEY_SHAPES = [
+    RAW_KEY,
+    f" {RAW_KEY}\n",
+    RAW_KEY.upper(),
+    "com_short",
+    "\ufeff" + RAW_KEY,
+    "\u200b" + RAW_KEY,
+    f'"{RAW_KEY}"',
+    f"Bearer {RAW_KEY}",
+    f"MANDALA_API_KEY={RAW_KEY}",
+]
 
 
 @pytest.mark.parametrize("raw", RAW_KEY_SHAPES)
@@ -199,6 +211,7 @@ def test_revoke_refuses_an_api_key_before_any_request(raw: str) -> None:
     assert not anything.called
     assert str(caught.value) == RAW_KEY_SENTENCE
     assert raw.strip().lower() not in str(caught.value).lower()
+    assert RAW_KEY not in str(caught.value).lower()
 
 
 @pytest.mark.parametrize("raw", RAW_KEY_SHAPES)
@@ -210,6 +223,7 @@ async def test_async_revoke_refuses_an_api_key_before_any_request(raw: str) -> N
             await c.api_keys.revoke(raw)
     assert not anything.called
     assert str(caught.value) == RAW_KEY_SENTENCE
+    assert RAW_KEY not in str(caught.value).lower()
 
 
 @respx.mock
@@ -293,10 +307,12 @@ def test_cli_api_keys_revoke(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out == "revoked key-a1b2c3d4e5f6\n"
 
 
+@pytest.mark.parametrize("raw", RAW_KEY_SHAPES)
 @pytest.mark.parametrize("as_json", [False, True])
 @pytest.mark.parametrize("logged_in", [True, False])
 @respx.mock
 def test_cli_api_keys_revoke_refuses_an_api_key_without_repeating_it(
+    raw: str,
     as_json: bool,
     logged_in: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -307,12 +323,13 @@ def test_cli_api_keys_revoke_refuses_an_api_key_without_repeating_it(
         monkeypatch.delenv("MANDALA_API_KEY")
         monkeypatch.setenv("HOME", str(tmp_path))
     anything = respx.route().mock(return_value=httpx.Response(404, json={"error": "no"}))
-    argv = ["api-keys", "revoke", RAW_KEY, *(["--json"] if as_json else [])]
+    argv = ["api-keys", "revoke", raw, *(["--json"] if as_json else [])]
     assert _cli.main(argv) == 1
     out, err = capsys.readouterr()
     assert not anything.called
     assert out == ""
-    assert RAW_KEY not in err
+    assert RAW_KEY not in err.lower()
+    assert raw.strip().lower() not in err.lower()
     if as_json:
         assert json.loads(err)["error"] == {
             "code": "invalid_arguments",
