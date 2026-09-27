@@ -72,6 +72,7 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.parse
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import suppress
@@ -2341,6 +2342,24 @@ def _cmd_browser_proxy_get(args: argparse.Namespace) -> int:
     return _proxy_result(args, c)
 
 
+def _same_proxy_server(a: str, b: str) -> bool:
+    """Whether two proxy URLs name the same server: the scheme, host and port,
+    compared without case, as the platform stores a server. A proxy's
+    credentials are sent to its server on every request, so they are carried
+    over only to the server they were set for; ``False`` when either will not
+    parse, which refuses the carry rather than guessing."""
+
+    def parts(value: str) -> tuple[str, str, int | None] | None:
+        try:
+            u = urllib.parse.urlsplit(value.strip())
+            return (u.scheme.lower(), (u.hostname or "").lower(), u.port)
+        except ValueError:
+            return None
+
+    left = parts(a)
+    return left is not None and left[1] != "" and left == parts(b)
+
+
 def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
     proxy: BrowserProxyArgs = {"server": args.url}
     bypass = _bypass_list(args.bypass)
@@ -2357,9 +2376,18 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
             # The setting is replaced whole, so a change that named no
             # credentials would remove the proxy's, and its upstream would then
             # answer every browser 407. Read fresh, not off the listing the name
-            # was resolved from, and carry the id over.
+            # was resolved from, and carry the id over, but only to the same
+            # server: the credentials are sent to the proxy on every request.
             current = c.refresh().browser_proxy
             if current is not None and current.credentials_secret_id is not None:
+                if not _same_proxy_server(current.server, args.url):
+                    _die(
+                        f"the proxy's credentials ({current.credentials_secret_id}) are for "
+                        f"{current.server}, not {args.url}; give --credentials SECRET_ID to "
+                        "use credentials with the new server, or --no-credentials to set it "
+                        "without any",
+                        "invalid_arguments",
+                    )
                 proxy["credentials_secret_id"] = current.credentials_secret_id
         c = c.set_browser_proxy(proxy)
         if args.wait:
@@ -2385,7 +2413,7 @@ def _browser_proxy_parser(sub: Any) -> None:
     put = verbs.add_parser(
         "set",
         help="send a computer's browsers through a proxy, replacing any it has; "
-        "its credentials are kept unless changed",
+        "its credentials are kept when the server is unchanged",
     )
     put.add_argument("target", metavar="computer", help="computer name or id")
     put.add_argument("url", metavar="URL", help="the proxy, e.g. http://proxy.example.com:3128")
@@ -2400,7 +2428,8 @@ def _browser_proxy_parser(sub: Any) -> None:
         "--credentials",
         metavar="SECRET_ID",
         help="the id of a secret holding user:password for the proxy, bound to the "
-        "computer as a file (default: keep the proxy's current credentials)",
+        "computer as a file (default: keep the proxy's current credentials when the "
+        "server is unchanged)",
     )
     creds.add_argument(
         "--no-credentials",

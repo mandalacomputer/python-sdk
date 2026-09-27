@@ -698,7 +698,7 @@ def test_cli_set_keeps_replaces_or_removes_the_credentials(cli_env, capsys):
     current = {
         **COMPUTER,
         "name": "dev",
-        "browser_proxy": {"server": "http://old:1", "credentials_secret_id": CREDS},
+        "browser_proxy": {"server": SERVER, "credentials_secret_id": CREDS},
     }
     respx.get(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=current))
     patch = respx.patch(f"{BASE}/computers/launch-42").mock(
@@ -717,6 +717,68 @@ def test_cli_set_keeps_replaces_or_removes_the_credentials(cli_env, capsys):
     assert json.loads(patch.calls.last.request.content) == {"browser_proxy": {"server": SERVER}}
     # And the text output says which secret the proxy uses.
     assert f"  credentials: secret {CREDS}" in capsys.readouterr().out
+
+
+@respx.mock
+def test_cli_set_carries_credentials_only_to_the_server_they_were_set_for(cli_env, capsys):
+    # The platform sends user:password to the proxy on every request, so a set
+    # that names another server must not take the current credentials with it.
+    listing()
+    current = {
+        **COMPUTER,
+        "name": "dev",
+        "browser_proxy": {
+            "server": "http://corp-proxy.example:3128",
+            "credentials_secret_id": CREDS,
+        },
+    }
+    respx.get(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=current))
+    patch = respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json=current)
+    )
+    # The same server, written with other case and a trailing slash: kept.
+    same = "HTTP://Corp-Proxy.example:3128/"
+    assert _cli.main(["browser-proxy", "set", "dev", same, "--bypass", "a.com"]) == 0
+    assert json.loads(patch.calls.last.request.content) == {
+        "browser_proxy": {"server": same, "bypass": ["a.com"], "credentials_secret_id": CREDS}
+    }
+    capsys.readouterr()
+    for url in (
+        "http://other.example:3128",
+        "http://corp-proxy.example:8080",
+        "socks5://corp-proxy.example:3128",
+        "https://corp-proxy.example:3128",
+        "not a url",
+    ):
+        before = patch.call_count
+        assert _cli.main(["browser-proxy", "set", "dev", url, "--json"]) == 1, url
+        error = json.loads(capsys.readouterr().err)["error"]
+        assert error["code"] == "invalid_arguments", url
+        assert CREDS in error["message"], url
+        assert "--no-credentials" in error["message"], url
+        assert patch.call_count == before, url
+    other = "csec-fedcba9876543210"
+    new = "http://other.example:3128"
+    assert _cli.main(["browser-proxy", "set", "dev", new, "--credentials", other]) == 0
+    assert json.loads(patch.calls.last.request.content) == {
+        "browser_proxy": {"server": new, "credentials_secret_id": other}
+    }
+    assert _cli.main(["browser-proxy", "set", "dev", new, "--no-credentials"]) == 0
+    assert json.loads(patch.calls.last.request.content) == {"browser_proxy": {"server": new}}
+
+
+@respx.mock
+def test_cli_set_moves_a_proxy_without_credentials_anywhere(cli_env):
+    listing()
+    current = {**COMPUTER, "name": "dev", "browser_proxy": {"server": SERVER}}
+    respx.get(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=current))
+    patch = respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json=current)
+    )
+    assert _cli.main(["browser-proxy", "set", "dev", "socks5://elsewhere:1080"]) == 0
+    assert json.loads(patch.calls.last.request.content) == {
+        "browser_proxy": {"server": "socks5://elsewhere:1080"}
+    }
 
 
 def test_cli_refuses_a_malformed_or_doubled_credentials_flag_before_any_request(
