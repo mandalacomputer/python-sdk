@@ -457,3 +457,41 @@ async def test_build_transient_failures_honour_retry_after(monkeypatch):
         assert c.id == "launch-42"
     assert json.loads(requests[0].content) == {"start": False}
     assert len([r for r in requests if r.url.path.endswith("/start")]) == 1
+
+
+async def test_launch_sends_its_idempotency_key_on_the_create_only():
+    scenario = Scenario(
+        [
+            step("POST", "", {"id": "launch-42", "status": "stopped"}),
+            step("POST", "/launch-42/start", {"ok": True}),
+            step("GET", "/launch-42", COMPUTER),
+            step("GET", "/launch-42", COMPUTER),
+            step("POST", "/launch-42/exec", GUEST),
+        ]
+    )
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        await client.computers.launch(template="base", start=False, idempotency_key="k-1")
+    assert not scenario.steps
+    create, start = scenario.requests[0], scenario.requests[1]
+    assert create.headers["Idempotency-Key"] == "k-1"
+    assert start.url.path.endswith("/start")
+    assert start.headers["Idempotency-Key"] not in ("", "k-1")
+
+
+async def test_launch_refuses_a_bad_idempotency_key_before_any_request():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(500)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(ValueError, match="idempotency_key"):
+            await client.computers.launch(template="base", idempotency_key="has space")
+    assert requests == []

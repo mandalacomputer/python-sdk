@@ -431,3 +431,44 @@ def test_build_transient_failures_honour_retry_after(monkeypatch):
         assert c.id == "launch-42"
     assert json.loads(requests[0].content) == {"start": False}
     assert len([r for r in requests if r.url.path.endswith("/start")]) == 1
+
+
+def test_launch_sends_its_idempotency_key_on_the_create_only():
+    # The key is the create's: a launch whose create timed out is recovered by
+    # launching again with it. The start launch sends itself is another call
+    # and gets its own key; the create's reused there would be a 422.
+    scenario = Scenario(
+        [
+            step("POST", "", {"id": "launch-42", "status": "stopped"}),
+            step("POST", "/launch-42/start", {"ok": True}),
+            step("GET", "/launch-42", COMPUTER),
+            step("GET", "/launch-42", COMPUTER),
+            step("POST", "/launch-42/exec", GUEST),
+        ]
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        client.computers.launch(template="base", start=False, idempotency_key="k-1")
+    assert not scenario.steps
+    create, start = scenario.requests[0], scenario.requests[1]
+    assert create.headers["Idempotency-Key"] == "k-1"
+    assert start.url.path.endswith("/start")
+    assert start.headers["Idempotency-Key"] not in ("", "k-1")
+
+
+def test_launch_refuses_a_bad_idempotency_key_before_any_request():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(500)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        pytest.raises(ValueError, match="idempotency_key"),
+    ):
+        client.computers.launch(template="base", idempotency_key="has space")
+    assert requests == []

@@ -365,6 +365,7 @@ class Computers:
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
+        idempotency_key: str | None = None,
     ) -> Computer:
         """Create, start if needed, and wait for the guest agent to answer.
 
@@ -393,6 +394,16 @@ class Computers:
         after creation retain their type and include its id. Interruption
         propagates unchanged. Use ``ephemeral`` for scoped cleanup. Guest
         readiness does not guarantee the desktop has finished logging in.
+
+        ``idempotency_key`` is the create's key (see :meth:`create`): after a
+        dropped connection or a timeout on the create, calling ``launch`` again
+        with the same arguments and ``idempotency_key=err.idempotency_key``
+        answers the first create's computer, and launch then carries on
+        waiting for it. A failure of a start launch sends itself (for
+        ``start=False``, or when the create's own start was not admitted), or
+        of a later wait, carries a different key (the start's) or none, so
+        recover from those through the computer's id, which the error's
+        message names, rather than by launching again.
         """
         check_wait_args(timeout, poll)
         computer = self.create(
@@ -408,6 +419,7 @@ class Computers:
             secrets=secrets,
             browser_proxy=browser_proxy,
             egress_proxy=egress_proxy,
+            idempotency_key=idempotency_key,
         )
         computer_id = computer.id
         deadline = time.monotonic() + timeout
