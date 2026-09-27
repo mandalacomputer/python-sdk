@@ -29,6 +29,12 @@ This is the summary you read to decide whether to upgrade.
   the same way, since its text can come from the response: a newline or
   escape sequence in it can no longer forge a line or drive the terminal.
 
+- **`Computer.schedule()` / `AsyncComputer.schedule()` no longer overwrite
+  `snapshot_schedule`** with their answer, which reported a computer with no
+  schedule as a disabled 00:00 UTC window. The property is the computer
+  record's field: `refresh()`, `set_schedule()` and `clear_schedule()` update
+  it.
+
 ## [0.7.0] — 2026-09-27
 
 ### Added

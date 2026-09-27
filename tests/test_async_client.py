@@ -1201,23 +1201,31 @@ async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None
 
 
 @respx.mock
-async def test_schedule_writes_through_to_the_cached_property(client: mc.AsyncClient) -> None:
-    """A GET used to leave snapshot_schedule stale against the just-fetched value."""
-    stored = {"enabled": False, "hour": 0, "minute": 0, "tz": "UTC"}
-    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=stored))
+async def test_schedule_leaves_no_schedule_as_none(client: mc.AsyncClient) -> None:
+    """The sync twin's test: a GET's zero window is not cached as a schedule."""
+    from tests.test_client import NO_SCHEDULE_GET
+
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=NO_SCHEDULE_GET))
     c = mc.AsyncComputer(client._t, COMPUTER)
-    assert await c.schedule() == stored
-    assert c.snapshot_schedule == stored
+    assert "snapshot_schedule" not in COMPUTER
+    assert await c.schedule() == NO_SCHEDULE_GET
+    assert c.snapshot_schedule is None
     await client.aclose()
 
 
 @respx.mock
-async def test_an_empty_schedule_does_not_cache_as_a_window(client: mc.AsyncClient) -> None:
-    """GET {} is "no schedule"; snapshot_schedule is None, not {}."""
-    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
-    c = mc.AsyncComputer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
-    assert await c.schedule() == {}
-    assert c.snapshot_schedule is None
+async def test_schedule_does_not_change_the_cached_property(client: mc.AsyncClient) -> None:
+    """The sync twin's test: the record's value survives the GET's answer."""
+    from tests.test_client import NO_SCHEDULE_GET
+
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=NO_SCHEDULE_GET))
+    chicago = {"enabled": True, "hour": 23, "minute": 30, "tz": "America/Chicago"}
+    c = mc.AsyncComputer(client._t, {**COMPUTER, "snapshot_schedule": chicago})
+    assert await c.schedule() == NO_SCHEDULE_GET
+    assert c.snapshot_schedule == chicago
+    bare = mc.AsyncComputer(client._t, {**COMPUTER, "snapshot_schedule": None})
+    assert await bare.schedule() == NO_SCHEDULE_GET
+    assert bare.snapshot_schedule is None
     await client.aclose()
 
 

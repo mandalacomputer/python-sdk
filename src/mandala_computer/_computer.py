@@ -1854,11 +1854,13 @@ class ComputerFields:
     def snapshot_schedule(self) -> Mapping[str, Any] | None:
         """This computer's automatic snapshot window, if it has one.
 
-        The same shape :meth:`Computer.schedule` returns and ``None`` where that
-        would answer an empty mapping — carried on the computer itself, so a
-        caller that already holds one does not spend a second metered call to
-        find out whether it snapshots itself. Read it here; change it with
-        :meth:`Computer.set_schedule`.
+        The computer record's own field, ``None`` when the computer has no
+        schedule — carried on the computer itself, so a caller that already
+        holds one does not spend a second metered call to find out whether it
+        snapshots itself. :meth:`Computer.refresh`,
+        :meth:`Computer.set_schedule` and :meth:`Computer.clear_schedule`
+        update it; :meth:`Computer.schedule` does not, since it answers a
+        computer with no schedule as a disabled 00:00 UTC window.
         """
         value = self._data.get("snapshot_schedule")
         if not isinstance(value, Mapping) or not value:
@@ -4372,10 +4374,13 @@ class Computer(ComputerFields):
         return SnapshotHoldings.from_api(data)
 
     def schedule(self) -> Mapping[str, Any]:
-        """The automatic daily snapshot schedule."""
-        stored = dict(self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
-        self._data["snapshot_schedule"] = stored or None
-        return stored
+        """The automatic daily snapshot schedule.
+
+        This does not update :attr:`snapshot_schedule`, because it answers a
+        computer with no schedule as a disabled 00:00 UTC window. Use
+        :meth:`refresh` to update the property.
+        """
+        return dict(self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
 
     def set_schedule(
         self,
