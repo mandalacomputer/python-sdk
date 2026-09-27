@@ -2101,10 +2101,13 @@ class AsyncComputer(ComputerFields):
         return SnapshotHoldings.from_api(data)
 
     async def schedule(self) -> Mapping[str, Any]:
-        """The automatic daily snapshot schedule."""
-        stored = dict(await self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
-        self._data["snapshot_schedule"] = stored or None
-        return stored
+        """The automatic daily snapshot schedule.
+
+        This does not update :attr:`snapshot_schedule`, because it answers a
+        computer with no schedule as a disabled 00:00 UTC window. Use
+        :meth:`refresh` to update the property.
+        """
+        return dict(await self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
 
     async def set_schedule(
         self,

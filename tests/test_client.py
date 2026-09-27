@@ -1184,23 +1184,29 @@ def test_schedule_is_the_window_only(client: mc.Client) -> None:
     # Empty string would mean "UTC" to the daemon but is rejected by every
     # timezone library, so the surface must name the zone.
     assert sched["tz"] == "UTC"
-    # The GET must write through: snapshot_schedule used to stay stale after
-    # a fetch that set_schedule would have cached.
-    assert c.snapshot_schedule == {
-        "enabled": False,
-        "hour": 0,
-        "minute": 0,
-        "tz": "UTC",
-    }
+    # That answer is also what the platform sends for a computer with no
+    # schedule, so it must not land in snapshot_schedule: the record said
+    # "none" and a GET cannot tell the two apart.
+    assert "snapshot_schedule" not in COMPUTER
+    assert c.snapshot_schedule is None
 
 
 @respx.mock
-def test_an_empty_schedule_does_not_cache_as_a_window(client: mc.Client) -> None:
-    """GET {} is "no schedule"; snapshot_schedule is None, not {}."""
-    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
-    c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
-    assert c.schedule() == {}
-    assert c.snapshot_schedule is None
+def test_schedule_does_not_change_the_cached_property(client: mc.Client) -> None:
+    """The GET's no-schedule answer leaves snapshot_schedule as the record had it.
+
+    The platform answers a computer with no schedule as a disabled 00:00 UTC
+    window, not ``{}``. Caching it would report a schedule the record does not
+    have, or overwrite one it does.
+    """
+    respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=NO_SCHEDULE_GET))
+    chicago = {"enabled": True, "hour": 23, "minute": 30, "tz": "America/Chicago"}
+    c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": chicago})
+    assert c.schedule() == NO_SCHEDULE_GET
+    assert c.snapshot_schedule == chicago
+    bare = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": None})
+    assert bare.schedule() == NO_SCHEDULE_GET
+    assert bare.snapshot_schedule is None
 
 
 @respx.mock

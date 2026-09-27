@@ -2239,7 +2239,8 @@ clones back to what it was. Read it before cloning if the size matters.
 `c.snapshot_schedule` is the same window carried on the computer itself, for a
 caller that already holds one and would rather not spend a second call on
 `c.schedule()`. It is `None` on a computer that has no schedule, which is not
-the same as one whose schedule is switched off.
+the same as one whose schedule is switched off, and `c.schedule()` does not
+change it.
 
 Disabling and clearing differ. `set_schedule(enabled=False)` keeps the chosen
 time: `hour`, `minute` and `tz` left out keep the current schedule's values
