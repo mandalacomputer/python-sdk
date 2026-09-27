@@ -1131,7 +1131,10 @@ def create_body(
     return body
 
 
-_BROWSER_PROXY_KEYS = frozenset({"server", "bypass"})
+_BROWSER_PROXY_KEYS = frozenset({"server", "bypass", "credentials_secret_id"})
+
+#: A secret's id: ``csec-`` and sixteen lowercase hex characters.
+_SECRET_ID = re.compile(r"csec-[0-9a-f]{16}")
 
 
 def browser_proxy_body(proxy: object, what: str = "browser_proxy") -> dict[str, Any]:
@@ -1143,7 +1146,8 @@ def browser_proxy_body(proxy: object, what: str = "browser_proxy") -> dict[str, 
     schemes a proxy may use, which hosts it may name and how many bypass
     entries there may be are the platform's, and they are growing, so they are
     left to its 400, which names the rule that was broken. A copy here would
-    refuse a value the platform has since learned to accept.
+    refuse a value the platform has since learned to accept. The credentials
+    id is checked here because its form is an id's, not a rule that grows.
 
     A key this does not know is refused rather than dropped, as a secret
     binding's is: a misspelt ``bypass`` left out would send the browsers
@@ -1152,10 +1156,15 @@ def browser_proxy_body(proxy: object, what: str = "browser_proxy") -> dict[str, 
     from ._models import BrowserProxy  # a cycle at import time; not at call time
 
     if isinstance(proxy, BrowserProxy):
-        proxy = {"server": proxy.server, "bypass": list(proxy.bypass)}
+        proxy = {
+            "server": proxy.server,
+            "bypass": list(proxy.bypass),
+            "credentials_secret_id": proxy.credentials_secret_id,
+        }
     if not isinstance(proxy, Mapping):
         raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
-            f"{what} must be a mapping {{server, bypass}}, not {type(proxy).__name__}"
+            f"{what} must be a mapping {{server, bypass, credentials_secret_id}}, "
+            f"not {type(proxy).__name__}"
         )
     unknown = sorted(str(k) for k in proxy if k not in _BROWSER_PROXY_KEYS)
     if unknown:
@@ -1165,21 +1174,27 @@ def browser_proxy_body(proxy: object, what: str = "browser_proxy") -> dict[str, 
         raise ValueError(f"{what}.server must not be empty")
     body: dict[str, Any] = {"server": server}
     bypass = proxy.get("bypass")
-    if bypass is None:
-        return body
-    # A bare string is a sequence of characters, and would go out as one
-    # bypass entry per letter.
-    if isinstance(bypass, (str, bytes, Mapping)) or not isinstance(bypass, (list, tuple)):
-        raise ValueError(  # noqa: TRY004
-            f"{what}.bypass must be a list of hosts, not {type(bypass).__name__}"
-        )
-    entries = []
-    for i, entry in enumerate(bypass):
-        text = canonical(entry, f"{what}.bypass[{i}]")
-        if not text.strip():
-            raise ValueError(f"{what}.bypass[{i}] must not be empty")
-        entries.append(text)
-    body["bypass"] = entries
+    if bypass is not None:
+        # A bare string is a sequence of characters, and would go out as one
+        # bypass entry per letter.
+        if isinstance(bypass, (str, bytes, Mapping)) or not isinstance(bypass, (list, tuple)):
+            raise ValueError(f"{what}.bypass must be a list of hosts, not {type(bypass).__name__}")
+        entries = []
+        for i, entry in enumerate(bypass):
+            text = canonical(entry, f"{what}.bypass[{i}]")
+            if not text.strip():
+                raise ValueError(f"{what}.bypass[{i}] must not be empty")
+            entries.append(text)
+        body["bypass"] = entries
+    creds = proxy.get("credentials_secret_id")
+    if creds is not None:
+        creds = canonical(creds, f"{what}.credentials_secret_id")
+        if not _SECRET_ID.fullmatch(creds):
+            raise ValueError(
+                f"{what}.credentials_secret_id must be a secret's id: "
+                "csec- and sixteen hex characters"
+            )
+        body["credentials_secret_id"] = creds
     return body
 
 

@@ -3,6 +3,7 @@ the CLI (OPL-5144)."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import httpx
@@ -19,6 +20,7 @@ from mandala_computer import _api, _cli
 
 SERVER = "http://proxy.example.com:3128"
 PROXY = {"server": SERVER, "bypass": ["<local>"]}
+CREDS = "csec-0123456789abcdef"
 
 
 def proxied(pending, **extra):
@@ -45,11 +47,46 @@ def test_update_sends_null_to_remove_it():
 
 
 def test_a_proxy_read_off_a_computer_goes_back_as_it_is():
-    read = mc.BrowserProxy(server=SERVER, bypass=("<local>", "*.example.com"))
+    # Credentials included: the setting is replaced whole, so an id dropped on
+    # the way back removes them and the upstream answers every browser 407.
+    read = mc.BrowserProxy(
+        server=SERVER, bypass=("<local>", "*.example.com"), credentials_secret_id=CREDS
+    )
     assert _api.browser_proxy_body(read) == {
         "server": SERVER,
         "bypass": ["<local>", "*.example.com"],
+        "credentials_secret_id": CREDS,
     }
+    bare = mc.BrowserProxy(server=SERVER)
+    assert _api.browser_proxy_body(bare) == {"server": SERVER, "bypass": []}
+
+
+def test_a_credentials_id_is_sent_and_none_leaves_it_out():
+    assert _api.browser_proxy_body({"server": SERVER, "credentials_secret_id": CREDS}) == {
+        "server": SERVER,
+        "credentials_secret_id": CREDS,
+    }
+    assert _api.browser_proxy_body({"server": SERVER, "credentials_secret_id": None}) == {
+        "server": SERVER
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "must be a secret's id"),
+        ("csec-0123", "must be a secret's id"),
+        ("csec-0123456789ABCDEF", "must be a secret's id"),
+        (" " + CREDS, "must be a secret's id"),
+        ("my-secret", "must be a secret's id"),
+        (7, "credentials_secret_id must be a string"),
+    ],
+)
+def test_a_credentials_id_that_is_not_one_is_refused(value, message):
+    # Refused here rather than dropped: a proxy sent without its id is a proxy
+    # whose credentials the change removed.
+    with pytest.raises(ValueError, match=message):
+        _api.browser_proxy_body({"server": SERVER, "credentials_secret_id": value})
 
 
 @pytest.mark.parametrize(
@@ -87,9 +124,17 @@ def computer(**row):
 
 
 def test_the_setting_reads_back_and_ignores_keys_it_does_not_know():
-    c = computer(browser_proxy={**PROXY, "later": "field"}, browser_proxy_pending=True)
-    assert c.browser_proxy == mc.BrowserProxy(server=SERVER, bypass=("<local>",))
+    c = computer(
+        browser_proxy={**PROXY, "credentials_secret_id": CREDS, "later": "field"},
+        browser_proxy_pending=True,
+    )
+    assert c.browser_proxy == mc.BrowserProxy(
+        server=SERVER, bypass=("<local>",), credentials_secret_id=CREDS
+    )
     assert c.browser_proxy_pending is True
+    assert computer(browser_proxy={**PROXY, "credentials_secret_id": None}).browser_proxy == (
+        mc.BrowserProxy(server=SERVER, bypass=("<local>",))
+    )
     bare = computer(browser_proxy={"server": SERVER})
     assert bare.browser_proxy == mc.BrowserProxy(server=SERVER)
     assert bare.browser_proxy_pending is False
@@ -104,6 +149,8 @@ def test_the_setting_reads_back_and_ignores_keys_it_does_not_know():
         {"server": ""},
         {"server": SERVER, "bypass": "a.com"},
         {"server": SERVER, "bypass": ["a.com", 7]},
+        {"server": SERVER, "credentials_secret_id": ""},
+        {"server": SERVER, "credentials_secret_id": 7},
     ],
 )
 def test_a_value_it_cannot_read_raises_rather_than_being_dropped(value):
@@ -316,6 +363,34 @@ def test_set_sends_the_change_alone_and_null_to_remove_it(monkeypatch):
     assert json.loads(scenario.requests[2].content) == {"browser_proxy": None}
 
 
+def test_a_read_edited_and_set_back_keeps_its_credentials(monkeypatch):
+    # The documented read-modify-write. The change replaces the setting whole,
+    # so an id lost anywhere on the trip removes the credentials.
+    with_creds = {**PROXY, "credentials_secret_id": CREDS}
+    row = {**COMPUTER, "browser_proxy": with_creds}
+    scenario = Scenario(
+        [
+            step("GET", "/launch-42", row),
+            step("PATCH", "/launch-42", row),
+            step("PATCH", "/launch-42", row),
+        ]
+    )
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.get("launch-42")
+        read = c.browser_proxy
+        assert read is not None
+        c.set_browser_proxy(read)
+        c.set_browser_proxy(dataclasses.replace(read, bypass=("<local>", "*.example.com")))
+    assert json.loads(scenario.requests[1].content) == {"browser_proxy": with_creds}
+    assert json.loads(scenario.requests[2].content) == {
+        "browser_proxy": {**with_creds, "bypass": ["<local>", "*.example.com"]}
+    }
+
+
 def launch_steps():
     return [
         step("POST", "", proxied(True)),
@@ -488,6 +563,9 @@ def listing():
 @respx.mock
 def test_cli_sets_a_proxy_by_name(cli_env, capsys):
     listing()
+    respx.get(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json={**COMPUTER, "name": "dev"})
+    )
     patch = respx.patch(f"{BASE}/computers/launch-42").mock(
         return_value=httpx.Response(200, json=proxied(True, name="dev"))
     )
@@ -550,6 +628,9 @@ def test_cli_prints_the_platforms_refusal_as_it_is(cli_env, capsys):
     # what was typed and passes the sentence back.
     sentence = "browser_proxy.server: https:// is not supported yet"
     listing()
+    respx.get(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json={**COMPUTER, "name": "dev"})
+    )
     respx.patch(f"{BASE}/computers/launch-42").mock(
         return_value=httpx.Response(400, json={"error": sentence})
     )
@@ -582,7 +663,8 @@ def test_cli_wait_on_a_stopped_computer_reports_the_change_stored(cli_env, capsy
         return_value=httpx.Response(200, json=stopped)
     )
     assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--wait"]) == 0
-    assert reads.call_count == 1
+    # One read for the credentials to keep, one for the wait.
+    assert reads.call_count == 2
     captured = capsys.readouterr()
     assert f"dev: browsers through {SERVER}" in captured.out
     assert "dev is stopped: the change is stored and applied as it starts" in captured.err
@@ -596,11 +678,53 @@ def test_cli_wait_rides_through_an_admitted_start(cli_env, capsys, monkeypatch):
     respx.patch(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=admitted))
     reads = respx.get(f"{BASE}/computers/launch-42").mock(
         side_effect=[
+            # The read for the credentials to keep, before the change.
+            httpx.Response(200, json={**COMPUTER, "name": "dev"}),
             httpx.Response(200, json=admitted),
             httpx.Response(200, json=proxied(True, name="dev")),
             httpx.Response(200, json=proxied(False, name="dev")),
         ]
     )
     assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--wait"]) == 0
-    assert reads.call_count == 3
+    assert reads.call_count == 4
     assert "stored" not in capsys.readouterr().err
+
+
+@respx.mock
+def test_cli_set_keeps_replaces_or_removes_the_credentials(cli_env, capsys):
+    # The setting is replaced whole, so a set that named no credentials would
+    # remove the proxy's and leave every browser answered 407 by its upstream.
+    listing()
+    current = {
+        **COMPUTER,
+        "name": "dev",
+        "browser_proxy": {"server": "http://old:1", "credentials_secret_id": CREDS},
+    }
+    respx.get(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=current))
+    patch = respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json=current)
+    )
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--bypass", "a.com"]) == 0
+    assert json.loads(patch.calls.last.request.content) == {
+        "browser_proxy": {"server": SERVER, "bypass": ["a.com"], "credentials_secret_id": CREDS}
+    }
+    other = "csec-fedcba9876543210"
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--credentials", other]) == 0
+    assert json.loads(patch.calls.last.request.content) == {
+        "browser_proxy": {"server": SERVER, "credentials_secret_id": other}
+    }
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--no-credentials"]) == 0
+    assert json.loads(patch.calls.last.request.content) == {"browser_proxy": {"server": SERVER}}
+    # And the text output says which secret the proxy uses.
+    assert f"  credentials: secret {CREDS}" in capsys.readouterr().out
+
+
+def test_cli_refuses_a_malformed_or_doubled_credentials_flag_before_any_request(
+    cli_env, monkeypatch
+):
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--credentials", "csec-01"]) == 1
+    with pytest.raises(SystemExit):
+        _cli.main(
+            ["browser-proxy", "set", "dev", SERVER, "--credentials", CREDS, "--no-credentials"]
+        )

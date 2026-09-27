@@ -2328,6 +2328,8 @@ def _proxy_result(args: argparse.Namespace, c: Computer) -> int:
         print(f"{label}: browsers through {proxy.server}")
         if proxy.bypass:
             print(f"  bypass: {', '.join(proxy.bypass)}")
+        if proxy.credentials_secret_id:
+            print(f"  credentials: secret {proxy.credentials_secret_id}")
     if pending:
         print("  pending: the computer's browsers do not have this setting yet")
     return 0
@@ -2344,11 +2346,22 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
     bypass = _bypass_list(args.bypass)
     if bypass is not None:
         proxy["bypass"] = bypass
+    if args.credentials is not None:
+        proxy["credentials_secret_id"] = args.credentials
     # Checked before the computer is looked up, so a malformed value costs no
     # request. The platform's rules on the URL itself are its own to apply.
     _api.browser_proxy_body(proxy)
     with _client() as client:
-        c = _resolve(client, args.target).set_browser_proxy(proxy)
+        c = _resolve(client, args.target)
+        if args.credentials is None and not args.no_credentials:
+            # The setting is replaced whole, so a change that named no
+            # credentials would remove the proxy's, and its upstream would then
+            # answer every browser 407. Read fresh, not off the listing the name
+            # was resolved from, and carry the id over.
+            current = c.refresh().browser_proxy
+            if current is not None and current.credentials_secret_id is not None:
+                proxy["credentials_secret_id"] = current.credentials_secret_id
+        c = c.set_browser_proxy(proxy)
         if args.wait:
             _wait_for_proxy(c)
     return _proxy_result(args, c)
@@ -2370,7 +2383,9 @@ def _browser_proxy_parser(sub: Any) -> None:
     get.add_argument("--json", action="store_true", help="the setting as JSON")
     get.set_defaults(fn=_cmd_browser_proxy_get)
     put = verbs.add_parser(
-        "set", help="send a computer's browsers through a proxy, replacing any it has"
+        "set",
+        help="send a computer's browsers through a proxy, replacing any it has; "
+        "its credentials are kept unless changed",
     )
     put.add_argument("target", metavar="computer", help="computer name or id")
     put.add_argument("url", metavar="URL", help="the proxy, e.g. http://proxy.example.com:3128")
@@ -2379,6 +2394,18 @@ def _browser_proxy_parser(sub: Any) -> None:
         action="append",
         metavar="LIST",
         help="hosts the browsers reach directly, comma-separated; repeat for more",
+    )
+    creds = put.add_mutually_exclusive_group()
+    creds.add_argument(
+        "--credentials",
+        metavar="SECRET_ID",
+        help="the id of a secret holding user:password for the proxy, bound to the "
+        "computer as a file (default: keep the proxy's current credentials)",
+    )
+    creds.add_argument(
+        "--no-credentials",
+        action="store_true",
+        help="remove the proxy's credentials rather than keep them",
     )
     put.add_argument(
         "--wait",
