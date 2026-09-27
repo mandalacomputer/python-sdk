@@ -1789,6 +1789,23 @@ def _whole_point(x: int | None, y: int | None) -> None:
         _coordinate(y, "y")
 
 
+def _modifier_text(modifiers: tuple[str, ...]) -> str | None:
+    """The held keys as the ``text`` a click, drag or scroll sends, or None.
+
+    A single string is refused rather than joined. ``"+".join("shift")`` is
+    ``"s+h+i+f+t"``, which holds five letter keys instead of Shift; a single
+    letter is a valid key name, so nothing downstream reports it. The keyword
+    forms (``drag(..., modifiers=...)``, ``scroll(..., modifiers=...)``) are
+    where a bare string is easy to write.
+    """
+    if isinstance(modifiers, str):
+        raise ValueError(  # noqa: TRY004
+            "modifiers must be a sequence of key names, e.g. "
+            f'("shift",), not the string {modifiers!r}'
+        )
+    return "+".join(modifiers) if modifiers else None
+
+
 def click_body(
     action: str, x: int | None, y: int | None, modifiers: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -1798,13 +1815,14 @@ def click_body(
     different request from clicking (0, 0) — so the keys are omitted rather than
     sent as zeros.
     """
+    text = _modifier_text(modifiers)
     _whole_point(x, y)
     body: dict[str, Any] = {"action": action}
     if x is not None and y is not None:
         body["x"] = x
         body["y"] = y
-    if modifiers:
-        body["text"] = "+".join(modifiers)
+    if text is not None:
+        body["text"] = text
     return body
 
 
@@ -1828,6 +1846,7 @@ def drag_body(
     selecting a different region — the worst shape a mistake can take, because
     nothing reports it.
     """
+    text = _modifier_text(modifiers)
     if (from_x is None) != (from_y is None):
         raise ValueError("give both from_x and from_y, or neither")
     _coordinate(to_x, "to_x")
@@ -1838,8 +1857,8 @@ def drag_body(
     body: dict[str, Any] = {"action": "left_click_drag", "coordinate": [to_x, to_y]}
     if from_x is not None and from_y is not None:
         body["start_coordinate"] = [from_x, from_y]
-    if modifiers:
-        body["text"] = "+".join(modifiers)
+    if text is not None:
+        body["text"] = text
     return body
 
 
@@ -1867,6 +1886,7 @@ def scroll_body(
     is what a defaulted ``scroll()`` did before the coordinate keys became
     optional.
     """
+    text = _modifier_text(modifiers)
     direction = canonical(direction, "direction")
     if direction not in _SCROLL_DIRECTIONS:
         raise ValueError(f"direction must be one of {_SCROLL_DIRECTIONS}")
@@ -1887,8 +1907,8 @@ def scroll_body(
         # cannot say so that way. `coordinate` has no such history and is
         # unambiguous, which makes scroll(0, 0) mean the corner again.
         body["coordinate"] = [x, y]
-    if modifiers:
-        body["text"] = "+".join(modifiers)
+    if text is not None:
+        body["text"] = text
     return body
 
 

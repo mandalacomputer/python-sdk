@@ -207,6 +207,22 @@ async def test_modifiers_are_held_for_the_drag(client: mc.AsyncClient) -> None:
 
 
 @respx.mock
+async def test_modifiers_given_as_one_string_are_refused_before_any_request(
+    client: mc.AsyncClient,
+) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="sequence of key names"):
+        await c.drag(10, 10, from_x=0, from_y=0, modifiers="shift")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="sequence of key names"):
+        await c.scroll(5, 5, modifiers="ctrl")  # type: ignore[arg-type]
+    assert not route.called
+    await c.scroll(5, 5, modifiers=("ctrl", "shift"))
+    assert json.loads(route.calls[0].request.content)["text"] == "ctrl+shift"
+    await client.aclose()
+
+
+@respx.mock
 async def test_long_input_actions_widen_the_request_budget(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = mc.AsyncComputer(client._t, COMPUTER)
