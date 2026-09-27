@@ -55,6 +55,7 @@ from ._async_resources import (
     AsyncTemplates,
     AsyncUsage,
     AsyncWebhooks,
+    AsyncWorkspaces,
 )
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
@@ -99,6 +100,7 @@ from ._exceptions import (
 )
 from ._executions import ExecutionMetadata, ExecutionOutput
 from ._models import (
+    NO_BROWSER_PROXY,
     AccountCapabilities,
     AccountCompleteness,
     AccountLimits,
@@ -129,6 +131,7 @@ from ._models import (
     LifecycleAck,
     Listing,
     Move,
+    NoBrowserProxy,
     Operation,
     OperationError,
     OperationPage,
@@ -165,6 +168,8 @@ from ._models import (
     WhoamiWorkspace,
     Window,
     WindowResult,
+    Workspace,
+    WorkspaceMember,
 )
 from ._resources import (
     Account,
@@ -180,6 +185,7 @@ from ._resources import (
     Templates,
     Usage,
     Webhooks,
+    Workspaces,
 )
 from ._results import (
     BackgroundResult,
@@ -202,6 +208,7 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DESKTOP_EVENT_TYPES",
     "GUEST_EVENT_TYPES",
+    "NO_BROWSER_PROXY",
     "REPLAY_WINDOW_S",
     "SCREEN_HEIGHT",
     "SCREEN_WIDTH",
@@ -275,6 +282,7 @@ __all__ = [
     "MethodNotAllowedError",
     "Move",
     "MoveRequiredError",
+    "NoBrowserProxy",
     "NotFoundError",
     "Operation",
     "OperationError",
@@ -332,6 +340,8 @@ __all__ = [
     "WhoamiWorkspace",
     "Window",
     "WindowResult",
+    "Workspace",
+    "WorkspaceMember",
     "__version__",
     "is_transient",
     "verify",
@@ -378,6 +388,7 @@ class Client:
         self.ssh_keys = SshKeys(self._t)
         self.secrets = Secrets(self._t)
         self.api_keys = ApiKeys(self._t)
+        self.workspaces = Workspaces(self._t)
 
     @property
     def base_url(self) -> str:
@@ -437,6 +448,7 @@ class AsyncClient:
         self.ssh_keys = AsyncSshKeys(self._t)
         self.secrets = AsyncSecrets(self._t)
         self.api_keys = AsyncApiKeys(self._t)
+        self.workspaces = AsyncWorkspaces(self._t)
 
     @property
     def base_url(self) -> str:

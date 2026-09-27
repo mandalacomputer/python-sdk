@@ -993,6 +993,67 @@ def _browser_proxy_timeout(
     )
 
 
+def _schedule_window(
+    current: object, hour: int | None, minute: int | None, tz: str | None
+) -> tuple[int, int, str]:
+    """The window ``set_schedule`` sends: each part given, else the current
+    schedule's, else the 04:00 UTC default for a computer that has none.
+
+    ``current`` is the computer record's ``snapshot_schedule``, not the answer
+    of ``GET .../schedule``: that route answers a computer with no schedule as
+    ``{enabled: false, hour: 0, minute: 0, tz: "UTC"}``, which cannot be told
+    apart from a disabled midnight-UTC schedule. The record omits the field
+    when there is none, so a missing, empty or non-mapping value is "no
+    schedule" and takes the default, as :attr:`ComputerFields.snapshot_schedule`
+    reads it.
+
+    The caller reads that record into a local and does NOT refresh the handle:
+    a refresh replaces the whole payload and so drops a create envelope's
+    ``start_error``, which ``wait_until_running`` and ``wait_for_guest`` fail
+    fast on (OPL-4222).
+
+    The platform stores the PUT's body whole, so a part not sent is a part
+    reset: this is what keeps ``set_schedule(enabled=False)`` from moving the
+    window. A stored value is passed on as it is, for the body's own checks.
+    """
+    if not isinstance(current, Mapping) or not current:
+        return (
+            4 if hour is None else hour,
+            0 if minute is None else minute,
+            "UTC" if tz is None else tz,
+        )
+    stored_hour, stored_minute, stored_tz = (
+        current.get("hour"),
+        current.get("minute"),
+        current.get("tz"),
+    )
+    return (
+        hour if hour is not None else 0 if stored_hour is None else stored_hour,
+        minute if minute is not None else 0 if stored_minute is None else stored_minute,
+        tz if tz is not None else "UTC" if stored_tz is None else stored_tz,
+    )
+
+
+def _egress_proxy_timeout(
+    computer_id: str, timeout: float, observed: bool, fresh: bool, state: object = "applying"
+) -> str:
+    """What a ``wait_for_egress_proxy`` that ran out of time says, on both handles."""
+    if not observed:
+        return (
+            f"{computer_id} could not be observed within {timeout:g}s, so whether its host "
+            "holds its egress proxy's credentials is unknown"
+        )
+    if fresh:
+        return (
+            f"{computer_id}'s host still did not hold its egress proxy's credentials after "
+            f"{timeout:g}s, so its connections are still being closed"
+        )
+    return (
+        f"{computer_id} could not be reached for the last part of {timeout:g}s; when it last "
+        "answered its host did not hold its egress proxy's credentials yet"
+    )
+
+
 def _ride_out(err: MandalaError, deadline: float, poll: float) -> float:
     """How long to sleep past a failed poll — or a re-raise, if it is not one.
 
@@ -1439,6 +1500,48 @@ class ComputerFields:
                 )
             return waiting
         return "applied" if is_set else "unreported"
+
+    def _egress_proxy_state(
+        self, expect_credentials: bool = False, start_failed: str = ""
+    ) -> str | MandalaError:
+        """Where this computer's egress proxy is, as ``wait_for_egress_proxy``
+        reads it: ``"applied"`` (its host holds what it needs), ``"applying"``,
+        or the error a wait should raise because nothing will apply it.
+
+        Only a proxy naming ``credentials_secret_id`` is ever pending: without
+        credentials the host needs nothing it does not already have.
+        ``expect_credentials`` is for a caller that knows the proxy names them,
+        so a read that leaves the setting out is not taken for "none". The
+        platform reports it pending only on a running computer, so one that is
+        not running yet is waited through, with :meth:`_browser_proxy_state`'s
+        refusals for one nobody is starting.
+        """
+        if self.egress_proxy_pending:
+            return "applying"
+        proxy = self.egress_proxy
+        names_credentials = expect_credentials or (
+            proxy is not None and proxy.credentials_secret_id is not None
+        )
+        if not names_credentials or self.status == "running":
+            return "applied"
+        if self.build_failed:
+            return MandalaError(
+                f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
+            )
+        if self.is_building:
+            return "applying"
+        if start_failed and self.status == "stopped" and not self._start_admitted():
+            return MandalaError(
+                f"{self.id} is stopped after it failed to start, so its egress proxy's "
+                f"credentials were not delivered to its host: {start_failed}. Call start() to "
+                "try again"
+            )
+        if self._nothing_admitted():
+            return MandalaError(
+                f"{self.id} is {self.status!r}, and its egress proxy's credentials are delivered "
+                "to its host only as it starts: call start()"
+            )
+        return "applying"
 
     @property
     def is_suspended(self) -> bool:
@@ -2115,7 +2218,8 @@ class Computer(ComputerFields):
         return self.refresh()
 
     def clone(self, name: str | None = None, *, idempotency_key: str | None = None) -> Computer:
-        """Copy this computer into a new one. The source must be stopped.
+        """Copy this computer into a new one. The source must be stopped or
+        suspended; a running one raises :class:`~mandala_computer.ConflictError`.
 
         Returns as soon as the new computer exists, which is before its disk
         does: copying a disk runs for minutes, so the clone comes back
@@ -2892,6 +2996,43 @@ class Computer(ComputerFields):
             ),
         )
 
+    def wait_for_egress_proxy(
+        self, timeout: float = 180.0, poll: float = 2.0, *, expect_credentials: bool = False
+    ) -> Computer:
+        """Block until this computer's host holds its egress proxy's credentials.
+
+        An :attr:`egress_proxy` naming ``credentials_secret_id`` closes every
+        connection the computer opens until its host holds the value — just
+        after a create, a start or a change (:attr:`egress_proxy_pending`).
+        This polls until the platform says it is no longer pending on a running
+        computer, and returns at once for a computer whose proxy names no
+        credentials, or that has none. :meth:`Computers.launch` calls it for
+        you when the create's proxy, or the computer's, names credentials.
+
+        Always reads the computer again before answering, so it is safe
+        straight after :meth:`set_egress_proxy`, :meth:`start` or a create.
+
+        Raises :class:`~mandala_computer.MandalaError` rather than waiting out
+        the timeout when nothing will deliver them: a computer that is stopped
+        or suspended while the platform says it has admitted no start —
+        :meth:`start` is the fix — a create's computer whose first start
+        failed, and a failed build.
+
+        ``expect_credentials`` is for a caller that knows the proxy names
+        credentials, such as one that just created the computer with them: a
+        read that leaves the setting out is then not taken for "none" while the
+        computer is not running yet.
+        """
+        return self._wait_for_state(
+            timeout,
+            poll,
+            "applied",
+            lambda start_failed: self._egress_proxy_state(expect_credentials, start_failed),
+            lambda observed, fresh, state: _egress_proxy_timeout(
+                self.id, timeout, observed, fresh, state
+            ),
+        )
+
     def _wait_for_state(
         self,
         timeout: float,
@@ -2900,8 +3041,8 @@ class Computer(ComputerFields):
         judge: Callable[[str], str | MandalaError],
         timed_out: Callable[[bool, bool, str], str],
     ) -> Computer:
-        """The loop :meth:`wait_for_secrets` and :meth:`wait_for_browser_proxy`
-        share: read the computer, ask ``judge`` where things are, and return on
+        """The loop :meth:`wait_for_secrets`, :meth:`wait_for_browser_proxy` and
+        :meth:`wait_for_egress_proxy` share: read the computer, ask ``judge`` where things are, and return on
         ``done``, raise the refusal ``judge`` hands back, or sleep and read
         again until the deadline, when ``timed_out`` words the TimeoutError.
 
@@ -2959,9 +3100,15 @@ class Computer(ComputerFields):
     ) -> bytes:
         """Capture the screen.
 
-        Full-resolution PNG by default. Passing ``width`` returns a downscaled
-        JPEG instead — much cheaper, and enough for a thumbnail or a quick
-        "has anything changed" check.
+        Full-resolution PNG by default, from a running computer. Passing
+        ``width`` returns a downscaled JPEG instead — much cheaper, and enough
+        for a thumbnail or a quick "has anything changed" check.
+
+        A SUSPENDED computer is not woken: it answers with the JPEG saved when
+        it was suspended, at most 640 pixels wide, with or without ``width`` —
+        so check the bytes (a JPEG starts ``\\xff\\xd8``) before treating them
+        as a PNG. ``fresh=True``, ``region``, ``scale``, ``quality`` or a PNG
+        ``format`` is refused for one, since the saved picture cannot honour it.
 
         PASS ``fresh=True`` WHENEVER THE IMAGE IS FEEDING A DECISION. Without it
         the platform may answer from a frame up to 1.5 seconds old, which is
@@ -3049,7 +3196,13 @@ class Computer(ComputerFields):
         self._input(_api.click_body("triple_click", x, y, modifiers))
 
     def drag(
-        self, to_x: int, to_y: int, *, from_x: int | None = None, from_y: int | None = None
+        self,
+        to_x: int,
+        to_y: int,
+        *,
+        from_x: int | None = None,
+        from_y: int | None = None,
+        modifiers: tuple[str, ...] = (),
     ) -> None:
         """Press, move, release — one gesture.
 
@@ -3060,8 +3213,13 @@ class Computer(ComputerFields):
         Without ``from_x``/``from_y`` the drag starts wherever the pointer is.
         That is refused if nothing has moved it yet, rather than guessing at an
         origin and selecting the wrong thing.
+
+        ``modifiers`` are held down for the whole drag, e.g.
+        ``drag(400, 300, from_x=100, from_y=200, modifiers=("shift",))`` to
+        extend a selection. They are pressed before the pointer moves and
+        released after the button.
         """
-        self._input(_api.drag_body(from_x, from_y, to_x, to_y))
+        self._input(_api.drag_body(from_x, from_y, to_x, to_y, modifiers))
 
     def mouse_down(self, x: int | None = None, y: int | None = None) -> None:
         """Press the left button and leave it down.
@@ -4223,11 +4381,22 @@ class Computer(ComputerFields):
         self,
         *,
         enabled: bool,
-        hour: int = 4,
-        minute: int = 0,
-        tz: str = "UTC",
+        hour: int | None = None,
+        minute: int | None = None,
+        tz: str | None = None,
     ) -> Mapping[str, Any]:
         """Set the automatic daily snapshot window, in the given IANA timezone.
+
+        The platform stores the window whole, so ``hour``, ``minute`` or ``tz``
+        left out (``None``) keeps the current schedule's value: this reads
+        the computer record first and sends its ``snapshot_schedule`` back,
+        falling back to 04:00 UTC only for a computer with no schedule. The
+        read leaves this handle as it was (only the PUT's answer is written
+        to :attr:`snapshot_schedule`), so a create's :attr:`start_error`
+        survives it. So ``set_schedule(enabled=False)``
+        switches the schedule off and keeps its time, and
+        ``set_schedule(enabled=True)`` switches it back on at that time. Pass
+        all three to skip the read.
 
         Returns the schedule as stored, out of the PUT's own answer. A follow-up
         GET would cost a second metered round trip to report a *re-read* rather
@@ -4235,6 +4404,11 @@ class Computer(ComputerFields):
         come back looking like yours. :meth:`clear_schedule` reads its own
         answer for the same reason, as do :meth:`rename` and :meth:`resize`.
         """
+        if hour is None or minute is None or tz is None:
+            _api.check_schedule_args(enabled=enabled, hour=hour, minute=minute, tz=tz)
+            # The record, not GET .../schedule: see _schedule_window.
+            record = _api.computer_payload(self._t.json_object("GET", _api.computer(self.id)))
+            hour, minute, tz = _schedule_window(record.get("snapshot_schedule"), hour, minute, tz)
         stored = dict(
             self._t.json_object(
                 "PUT",
@@ -4248,9 +4422,10 @@ class Computer(ComputerFields):
     def clear_schedule(self) -> Mapping[str, Any]:
         """Remove the schedule, as distinct from disabling it.
 
-        ``set_schedule(enabled=False)`` keeps the chosen time so toggling back on
-        restores it, and keeps the scheduler's bookkeeping with it. Clearing
-        returns the computer to never having had a schedule.
+        ``set_schedule(enabled=False)`` keeps the chosen time — it reads the
+        current window and sends it back — so ``set_schedule(enabled=True)``
+        restores it. Clearing returns the computer to never having had a
+        schedule.
         """
         cleared = dict(self._t.json_object("DELETE", _api.computer_action(self.id, "schedule")))
         self._data["snapshot_schedule"] = None

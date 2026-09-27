@@ -123,11 +123,14 @@ the visible desktop has finished logging in. Every `create()` option is accepted
 its disk is ready. An already admitted start is waited on, and failed starts are
 reported without retrying them. With `secrets` bound, it also waits until they
 have reached the desktop, so the first command on the returned computer sees
-them; a delivery that failed raises, naming why.
+them; a delivery that failed raises, naming why. With a browser proxy (sent, or
+a template's default) it waits until the guest has it, and with an
+`egress_proxy` naming `credentials_secret_id` until the computer's host holds
+them, since every connection the computer opens is closed until then.
 
 `launch(timeout=600)` allows a longer build. The default readiness budget is 180
-seconds, beginning after create returns. Disk, running, guest and secrets waits share the
-remaining budget, including elapsed start work. Create and start retain their
+seconds, beginning after create returns. Disk, running, guest, secrets and proxy
+waits share the remaining budget, including elapsed start work. Create and start retain their
 usual transport deadlines, so this is not a total wall-clock limit on launch.
 `poll` defaults to 3 seconds for every stage. The async equivalent is
 `await client.computers.launch(...)` on an `AsyncClient`; task cancellation
@@ -311,11 +314,14 @@ Publishing a *different* document under the same ref is a `ConflictError`; bump
 a change.
 
 **Two digests, and one of them is sometimes a sentence instead.** `doc_digest`
-covers the whole document and changes with any edit; `build_digest` covers only
+covers the whole document and changes with anything that changes what it means,
+a label included — not with comments, key order, whitespace or YAML versus
+JSON; `build_digest` covers only
 what decides the image, so comparing it against a previous run is how you tell
 whether an edit means a rebuild. A document naming a parent in `spec.from` gets
 `build_digest_needs` *instead* of `build_digest` — the two are alternatives, not
-a pair — because a layered document's build digest depends on the contents of
+a pair, and `build_digest` is present only for a document with no `spec.from` —
+because a layered document's build digest depends on the contents of
 the base image, which only a host holding it can compute:
 
 ```python
@@ -351,7 +357,15 @@ Without `version` you get the newest, which is also what a create naming the
 unpinned `namespace/name` resolves to. `client.templates.list()` is the
 catalogue of what you can launch — each row's `ref` is what `create()` takes —
 and `client.templates.schema()` is the JSON Schema for a `mandala/v1` document,
-returned as it arrives so an editor or validator can be pointed at it.
+returned as it arrives. Its URL needs an API key, which an editor will not send,
+so save it to a file and point the editor or validator at that:
+
+```python
+import json
+
+with open("mandala-v1.schema.json", "w") as f:
+    json.dump(client.templates.schema(), f)
+```
 
 The catalogue is a list-compatible `Listing[Template]`. Check `is_complete`
 before treating a missing template as unavailable: a host outage can return
@@ -683,7 +697,19 @@ c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
 c.wait_for_browser_proxy()  # before starting a browser that must use it
 c.browser_proxy  # BrowserProxy(server='socks5://127.0.0.1:1080', bypass=())
 c.set_browser_proxy(None)  # browsers go out directly again
+
+# A template you published can carry a default proxy (spec.browser_proxy),
+# which a create that leaves browser_proxy out inherits. To opt out of it:
+from mandala_computer import NO_BROWSER_PROXY
+
+c = client.computers.create(template="acme/scraper", browser_proxy=NO_BROWSER_PROXY)
 ```
+
+A template's default proxy is inherited exactly as if it had been sent: the
+create is a cold boot, `launch()` waits for it, and a host that cannot launch
+one yet answers `409` with reason `unsupported`. `browser_proxy=None`, the
+default, means "not mentioned" and so cannot opt out; `NO_BROWSER_PROXY`
+sends `null`, which creates the computer with no proxy.
 
 A running computer has a change within seconds; `browser_proxy_pending` is true
 until it does, and `wait_for_browser_proxy()` waits on it. A stopped or
@@ -725,8 +751,8 @@ What to expect once it is set:
 - **DNS lookups are not proxied.** They still go to the platform's resolver.
 - **Open connections are closed when the setting changes**, and when the
   computer stops.
-- **A create carrying one is always a cold boot**, never a warm computer, and
-  a clone does not inherit it.
+- **A create carrying one is never answered from the warm pool**, and a clone
+  does not inherit it.
 
 `credentials_secret_id` names a secret in your store (in the computer's
 workspace, or account-wide) whose value is `user:password`. The secret is NOT
@@ -739,7 +765,8 @@ reaches the host within seconds, for connections opened after it. While a
 running computer's host does not hold the value yet — just after a create or a
 change, after the host restarts, or once the secret is deleted —
 `egress_proxy_pending` is true and every connection is closed; it usually
-clears within seconds.
+clears within seconds. `wait_for_egress_proxy()` waits for it, and `launch()`
+does so for you when the create's proxy, or the computer's, names credentials.
 
 The setting is replaced whole, so a `credentials_secret_id` left out is
 removed: pass the `EgressProxy` read off the computer, edited with
@@ -831,6 +858,7 @@ c.middle_click(x, y)
 c.double_click(x, y)
 c.triple_click(x, y)
 c.drag(900, 480, from_x=x, from_y=y)  # press, move through, release
+c.drag(900, 480, modifiers=("shift",))  # keys held for the whole drag
 c.scroll(x, y, direction="up", amount=3)  # also "left"/"right"
 c.type("some text")  # returns "physical", "unicode" or "mixed"
 c.paste("Café — 東京 😀")  # clipboard + Ctrl+V; shift=True for Ctrl+Shift+V
@@ -839,7 +867,7 @@ c.hold_key("Down", seconds=2)  # for keys that mean something while held
 c.wait(1.5)  # a pause inside the platform; what a model's `wait` action maps to
 c.cursor_position()  # (x, y), or None before anything has placed the pointer
 
-png = c.screenshot()  # full-resolution PNG
+png = c.screenshot()  # full-resolution PNG (a suspended computer: its saved JPEG)
 jpg = c.screenshot(width=320)  # downscaled JPEG — cheap enough to poll
 now = c.screenshot(fresh=True)  # skip the cache; what a drive loop wants
 # A crop in screen pixels, halved, as a JPEG: the cheaper frame to hand a model
@@ -887,8 +915,10 @@ with a width), and `quality` is 1 to 100 for a JPEG only. The value checks
 raise `ValueError` before anything is sent. A cropped or scaled picture is in
 its own pixel space: to click on something in it, divide its position by the
 scale and add the region's `x` and `y` — (100, 50) in `corner` above is
-(200, 100) on the screen. A suspended computer has only its saved JPEG and
-cannot shape it: a crop, a scale, `format="png"` or a quality raises
+(200, 100) on the screen. A suspended computer is not woken by a screenshot:
+it answers with the JPEG saved when it was suspended, at most 640 pixels wide,
+even where a PNG is the default — check the bytes before treating them as a
+PNG. It cannot shape that picture either: a crop, a scale, `format="png"` or a quality raises
 `ConflictError` with `reason == "unavailable"`, which does not clear by waiting.
 
 A non-zero exit is returned, not raised — check `res.ok`.
@@ -1319,10 +1349,11 @@ rather than that a command ran.
 
 **Not every `ConflictError` here is worth retrying.** Classified refusals carry
 an `APIError.reason`: `contention` and `starting` clear on their own, while
-`unavailable` and `unsupported` require a different action. `is_transient()`
-therefore answers `True` for the first pair and `False` for the second. A
-response classified as `unavailable` requires starting the computer or otherwise
-restoring access, rather than retrying unchanged. Read the returned reason:
+`unavailable`, `unsupported` and `running` require a different action.
+`is_transient()` therefore answers `True` for the first pair and `False` for
+the rest. A response classified as `unavailable` requires starting the computer
+or otherwise restoring access, and one classified as `running` requires stopping
+it, rather than retrying unchanged. Read the returned reason:
 being suspended alone does not determine the classification. If an older
 platform response has no recognised reason, the SDK preserves the historical
 `ConflictError` fallback of `True`, so code that must support unclassified
@@ -2064,10 +2095,11 @@ still going.
 ### Operations
 
 Every accepted create, clone, start, stop, suspend, restart, snapshot restore,
-resize and move records a **lifecycle operation**, and its answer carries the
-id: `computer.operation_id` after a create, a clone or any of those calls on the
-handle, `client.snapshots.restore(snapshot_id).operation_id`, and
-`move.operation_id` on what `relocate` accepted. It is `None` where the
+resize, move and delete records a **lifecycle operation**, and its answer
+carries the id: `computer.operation_id` after a create, a clone or any of those
+calls on the handle, `client.snapshots.restore(snapshot_id).operation_id`,
+`move.operation_id` on what `relocate` accepted, and
+`c.delete(detailed=True).operation_id`. It is `None` where the
 platform could not record one; the call happened either way.
 
 ```python
@@ -2121,14 +2153,21 @@ twin = client.snapshots.clone(snap.id)  # a fork, for memory snapshots
 twin.wait_until_built()  # the disk is copied out of backup first
 fresh = client.snapshots.clone(snap.id, memory=False)  # the disk alone, boots fresh
 c.set_schedule(enabled=True, hour=4, tz="America/Chicago")
-c.set_schedule(enabled=False, hour=4, tz="America/Chicago")  # off, keeps the time
+c.set_schedule(enabled=False)  # off, keeps the time
 c.clear_schedule()  # removed entirely
 ```
 
+A clone of a memory snapshot resumes the original's session, and is given an
+identity of its own before its network comes up — its own MAC and address, its
+name as hostname, a new machine ID and SSH host keys, and its own desktop
+password — so it runs beside its source. If that cannot be done the copy is
+left stopped rather than running as its source; starting it boots its disk
+fresh.
+
 A memory snapshot of a computer that **held secrets** is resumed only with
 `inherit_secrets=True`: the copy holds the same credentials, bound to the same
-secrets, lands in the source's workspace, and cannot run on the same host while
-its source is running. Without it the clone is built from the disk instead, and
+secrets, and lands in the source's workspace. Without it the clone is built
+from the disk instead, and
 says so: check `twin.memory_dropped` (and `memory_dropped_reason`) before
 assuming the session came across. It is the clone's answer, kept on that handle
 through `wait_until_built()`; a computer fetched later with `computers.get()`
@@ -2139,9 +2178,10 @@ minutes, and scales with how much has been written to the disk — longer than a
 HTTP request survives, so the platform answers `202` the moment it accepts one
 and copies the disk afterwards. What comes back at that point is a placeholder
 row in state `capturing`, carrying the id the snapshot will keep. `snapshot()`
-polls the snapshot listing for that id and returns when it reads `pending`,
-which is the point the snapshot can be restored, cloned or deleted. It does not
-wait for `durable` — that is backup replication, and nothing is gated on it.
+polls the snapshot listing for that id and returns when it stops reading
+`capturing` — it may read `pending` or already `durable` by then — which is the
+point the snapshot can be restored, cloned or deleted. It does not wait for
+`durable` — that is backup replication, and nothing is gated on it.
 
 Every refusal is still immediate and still the exception it always was: a
 `ConflictError` for a capture already running or a disk still being copied, a
@@ -2201,9 +2241,17 @@ caller that already holds one and would rather not spend a second call on
 `c.schedule()`. It is `None` on a computer that has no schedule, which is not
 the same as one whose schedule is switched off.
 
-Disabling and clearing differ. `set_schedule(enabled=False)` is deliberately
-non-destructive — it keeps the chosen time so toggling back on restores it.
-`clear_schedule()` returns the computer to never having had a schedule.
+Disabling and clearing differ. `set_schedule(enabled=False)` keeps the chosen
+time: `hour`, `minute` and `tz` left out keep the current schedule's values
+(it reads the computer record first and sends its `snapshot_schedule` back,
+since the platform stores the window whole; the read does not refresh your
+handle, so a create's `start_error` survives it), so
+`set_schedule(enabled=True)` switches it back on at the same time. Only a
+computer with no schedule falls back to 04:00 UTC. (`c.schedule()` cannot tell
+you which case you are in: it answers a computer with no schedule as a disabled
+00:00 UTC one. `snapshot_schedule` being `None` after `c.refresh()` can.)
+`clear_schedule()` returns
+the computer to never having had a schedule.
 
 The schedule describes the *window* and nothing else — there is no `last_run`.
 For "when did my backups last run", read the snapshots, which carry real capture
@@ -2439,7 +2487,10 @@ it was issued to, the account and role it acts with (the role as it is now,
 not as it was when the key was minted), the workspace it is confined to, and
 the key itself. It needs no permission and any role, and a suspended account
 can ask it — `account.status` is how such a caller finds out why nothing else
-works.
+works. A key confined to a workspace is not told who the account's people are:
+`who.user.email` and `who.user.name`, and `who.account.name` and
+`who.account.plan`, are `None` for one (the plan is still on
+`client.account.read()`).
 
 ```python
 with Client() as client:
@@ -2458,9 +2509,10 @@ is off for every key until its holder turns it on in a signed-in dashboard
 session (**Credentials** in the dashboard, the **Manage keys** checkbox), and no
 API call turns it on. Without it each call raises `PermissionDeniedError` whose
 message says exactly that. A key minted here never has the permission — asking
-for one is refused, so the SDK has no argument for it — which keeps a leaked
-key that manages keys from minting a family of keys that survive its
-revocation.
+for one is refused, so the SDK has no argument for it — so a leaked manage-keys
+key cannot pass the permission on. The plain keys it minted DO keep working
+after it is revoked: find them by `minted_by_key_id` and revoke them too (the
+dashboard can do this in one step).
 
 Reach follows the key: its holder's own keys only (anybody else's answers like
 an id that does not exist, `NotFoundError`), and a key confined to a workspace
@@ -2471,6 +2523,28 @@ viewer role, minting and revoking the member role. A key may revoke itself; the
 call that does so is the last it makes. A mint answered 503 is not retried: it
 may have happened, so list and revoke rather than send it again. `AsyncClient`
 has the same methods, awaited.
+
+### Workspaces
+
+A workspace partitions the account's computers: a key confined to one reaches
+that workspace's computers only, and a computer's `workspace_id` names the
+workspace it is in. They are read here and created, renamed and deleted in the
+dashboard.
+
+```python
+for ws in client.workspaces.list():  # oldest first
+    print(ws.id, ws.name)
+ws = client.workspaces.get("wsp-0123456789ab")
+for m in client.workspaces.members(ws.id):  # the account's accepted members
+    print(m.email, m.role, "suspended" if m.suspended else "")
+```
+
+A key confined to a workspace lists that one workspace and no other, and `get`
+of any other id raises `NotFoundError`, the same as one that does not exist (so
+does a deleted workspace a computer's `workspace_id` still names). `members()`
+is the whole account's roster, since everybody on the account reaches every
+workspace at their account role, so a key confined to a workspace cannot list
+it: `PermissionDeniedError` (403). `AsyncClient` has the same methods, awaited.
 
 ### Usage
 
@@ -2863,7 +2937,7 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 |---|---|
 | `AuthenticationError` | 401 — a credential was refused |
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
-| `PermissionDeniedError` | 403 — suspended or unverified account |
+| `PermissionDeniedError` | 403 — the credential is valid but lacks the role, membership or permission (such as Manage keys), or the account or person is suspended |
 | `NotFoundError` | 404 — no such computer, snapshot, guest file, or route |
 | `MethodNotAllowedError` | 405 — method unsupported; see `allow` |
 | `ConflictError` | 409 — refused for the state something is in; `reason` says whether waiting helps |
@@ -2877,7 +2951,7 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `UnavailableError` | 503 — something could not answer now; retry a read, but a change may or may not have happened |
 | `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on |
 | `OriginResponseError` | 520 — it was reached; the exchange broke on the way back |
-| `OriginUnreachableError` | 521-523 — a proxy could not reach it; retry |
+| `OriginUnreachableError` | 521-523 — a proxy could not reach it; the outcome is unknown, so read state before repeating a change (not in `is_transient`) |
 | `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
 | `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
@@ -2885,7 +2959,10 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
 
 Every `APIError` exposes optional `request_id`, `allow` and `www_authenticate`
-properties. `request_id` uses a nonblank `X-Request-ID` response header first,
+properties, and `code` and `operation_id` read off the body: `code` is a word a
+program may branch on (such as `idempotency_in_progress` or
+`idempotency_outcome_unknown`), and `operation_id` names the operation a keyed
+call's `5xx` or `409` reserved. Each is `None` when the body has none. `request_id` uses a nonblank `X-Request-ID` response header first,
 then a nonblank top-level `request_id` in the body. It is an opaque diagnostic,
 not an idempotency key. HEAD errors and unreadable error bodies can still carry
 header metadata; older servers and connection failures may supply none. `allow`
@@ -3095,8 +3172,9 @@ Read `APIError.reason`, one word the platform puts beside the sentence:
 `contention` (something in flight) and `starting` (the guest agent's boot
 window, two minutes after a start, a restart or a reboot inside the guest)
 make `is_transient()` answer `True`; `unavailable` (the computer is not
-running — start it), `unsupported`, `exists` and `revoked` make it answer
-`False`. The set is open: an absent or unknown word is treated as unclassified
+running — start it), `running` (the computer IS running and the request needs
+it stopped, such as a resize — stop it; waiting never helps), `unsupported`,
+`exists` and `revoked` make it answer `False`. The set is open: an absent or unknown word is treated as unclassified
 and falls back to the exception type, so a `ConflictError` without one still
 answers `True`. Not every 409 has a word yet — a seventeenth background command
 on one computer is refused without one, and waiting does not necessarily help —
@@ -3138,6 +3216,7 @@ mandala-py webhooks list              # and create, get, update, delete, rotate,
 mandala-py secrets list               # names and revisions, never values
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
+mandala-py workspaces list            # and get ID, members ID; read only
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
 mandala-py egress-proxy set dev https://proxy.example.com:3128 --credentials csec-0123456789abcdef
@@ -3229,6 +3308,14 @@ printed, which names the page and the checkbox (`--json`: `code`
 so `KEY=$(mandala-py api-keys create --name ci)` captures it, and says what it
 made on stderr; `--json` prints the platform's object with the key under `raw`.
 It is shown once.
+
+`workspaces list` prints the workspaces the key reaches, with the ids that
+`secrets --workspace` and `api-keys create --workspace` take; `workspaces get
+ID` prints one, and one the key cannot see is `not_found`. `workspaces members
+ID` lists the people who reach it (the account's accepted members, with their
+role and whether they are suspended) and needs an account-wide key: a key
+confined to a workspace gets the platform's 403 (`--json`: `code`
+`permission_denied`). Each takes `--json` for the platform's rows.
 
 `logout [--profile NAME]` forgets one profile that `mandala login` saved in
 `~/.mandala/credentials.json` — the one `--profile` or `MANDALA_PROFILE` names,

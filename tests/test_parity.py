@@ -66,6 +66,7 @@ PAIRS = [
     (_resources.Secrets, _async_resources.AsyncSecrets),
     (_resources.ApiKeys, _async_resources.AsyncApiKeys),
     (_resources.Operations, _async_resources.AsyncOperations),
+    (_resources.Workspaces, _async_resources.AsyncWorkspaces),
 ]
 
 

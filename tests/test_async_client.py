@@ -194,6 +194,19 @@ async def test_validation_happens_before_any_request(client: mc.AsyncClient) -> 
 
 
 @respx.mock
+async def test_modifiers_are_held_for_the_drag(client: mc.AsyncClient) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    await c.drag(90, 80, modifiers=("shift",))
+    assert json.loads(route.calls[0].request.content) == {
+        "action": "left_click_drag",
+        "coordinate": [90, 80],
+        "text": "shift",
+    }
+    await client.aclose()
+
+
+@respx.mock
 async def test_long_input_actions_widen_the_request_budget(client: mc.AsyncClient) -> None:
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = mc.AsyncComputer(client._t, COMPUTER)
@@ -1085,6 +1098,92 @@ async def test_a_transport_timeout_arrives_as_a_mandala_error(client: mc.AsyncCl
 
 
 @respx.mock
+async def test_schedule_toggle_keeps_the_window(client: mc.AsyncClient) -> None:
+    """The sync twin's test: ``enabled`` alone keeps 23:30 Chicago (OPL-5322)."""
+    from tests.test_client import CHICAGO, ScheduleServer
+
+    server = ScheduleServer(dict(CHICAGO))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.set_schedule(enabled=False) == {**CHICAGO, "enabled": False}
+    assert await c.set_schedule(enabled=True) == CHICAGO
+    assert server.stored == CHICAGO
+    assert (server.get_computer.call_count, server.put.call_count) == (2, 2)
+    assert await c.set_schedule(enabled=True, minute=5) == {**CHICAGO, "minute": 5}
+    await client.aclose()
+
+
+@respx.mock
+async def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.AsyncClient) -> None:
+    """The sync twin's test: no schedule means 04:00, not the GET's zeros."""
+    from tests.test_client import NO_SCHEDULE_GET, ScheduleServer
+
+    server = ScheduleServer(None)
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.schedule() == NO_SCHEDULE_GET
+    assert await c.set_schedule(enabled=True) == {
+        "enabled": True,
+        "hour": 4,
+        "minute": 0,
+        "tz": "UTC",
+    }
+    server.stored = None
+    assert await c.set_schedule(enabled=True, tz="Europe/Paris") == {
+        "enabled": True,
+        "hour": 4,
+        "minute": 0,
+        "tz": "Europe/Paris",
+    }
+    await client.aclose()
+
+
+@respx.mock
+async def test_set_schedule_keeps_a_creates_start_error(client: mc.AsyncClient) -> None:
+    """The sync twin's test: the schedule read leaves ``start_error`` alone."""
+    from tests.test_client import ScheduleServer
+
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(
+            201,
+            json={
+                "computer": {**COMPUTER, "status": "stopped"},
+                "start_error": "no host had room",
+            },
+        )
+    )
+    server = ScheduleServer(None)
+    server.get_computer.side_effect = lambda _: httpx.Response(
+        200, json={**COMPUTER, "status": "stopped"}
+    )
+    c = await client.computers.create(template="base")
+    assert c.start_error == "no host had room"
+    await c.set_schedule(enabled=True)
+    assert server.get_computer.call_count == 1
+    assert c.start_error == "no host had room"
+    assert c.snapshot_schedule == {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    with pytest.raises(mc.MandalaError, match="did not start: no host had room"):
+        await c.wait_until_running(timeout=30, poll=0)
+    assert server.get_computer.call_count == 1
+    await client.aclose()
+
+
+@respx.mock
+async def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.AsyncClient) -> None:
+    """The sync twin's test: a real disabled 00:00 UTC schedule is kept."""
+    from tests.test_client import NO_SCHEDULE_GET, ScheduleServer
+
+    server = ScheduleServer(dict(NO_SCHEDULE_GET))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    assert await c.set_schedule(enabled=True) == {
+        "enabled": True,
+        "hour": 0,
+        "minute": 0,
+        "tz": "UTC",
+    }
+    assert server.put_bodies == [{"enabled": True, "hour": 0, "minute": 0, "tz": "UTC"}]
+    await client.aclose()
+
+
+@respx.mock
 async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None:
     """No follow-up GET on this half either."""
     stored = {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
@@ -1094,7 +1193,8 @@ async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None
     )
 
     c = mc.AsyncComputer(client._t, COMPUTER)
-    assert await c.set_schedule(enabled=True) == stored
+    # The whole window given: nothing to read first (see test_schedule_toggle).
+    assert await c.set_schedule(enabled=True, hour=4, minute=0, tz="UTC") == stored
     assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
     await client.aclose()

@@ -26,6 +26,7 @@ from ._models import (
     LifecycleAck,
     Listing,
     Move,
+    NoBrowserProxy,
     Operation,
     OperationPage,
     PublishedTemplate,
@@ -45,6 +46,8 @@ from ._models import (
     WebhookCreated,
     WebhookDelivery,
     Whoami,
+    Workspace,
+    WorkspaceMember,
     build_contradiction,
     move_rows,
 )
@@ -92,10 +95,12 @@ from ._resources import (
     SshKeys,
     Templates,
     Webhooks,
+    Workspaces,
     _LastPoll,
     _launch_start_admitted,
     _named,
     _named_secret,
+    _names_egress_credentials,
     _operation_id_arg,
     _operation_settled,
     _operation_timed_out,
@@ -121,6 +126,7 @@ __all__ = [
     "AsyncTemplates",
     "AsyncUsage",
     "AsyncWebhooks",
+    "AsyncWorkspaces",
 ]
 
 
@@ -187,7 +193,7 @@ class AsyncComputers:
         start: bool = True,
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
-        browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         idempotency_key: str | None = None,
     ) -> AsyncComputer:
@@ -212,10 +218,20 @@ class AsyncComputers:
         one per call, or ``idempotency_key`` if you pass it. An error that
         leaves the outcome unknown — a dropped connection or timeout after the
         request went out, a ``5xx`` — carries the key it was sent with as
-        :attr:`~mandala_computer.MandalaError.idempotency_key`; calling
-        ``create`` again with the same arguments and that key answers the first
-        call's result instead of building a second computer. Keys last 24 hours,
-        and a key sent with different arguments raises an ``APIError`` (422).
+        :attr:`~mandala_computer.MandalaError.idempotency_key`. After a dropped
+        connection or a timeout, calling ``create`` again with the same
+        arguments and that key answers the first call's result instead of
+        building a second computer, or a :class:`~mandala_computer.ConflictError`
+        with :attr:`~mandala_computer.APIError.code` ``idempotency_in_progress``
+        while it is still running (send it again later). After a ``5xx``, the
+        key never answers the result: every resend raises a ``ConflictError``
+        with code ``idempotency_outcome_unknown``, and so does one sent after an
+        ``idempotency_in_progress`` the platform gave up on. Then read the
+        computer, or the operation the error's
+        :attr:`~mandala_computer.APIError.operation_id` names
+        (:attr:`Client.operations`), rather than sending the create again under
+        a new key, which may build a second computer. Keys last 24 hours, and a
+        key sent with different arguments raises an ``APIError`` (422).
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -253,7 +269,14 @@ class AsyncComputers:
         carrying one is always a cold boot; wait with
         :meth:`Computer.wait_for_browser_proxy` before starting a browser that
         must use it. Which proxies are accepted is the platform's rule, and a
-        value it refuses is its 400; only the shape is checked here.
+        value it refuses is its 400; only the shape is checked here. A template
+        you published can carry a default proxy (``spec.browser_proxy``), and a
+        create that leaves ``browser_proxy`` out (``None``) inherits it, exactly
+        as if it had been sent: a cold boot. Pass
+        :data:`~mandala_computer.NO_BROWSER_PROXY` to create the computer with
+        none instead. A create from such a template, whatever it sends here,
+        answers 409 with reason ``unsupported`` if its host cannot launch a
+        proxy yet.
 
         ``egress_proxy`` sends ALL of the computer's outbound TCP — ``exec``,
         terminals, package managers and browsers alike — through a proxy, an
@@ -263,8 +286,8 @@ class AsyncComputers:
         nothing goes direct), drops UDP to the internet and ICMP, and leaves DNS
         lookups to the platform's resolver. Its ``credentials_secret_id`` names
         a secret holding ``user:password`` that is not bound to the computer and
-        never reaches it. A create carrying one is always a cold boot, and a
-        clone does not inherit it. A host that cannot take one — or an
+        never reaches it. A create carrying one is never answered from the warm
+        pool, and a clone does not inherit it. A host that cannot take one — or an
         ``https://`` one, or one naming credentials — answers 409 with reason
         ``unsupported``.
 
@@ -310,7 +333,7 @@ class AsyncComputers:
         start: bool = True,
         resolution: str | None = None,
         secrets: Sequence[SecretBindingArgs] | None = None,
-        browser_proxy: BrowserProxyArgs | BrowserProxy | None = None,
+        browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
@@ -324,11 +347,16 @@ class AsyncComputers:
         With ``secrets`` bound it also waits until they have reached the
         desktop (:meth:`AsyncComputer.wait_for_secrets`), so a command run on
         the returned computer sees them; a delivery that failed raises, naming
-        why. With ``browser_proxy`` it also waits until the guest has it
-        (:meth:`AsyncComputer.wait_for_browser_proxy`).
+        why. With ``browser_proxy`` (or a template's default one) it also
+        waits until the guest has it
+        (:meth:`AsyncComputer.wait_for_browser_proxy`). With an ``egress_proxy``
+        naming ``credentials_secret_id`` it also waits until the computer's
+        host holds them (:meth:`AsyncComputer.wait_for_egress_proxy`): until
+        then every connection the computer opens is closed.
 
         ``timeout`` is one readiness budget in seconds, beginning after create
-        returns. Disk, running, guest, secrets and browser proxy waits share the remaining time, and
+        returns. Disk, running, guest, secrets, browser proxy and egress proxy
+        waits share the remaining time, and
         elapsed start work consumes it too. Create and start retain their usual
         transport deadlines: this is not a total wall-clock limit on launch.
         ``poll`` is the delay in seconds between polls in every stage.
@@ -409,10 +437,19 @@ class AsyncComputers:
             # The same gap for a browser proxy: the guest answers before the
             # policy is on disk, and a browser opened in between goes out
             # directly.
-            if browser_proxy is not None or computer.raw.get("browser_proxy") is not None:
+            if (
+                browser_proxy is not None and browser_proxy is not NoBrowserProxy.NO_BROWSER_PROXY
+            ) or computer.raw.get("browser_proxy") is not None:
                 # Told one is set, as the secrets wait is: see the sync twin.
                 await computer.wait_for_browser_proxy(
                     timeout=remaining(), poll=poll, expect_browser_proxy=True
+                )
+            # And for an egress proxy naming credentials: see the sync twin.
+            if _names_egress_credentials(egress_proxy) or _names_egress_credentials(
+                computer.raw.get("egress_proxy")
+            ):
+                await computer.wait_for_egress_proxy(
+                    timeout=remaining(), poll=poll, expect_credentials=True
                 )
             return computer
         except MandalaError as err:
@@ -519,8 +556,12 @@ class AsyncSnapshots:
         """Create a new computer from a snapshot.
 
         Cloning a memory snapshot forks it: the new machine resumes from the
-        captured RAM rather than booting, so it starts as a live twin of the
-        original — same hostname and network identity until it is re-identified.
+        captured RAM rather than booting, with the original's session. Before
+        its network comes up it is given an identity of its own — its own MAC
+        and address, its name as hostname, a new machine ID and SSH host keys,
+        and its own desktop password — so it runs beside its source. If that
+        cannot be done the copy is left stopped rather than running as its
+        source; starting it boots its disk fresh.
 
         Returns as soon as the computer exists, which is before its disk does.
         A snapshot has to be copied out — and a snapshot taken incrementally is
@@ -533,8 +574,8 @@ class AsyncSnapshots:
         boot with its own network identity, the way out when the saved session
         is what is broken. A memory snapshot of a computer that held secrets is
         resumed only with ``inherit_secrets=True`` — the copy then holds the
-        SAME credentials, lands in the source's workspace, and cannot run on the
-        same host while its source is running. Otherwise it too is built from
+        SAME credentials, bound to the same secrets, and lands in the source's
+        workspace. Otherwise it too is built from
         the disk, and the returned computer's :attr:`memory_dropped` says so;
         check it before assuming the session came across.
         """
@@ -1215,6 +1256,28 @@ class AsyncApiKeys:
     list.__doc__ = ApiKeys.list.__doc__
     create.__doc__ = ApiKeys.create.__doc__
     revoke.__doc__ = ApiKeys.revoke.__doc__
+
+
+class AsyncWorkspaces:
+    __doc__ = Workspaces.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self) -> builtins.list[Workspace]:
+        rows = await self._t.json_array("GET", _api.WORKSPACES)
+        return [Workspace.from_api(w, f"workspace {i}") for i, w in enumerate(rows)]
+
+    async def get(self, workspace_id: str) -> Workspace:
+        return Workspace.from_api(await self._t.json_object("GET", _api.workspace(workspace_id)))
+
+    async def members(self, workspace_id: str) -> builtins.list[WorkspaceMember]:
+        rows = await self._t.json_array("GET", _api.workspace_members(workspace_id))
+        return [WorkspaceMember.from_api(m, f"workspace member {i}") for i, m in enumerate(rows)]
+
+    list.__doc__ = Workspaces.list.__doc__
+    get.__doc__ = Workspaces.get.__doc__
+    members.__doc__ = Workspaces.members.__doc__
 
 
 class AsyncOperations:

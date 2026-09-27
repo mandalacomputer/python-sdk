@@ -9,9 +9,13 @@ import json
 import httpx
 import pytest
 import respx
-from tests.test_launch import BASE, COMPUTER
+from tests.test_launch import BASE, COMPUTER, GUEST, Scenario, step
 
 import mandala_computer as mc
+import mandala_computer._async_computer as async_computers
+import mandala_computer._async_resources as async_resources
+import mandala_computer._computer as computers
+import mandala_computer._resources as resources
 from mandala_computer import _api, _cli
 
 SERVER = "https://proxy.example.com:3128"
@@ -158,6 +162,152 @@ async def test_async_create_and_change_on_the_wire():
         with pytest.raises(ValueError, match="unknown keys"):
             await c.set_egress_proxy({"server": SERVER, "credentials": CREDS})  # type: ignore[typeddict-unknown-key]
     assert patch.call_count == 2
+
+
+# --- the wait, and launch (OPL-5322) ------------------------------------------
+
+
+def egressed(pending, **extra):
+    row = {**COMPUTER, "egress_proxy": PROXY, **extra}
+    if pending is not None:
+        row["egress_proxy_pending"] = pending
+    return row
+
+
+def run_sync(monkeypatch, steps, act):
+    scenario = Scenario(steps)
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        return scenario, act(client)
+
+
+async def run_async(monkeypatch, steps, act):
+    scenario = Scenario(steps)
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        return scenario, await act(client)
+
+
+def pending_then_held():
+    return [
+        step("GET", "/launch-42", egressed(True)),
+        step("GET", "/launch-42", egressed(True)),
+        step("GET", "/launch-42", egressed(False)),
+    ]
+
+
+def test_wait_polls_until_the_host_holds_the_credentials(monkeypatch):
+    scenario, c = run_sync(
+        monkeypatch,
+        pending_then_held(),
+        lambda client: mc.Computer(client._t, egressed(True)).wait_for_egress_proxy(poll=0.5),
+    )
+    assert not scenario.steps
+    assert c.egress_proxy_pending is False
+
+
+async def test_async_wait_polls_until_the_host_holds_the_credentials(monkeypatch):
+    async def act(client):
+        return await mc.AsyncComputer(client._t, egressed(True)).wait_for_egress_proxy(poll=0.5)
+
+    scenario, c = await run_async(monkeypatch, pending_then_held(), act)
+    assert not scenario.steps
+    assert c.egress_proxy_pending is False
+
+
+def test_wait_answers_at_once_for_a_proxy_with_no_credentials(monkeypatch):
+    plain = {**COMPUTER, "egress_proxy": {"server": SERVER}}
+    scenario, _ = run_sync(
+        monkeypatch,
+        [step("GET", "/launch-42", plain)],
+        lambda client: mc.Computer(client._t, plain).wait_for_egress_proxy(),
+    )
+    assert not scenario.steps
+
+
+def test_wait_times_out_naming_the_credentials(monkeypatch):
+    with pytest.raises(mc.TimeoutError) as caught:
+        run_sync(
+            monkeypatch,
+            [step("GET", "/launch-42", egressed(True)) for _ in range(3)],
+            lambda client: mc.Computer(client._t, egressed(True)).wait_for_egress_proxy(
+                timeout=2, poll=1
+            ),
+        )
+    assert str(caught.value) == (
+        "launch-42's host still did not hold its egress proxy's credentials after 2s, so its "
+        "connections are still being closed"
+    )
+
+
+def test_wait_refuses_a_stopped_computer_nobody_is_starting(monkeypatch):
+    stopped = egressed(None, status="stopped", running_ram_mb=0)
+    with pytest.raises(mc.MandalaError) as caught:
+        run_sync(
+            monkeypatch,
+            [step("GET", "/launch-42", stopped)],
+            lambda client: mc.Computer(client._t, stopped).wait_for_egress_proxy(timeout=60),
+        )
+    assert not isinstance(caught.value, mc.TimeoutError)
+    assert "call start()" in str(caught.value)
+
+
+def launch_steps(created):
+    return [
+        step("POST", "", created),
+        step("GET", "/launch-42", created),
+        step("POST", "/launch-42/exec", GUEST),
+        *pending_then_held(),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("argument", "created"),
+    [
+        # The create named credentials, and the reads before the wait left the
+        # setting out...
+        (PROXY, COMPUTER),
+        # ...or the create did not, and the computer's record does.
+        (None, egressed(True)),
+    ],
+)
+def test_launch_waits_for_the_credentials(monkeypatch, argument, created):
+    scenario, c = run_sync(
+        monkeypatch,
+        launch_steps(created),
+        lambda client: client.computers.launch(poll=0.5, egress_proxy=argument),
+    )
+    assert not scenario.steps
+    assert c.egress_proxy_pending is False
+
+
+async def test_async_launch_waits_for_the_credentials(monkeypatch):
+    async def act(client):
+        return await client.computers.launch(poll=0.5, egress_proxy=PROXY)
+
+    scenario, c = await run_async(monkeypatch, launch_steps(egressed(True)), act)
+    assert not scenario.steps
+    assert c.egress_proxy_pending is False
+
+
+def test_launch_adds_no_request_for_a_proxy_without_credentials(monkeypatch):
+    plain = {**COMPUTER, "egress_proxy": {"server": SERVER}}
+    scenario, _ = run_sync(
+        monkeypatch,
+        [
+            step("POST", "", plain),
+            step("GET", "/launch-42", plain),
+            step("POST", "/launch-42/exec", GUEST),
+        ],
+        lambda client: client.computers.launch(poll=0.5, egress_proxy={"server": SERVER}),
+    )
+    assert not scenario.steps
 
 
 # --- CLI ----------------------------------------------------------------------

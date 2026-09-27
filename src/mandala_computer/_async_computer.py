@@ -52,6 +52,7 @@ from ._computer import (
     _continues,
     _cursor,
     _download_sink,
+    _egress_proxy_timeout,
     _empty_guest_file,
     _file_body,
     _guest_not_running,
@@ -61,6 +62,7 @@ from ._computer import (
     _require_background_pid,
     _require_model_key,
     _ride_out,
+    _schedule_window,
     _secrets_timeout,
     _snapshots_deleted,
     _upload_refusal,
@@ -266,7 +268,8 @@ class AsyncComputer(ComputerFields):
     async def clone(
         self, name: str | None = None, *, idempotency_key: str | None = None
     ) -> AsyncComputer:
-        """Copy this computer into a new one. The source must be stopped.
+        """Copy this computer into a new one. The source must be stopped or
+        suspended; a running one raises :class:`~mandala_computer.ConflictError`.
 
         Returns as soon as the new computer exists, which is before its disk
         does: copying a disk runs for minutes, so the clone comes back
@@ -938,6 +941,25 @@ class AsyncComputer(ComputerFields):
             ),
         )
 
+    async def wait_for_egress_proxy(
+        self, timeout: float = 180.0, poll: float = 2.0, *, expect_credentials: bool = False
+    ) -> AsyncComputer:
+        """Await until this computer's host holds its egress proxy's credentials.
+
+        See :meth:`Computer.wait_for_egress_proxy`: this is its twin, and
+        :meth:`AsyncComputers.launch` calls it for you when the create's proxy,
+        or the computer's, names credentials.
+        """
+        return await self._wait_for_state(
+            timeout,
+            poll,
+            "applied",
+            lambda start_failed: self._egress_proxy_state(expect_credentials, start_failed),
+            lambda observed, fresh, state: _egress_proxy_timeout(
+                self.id, timeout, observed, fresh, state
+            ),
+        )
+
     async def _wait_for_state(
         self,
         timeout: float,
@@ -992,9 +1014,15 @@ class AsyncComputer(ComputerFields):
     ) -> bytes:
         """Capture the screen.
 
-        Full-resolution PNG by default. Passing ``width`` returns a downscaled
-        JPEG instead — much cheaper, and enough for a thumbnail or a quick
-        "has anything changed" check.
+        Full-resolution PNG by default, from a running computer. Passing
+        ``width`` returns a downscaled JPEG instead — much cheaper, and enough
+        for a thumbnail or a quick "has anything changed" check.
+
+        A SUSPENDED computer is not woken: it answers with the JPEG saved when
+        it was suspended, at most 640 pixels wide, with or without ``width`` —
+        so check the bytes (a JPEG starts ``\\xff\\xd8``) before treating them
+        as a PNG. ``fresh=True``, ``region``, ``scale``, ``quality`` or a PNG
+        ``format`` is refused for one, since the saved picture cannot honour it.
 
         PASS ``fresh=True`` WHENEVER THE IMAGE IS FEEDING A DECISION. Without it
         the platform may answer from a frame up to 1.5 seconds old, which is
@@ -1092,7 +1120,13 @@ class AsyncComputer(ComputerFields):
         await self._input(_api.click_body("triple_click", x, y, modifiers))
 
     async def drag(
-        self, to_x: int, to_y: int, *, from_x: int | None = None, from_y: int | None = None
+        self,
+        to_x: int,
+        to_y: int,
+        *,
+        from_x: int | None = None,
+        from_y: int | None = None,
+        modifiers: tuple[str, ...] = (),
     ) -> None:
         """Press, move, release — one gesture.
 
@@ -1103,8 +1137,13 @@ class AsyncComputer(ComputerFields):
         Without ``from_x``/``from_y`` the drag starts wherever the pointer is.
         That is refused if nothing has moved it yet, rather than guessing at an
         origin and selecting the wrong thing.
+
+        ``modifiers`` are held down for the whole drag, e.g.
+        ``await c.drag(400, 300, from_x=100, from_y=200, modifiers=("shift",))`` to
+        extend a selection. They are pressed before the pointer moves and
+        released after the button.
         """
-        await self._input(_api.drag_body(from_x, from_y, to_x, to_y))
+        await self._input(_api.drag_body(from_x, from_y, to_x, to_y, modifiers))
 
     async def mouse_down(self, x: int | None = None, y: int | None = None) -> None:
         """Press the left button and leave it down.
@@ -2071,14 +2110,23 @@ class AsyncComputer(ComputerFields):
         self,
         *,
         enabled: bool,
-        hour: int = 4,
-        minute: int = 0,
-        tz: str = "UTC",
+        hour: int | None = None,
+        minute: int | None = None,
+        tz: str | None = None,
     ) -> Mapping[str, Any]:
         """Set the automatic daily snapshot window, in the given IANA timezone.
 
+        ``hour``, ``minute`` or ``tz`` left out (``None``) keeps the current
+        schedule's value, read first from the computer record (without
+        refreshing this handle, so a create's :attr:`start_error` survives);
+        04:00 UTC only for a computer with no schedule.
         See :meth:`mandala_computer.Computer.set_schedule`.
         """
+        if hour is None or minute is None or tz is None:
+            _api.check_schedule_args(enabled=enabled, hour=hour, minute=minute, tz=tz)
+            # The record, not GET .../schedule: see _schedule_window.
+            record = _api.computer_payload(await self._t.json_object("GET", _api.computer(self.id)))
+            hour, minute, tz = _schedule_window(record.get("snapshot_schedule"), hour, minute, tz)
         stored = dict(
             await self._t.json_object(
                 "PUT",
@@ -2092,9 +2140,10 @@ class AsyncComputer(ComputerFields):
     async def clear_schedule(self) -> Mapping[str, Any]:
         """Remove the schedule, as distinct from disabling it.
 
-        ``set_schedule(enabled=False)`` keeps the chosen time so toggling back on
-        restores it, and keeps the scheduler's bookkeeping with it. Clearing
-        returns the computer to never having had a schedule.
+        ``set_schedule(enabled=False)`` keeps the chosen time — it reads the
+        current window and sends it back — so ``set_schedule(enabled=True)``
+        restores it. Clearing returns the computer to never having had a
+        schedule.
         """
         cleared = dict(
             await self._t.json_object("DELETE", _api.computer_action(self.id, "schedule"))

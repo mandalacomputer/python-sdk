@@ -453,6 +453,75 @@ def test_launch_adds_no_request_for_none(monkeypatch):
     assert not scenario.steps
 
 
+# --- opting out of a template's default (OPL-5322) ----------------------------
+
+
+def test_no_browser_proxy_sends_null_and_none_sends_nothing():
+    base = {"name": None, "template": None, "cpu": None, "ram_mb": None, "disk_gb": None}
+    body = _api.create_body(**base, start=True, browser_proxy=mc.NO_BROWSER_PROXY)
+    assert "browser_proxy" in body and body["browser_proxy"] is None
+    assert "browser_proxy" not in _api.create_body(**base, start=True, browser_proxy=None)
+
+
+def no_proxy_launch_steps():
+    return [
+        step("POST", "", COMPUTER),
+        step("GET", "/launch-42", COMPUTER),
+        step("POST", "/launch-42/exec", GUEST),
+    ]
+
+
+def test_create_and_launch_send_null_for_no_browser_proxy(monkeypatch):
+    scenario = Scenario([step("POST", "", COMPUTER), *no_proxy_launch_steps()])
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        client.computers.create(template="acme/proxied", browser_proxy=mc.NO_BROWSER_PROXY)
+        # No wait for a proxy the computer was created without.
+        client.computers.launch(
+            template="acme/proxied", browser_proxy=mc.NO_BROWSER_PROXY, poll=0.5
+        )
+    assert not scenario.steps
+    for request in (scenario.requests[0], scenario.requests[1]):
+        assert json.loads(request.content) == {
+            "start": True,
+            "template": "acme/proxied",
+            "browser_proxy": None,
+        }
+
+
+async def test_async_create_and_launch_send_null_for_no_browser_proxy(monkeypatch):
+    scenario = Scenario([step("POST", "", COMPUTER), *no_proxy_launch_steps()])
+    scenario.install(monkeypatch, async_resources, async_computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        await client.computers.create(template="acme/proxied", browser_proxy=mc.NO_BROWSER_PROXY)
+        await client.computers.launch(
+            template="acme/proxied", browser_proxy=mc.NO_BROWSER_PROXY, poll=0.5
+        )
+    assert not scenario.steps
+    for request in (scenario.requests[0], scenario.requests[1]):
+        assert json.loads(request.content)["browser_proxy"] is None
+
+
+def test_launch_waits_for_a_proxy_the_template_gave_it(monkeypatch):
+    # Omitted, so the template's default is inherited and the record carries it.
+    scenario = Scenario(launch_steps())
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.launch(template="acme/proxied", poll=0.5)
+    assert not scenario.steps
+    assert "browser_proxy" not in json.loads(scenario.requests[0].content)
+    assert c.browser_proxy_pending is False
+
+
 # --- async --------------------------------------------------------------------
 
 

@@ -59,10 +59,18 @@ class MandalaError(Exception):
     #: leaves its outcome unknown: a request that may have been received before
     #: the connection died or the deadline passed, a ``5xx``, or the platform's
     #: ``409``\ s saying the keyed call is still running or was never heard to
-    #: end (platform OPL-5127). Send the same call again with this key —
+    #: end (platform OPL-5127). ``None`` on every other error.
+    #:
+    #: What resending with it gets depends on how the call failed. After a
+    #: dropped connection, a timeout or ``idempotency_in_progress``, send the
+    #: same call again with this key —
     #: ``computer.start(idempotency_key=err.idempotency_key)`` — to learn how it
-    #: went without doing it twice, or find its operation with
-    #: ``operations.list(idempotency_key=...)``. ``None`` on every other error.
+    #: went without doing it twice: the first call's answer once it has
+    #: finished. After a ``5xx``, or ``idempotency_outcome_unknown``, the key
+    #: never gives the answer: every resend is a ``409``
+    #: ``idempotency_outcome_unknown``. Read the computer instead, or the
+    #: operation (:attr:`APIError.operation_id`, or
+    #: ``operations.list(idempotency_key=...)``), to see whether it took effect.
     idempotency_key: str | None = None
 
 
@@ -181,13 +189,31 @@ class APIError(MandalaError):
         self.allow = allow
         self.www_authenticate = www_authenticate
 
+    @property
+    def code(self) -> str | None:
+        """The body's ``code``, when the platform sent one: a word a program
+        may branch on, such as ``idempotency_in_progress`` or
+        ``idempotency_outcome_unknown`` on a :class:`ConflictError`. ``None``
+        when there is none, which is most errors."""
+        return _nonblank(self.body.get("code") if isinstance(self.body, dict) else None)
+
+    @property
+    def operation_id(self) -> str | None:
+        """The body's ``operation_id``, when the platform sent one: the
+        operation a keyed lifecycle call's ``5xx`` or ``409`` reserved, which
+        :meth:`~mandala_computer.Operations.get` reads to see how it ended.
+        ``None`` when there is none."""
+        return _nonblank(self.body.get("operation_id") if isinstance(self.body, dict) else None)
+
 
 class AuthenticationError(APIError):
     """A credential was refused (401); reason/challenge may classify the refusal."""
 
 
 class PermissionDeniedError(APIError):
-    """Authenticated, but not allowed — e.g. a suspended or unverified account (403)."""
+    """Authenticated, but not allowed (403): the credential is valid but lacks
+    the role, the workspace membership or the permission (such as a key's
+    "Manage keys") the request needs, or the account or person is suspended."""
 
 
 class NotFoundError(APIError):
