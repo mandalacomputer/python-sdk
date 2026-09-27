@@ -338,6 +338,7 @@ def test_a_detailed_delete_keeps_the_whole_answer(client: mc.Client) -> None:
         (409, "unavailable", False),
         (409, "unsupported", False),
         (409, "exists", False),
+        (409, "running", False),  # stop the computer first; waiting never clears it
         (409, "some-new-word", True),  # unknown: the type's answer stands
         (400, "some-new-word", False),
         (502, None, False),  # the guest agent silent past its boot window
@@ -355,6 +356,20 @@ def test_refusal_words_on_the_wire(
         computer(client).exec("true")
     assert caught.value.reason == reason
     assert mc.is_transient(caught.value) is transient
+
+
+@respx.mock
+def test_a_resize_refused_because_the_computer_is_running_is_final(client: mc.Client) -> None:
+    route = respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(
+            409, json={"error": "stop the computer before resizing it", "reason": "running"}
+        )
+    )
+    with pytest.raises(mc.ConflictError) as caught:
+        computer(client).resize(ram_mb=8192)
+    assert route.call_count == 1
+    assert caught.value.reason == "running"
+    assert mc.is_transient(caught.value) is False
 
 
 @pytest.mark.parametrize(

@@ -144,6 +144,12 @@ This is the summary you read to decide whether to upgrade.
   `ValueError` ("that is an API key, not a key id; run api-keys list to find
   its id (key-...)") before any request, and neither the error nor the CLI
   repeats the value.
+- **A 409 whose `reason` is `running` is permanent.** It is the platform's
+  refusal of something only a stopped computer can have, a resize today, and
+  nothing clears it by waiting: stop the computer, then send it again.
+  `is_transient` called it worth sending again, as it does any other
+  `ConflictError`, so a caller looping on it resent the same resize until it
+  gave up. It now answers `False`.
 
 ## [0.6.0] — 2026-09-25
 

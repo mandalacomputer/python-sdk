@@ -641,6 +641,8 @@ def test_the_refusal_reason_decides_before_the_type_does() -> None:
     # The one the ticket was filed for, and its permanent neighbour.
     assert mc.is_transient(conflict("unavailable")) is False
     assert mc.is_transient(conflict("unsupported")) is False
+    # The mirror of `unavailable`: a resize of a running computer, fixed by a stop.
+    assert mc.is_transient(conflict("running")) is False
 
 
 def test_a_reason_this_version_has_never_heard_of_falls_back_to_the_type() -> None:
