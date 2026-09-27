@@ -117,6 +117,18 @@ This is the summary you read to decide whether to upgrade.
   argparse's own messages that quote a value (`--keep-newline=VALUE`, an
   ambiguous abbreviation, an unknown verb, which now lists the verbs instead).
 
+### Fixed
+
+- **`api_keys.revoke()` refuses an API key passed where its id goes** (sync
+  and async, and `mandala-py api-keys revoke`). Revoking the key you hold by
+  pasting it (`com_...`) put the live key into the request path, where access
+  logs record it, and the platform answered 404 and left the key valid. Any
+  value starting `com_`, or holding a full key anywhere (behind a byte-order
+  mark or zero-width space, in quotes, after `Bearer`), now raises
+  `ValueError` ("that is an API key, not a key id; run api-keys list to find
+  its id (key-...)") before any request, and neither the error nor the CLI
+  repeats the value.
+
 ## [0.6.0] — 2026-09-25
 
 0.5.1 was never released; everything listed for it is here. Three behaviour
