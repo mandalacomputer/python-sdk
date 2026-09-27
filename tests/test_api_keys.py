@@ -328,6 +328,23 @@ def test_cli_whoami_unscoped_account_with_no_name_is_unnamed(
 
 
 @respx.mock
+def test_cli_whoami_unscoped_escapes_names(capsys: pytest.CaptureFixture[str]) -> None:
+    hostile = {
+        **WHOAMI,
+        "user": {**WHOAMI["user"], "name": "Dana\x1b]0;x\x07", "email": "dana\n@example.com"},
+        "account": {**WHOAMI["account"], "name": "Acme\x9b"},
+    }
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=hostile))
+    assert _cli.main(["whoami"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[:2] == [
+        "Dana\\x1b]0;x\\x07 <dana\\x0a@example.com> (usr-1)",
+        "Account: Acme\\x9b (acc-1), plan team, active",
+    ]
+    assert not any(c in out.replace("\n", "") for c in map(chr, [*range(0x20), *range(0x7F, 0xA0)]))
+
+
+@respx.mock
 def test_cli_api_keys_list(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[API_KEY]))
     assert _cli.main(["api-keys", "list"]) == 0
