@@ -1706,6 +1706,16 @@ def test_printable_escapes_control_characters_and_nothing_else(given: str, want:
     assert _cli._printable(given) == want
 
 
+def test_changelog_shows_the_escapes_the_cli_prints() -> None:
+    # The release notes quote the escapes; a raw U+2028 there renders as an
+    # empty code span (or a line break) instead of the text the CLI prints.
+    changelog = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+    text = changelog.read_text(encoding="utf-8")
+    assert _raw_controls(text) == []
+    for given in ("\n", "\x1b", " "):
+        assert f"`{_cli._printable(given)}`" in text
+
+
 @respx.mock
 def test_api_keys_list_prints_a_hostile_name_on_its_own_row(
     capsys: pytest.CaptureFixture[str],
