@@ -3393,7 +3393,8 @@ sftp dev
 
 The block is written under the computer's id instead of its name when the name
 cannot be a `Host` (it holds a space or a `*`, say). It is too, with a note on
-stderr saying why, when another computer has the same name, when the list of
+stderr saying why, when another computer has the same name (in any case, since
+OpenSSH reads `dev` and `Dev` as one `Host`), when the list of
 your computers could not be read in full to check that, or when ssh would also
 read the name as another destination: a hostname such as `github.com` or
 `corp.internal`, an IP address in any form (`10.5` is `10.0.0.5`), a bare
@@ -3401,6 +3402,15 @@ number, `localhost`, the gateway's `mandala-gateway`, or another computer's id,
 compared without regard to case. A block under such a name would take over
 every connection you make there. Connect with `ssh <id>` then (`--json`'s
 `host` says which); a dotted name such as `ubuntu-24.04` is kept.
+
+`--write` replaces only the block of the computer it is run for, so a block an
+earlier version of the CLI wrote under such a name stays in `~/.ssh/config`
+until you run `mandala-py ssh-config <computer> --write` again for that
+computer. To find one, read the `Host` line after each
+`# >>> mandala computer <id> >>>` marker in `~/.ssh/config`, and run `--write`
+again for any whose `Host` is a hostname, an IP address, another computer's id,
+or a name another computer has in any case. For a computer that no longer
+exists, delete its block, markers included.
 
 In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
 Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also

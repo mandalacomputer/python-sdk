@@ -961,6 +961,32 @@ def test_ssh_config_uses_the_id_when_another_computer_shares_the_name(
     assert "using Host vm-7 instead" in err
 
 
+# OpenSSH matches Host patterns without regard to case, so "dev" and "Dev"
+# are one Host: each computer falls back to its id, as for an identical name.
+@pytest.mark.parametrize(("target", "name"), [("vm-9", "dev"), ("vm-7", "Dev")])
+@respx.mock
+def test_ssh_config_uses_the_id_when_another_name_differs_only_in_case(
+    env: Path, capsys: pytest.CaptureFixture[str], target: str, name: str
+) -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"id": "vm-9", "name": "dev", "status": "running", "os": "linux"},
+                {"id": "vm-7", "name": "Dev", "status": "running", "os": "linux"},
+            ],
+        )
+    )
+    assert _cli.main(["ssh-config", target]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        f"mandala-py: another computer is also named {name}; using Host {target} instead\n"
+    )
+    assert f"# >>> mandala computer {target} >>>\nHost {target}\n" in out
+    assert _cli.main(["ssh-config", target, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["host"] == target
+
+
 @respx.mock
 def test_ssh_config_uses_the_id_when_the_listing_is_incomplete(
     env: Path, capsys: pytest.CaptureFixture[str]
