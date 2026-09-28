@@ -56,6 +56,16 @@ This is the summary you read to decide whether to upgrade.
   `invalid_response`, before anything is registered, printed, written or run.
   Every id the platform issues is accepted as before.
 
+- **`mandala-py ssh-config` no longer writes a computer's name as its `Host`
+  when ssh would also read that name as another destination**: anything
+  with a dot in it (a hostname such as `github.com`, or an IPv4 address), a
+  bare number, `localhost`, the gateway's alias `mandala-gateway`, or
+  another computer's id, compared without regard to case as OpenSSH does.
+  A block under such a name took over every connection made there, so a
+  computer a teammate named `github.com` received the pushes meant for
+  GitHub. The block uses the computer's id instead, and a note on stderr
+  says so, with the name escaped. Other names are used as before.
+
 - **`mandala-py whoami` escapes every field it prints**, not only the names
   and email: the user, account, workspace and key ids, the account's status
   and the role are the platform's text too, and a control character in one

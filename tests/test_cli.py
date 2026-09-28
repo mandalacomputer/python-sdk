@@ -15,7 +15,7 @@ import httpx
 import pytest
 import respx
 
-from mandala_computer import _cli
+from mandala_computer import _cli, _openssh
 
 BASE = "https://api.test/api/v1"
 
@@ -2672,6 +2672,83 @@ def test_ssh_config_escapes_a_shared_name_in_its_note(
         "mandala-py: another computer is also named dev\\u202e\\u001b[2J; using Host vm-9 instead\n"
     )
     assert out.endswith("connect with: ssh vm-9\n")
+
+
+# A name ssh would also read as another destination is never a Host: a block
+# written under "github.com" would send the user's own pushes through the
+# gateway to whichever teammate's computer carries that name.
+NAMES_OF_OTHER_DESTINATIONS = [
+    "github.com",
+    "10.0.0.5",
+    "167772165",
+    "mandala-gateway",
+    "Mandala-Gateway",
+    "localhost",
+    "vm-7",  # the other listed computer's id
+    "VM-7",
+]
+
+
+@pytest.mark.parametrize("name", NAMES_OF_OTHER_DESTINATIONS)
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_never_writes_a_name_another_destination_has_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], name: str, write: bool
+) -> None:
+    rows = [
+        {"id": "vm-9", "name": name, "status": "running", "os": "linux"},
+        {"id": "vm-7", "name": "other", "status": "running", "os": "linux"},
+    ]
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=rows))
+    assert _cli.main(["ssh-config", "vm-9", *(["--write"] if write else [])]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        f"mandala-py: the name {name} cannot be a Host, since ssh would also use it "
+        "for another destination; using Host vm-9 instead\n"
+    )
+    config = ssh_home / ".ssh" / "config"
+    if write:
+        assert out == "wrote Host vm-9 in " + str(config) + "\nconnect with: ssh vm-9\n"
+        text = config.read_text()
+    else:
+        assert not config.exists()
+        text = out
+    hosts = [
+        line.split(" ", 1)[1].lower() for line in text.splitlines() if line.startswith("Host ")
+    ]
+    # The gateway's own block, then the computer's under its id: no block for
+    # the name, and none but the gateway's under the gateway's alias.
+    assert hosts == [_openssh.GATEWAY_ALIAS, "vm-9"]
+
+
+@respx.mock
+def test_ssh_config_escapes_a_name_it_cannot_use_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _one_computer(name=f"evil{RLO}.com\x1b[2J")
+    assert _cli.main(["ssh-config", "vm-9"]) == 0
+    out, err = capsys.readouterr()
+    _clean(err)
+    assert err == (
+        "mandala-py: the name evil\\u202e.com\\u001b[2J cannot be a Host, since ssh "
+        "would also use it for another destination; using Host vm-9 instead\n"
+    )
+    assert "Host vm-9\n" in out
+
+
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_keeps_a_plain_name_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], write: bool
+) -> None:
+    _one_computer(name="devbox")
+    assert _cli.main(["ssh-config", "devbox", *(["--write"] if write else [])]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    config = ssh_home / ".ssh" / "config"
+    text = config.read_text() if write else out
+    assert "Host devbox\n" in text
+    assert "Host vm-9\n" not in text
 
 
 @respx.mock

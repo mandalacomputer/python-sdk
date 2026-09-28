@@ -2453,6 +2453,23 @@ def _cmd_ssh_access(args: argparse.Namespace) -> int:
     return 0
 
 
+def _names_another_destination(name: str, computers: Collection[Computer]) -> bool:
+    """Whether ssh would also read ``name``, as a ``Host``, as some other place.
+
+    OpenSSH matches ``Host`` patterns without regard to case, so these are
+    compared lowercased: the gateway's own alias, ``localhost``, anything with a
+    dot in it (a hostname or an IPv4 address), a bare number (``ssh 167772165``
+    is 10.0.0.5), and any listed computer's id, which is that computer's Host
+    when its own name cannot be one.
+    """
+    folded = name.lower()
+    if folded in (_openssh.GATEWAY_ALIAS, "localhost") or "." in folded:
+        return True
+    if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", folded):
+        return True
+    return any(o.id.lower() == folded for o in computers)
+
+
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
     gw = _openssh.gateway()
     with _client() as client:
@@ -2469,7 +2486,12 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # unique, so the id is used then too.
     unchecked = not computers.is_complete
     shared = bool(c.name) and any(o.name == c.name and o.id != c.id for o in computers)
-    host = computer_id if unchecked or shared else _openssh.host_alias(c.name, computer_id)
+    # A name is also refused as the Host when ssh would read it as some other
+    # destination: a block written under it would take over every connection
+    # the user makes there, so a teammate naming a computer "github.com" could
+    # send the user's pushes through the gateway to their own guest.
+    taken = bool(c.name) and _names_another_destination(c.name, computers)
+    host = computer_id if unchecked or shared or taken else _openssh.host_alias(c.name, computer_id)
     if unchecked:
         print(
             f"{PROG}: could not check other computers' names; using Host {_shown(c.id)} instead",
@@ -2479,6 +2501,12 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
         print(
             f"{PROG}: another computer is also named {_shown(c.name)}; "
             f"using Host {_shown(c.id)} instead",
+            file=sys.stderr,
+        )
+    elif taken and host != c.name:
+        print(
+            f"{PROG}: the name {_shown(c.name)} cannot be a Host, since ssh would also "
+            f"use it for another destination; using Host {_shown(c.id)} instead",
             file=sys.stderr,
         )
     snippet = _openssh.config_snippet(host, computer_id, gw, known_hosts)
