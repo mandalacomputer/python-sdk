@@ -409,8 +409,8 @@ def test_cli_whoami_unscoped_escapes_names(capsys: pytest.CaptureFixture[str]) -
     assert _cli.main(["whoami"]) == 0
     out = capsys.readouterr().out
     assert out.splitlines()[:2] == [
-        "Dana\\x1b]0;x\\x07 <dana\\x0a@example.com> (usr-1)",
-        "Account: Acme\\x9b (acc-1), plan team, active",
+        "Dana\\u001b]0;x\\u0007 <dana\\u000a@example.com> (usr-1)",
+        "Account: Acme\\u009b (acc-1), plan team, active",
     ]
     assert not any(c in out.replace("\n", "") for c in map(chr, [*range(0x20), *range(0x7F, 0xA0)]))
 

@@ -1683,27 +1683,63 @@ HOSTILE_KEY = {
 }
 
 
+# What the TypeScript CLI escapes (its TERMINAL_UNSAFE: C0, DEL, C1 and the
+# bidi marks, embeddings, overrides and isolates), as inclusive ranges.
+TS_TERMINAL_UNSAFE = [
+    (0x00, 0x1F),
+    (0x7F, 0x9F),
+    (0x061C, 0x061C),
+    (0x200E, 0x200F),
+    (0x202A, 0x202E),
+    (0x2066, 0x2069),
+]
+# What this CLI escapes: the same, plus the two Unicode line separators.
+ESCAPED = [*TS_TERMINAL_UNSAFE, (0x2028, 0x2029)]
+
+
+def _escaped(c: str) -> bool:
+    return any(lo <= ord(c) <= hi for lo, hi in ESCAPED)
+
+
 def _raw_controls(text: str) -> list[str]:
-    """The control characters in ``text``, the line breaks between lines aside."""
-    return [
-        c
-        for line in text.split("\n")
-        for c in line
-        if ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F or c in "  "
-    ]
+    """The characters ``_printable`` escapes in ``text``, the line breaks between lines aside."""
+    return [c for line in text.split("\n") for c in line if _escaped(c)]
 
 
 @pytest.mark.parametrize(
     ("given", "want"),
     [
-        ("ci\x1b[2Jevil\nforged", "ci\\x1b[2Jevil\\x0aforged"),
-        ("x\x7fy\x85z\x9b", "x\\x7fy\\x85z\\x9b"),
+        ("ci\x1b[2Jevil\nforged", "ci\\u001b[2Jevil\\u000aforged"),
+        ("x\x7fy\x85z\x9b", "x\\u007fy\\u0085z\\u009b"),
         ("a b c", "a\\u2028b\\u2029c"),
-        ("CI – déploiement ✓ \\x1b", "CI – déploiement ✓ \\x1b"),
+        ("CI – déploiement ✓ \\u001b", "CI – déploiement ✓ \\u001b"),
+        ("a\u061cb\u200ec\u200fd", "a\\u061cb\\u200ec\\u200fd"),
+        ("ci\u202eevil\u2066x", "ci\\u202eevil\\u2066x"),
+        ("東京 🙂 ñandú עברית العربية", "東京 🙂 ñandú עברית العربية"),
     ],
 )
 def test_printable_escapes_control_characters_and_nothing_else(given: str, want: str) -> None:
     assert _cli._printable(given) == want
+
+
+def test_printable_escapes_the_typescript_set_and_the_line_separators() -> None:
+    # Pins the set: both ends and the middle of each range are escaped as
+    # \uXXXX (four lowercase digits, as the TypeScript CLI spells them), and
+    # the character just outside each end is left alone, so a drift either
+    # way shows up here.
+    for lo, hi in ESCAPED:
+        for cp in {lo, (lo + hi) // 2, hi}:
+            assert _cli._printable(chr(cp)) == f"\\u{cp:04x}", hex(cp)
+        for cp in (lo - 1, hi + 1):
+            if cp >= 0 and not _escaped(chr(cp)):
+                assert _cli._printable(chr(cp)) == chr(cp), hex(cp)
+    # The neighbours by name, so the loop above cannot pass by skipping them.
+    for cp in (0x20, 0xA0, 0x061B, 0x061D, 0x200D, 0x2010, 0x2027, 0x202F, 0x2065, 0x206A):
+        assert _cli._printable(chr(cp)) == chr(cp), hex(cp)
+    # Escaping twice changes nothing: an escape holds no escaped character.
+    every = "".join(chr(cp) for lo, hi in ESCAPED for cp in range(lo, hi + 1))
+    once = _cli._printable(every)
+    assert _raw_controls(once) == [] and _cli._printable(once) == once
 
 
 def test_changelog_shows_the_escapes_the_cli_prints() -> None:
@@ -1725,8 +1761,8 @@ def test_api_keys_list_prints_a_hostile_name_on_its_own_row(
     out = capsys.readouterr().out
     assert len(out.splitlines()) == 2  # the header and the one key
     assert _raw_controls(out) == []
-    assert "ci\\x1b[2Jevil\\x0aforged" in out
-    assert "workspace tenant\\x0d\\u2028x (wsp-1)" in out
+    assert "ci\\u001b[2Jevil\\u000aforged" in out
+    assert "workspace tenant\\u000d\\u2028x (wsp-1)" in out
 
 
 @respx.mock
@@ -1737,7 +1773,7 @@ def test_api_keys_create_escapes_the_name_it_reports(capsys: pytest.CaptureFixtu
     out, err = capsys.readouterr()
     assert out == created["raw"] + "\n"
     assert _raw_controls(err) == [] and err.count("\n") == 1
-    assert "(ci\\x1b[2Jevil\\x0aforged, workspace tenant\\x0d\\u2028x (wsp-1))" in err
+    assert "(ci\\u001b[2Jevil\\u000aforged, workspace tenant\\u000d\\u2028x (wsp-1))" in err
 
 
 @respx.mock
@@ -1762,11 +1798,65 @@ def test_whoami_escapes_every_name(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert _raw_controls(out) == []
     assert out.splitlines() == [
-        "Dana\\x1b]0;x\\x07 <dana\\x0a@example.com> (usr-1)",
-        "Account: Acme\\x9b (acc-1), plan team, active",
+        "Dana\\u001b]0;x\\u0007 <dana\\u000a@example.com> (usr-1)",
+        "Account: Acme\\u009b (acc-1), plan team, active",
         "Role: owner",
         "Scope: workspace ws\\u2029 (wsp-1)",
-        "Key: ci\\x1b[2Jevil\\x0aforged (key-a1b2c3d4e5f6, com_1a2b3c4d…); cannot manage API keys",
+        "Key: ci\\u001b[2Jevil\\u000aforged (key-a1b2c3d4e5f6, com_1a2b3c4d…); cannot manage API keys",
+    ]
+
+
+# Every whoami field comes from the platform, not only the names a person
+# chose: an id, a status or a role holding a control character is escaped too.
+HOSTILE_IDS = {
+    "user": {"id": "usr-\x1b[2J\nforged", "email": "dana@example.com", "name": "Dana"},
+    "account": {"id": "acc-\u202e1", "name": "Acme", "plan": "team", "status": "act\x1bive"},
+    "role": "own\ner",
+    "workspace": None,
+    "key": {**HOSTILE_KEY, "id": "key-\x07\u200f1", "name": "ci", "workspace_id": None},
+}
+
+
+@respx.mock
+def test_whoami_escapes_the_platforms_fields(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=HOSTILE_IDS))
+    assert _cli.main(["whoami"]) == 0
+    out = capsys.readouterr().out
+    assert _raw_controls(out) == []
+    assert out.splitlines() == [
+        "Dana <dana@example.com> (usr-\\u001b[2J\\u000aforged)",
+        "Account: Acme (acc-\\u202e1), plan team, act\\u001bive",
+        "Role: own\\u000aer",
+        "Scope: the whole account",
+        "Key: ci (key-\\u0007\\u200f1, com_1a2b3c4d…); cannot manage API keys",
+    ]
+
+
+@respx.mock
+def test_whoami_escapes_the_platforms_fields_for_a_workspace_key(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A workspace-scoped key: the names are withheld, so the ids stand alone.
+    scoped = {
+        **HOSTILE_IDS,
+        "user": {"id": "usr-\x1b[2J\nforged", "email": None, "name": None},
+        "account": {"id": "acc-\u202e1", "name": None, "plan": None, "status": "act\x1bive"},
+        "workspace": {
+            "id": "wsp-\n\u061c1",
+            "name": "tenant",
+            "created_at": "2026-09-20T08:00:00.000Z",
+        },
+    }
+    respx.get(f"{BASE}/whoami").mock(return_value=httpx.Response(200, json=scoped))
+    assert _cli.main(["whoami"]) == 0
+    out = capsys.readouterr().out
+    assert _raw_controls(out) == []
+    assert out.splitlines() == [
+        "User usr-\\u001b[2J\\u000aforged (name and email withheld from a workspace-scoped key)",
+        "Account: acc-\\u202e1, act\\u001bive (name and plan withheld from a workspace-scoped key)",
+        "Role: own\\u000aer",
+        "Scope: workspace tenant (wsp-\\u000a\\u061c1)",
+        "Key: ci (key-\\u0007\\u200f1, com_1a2b3c4d…); cannot manage API keys",
     ]
 
 
@@ -1805,7 +1895,7 @@ def test_workspaces_list_prints_one_row_each(capsys: pytest.CaptureFixture[str])
     assert lines[1].split() == ["wsp-0123456789ab", "acme", "2026-09-01T00:00:00.000Z"]
     assert lines[2].split() == [
         "wsp-ba9876543210",
-        "tenant\\x0d\\u202ex",
+        "tenant\\u000d\\u202ex",
         "2026-09-01T00:00:00.000Z",
     ]
 
@@ -1867,7 +1957,7 @@ def test_workspaces_members_prints_each_person(capsys: pytest.CaptureFixture[str
     assert lines[1].split() == [
         "usr-0123456789abcdef",
         "dana@example.com",
-        "Dana\\x1b[2J\\x0aforged",
+        "Dana\\u001b[2J\\u000aforged",
         "owner",
         "2026-09-02T00:00:00.000Z",
         "no",

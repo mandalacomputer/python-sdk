@@ -20,7 +20,24 @@ This is the summary you read to decide whether to upgrade.
   computer's id, which the error's message names. This makes the 0.7.0
   entry's "`computers.create` (and so `launch`)" true of the keyword too.
 
+### Changed
+
+- **`mandala-py` spells an escaped character as the TypeScript CLI does**:
+  `\uXXXX` with four lowercase hex digits, so a newline in a printed name or
+  error message now reads `\u000a` rather than `\x0a`, and ESC `\u001b`
+  rather than `\x1b`. It also escapes the three bidi marks it missed, U+061C
+  (Arabic letter mark), U+200E and U+200F (left-to-right and right-to-left
+  marks), so it now escapes everything the TypeScript CLI does. One
+  difference remains: `mandala-py` also escapes the Unicode line and
+  paragraph separators, as `\u2028` and `\u2029`, which the TypeScript CLI
+  prints as they are. `--json` output is unchanged.
+
 ### Fixed
+
+- **`mandala-py whoami` escapes every field it prints**, not only the names
+  and email: the user, account, workspace and key ids, the account's status
+  and the role are the platform's text too, and a control character in one
+  of them reached the terminal raw. Each line is now escaped whole.
 
 - **`mandala-py` names a failed call's ids in text mode too**, as `--json`
   already did: after the error line, a second stderr line gives the operation
