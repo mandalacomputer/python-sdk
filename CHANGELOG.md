@@ -34,6 +34,19 @@ This is the summary you read to decide whether to upgrade.
 
 ### Fixed
 
+- **`mandala-py` escapes control and bidirectional characters in every name,
+  id, timestamp and error text it prints, not only in `whoami`.** Every
+  listing (secrets, webhooks and their deliveries, SSH keys, API keys,
+  workspaces, members) escapes each cell; the lines `secrets set`/`rm`,
+  `ssh-key add`, `ssh-access`, `ssh --setup`, `browser-proxy` and
+  `egress-proxy` print escape the values they quote; and so does every
+  refusal that names a computer, a secret or the platform's reason, such as
+  the list of computers after an unknown name. A computer, secret or key
+  named with a right-to-left override (U+202E), an escape sequence or a
+  newline now prints as `\u202e`, `\u001b` or `\u000a` rather than
+  reversing, driving or forging part of the terminal's output. `--json`
+  output is unchanged.
+
 - **`mandala-py whoami` escapes every field it prints**, not only the names
   and email: the user, account, workspace and key ids, the account's status
   and the role are the platform's text too, and a control character in one

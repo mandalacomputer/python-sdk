@@ -2003,3 +2003,437 @@ def test_workspaces_members_with_a_scoped_key_is_refused(
     assert _cli.main(["workspaces", "members", "wsp-0123456789ab", "--json"]) == 1
     error = json.loads(capsys.readouterr().err)["error"]
     assert (error["code"], error["status"]) == ("permission_denied", 403)
+
+
+# --- every value the CLI prints is escaped, not only whoami's (OPL-5367, OPL-5366) --
+#
+# A name another member of the account or workspace chose (a computer, a
+# secret, an SSH key, a webhook's URL), and the ids, timestamps and error texts
+# the platform sets, reach the terminal through a table, a line of their own or
+# a refusal. Each hostile value below holds a right-to-left override, an escape
+# sequence or a newline, and none may reach the terminal raw.
+
+RLO = "\u202e"
+EVIL_NAME = f"evil{RLO}exe.txt"
+EVIL_STATUS = "run\x1b[31mning"
+
+
+def _clean(text: str) -> None:
+    """``text`` holds no character ``_printable`` escapes, line breaks aside."""
+    assert _raw_controls(text) == [], text
+    assert RLO not in text and "\x1b" not in text
+
+
+def test_table_escapes_every_cell_but_the_header() -> None:
+    table = _cli._table(("ID", "NAME"), [("vm-\x1b[2J1", "a\nforged  row"), ("vm-2", EVIL_NAME)])
+    _clean(table)
+    assert table.splitlines() == [
+        "ID             NAME",
+        "vm-\\u001b[2J1  a\\u000aforged  row",
+        "vm-2           evil\\u202eexe.txt",
+    ]
+
+
+HOSTILE_COMPUTERS = [
+    {"id": "vm-\u202e1", "name": EVIL_NAME, "status": EVIL_STATUS, "os": "linux"},
+    {"id": "vm-2\nvm-forged  x  running", "name": "scratch", "status": "stopped", "os": "linux"},
+]
+
+
+def _escaped_rows(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("  ")]
+
+
+@respx.mock
+def test_you_have_listing_escapes_each_value_and_keeps_its_own_newlines() -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=HOSTILE_COMPUTERS))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._resolve(_cli._client(), "nope")
+    shown = str(caught.value.code)
+    _clean(shown)
+    # One real line per computer: a newline in an id forges none.
+    assert _escaped_rows(shown) == [
+        "  vm-\\u202e1  evil\\u202eexe.txt  run\\u001b[31mning",
+        "  vm-2\\u000avm-forged  x  running  scratch  stopped",
+    ]
+    assert shown.startswith("mandala-py: no computer named 'nope'. You have:\n")
+    # --json's message keeps the values as they are: JSON escapes them.
+    assert caught.value.message == (
+        "no computer named 'nope'. You have:\n"
+        f"  vm-{RLO}1  {EVIL_NAME}  {EVIL_STATUS}\n"
+        "  vm-2\nvm-forged  x  running  scratch  stopped"
+    )
+
+
+@respx.mock
+def test_known_computers_listing_of_an_incomplete_fleet_is_escaped() -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(200, json=HOSTILE_COMPUTERS, headers={"X-GC-Incomplete": "1"})
+    )
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._resolve(_cli._client(), "nope")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "Known computers:\n" in shown
+    assert len(_escaped_rows(shown)) == 2
+    assert shown.endswith("\nretry when every host is reachable")
+
+
+@respx.mock
+def test_ambiguous_name_escapes_the_ids() -> None:
+    twins = [
+        {"id": "vm-\x1b]0;x\x07", "name": "scratch", "status": "running"},
+        {"id": f"vm-{RLO}3", "name": "scratch", "status": "running"},
+    ]
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=twins))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._resolve(_cli._client(), "scratch")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown.endswith("use an id: vm-\\u001b]0;x\\u0007, vm-\\u202e3")
+    assert caught.value.reason == "ambiguous_computer"
+
+
+@respx.mock
+def test_a_refusal_under_json_reports_the_values_as_they_are(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=HOSTILE_COMPUTERS))
+    assert _cli.main(["ssh-access", "nope", "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "not_found"
+    assert f"  vm-{RLO}1  {EVIL_NAME}  {EVIL_STATUS}\n" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "want"),
+    [
+        ({"status": "running", "os": "windows"}, "evil\\u202eexe.txt is a Windows computer"),
+        ({"status": EVIL_STATUS, "os": "linux"}, "evil\\u202eexe.txt is run\\u001b[31mning"),
+        ({"status": "running", "os": "linux"}, "evil\\u202eexe.txt has no terminal endpoint"),
+    ],
+)
+@respx.mock
+def test_terminal_refusals_escape_the_computer(payload: dict, want: str) -> None:
+    row = {**payload, "id": "vm-9", "name": EVIL_NAME}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["terminal", "vm-9"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert want in shown
+
+
+SECRET_ROW = {
+    "id": f"csec-{RLO}1",
+    "name": f"OPENAI{RLO}KEY",
+    "workspace_id": "wsp-\x1b[2J",
+    "revision_id": "csr-\nforged",
+    "created_at": "2026-09-20T12:00:00Z",
+    "updated_at": "2026-09-20T12:00:00Z\x1b[31m",
+    "last_used_at": f"2026-09-21{RLO}",
+}
+SECRETS_LISTING = {
+    "secrets": [SECRET_ROW],
+    "delivery": True,
+    "limits": {
+        "name_max_chars": 60,
+        "value_max_bytes": 4096,
+        "active_per_account": 100,
+        "created_per_account": 1000,
+    },
+}
+WEBHOOK_ROW = {
+    "id": "whk-\x1b[2J",
+    "url": f"https://ci.example.com/{RLO}moc.live",
+    "description": "CI",
+    "events": ["process.exited", f"computer{RLO}.ready"],
+    "computers": [],
+    "enabled": False,
+    "disabled_reason": "fail\ning",
+    "disabled_at": "2026-09-02T00:00:00.000Z",
+    "last_success_at": None,
+    "last_failure_at": None,
+    "last_status": 503,
+    "workspace_id": None,
+    "created_at": "2026-09-01T11:00:00.000Z",
+    "updated_at": "2026-09-02T00:00:00.000Z",
+}
+DELIVERY_ROW = {
+    "id": "whd-1",
+    "event_type": f"process{RLO}.exited",
+    "computer": "vm-\x1b[2J",
+    "cursor": "c",
+    "state": "exhausted",
+    "attempts": 8,
+    "next_at": None,
+    "attempted_at": "2026-09-02T04:00:00.000Z",
+    "last_status": None,
+    "last_error": "timeout\nwhd-2  delivered  1  forged",
+    "delivered_at": None,
+    "created_at": "2026-09-01T12:00:00.000Z",
+}
+SSH_KEY_ROW = {
+    "id": f"sshk-{RLO}1",
+    "name": f"laptop{RLO}\x1b[31m",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGqsBlqrbipXh/7n81gKS46IyjJY7nVv8mGtIAE+v76w",
+    "fingerprint": "SHA256:\x1b[2Jx",
+    "key_type": "ssh-ed25519",
+    "created_at": "2026-09-16T12:00:00Z",
+    "last_used_at": "2026-09-17\n",
+}
+API_KEY_ROW = {
+    **HOSTILE_KEY,
+    "id": f"key-{RLO}1",
+    "last_used_at": "2026-09-21T00:00:00Z\x1b[2J",
+    "workspace_id": f"wsp-{RLO}\x1b[31m",
+    "minted_by_key_id": "key-\n2",
+}
+WORKSPACE_ROW = {"id": f"wsp-{RLO}1", "name": "acme", "created_at": "2026-09-01\x1b[2J"}
+MEMBER_ROW = {**WSP_MEMBERS[0], "user_id": f"usr-{RLO}1", "accepted_at": "2026-09-02\n\x1b[31m"}
+
+
+@pytest.mark.parametrize(
+    ("argv", "method", "path", "answer", "want", "lines"),
+    [
+        (
+            ["secrets", "list"],
+            "GET",
+            "/secrets",
+            SECRETS_LISTING,
+            [
+                "csec-\\u202e1",
+                "OPENAI\\u202eKEY",
+                "wsp-\\u001b[2J",
+                "2026-09-21\\u202e",
+                "2026-09-20T12:00:00Z\\u001b[31m",
+            ],
+            2,
+        ),
+        (
+            ["webhooks", "list"],
+            "GET",
+            "/webhooks",
+            [WEBHOOK_ROW],
+            [
+                "whk-\\u001b[2J",
+                "off (fail\\u000aing)",
+                "process.exited,computer\\u202e.ready",
+                "https://ci.example.com/\\u202emoc.live",
+            ],
+            2,
+        ),
+        (
+            ["webhooks", "deliveries", "whk-1"],
+            "GET",
+            "/webhooks/whk-1/deliveries",
+            [DELIVERY_ROW],
+            ["process\\u202e.exited", "vm-\\u001b[2J", "timeout\\u000awhd-2  delivered"],
+            2,
+        ),
+        (
+            ["ssh-key", "list"],
+            "GET",
+            "/ssh-keys",
+            [SSH_KEY_ROW],
+            [
+                "sshk-\\u202e1",
+                "SHA256:\\u001b[2Jx",
+                "2026-09-17\\u000a",
+                "laptop\\u202e\\u001b[31m",
+            ],
+            2,
+        ),
+        (
+            ["api-keys", "list"],
+            "GET",
+            "/api-keys",
+            [API_KEY_ROW],
+            [
+                "key-\\u202e1",
+                "2026-09-21T00:00:00Z\\u001b[2J",
+                "(wsp-\\u202e\\u001b[31m)",
+                "key-\\u000a2",
+            ],
+            2,
+        ),
+        (
+            ["workspaces", "list"],
+            "GET",
+            "/workspaces",
+            [WORKSPACE_ROW],
+            ["wsp-\\u202e1", "2026-09-01\\u001b[2J"],
+            2,
+        ),
+        (
+            ["workspaces", "members", "wsp-1"],
+            "GET",
+            "/workspaces/wsp-1/members",
+            [MEMBER_ROW],
+            ["usr-\\u202e1", "2026-09-02\\u000a\\u001b[31m"],
+            2,
+        ),
+    ],
+)
+@respx.mock
+def test_listings_escape_every_cell(
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    method: str,
+    path: str,
+    answer: object,
+    want: list[str],
+    lines: int,
+) -> None:
+    respx.route(method=method, url=f"{BASE}{path}").mock(
+        return_value=httpx.Response(200, json=answer)
+    )
+    assert _cli.main(argv) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert len(out.splitlines()) == lines  # the header and the one row: nothing forged
+    for escaped in want:
+        assert escaped in out
+
+
+@respx.mock
+def test_secrets_set_and_rm_escape_the_line_they_print(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import sys
+
+    class Stdin(io.TextIOWrapper):
+        def isatty(self) -> bool:
+            return False
+
+    respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(200, json=SECRETS_LISTING))
+    respx.put(f"{BASE}/secrets/{SECRET_ROW['id']}").mock(
+        return_value=httpx.Response(200, json=SECRET_ROW)
+    )
+    respx.post(f"{BASE}/secrets").mock(return_value=httpx.Response(201, json=SECRET_ROW))
+    respx.delete(f"{BASE}/secrets/{SECRET_ROW['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    monkeypatch.setattr(sys, "stdin", Stdin(io.BytesIO(b"value\n"), encoding="utf-8"))
+    assert _cli.main(["secrets", "set", "OPENAI_KEY"]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out == "stored OPENAI\\u202eKEY  csec-\\u202e1  revision csr-\\u000aforged\n"
+    assert _cli.main(["secrets", "rm", SECRET_ROW["id"]]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out == "deleted OPENAI\\u202eKEY  csec-\\u202e1\n"
+
+
+@respx.mock
+def test_api_keys_create_escapes_the_id_it_reports(capsys: pytest.CaptureFixture[str]) -> None:
+    created = {**API_KEY_ROW, "raw": "com_" + "ab" * 24}
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=created))
+    assert _cli.main(["api-keys", "create"]) == 0
+    out, err = capsys.readouterr()
+    assert out == created["raw"] + "\n"
+    _clean(err)
+    assert err.count("\n") == 1
+    assert err.startswith("mandala-py: created key-\\u202e1 (")
+    assert "(wsp-\\u202e\\u001b[31m))" in err
+
+
+@respx.mock
+def test_ssh_key_add_escapes_the_line_it_prints(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    pub = tmp_path / "id.pub"
+    pub.write_text(SSH_KEY_ROW["public_key"] + "\n")
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=SSH_KEY_ROW))
+    assert _cli.main(["ssh-key", "add", str(pub)]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out == "added sshk-\\u202e1  SHA256:\\u001b[2Jx  laptop\\u202e\\u001b[31m\n"
+
+
+@respx.mock
+def test_ssh_access_escapes_the_name_and_the_hosts_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row = {"id": "vm-9", "name": EVIL_NAME, "status": "running"}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "computer": "vm-9",
+                "enabled": True,
+                "available": True,
+                "pending": False,
+                "key_count": 1,
+                "keys_pushed": 0,
+                "error": "push failed\nSSH is on for prod",
+            },
+        )
+    )
+    assert _cli.main(["ssh-access", "vm-9"]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out.splitlines() == [
+        "SSH is on for evil\\u202eexe.txt",
+        "  keys: 0 of 1 delivered",
+        "  error: push failed\\u000aSSH is on for prod",
+    ]
+
+
+@pytest.mark.parametrize("kind", ["browser-proxy", "egress-proxy"])
+@respx.mock
+def test_proxy_get_escapes_the_name_server_and_ids(
+    capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    field = kind.replace("-", "_")
+    proxy: dict[str, object] = {
+        "server": f"http://proxy.example.com:3128/{RLO}",
+        "credentials_secret_id": "csec-\x1b[2J",
+    }
+    if kind == "browser-proxy":
+        proxy["bypass"] = [f"a{RLO}.com", "b\n.com"]
+    row = {"id": "vm-9", "name": EVIL_NAME, "status": "running", field: proxy}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    assert _cli.main([kind, "get", "vm-9"]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out.startswith("evil\\u202eexe.txt: ")
+    assert "http://proxy.example.com:3128/\\u202e" in out
+    assert "  credentials: secret csec-\\u001b[2J" in out
+    if kind == "browser-proxy":
+        assert "  bypass: a\\u202e.com, b\\u000a.com" in out
+
+
+@respx.mock
+def test_secrets_rm_ambiguity_escapes_the_secret_it_names() -> None:
+    by_name = {**SECRET_ROW, "id": "csec-\u202ea", "name": "CSEC-B"}
+    by_id = {**SECRET_ROW, "id": "csec-b", "name": "other"}
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(200, json={**SECRETS_LISTING, "secrets": [by_name, by_id]})
+    )
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["secrets", "rm", "csec-b"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "is both a name (CSEC-B, csec-\\u202ea) and another secret's id" in shown
+    assert caught.value.reason == "ambiguous_secret"
+
+
+@pytest.mark.parametrize("kind", ["browser-proxy", "egress-proxy"])
+@respx.mock
+def test_proxy_set_refusal_escapes_the_current_server_and_credentials(kind: str) -> None:
+    proxy = {"server": "http://old.example.com:3128/\u202e", "credentials_secret_id": "csec-\n1"}
+    row = {"id": "vm-9", "name": "dev", "status": "running", kind.replace("-", "_"): proxy}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main([kind, "set", "vm-9", "http://new.example.com:3128"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "credentials (csec-\\u000a1) are for http://old.example.com:3128/\\u202e," in shown
