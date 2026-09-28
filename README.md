@@ -3407,9 +3407,10 @@ earlier version of the CLI wrote under such a name stays in `~/.ssh/config`
 until you run `mandala-py ssh-config <computer> --write` again for that
 computer. To find one, read the `Host` line after each
 `# >>> mandala computer <id> >>>` marker in `~/.ssh/config`, and run `--write`
-again for any whose `Host` is a hostname, an IP address, another computer's id,
-or a name another computer also has. For a computer that no longer exists,
-delete its block, markers included.
+again for any whose `Host` is a hostname, an IP address, a bare number,
+`localhost`, `mandala-gateway`, another computer's id, or a name another
+computer also has. For a computer that no longer exists, delete its block,
+markers included.
 
 In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
 Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also

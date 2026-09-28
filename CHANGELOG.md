@@ -78,9 +78,10 @@ This is the summary you read to decide whether to upgrade.
   `mandala-py ssh-config <computer> --write` again for that computer. To
   find one, read the `Host` line after each
   `# >>> mandala computer <id> >>>` marker in `~/.ssh/config`, and run
-  `--write` again for any whose `Host` is a hostname, an IP address, another
-  computer's id, or a name another computer also has (for a computer that
-  no longer exists, delete its block, markers included).
+  `--write` again for any whose `Host` is a hostname, an IP address, a bare
+  number, `localhost`, `mandala-gateway`, another computer's id, or a name
+  another computer also has (for a computer that no longer exists, delete
+  its block, markers included).
 
 - **`mandala-py whoami` escapes every field it prints**, not only the names
   and email: the user, account, workspace and key ids, the account's status
