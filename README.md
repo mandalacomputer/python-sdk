@@ -3391,6 +3391,17 @@ scp report.csv dev:/home/user/
 sftp dev
 ```
 
+The block is written under the computer's id instead of its name when the name
+cannot be a `Host` (it holds a space or a `*`, say). It is too, with a note on
+stderr saying why, when another computer has the same name, when the list of
+your computers could not be read in full to check that, or when ssh would also
+read the name as another destination: a hostname such as `github.com` or
+`corp.internal`, an IP address in any form (`10.5` is `10.0.0.5`), a bare
+number, `localhost`, the gateway's `mandala-gateway`, or another computer's id,
+compared without regard to case. A block under such a name would take over
+every connection you make there. Connect with `ssh <id>` then (`--json`'s
+`host` says which); a dotted name such as `ubuntu-24.04` is kept.
+
 In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
 Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also
 takes the one-liner below, but the entry it writes carries no pinned gateway
