@@ -643,7 +643,7 @@ def test_a_request_id_is_escaped_in_text(capsys: pytest.CaptureFixture[str]) -> 
     assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
     lines = text_failure(capsys)
     assert "\x1b" not in lines[1]
-    assert lines[1].endswith("; request id req\\x1b[2J")
+    assert lines[1].endswith("; request id req\\u001b[2J")
 
 
 @respx.mock
@@ -664,7 +664,7 @@ def test_a_text_failure_message_cannot_forge_the_recovery_line(
     key = route.calls.last.request.headers["Idempotency-Key"]
     lines = text_failure(capsys)
     assert len(lines) == 2
-    assert lines[0] == "mandala-py: down\\x0amandala-py: idempotency key forged\\x1b[2J"
+    assert lines[0] == "mandala-py: down\\u000amandala-py: idempotency key forged\\u001b[2J"
     assert all("\x1b" not in line for line in lines)
     assert lines[1] == f"mandala-py: idempotency key {key}; request id r1"
 

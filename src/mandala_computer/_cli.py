@@ -1656,22 +1656,25 @@ def _secrets_parser(sub: Any) -> None:
 def _printable(s: str) -> str:
     """``s`` with each control character written out as a visible escape.
 
-    C0, DEL, C1, the two Unicode line separators and the bidi embeddings,
-    overrides and isolates (U+202A-U+202E, U+2066-U+2069) become a ``\\x`` or
-    ``\\u`` escape (a newline prints as ``\\x0a``, ESC as ``\\x1b``, U+2028 as
-    ``\\u2028``), with no quotes around the result; anything else is left
-    alone. For names somebody chose (a key, a workspace, a person, an
-    account), printed to a terminal where a newline would forge a row, an
-    escape sequence would drive the terminal and a right-to-left override
-    would visually reverse the rest of the row. ``--json`` output needs none of
-    this: JSON escapes them already.
+    C0, DEL, C1, the bidi marks, embeddings, overrides and isolates (U+061C,
+    U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) and the two Unicode line
+    separators (U+2028, U+2029) each become a ``\\uXXXX`` escape with four
+    lowercase hex digits (a newline prints as ``\\u000a``, ESC as ``\\u001b``,
+    U+202E as ``\\u202e``), with no quotes around the result; anything else is
+    left alone. That is the TypeScript CLI's set and spelling, plus the two
+    line separators, which it leaves alone. For names somebody chose (a key, a
+    workspace, a person, an account), printed to a terminal where a newline
+    would forge a row, an escape sequence would drive the terminal and a
+    right-to-left override would visually reverse the rest of the row. The
+    escapes hold no control character, so escaping twice changes nothing.
+    ``--json`` output needs none of this: JSON escapes them already.
     """
-    return _CONTROL_CHARS.sub(
-        lambda m: f"\\x{ord(m[0]):02x}" if ord(m[0]) < 0x100 else f"\\u{ord(m[0]):04x}", s
-    )
+    return _CONTROL_CHARS.sub(lambda m: f"\\u{ord(m[0]):04x}", s)
 
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_CONTROL_CHARS = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
 
 
 def _key_scope(k: ApiKey) -> str:
@@ -1703,18 +1706,19 @@ def _whoami_person_account(w: Whoami) -> list[str]:
     plan from a workspace-scoped key (it is the credential handed to an end
     customer), so for one of those an empty field is left out and named at the
     end of its line rather than printed as ``<>``, ``(unnamed)`` or ``plan ,``.
-    An unscoped answer prints exactly as it always has.
+    An unscoped answer prints exactly as it always has. The lines are raw:
+    :func:`_whoami_lines` escapes each one whole.
     """
     user, account = w.user, w.account
     if w.workspace is None:
         # Never null for an unscoped key; "?" rather than "None" if it ever is.
-        email = _printable(user.email or "?")
-        who = f"{_printable(user.name)} <{email}>" if user.name else f"<{email}>"
+        email = user.email or "?"
+        who = f"{user.name} <{email}>" if user.name else f"<{email}>"
         return [
             f"{who} ({user.id})",
             (
-                f"Account: {_printable(account.name or '(unnamed)')} ({account.id}), "
-                f"plan {_printable(account.plan or '?')}, {account.status}"
+                f"Account: {account.name or '(unnamed)'} ({account.id}), "
+                f"plan {account.plan or '?'}, {account.status}"
             ),
         ]
 
@@ -1722,13 +1726,13 @@ def _whoami_person_account(w: Whoami) -> list[str]:
         return f" ({' and '.join(fields)} withheld from a workspace-scoped key)" if fields else ""
 
     if user.name or user.email:
-        name = f"{_printable(user.name)} " if user.name else ""
-        email = f"<{_printable(user.email)}> " if user.email else ""
+        name = f"{user.name} " if user.name else ""
+        email = f"<{user.email}> " if user.email else ""
         person = f"{name}{email}({user.id})"
     else:
         person = f"User {user.id}"
-    acct = f"{_printable(account.name)} ({account.id})" if account.name else account.id
-    plan = f", plan {_printable(account.plan)}" if account.plan else ""
+    acct = f"{account.name} ({account.id})" if account.name else account.id
+    plan = f", plan {account.plan}" if account.plan else ""
     return [
         person + withheld([f for f, v in (("name", user.name), ("email", user.email)) if not v]),
         f"Account: {acct}{plan}, {account.status}"
@@ -1737,10 +1741,14 @@ def _whoami_person_account(w: Whoami) -> list[str]:
 
 
 def _whoami_lines(w: Whoami) -> list[str]:
+    """The lines of ``whoami``, each escaped whole with :func:`_printable`.
+
+    Every field comes from the platform's answer, the ids, status and role as
+    much as the names a person chose: escaping the whole line, as the
+    TypeScript CLI does, leaves no field to forget.
+    """
     scope = (
-        f"workspace {_printable(w.workspace.name)} ({w.workspace.id})"
-        if w.workspace
-        else "the whole account"
+        f"workspace {w.workspace.name} ({w.workspace.id})" if w.workspace else "the whole account"
     )
     lines = [
         *_whoami_person_account(w),
@@ -1752,10 +1760,9 @@ def _whoami_lines(w: Whoami) -> list[str]:
     else:
         can = "can" if w.key.manage_keys else "cannot"
         lines.append(
-            f"Key: {_printable(w.key.name or '(unnamed)')} ({w.key.id}, {_printable(w.key.prefix)}); "
-            f"{can} manage API keys"
+            f"Key: {w.key.name or '(unnamed)'} ({w.key.id}, {w.key.prefix}); {can} manage API keys"
         )
-    return lines
+    return [_printable(line) for line in lines]
 
 
 def _cmd_whoami(args: argparse.Namespace) -> int:
