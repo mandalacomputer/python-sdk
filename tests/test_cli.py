@@ -2437,3 +2437,299 @@ def test_proxy_set_refusal_escapes_the_current_server_and_credentials(kind: str)
     shown = str(caught.value.code)
     _clean(shown)
     assert "credentials (csec-\\u000a1) are for http://old.example.com:3128/\\u202e," in shown
+
+
+# --- ssh, ssh-config and the terminal: the id OpenSSH is handed, and every
+# line around it --------------------------------------------------------------
+#
+# A computer id is OpenSSH's destination and HostKeyAlias, and a ~/.ssh/config
+# block's HostName: one holding a newline would add a directive (a ProxyCommand
+# runs locally), and one starting with "-" would be read as an option. It is
+# refused before anything is printed, written or run. The names, key labels and
+# host errors around it are escaped like every other value.
+
+SSH_FINGERPRINT = "SHA256:7OR2azJrv1nm44ploDfzY03D/74wXZGn8Qj4fabJDXs"
+SSH_KEY = {**SSH_KEY_ROW, "id": "sshk-1", "name": "laptop", "fingerprint": SSH_FINGERPRINT}
+SSH_ON = {
+    "computer": "vm-9",
+    "enabled": True,
+    "available": True,
+    "pending": False,
+    "key_count": 1,
+    "keys_pushed": 1,
+    "error": None,
+}
+SSH_UNASKED = {**SSH_ON, "enabled": False, "available": None, "key_count": 0, "keys_pushed": 0}
+
+
+@pytest.fixture
+def ssh_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A private HOME with a public key in it, and an ssh that must never run."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MANDALA_SSH_GATEWAY", raising=False)
+    monkeypatch.delenv("MANDALA_SSH_GATEWAY_KNOWN_HOSTS", raising=False)
+    monkeypatch.setattr(_cli, "LOCAL_WINDOWS", False)
+    monkeypatch.setattr(
+        _cli.shutil, "which", lambda name: "/usr/bin/ssh" if name == "ssh" else None
+    )
+
+    def never(argv: list[str]) -> int:
+        raise AssertionError(f"ssh was run: {argv}")
+
+    monkeypatch.setattr(_cli, "_exec", never)
+    (tmp_path / "id.pub").write_text(SSH_KEY["public_key"] + " me@laptop\n")
+    return tmp_path
+
+
+def _one_computer(computer_id: str = "vm-9", name: str = "box") -> None:
+    row = {"id": computer_id, "name": name, "status": "running", "os": "linux"}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+
+
+UNSSHABLE_IDS = [
+    ("vm-1\n  ProxyCommand touch /tmp/x", "vm-1\\u000a  ProxyCommand touch /tmp/x"),
+    (f"vm-1\x1b[2J{RLO}", "vm-1\\u001b[2J\\u202e"),
+    ("-oProxyCommand=x", "-oProxyCommand=x"),
+    ("vm 1", "vm 1"),
+]
+
+
+def _refused_id(caught: pytest.ExceptionInfo[SystemExit], shown_id: str) -> None:
+    assert isinstance(caught.value, _cli._Failure)
+    assert caught.value.reason == "invalid_response"
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "\n" not in shown
+    assert shown == f"mandala-py: the platform returned a computer id SSH cannot use: {shown_id}"
+
+
+@pytest.mark.parametrize(("computer_id", "shown_id"), UNSSHABLE_IDS)
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_refuses_an_id_ssh_cannot_be_handed(
+    ssh_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    computer_id: str,
+    shown_id: str,
+    write: bool,
+) -> None:
+    _one_computer(computer_id)
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh-config", "box", *(["--write"] if write else [])])
+    _refused_id(caught, shown_id)
+    assert capsys.readouterr() == ("", "")  # no snippet, and no note about it
+    assert not (ssh_home / ".ssh" / "config").exists()
+    assert not (ssh_home / ".mandala").exists()
+
+
+@respx.mock
+def test_ssh_config_json_refuses_an_id_ssh_cannot_be_handed(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    _one_computer("vm-1\n  ProxyCommand touch /tmp/x")
+    assert _cli.main(["ssh-config", "box", "--write", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert json.loads(err)["error"]["code"] == "invalid_response"
+    assert not (ssh_home / ".ssh" / "config").exists()
+
+
+@pytest.mark.parametrize(("computer_id", "shown_id"), UNSSHABLE_IDS)
+@respx.mock
+def test_ssh_refuses_an_id_ssh_cannot_be_handed(
+    ssh_home: Path, computer_id: str, shown_id: str
+) -> None:
+    _one_computer(computer_id)
+    # Answered as a computer that could be connected to, so only the id stops it.
+    respx.get(url__regex=r".*/ssh$").mock(return_value=httpx.Response(200, json=SSH_ON))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[SSH_KEY]))
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh", "box"])
+    _refused_id(caught, shown_id)
+
+
+@pytest.mark.parametrize(("computer_id", "shown_id"), UNSSHABLE_IDS)
+@respx.mock
+def test_ssh_setup_refuses_an_id_ssh_cannot_be_handed_before_changing_anything(
+    ssh_home: Path, computer_id: str, shown_id: str
+) -> None:
+    _one_computer(computer_id)
+    respx.get(url__regex=r".*/ssh$").mock(return_value=httpx.Response(200, json=SSH_UNASKED))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    add = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=SSH_KEY))
+    put = respx.put(url__regex=r".*/ssh$").mock(return_value=httpx.Response(200, json=SSH_ON))
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh", "--setup", "box", "--key", str(ssh_home / "id.pub")])
+    _refused_id(caught, shown_id)
+    assert not add.called and not put.called
+
+
+def _setup(
+    ssh_home: Path,
+    *,
+    name: str = "box",
+    before: dict = SSH_UNASKED,
+    after: dict = SSH_ON,
+    key: dict = SSH_KEY,
+) -> None:
+    _one_computer(name=name)
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=before))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=key))
+    respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=after))
+
+
+@respx.mock
+def test_ssh_setup_escapes_the_hosts_refusal(ssh_home: Path) -> None:
+    _setup(ssh_home, after={**SSH_ON, "error": "refused\nSSH is on for prod\x1b[2J"})
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["ssh", "--setup", "vm-9", "--key", str(ssh_home / "id.pub")])
+    assert caught.value.reason == "ssh_refused"
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown == (
+        "mandala-py: the computer's host refused the SSH setting: "
+        "refused\\u000aSSH is on for prod\\u001b[2J"
+    )
+
+
+@respx.mock
+def test_ssh_setup_escapes_the_lines_it_prints(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _setup(
+        ssh_home,
+        name="box\x1b[31m",
+        after={**SSH_ON, "pending": True},
+        key={**SSH_KEY, "name": f"laptop{RLO}\n"},
+    )
+    assert _cli.main(["ssh", "--setup", "vm-9", "--key", str(ssh_home / "id.pub")]) == 0
+    out, err = capsys.readouterr()
+    _clean(out)
+    _clean(err)
+    assert out == (
+        f"key {SSH_FINGERPRINT} (laptop\\u202e\\u000a) registered\n"
+        "SSH is on for box\\u001b[31m\n"
+        "connect with: mandala-py ssh vm-9\n"
+    )
+    assert err.startswith("mandala-py: box\\u001b[31m has not received the setting yet;")
+    assert err.count("\n") == 1
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ({**SSH_UNASKED, "available": False}, SSH_ON),  # refused before anything changes
+        (SSH_UNASKED, {**SSH_ON, "available": False}),  # refused after the switch
+    ],
+)
+@respx.mock
+def test_ssh_setup_escapes_a_computer_that_predates_ssh(
+    ssh_home: Path, before: dict, after: dict
+) -> None:
+    _setup(ssh_home, name=EVIL_NAME, before=before, after=after)
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["ssh", "--setup", "vm-9", "--key", str(ssh_home / "id.pub")])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown.startswith("mandala-py: evil\\u202eexe.txt was made from a template")
+
+
+@pytest.mark.parametrize(
+    ("access", "want"),
+    [
+        ({**SSH_ON, "available": False}, "mandala-py: evil\\u202eexe.txt was made from"),
+        ({**SSH_ON, "enabled": False}, "mandala-py: SSH is off for evil\\u202eexe.txt;"),
+    ],
+)
+@respx.mock
+def test_ssh_refusals_escape_the_computer(ssh_home: Path, access: dict, want: str) -> None:
+    _one_computer(name=EVIL_NAME)
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=access))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[SSH_KEY]))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["ssh", "vm-9"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown.startswith(want)
+
+
+@respx.mock
+def test_ssh_config_escapes_a_shared_name_in_its_note(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    twins = [
+        {"id": "vm-9", "name": f"dev{RLO}\x1b[2J", "status": "running", "os": "linux"},
+        {"id": "vm-7", "name": f"dev{RLO}\x1b[2J", "status": "running", "os": "linux"},
+    ]
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=twins))
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    out, err = capsys.readouterr()
+    _clean(err)
+    assert err == (
+        "mandala-py: another computer is also named dev\\u202e\\u001b[2J; using Host vm-9 instead\n"
+    )
+    assert out.endswith("connect with: ssh vm-9\n")
+
+
+@respx.mock
+def test_wait_for_proxy_escapes_a_stopped_computers_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row = {"id": "vm-9", "name": f"box\x1b[2J{RLO}", "status": "stopped", "running_ram_mb": 0}
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    c = _cli._client().computers.get("vm-9")
+    _cli._wait_for_proxy(c)
+    err = capsys.readouterr().err
+    _clean(err)
+    assert err == (
+        "box\\u001b[2J\\u202e is stopped: the change is stored and applied as it starts\n"
+    )
+
+
+def test_terminal_unreachable_escapes_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    import websockets.sync.client
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError(f"down\x1b[2J{RLO}\nforged")
+
+    monkeypatch.setattr(websockets.sync.client, "connect", refuse)
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._connect("wss://terminal.test")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown == ("mandala-py: could not reach the terminal: down\\u001b[2J\\u202e\\u000aforged")
+
+
+def test_terminal_connection_failure_escapes_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    from websockets.exceptions import WebSocketException
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    class FakeConnection:
+        def recv(self) -> str:
+            raise WebSocketException(f"closed: \x1b]0;x\x07{RLO}\nforged")
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._interact("wss://terminal.test")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown == (
+        "mandala-py: terminal connection failed: closed: \\u001b]0;x\\u0007\\u202e\\u000aforged"
+    )

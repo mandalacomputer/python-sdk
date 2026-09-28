@@ -2244,12 +2244,30 @@ def _cmd_ssh(parsed: _SshWords) -> int:
     return _ssh_connect(target, parsed.rest)
 
 
+#: A computer id OpenSSH can be handed: its destination, its ``HostKeyAlias``
+#: and a ``~/.ssh/config`` ``Host`` / ``HostName``. Every id the platform mints
+#: matches; anything else (a newline, a space, a leading ``-``) would be read by
+#: ssh as another directive or option, so it is refused, not escaped.
+_SSH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _ssh_id(c: Computer) -> str:
+    """``c``'s id, refused unless it is one OpenSSH reads as a single host."""
+    if not _SSH_ID.fullmatch(c.id):
+        _die(
+            lambda s: f"the platform returned a computer id SSH cannot use: {s(c.id)}",
+            "invalid_response",
+        )
+    return c.id
+
+
 def _ssh_connect(target: str, extra: list[str]) -> int:
     ssh = _ssh_binary()
     gw = _openssh.gateway()
     quoted = shlex.quote(target)
     with _client() as client:
         c = _resolve(client, target)
+        computer_id = _ssh_id(c)
         label = c.name or c.id
         access = c.ssh_access()
         if access.available is False:
@@ -2273,7 +2291,7 @@ def _ssh_connect(target: str, extra: list[str]) -> int:
             )
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
-    return _exec(_openssh.ssh_argv(ssh, c.id, gw, known_hosts, extra, windows=LOCAL_WINDOWS))
+    return _exec(_openssh.ssh_argv(ssh, computer_id, gw, known_hosts, extra, windows=LOCAL_WINDOWS))
 
 
 def _key_path(given: str | None) -> Path:
@@ -2292,8 +2310,10 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
     gw = _openssh.gateway()
     with _client() as client:
         c = _resolve(client, target)
-        # Before anything is registered or switched: a computer that cannot run
-        # SSH should cost the caller nothing but this read.
+        # Before anything is registered or switched: an id ssh cannot be
+        # handed, or a computer that cannot run SSH, should cost the caller
+        # nothing but this read.
+        _ssh_id(c)
         if c.ssh_access().available is False:
             _die(
                 lambda s: (
@@ -2438,6 +2458,9 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     with _client() as client:
         computers = client.computers.list(allow_partial=True)
         c = _resolve(client, args.target, computers)
+    # Before a byte of the block is printed or written: the id is its HostName
+    # and HostKeyAlias, and its Host when the name cannot be one.
+    computer_id = _ssh_id(c)
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
     # A name two computers share would give two blocks one Host, and ssh would
@@ -2446,7 +2469,7 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # unique, so the id is used then too.
     unchecked = not computers.is_complete
     shared = bool(c.name) and any(o.name == c.name and o.id != c.id for o in computers)
-    host = c.id if unchecked or shared else _openssh.host_alias(c.name, c.id)
+    host = computer_id if unchecked or shared else _openssh.host_alias(c.name, computer_id)
     if unchecked:
         print(
             f"{PROG}: could not check other computers' names; using Host {_shown(c.id)} instead",
@@ -2458,7 +2481,7 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
             f"using Host {_shown(c.id)} instead",
             file=sys.stderr,
         )
-    snippet = _openssh.config_snippet(host, c.id, gw, known_hosts)
+    snippet = _openssh.config_snippet(host, computer_id, gw, known_hosts)
     path = Path.home() / ".ssh" / "config"
     changed = _openssh.write_config(path, snippet) if args.write else None
     if args.json:

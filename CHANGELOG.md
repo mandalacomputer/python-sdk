@@ -47,6 +47,15 @@ This is the summary you read to decide whether to upgrade.
   reversing, driving or forging part of the terminal's output. `--json`
   output is unchanged.
 
+- **`mandala-py ssh`, `ssh --setup` and `ssh-config` refuse a computer id
+  OpenSSH could misread**, rather than handing it to `ssh` or writing it into
+  `~/.ssh/config`. The id is ssh's destination and `HostKeyAlias` and the
+  block's `HostName`, so one holding a newline could have added a directive
+  such as `ProxyCommand`, and one starting with `-` would have been read as
+  an option. The refusal names the id escaped, under the `--json` error code
+  `invalid_response`, before anything is registered, printed, written or run.
+  Every id the platform issues is accepted as before.
+
 - **`mandala-py whoami` escapes every field it prints**, not only the names
   and email: the user, account, workspace and key ids, the account's status
   and the role are the platform's text too, and a control character in one
