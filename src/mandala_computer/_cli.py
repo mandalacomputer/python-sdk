@@ -75,6 +75,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -154,15 +155,41 @@ class _Failure(SystemExit):
 
     A ``SystemExit`` still, so everything that already exits on one — a test,
     a thread that ends the session — reads it exactly as before.
+
+    ``message`` is what ``--json`` reports; ``shown``, when given, is the same
+    sentence with each value from a response escaped, which is what the exit
+    prints to a terminal. See :func:`_die`.
     """
 
-    def __init__(self, message: str, reason: str) -> None:
-        super().__init__(f"{PROG}: {message}")
+    def __init__(self, message: str, reason: str, shown: str | None = None) -> None:
+        super().__init__(f"{PROG}: {message if shown is None else shown}")
         self.message = message
         self.reason = reason
 
 
-def _die(message: str, code: str = "failed") -> NoReturn:
+#: How a message spells a value from a response: ``str`` for ``--json``'s
+#: ``message``, or :func:`_shown` for the line printed to a terminal.
+_Spell = Callable[[object], str]
+
+
+def _shown(value: object) -> str:
+    """``value`` as a terminal line quotes it: escaped with :func:`_printable`."""
+    return _printable(str(value))
+
+
+def _die(message: str | Callable[[_Spell], str], code: str = "failed") -> NoReturn:
+    """Refuse with ``message``, under the ``--json`` ``error.code`` ``code``.
+
+    A message that quotes a value from a response (a computer's name, a
+    secret's id, the platform's error text) is given as a function of how to
+    spell one. The terminal line spells each value with :func:`_shown`, so a
+    name holding a newline, an escape sequence or a right-to-left override
+    cannot forge a line or drive the terminal, while the message's own
+    newlines (a listing of computers) stay real ones. ``--json`` reports the
+    values as they are, as it reports every other answer: JSON escapes them.
+    """
+    if callable(message):
+        raise _Failure(message(str), code, message(_shown))
     raise _Failure(message, code)
 
 
@@ -722,14 +749,25 @@ def _resolve(client: Client, target: str, computers: Listing[Computer] | None = 
     if len(named) == 1:
         return named[0]
     if named:
-        ids = ", ".join(c.id for c in named)
-        _die(f"{target!r} names {len(named)} computers — use an id: {ids}", "ambiguous_computer")
+        _die(
+            lambda s: (
+                f"{target!r} names {len(named)} computers — use an id: "
+                + ", ".join(s(c.id) for c in named)
+            ),
+            "ambiguous_computer",
+        )
+
+    # One row per computer; the newlines between rows are the listing's own.
+    def have(s: _Spell) -> str:
+        return "\n".join(f"  {s(c.id)}  {s(c.name)}  {s(c.status)}" for c in computers)
+
     if not computers.is_complete:
         if computers:
-            have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
             _die(
-                f"no computer named {target!r} in an incomplete fleet listing. "
-                f"Known computers:\n{have}\nretry when every host is reachable"
+                lambda s: (
+                    f"no computer named {target!r} in an incomplete fleet listing. "
+                    f"Known computers:\n{have(s)}\nretry when every host is reachable"
+                )
             )
         _die(
             f"no computer named {target!r} in an incomplete fleet listing; "
@@ -737,8 +775,7 @@ def _resolve(client: Client, target: str, computers: Listing[Computer] | None = 
         )
     if not computers:
         _die(f"no computer named {target!r}; the account has no computers", "not_found")
-    have = "\n".join(f"  {c.id}  {c.name}  {c.status}" for c in computers)
-    _die(f"no computer named {target!r}. You have:\n{have}", "not_found")
+    _die(lambda s: f"no computer named {target!r}. You have:\n{have(s)}", "not_found")
 
 
 # --- terminal --------------------------------------------------------------
@@ -752,10 +789,10 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
     vnc = c.vnc
     if vnc is None or not vnc.terminal_url:
         if c.os == "windows":
-            _die(f"{c.name} is a Windows computer; terminals are Linux-only for now")
+            _die(lambda s: f"{s(c.name)} is a Windows computer; terminals are Linux-only for now")
         if c.status not in ("running", "suspended"):
-            _die(f"{c.name} is {c.status or 'not running'} — start it, then retry")
-        _die(f"{c.name} has no terminal endpoint (server too old?)")
+            _die(lambda s: f"{s(c.name)} is {s(c.status or 'not running')} — start it, then retry")
+        _die(lambda s: f"{s(c.name)} has no terminal endpoint (server too old?)")
     url = vnc.terminal_url
     params: list[tuple[str, str]] = []
     if args.session != "main":
@@ -795,7 +832,8 @@ def _connect(url: str) -> ClientConnection:
             )
         _die(f"terminal refused: HTTP {status}")
     except OSError as e:
-        _die(f"could not reach the terminal: {e}")
+        unreachable = str(e)
+        _die(lambda s: f"could not reach the terminal: {s(unreachable)}")
     except WebSocketException:
         # Not ``str(e)``: ``InvalidURI`` includes the full URI, and
         # ``terminal_url`` carries a credential with no expiry. The
@@ -1174,7 +1212,9 @@ def _interact(url: str) -> int:
     except ConnectionClosed:
         pass
     except WebSocketException as e:
-        _die(f"terminal connection failed: {e}")
+        # The text can carry the reason the far end closed with.
+        failed = str(e)
+        _die(lambda s: f"terminal connection failed: {s(failed)}")
     except KeyboardInterrupt:
         # Reachable with a non-tty stdin, and once a stalled stdout has handed
         # the terminal back; while raw, ^C is a byte to the guest.
@@ -1376,8 +1416,15 @@ def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     Two spaces between columns and no border, which is what every tool a
     person pipes into ``awk`` prints, and the last column left ragged so a long
     URL does not pad every other row out to its width.
+
+    Every cell is escaped with :func:`_printable` before it is measured: each
+    one is the platform's text (a name somebody chose, an id, a timestamp, a
+    URL, an error), and a newline in one would forge a row, an escape sequence
+    would drive the terminal and a right-to-left override would reverse the
+    rest of the row. Escaping twice changes nothing, so a cell the caller
+    already escaped is printed as it was.
     """
-    table = [list(header), *[list(r) for r in rows]]
+    table = [list(header), *[[_printable(cell) for cell in r] for r in rows]]
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     lines = []
     for row in table:
@@ -1579,7 +1626,10 @@ def _cmd_secrets_set(args: argparse.Namespace) -> int:
     if args.json:
         _json(stored.raw)
     else:
-        print(f"stored {stored.name}  {stored.id}  revision {stored.revision_id}")
+        print(
+            f"stored {_shown(stored.name)}  {_shown(stored.id)}  "
+            f"revision {_shown(stored.revision_id)}"
+        )
     return 0
 
 
@@ -1598,8 +1648,10 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
     by_id = next((x for x in listed if x.id == name), None)
     if by_name is not None and by_id is not None and by_name.id != by_id.id:
         _die(
-            f"{name!r} is both a name ({by_name.name}, {by_name.id}) and another secret's id; "
-            "give the exact name",
+            lambda s: (
+                f"{name!r} is both a name ({s(by_name.name)}, {s(by_name.id)}) and another "
+                "secret's id; give the exact name"
+            ),
             "ambiguous_secret",
         )
     return by_name or by_id
@@ -1613,7 +1665,7 @@ def _cmd_secrets_rm(args: argparse.Namespace) -> int:
             scope = f"workspace {args.workspace}" if args.workspace else "the account-wide scope"
             _die(f"no secret named {args.name!r} in {scope}", "not_found")
         client.secrets.delete(found.id, revision_id=found.revision_id, workspace_id=args.workspace)
-    print(f"deleted {found.name}  {found.id}")
+    print(f"deleted {_shown(found.name)}  {_shown(found.id)}")
     return 0
 
 
@@ -1680,7 +1732,7 @@ _CONTROL_CHARS = re.compile(
 def _key_scope(k: ApiKey) -> str:
     if k.workspace_id is None:
         return "account-wide"
-    return f"workspace {_printable(k.workspace_name or '?')} ({k.workspace_id})"
+    return f"workspace {_printable(k.workspace_name or '?')} ({_printable(k.workspace_id)})"
 
 
 def _api_key_rows(keys: Sequence[ApiKey]) -> str:
@@ -1801,7 +1853,7 @@ def _cmd_api_keys_create(args: argparse.Namespace) -> int:
     else:
         print(created.key)
     print(
-        f"{PROG}: created {created.id} ({_printable(created.name or 'unnamed')}, "
+        f"{PROG}: created {_printable(created.id)} ({_printable(created.name or 'unnamed')}, "
         f"{_key_scope(created)}). "
         "Store the key now: it is shown once and cannot be read again.",
         file=sys.stderr,
@@ -2193,23 +2245,45 @@ def _cmd_ssh(parsed: _SshWords) -> int:
     return _ssh_connect(target, parsed.rest)
 
 
+#: A computer id OpenSSH can be handed: its destination, its ``HostKeyAlias``
+#: and a ``~/.ssh/config`` ``Host`` / ``HostName``. Every id the platform mints
+#: matches; anything else (a newline, a space, a leading ``-``) would be read by
+#: ssh as another directive or option, so it is refused, not escaped.
+_SSH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _ssh_id(c: Computer) -> str:
+    """``c``'s id, refused unless it is one OpenSSH reads as a single host."""
+    if not _SSH_ID.fullmatch(c.id):
+        _die(
+            lambda s: f"the platform returned a computer id SSH cannot use: {s(c.id)}",
+            "invalid_response",
+        )
+    return c.id
+
+
 def _ssh_connect(target: str, extra: list[str]) -> int:
     ssh = _ssh_binary()
     gw = _openssh.gateway()
     quoted = shlex.quote(target)
     with _client() as client:
         c = _resolve(client, target)
+        computer_id = _ssh_id(c)
         label = c.name or c.id
         access = c.ssh_access()
         if access.available is False:
             _die(
-                f"{label} was made from a template that predates SSH; create a new computer "
-                f"to use SSH, {_terminal_hint(target)}"
+                lambda s: (
+                    f"{s(label)} was made from a template that predates SSH; create a new "
+                    f"computer to use SSH, {_terminal_hint(target)}"
+                )
             )
         if not access.enabled:
             _die(
-                f'SSH is off for {label}; run "{PROG} ssh --setup {quoted}" to turn it on, '
-                f"{_terminal_hint(target)}"
+                lambda s: (
+                    f'SSH is off for {s(label)}; run "{PROG} ssh --setup {quoted}" to turn it '
+                    f"on, {_terminal_hint(target)}"
+                )
             )
         if not client.ssh_keys.list():
             _die(
@@ -2218,7 +2292,7 @@ def _ssh_connect(target: str, extra: list[str]) -> int:
             )
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
-    return _exec(_openssh.ssh_argv(ssh, c.id, gw, known_hosts, extra, windows=LOCAL_WINDOWS))
+    return _exec(_openssh.ssh_argv(ssh, computer_id, gw, known_hosts, extra, windows=LOCAL_WINDOWS))
 
 
 def _key_path(given: str | None) -> Path:
@@ -2237,12 +2311,16 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
     gw = _openssh.gateway()
     with _client() as client:
         c = _resolve(client, target)
-        # Before anything is registered or switched: a computer that cannot run
-        # SSH should cost the caller nothing but this read.
+        # Before anything is registered or switched: an id ssh cannot be
+        # handed, or a computer that cannot run SSH, should cost the caller
+        # nothing but this read.
+        _ssh_id(c)
         if c.ssh_access().available is False:
             _die(
-                f"{c.name or c.id} was made from a template that predates SSH; "
-                "create a new computer to use SSH"
+                lambda s: (
+                    f"{s(c.name or c.id)} was made from a template that predates SSH; "
+                    "create a new computer to use SSH"
+                )
             )
         existing = _own_key(client, fingerprint)
         if existing is None:
@@ -2264,10 +2342,16 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
     # say "SSH is on" or hand a script a success object first.
     if access.available is False:
         _die(
-            f"{label} was made from a template that predates SSH; create a new computer to use SSH"
+            lambda s: (
+                f"{s(label)} was made from a template that predates SSH; create a new computer "
+                "to use SSH"
+            )
         )
     if access.error:
-        _die(f"the computer's host refused the SSH setting: {access.error}", "ssh_refused")
+        _die(
+            lambda s: f"the computer's host refused the SSH setting: {s(access.error)}",
+            "ssh_refused",
+        )
     _openssh.ensure_known_hosts(gw, _openssh.known_hosts_path())
     command = f"{PROG} ssh {shlex.quote(target)}"
     if as_json:
@@ -2283,12 +2367,12 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
         )
     else:
         state = "already registered" if existing is not None else "registered"
-        print(f"key {registered.fingerprint} ({registered.name}) {state}")
-        print(f"SSH is on for {label}")
+        print(f"key {_shown(registered.fingerprint)} ({_shown(registered.name)}) {state}")
+        print(f"SSH is on for {_shown(label)}")
         print(f"connect with: {command}")
     if access.pending:
         print(
-            f"{PROG}: {label} has not received the setting yet; it is sent again "
+            f"{PROG}: {_shown(label)} has not received the setting yet; it is sent again "
             "automatically, and connecting sends it first",
             file=sys.stderr,
         )
@@ -2323,7 +2407,7 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
     if args.json:
         _json(key.raw)
     else:
-        print(f"added {key.id}  {key.fingerprint}  {key.name}")
+        print(f"added {_shown(key.id)}  {_shown(key.fingerprint)}  {_shown(key.name)}")
     return 0
 
 
@@ -2335,6 +2419,8 @@ def _cmd_ssh_key_rm(args: argparse.Namespace) -> int:
 
 
 def _access_lines(label: str, access: SshAccess) -> list[str]:
+    """The lines of ``ssh-access``; ``label`` and the host's error are escaped."""
+    label = _shown(label)
     lines = [f"SSH is {'on' if access.enabled else 'off'} for {label}"]
     if access.available is False:
         lines.append(
@@ -2350,7 +2436,7 @@ def _access_lines(label: str, access: SshAccess) -> list[str]:
     if access.pending:
         lines.append("  pending: the computer's host has not received the current setting yet")
     if access.error:
-        lines.append(f"  error: {access.error}")
+        lines.append(f"  error: {_shown(access.error)}")
     return lines
 
 
@@ -2368,11 +2454,45 @@ def _cmd_ssh_access(args: argparse.Namespace) -> int:
     return 0
 
 
+def _names_another_destination(name: str, computers: Collection[Computer]) -> bool:
+    """Whether ssh would also read ``name``, as a ``Host``, as some other place.
+
+    OpenSSH matches ``Host`` patterns without regard to case, so these are
+    compared lowercased: the gateway's own alias, ``localhost``, a bare number
+    (``ssh 167772165`` is 10.0.0.5), any IPv4 address in the forms the resolver
+    reads (``10.5`` is 10.0.0.5 too), a dotted name shaped like a hostname
+    (its last label empty, as in ``github.com.``, all letters like a top-level
+    domain, or an ``xn--`` one), and any listed computer's id, which is that
+    computer's Host when its own name cannot be one. A dotted name whose last
+    label has a digit, such as ``ubuntu-24.04``, names no other place: no
+    top-level domain has one.
+    """
+    folded = name.lower()
+    if folded in (_openssh.GATEWAY_ALIAS, "localhost"):
+        return True
+    if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", folded):
+        return True
+    if "." in folded:
+        try:
+            socket.inet_aton(folded)
+        except (OSError, ValueError):
+            pass
+        else:
+            return True
+        last = folded.rsplit(".", 1)[1]
+        if not last or re.fullmatch(r"[a-z]+", last) or last.startswith("xn--"):
+            return True
+    return any(o.id.lower() == folded for o in computers)
+
+
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
     gw = _openssh.gateway()
     with _client() as client:
         computers = client.computers.list(allow_partial=True)
         c = _resolve(client, args.target, computers)
+    # Before a byte of the block is printed or written: the id is its HostName
+    # and HostKeyAlias, and its Host when the name cannot be one.
+    computer_id = _ssh_id(c)
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
     # A name two computers share would give two blocks one Host, and ssh would
@@ -2381,18 +2501,30 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # unique, so the id is used then too.
     unchecked = not computers.is_complete
     shared = bool(c.name) and any(o.name == c.name and o.id != c.id for o in computers)
-    host = c.id if unchecked or shared else _openssh.host_alias(c.name, c.id)
+    # A name is also refused as the Host when ssh would read it as some other
+    # destination: a block written under it would take over every connection
+    # the user makes there, so a teammate naming a computer "github.com" could
+    # send the user's pushes through the gateway to their own guest.
+    taken = bool(c.name) and _names_another_destination(c.name, computers)
+    host = computer_id if unchecked or shared or taken else _openssh.host_alias(c.name, computer_id)
     if unchecked:
         print(
-            f"{PROG}: could not check other computers' names; using Host {c.id} instead",
+            f"{PROG}: could not check other computers' names; using Host {_shown(c.id)} instead",
             file=sys.stderr,
         )
     elif shared and host != c.name:
         print(
-            f"{PROG}: another computer is also named {c.name}; using Host {c.id} instead",
+            f"{PROG}: another computer is also named {_shown(c.name)}; "
+            f"using Host {_shown(c.id)} instead",
             file=sys.stderr,
         )
-    snippet = _openssh.config_snippet(host, c.id, gw, known_hosts)
+    elif taken and host != c.name:
+        print(
+            f"{PROG}: the name {_shown(c.name)} cannot be a Host, since ssh would also "
+            f"use it for another destination; using Host {_shown(c.id)} instead",
+            file=sys.stderr,
+        )
+    snippet = _openssh.config_snippet(host, computer_id, gw, known_hosts)
     path = Path.home() / ".ssh" / "config"
     changed = _openssh.write_config(path, snippet) if args.write else None
     if args.json:
@@ -2408,8 +2540,8 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
         )
     elif args.write:
         verb = "wrote" if changed else "already up to date:"
-        print(f"{verb} Host {host} in {path}")
-        print(f"connect with: ssh {host}")
+        print(f"{verb} Host {_shown(host)} in {path}")
+        print(f"connect with: ssh {_shown(host)}")
     else:
         print(snippet, end="")
     return 0
@@ -2488,7 +2620,8 @@ def _wait_for_proxy(c: Computer) -> None:
     running_ram = c.running_ram_mb
     if c.status in ("stopped", "suspended") and not (running_ram is not None and running_ram > 0):
         print(
-            f"{c.name or c.id} is {c.status}: the change is stored and applied as it starts",
+            f"{_shown(c.name or c.id)} is {_shown(c.status)}: "
+            "the change is stored and applied as it starts",
             file=sys.stderr,
         )
         return
@@ -2508,15 +2641,15 @@ def _proxy_result(args: argparse.Namespace, c: Computer) -> int:
             }
         )
         return 0
-    label = c.name or c.id
+    label = _shown(c.name or c.id)
     if proxy is None:
         print(f"{label}: no browser proxy; its browsers go out directly")
     else:
-        print(f"{label}: browsers through {proxy.server}")
+        print(f"{label}: browsers through {_shown(proxy.server)}")
         if proxy.bypass:
-            print(f"  bypass: {', '.join(proxy.bypass)}")
+            print(f"  bypass: {', '.join(_shown(entry) for entry in proxy.bypass)}")
         if proxy.credentials_secret_id:
-            print(f"  credentials: secret {proxy.credentials_secret_id}")
+            print(f"  credentials: secret {_shown(proxy.credentials_secret_id)}")
     if pending:
         print("  pending: the computer's browsers do not have this setting yet")
     return 0
@@ -2568,10 +2701,12 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
             if current is not None and current.credentials_secret_id is not None:
                 if not _same_proxy_server(current.server, args.url):
                     _die(
-                        f"the proxy's credentials ({current.credentials_secret_id}) are for "
-                        f"{current.server}, not {args.url}; give --credentials SECRET_ID to "
-                        "use credentials with the new server, or --no-credentials to set it "
-                        "without any",
+                        lambda s: (
+                            f"the proxy's credentials ({s(current.credentials_secret_id)}) are for "
+                            f"{s(current.server)}, not {args.url}; give --credentials SECRET_ID to "
+                            "use credentials with the new server, or --no-credentials to set it "
+                            "without any"
+                        ),
                         "invalid_arguments",
                     )
                 proxy["credentials_secret_id"] = current.credentials_secret_id
@@ -2658,13 +2793,13 @@ def _egress_proxy_result(args: argparse.Namespace, c: Computer) -> int:
             }
         )
         return 0
-    label = c.name or c.id
+    label = _shown(c.name or c.id)
     if proxy is None:
         print(f"{label}: no egress proxy; its traffic goes out directly")
     else:
-        print(f"{label}: all outbound TCP through {proxy.server}")
+        print(f"{label}: all outbound TCP through {_shown(proxy.server)}")
         if proxy.credentials_secret_id:
-            print(f"  credentials: secret {proxy.credentials_secret_id}")
+            print(f"  credentials: secret {_shown(proxy.credentials_secret_id)}")
     if pending:
         print(
             "  pending: its host does not hold the proxy's credentials yet; "
@@ -2696,10 +2831,13 @@ def _cmd_egress_proxy_set(args: argparse.Namespace) -> int:
             if current is not None and current.credentials_secret_id is not None:
                 if not _same_proxy_server(current.server, args.url):
                     _die(
-                        f"the egress proxy's credentials ({current.credentials_secret_id}) are "
-                        f"for {current.server}, not {args.url}; give --credentials SECRET_ID to "
-                        "use credentials with the new server, or --no-credentials to set it "
-                        "without any",
+                        lambda s: (
+                            f"the egress proxy's credentials "
+                            f"({s(current.credentials_secret_id)}) are for "
+                            f"{s(current.server)}, not {args.url}; give --credentials "
+                            "SECRET_ID to use credentials with the new server, or "
+                            "--no-credentials to set it without any"
+                        ),
                         "invalid_arguments",
                     )
                 proxy["credentials_secret_id"] = current.credentials_secret_id

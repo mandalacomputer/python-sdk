@@ -8,6 +8,7 @@ right routes. The HTTP layer is respx, same as the client tests.
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import httpx
 import pytest
 import respx
 
-from mandala_computer import _cli
+from mandala_computer import _cli, _openssh
 
 BASE = "https://api.test/api/v1"
 
@@ -2003,3 +2004,836 @@ def test_workspaces_members_with_a_scoped_key_is_refused(
     assert _cli.main(["workspaces", "members", "wsp-0123456789ab", "--json"]) == 1
     error = json.loads(capsys.readouterr().err)["error"]
     assert (error["code"], error["status"]) == ("permission_denied", 403)
+
+
+# --- every value the CLI prints is escaped, not only whoami's (OPL-5367, OPL-5366) --
+#
+# A name another member of the account or workspace chose (a computer, a
+# secret, an SSH key, a webhook's URL), and the ids, timestamps and error texts
+# the platform sets, reach the terminal through a table, a line of their own or
+# a refusal. Each hostile value below holds a right-to-left override, an escape
+# sequence or a newline, and none may reach the terminal raw.
+
+RLO = "\u202e"
+EVIL_NAME = f"evil{RLO}exe.txt"
+EVIL_STATUS = "run\x1b[31mning"
+
+
+def _clean(text: str) -> None:
+    """``text`` holds no character ``_printable`` escapes, line breaks aside."""
+    assert _raw_controls(text) == [], text
+    assert RLO not in text and "\x1b" not in text
+
+
+def test_table_escapes_every_cell_but_the_header() -> None:
+    table = _cli._table(("ID", "NAME"), [("vm-\x1b[2J1", "a\nforged  row"), ("vm-2", EVIL_NAME)])
+    _clean(table)
+    assert table.splitlines() == [
+        "ID             NAME",
+        "vm-\\u001b[2J1  a\\u000aforged  row",
+        "vm-2           evil\\u202eexe.txt",
+    ]
+
+
+HOSTILE_COMPUTERS = [
+    {"id": "vm-\u202e1", "name": EVIL_NAME, "status": EVIL_STATUS, "os": "linux"},
+    {"id": "vm-2\nvm-forged  x  running", "name": "scratch", "status": "stopped", "os": "linux"},
+]
+
+
+def _escaped_rows(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("  ")]
+
+
+@respx.mock
+def test_you_have_listing_escapes_each_value_and_keeps_its_own_newlines() -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=HOSTILE_COMPUTERS))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._resolve(_cli._client(), "nope")
+    shown = str(caught.value.code)
+    _clean(shown)
+    # One real line per computer: a newline in an id forges none.
+    assert _escaped_rows(shown) == [
+        "  vm-\\u202e1  evil\\u202eexe.txt  run\\u001b[31mning",
+        "  vm-2\\u000avm-forged  x  running  scratch  stopped",
+    ]
+    assert shown.startswith("mandala-py: no computer named 'nope'. You have:\n")
+    # --json's message keeps the values as they are: JSON escapes them.
+    assert caught.value.message == (
+        "no computer named 'nope'. You have:\n"
+        f"  vm-{RLO}1  {EVIL_NAME}  {EVIL_STATUS}\n"
+        "  vm-2\nvm-forged  x  running  scratch  stopped"
+    )
+
+
+@respx.mock
+def test_known_computers_listing_of_an_incomplete_fleet_is_escaped() -> None:
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(200, json=HOSTILE_COMPUTERS, headers={"X-GC-Incomplete": "1"})
+    )
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._resolve(_cli._client(), "nope")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "Known computers:\n" in shown
+    assert len(_escaped_rows(shown)) == 2
+    assert shown.endswith("\nretry when every host is reachable")
+
+
+@respx.mock
+def test_ambiguous_name_escapes_the_ids() -> None:
+    twins = [
+        {"id": "vm-\x1b]0;x\x07", "name": "scratch", "status": "running"},
+        {"id": f"vm-{RLO}3", "name": "scratch", "status": "running"},
+    ]
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=twins))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._resolve(_cli._client(), "scratch")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown.endswith("use an id: vm-\\u001b]0;x\\u0007, vm-\\u202e3")
+    assert caught.value.reason == "ambiguous_computer"
+
+
+@respx.mock
+def test_a_refusal_under_json_reports_the_values_as_they_are(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=HOSTILE_COMPUTERS))
+    assert _cli.main(["ssh-access", "nope", "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "not_found"
+    assert f"  vm-{RLO}1  {EVIL_NAME}  {EVIL_STATUS}\n" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "want"),
+    [
+        ({"status": "running", "os": "windows"}, "evil\\u202eexe.txt is a Windows computer"),
+        ({"status": EVIL_STATUS, "os": "linux"}, "evil\\u202eexe.txt is run\\u001b[31mning"),
+        ({"status": "running", "os": "linux"}, "evil\\u202eexe.txt has no terminal endpoint"),
+    ],
+)
+@respx.mock
+def test_terminal_refusals_escape_the_computer(payload: dict, want: str) -> None:
+    row = {**payload, "id": "vm-9", "name": EVIL_NAME}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["terminal", "vm-9"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert want in shown
+
+
+SECRET_ROW = {
+    "id": f"csec-{RLO}1",
+    "name": f"OPENAI{RLO}KEY",
+    "workspace_id": "wsp-\x1b[2J",
+    "revision_id": "csr-\nforged",
+    "created_at": "2026-09-20T12:00:00Z",
+    "updated_at": "2026-09-20T12:00:00Z\x1b[31m",
+    "last_used_at": f"2026-09-21{RLO}",
+}
+SECRETS_LISTING = {
+    "secrets": [SECRET_ROW],
+    "delivery": True,
+    "limits": {
+        "name_max_chars": 60,
+        "value_max_bytes": 4096,
+        "active_per_account": 100,
+        "created_per_account": 1000,
+    },
+}
+WEBHOOK_ROW = {
+    "id": "whk-\x1b[2J",
+    "url": f"https://ci.example.com/{RLO}moc.live",
+    "description": "CI",
+    "events": ["process.exited", f"computer{RLO}.ready"],
+    "computers": [],
+    "enabled": False,
+    "disabled_reason": "fail\ning",
+    "disabled_at": "2026-09-02T00:00:00.000Z",
+    "last_success_at": None,
+    "last_failure_at": None,
+    "last_status": 503,
+    "workspace_id": None,
+    "created_at": "2026-09-01T11:00:00.000Z",
+    "updated_at": "2026-09-02T00:00:00.000Z",
+}
+DELIVERY_ROW = {
+    "id": "whd-1",
+    "event_type": f"process{RLO}.exited",
+    "computer": "vm-\x1b[2J",
+    "cursor": "c",
+    "state": "exhausted",
+    "attempts": 8,
+    "next_at": None,
+    "attempted_at": "2026-09-02T04:00:00.000Z",
+    "last_status": None,
+    "last_error": "timeout\nwhd-2  delivered  1  forged",
+    "delivered_at": None,
+    "created_at": "2026-09-01T12:00:00.000Z",
+}
+SSH_KEY_ROW = {
+    "id": f"sshk-{RLO}1",
+    "name": f"laptop{RLO}\x1b[31m",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGqsBlqrbipXh/7n81gKS46IyjJY7nVv8mGtIAE+v76w",
+    "fingerprint": "SHA256:\x1b[2Jx",
+    "key_type": "ssh-ed25519",
+    "created_at": "2026-09-16T12:00:00Z",
+    "last_used_at": "2026-09-17\n",
+}
+API_KEY_ROW = {
+    **HOSTILE_KEY,
+    "id": f"key-{RLO}1",
+    "last_used_at": "2026-09-21T00:00:00Z\x1b[2J",
+    "workspace_id": f"wsp-{RLO}\x1b[31m",
+    "minted_by_key_id": "key-\n2",
+}
+WORKSPACE_ROW = {"id": f"wsp-{RLO}1", "name": "acme", "created_at": "2026-09-01\x1b[2J"}
+MEMBER_ROW = {**WSP_MEMBERS[0], "user_id": f"usr-{RLO}1", "accepted_at": "2026-09-02\n\x1b[31m"}
+
+
+@pytest.mark.parametrize(
+    ("argv", "method", "path", "answer", "want", "lines"),
+    [
+        (
+            ["secrets", "list"],
+            "GET",
+            "/secrets",
+            SECRETS_LISTING,
+            [
+                "csec-\\u202e1",
+                "OPENAI\\u202eKEY",
+                "wsp-\\u001b[2J",
+                "2026-09-21\\u202e",
+                "2026-09-20T12:00:00Z\\u001b[31m",
+            ],
+            2,
+        ),
+        (
+            ["webhooks", "list"],
+            "GET",
+            "/webhooks",
+            [WEBHOOK_ROW],
+            [
+                "whk-\\u001b[2J",
+                "off (fail\\u000aing)",
+                "process.exited,computer\\u202e.ready",
+                "https://ci.example.com/\\u202emoc.live",
+            ],
+            2,
+        ),
+        (
+            ["webhooks", "deliveries", "whk-1"],
+            "GET",
+            "/webhooks/whk-1/deliveries",
+            [DELIVERY_ROW],
+            ["process\\u202e.exited", "vm-\\u001b[2J", "timeout\\u000awhd-2  delivered"],
+            2,
+        ),
+        (
+            ["ssh-key", "list"],
+            "GET",
+            "/ssh-keys",
+            [SSH_KEY_ROW],
+            [
+                "sshk-\\u202e1",
+                "SHA256:\\u001b[2Jx",
+                "2026-09-17\\u000a",
+                "laptop\\u202e\\u001b[31m",
+            ],
+            2,
+        ),
+        (
+            ["api-keys", "list"],
+            "GET",
+            "/api-keys",
+            [API_KEY_ROW],
+            [
+                "key-\\u202e1",
+                "2026-09-21T00:00:00Z\\u001b[2J",
+                "(wsp-\\u202e\\u001b[31m)",
+                "key-\\u000a2",
+            ],
+            2,
+        ),
+        (
+            ["workspaces", "list"],
+            "GET",
+            "/workspaces",
+            [WORKSPACE_ROW],
+            ["wsp-\\u202e1", "2026-09-01\\u001b[2J"],
+            2,
+        ),
+        (
+            ["workspaces", "members", "wsp-1"],
+            "GET",
+            "/workspaces/wsp-1/members",
+            [MEMBER_ROW],
+            ["usr-\\u202e1", "2026-09-02\\u000a\\u001b[31m"],
+            2,
+        ),
+    ],
+)
+@respx.mock
+def test_listings_escape_every_cell(
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    method: str,
+    path: str,
+    answer: object,
+    want: list[str],
+    lines: int,
+) -> None:
+    respx.route(method=method, url=f"{BASE}{path}").mock(
+        return_value=httpx.Response(200, json=answer)
+    )
+    assert _cli.main(argv) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert len(out.splitlines()) == lines  # the header and the one row: nothing forged
+    for escaped in want:
+        assert escaped in out
+
+
+@respx.mock
+def test_secrets_set_and_rm_escape_the_line_they_print(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import sys
+
+    class Stdin(io.TextIOWrapper):
+        def isatty(self) -> bool:
+            return False
+
+    respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(200, json=SECRETS_LISTING))
+    respx.put(f"{BASE}/secrets/{SECRET_ROW['id']}").mock(
+        return_value=httpx.Response(200, json=SECRET_ROW)
+    )
+    respx.post(f"{BASE}/secrets").mock(return_value=httpx.Response(201, json=SECRET_ROW))
+    respx.delete(f"{BASE}/secrets/{SECRET_ROW['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    monkeypatch.setattr(sys, "stdin", Stdin(io.BytesIO(b"value\n"), encoding="utf-8"))
+    assert _cli.main(["secrets", "set", "OPENAI_KEY"]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out == "stored OPENAI\\u202eKEY  csec-\\u202e1  revision csr-\\u000aforged\n"
+    assert _cli.main(["secrets", "rm", SECRET_ROW["id"]]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out == "deleted OPENAI\\u202eKEY  csec-\\u202e1\n"
+
+
+@respx.mock
+def test_api_keys_create_escapes_the_id_it_reports(capsys: pytest.CaptureFixture[str]) -> None:
+    created = {**API_KEY_ROW, "raw": "com_" + "ab" * 24}
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=created))
+    assert _cli.main(["api-keys", "create"]) == 0
+    out, err = capsys.readouterr()
+    assert out == created["raw"] + "\n"
+    _clean(err)
+    assert err.count("\n") == 1
+    assert err.startswith("mandala-py: created key-\\u202e1 (")
+    assert "(wsp-\\u202e\\u001b[31m))" in err
+
+
+@respx.mock
+def test_ssh_key_add_escapes_the_line_it_prints(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    pub = tmp_path / "id.pub"
+    pub.write_text(SSH_KEY_ROW["public_key"] + "\n")
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=SSH_KEY_ROW))
+    assert _cli.main(["ssh-key", "add", str(pub)]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out == "added sshk-\\u202e1  SHA256:\\u001b[2Jx  laptop\\u202e\\u001b[31m\n"
+
+
+@respx.mock
+def test_ssh_access_escapes_the_name_and_the_hosts_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row = {"id": "vm-9", "name": EVIL_NAME, "status": "running"}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "computer": "vm-9",
+                "enabled": True,
+                "available": True,
+                "pending": False,
+                "key_count": 1,
+                "keys_pushed": 0,
+                "error": "push failed\nSSH is on for prod",
+            },
+        )
+    )
+    assert _cli.main(["ssh-access", "vm-9"]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out.splitlines() == [
+        "SSH is on for evil\\u202eexe.txt",
+        "  keys: 0 of 1 delivered",
+        "  error: push failed\\u000aSSH is on for prod",
+    ]
+
+
+@pytest.mark.parametrize("kind", ["browser-proxy", "egress-proxy"])
+@respx.mock
+def test_proxy_get_escapes_the_name_server_and_ids(
+    capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    field = kind.replace("-", "_")
+    proxy: dict[str, object] = {
+        "server": f"http://proxy.example.com:3128/{RLO}",
+        "credentials_secret_id": "csec-\x1b[2J",
+    }
+    if kind == "browser-proxy":
+        proxy["bypass"] = [f"a{RLO}.com", "b\n.com"]
+    row = {"id": "vm-9", "name": EVIL_NAME, "status": "running", field: proxy}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    assert _cli.main([kind, "get", "vm-9"]) == 0
+    out = capsys.readouterr().out
+    _clean(out)
+    assert out.startswith("evil\\u202eexe.txt: ")
+    assert "http://proxy.example.com:3128/\\u202e" in out
+    assert "  credentials: secret csec-\\u001b[2J" in out
+    if kind == "browser-proxy":
+        assert "  bypass: a\\u202e.com, b\\u000a.com" in out
+
+
+@respx.mock
+def test_secrets_rm_ambiguity_escapes_the_secret_it_names() -> None:
+    by_name = {**SECRET_ROW, "id": "csec-\u202ea", "name": "CSEC-B"}
+    by_id = {**SECRET_ROW, "id": "csec-b", "name": "other"}
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(200, json={**SECRETS_LISTING, "secrets": [by_name, by_id]})
+    )
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["secrets", "rm", "csec-b"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "is both a name (CSEC-B, csec-\\u202ea) and another secret's id" in shown
+    assert caught.value.reason == "ambiguous_secret"
+
+
+@pytest.mark.parametrize("kind", ["browser-proxy", "egress-proxy"])
+@respx.mock
+def test_proxy_set_refusal_escapes_the_current_server_and_credentials(kind: str) -> None:
+    proxy = {"server": "http://old.example.com:3128/\u202e", "credentials_secret_id": "csec-\n1"}
+    row = {"id": "vm-9", "name": "dev", "status": "running", kind.replace("-", "_"): proxy}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main([kind, "set", "vm-9", "http://new.example.com:3128"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "credentials (csec-\\u000a1) are for http://old.example.com:3128/\\u202e," in shown
+
+
+# --- ssh, ssh-config and the terminal: the id OpenSSH is handed, and every
+# line around it --------------------------------------------------------------
+#
+# A computer id is OpenSSH's destination and HostKeyAlias, and a ~/.ssh/config
+# block's HostName: one holding a newline would add a directive (a ProxyCommand
+# runs locally), and one starting with "-" would be read as an option. It is
+# refused before anything is printed, written or run. The names, key labels and
+# host errors around it are escaped like every other value.
+
+SSH_FINGERPRINT = "SHA256:7OR2azJrv1nm44ploDfzY03D/74wXZGn8Qj4fabJDXs"
+SSH_KEY = {**SSH_KEY_ROW, "id": "sshk-1", "name": "laptop", "fingerprint": SSH_FINGERPRINT}
+SSH_ON = {
+    "computer": "vm-9",
+    "enabled": True,
+    "available": True,
+    "pending": False,
+    "key_count": 1,
+    "keys_pushed": 1,
+    "error": None,
+}
+SSH_UNASKED = {**SSH_ON, "enabled": False, "available": None, "key_count": 0, "keys_pushed": 0}
+
+
+@pytest.fixture
+def ssh_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A private HOME with a public key in it, and an ssh that must never run."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MANDALA_SSH_GATEWAY", raising=False)
+    monkeypatch.delenv("MANDALA_SSH_GATEWAY_KNOWN_HOSTS", raising=False)
+    monkeypatch.setattr(_cli, "LOCAL_WINDOWS", False)
+    monkeypatch.setattr(
+        _cli.shutil, "which", lambda name: "/usr/bin/ssh" if name == "ssh" else None
+    )
+
+    def never(argv: list[str]) -> int:
+        raise AssertionError(f"ssh was run: {argv}")
+
+    monkeypatch.setattr(_cli, "_exec", never)
+    (tmp_path / "id.pub").write_text(SSH_KEY["public_key"] + " me@laptop\n")
+    return tmp_path
+
+
+def _one_computer(computer_id: str = "vm-9", name: str = "box") -> None:
+    row = {"id": computer_id, "name": name, "status": "running", "os": "linux"}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
+
+
+UNSSHABLE_IDS = [
+    ("vm-1\n  ProxyCommand touch /tmp/x", "vm-1\\u000a  ProxyCommand touch /tmp/x"),
+    (f"vm-1\x1b[2J{RLO}", "vm-1\\u001b[2J\\u202e"),
+    ("-oProxyCommand=x", "-oProxyCommand=x"),
+    ("vm 1", "vm 1"),
+]
+
+
+def _refused_id(caught: pytest.ExceptionInfo[SystemExit], shown_id: str) -> None:
+    assert isinstance(caught.value, _cli._Failure)
+    assert caught.value.reason == "invalid_response"
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert "\n" not in shown
+    assert shown == f"mandala-py: the platform returned a computer id SSH cannot use: {shown_id}"
+
+
+@pytest.mark.parametrize(("computer_id", "shown_id"), UNSSHABLE_IDS)
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_refuses_an_id_ssh_cannot_be_handed(
+    ssh_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    computer_id: str,
+    shown_id: str,
+    write: bool,
+) -> None:
+    _one_computer(computer_id)
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh-config", "box", *(["--write"] if write else [])])
+    _refused_id(caught, shown_id)
+    assert capsys.readouterr() == ("", "")  # no snippet, and no note about it
+    assert not (ssh_home / ".ssh" / "config").exists()
+    assert not (ssh_home / ".mandala").exists()
+
+
+@respx.mock
+def test_ssh_config_json_refuses_an_id_ssh_cannot_be_handed(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    _one_computer("vm-1\n  ProxyCommand touch /tmp/x")
+    assert _cli.main(["ssh-config", "box", "--write", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert json.loads(err)["error"]["code"] == "invalid_response"
+    assert not (ssh_home / ".ssh" / "config").exists()
+
+
+@pytest.mark.parametrize(("computer_id", "shown_id"), UNSSHABLE_IDS)
+@respx.mock
+def test_ssh_refuses_an_id_ssh_cannot_be_handed(
+    ssh_home: Path, computer_id: str, shown_id: str
+) -> None:
+    _one_computer(computer_id)
+    # Answered as a computer that could be connected to, so only the id stops it.
+    respx.get(url__regex=r".*/ssh$").mock(return_value=httpx.Response(200, json=SSH_ON))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[SSH_KEY]))
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh", "box"])
+    _refused_id(caught, shown_id)
+
+
+@pytest.mark.parametrize(("computer_id", "shown_id"), UNSSHABLE_IDS)
+@respx.mock
+def test_ssh_setup_refuses_an_id_ssh_cannot_be_handed_before_changing_anything(
+    ssh_home: Path, computer_id: str, shown_id: str
+) -> None:
+    _one_computer(computer_id)
+    respx.get(url__regex=r".*/ssh$").mock(return_value=httpx.Response(200, json=SSH_UNASKED))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    add = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=SSH_KEY))
+    put = respx.put(url__regex=r".*/ssh$").mock(return_value=httpx.Response(200, json=SSH_ON))
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh", "--setup", "box", "--key", str(ssh_home / "id.pub")])
+    _refused_id(caught, shown_id)
+    assert not add.called and not put.called
+
+
+def _setup(
+    ssh_home: Path,
+    *,
+    name: str = "box",
+    before: dict = SSH_UNASKED,
+    after: dict = SSH_ON,
+    key: dict = SSH_KEY,
+) -> None:
+    _one_computer(name=name)
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=before))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=key))
+    respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=after))
+
+
+@respx.mock
+def test_ssh_setup_escapes_the_hosts_refusal(ssh_home: Path) -> None:
+    _setup(ssh_home, after={**SSH_ON, "error": "refused\nSSH is on for prod\x1b[2J"})
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["ssh", "--setup", "vm-9", "--key", str(ssh_home / "id.pub")])
+    assert caught.value.reason == "ssh_refused"
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown == (
+        "mandala-py: the computer's host refused the SSH setting: "
+        "refused\\u000aSSH is on for prod\\u001b[2J"
+    )
+
+
+@respx.mock
+def test_ssh_setup_escapes_the_lines_it_prints(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _setup(
+        ssh_home,
+        name="box\x1b[31m",
+        after={**SSH_ON, "pending": True},
+        key={**SSH_KEY, "name": f"laptop{RLO}\n"},
+    )
+    assert _cli.main(["ssh", "--setup", "vm-9", "--key", str(ssh_home / "id.pub")]) == 0
+    out, err = capsys.readouterr()
+    _clean(out)
+    _clean(err)
+    assert out == (
+        f"key {SSH_FINGERPRINT} (laptop\\u202e\\u000a) registered\n"
+        "SSH is on for box\\u001b[31m\n"
+        "connect with: mandala-py ssh vm-9\n"
+    )
+    assert err.startswith("mandala-py: box\\u001b[31m has not received the setting yet;")
+    assert err.count("\n") == 1
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ({**SSH_UNASKED, "available": False}, SSH_ON),  # refused before anything changes
+        (SSH_UNASKED, {**SSH_ON, "available": False}),  # refused after the switch
+    ],
+)
+@respx.mock
+def test_ssh_setup_escapes_a_computer_that_predates_ssh(
+    ssh_home: Path, before: dict, after: dict
+) -> None:
+    _setup(ssh_home, name=EVIL_NAME, before=before, after=after)
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["ssh", "--setup", "vm-9", "--key", str(ssh_home / "id.pub")])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown.startswith("mandala-py: evil\\u202eexe.txt was made from a template")
+
+
+@pytest.mark.parametrize(
+    ("access", "want"),
+    [
+        ({**SSH_ON, "available": False}, "mandala-py: evil\\u202eexe.txt was made from"),
+        ({**SSH_ON, "enabled": False}, "mandala-py: SSH is off for evil\\u202eexe.txt;"),
+    ],
+)
+@respx.mock
+def test_ssh_refusals_escape_the_computer(ssh_home: Path, access: dict, want: str) -> None:
+    _one_computer(name=EVIL_NAME)
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=access))
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[SSH_KEY]))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["ssh", "vm-9"])
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown.startswith(want)
+
+
+@respx.mock
+def test_ssh_config_escapes_a_shared_name_in_its_note(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    twins = [
+        {"id": "vm-9", "name": f"dev{RLO}\x1b[2J", "status": "running", "os": "linux"},
+        {"id": "vm-7", "name": f"dev{RLO}\x1b[2J", "status": "running", "os": "linux"},
+    ]
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=twins))
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    out, err = capsys.readouterr()
+    _clean(err)
+    assert err == (
+        "mandala-py: another computer is also named dev\\u202e\\u001b[2J; using Host vm-9 instead\n"
+    )
+    assert out.endswith("connect with: ssh vm-9\n")
+
+
+# A name ssh would also read as another destination is never a Host: a block
+# written under "github.com" would send the user's own pushes through the
+# gateway to whichever teammate's computer carries that name.
+NAMES_OF_OTHER_DESTINATIONS = [
+    "github.com",
+    "github.com.",  # a trailing dot is still github.com
+    "corp.internal",  # any all-letter last label reads as a top-level domain
+    "shop.xn--p1ai",
+    "10.0.0.5",
+    "10.5",  # the resolver reads this as 10.0.0.5
+    "167772165",
+    "0x0A000005",  # 10.0.0.5 too, in any case
+    "mandala-gateway",
+    "Mandala-Gateway",
+    "localhost",
+    "vm-7",  # the other listed computer's id
+    "VM-7",
+]
+
+
+@pytest.mark.parametrize("name", NAMES_OF_OTHER_DESTINATIONS)
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_never_writes_a_name_another_destination_has_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], name: str, write: bool
+) -> None:
+    rows = [
+        {"id": "vm-9", "name": name, "status": "running", "os": "linux"},
+        {"id": "vm-7", "name": "other", "status": "running", "os": "linux"},
+    ]
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=rows))
+    assert _cli.main(["ssh-config", "vm-9", *(["--write"] if write else [])]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        f"mandala-py: the name {name} cannot be a Host, since ssh would also use it "
+        "for another destination; using Host vm-9 instead\n"
+    )
+    config = ssh_home / ".ssh" / "config"
+    if write:
+        assert out == "wrote Host vm-9 in " + str(config) + "\nconnect with: ssh vm-9\n"
+        text = config.read_text()
+    else:
+        assert not config.exists()
+        text = out
+    hosts = [
+        line.split(" ", 1)[1].lower() for line in text.splitlines() if line.startswith("Host ")
+    ]
+    # The gateway's own block, then the computer's under its id: no block for
+    # the name, and none but the gateway's under the gateway's alias.
+    assert hosts == [_openssh.GATEWAY_ALIAS, "vm-9"]
+
+
+@respx.mock
+def test_ssh_config_escapes_a_name_it_cannot_use_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _one_computer(name=f"evil{RLO}\x1b[2J.com")
+    assert _cli.main(["ssh-config", "vm-9"]) == 0
+    out, err = capsys.readouterr()
+    _clean(err)
+    assert err == (
+        "mandala-py: the name evil\\u202e\\u001b[2J.com cannot be a Host, since ssh "
+        "would also use it for another destination; using Host vm-9 instead\n"
+    )
+    assert "Host vm-9\n" in out
+
+
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_keeps_a_plain_name_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], write: bool
+) -> None:
+    _one_computer(name="devbox")
+    assert _cli.main(["ssh-config", "devbox", *(["--write"] if write else [])]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    config = ssh_home / ".ssh" / "config"
+    text = config.read_text() if write else out
+    assert "Host devbox\n" in text
+    assert "Host vm-9\n" not in text
+
+
+# A dot alone does not make a name another destination: no top-level domain
+# has a digit, so these resolve nowhere but the block written for them.
+@pytest.mark.parametrize("name", ["ubuntu-24.04", "py3.12", "api.v2"])
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_keeps_a_dotted_version_name_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], name: str, write: bool
+) -> None:
+    _one_computer(name=name)
+    args = ["ssh-config", name, "--json", *(["--write"] if write else [])]
+    assert _cli.main(args) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    shown = json.loads(out)
+    assert shown["host"] == name
+    assert f"Host {name}\n" in shown["config"]
+    assert "Host vm-9\n" not in shown["config"]
+    if write:
+        assert f"Host {name}\n" in (ssh_home / ".ssh" / "config").read_text()
+
+
+@respx.mock
+def test_wait_for_proxy_escapes_a_stopped_computers_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row = {"id": "vm-9", "name": f"box\x1b[2J{RLO}", "status": "stopped", "running_ram_mb": 0}
+    respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    c = _cli._client().computers.get("vm-9")
+    _cli._wait_for_proxy(c)
+    err = capsys.readouterr().err
+    _clean(err)
+    assert err == (
+        "box\\u001b[2J\\u202e is stopped: the change is stored and applied as it starts\n"
+    )
+
+
+def test_terminal_unreachable_escapes_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    import websockets.sync.client
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError(f"down\x1b[2J{RLO}\nforged")
+
+    monkeypatch.setattr(websockets.sync.client, "connect", refuse)
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._connect("wss://terminal.test")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown == ("mandala-py: could not reach the terminal: down\\u001b[2J\\u202e\\u000aforged")
+
+
+def test_terminal_connection_failure_escapes_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    from websockets.exceptions import WebSocketException
+
+    class FakeFile:
+        def fileno(self) -> int:
+            return -1
+
+        def isatty(self) -> bool:
+            return False
+
+    class FakeConnection:
+        def recv(self) -> str:
+            raise WebSocketException(f"closed: \x1b]0;x\x07{RLO}\nforged")
+
+        def send(self, message: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(_cli, "_connect", lambda url: FakeConnection())
+    monkeypatch.setattr(_cli.sys, "stdin", FakeFile())
+    monkeypatch.setattr(_cli.sys, "stdout", FakeFile())
+    with pytest.raises(_cli._Failure) as caught:
+        _cli._interact("wss://terminal.test")
+    shown = str(caught.value.code)
+    _clean(shown)
+    assert shown == (
+        "mandala-py: terminal connection failed: closed: \\u001b]0;x\\u0007\\u202e\\u000aforged"
+    )
