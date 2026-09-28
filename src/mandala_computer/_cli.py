@@ -2496,13 +2496,11 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
     # A name two computers share would give two blocks one Host, and ssh would
-    # only ever use the first; the id is unique. OpenSSH matches ``Host``
-    # patterns without regard to case, so ``dev`` and ``Dev`` count as shared.
+    # only ever use the first; the id is unique.
     # A listing that may not hold every computer cannot prove the name is
     # unique, so the id is used then too.
     unchecked = not computers.is_complete
-    folded = c.name.lower()
-    shared = bool(c.name) and any(o.name.lower() == folded and o.id != c.id for o in computers)
+    shared = bool(c.name) and any(o.name == c.name and o.id != c.id for o in computers)
     # A name is also refused as the Host when ssh would read it as some other
     # destination: a block written under it would take over every connection
     # the user makes there, so a teammate naming a computer "github.com" could

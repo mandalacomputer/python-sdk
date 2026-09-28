@@ -961,11 +961,12 @@ def test_ssh_config_uses_the_id_when_another_computer_shares_the_name(
     assert "using Host vm-7 instead" in err
 
 
-# OpenSSH matches Host patterns without regard to case, so "dev" and "Dev"
-# are one Host: each computer falls back to its id, as for an identical name.
+# OpenSSH matches Host patterns case-sensitively (ssh -G dev and ssh -G Dev
+# pick different blocks, in either order), so "dev" and "Dev" are two working
+# aliases and each computer keeps its own name as the Host.
 @pytest.mark.parametrize(("target", "name"), [("vm-9", "dev"), ("vm-7", "Dev")])
 @respx.mock
-def test_ssh_config_uses_the_id_when_another_name_differs_only_in_case(
+def test_ssh_config_keeps_a_name_that_differs_only_in_case(
     env: Path, capsys: pytest.CaptureFixture[str], target: str, name: str
 ) -> None:
     respx.get(f"{BASE}/computers").mock(
@@ -979,12 +980,10 @@ def test_ssh_config_uses_the_id_when_another_name_differs_only_in_case(
     )
     assert _cli.main(["ssh-config", target]) == 0
     out, err = capsys.readouterr()
-    assert err == (
-        f"mandala-py: another computer is also named {name}; using Host {target} instead\n"
-    )
-    assert f"# >>> mandala computer {target} >>>\nHost {target}\n" in out
+    assert err == ""
+    assert f"# >>> mandala computer {target} >>>\nHost {name}\n  HostName {target}\n" in out
     assert _cli.main(["ssh-config", target, "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["host"] == target
+    assert json.loads(capsys.readouterr().out)["host"] == name
 
 
 @respx.mock
