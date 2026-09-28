@@ -75,6 +75,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -2457,16 +2458,30 @@ def _names_another_destination(name: str, computers: Collection[Computer]) -> bo
     """Whether ssh would also read ``name``, as a ``Host``, as some other place.
 
     OpenSSH matches ``Host`` patterns without regard to case, so these are
-    compared lowercased: the gateway's own alias, ``localhost``, anything with a
-    dot in it (a hostname or an IPv4 address), a bare number (``ssh 167772165``
-    is 10.0.0.5), and any listed computer's id, which is that computer's Host
-    when its own name cannot be one.
+    compared lowercased: the gateway's own alias, ``localhost``, a bare number
+    (``ssh 167772165`` is 10.0.0.5), any IPv4 address in the forms the resolver
+    reads (``10.5`` is 10.0.0.5 too), a dotted name shaped like a hostname
+    (its last label empty, as in ``github.com.``, all letters like a top-level
+    domain, or an ``xn--`` one), and any listed computer's id, which is that
+    computer's Host when its own name cannot be one. A dotted name whose last
+    label has a digit, such as ``ubuntu-24.04``, names no other place: no
+    top-level domain has one.
     """
     folded = name.lower()
-    if folded in (_openssh.GATEWAY_ALIAS, "localhost") or "." in folded:
+    if folded in (_openssh.GATEWAY_ALIAS, "localhost"):
         return True
     if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", folded):
         return True
+    if "." in folded:
+        try:
+            socket.inet_aton(folded)
+        except (OSError, ValueError):
+            pass
+        else:
+            return True
+        last = folded.rsplit(".", 1)[1]
+        if not last or re.fullmatch(r"[a-z]+", last) or last.startswith("xn--"):
+            return True
     return any(o.id.lower() == folded for o in computers)
 
 

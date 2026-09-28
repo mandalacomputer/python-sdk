@@ -8,6 +8,7 @@ right routes. The HTTP layer is respx, same as the client tests.
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
@@ -2679,8 +2680,13 @@ def test_ssh_config_escapes_a_shared_name_in_its_note(
 # gateway to whichever teammate's computer carries that name.
 NAMES_OF_OTHER_DESTINATIONS = [
     "github.com",
+    "github.com.",  # a trailing dot is still github.com
+    "corp.internal",  # any all-letter last label reads as a top-level domain
+    "shop.xn--p1ai",
     "10.0.0.5",
+    "10.5",  # the resolver reads this as 10.0.0.5
     "167772165",
+    "0x0A000005",  # 10.0.0.5 too, in any case
     "mandala-gateway",
     "Mandala-Gateway",
     "localhost",
@@ -2725,12 +2731,12 @@ def test_ssh_config_never_writes_a_name_another_destination_has_as_host(
 def test_ssh_config_escapes_a_name_it_cannot_use_as_host(
     ssh_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _one_computer(name=f"evil{RLO}.com\x1b[2J")
+    _one_computer(name=f"evil{RLO}\x1b[2J.com")
     assert _cli.main(["ssh-config", "vm-9"]) == 0
     out, err = capsys.readouterr()
     _clean(err)
     assert err == (
-        "mandala-py: the name evil\\u202e.com\\u001b[2J cannot be a Host, since ssh "
+        "mandala-py: the name evil\\u202e\\u001b[2J.com cannot be a Host, since ssh "
         "would also use it for another destination; using Host vm-9 instead\n"
     )
     assert "Host vm-9\n" in out
@@ -2749,6 +2755,27 @@ def test_ssh_config_keeps_a_plain_name_as_host(
     text = config.read_text() if write else out
     assert "Host devbox\n" in text
     assert "Host vm-9\n" not in text
+
+
+# A dot alone does not make a name another destination: no top-level domain
+# has a digit, so these resolve nowhere but the block written for them.
+@pytest.mark.parametrize("name", ["ubuntu-24.04", "py3.12", "api.v2"])
+@pytest.mark.parametrize("write", [False, True])
+@respx.mock
+def test_ssh_config_keeps_a_dotted_version_name_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], name: str, write: bool
+) -> None:
+    _one_computer(name=name)
+    args = ["ssh-config", name, "--json", *(["--write"] if write else [])]
+    assert _cli.main(args) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    shown = json.loads(out)
+    assert shown["host"] == name
+    assert f"Host {name}\n" in shown["config"]
+    assert "Host vm-9\n" not in shown["config"]
+    if write:
+        assert f"Host {name}\n" in (ssh_home / ".ssh" / "config").read_text()
 
 
 @respx.mock
