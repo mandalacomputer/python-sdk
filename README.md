@@ -3402,6 +3402,16 @@ compared without regard to case. A block under such a name would take over
 every connection you make there. Connect with `ssh <id>` then (`--json`'s
 `host` says which); a dotted name such as `ubuntu-24.04` is kept.
 
+`--write` replaces only the block of the computer it is run for, so a block an
+earlier version of the CLI wrote under such a name stays in `~/.ssh/config`
+until you run `mandala-py ssh-config <computer> --write` again for that
+computer. To find one, read the `Host` line after each
+`# >>> mandala computer <id> >>>` marker in `~/.ssh/config`, and run `--write`
+again for any whose `Host` is a hostname, an IP address, a bare number,
+`localhost`, `mandala-gateway`, another computer's id, or a name another
+computer also has. For a computer that no longer exists, delete its block,
+markers included.
+
 In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
 Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also
 takes the one-liner below, but the entry it writes carries no pinned gateway

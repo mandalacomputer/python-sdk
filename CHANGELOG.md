@@ -72,6 +72,16 @@ This is the summary you read to decide whether to upgrade.
   under the id, so `ssh <name>` stops reaching that computer and
   `ssh <id>` does. Other names, dotted ones such as `ubuntu-24.04` or
   `py3.12` included, are used as before.
+  Upgrading changes nothing in `~/.ssh/config` by itself: `--write`
+  replaces only the block of the computer it is run for, so a block an
+  earlier version wrote under such a name stays until you run
+  `mandala-py ssh-config <computer> --write` again for that computer. To
+  find one, read the `Host` line after each
+  `# >>> mandala computer <id> >>>` marker in `~/.ssh/config`, and run
+  `--write` again for any whose `Host` is a hostname, an IP address, a bare
+  number, `localhost`, `mandala-gateway`, another computer's id, or a name
+  another computer also has (for a computer that no longer exists, delete
+  its block, markers included).
 
 - **`mandala-py whoami` escapes every field it prints**, not only the names
   and email: the user, account, workspace and key ids, the account's status
