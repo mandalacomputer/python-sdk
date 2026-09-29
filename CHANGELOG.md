@@ -164,6 +164,10 @@ This is the summary you read to decide whether to upgrade.
   uses as a `Host`, is refused as before, and so is a config holding a byte
   that is not valid in the system's text encoding, which `--write` cannot
   rewrite: that error says to fix the byte first.
+- **`mandala-py ssh-config --write` removes a second copy of the computer's
+  block or the gateway's block**, one an earlier `mandala` CLI appended to a
+  `~/.ssh/config` saved with CRLF line endings, instead of leaving it routing
+  its old `Host` alias.
 
 ## [0.7.0] — 2026-09-27
 

@@ -469,11 +469,32 @@ def under_its_id(text: str, block: WrittenBlock) -> str:
     )
 
 
+def _without_later_copies(text: str, label: str, pos: int) -> str:
+    """*text* without any block for *label* that starts at *pos* or later.
+
+    Each goes with its end marker's line break and, when a blank line comes
+    before it, that blank line: the shape an append left.
+    """
+    pattern = _block_pattern(label)
+    while (found := pattern.search(text, pos)) is not None:
+        start, end = found.span()
+        if text[end : end + 1] == "\n":
+            end += 1
+        if start >= 2 and text[start - 2 : start] == "\n\n":
+            start -= 1
+        text = text[:start] + text[end:]
+        pos = start
+    return text
+
+
 def merge_config(current: str, snippet: str) -> str:
     """*current* with each marked block of *snippet* replaced, or appended.
 
     Everything outside the markers is kept byte for byte. A block already
-    there is replaced where it stands, so writing twice changes nothing.
+    there is replaced where it stands, so writing twice changes nothing. A
+    later copy of a block *snippet* carries (one an earlier ``mandala`` CLI
+    appended to a CRLF config) is removed, with the blank line before it;
+    another label's copies are left as they are.
     """
     text = current
     labels = re.findall(r"^# >>> mandala (.+?) >>>$", snippet, re.MULTILINE)
@@ -484,6 +505,7 @@ def merge_config(current: str, snippet: str) -> str:
         block = block_match.group(0)
         found = _block_pattern(label).search(text)
         if found is not None:
+            text = _without_later_copies(text, label, found.end())
             text = text[: found.start()] + block + text[found.end() :]
             continue
         if text and not text.endswith("\n"):

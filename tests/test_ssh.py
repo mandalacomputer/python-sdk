@@ -340,6 +340,45 @@ def test_write_config_replaces_the_block_in_place_and_is_idempotent(tmp_path: Pa
     assert path.read_text() == text
 
 
+def _blocks_of(whole: str) -> tuple[str, str]:
+    """The gateway block and the computer block of a snippet, markers included."""
+    gateway, computer = whole.split("\n\n")
+    return gateway, computer.removesuffix("\n")
+
+
+@pytest.mark.parametrize("first", ["old", "dev"])
+def test_write_config_removes_a_later_copy_of_its_blocks(tmp_path: Path, first: str) -> None:
+    # Before it read CRLF line endings as LF, the TypeScript CLI found no block
+    # in a CRLF config and appended a second copy of both after the originals.
+    path = tmp_path / "config"
+    gateway, computer = _blocks_of(snippet("stale"))
+    path.write_text(f"Host work\n  User me\n\n{snippet(first)}\n{gateway}\n\n{computer}\n")
+    assert _openssh.write_config(path, snippet("dev"))
+    text = path.read_text()
+    assert text == "Host work\n  User me\n\n" + snippet("dev")
+    assert text.count("# >>> mandala gateway >>>") == 1
+    assert text.count("# >>> mandala computer vm-9 >>>") == 1
+    assert "stale" not in text
+    assert not _openssh.write_config(path, snippet("dev"))
+    assert path.read_text() == text
+
+
+def test_merge_config_removes_only_the_snippets_own_copies() -> None:
+    gateway, computer = _blocks_of(snippet("old"))
+    gateway_copy, computer_copy = _blocks_of(snippet("stale"))
+    other = _block("a", "vm-7").removesuffix("\n")
+    other_copy = _block("b", "vm-7").removesuffix("\n")
+    text = (
+        f"# before\n\n{gateway}\n\n{computer}\n# middle\n\n{gateway_copy}\n\n"
+        f"{computer_copy}\n\n{other}\n\n{other_copy}\n# after\n"
+    )
+    new_gateway, new_computer = _blocks_of(snippet("dev"))
+    assert _openssh.merge_config(text, snippet("dev")) == (
+        f"# before\n\n{new_gateway}\n\n{new_computer}\n# middle\n\n"
+        f"{other}\n\n{other_copy}\n# after\n"
+    )
+
+
 def test_a_second_computer_adds_its_block_and_shares_the_gateway(tmp_path: Path) -> None:
     path = tmp_path / "config"
     _openssh.write_config(path, snippet())
