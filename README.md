@@ -3396,11 +3396,20 @@ cannot be a `Host` (it holds a space or a `*`, say). It is too, with a note on
 stderr saying why, when another computer has the same name, when the list of
 your computers could not be read in full to check that, or when ssh would also
 read the name as another destination: a hostname such as `github.com` or
-`corp.internal`, an IP address in any form (`10.5` is `10.0.0.5`), a bare
-number, `localhost`, the gateway's `mandala-gateway`, or another computer's id,
+`corp.internal`, an IP address in any form a resolver reads (`10.5` is
+`10.0.0.5`, and macOS reads `08.0.0.1` as `8.0.0.1`), a bare number,
+`localhost`, the gateway's `mandala-gateway`, or another computer's id,
 compared without regard to case. A block under such a name would take over
-every connection you make there. Connect with `ssh <id>` then (`--json`'s
-`host` says which); a dotted name such as `ubuntu-24.04` is kept.
+every connection you make there. The id is used as well when a block already
+in `~/.ssh/config` uses the name for another computer, as its `Host` or as its
+id: one written with another account's API key, say, which the list of your
+computers does not show. Your computer's own earlier block never counts, and
+`--write` replaces it. Connect with `ssh <id>` then (`--json`'s `host` says
+which); a dotted name such as `ubuntu-24.04` is kept. If another computer's
+block in `~/.ssh/config` already has the id itself as its `Host` (a computer
+named after this one's id, say), there is nothing left to fall back to:
+`ssh-config` refuses with a `conflict` error naming that computer, and prints
+and writes nothing. Remove that block, then run it again.
 
 `--write` replaces only the block of the computer it is run for, so a block an
 earlier version of the CLI wrote under such a name stays in `~/.ssh/config`
@@ -3409,8 +3418,8 @@ computer. To find one, read the `Host` line after each
 `# >>> mandala computer <id> >>>` marker in `~/.ssh/config`, and run `--write`
 again for any whose `Host` is a hostname, an IP address, a bare number,
 `localhost`, `mandala-gateway`, another computer's id, or a name another
-computer also has. For a computer that no longer exists, delete its block,
-markers included.
+computer, or another block's `Host`, also has. For a computer that no longer
+exists, delete its block, markers included.
 
 In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
 Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also

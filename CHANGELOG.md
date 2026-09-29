@@ -83,6 +83,32 @@ This is the summary you read to decide whether to upgrade.
   another computer also has (for a computer that no longer exists, delete
   its block, markers included).
 
+- **`mandala-py ssh-config` refuses as a `Host` every IPv4 form macOS
+  reads**, not only those `inet_aton` takes: a part with a leading zero and
+  an `8` or `9` (`08.0.0.1` is `8.0.0.1` there, and `192.168.1.09` an
+  address), an empty `0x` part (`0x.1` is `0.0.0.1`), and a part too big for
+  its bytes. A block under such a name took over the connections macOS's ssh
+  made to that address. The check no longer asks the local `inet_aton`, so
+  the same names are refused on every platform. The block uses the
+  computer's id instead, with the same stderr note as for the other refused
+  names.
+
+- **`mandala-py ssh-config` uses the computer's id as its `Host` when a
+  block already in `~/.ssh/config` uses the name for another computer**, as
+  its `Host` or as its id, compared without regard to case: one written with
+  another account's API key, say, which the listing the name was checked
+  against does not show. `ssh <name>` went to whichever of the two blocks
+  came first. A note on stderr says so, with the name escaped, and `--json`'s
+  `host` and `config` carry the id. The computer's own earlier block never
+  counts, and `--write` still replaces it where it stands. The file is only
+  read, in print mode too; one that is missing or cannot be read holds no
+  blocks. When the id itself is already another computer's `Host` there (one
+  named after this computer's id, say), there is no other name to use, so
+  `ssh-config` refuses, in every mode, with a `conflict` error naming that
+  computer: it prints and writes nothing, since a second block under the id
+  would never be reached and `ssh <id>` would go to the other computer.
+  Remove that block, then run again.
+
 - **`mandala-py whoami` escapes every field it prints**, not only the names
   and email: the user, account, workspace and key ids, the account's status
   and the role are the platform's text too, and a control character in one

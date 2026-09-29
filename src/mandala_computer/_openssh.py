@@ -359,6 +359,25 @@ def _block_pattern(label: str) -> re.Pattern[str]:
     )
 
 
+def written_hosts(text: str) -> list[tuple[str, str]]:
+    """The computer blocks written in the ssh config *text*.
+
+    For each ``mandala computer <id>`` block whose markers :func:`merge_config`
+    would find, its id and the value of its first ``Host`` line (``""`` when
+    it has none). Only the marked blocks are read: the gateway's block, one
+    with no end marker and anything outside the markers are left out.
+    """
+    written = []
+    for begin in re.finditer(r"^# >>> mandala computer (.+?) >>>$", text, re.MULTILINE):
+        computer_id = begin.group(1)
+        block = _block_pattern(f"computer {computer_id}").match(text, begin.start())
+        if block is None:
+            continue
+        host = re.search(r"^Host (.+)$", block.group(0), re.MULTILINE)
+        written.append((computer_id, host.group(1).strip() if host else ""))
+    return written
+
+
 def merge_config(current: str, snippet: str) -> str:
     """*current* with each marked block of *snippet* replaced, or appended.
 
