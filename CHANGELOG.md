@@ -167,7 +167,9 @@ This is the summary you read to decide whether to upgrade.
 - **`mandala-py ssh-config --write` removes a second copy of the computer's
   block or the gateway's block**, one an earlier `mandala` CLI appended to a
   `~/.ssh/config` saved with CRLF line endings, instead of leaving it routing
-  its old `Host` alias.
+  its old `Host` alias. A copy followed by a line of your own before the next
+  `Host` or `Match` line is left in place, since that line belongs to the
+  copy's `Host` and removing the copy would apply it to other hosts.
 
 ## [0.7.0] — 2026-09-27
 

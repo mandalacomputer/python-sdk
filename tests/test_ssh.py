@@ -379,6 +379,41 @@ def test_merge_config_removes_only_the_snippets_own_copies() -> None:
     )
 
 
+# OpenSSH ends a stanza at the next Host or Match line, not at a comment, so a
+# directive after a copy's end marker belongs to the copy's last Host.
+def _copy_followed_by(tail: str) -> str:
+    return (
+        f"Host work\n  User me\n\n{snippet('dev')}\n"
+        f"Host *\n  ServerAliveInterval 30\n\n{snippet('stale')}{tail}"
+    )
+
+
+def test_merge_config_keeps_a_copy_whose_stanza_goes_on_past_its_end_marker() -> None:
+    _, stale_computer = _blocks_of(snippet("stale"))
+    merged = _openssh.merge_config(_copy_followed_by("ForwardAgent yes\n"), snippet("dev"))
+    assert merged == (
+        f"Host work\n  User me\n\n{snippet('dev')}\n"
+        f"Host *\n  ServerAliveInterval 30\n\n{stale_computer}\nForwardAgent yes\n"
+    )
+    assert _openssh.merge_config(merged, snippet("dev")) == merged
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "",
+        "\n  \t\n# a note\n   # another\n",
+        "\n# mine\nHost other\n  ForwardAgent yes\n",
+        "Match host other\n  ForwardAgent yes\n",
+    ],
+    ids=["nothing", "blank-and-comments", "then-host", "then-match"],
+)
+def test_merge_config_still_removes_a_copy_its_stanza_ends_with(tail: str) -> None:
+    assert _openssh.merge_config(_copy_followed_by(tail), snippet("dev")) == (
+        f"Host work\n  User me\n\n{snippet('dev')}\nHost *\n  ServerAliveInterval 30\n{tail}"
+    )
+
+
 def test_a_second_computer_adds_its_block_and_shares_the_gateway(tmp_path: Path) -> None:
     path = tmp_path / "config"
     _openssh.write_config(path, snippet())
