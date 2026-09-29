@@ -2498,30 +2498,36 @@ def _names_another_destination(name: str, computers: Collection[Computer]) -> bo
     return any(o.id.lower() == folded for o in computers)
 
 
-def _other_written_blocks(path: Path, computer_id: str) -> tuple[str, list[_openssh.WrittenBlock]]:
+def _other_written_blocks(
+    path: Path, computer_id: str
+) -> tuple[str, list[_openssh.WrittenBlock], bool]:
     """The blocks in the ssh config at *path* written for computers other
-    than *computer_id*, as :func:`_openssh.written_blocks` reads them, and the
-    text they stand in. A file that is missing or cannot be read holds none.
+    than *computer_id*, as :func:`_openssh.written_blocks` reads them, the
+    text they stand in, and whether that text is not the file's own (see
+    below). A file that is missing or cannot be read holds none.
 
     The file is decoded as :func:`_openssh.write_config` reads it, so a block
     moved from this text is written back with the bytes it had. Only when that
     decode fails is it decoded as UTF-8 with any byte that is not UTF-8
     replaced, so one stray byte (a Latin-1 comment, say) does not hide every
     block in it; its line endings are made ``\\n`` as :meth:`Path.read_text`
-    makes them. ``--write`` still reads the file strictly, so it fails on such
-    a file, before writing anything, as it did before.
+    makes them, and the third value is true. ``--write`` still reads the file
+    strictly, so it fails on such a file without changing it, as it did
+    before; the gateway's known_hosts file has been refreshed by then.
     """
+    undecodable = False
     try:
         text = path.read_text()
     except UnicodeDecodeError:
         try:
             raw = path.read_bytes()
         except OSError:
-            return "", []
+            return "", [], False
         text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        undecodable = True
     except OSError:
-        return "", []
-    return text, [b for b in _openssh.written_blocks(text) if b.id != computer_id]
+        return "", [], False
+    return text, [b for b in _openssh.written_blocks(text) if b.id != computer_id], undecodable
 
 
 def _uses_host(block: _openssh.WrittenBlock, host: str) -> bool:
@@ -2555,7 +2561,7 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # `ssh <name>` whenever it came first. This computer's own block is the
     # one --write replaces, so it never counts.
     path = Path.home() / ".ssh" / "config"
-    config, others = _other_written_blocks(path, computer_id)
+    config, others, undecodable = _other_written_blocks(path, computer_id)
     folded = host.lower()
     clashes = host != computer_id and any(
         folded == b.id.lower() or _uses_host(b, folded) for b in others
@@ -2595,6 +2601,17 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
                 b is not holder and (b.id == holder.id or _uses_host(b, holder.id)) for b in others
             )
         )
+        if mutual and undecodable:
+            # --write reads the file strictly and fails on it, so pointing
+            # there would only fail; the byte has to go first.
+            _die(
+                lambda spell: (
+                    f"a block in ~/.ssh/config for computer {spell(holder.id)} already uses "
+                    f"Host {spell(host)}, and ~/.ssh/config holds a byte that is not valid "
+                    "in the system's text encoding; fix that byte, then run again"
+                ),
+                "conflict",
+            )
         if not mutual:
             _die(
                 lambda spell: (

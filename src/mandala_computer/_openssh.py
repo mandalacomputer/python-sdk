@@ -359,38 +359,57 @@ def _block_pattern(label: str) -> re.Pattern[str]:
     )
 
 
-_HOST_KEYWORD = re.compile(r"\s*host(?:\s*=\s*|\s+|$)", re.IGNORECASE)
+# The keyword as OpenSSH's readconf splits it off: ASCII space and tab only
+# (not every character Python counts as whitespace), and at most one ``=``.
+_HOST_KEYWORD = re.compile(r"[ \t]*host(?:[ \t]*=[ \t]*|[ \t]+|$)", re.IGNORECASE | re.ASCII)
 
 
 def _host_line_args(line: str) -> list[str] | None:
     """The arguments of *line* when it is a ``Host`` line, else ``None``.
 
-    Read as OpenSSH reads a config line: leading whitespace allowed, the
-    keyword in any case and then whitespace and/or one ``=``, the arguments
-    split on whitespace, a ``"double quoted"`` one unquoted, and an unquoted
-    one starting with ``#`` ending the line as a comment. Any other line (a
-    ``Match`` line included) is ``None``. Negated patterns (``!x``) are kept
-    here.
+    Read as OpenSSH reads a config line (``readconf`` and ``argv_split``):
+    trailing space, tab and form feed dropped; leading space or tab allowed;
+    the keyword in any case and then space or tab and/or one ``=``. The
+    arguments are split on space and tab only, so a no-break space is part of
+    an argument. ``'`` and ``"`` both quote, a quote ending only at the same
+    character. A backslash before ``'``, ``"`` or ``\\`` (or, outside quotes,
+    a space) stands for that character; before any other it is kept. An
+    unquoted argument starting with ``#`` ends the line as a comment. Any
+    other line (a ``Match`` line included) is ``None``. Negated patterns
+    (``!x``) are kept here. A quote left open, which ssh refuses, is read to
+    the end of the line.
     """
+    line = line.rstrip(" \t\r\n\f")
     keyword = _HOST_KEYWORD.match(line)
     if keyword is None:
         return None
+    rest = line[keyword.end() :]
     args: list[str] = []
-    arg, started, quoted = "", False, False
-    for c in line[keyword.end() :]:
-        if not quoted and c.isspace():
-            if started:
-                args.append(arg)
-            arg, started = "", False
+    i = 0
+    while i < len(rest):
+        if rest[i] in " \t":
+            i += 1
             continue
-        if not quoted and not started and c == "#":
-            return args
-        started = True
-        if c == '"':
-            quoted = not quoted
-        else:
-            arg += c
-    if started:
+        if rest[i] == "#":
+            break
+        arg, quote = "", ""
+        while i < len(rest):
+            c = rest[i]
+            if c == "\\":
+                following = rest[i + 1 : i + 2]
+                if following and (following in "'\"\\" or (not quote and following == " ")):
+                    i += 1
+                    c = following
+                arg += c
+            elif not quote and c in " \t":
+                break
+            elif not quote and c in "'\"":
+                quote = c
+            elif quote and c == quote:
+                quote = ""
+            else:
+                arg += c
+            i += 1
         args.append(arg)
     return args
 

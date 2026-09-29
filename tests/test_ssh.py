@@ -402,6 +402,26 @@ def test_written_hosts_lists_the_computer_blocks_and_only_those() -> None:
         ("Hostname x", ()),
         ("Match host x", ()),
         ("# Host x", ()),
+        # OpenSSH splits on space and tab only, so a no-break space is part of
+        # an argument and the `#` after it starts no comment.
+        ("Host other\u00a0# vm-9", ("other\u00a0#", "vm-9")),
+        ("Host x\u00a0", ("x\u00a0",)),
+        ("Host\u00a0x", ()),
+        ("Host\fx", ()),
+        ("Host x\f", ("x",)),
+        # The keyword is ASCII: a long s does not fold to s as it does for re.
+        ("Ho\u017ft x", ()),
+        # Single quotes quote too, a quote ends only at its own character, and
+        # a backslash escapes a quote, a backslash or (outside quotes) a space.
+        ("Host 'x y' z", ("x y", "z")),
+        ("Host 'dev'", ("dev",)),
+        ("Host 'a\"b' \"c'd\"", ('a"b', "c'd")),
+        ('Host de\\"v', ('de"v',)),
+        ("Host a\\'b a\\\\b", ("a'b", "a\\b")),
+        ("Host a\\ b", ("a b",)),
+        ('Host "a\\ b"', ("a\\ b",)),
+        ("Host a\\x", ("a\\x",)),
+        ("Host '#x' y", ("#x", "y")),
     ],
 )
 def test_written_hosts_reads_every_alias_of_a_hand_edited_host_line(

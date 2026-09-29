@@ -3423,7 +3423,9 @@ its id and changes the other block's `Host` line, and nothing else in it, to
 that computer's id, with a note on stderr. Printing or `--json` without
 `--write` refuses and says so. When the other block has more than the one
 alias the CLI writes, or its id is another block's `Host`, it is refused as
-above.
+above. When `~/.ssh/config` holds a byte that is not valid in the system's
+text encoding, `--write` cannot rewrite the file, so every mode refuses and
+says to fix that byte first.
 
 Apart from that one case, `--write` replaces only the block of the computer it
 is run for, so a block an earlier version of the CLI wrote under such a name

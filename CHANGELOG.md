@@ -144,11 +144,13 @@ This is the summary you read to decide whether to upgrade.
 
 - **`mandala-py ssh-config` counts every alias of a hand-edited block's
   `Host` lines**, read the way OpenSSH reads them: `Host dev # mine`,
-  `Host other dev`, `  host=dev`, `Host "dev"` and a second `Host` line all
-  put `dev` in that block. Only the whole first `Host` line counted before,
-  so a name such a block used could still be written under, and
-  `ssh <name>` went to whichever block came first. Negated patterns (`!dev`)
-  do not count, and a wildcard pattern is compared as written, not expanded.
+  `Host other dev`, `  host=dev`, `Host "dev"`, `Host 'dev'` and a second
+  `Host` line all put `dev` in that block. Only spaces and tabs separate
+  aliases, as for ssh: a no-break space does not, so the `#` after one starts
+  no comment. Only the whole first `Host` line counted before, so a name
+  such a block used could still be written under, and `ssh <name>` went to
+  whichever block came first. Negated patterns (`!dev`) do not count, and a
+  wildcard pattern is compared as written, not expanded.
 
 - **`mandala-py ssh-config` no longer refuses forever when two computers
   are named after each other's ids** (say `vm-1` named `vm-other` and
@@ -159,7 +161,9 @@ This is the summary you read to decide whether to upgrade.
   line, to its id, and a note on stderr says so. Without `--write` it still
   refuses, and the `conflict` error says that `--write` moves both. A block
   with more than the one alias the CLI writes, or whose id another block
-  uses as a `Host`, is refused as before.
+  uses as a `Host`, is refused as before, and so is a config holding a byte
+  that is not valid in the system's text encoding, which `--write` cannot
+  rewrite: that error says to fix the byte first.
 
 ## [0.7.0] — 2026-09-27
 
