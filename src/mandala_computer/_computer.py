@@ -3232,10 +3232,14 @@ class Computer(ComputerFields):
                 raise TimeoutError(_desktop_timeout(self.id, timeout))
             try:
                 probe_timeout = max(1, min(5, math.ceil(remaining)))
-                self._exec(DESKTOP_PROBE, probe_timeout, desktop=True, timeout_cap=remaining)
-                # Whatever `true` exited with, the session it ran in exists: the
-                # platform answers a missing session as a refusal, never a result.
-                return self
+                res = self._exec(DESKTOP_PROBE, probe_timeout, desktop=True, timeout_cap=remaining)
+                # Only a `true` that FINISHED with 0 is evidence of a session. The
+                # platform answers a missing session as a refusal, but only once
+                # its in-guest lookup completes: a lookup still running at the
+                # probe's timeout comes back as a result with ``timed_out`` set,
+                # which says nothing either way, so it is polled through.
+                if res.ok:
+                    return self
             except MandalaError as err:
                 if _desktop_wait_fatal(err):
                     raise

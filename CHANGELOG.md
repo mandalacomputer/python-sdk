@@ -22,8 +22,9 @@ This is the summary you read to decide whether to upgrade.
 ### Added
 
 - **`Computer.wait_for_desktop()`** (and the `AsyncComputer` twin) polls a
-  no-output `true` in the desktop session until it is accepted. It returns at
-  once for a Windows guest or a computer whose `os` is not reported. An absent
+  no-output `true` in the desktop session until it finishes with exit 0; a
+  probe that times out inside the guest is polled through, not taken as a
+  session. It returns at once for a Windows guest or a computer whose `os` is not reported. An absent
   `desktop` field is an X11 desktop and is waited on.
 
 ## [0.8.0] — 2026-09-29

@@ -242,3 +242,30 @@ async def test_wait_for_desktop_names_the_desktop_session_when_it_times_out(monk
         "launch-42's desktop session was not active within 5s (it may still be "
         "logging in, or nobody is logged in)"
     )
+
+
+# A probe whose in-guest session lookup outlived its timeout answers 200 with
+# `timed_out` set: no evidence of a session, so it is not an answer.
+UNFINISHED = {"exit_code": -1, "timed_out": True, "stdout_b64": "", "stderr_b64": ""}
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_launch_polls_through_a_desktop_probe_that_timed_out(monkeypatch, flavour):
+    rig = Rig(
+        linux(),
+        lambda n: httpx.Response(200, json=UNFINISHED if n == 1 else GUEST),
+    )
+    rig.install(monkeypatch)
+    c = await launch(rig, flavour, poll=0)
+    assert c.id == "launch-42"
+    assert len(rig.desktop_probes()) == 2
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_launch_times_out_when_every_desktop_probe_times_out(monkeypatch, flavour):
+    rig = Rig(linux(), lambda n: httpx.Response(200, json=UNFINISHED), tick=1.0)
+    rig.install(monkeypatch)
+    with pytest.raises(mc.TimeoutError) as caught:
+        await launch(rig, flavour, timeout=20, poll=0)
+    assert "desktop session was not active" in str(caught.value)
+    assert len(rig.desktop_probes()) > 1

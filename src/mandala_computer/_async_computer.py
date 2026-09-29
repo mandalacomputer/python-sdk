@@ -937,8 +937,13 @@ class AsyncComputer(ComputerFields):
                 raise TimeoutError(_desktop_timeout(self.id, timeout))
             try:
                 probe_timeout = max(1, min(5, math.ceil(remaining)))
-                await self._exec(DESKTOP_PROBE, probe_timeout, desktop=True, timeout_cap=remaining)
-                return self
+                res = await self._exec(
+                    DESKTOP_PROBE, probe_timeout, desktop=True, timeout_cap=remaining
+                )
+                # Only a finished exit 0 is evidence of a session; a probe that
+                # timed out in the guest is polled through (see Computer).
+                if res.ok:
+                    return self
             except MandalaError as err:
                 if _desktop_wait_fatal(err):
                     raise
