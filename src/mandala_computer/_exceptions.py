@@ -361,6 +361,10 @@ class GatewayTimeoutError(APIError):
     where it was, and its usage and steps are lost with the response. Use
     :meth:`~mandala_computer.Computer.agent` or
     :meth:`~mandala_computer.Computer.agent_stream` for a run that may be long.
+    A 504 the platform itself reports on that route — the model API's own
+    ``timeout_error``, relayed with the run's usage and steps — is not this
+    class: it is raised as a plain :class:`APIError`, with the run on
+    :attr:`~MandalaError.agent`.
 
     The ceiling this reports is not the SDK's and not ``timeout``\'s: it belongs
     to whatever sits between the caller and the platform, and it is reached at

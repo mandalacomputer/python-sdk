@@ -1052,12 +1052,14 @@ class Templates:
         a published ref, a retired ref, and the two per-account ceilings (the
         templates stored, and the refs ever claimed) all answer the same until
         something else changes. So a :class:`~mandala_computer.ConflictError`
-        from here always carries a permanent
-        :attr:`~mandala_computer.APIError.reason` — the platform's own, or
-        ``"exists"`` where it sent none — and
+        from here carries a permanent :attr:`~mandala_computer.APIError.reason`
+        — the platform's own permanent word, or ``"exists"`` where it sent none
+        or sent a word this version does not recognise — and
         :func:`~mandala_computer.is_transient` answers ``False`` for it. Bump
         ``metadata.version`` (or retire a template, for the first ceiling) and
-        publish again.
+        publish again. The one exception is a clearing word (``contention`` or
+        ``starting``): that is the platform's explicit advice to wait, so it is
+        kept as sent and ``is_transient`` answers ``True`` for it.
 
         An invalid document is refused with an
         :class:`~mandala_computer.APIError` (400) whose ``body["problems"]``

@@ -31,8 +31,10 @@ This is the summary you read to decide whether to upgrade.
   `steps_taken` its body carries. Empty on a streamed result.
 - **`RateLimitError.limit`, `.remaining` and `.reset`**, from the
   `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers; each
-  `None` when absent. The README shows how to read the same headers on a
-  successful answer with an `httpx` event hook.
+  `None` when absent, or when the value is not a plain whole number of at most
+  18 digits. The README shows how to read the same headers on a successful
+  answer with an `httpx` event hook, and says that such a hook turns off the
+  SDK's opt-in retries of connection failures seen before a response.
 
 ### Changed
 
@@ -52,6 +54,11 @@ This is the summary you read to decide whether to upgrade.
   or 529 there is the model API's own status for the account behind
   `model_key`. The docs no longer say a plan downgraded mid-run stops a run.
   `is_transient()` still answers `False`.
+- **A model API 504 on `agent_once()` raises a plain `APIError`, not
+  `GatewayTimeoutError`.** The platform relays the model's `timeout_error`
+  with the run's usage and steps in the body (on `e.agent`), so the connection
+  was not cut; `agent()` already reported the same 504 this way. A body-less
+  504 or 524 is still `GatewayTimeoutError`.
 - **`open()` picks a browser the image has, and raises when none starts**
   (OPL-3705). It used to run `nohup firefox <url> &`, which exits 0 whether
   or not a `firefox` exists, so on the Omarchy image — Chromium and no Firefox
@@ -65,11 +72,14 @@ This is the summary you read to decide whether to upgrade.
   per-account ceilings — clear by nothing but a changed request, and came with
   no `reason`, so `is_transient()` called them worth retrying. `publish()`
   now raises them as a `ConflictError` whose `reason` is the platform's own
-  permanent word, or `"exists"` where it sent none.
-- **`wait_until_running()`, `wait_for_guest()` and `launch()` raise at once on
-  a `half-removed` computer** — one whose deletion stopped partway and took
-  its disk — instead of polling to their timeout. Deleting it again is what
-  clears it.
+  permanent word, or `"exists"` where it sent none or sent a word this version
+  does not recognise. A clearing word (`contention` or `starting`) is kept as
+  the platform sent it, and `is_transient()` answers `True` for it.
+- **`wait_until_running()`, `wait_for_guest()`, `wait_for_secrets()`,
+  `wait_for_browser_proxy()`, `wait_for_egress_proxy()` and `launch()` raise at
+  once on a `half-removed` computer** — one whose deletion stopped partway and
+  took its disk — instead of polling to their timeout or telling the caller to
+  call `start()`. Deleting it again is what clears it.
 
 ### Fixed
 

@@ -692,7 +692,8 @@ c.set_idle_suspend(None)  # back to the host's own sweep
 `0` means never: no idle suspend and no eviction under memory pressure. It is
 capped per plan — Solo 0, Studio 1, Fleet 4 computers pinned at once — and one
 past the cap raises `PlanLimitError`. The most a host accepts is 10080 minutes
-(a week); more, or a negative number, is a `400`.
+(a week); more is a `400` from the host. A negative number raises `ValueError`
+before anything is sent.
 
 Three methods rather than one `update()`, because the platform refuses these in
 combination and is right to: a resize needs the computer stopped and the other
@@ -1524,7 +1525,8 @@ reason `revoked` rather than with a body — after steps that already ran on the
 desktop and already cost model tokens. The Mandala plan is not rechecked. The
 model API can end the run too, and its status is relayed as it came, about the
 account behind `model_key`: 402 `billing_error` (`ModelProviderError`), 504
-`timeout_error`, 529 `overloaded_error`; a 403 without reason `revoked` may be
+`timeout_error` (a plain `APIError`, not `GatewayTimeoutError`: the platform
+answered, with the run's usage and steps), 529 `overloaded_error`; a 403 without reason `revoked` may be
 its `permission_error`. Where the refusal says how far the run got, `e.agent`
 carries it there too. A `revoked` refusal or a 402 is not a reason to send the
 request again: the credential, the role or the model account's billing has to
@@ -2814,8 +2816,9 @@ is sent as given, and one that does not exist comes back as the platform's own
 deletion stopped partway and took its disk with it: its files were partly
 removed, every call that needs a disk is refused, it will never start again,
 and deleting it again is what clears it. `wait_until_running()`,
-`wait_for_guest()` and `launch()` raise on it at once rather than waiting out
-their timeout. Treat a status outside the six as not startable, not as
+`wait_for_guest()`, `wait_for_secrets()`, `wait_for_browser_proxy()`,
+`wait_for_egress_proxy()` and `launch()` raise on it at once rather than
+waiting out their timeout. Treat a status outside the six as not startable, not as
 `stopped`.
 
 ### Files
@@ -3075,12 +3078,20 @@ import mandala_computer as mc
 
 def budget(response: httpx.Response) -> None:
     left = response.headers.get("RateLimit-Remaining")
-    if left is not None and int(left) < 50:
+    # A proxy can fold two values into one header ("100, 100"); an exception
+    # raised here escapes httpx.send as a bare error, even after a POST ran.
+    if left is not None and left.strip().isdigit() and int(left) < 50:
         print(f"rate budget low: {left} left")
 
 
 client = mc.Client(http_client=httpx.Client(event_hooks={"response": [budget]}))
 ```
+
+A response hook on the `http_client` turns off the SDK's opt-in retries of
+connection failures that happen before a response is seen (see
+[Optional retries for reads](#optional-retries-for-reads)): a hook can read a
+response before httpx hands it back, so the SDK can no longer tell whether one
+arrived.
 
 Replace the ID below with an existing computer's ID.
 

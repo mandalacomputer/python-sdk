@@ -6291,3 +6291,24 @@ def test_a_half_removed_computer_fails_both_waits_at_once(client: mc.Client) -> 
     assert not isinstance(running.value, mc.TimeoutError)
     assert not isinstance(guest.value, mc.TimeoutError)
     assert not probe.called
+
+
+@pytest.mark.parametrize(
+    "wait",
+    [
+        lambda c: c.wait_for_secrets(timeout=30, poll=0, expect_secrets=True),
+        lambda c: c.wait_for_browser_proxy(timeout=30, poll=0, expect_browser_proxy=True),
+        lambda c: c.wait_for_egress_proxy(timeout=30, poll=0, expect_credentials=True),
+    ],
+    ids=["secrets", "browser-proxy", "egress-proxy"],
+)
+@respx.mock
+def test_a_half_removed_computer_fails_the_delivery_waits_at_once(client: mc.Client, wait) -> None:
+    """Not "call start()": no start will ever take on a computer whose disk a
+    stopped deletion took with it, so these waits give the same answer the
+    lifecycle waits do."""
+    half = {**COMPUTER, "status": "half-removed", "running_ram_mb": 0}
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=half))
+    with pytest.raises(mc.MandalaError, match="partly removed; it cannot be started") as error:
+        wait(mc.Computer(client._t, half))
+    assert not isinstance(error.value, mc.TimeoutError)

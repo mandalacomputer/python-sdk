@@ -493,8 +493,9 @@ class AsyncComputer(ComputerFields):
 
         ``None`` clears the override and returns it to its host's own sweep. See
         :attr:`idle_suspend_min` for why that is not the same as reading a
-        number back. The most a host accepts is 10080 (a week); more, or a
-        negative number, is a 400.
+        number back. The most a host accepts is 10080 (a week); more is a 400
+        from the host. A negative number raises :class:`ValueError` before
+        anything is sent.
 
         ``0`` means never: no idle suspend, and no eviction under memory
         pressure either. It is capped per plan — Solo 0, Studio 1, Fleet 4
@@ -2366,9 +2367,11 @@ class AsyncComputer(ComputerFields):
         own status is relayed as it came, about the account behind
         ``model_key``: 402 ``billing_error`` (raised as
         :class:`~mandala_computer.ModelProviderError`, not
-        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``, 529
-        ``overloaded_error``, and a 403 without reason ``revoked`` may be its
-        ``permission_error``. Where the refusal says how far it got, that
+        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``
+        (raised as a plain :class:`~mandala_computer.APIError`, not
+        :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
+        with the run's usage and steps), 529 ``overloaded_error``, and a 403
+        without reason ``revoked`` may be its ``permission_error``. Where the refusal says how far it got, that
         account rides on the exception as
         :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
         :meth:`agent`. A ``revoked`` refusal or a 402 is not worth retrying

@@ -158,6 +158,20 @@ def test_a_publish_conflict_keeps_the_platforms_own_word(client: mc.Client) -> N
 
 
 @respx.mock
+@pytest.mark.parametrize("word", ["contention", "starting"])
+def test_a_publish_conflict_keeps_a_clearing_word_as_sent(client: mc.Client, word: str) -> None:
+    """The one exception publish() documents: a clearing word is the platform's
+    explicit advice to wait, so it is not rewritten to "exists"."""
+    respx.post(f"{BASE}/templates").mock(
+        return_value=httpx.Response(409, json={"error": "busy", "reason": word})
+    )
+    with pytest.raises(mc.ConflictError) as error:
+        client.templates.publish("apiVersion: mandala/v1")
+    assert error.value.reason == word
+    assert mc.is_transient(error.value) is True
+
+
+@respx.mock
 async def test_an_async_publish_conflict_is_never_called_worth_retrying(
     async_client: mc.AsyncClient,
 ) -> None:

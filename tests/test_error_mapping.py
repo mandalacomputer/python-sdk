@@ -657,8 +657,15 @@ def test_an_explicit_exists_is_still_file_exists_error_and_unchained():
             {"RateLimit-Limit": "6e2", "RateLimit-Remaining": "-1", "RateLimit-Reset": " 4 "},
             (None, None, 4),
         ),
+        # A digit run past int()'s 4300-digit limit would raise ValueError
+        # out of the error mapping; it is no budget, so it reads as None.
+        (
+            {"RateLimit-Limit": "600", "RateLimit-Remaining": "9" * 5000},
+            (600, None, None),
+        ),
+        ({"RateLimit-Remaining": "1" * 19}, (None, None, None)),
     ],
-    ids=["all-three", "absent", "malformed"],
+    ids=["all-three", "absent", "malformed", "oversized", "past-18-digits"],
 )
 def test_a_429_carries_the_platforms_budget_headers(headers, expected):
     """Every metered answer carries RateLimit-*; a caller that was refused should

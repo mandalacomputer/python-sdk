@@ -1533,3 +1533,11 @@ async def test_async_waits_fail_at_once_on_a_half_removed_computer(
     assert not isinstance(running.value, mc.TimeoutError)
     assert not isinstance(guest.value, mc.TimeoutError)
     assert not probe.called
+    for wait in (
+        lambda c: c.wait_for_secrets(timeout=30, poll=0, expect_secrets=True),
+        lambda c: c.wait_for_browser_proxy(timeout=30, poll=0, expect_browser_proxy=True),
+        lambda c: c.wait_for_egress_proxy(timeout=30, poll=0, expect_credentials=True),
+    ):
+        with pytest.raises(mc.MandalaError, match="partly removed; it cannot be started") as e:
+            await wait(mc.AsyncComputer(client._t, half))
+        assert not isinstance(e.value, mc.TimeoutError)

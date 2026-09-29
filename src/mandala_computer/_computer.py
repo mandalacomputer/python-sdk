@@ -54,6 +54,7 @@ from ._exceptions import (
     ConnectionError,
     CreateOnlyConflictError,
     FileExistsError,
+    GatewayTimeoutError,
     MandalaError,
     ModelProviderError,
     RangeNotSatisfiableError,
@@ -231,11 +232,32 @@ def _agent_route_error(exc: APIError) -> APIError:
     files every 402 as :class:`~mandala_computer.PlanLimitError`, whose advice
     (change the plan) would be wrong here. So a 402 is rebuilt as a
     :class:`~mandala_computer.ModelProviderError` carrying everything the first
-    one did, and every other status is returned as it is.
+    one did.
+
+    A 504 is the other status that needs a second look. The platform relays the
+    model API's own ``timeout_error`` on a failed ``agent_once`` run as an HTTP
+    504 whose JSON body carries the run's ``usage`` and ``steps_taken``. That is
+    the platform reporting a downstream timeout, not a hop that stopped waiting,
+    so it is rebuilt as a plain :class:`~mandala_computer.APIError` — the class
+    :func:`error_for_status` already gives the same 504 reported mid-stream.
+    A body-less 504 (or one without either field) is left a
+    :class:`~mandala_computer.GatewayTimeoutError`: that is an edge cut, and the
+    run went with the connection. Every other status is returned as it is.
     """
-    if exc.status != 402 or isinstance(exc, ModelProviderError):
+    if isinstance(exc, ModelProviderError):
         return exc
-    error = ModelProviderError(
+    if exc.status == 402:
+        cls: type[APIError] = ModelProviderError
+    elif (
+        exc.status == 504
+        and isinstance(exc, GatewayTimeoutError)
+        and isinstance(exc.body, Mapping)
+        and ("steps_taken" in exc.body or "usage" in exc.body)
+    ):
+        cls = APIError
+    else:
+        return exc
+    error = cls(
         str(exc),
         status=exc.status,
         body=exc.body,
@@ -1222,7 +1244,11 @@ class ComputerFields:
         ``"half-removed"`` is a computer whose deletion stopped partway and took
         its disk with it: its files were partly removed, every call that needs
         a disk is refused on it, it will never start again, and deleting it
-        again is what clears it. The waits raise on it at once.
+        again is what clears it. :meth:`~Computer.wait_until_running`,
+        :meth:`~Computer.wait_for_guest`, :meth:`~Computer.wait_for_secrets`,
+        :meth:`~Computer.wait_for_browser_proxy`,
+        :meth:`~Computer.wait_for_egress_proxy` and ``launch()`` raise on it at
+        once rather than waiting out their timeout.
 
         The platform documents these six as a closed set: treat anything
         outside it as not startable rather than as ``"stopped"``.
@@ -1416,6 +1442,11 @@ class ComputerFields:
         if self.is_building:
             return "unreported" if unreported else "delivering"
         if self.status != "running":
+            # A deletion that stopped partway took the disk with it: nothing
+            # will start this computer, so no delivery is coming.
+            half = self._half_removed()
+            if half is not None:
+                return half
             # Both refusals come before the silence about bindings is waited
             # past: whatever is bound, a machine nobody is starting delivers
             # nothing, and a read that says so outright is an answer.
@@ -1568,6 +1599,9 @@ class ComputerFields:
         if self.is_building:
             return waiting
         if self.status != "running":
+            half = self._half_removed()
+            if half is not None:
+                return half
             # The refusals _secrets_state makes, for its reasons: a known failed
             # boot on the weaker evidence, and a machine the platform says
             # nobody is starting. A start admitted but not yet booted reads
@@ -1608,6 +1642,9 @@ class ComputerFields:
         )
         if not names_credentials or self.status == "running":
             return "applied"
+        half = self._half_removed()
+        if half is not None:
+            return half
         if self.build_failed:
             return MandalaError(
                 f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
@@ -2554,8 +2591,9 @@ class Computer(ComputerFields):
 
         ``None`` clears the override and returns it to its host's own sweep. See
         :attr:`idle_suspend_min` for why that is not the same as reading a
-        number back. The most a host accepts is 10080 (a week); more, or a
-        negative number, is a 400.
+        number back. The most a host accepts is 10080 (a week); more is a 400
+        from the host. A negative number raises :class:`ValueError` before
+        anything is sent.
 
         ``0`` means never: no idle suspend, and no eviction under memory
         pressure either. It is capped per plan — Solo 0, Studio 1, Fleet 4
@@ -4759,9 +4797,11 @@ class Computer(ComputerFields):
         own status is relayed as it came, about the account behind
         ``model_key``: 402 ``billing_error`` (raised as
         :class:`~mandala_computer.ModelProviderError`, not
-        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``, 529
-        ``overloaded_error``, and a 403 without reason ``revoked`` may be its
-        ``permission_error``. Where the refusal says how far it got, that
+        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``
+        (raised as a plain :class:`~mandala_computer.APIError`, not
+        :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
+        with the run's usage and steps), 529 ``overloaded_error``, and a 403
+        without reason ``revoked`` may be its ``permission_error``. Where the refusal says how far it got, that
         account rides on the exception as
         :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
         :meth:`agent`. A ``revoked`` refusal or a 402 is not worth retrying

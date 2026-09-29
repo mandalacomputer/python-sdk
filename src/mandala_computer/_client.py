@@ -993,12 +993,15 @@ def _rate_header(resp: httpx.Response, name: str) -> int | None:
     Each is a non-negative whole number on the wire. Anything else — absent,
     blank, a fraction, a sign, a list a proxy folded two values into — is
     ``None`` rather than a guess, because a wrong budget is worse than none.
+    So is a digit run too long to be a real budget: past 18 digits it is no
+    count the platform sends, and past 4300 ``int()`` itself refuses it, which
+    would otherwise escape the error mapping as a bare ``ValueError``.
     """
     raw = resp.headers.get(name)
     if raw is None:
         return None
     text = raw.strip()
-    if not text.isascii() or not text.isdigit():
+    if not text.isascii() or not text.isdigit() or len(text) > 18:
         return None
     return int(text)
 

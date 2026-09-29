@@ -598,6 +598,36 @@ def test_a_402_reported_mid_stream_is_the_model_provider_too(computer: mc.Comput
     assert mc.is_transient(error.value) is False
 
 
+TIMEOUT_504 = {
+    "error": "model API: 504 timeout_error",
+    "usage": {"input_tokens": 7},
+    "steps_taken": [{"n": 1, "tool": "computer"}],
+}
+
+
+@respx.mock
+def test_a_model_504_on_agent_once_is_not_a_gateway_timeout(computer: mc.Computer) -> None:
+    """The platform answered: a 504 with the run's usage and steps is the model
+    API's timeout, relayed. GatewayTimeoutError says the connection was cut
+    and the run lost, which this body contradicts; the stream already calls
+    the same 504 a plain APIError."""
+    respx.post(AGENT).mock(httpx.Response(504, json=TIMEOUT_504))
+    with pytest.raises(mc.APIError, match="timeout_error") as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert type(error.value) is mc.APIError
+    assert error.value.status == 504 and error.value.method == "POST"
+    assert error.value.agent is not None and error.value.agent.usage.input_tokens == 7
+    assert len(error.value.agent.steps) == 1
+
+
+@respx.mock
+def test_a_body_less_504_on_agent_once_is_still_the_edge_cut(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(httpx.Response(504, json={"error": "gateway timeout"}))
+    with pytest.raises(mc.GatewayTimeoutError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is None
+
+
 @respx.mock
 def test_a_402_elsewhere_is_still_the_plan(client: mc.Client) -> None:
     """Only the agent routes relay the model provider's 402."""
@@ -1108,6 +1138,18 @@ async def test_the_async_halves_raise_a_402_as_the_model_provider() -> None:
     for error in (once.value, streamed.value):
         assert not isinstance(error, mc.PlanLimitError)
         assert error.agent is not None
+    assert once.value.agent is not None and len(once.value.agent.steps) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_agent_once_raises_a_model_504_as_a_plain_api_error() -> None:
+    respx.post(AGENT).mock(httpx.Response(504, json=TIMEOUT_504))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.APIError) as once:
+            await c.agent_once("do the thing", model_key=KEY)
+    assert type(once.value) is mc.APIError
     assert once.value.agent is not None and len(once.value.agent.steps) == 1
 
 
