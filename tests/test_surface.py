@@ -816,12 +816,13 @@ def exercise_everything(client: mc.Client) -> None:
     with client.computers.ephemeral(template="base"):
         pass
     c.refresh()
-    # The three readiness waits, which poll routes the calls around them already
-    # reach: `GET computers/:id` for the first two and `POST computers/:id/exec`
-    # for the guest probe.
+    # The readiness waits, which poll routes the calls around them already
+    # reach: `GET computers/:id` for most and `POST computers/:id/exec` for the
+    # guest and desktop probes.
     c.wait_until_built()
     c.wait_until_running()
     c.wait_for_guest()
+    c.wait_for_desktop()
     c.wait_for_secrets()
     c.wait_for_browser_proxy()
     c.wait_for_egress_proxy()
@@ -1110,6 +1111,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.wait_until_built()
     await c.wait_until_running()
     await c.wait_for_guest()
+    await c.wait_for_desktop()
     await c.wait_for_secrets()
     await c.wait_for_browser_proxy()
     await c.wait_for_egress_proxy()

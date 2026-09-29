@@ -971,6 +971,11 @@ def capture_timed_out(snapshot_id: str, timeout: float, *, short: bool = False) 
 # on Windows it could only spin until it timed out.
 GUEST_PROBE = "exit 0"
 
+# What wait_for_desktop() runs in the desktop session to decide it exists.
+# Linux only — that wait never asks a Windows guest — so the shell builtin needs
+# no cmd.exe spelling.
+DESKTOP_PROBE = "true"
+
 
 def _require_background_pid(data: Mapping[str, Any]) -> None:
     """Reject a successful start response that cannot identify its command."""
@@ -1114,6 +1119,42 @@ def _guest_not_running(err: BaseException) -> bool:
     business waiting out a 400.
     """
     return isinstance(err, APIError) and err.status == 400
+
+
+def _desktop_wait_skipped(data: Mapping[str, Any]) -> bool:
+    """Whether :meth:`Computer.wait_for_desktop` has nothing to ask this computer.
+
+    Linux only: a Windows guest's desktop session is not reachable through this
+    API, and a computer whose ``os`` was not reported is not assumed to have
+    one. An explicit empty ``desktop`` is skipped too. An ABSENT ``desktop`` is
+    not: the platform leaves the field out for an X11 desktop, which is what
+    most Linux templates run — the case the wait matters most for. Read off the
+    raw payload because :attr:`ComputerFields.desktop` answers ``""`` for both.
+    """
+    return data.get("os") != "linux" or data.get("desktop") == ""
+
+
+def _desktop_wait_fatal(err: MandalaError) -> bool:
+    """Whether a failed desktop probe ends :meth:`Computer.wait_for_desktop`.
+
+    The no-desktop refusal is a 409 with no ``reason`` — deliberately, since the
+    same sentence describes a guest where nobody will ever log in — and it is
+    what the wait exists to outlast; a 5xx, a 429 or a ``contention`` 409 is the
+    moment too, as :func:`_is_transient_for_poll` says. A computer that is not
+    running (``reason: "unavailable"``) will not grow a desktop by being asked
+    again, and a refusal of the request itself must not become a timeout.
+    """
+    if isinstance(err, APIError) and err.reason == "unavailable":
+        return True
+    return not _is_transient_for_poll(err)
+
+
+def _desktop_timeout(computer_id: str, timeout: float) -> str:
+    """What a ``wait_for_desktop`` that ran out of time says, on both handles."""
+    return (
+        f"{computer_id}'s desktop session was not active within {timeout:g}s (it may "
+        "still be logging in, or nobody is logged in)"
+    )
 
 
 def _secrets_timeout(
@@ -3153,6 +3194,56 @@ class Computer(ComputerFields):
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             time.sleep(min(delay, remaining))
+
+    def wait_for_desktop(self, timeout: float = 180.0, poll: float = 3.0) -> Computer:
+        """Block until this computer's desktop session exists, by running a
+        trivial command in it.
+
+        :meth:`wait_for_guest` establishes that the *guest agent* answers, which
+        is earlier than the desktop user being logged in: for a few seconds
+        after it, ``exec(..., desktop=True)`` is refused with a
+        :class:`ConflictError` saying no desktop session is active. That
+        refusal carries no ``reason`` on purpose — the same sentence also
+        describes a guest where nobody will ever log in — so only a caller that
+        knows the computer has just booted can wait it out. This is that wait,
+        and :meth:`Computers.launch` calls it for you.
+
+        The probe is ``true``, run in the desktop session with no output.
+        Refusals that describe the moment are polled through as the other waits
+        poll them; one saying the computer is not running
+        (``reason: "unavailable"``) and anything about the request itself are
+        raised at once.
+
+        Linux only. Returns at once, asking nothing, for a Windows guest, for a
+        computer whose :attr:`os` was not reported, and for one whose
+        ``desktop`` is an explicit empty string. An absent ``desktop`` IS waited
+        on: the platform leaves it out for an X11 desktop.
+
+        Like :meth:`wait_for_guest`, the probe resumes a suspended computer.
+        """
+        check_wait_args(timeout, poll)
+        if _desktop_wait_skipped(self._data):
+            return self
+        deadline = time.monotonic() + timeout
+        while True:
+            delay = poll
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_desktop_timeout(self.id, timeout))
+            try:
+                probe_timeout = max(1, min(5, math.ceil(remaining)))
+                self._exec(DESKTOP_PROBE, probe_timeout, desktop=True, timeout_cap=remaining)
+                # Whatever `true` exited with, the session it ran in exists: the
+                # platform answers a missing session as a refusal, never a result.
+                return self
+            except MandalaError as err:
+                if _desktop_wait_fatal(err):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(_desktop_timeout(self.id, timeout)) from err
+                delay = _poll_delay(err, poll)
+            time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
 
     def wait_for_secrets(
         self, timeout: float = 180.0, poll: float = 2.0, *, expect_secrets: bool = False

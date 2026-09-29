@@ -387,19 +387,21 @@ class Computers:
         browser opened on the returned computer uses it. With an
         ``egress_proxy`` naming ``credentials_secret_id`` it also waits until
         the computer's host holds them (:meth:`Computer.wait_for_egress_proxy`):
-        until then every connection the computer opens is closed.
+        until then every connection the computer opens is closed. A Linux computer is
+        waited on until its desktop session exists
+        (:meth:`Computer.wait_for_desktop`), so ``exec(..., desktop=True)`` on the
+        returned computer is not refused as having no desktop session.
 
         ``timeout`` is one readiness budget in seconds, beginning after create
-        returns. Disk, running, guest, secrets, browser proxy and egress proxy
-        waits share the remaining time, and
+        returns. Disk, running, guest, secrets, browser proxy, egress proxy
+        and desktop waits share the remaining time, and
         elapsed start work consumes it too. Create and start retain their usual
         transport deadlines: this is not a total wall-clock limit on launch.
         ``poll`` is the delay in seconds between polls in every stage.
 
         The computer is persistent and is never deleted on failure. SDK errors
         after creation retain their type and include its id. Interruption
-        propagates unchanged. Use ``ephemeral`` for scoped cleanup. Guest
-        readiness does not guarantee the desktop has finished logging in.
+        propagates unchanged. Use ``ephemeral`` for scoped cleanup.
 
         ``idempotency_key`` is the create's key (see :meth:`create`): after a
         dropped connection or a timeout on the create, calling ``launch`` again
@@ -504,6 +506,12 @@ class Computers:
                 computer.wait_for_egress_proxy(
                     timeout=remaining(), poll=poll, expect_credentials=True
                 )
+            # The guest agent answers, and the secrets land, seconds before the
+            # desktop user is logged in, and a desktop command run in between is
+            # refused with a 409 that cannot say "still booting". Last, so every
+            # wait above has had that time too. Returns at once for a computer
+            # that is not reported as Linux.
+            computer.wait_for_desktop(timeout=remaining(), poll=poll)
             return computer
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.
