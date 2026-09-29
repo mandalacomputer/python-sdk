@@ -534,11 +534,11 @@ def merge_config(current: str, snippet: str) -> str:
     appended to a CRLF config) is removed, with the blank line before it,
     unless an unmarked directive follows it before the next ``Host`` or
     ``Match`` line: removing that copy would move the directive under another
-    stanza, so it is left as it is. A begin marker with no end marker of its
-    own is left as it is, with every copy after it: it reads the next copy's
-    end marker as its own, so removing that copy would hide the aliases under
-    it from :func:`written_hosts`. Another label's copies are left as they
-    are.
+    stanza, so it is left as it is. A later begin marker with no end marker
+    of its own is left as it is, with every copy after it: it reads the next
+    copy's end marker as its own, so removing that copy would hide the
+    aliases under it from :func:`written_hosts`. Another label's copies are
+    left as they are.
     """
     text = current
     labels = re.findall(r"^# >>> mandala (.+?) >>>$", snippet, re.MULTILINE)

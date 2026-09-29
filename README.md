@@ -3439,7 +3439,8 @@ exists, delete its block, markers included. `--write` also removes any later
 copy of the block of the computer it is run for, or of the gateway's block (an
 earlier `mandala` CLI could append one to a `~/.ssh/config` saved with CRLF
 line endings), unless a line of your own follows that copy before the next
-`Host` or `Match` line.
+`Host` or `Match` line, or a later copy whose `# <<< mandala … <<<` line was
+deleted, which is left in place with every copy after it.
 
 In VS Code, with the Remote-SSH extension, run **Remote-SSH: Connect to
 Host…** and pick `dev` — it reads the same file. **Add New SSH Host** also
