@@ -157,6 +157,7 @@ async def test_exhausted_budget_does_not_enter_next_stage(monkeypatch, stage):
     [
         ({**state("build-failed", 0), "build_error": "disk copy failed"}, "disk copy failed"),
         ({**state("stopped", 0), "start_error": "boot refused"}, "boot refused"),
+        (state("half-removed", 0), "partly removed"),
     ],
 )
 async def test_failed_create_stage_is_not_retried(result, reason):

@@ -564,16 +564,76 @@ def test_a_refusal_that_reports_no_run_carries_none(computer: mc.Computer) -> No
     assert error.value.agent is None
 
 
+BILLING_402 = {
+    "error": "model API: 402 billing_error",
+    "usage": {"input_tokens": 5},
+    "steps_taken": [{"n": 1, "tool": "computer"}],
+}
+
+
 @respx.mock
-def test_a_plan_refused_mid_run_keeps_the_account_too(computer: mc.Computer) -> None:
-    """402 as well as 401 and 403: the plan is rechecked against the current one."""
-    respx.post(AGENT).mock(
-        httpx.Response(402, json={"error": "Choose a plan.", "usage": {"input_tokens": 5}})
-    )
-    with pytest.raises(mc.PlanLimitError) as error:
+def test_a_402_from_the_run_is_the_model_provider_not_the_plan(computer: mc.Computer) -> None:
+    """Nothing inside a run consults the plan: the only 402 there is the model
+    API's own billing_error, relayed. A PlanLimitError would tell the caller to
+    change a plan that is not the problem."""
+    respx.post(AGENT).mock(httpx.Response(402, json=BILLING_402))
+    with pytest.raises(mc.ModelProviderError, match="billing_error") as error:
         computer.agent_once("do the thing", model_key=KEY)
+    assert not isinstance(error.value, mc.PlanLimitError)
+    assert error.value.status == 402 and error.value.method == "POST"
     assert error.value.agent is not None and error.value.agent.usage.input_tokens == 5
-    assert error.value.agent.steps == ()
+    assert len(error.value.agent.steps) == 1
+    assert mc.is_transient(error.value) is False
+
+
+@respx.mock
+def test_a_402_reported_mid_stream_is_the_model_provider_too(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(
+        stream(frame("error", '{"error": "model API: billing_error", "status": 402}'))
+    )
+    with pytest.raises(mc.ModelProviderError, match="billing_error") as error:
+        computer.agent("do the thing", model_key=KEY)
+    assert not isinstance(error.value, mc.PlanLimitError)
+    assert error.value.agent is not None and error.value.agent.status == 402
+    assert mc.is_transient(error.value) is False
+
+
+TIMEOUT_504 = {
+    "error": "model API: 504 timeout_error",
+    "usage": {"input_tokens": 7},
+    "steps_taken": [{"n": 1, "tool": "computer"}],
+}
+
+
+@respx.mock
+def test_a_model_504_on_agent_once_is_not_a_gateway_timeout(computer: mc.Computer) -> None:
+    """The platform answered: a 504 with the run's usage and steps is the model
+    API's timeout, relayed. GatewayTimeoutError says the connection was cut
+    and the run lost, which this body contradicts; the stream already calls
+    the same 504 a plain APIError."""
+    respx.post(AGENT).mock(httpx.Response(504, json=TIMEOUT_504))
+    with pytest.raises(mc.APIError, match="timeout_error") as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert type(error.value) is mc.APIError
+    assert error.value.status == 504 and error.value.method == "POST"
+    assert error.value.agent is not None and error.value.agent.usage.input_tokens == 7
+    assert len(error.value.agent.steps) == 1
+
+
+@respx.mock
+def test_a_body_less_504_on_agent_once_is_still_the_edge_cut(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(httpx.Response(504, json={"error": "gateway timeout"}))
+    with pytest.raises(mc.GatewayTimeoutError) as error:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert error.value.agent is None
+
+
+@respx.mock
+def test_a_402_elsewhere_is_still_the_plan(client: mc.Client) -> None:
+    """Only the agent routes relay the model provider's 402."""
+    respx.post(f"{BASE}/computers").mock(httpx.Response(402, json={"error": "Choose a plan."}))
+    with pytest.raises(mc.PlanLimitError):
+        client.computers.create(name="dev")
 
 
 # --- forward compatibility -------------------------------------------------
@@ -1058,3 +1118,73 @@ async def test_the_async_raise_carries_the_failed_run_too() -> None:
         with pytest.raises(mc.AuthenticationError, match="after 1 step:") as e:
             await c.agent("do the thing", model_key=KEY)
     assert e.value.agent is not None and e.value.agent.usage.input_tokens == 90
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_halves_raise_a_402_as_the_model_provider() -> None:
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(402, json=BILLING_402),
+            stream(frame("error", '{"error": "model API: billing_error", "status": 402}')),
+        ]
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.ModelProviderError) as once:
+            await c.agent_once("do the thing", model_key=KEY)
+        with pytest.raises(mc.ModelProviderError) as streamed:
+            await c.agent("do the thing", model_key=KEY)
+    for error in (once.value, streamed.value):
+        assert not isinstance(error, mc.PlanLimitError)
+        assert error.agent is not None
+    assert once.value.agent is not None and len(once.value.agent.steps) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_agent_once_raises_a_model_504_as_a_plain_api_error() -> None:
+    respx.post(AGENT).mock(httpx.Response(504, json=TIMEOUT_504))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.APIError) as once:
+            await c.agent_once("do the thing", model_key=KEY)
+    assert type(once.value) is mc.APIError
+    assert once.value.agent is not None and len(once.value.agent.steps) == 1
+
+
+ONCE_WITH_STEPS = {
+    **DONE,
+    "steps_taken": [
+        {"n": 1, "tool": "computer", "action": "left_click", "detail": "clicked Settings"},
+        {"tool": "bash", "detail": "ran ls"},
+    ],
+}
+
+
+@respx.mock
+def test_agent_once_keeps_the_steps_its_body_carries(computer: mc.Computer) -> None:
+    """The one body of a non-streaming run lists every step it took; dropping it
+    left a finished run with only a count of what it did to the desktop."""
+    respx.post(AGENT).mock(httpx.Response(200, json=ONCE_WITH_STEPS))
+    result = computer.agent_once("do the thing", model_key=KEY)
+    assert [(s.n, s.tool, s.detail) for s in result.steps_taken] == [
+        (1, "computer", "clicked Settings"),
+        (2, "bash", "ran ls"),
+    ]
+
+
+@respx.mock
+def test_a_streamed_result_has_no_steps_taken(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(stream(frame("step", '{"n": 1}'), DONE_FRAME))
+    assert computer.agent("do the thing", model_key=KEY).steps_taken == ()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_agent_once_keeps_the_steps_too() -> None:
+    respx.post(AGENT).mock(httpx.Response(200, json=ONCE_WITH_STEPS))
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        result = await c.agent_once("do the thing", model_key=KEY)
+    assert [s.n for s in result.steps_taken] == [1, 2]

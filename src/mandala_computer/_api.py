@@ -1462,18 +1462,33 @@ def _env_object(env: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+#: The browsers :func:`open_url_command` looks for, in the order it prefers them.
+#: The images do not agree on one: the Debian-based ones ship ``firefox-esr``
+#: (and Chromium), and the Omarchy one ships Chromium and no Firefox at all.
+OPEN_URL_BROWSERS = ("firefox-esr", "firefox", "chromium")
+
+#: What the guest prints, and exits 127 with, when none of them is installed.
+OPEN_URL_NO_BROWSER = "no browser (firefox-esr, firefox or chromium) on this image"
+
+
 def open_url_command(url: str) -> str:
     """Build the shell command that puts ``url`` on the guest's screen.
 
-    The browser is named rather than asked for: Firefox, not ``xdg-open`` or one
-    of the other portable wrappers. Naming it keeps the choice in one place —
-    this function is the only thing that decides which browser the guest opens,
-    so a change of image, or of which browser we want, is a change here rather
+    The browser is chosen from what the image has installed rather than asked
+    of ``xdg-open`` or one of the other portable wrappers: ``firefox-esr``,
+    then ``firefox``, then ``chromium``, the first one ``command -v`` finds.
+    One name cannot be hard-coded, because the images do not share one — the
+    Omarchy image has Chromium and no Firefox, and a fixed ``firefox`` there
+    opened nothing while the call reported success (OPL-3705). Keeping the
+    choice here still means a change of image is a change in one place rather
     than in every caller's prompt.
 
-    Detached, because a browser does not exit on its own: in the foreground the
-    call would block until the timeout killed it and come back as a failure,
-    having opened the window anyway.
+    The lookup runs in the foreground, so an image with none of the three exits
+    127 with :data:`OPEN_URL_NO_BROWSER` on stderr, which the caller can see.
+    Only the launch is detached, because a browser does not exit on its own: in
+    the foreground the call would block until the timeout killed it and come
+    back as a failure, having opened the window anyway. The cost of detaching
+    is that a browser which starts and then dies is not reported.
     """
     # Canonical first, then strip the canonical string — not the original.
     # ``str.strip`` returns ``self`` when there is nothing to strip, so a
@@ -1489,7 +1504,11 @@ def open_url_command(url: str) -> str:
     # starts with one, so that is refused outright rather than quoted.
     if url.startswith("-"):
         raise ValueError(f"url must not start with '-': {url!r}")
-    return f"nohup firefox {shlex.quote(url)} >/dev/null 2>&1 &"
+    lookup = " || ".join(f"command -v {name}" for name in OPEN_URL_BROWSERS)
+    return (
+        f"b=$({lookup}) || {{ echo {shlex.quote(OPEN_URL_NO_BROWSER)} >&2; exit 127; }}; "
+        f'nohup "$b" {shlex.quote(url)} >/dev/null 2>&1 &'
+    )
 
 
 def snapshot_body(memory: bool, name: str | None = None) -> dict[str, Any]:
@@ -2362,11 +2381,14 @@ def workspace_members(workspace_id: str) -> str:
 #: before carrying it out, and for 24 hours answers the same key with the same
 #: request from that record instead of doing the call again: ``409`` with
 #: ``code: "idempotency_in_progress"`` while it runs, the original answer once
-#: it has finished. A call the platform answered with a ``5xx`` is different:
-#: its outcome is unknown, and from then on the same key answers ``409`` with
+#: it has finished. A ``5xx`` that names an ``operation_id`` is different: its
+#: outcome is unknown, and from then on the same key answers ``409`` with
 #: ``code: "idempotency_outcome_unknown"`` and never the result, so read the
-#: computer or its operation instead. A different request under the same key
-#: is a ``422``.
+#: computer or its operation instead. A ``5xx`` that names none may have been
+#: refused before the call was sent anywhere, which releases the key, and the
+#: same call under it is carried out; so resending under the same key is safe
+#: after any ``5xx``. Keys are kept per credential scope. A different request
+#: under the same key is a ``422``.
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
 _IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,255}")

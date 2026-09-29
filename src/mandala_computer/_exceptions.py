@@ -22,6 +22,7 @@ __all__ = [
     "GatewayTimeoutError",
     "MandalaError",
     "MethodNotAllowedError",
+    "ModelProviderError",
     "MoveRequiredError",
     "NotFoundError",
     "OperationFailedError",
@@ -66,11 +67,15 @@ class MandalaError(Exception):
     #: same call again with this key —
     #: ``computer.start(idempotency_key=err.idempotency_key)`` — to learn how it
     #: went without doing it twice: the first call's answer once it has
-    #: finished. After a ``5xx``, or ``idempotency_outcome_unknown``, the key
-    #: never gives the answer: every resend is a ``409``
-    #: ``idempotency_outcome_unknown``. Read the computer instead, or the
-    #: operation (:attr:`APIError.operation_id`, or
+    #: finished. After ``idempotency_outcome_unknown``, or a ``5xx`` that names
+    #: an :attr:`APIError.operation_id`, the key is spent and never gives the
+    #: answer: every resend is a ``409`` ``idempotency_outcome_unknown``. Read
+    #: the computer instead, or the operation (that id, or
     #: ``operations.list(idempotency_key=...)``), to see whether it took effect.
+    #: A ``5xx`` that names no operation may have been refused before the call
+    #: was sent anywhere, which releases the key, and a resend under it is
+    #: carried out. So resending the same call under the same key is safe after
+    #: any ``5xx``: it is either carried out once or answered ``409``.
     idempotency_key: str | None = None
 
 
@@ -230,6 +235,30 @@ class PlanLimitError(APIError):
     Raised for computer-count caps, per-computer size ceilings, account-wide RAM
     and storage pools, and OS entitlements. ``str(e)`` carries the API's
     explanation of which limit was hit.
+
+    Not raised by the agent routes (:meth:`~mandala_computer.Computer.agent`,
+    :meth:`~mandala_computer.Computer.agent_stream`,
+    :meth:`~mandala_computer.Computer.agent_once`): a 402 there is the model
+    provider's, and arrives as :class:`ModelProviderError`.
+    """
+
+
+class ModelProviderError(APIError):
+    """The model provider refused an agent run's model call (402).
+
+    Raised by :meth:`~mandala_computer.Computer.agent` and
+    :meth:`~mandala_computer.Computer.agent_once` (and their async twins) for a
+    402, which on the agent routes is never the Mandala plan: it is the model
+    API's own ``billing_error``, relayed as it came, and it means the account
+    behind your ``model_key`` has a billing problem. Nothing inside an agent run
+    consults the plan; the platform's own mid-run recheck answers only 401 or
+    403 with reason ``revoked``.
+
+    A subclass of :class:`APIError` and not of :class:`PlanLimitError`, so a
+    handler written for the plan does not catch it and tell the caller to
+    upgrade something that is not the problem. Fix the model account, then run
+    again; :func:`is_transient` answers ``False``. Whatever the run had already
+    done rides on :attr:`~MandalaError.agent`, as on any other mid-run failure.
     """
 
 
@@ -326,6 +355,16 @@ class GatewayTimeoutError(APIError):
     upload whose body had not finished arriving — so before retrying something
     that *creates* rather than reads, check whether the first attempt took
     effect.
+
+    One route is the exception outright: :meth:`~mandala_computer.Computer.agent_once`.
+    An agent run is tied to its request, so the dropped connection stops the run
+    where it was, and its usage and steps are lost with the response. Use
+    :meth:`~mandala_computer.Computer.agent` or
+    :meth:`~mandala_computer.Computer.agent_stream` for a run that may be long.
+    A 504 the platform itself reports on that route — the model API's own
+    ``timeout_error``, relayed with the run's usage and steps — is not this
+    class: it is raised as a plain :class:`APIError`, with the run on
+    :attr:`~MandalaError.agent`.
 
     The ceiling this reports is not the SDK's and not ``timeout``\'s: it belongs
     to whatever sits between the caller and the platform, and it is reached at
@@ -444,6 +483,13 @@ class RateLimitError(APIError):
     :attr:`retry_after` carries the ``Retry-After`` header in seconds. Sleeping
     that long and repeating the request is the whole remedy.
 
+    The platform's budget headers ride on it too: :attr:`limit`,
+    :attr:`remaining` and :attr:`reset` are ``RateLimit-Limit``,
+    ``RateLimit-Remaining`` and ``RateLimit-Reset``. The platform sends the same
+    three on successful answers as well, and the SDK does not surface those; an
+    ``httpx`` response event hook on the ``http_client`` you pass the client
+    can read them (see the README's Errors section).
+
     Which is what the ``wait_*`` helpers do with it, and why this left the fatal
     set in OPL-3724. It was named there for a real reason — a rate limit clears
     only on the server's cadence, and a poll loop substituting its own faster
@@ -462,6 +508,9 @@ class RateLimitError(APIError):
         allow: str | None = None,
         www_authenticate: str | None = None,
         method: str | None = None,
+        limit: int | None = None,
+        remaining: int | None = None,
+        reset: int | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -473,6 +522,18 @@ class RateLimitError(APIError):
             www_authenticate=www_authenticate,
             method=method,
         )
+        #: The budget binding on this request, from ``RateLimit-Limit``: the
+        #: per-key half of the account's budget, or the account-wide figure when
+        #: other keys have spent more of it. ``None`` when the header was absent
+        #: or not a whole number, which includes every 429 reported from inside
+        #: an agent stream.
+        self.limit = limit
+        #: What was left of that budget, from ``RateLimit-Remaining``; ``None``
+        #: as for :attr:`limit`.
+        self.remaining = remaining
+        #: Seconds until that budget has refilled, from ``RateLimit-Reset``;
+        #: ``None`` as for :attr:`limit`.
+        self.reset = reset
         #: Seconds to wait before retrying, from ``Retry-After``.
         #:
         #: ``None`` where there was no usable header, which on an ordinary

@@ -311,7 +311,10 @@ would be worse than refusing.
 changes nothing, so a pipeline that republishes on every commit is safe.
 Publishing a *different* document under the same ref is a `ConflictError`; bump
 `metadata.version`. What counts as different is the digest, so a changed label is
-a change.
+a change. Retrying does not help with any of `publish()`'s 409s — a different
+document under a ref, a retired ref, or one of the per-account ceilings — so
+each carries a permanent `reason` (the platform's own, or `"exists"` where it
+sent none) and `is_transient()` answers `False`.
 
 **Two digests, and one of them is sometimes a sentence instead.** `doc_digest`
 covers the whole document and changes with anything that changes what it means,
@@ -322,13 +325,14 @@ whether an edit means a rebuild. A document naming a parent in `spec.from` gets
 `build_digest_needs` *instead* of `build_digest` — the two are alternatives, not
 a pair, and `build_digest` is present only for a document with no `spec.from` —
 because a layered document's build digest depends on the contents of
-the base image, which only a host holding it can compute:
+the base image, which only a host holding it can compute. There is nothing to
+fetch beforehand: the digest is computed when the build runs.
 
 ```python
 if check.build_digest is None and check.build_digest_needs:
     print(check.build_digest_needs)
-    # "the contents of acme/base's image, which only a host holding it can
-    # supply. ..." — and then how to get it
+    # "the contents of acme/base's image, which only a host holding that image
+    # can compute; the digest is computed when the build runs"
 ```
 
 `check.canonical` is the document as `doc_digest` was taken over it — compact
@@ -403,9 +407,9 @@ concluding you mistyped something.
 
 ### Building one
 
-A document that declares `spec.build` steps has to be compiled into an image
-before anything can launch it. That is minutes of work — an agent image is
-roughly fifteen — so it never blocks:
+A document that declares `spec.build` steps or `spec.env` has to be compiled
+into an image before anything can launch it. That is minutes of work — an agent
+image is roughly fifteen — so it never blocks:
 
 ```python
 build = client.builds.start(doc)
@@ -418,6 +422,20 @@ if out.status != "succeeded":
     where = f"step {failed.n} ({failed.kind} {failed.label})" if failed else f"phase {out.phase}"
     print(f"{where} failed: {out.error}")
 ```
+
+`spec.from` has to name a `system/...` template; anything else is a `400`.
+
+**Build secrets.** `spec.secrets` lets build steps read secrets you have stored,
+each named by id and by the environment name it is read as — `{id: csec-…, as:
+NAME}` — and never by value. They are resolved in your key's scope when the
+build is submitted, and the revision each had then is the one the build reads.
+A document may name at most 32, and `templates.validate()` does not check that
+limit. A malformed reference is a `400` saying what is wrong; one that does not
+resolve in your scope is a `400` with one sentence for every reason (deleted,
+never there, another workspace's) — neither is worth retrying. A value that
+could not be read is a `409` and a platform with no secrets keyring a `503`;
+both are worth retrying. Any other `409` from `start()` is a busy hypervisor,
+one build per host at a time, and is worth retrying too.
 
 `wait()` does **not** raise for a build that failed. `succeeded` and `failed` are
 two situations with two remedies — one has an image, the other has a step to fix
@@ -535,8 +553,9 @@ their own whether anything is coming.
 
 ### Showing somebody the desktop
 
-Every response that *is* one computer carries the credentials and URLs to open
-its live desktop, so putting a screen on your own page costs no extra call:
+Every fresh response that *is* one computer carries the credentials and URLs to
+open its live desktop, so putting a screen on your own page costs no extra call
+(a replayed one does not; see below):
 
 ```python
 c = client.computers.get("vm-0a1b2c3d4e5f")
@@ -601,6 +620,11 @@ methods write the same X `CLIPBOARD` selection the agent then offers onward.
 platform's side: a desktop credential in every list response is a credential in
 every log line that ever captured one. Call `refresh()` to get one.
 
+It is `None` on a replayed answer too: a create, clone or rename sent again
+under an `idempotency_key` the platform already answered comes back as the
+stored answer, and the platform strips desktop credentials from what it stores.
+`refresh()` fetches them. `launch()` is unaffected, because its waits refresh.
+
 ### Async
 
 `AsyncClient` mirrors `Client` method for method — same names, same arguments,
@@ -661,8 +685,15 @@ identifying where those bytes came from.
 c.stop()
 c.resize(cpu=4, ram_mb=8192)  # the computer must be stopped; disks grow only
 c.set_idle_suspend(120)  # minutes untouched before the host suspends it
+c.set_idle_suspend(0)  # never suspend it (capped per plan)
 c.set_idle_suspend(None)  # back to the host's own sweep
 ```
+
+`0` means never: no idle suspend and no eviction under memory pressure. It is
+capped per plan — Solo 0, Studio 1, Fleet 4 computers pinned at once — and one
+past the cap raises `PlanLimitError`. The most a host accepts is 10080 minutes
+(a week); more is a `400` from the host. A negative number raises `ValueError`
+before anything is sent.
 
 Three methods rather than one `update()`, because the platform refuses these in
 combination and is right to: a resize needs the computer stopped and the other
@@ -917,8 +948,11 @@ its own pixel space: to click on something in it, divide its position by the
 scale and add the region's `x` and `y` — (100, 50) in `corner` above is
 (200, 100) on the screen. A suspended computer is not woken by a screenshot:
 it answers with the JPEG saved when it was suspended, at most 640 pixels wide,
-even where a PNG is the default — check the bytes before treating them as a
-PNG. It cannot shape that picture either: a crop, a scale, `format="png"` or a quality raises
+even where a PNG is the default. The bytes cannot tell you which you got — with
+`width` set a live capture is a JPEG too — so when it matters call
+`c.screenshot_info(...)`, which takes the same arguments and returns
+`ScreenshotInfo(data, content_type, suspended)`; `suspended` is the platform's
+`X-GC-Frame: suspended` marker. It cannot shape that picture either: a crop, a scale, `format="png"` or a quality raises
 `ConflictError` with `reason == "unavailable"`, which does not clear by waiting.
 
 A non-zero exit is returned, not raised — check `res.ok`.
@@ -945,15 +979,19 @@ By default `exec()` runs in the system context — as `root` on Linux, with no
 anything with a window. The obvious call therefore does nothing:
 
 ```python
-c.exec("firefox https://example.com")  # no DISPLAY — dies, and exec() reports it
+c.exec("firefox-esr https://example.com")  # no DISPLAY — dies, and exec() reports it
 ```
 
 `desktop=True` runs the command in the logged-in desktop session instead, as the
 desktop user with `DISPLAY`, `HOME` and `XAUTHORITY` set:
 
 ```python
-c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+c.exec("nohup firefox-esr https://example.com >/dev/null 2>&1 &", desktop=True)
 ```
+
+Which browser to name depends on the image: the Debian-based ones have
+`firefox-esr` (and Chromium), and the Omarchy one has only `chromium`. `open()`
+below makes that choice for you.
 
 The `nohup … &` is still yours to write. A GUI program does not exit on its own,
 so a foreground launch blocks until `timeout` ends the wait and comes back as a
@@ -970,16 +1008,21 @@ c.open("https://example.com")
 ```
 
 That is `exec(desktop=True)` with the session, the detaching and the browser
-already decided. The result describes the launch, not the page — a zero exit
-means the shell started the browser, not that the URL resolved. Screenshot it to
-see what loaded.
+already decided. It raises `MandalaError` when no browser was started — an image
+with none of the three below, or any other non-zero exit — or when the wait timed
+out, rather than returning a result that looks like success. A result that does come back describes the
+launch, not the page: the browser was started, not that the URL resolved.
+Screenshot it to see what loaded.
 
-**Why it names a browser.** `open()` asks for Firefox by name rather than going
-through `xdg-open` or one of the other portable wrappers. Naming it puts the
-choice in one place: this method is the only thing that decides which browser the
-guest opens, so if that ever needs to be a different one, it changes here and
-your code does not change at all. Which is most of the reason to call it rather
-than write the `exec()` yourself.
+**How it picks a browser.** `open()` uses the first of `firefox-esr`, `firefox`
+and `chromium` that the image has installed, rather than going through
+`xdg-open` or one of the other portable wrappers. It cannot name one browser,
+because the images do not share one: the Omarchy image has Chromium and no
+Firefox. The lookup runs before the launch is detached, so an image with none of
+them fails the call with `no browser (firefox-esr, firefox or chromium) on this
+image`. The choice lives in one place: this method is the only thing that
+decides which browser the guest opens, so if that changes, your code does not.
+Which is most of the reason to call it rather than write the `exec()` yourself.
 
 The URL is shell-quoted, so one containing `&` or `;` stays a URL. One starting
 with `-` is refused rather than escaped: quoting stops the *shell* reading it as
@@ -1453,7 +1496,9 @@ for event in c.agent_stream("Find the cheapest flight to Lisbon", model_key=key)
 reason: it is the same request either way, and the streaming one is the request
 a proxy between you and the platform will not close for being quiet. Use
 `agent_once()` — one non-streaming request — only if you cannot use a stream at
-all.
+all. Its result also carries `result.steps_taken`, every step the run took; a
+streamed result leaves it empty, because each step already arrived as an
+`AgentStepEvent`.
 
 **A run that ends unfinished does not raise.** `max_steps`, `rate_limited` and
 `refusal` all leave real work on the desktop, and raising would throw away the
@@ -1461,7 +1506,10 @@ only account of what was done to the machine. Check `result.finished`, which is
 `stop == "end_turn"` and nothing else — including for a stop reason added after
 this SDK was written. What *does* raise is a failure the platform reports
 mid-run, as whatever class its status deserves: a bad model key comes back as an
-`AuthenticationError`, not as something your handler cannot classify.
+`AuthenticationError`, not as something your handler cannot classify. A 402 on
+these routes is the model API's `billing_error` for the account behind
+`model_key`, never your Mandala plan, and raises `ModelProviderError` rather than
+`PlanLimitError`.
 
 That raise carries the run with it. `e.agent` holds what the loop had already
 spent on your model key and the steps it had already taken, so a failure at step
@@ -1469,14 +1517,26 @@ eight stays an account of eight steps rather than only a message — the spend i
 on a key the platform never meters, and the clicks are still on the desktop.
 `agent_stream()` hands the same record over as an `AgentFailed` event.
 
-`agent_once()` can be stopped the same way, and it arrives differently. The API
-rechecks authorization before each further model call and before each tool, so a
-key revoked, a role dropped, an account suspended or a plan downgraded mid-run
-ends that one request with a 401, a 403 or a 402 rather than with a body — after
-steps that already ran on the desktop and already cost model tokens. Where the
-refusal says how far the run got, `e.agent` carries it there too. What it is not
-is a reason to send the request again: the credential, the role or the plan has
-to change first, and `is_transient()` answers `False` for all three.
+`agent_once()` can be stopped the same way, and it arrives differently. The
+platform rechecks the credential, the role and the account's standing before
+each further model call and before each tool, so a key revoked, a role dropped
+or an account suspended mid-run ends that one request with a 401 or a 403 with
+reason `revoked` rather than with a body — after steps that already ran on the
+desktop and already cost model tokens. The Mandala plan is not rechecked. The
+model API can end the run too, and its status is relayed as it came, about the
+account behind `model_key`: 402 `billing_error` (`ModelProviderError`), 504
+`timeout_error` (a plain `APIError`, not `GatewayTimeoutError`: the platform
+answered, with the run's usage and steps), 529 `overloaded_error`; a 403 without reason `revoked` may be
+its `permission_error`. Where the refusal says how far the run got, `e.agent`
+carries it there too. A `revoked` refusal or a 402 is not a reason to send the
+request again: the credential, the role or the model account's billing has to
+change first, and `is_transient()` answers `False` for them.
+
+On the hosted API, `agent_once()` cannot outlive about two minutes: the edge
+cuts a request that is not streaming at about 120 seconds with a body-less 524
+(`GatewayTimeoutError`). The run is stopped where it was, and its usage and
+steps are lost with the response, so `e.agent` is `None`. Use `agent()` or
+`agent_stream()` for anything that may take longer.
 
 ```python
 import mandala_computer as mc
@@ -2135,13 +2195,30 @@ fresh one per call unless you pass `idempotency_key=` yourself. The platform
 records the call before carrying it out, so if its answer is lost (a timeout,
 a dropped connection, a `5xx`) the exception carries the key as
 `err.idempotency_key`: call the same method again with it and it is not done
-twice — you get the first call's answer, a `ConflictError` with `code:
-"idempotency_in_progress"` while it still runs, or one with `code:
-"idempotency_outcome_unknown"` when the platform itself never heard how it
-ended (it answered a `5xx`): then read the computer, or its operation, to see
-whether it took effect — or find its operation with
+twice — you get the first call's answer (without `vnc`; see below), a
+`ConflictError` with `code: "idempotency_in_progress"` while it still runs, or
+one with `code: "idempotency_outcome_unknown"` when the platform itself never
+heard how it ended: then read the computer, or its operation, to see whether it
+took effect — or find its operation with
 `client.operations.list(idempotency_key=...)`. Keys last 24 hours, and a key
 sent with different arguments is refused with a `422`.
+
+After a `5xx`, look at `err.operation_id`. A `5xx` that names one is an unknown
+outcome: the key is spent, and every resend answers `409
+idempotency_outcome_unknown`, so read that operation or the computer. A `5xx`
+that names none may have been refused before the call was sent anywhere, which
+releases the key, and a resend under it is carried out. So sending the same
+call again under the same key is safe after any `5xx`; sending it under a new
+key is what can do it twice.
+
+A replayed answer (`Idempotent-Replayed: true`) is the stored one with the
+desktop credentials taken out: a replayed create, clone or rename comes back
+with `vnc` set to `None`. `c.refresh()` fetches them.
+
+Keys are kept per credential scope. `operations.list(idempotency_key=...)` finds
+only an operation that a credential of the same scope reserved: the same key
+sent by another workspace's API key, or by a workspace's key when yours is
+account-wide, is a different key and is not found.
 
 ### Snapshots
 
@@ -2187,6 +2264,13 @@ Every refusal is still immediate and still the exception it always was: a
 `ConflictError` for a capture already running or a disk still being copied, a
 `PlanLimitError` for an allowance that will not stretch, a `MandalaError` for a
 memory snapshot of a computer that is not running.
+
+Admission adds one more, a 503 `UnavailableError`. Manual captures on one
+account are admitted one at a time, so a capture asked for while another is
+still being admitted is refused — `asyncio.gather()` over several computers'
+`snapshot()` fails for all but one, so take them one after another. The same
+503 answers when admission cannot be confirmed, and then the capture may have
+started: look in `c.snapshots()` for a `capturing` row before retrying.
 
 **Returning is the snapshot being usable, not the computer being free.** The
 capture's claim on the *computer* is released only after the snapshot has been
@@ -2727,6 +2811,16 @@ The vocabulary is the platform's rather than this SDK's: a state added upstream
 is sent as given, and one that does not exist comes back as the platform's own
 400 naming the ones that do.
 
+`c.status` is a closed set of six: `running`, `stopped`, `suspended`,
+`building`, `build-failed` and `half-removed`. The last is a computer whose
+deletion stopped partway and took its disk with it: its files were partly
+removed, every call that needs a disk is refused, it will never start again,
+and deleting it again is what clears it. `wait_until_running()`,
+`wait_for_guest()`, `wait_for_secrets()`, `wait_for_browser_proxy()`,
+`wait_for_egress_proxy()` and `launch()` raise on it at once rather than
+waiting out their timeout. Treat a status outside the six as not startable, not as
+`stopped`.
+
 ### Files
 
 One file in or out of the guest, no shell involved — the way a credential
@@ -2938,6 +3032,7 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 |---|---|
 | `AuthenticationError` | 401 — a credential was refused |
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
+| `ModelProviderError` | 402 on the agent routes — the model API's `billing_error` for the account behind `model_key`, not the plan |
 | `PermissionDeniedError` | 403 — the credential is valid but lacks the role, membership or permission (such as Manage keys), or the account or person is suspended |
 | `NotFoundError` | 404 — no such computer, snapshot, guest file, or route |
 | `MethodNotAllowedError` | 405 — method unsupported; see `allow` |
@@ -2950,7 +3045,7 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `RangeNotSatisfiableError` | 416 — that window names no byte the file has; `size` says how long it is |
 | `RateLimitError` | 429 — too many requests; retry after `retry_after` |
 | `UnavailableError` | 503 — something could not answer now; retry a read, but a change may or may not have happened |
-| `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on |
+| `GatewayTimeoutError` | 504/524 — a proxy gave up waiting; the work usually carries on (not for `agent_once()`, whose run is stopped) |
 | `OriginResponseError` | 520 — it was reached; the exchange broke on the way back |
 | `OriginUnreachableError` | 521-523 — a proxy could not reach it; the outcome is unknown, so read state before repeating a change (not in `is_transient`) |
 | `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
@@ -2969,6 +3064,34 @@ not an idempotency key. HEAD errors and unreadable error bodies can still carry
 header metadata; older servers and connection failures may supply none. `allow`
 and `www_authenticate` preserve the received headers and are never inferred from
 the body. A 405 does not trigger an automatic method change or retry.
+
+A `RateLimitError` also carries the platform's budget headers: `limit`,
+`remaining` and `reset` are `RateLimit-Limit`, `RateLimit-Remaining` and
+`RateLimit-Reset` (seconds until the budget refills), each `None` when absent.
+The platform sends the same three on successful answers, and the SDK does not
+surface those; read them with an `httpx` event hook on the `http_client` you pass:
+
+```python
+import httpx
+import mandala_computer as mc
+
+
+def budget(response: httpx.Response) -> None:
+    left = response.headers.get("RateLimit-Remaining")
+    # A proxy can fold two values into one header ("100, 100"); an exception
+    # raised here escapes httpx.send as a bare error, even after a POST ran.
+    if left is not None and left.strip().isdigit() and int(left) < 50:
+        print(f"rate budget low: {left} left")
+
+
+client = mc.Client(http_client=httpx.Client(event_hooks={"response": [budget]}))
+```
+
+A response hook on the `http_client` turns off the SDK's opt-in retries of
+connection failures that happen before a response is seen (see
+[Optional retries for reads](#optional-retries-for-reads)): a hook can read a
+response before httpx hands it back, so the SDK can no longer tell whether one
+arrived.
 
 Replace the ID below with an existing computer's ID.
 
@@ -3102,7 +3225,10 @@ the request and is still working on it — that is what a 524 is — so retrying
 same call unchanged reproduces it exactly, and after one on an `exec()` the next
 call may report the guest agent busy. A strong default rather than a guarantee,
 though: a 504 can come from a hop that never reached the platform, and a 524 can
-end an upload whose body had not finished arriving. `str(e)` carries the
+end an upload whose body had not finished arriving. One route is the exception
+outright: `agent_once()` cut off at the edge does not carry on, because the
+dropped connection stops the run, and its usage and steps are lost (see
+[Letting the platform drive](#letting-the-platform-drive)). `str(e)` carries the
 platform's own message where it sent one, and the SDK's explanation otherwise.
 See [Long-running commands](#long-running-commands) for the ceiling and for
 `start_exec()`, which is the shape that does not meet it.

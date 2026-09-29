@@ -19,6 +19,22 @@ This is the summary you read to decide whether to upgrade.
   failures carry the start's key or none, so recover from them through the
   computer's id, which the error's message names. This makes the 0.7.0
   entry's "`computers.create` (and so `launch`)" true of the keyword too.
+- **`ModelProviderError`**, an `APIError` raised by `agent()` and
+  `agent_once()` (sync and async) for a 402. On the agent routes a 402 is the
+  model API's `billing_error` for the account behind `model_key`, relayed as
+  it came, not the Mandala plan; see Changed.
+- **`screenshot_info()`**, sync and async: `screenshot()`'s request, answered
+  as `ScreenshotInfo(data, content_type, suspended)`. `suspended` is the
+  platform's `X-GC-Frame: suspended` marker for a suspended computer's saved
+  frame, which the bytes cannot show when `width` is set.
+- **`AgentResult.steps_taken`**: the steps an `agent_once()` run took, from the
+  `steps_taken` its body carries. Empty on a streamed result.
+- **`RateLimitError.limit`, `.remaining` and `.reset`**, from the
+  `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers; each
+  `None` when absent, or when the value is not a plain whole number of at most
+  18 digits. The README shows how to read the same headers on a successful
+  answer with an `httpx` event hook, and says that such a hook turns off the
+  SDK's opt-in retries of connection failures seen before a response.
 
 ### Changed
 
@@ -31,6 +47,39 @@ This is the summary you read to decide whether to upgrade.
   difference remains: `mandala-py` also escapes the Unicode line and
   paragraph separators, as `\u2028` and `\u2029`, which the TypeScript CLI
   prints as they are. `--json` output is unchanged.
+- **A 402 from `agent()` or `agent_once()` raises `ModelProviderError`, not
+  `PlanLimitError`.** Nothing inside an agent run consults the plan: the
+  platform's mid-run recheck covers the credential, the role and the account's
+  standing and answers only 401 or 403 with reason `revoked`, and a 402, 504
+  or 529 there is the model API's own status for the account behind
+  `model_key`. The docs no longer say a plan downgraded mid-run stops a run.
+  `is_transient()` still answers `False`.
+- **A model API 504 on `agent_once()` raises a plain `APIError`, not
+  `GatewayTimeoutError`.** The platform relays the model's `timeout_error`
+  with the run's usage and steps in the body (on `e.agent`), so the connection
+  was not cut; `agent()` already reported the same 504 this way. A body-less
+  504 or 524 is still `GatewayTimeoutError`.
+- **`open()` picks a browser the image has, and raises when none starts**
+  (OPL-3705). It used to run `nohup firefox <url> &`, which exits 0 whether
+  or not a `firefox` exists, so on the Omarchy image — Chromium and no Firefox
+  — it opened nothing and reported success. It now uses the first of
+  `firefox-esr`, `firefox` and `chromium` that `command -v` finds, looked up
+  before the launch is detached, and raises `MandalaError` on a non-zero exit
+  (127 with `no browser (firefox-esr, firefox or chromium) on this image` when
+  there is none) or a timed-out wait.
+- **Template `publish()` 409s are permanent.** The four publish refusals — a
+  different document under a published ref, a retired ref, and the two
+  per-account ceilings — clear by nothing but a changed request, and came with
+  no `reason`, so `is_transient()` called them worth retrying. `publish()`
+  now raises them as a `ConflictError` whose `reason` is the platform's own
+  permanent word, or `"exists"` where it sent none or sent a word this version
+  does not recognise. A clearing word (`contention` or `starting`) is kept as
+  the platform sent it, and `is_transient()` answers `True` for it.
+- **`wait_until_running()`, `wait_for_guest()`, `wait_for_secrets()`,
+  `wait_for_browser_proxy()`, `wait_for_egress_proxy()` and `launch()` raise at
+  once on a `half-removed` computer** — one whose deletion stopped partway and
+  took its disk — instead of polling to their timeout or telling the caller to
+  call `start()`. Deleting it again is what clears it.
 
 ### Fixed
 
@@ -172,6 +221,37 @@ This is the summary you read to decide whether to upgrade.
   copy's `Host` and removing the copy would apply it to other hosts. A later
   copy whose `# <<< mandala … <<<` line was deleted is left in place, with
   every copy after it.
+
+### Documentation
+
+- **Idempotency after a `5xx` (corrects the 0.7.0 entry).** 0.7.0 said a key
+  never answers the result after any `5xx`. That holds only for a `5xx` that
+  names an `operation_id`: the key is spent, and resends answer `409
+  idempotency_outcome_unknown`. A `5xx` naming none may have been refused
+  before the call was sent anywhere, which releases the key, and a resend is
+  carried out. Resending under the same key is safe after any `5xx`. Keys are
+  kept per credential scope, so `operations.list(idempotency_key=...)` finds
+  only operations a credential of the same scope reserved.
+- A replayed create, clone or rename answer has `vnc` `None`: the platform
+  strips desktop credentials from stored answers; `refresh()` fetches them.
+- `agent_once()` on the hosted API is cut at about two minutes with a
+  body-less 524; the run is stopped and its usage and steps are lost, so the
+  "work usually carries on" advice for `GatewayTimeoutError` does not apply.
+- `snapshot()` documents the admission 503: manual captures on one account are
+  admitted one at a time, and after a 503 look for a `capturing` row before
+  retrying.
+- `builds.start()` and the README document `spec.secrets` (by id and `as`,
+  resolved in the key's scope and frozen at submit, at most 32) and which of
+  its refusals are worth retrying; `spec.from` must be a `system/...`
+  template; a document with `spec.env` counts as one to build.
+- `build_digest_needs` quotes the platform's current sentence; the SDK no
+  longer claims it says how or where to compute the digest.
+- `set_idle_suspend(0)` is documented: never suspend, capped per plan, with
+  `PlanLimitError` past the cap; the maximum is 10080 minutes.
+- `Computer.status` documents `half-removed` and the closed set of six.
+- `Snapshot.state` no longer claims a listing puts `capturing` rows first;
+  `ApiKeys.create` and `mandala-py api-keys create --name` state which
+  characters a key name may not contain.
 
 ## [0.7.0] — 2026-09-27
 

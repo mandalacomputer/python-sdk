@@ -60,6 +60,7 @@ __all__ = [
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
+    "ScreenshotInfo",
     "Secret",
     "SecretBinding",
     "SecretBindingArgs",
@@ -1023,7 +1024,8 @@ class TemplateCheck:
 
     :attr:`build_digest` and :attr:`build_digest_needs` are ALTERNATIVES. A
     document with no parent gets the digest; one naming a parent in ``spec.from``
-    gets the sentence saying what could not be computed and where to compute it.
+    gets a sentence saying what could not be computed, and that the digest is
+    computed when the build runs.
     Reading only the first leaves a whole class of document looking like a
     failure with no reason attached, which is what it did here until OPL-4193.
     """
@@ -1064,9 +1066,14 @@ class TemplateCheck:
     #:     if check.build_digest is None and check.build_digest_needs:
     #:         print(check.build_digest_needs)
     #:
-    #: which prints, for a document naming a parent, what could not be
-    #: computed — the contents of that parent's image, which only a host
-    #: holding it can supply — and where it can be.
+    #: which prints, for a document naming a parent, the platform's sentence
+    #: (quoted as of this writing; it is prose, not a contract)::
+    #:
+    #:     the contents of acme/base's image, which only a host holding that
+    #:     image can compute; the digest is computed when the build runs
+    #:
+    #: There is nothing to fetch or run to get the digest beforehand: it is
+    #: computed by the build itself.
     #:
     #: ``None`` on an invalid document, on one with no parent — where
     #: :attr:`build_digest` is the answer instead — and from a host too old to
@@ -1446,7 +1453,8 @@ class Snapshot:
     #:
     #: ``"capturing"``
     #:     Still being taken, and NOT a snapshot yet: restore, clone and delete
-    #:     all answer 404 on one, and a listing puts these first. THE ID IS
+    #:     all answer 404 on one. It can appear anywhere in a listing, which
+    #:     has no account-wide order, so read ``state`` on every row. THE ID IS
     #:     ALREADY THE SNAPSHOT'S OWN — allocated before the copy starts, kept
     #:     when it lands — so this is the row to poll rather than a stand-in
     #:     that gets replaced by another (platform OPL-4562). It used to be
@@ -2393,6 +2401,27 @@ class Window:
             visible=_wire(d, "visible") is _Wire.TRUE,
             raw=dict(d),
         )
+
+
+@dataclass(frozen=True)
+class ScreenshotInfo:
+    """A screenshot, and what the response said about it.
+
+    What :meth:`~mandala_computer.Computer.screenshot_info` answers with. The
+    bytes alone cannot say whether they are the screen as it is now or the
+    picture a suspended computer saved when it was suspended: with ``width``
+    set both are JPEGs, so the image's magic bytes do not tell them apart. The
+    platform does, in a response header, and :attr:`suspended` is that header.
+    """
+
+    #: The image, PNG or JPEG as :attr:`content_type` says.
+    data: bytes
+    #: The response's ``Content-Type``, e.g. ``"image/png"`` or ``"image/jpeg"``.
+    content_type: str
+    #: True when the platform marked the frame ``X-GC-Frame: suspended``: the
+    #: JPEG saved when the computer was suspended, not a capture of a live
+    #: screen. A suspended computer is not woken by a screenshot.
+    suspended: bool
 
 
 @dataclass(frozen=True)
