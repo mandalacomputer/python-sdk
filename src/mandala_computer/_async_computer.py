@@ -2317,7 +2317,9 @@ class AsyncComputer(ComputerFields):
         large). A 429 the model API answered is a
         :class:`~mandala_computer.RateLimitError` whose ``limit``,
         ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
-        refuse it.
+        refuse it. Once the run has taken a step,
+        :func:`~mandala_computer.is_transient` answers ``False`` for that 429:
+        running the prompt again would repeat the steps already on the desktop.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -2325,6 +2327,7 @@ class AsyncComputer(ComputerFields):
         """
         result: AgentResult | None = None
         failure: AgentFailed | None = None
+        steps = 0
         try:
             async for event in self.agent_stream(
                 prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
@@ -2333,13 +2336,15 @@ class AsyncComputer(ComputerFields):
                     result = event.result
                 elif isinstance(event, AgentFailed):
                     failure = event
+                elif isinstance(event, AgentStepEvent):
+                    steps += 1
         except (TimeoutError, ConnectionError):
             # The sync twin carries the reasoning: the SSE reader stops after
             # a terminal chunk, and a dropped connection after a result must
             # not discard it.
             if result is None and failure is None:
                 raise
-        return _agent_outcome(result, failure)
+        return _agent_outcome(result, failure, steps_seen=steps)
 
     async def agent_once(
         self,
@@ -2381,7 +2386,9 @@ class AsyncComputer(ComputerFields):
         ``rate_limit_error`` (a :class:`~mandala_computer.RateLimitError`
         whose ``retry_after`` is the model API's own wait when it named one,
         and whose ``limit``, ``remaining`` and ``reset`` are ``None``, because
-        the Mandala budget did not refuse it), 504 ``timeout_error``
+        the Mandala budget did not refuse it; :func:`~mandala_computer.is_transient`
+        answers ``False`` for it when the body lists steps already taken, since
+        running the prompt again would repeat them), 504 ``timeout_error``
         (raised as a plain :class:`~mandala_computer.APIError`, not
         :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
         with the run's usage and steps), 529 ``overloaded_error``, and a 403

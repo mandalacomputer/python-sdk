@@ -172,7 +172,9 @@ _HALF_REMOVED_MESSAGE = (
 )
 
 
-def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> AgentResult:
+def _agent_outcome(
+    result: AgentResult | None, failure: AgentFailed | None, *, steps_seen: int = 0
+) -> AgentResult:
     """What a finished stream comes to, once its events are in.
 
     The failure is checked first. A run can report one after a result — a
@@ -185,13 +187,20 @@ def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> A
     is not reading the stream asked for, but the steps it had already taken are
     still on the desktop and their cost is already on the caller's model key, so
     the raise says how far it got rather than only that it stopped.
+
+    ``steps_seen`` is how many step events the stream delivered before the
+    failure, handed to :func:`_agent_route_error` as evidence that the run acted
+    even where the failure frame itself lists no steps.
     """
     if failure is not None:
         n = len(failure.steps)
         taken = f" after {n} step{'' if n == 1 else 's'}" if n else ""
         message = f"the agent run failed{taken}: {failure.error}"
         error = (
-            _agent_route_error(error_for_status(failure.status, message, dict(failure.raw)))
+            _agent_route_error(
+                error_for_status(failure.status, message, dict(failure.raw)),
+                steps_seen=steps_seen,
+            )
             if failure.status
             else MandalaError(message)
         )
@@ -246,7 +255,19 @@ def _relayed_from_model(exc: APIError) -> bool:
     return isinstance(message, str) and message.startswith(_MODEL_API_PREFIX)
 
 
-def _agent_route_error(exc: APIError) -> APIError:
+def _reports_steps(body: object) -> bool:
+    """Whether a failed run's body lists steps it had already completed.
+
+    Either name, on the rule the converter reads them by: a stream's error frame
+    calls them ``steps``, a non-streaming refusal ``steps_taken``, and only a
+    non-empty list counts — a count under ``steps`` is not a record of actions.
+    """
+    if not isinstance(body, Mapping):
+        return False
+    return any(isinstance(body.get(n), list) and body.get(n) for n in ("steps", "steps_taken"))
+
+
+def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     """The class an agent route's status deserves, where it is not the table's.
 
     Nothing inside an agent run consults the Mandala plan. The only 402 these
@@ -277,6 +298,15 @@ def _agent_route_error(exc: APIError) -> APIError:
     forwards the model API's own wait, when it named one, as ``Retry-After``.
     The platform's own 429 on these routes carries no prefix and keeps its
     budget fields.
+
+    A relayed 429 that arrives after the run has already taken steps — listed in
+    the body, or ``steps_seen`` step events delivered by the stream before it —
+    is also marked so that :func:`~mandala_computer.is_transient` answers
+    ``False``. The wait is the model provider's, but the steps are on the
+    desktop, and sending the same prompt again would repeat them. The same 429
+    before any step keeps ``True``: nothing ran. This is the one place the mark
+    is set, and :func:`~mandala_computer.is_transient` the one place it is read
+    (OPL-5446).
 
     A 504 is the other status that needs a second look. The platform relays the
     model API's own ``timeout_error`` on a failed ``agent_once`` run as an HTTP
@@ -317,6 +347,8 @@ def _agent_route_error(exc: APIError) -> APIError:
     error.reason = exc.reason
     error.agent = exc.agent
     error.idempotency_key = exc.idempotency_key
+    if cls is RateLimitError and (steps_seen > 0 or _reports_steps(exc.body)):
+        error._after_agent_steps = True
     return error
 
 
@@ -4791,7 +4823,9 @@ class Computer(ComputerFields):
         large). A 429 the model API answered is a
         :class:`~mandala_computer.RateLimitError` whose ``limit``,
         ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
-        refuse it.
+        refuse it. Once the run has taken a step,
+        :func:`~mandala_computer.is_transient` answers ``False`` for that 429:
+        running the prompt again would repeat the steps already on the desktop.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -4799,6 +4833,7 @@ class Computer(ComputerFields):
         """
         result: AgentResult | None = None
         failure: AgentFailed | None = None
+        steps = 0
         try:
             for event in self.agent_stream(
                 prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
@@ -4807,6 +4842,8 @@ class Computer(ComputerFields):
                     result = event.result
                 elif isinstance(event, AgentFailed):
                     failure = event
+                elif isinstance(event, AgentStepEvent):
+                    steps += 1
         except (TimeoutError, ConnectionError):
             # The SSE reader stops after a chunk that carried done/error, so a
             # trailing failure in that chunk can still override the result and
@@ -4816,7 +4853,7 @@ class Computer(ComputerFields):
             # ConnectionError, not a TimeoutError — used to throw it away.
             if result is None and failure is None:
                 raise
-        return _agent_outcome(result, failure)
+        return _agent_outcome(result, failure, steps_seen=steps)
 
     def agent_once(
         self,
@@ -4858,7 +4895,9 @@ class Computer(ComputerFields):
         ``rate_limit_error`` (a :class:`~mandala_computer.RateLimitError`
         whose ``retry_after`` is the model API's own wait when it named one,
         and whose ``limit``, ``remaining`` and ``reset`` are ``None``, because
-        the Mandala budget did not refuse it), 504 ``timeout_error``
+        the Mandala budget did not refuse it; :func:`~mandala_computer.is_transient`
+        answers ``False`` for it when the body lists steps already taken, since
+        running the prompt again would repeat them), 504 ``timeout_error``
         (raised as a plain :class:`~mandala_computer.APIError`, not
         :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
         with the run's usage and steps), 529 ``overloaded_error``, and a 403

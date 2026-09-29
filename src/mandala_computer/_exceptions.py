@@ -146,6 +146,14 @@ def _nonblank(value: object) -> str | None:
 class APIError(MandalaError):
     """The API returned an unsuccessful response."""
 
+    #: Set only by ``_agent_route_error`` in ``_computer``, on a 429 the model
+    #: API answered an agent run with after that run had already taken steps on
+    #: the desktop. :func:`is_transient` reads it and answers ``False``: sending
+    #: the prompt again would repeat those steps. Private, and a mark rather than
+    #: a second copy of the rule, so the route that knows the run and the
+    #: predicate that answers for it cannot come to disagree (OPL-5446).
+    _after_agent_steps: bool = False
+
     def __init__(
         self,
         message: str,
@@ -490,7 +498,10 @@ class RateLimitError(APIError):
     Its own class rather than a bare :class:`APIError` because the remedy is to
     slow the request cadence:
     :attr:`retry_after` carries the ``Retry-After`` header in seconds. Sleeping
-    that long and repeating the request is the whole remedy.
+    that long and repeating the request is the whole remedy — except for a 429
+    the model API answered an agent run with after the run had already taken
+    steps, where repeating the request repeats those steps too;
+    :func:`is_transient` answers ``False`` for that one.
 
     The platform's budget headers ride on it too: :attr:`limit`,
     :attr:`remaining` and :attr:`reset` are ``RateLimit-Limit``,
@@ -934,7 +945,13 @@ def is_transient(err: BaseException) -> bool:
     * :class:`ConflictError` — something in flight this cannot run alongside,
       minus :class:`MoveRequiredError`, which is a decision rather than a moment
       and ``template_image_preparing``, which requires an explicit continuation
-    * :class:`RateLimitError` — a cadence, and the response usually says how long
+    * :class:`RateLimitError` — a cadence, and the response usually says how long.
+      Minus one: a 429 the model API answered an agent run with (the platform
+      prefixes its message ``model API: ``) after the run had already taken
+      steps. Those steps are on the desktop, and sending the same prompt again
+      repeats them. Read :attr:`~MandalaError.agent` before running again. The
+      same relayed 429 before any step is still ``True``: nothing ran, and the
+      platform's own 429 on those routes is unchanged.
     * :class:`UnavailableError` ON A READ — a hypervisor briefly out of reach.
       A 503 answering a CHANGE is not in the set: the platform documents that a
       change answered 503 may or may not have happened, since a failure after
@@ -989,6 +1006,10 @@ def is_transient(err: BaseException) -> bool:
     only ever replays a read.
     """
     if isinstance(err, MoveRequiredError):
+        return False
+    # A relayed model 429 on an agent run that had already acted: the wait is
+    # the model provider's, but replaying the prompt repeats the steps it took.
+    if isinstance(err, APIError) and err._after_agent_steps:
         return False
     # By class as well as by word: a create-only upload whose 409 carried no
     # usable reason has no ``reason`` at all, and would otherwise fall through to

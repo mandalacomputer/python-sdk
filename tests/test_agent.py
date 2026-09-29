@@ -730,6 +730,122 @@ def test_the_platforms_own_429_on_an_agent_route_keeps_the_budget(computer: mc.C
     assert error.retry_after == 7
 
 
+# --- a relayed model 429 after steps is not safe to replay (OPL-5446) -------
+
+STEP_FRAME = frame("step", '{"n": 1, "tool": "computer", "detail": "clicked Settings"}')
+
+
+@respx.mock
+def test_a_relayed_model_429_after_steps_on_agent_once_is_not_transient(
+    computer: mc.Computer,
+) -> None:
+    """The wait is the model provider's, but the steps are on the desktop:
+    sending the same prompt again would repeat them."""
+    respx.post(AGENT).mock(
+        httpx.Response(429, json=relayed(429, "rate_limit_error"), headers=BUDGET_HEADERS)
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert raised.value.agent is not None and len(raised.value.agent.steps) == 1
+    assert mc.is_transient(raised.value) is False
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "model API: 429 rate_limit_error", "usage": {}, "steps_taken": []},
+        {"error": "model API: 429 rate_limit_error"},
+        {"error": "model API: 429 rate_limit_error", "steps": 0},
+    ],
+    ids=["empty-list", "no-steps", "a-count"],
+)
+def test_a_relayed_model_429_before_any_step_on_agent_once_stays_transient(
+    computer: mc.Computer, body: dict[str, Any]
+) -> None:
+    """Nothing ran, so the prompt can be sent again as it was."""
+    respx.post(AGENT).mock(httpx.Response(429, json=body, headers={"Retry-After": "7"}))
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is True
+
+
+@respx.mock
+def test_a_relayed_model_429_after_steps_in_a_200_body_is_not_transient(
+    computer: mc.Computer,
+) -> None:
+    """A run can report its failure in a 200 body too; the same rule holds."""
+    respx.post(AGENT).mock(
+        httpx.Response(200, json={**relayed(429, "rate_limit_error"), "status": 429})
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is False
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [{"error": "rate limited"}, {"error": "rate limited", "steps_taken": [{"n": 1}]}],
+    ids=["bare", "with-steps"],
+)
+def test_the_platforms_own_429_on_agent_once_stays_transient(
+    computer: mc.Computer, body: dict[str, Any]
+) -> None:
+    """No prefix: the platform's own budget, whose answer is unchanged."""
+    respx.post(AGENT).mock(httpx.Response(429, json=body, headers=BUDGET_HEADERS))
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is True
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "frames",
+    [
+        (frame("error", '{"error": "model API: 429 slow", "status": 429, "steps": [{"n": 1}]}'),),
+        (STEP_FRAME, frame("error", '{"error": "model API: 429 slow", "status": 429}')),
+    ],
+    ids=["listed-in-the-frame", "seen-as-a-step-event"],
+)
+def test_a_relayed_model_429_mid_stream_after_steps_is_not_transient(
+    computer: mc.Computer, frames: tuple[str, ...]
+) -> None:
+    """Evidence either way: the failure frame lists the steps, or the stream
+    delivered a step before it."""
+    respx.post(AGENT).mock(stream(*frames))
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent("do the thing", model_key=KEY)
+    assert raised.value.status == 429
+    assert mc.is_transient(raised.value) is False
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "data",
+    ['{"error": "model API: 429 slow", "status": 429}', '{"error": "slow down", "status": 429}'],
+    ids=["relayed", "platform"],
+)
+def test_a_429_mid_stream_before_any_step_stays_transient(computer: mc.Computer, data: str) -> None:
+    respx.post(AGENT).mock(stream(frame("error", data)))
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is True
+
+
+@respx.mock
+def test_the_platforms_own_429_mid_stream_after_a_step_is_unchanged(
+    computer: mc.Computer,
+) -> None:
+    """Only the relayed 429 is marked; the platform's own keeps its answer."""
+    respx.post(AGENT).mock(
+        stream(STEP_FRAME, frame("error", '{"error": "slow down", "status": 429}'))
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is True
+
+
 @respx.mock
 def test_a_402_elsewhere_is_still_the_plan(client: mc.Client) -> None:
     """Only the agent routes relay the model provider's 402."""
@@ -1333,3 +1449,34 @@ async def test_the_async_agent_once_keeps_the_steps_too() -> None:
         c = mc.AsyncComputer(client._t, COMPUTER)
         result = await c.agent_once("do the thing", model_key=KEY)
     assert [s.n for s in result.steps_taken] == [1, 2]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_halves_call_a_relayed_model_429_after_steps_not_transient() -> None:
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(429, json=relayed(429, "rate_limit_error"), headers=BUDGET_HEADERS),
+            httpx.Response(429, json={"error": "model API: 429 rate_limit_error"}),
+            stream(STEP_FRAME, frame("error", '{"error": "model API: 429 slow", "status": 429}')),
+            stream(frame("error", '{"error": "model API: 429 slow", "status": 429}')),
+            httpx.Response(429, json={"error": "rate limited"}, headers=BUDGET_HEADERS),
+        ]
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.RateLimitError) as once_after:
+            await c.agent_once("do the thing", model_key=KEY)
+        with pytest.raises(mc.RateLimitError) as once_before:
+            await c.agent_once("do the thing", model_key=KEY)
+        with pytest.raises(mc.RateLimitError) as streamed_after:
+            await c.agent("do the thing", model_key=KEY)
+        with pytest.raises(mc.RateLimitError) as streamed_before:
+            await c.agent("do the thing", model_key=KEY)
+        with pytest.raises(mc.RateLimitError) as own:
+            await c.agent_once("do the thing", model_key=KEY)
+    assert mc.is_transient(once_after.value) is False
+    assert mc.is_transient(once_before.value) is True
+    assert mc.is_transient(streamed_after.value) is False
+    assert mc.is_transient(streamed_before.value) is True
+    assert mc.is_transient(own.value) is True
