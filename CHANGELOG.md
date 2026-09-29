@@ -92,6 +92,14 @@ This is the summary you read to decide whether to upgrade.
   missing computer or a transfer to page. The platform's own 404 and 413 on
   these routes carry no prefix and keep their classes. `agent_stream()` still
   yields the failure as an `AgentFailed` event.
+- **`is_transient()` answers `False` for a 429 the model API answered an
+  agent run with after the run had already taken steps** (`agent()` and
+  `agent_once()`, sync and async). The wait is the model provider's, but the
+  steps are on the desktop, and sending the same prompt again repeats them;
+  read `e.agent` before running again. Steps count as taken when the error
+  body lists them, or, on `agent()`, when the stream delivered a step before
+  the failure. The same relayed 429 before any step, and the platform's own
+  429 on the agent routes, are still `True`.
 - **A 429 the model API answered on `agent_once()` has `limit`, `remaining`
   and `reset` set to `None`** (sync and async), as a streamed one already
   did. They came from the platform's `RateLimit-*` headers, the caller's
