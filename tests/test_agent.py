@@ -628,6 +628,108 @@ def test_a_body_less_504_on_agent_once_is_still_the_edge_cut(computer: mc.Comput
     assert error.value.agent is None
 
 
+def relayed(status: int, error: str) -> dict[str, Any]:
+    """A failed agent_once body the platform relayed from the model API."""
+    return {
+        "error": f"model API: {status} {error}",
+        "usage": {"input_tokens": 3},
+        "steps_taken": [{"n": 1, "tool": "computer"}],
+    }
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("status", "error", "table"),
+    [
+        (404, "not_found_error", mc.NotFoundError),
+        (413, "request_too_large", mc.FileTooLargeError),
+    ],
+    ids=["404", "413"],
+)
+def test_a_relayed_model_404_or_413_on_agent_once_is_the_model_provider(
+    computer: mc.Computer, status: int, error: str, table: type[mc.APIError]
+) -> None:
+    """A model name the provider does not know, or a request it found too large.
+
+    The table's classes say no such computer and page the transfer, and neither
+    is what happened. The platform prefixes what it relays with "model API: ",
+    which is what tells these apart from its own 404 and 413.
+    """
+    respx.post(AGENT).mock(httpx.Response(status, json=relayed(status, error)))
+    with pytest.raises(mc.ModelProviderError, match=error) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert not isinstance(raised.value, table)
+    assert raised.value.status == status and raised.value.method == "POST"
+    assert raised.value.agent is not None and len(raised.value.agent.steps) == 1
+    assert mc.is_transient(raised.value) is False
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [404, 413])
+def test_a_relayed_model_404_or_413_mid_stream_is_the_model_provider(
+    computer: mc.Computer, status: int
+) -> None:
+    respx.post(AGENT).mock(
+        stream(frame("error", f'{{"error": "model API: {status} no", "status": {status}}}'))
+    )
+    with pytest.raises(mc.ModelProviderError) as raised:
+        computer.agent("do the thing", model_key=KEY)
+    assert raised.value.status == status
+    assert raised.value.agent is not None and raised.value.agent.status == status
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("status", "table"), [(404, mc.NotFoundError), (413, mc.FileTooLargeError)], ids=["404", "413"]
+)
+def test_the_platforms_own_404_or_413_on_an_agent_route_keeps_its_class(
+    computer: mc.Computer, status: int, table: type[mc.APIError]
+) -> None:
+    """No prefix: the platform's own lookup or body limit, not the model API."""
+    respx.post(AGENT).mock(
+        httpx.Response(status, json={"error": "no such computer", "usage": {}, "steps_taken": []})
+    )
+    with pytest.raises(table) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert not isinstance(raised.value, mc.ModelProviderError)
+
+
+BUDGET_HEADERS = {
+    "RateLimit-Limit": "100",
+    "RateLimit-Remaining": "0",
+    "RateLimit-Reset": "30",
+    "Retry-After": "7",
+}
+
+
+@respx.mock
+def test_a_relayed_model_429_does_not_describe_the_mandala_budget(computer: mc.Computer) -> None:
+    """The RateLimit-* headers are the caller's Mandala budget, which did not
+    refuse this call; the model provider's limit did. Retry-After is the model
+    API's own wait, forwarded, so it stays."""
+    respx.post(AGENT).mock(
+        httpx.Response(429, json=relayed(429, "rate_limit_error"), headers=BUDGET_HEADERS)
+    )
+    with pytest.raises(mc.RateLimitError, match="rate_limit_error") as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    error = raised.value
+    assert (error.limit, error.remaining, error.reset) == (None, None, None)
+    assert error.retry_after == 7 and error.status == 429 and error.method == "POST"
+    assert error.agent is not None and len(error.agent.steps) == 1
+
+
+@respx.mock
+def test_the_platforms_own_429_on_an_agent_route_keeps_the_budget(computer: mc.Computer) -> None:
+    respx.post(AGENT).mock(
+        httpx.Response(429, json={"error": "rate limited"}, headers=BUDGET_HEADERS)
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    error = raised.value
+    assert (error.limit, error.remaining, error.reset) == (100, 0, 30)
+    assert error.retry_after == 7
+
+
 @respx.mock
 def test_a_402_elsewhere_is_still_the_plan(client: mc.Client) -> None:
     """Only the agent routes relay the model provider's 402."""
@@ -1151,6 +1253,49 @@ async def test_the_async_agent_once_raises_a_model_504_as_a_plain_api_error() ->
             await c.agent_once("do the thing", model_key=KEY)
     assert type(once.value) is mc.APIError
     assert once.value.agent is not None and len(once.value.agent.steps) == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_halves_raise_a_relayed_model_404_as_the_model_provider() -> None:
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(404, json=relayed(404, "not_found_error")),
+            stream(frame("error", '{"error": "model API: 413 too large", "status": 413}')),
+            httpx.Response(413, json=relayed(413, "request_too_large")),
+        ]
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.ModelProviderError) as once:
+            await c.agent_once("do the thing", model_key=KEY)
+        with pytest.raises(mc.ModelProviderError) as streamed:
+            await c.agent("do the thing", model_key=KEY)
+        with pytest.raises(mc.ModelProviderError) as large:
+            await c.agent_once("do the thing", model_key=KEY)
+    assert once.value.status == 404 and once.value.agent is not None
+    assert streamed.value.status == 413 and streamed.value.agent is not None
+    assert large.value.status == 413 and large.value.agent is not None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_the_async_agent_once_drops_the_budget_from_a_relayed_model_429() -> None:
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(429, json=relayed(429, "rate_limit_error"), headers=BUDGET_HEADERS),
+            httpx.Response(429, json={"error": "rate limited"}, headers=BUDGET_HEADERS),
+        ]
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.RateLimitError) as model:
+            await c.agent_once("do the thing", model_key=KEY)
+        with pytest.raises(mc.RateLimitError) as own:
+            await c.agent_once("do the thing", model_key=KEY)
+    assert (model.value.limit, model.value.remaining, model.value.reset) == (None, None, None)
+    assert model.value.retry_after == 7 and model.value.agent is not None
+    assert (own.value.limit, own.value.remaining, own.value.reset) == (100, 0, 30)
 
 
 ONCE_WITH_STEPS = {

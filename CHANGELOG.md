@@ -22,7 +22,8 @@ This is the summary you read to decide whether to upgrade.
 - **`ModelProviderError`**, an `APIError` raised by `agent()` and
   `agent_once()` (sync and async) for a 402. On the agent routes a 402 is the
   model API's `billing_error` for the account behind `model_key`, relayed as
-  it came, not the Mandala plan; see Changed.
+  it came, not the Mandala plan; see Changed. It is also raised for a 404 or
+  413 the model API answered; see Fixed.
 - **`screenshot_info()`**, sync and async: `screenshot()`'s request, answered
   as `ScreenshotInfo(data, content_type, suspended)`. `suspended` is the
   platform's `X-GC-Frame: suspended` marker for a suspended computer's saved
@@ -83,6 +84,20 @@ This is the summary you read to decide whether to upgrade.
 
 ### Fixed
 
+- **A 404 or 413 the model API answered on `agent()` or `agent_once()` is
+  raised as `ModelProviderError`** (sync and async), not `NotFoundError` or
+  `FileTooLargeError`. The platform relays the model API's own failures with
+  the message prefixed `model API: `; a 404 there is usually a model name the
+  provider does not know, and a 413 a request it found too large, not a
+  missing computer or a transfer to page. The platform's own 404 and 413 on
+  these routes carry no prefix and keep their classes. `agent_stream()` still
+  yields the failure as an `AgentFailed` event.
+- **A 429 the model API answered on `agent_once()` has `limit`, `remaining`
+  and `reset` set to `None`** (sync and async), as a streamed one already
+  did. They came from the platform's `RateLimit-*` headers, the caller's
+  Mandala budget, which did not refuse the call. `retry_after` stays: it is
+  the model API's own wait, forwarded. The platform's own 429 on the agent
+  routes keeps all three.
 - **`mandala-py` escapes control and bidirectional characters in every name,
   id, timestamp and error text it prints, not only in `whoami`.** Every
   listing (secrets, webhooks and their deliveries, SSH keys, API keys,

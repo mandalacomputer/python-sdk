@@ -244,7 +244,7 @@ class PlanLimitError(APIError):
 
 
 class ModelProviderError(APIError):
-    """The model provider refused an agent run's model call (402).
+    """The model provider refused an agent run's model call (402, 404, 413).
 
     Raised by :meth:`~mandala_computer.Computer.agent` and
     :meth:`~mandala_computer.Computer.agent_once` (and their async twins) for a
@@ -254,11 +254,20 @@ class ModelProviderError(APIError):
     consults the plan; the platform's own mid-run recheck answers only 401 or
     403 with reason ``revoked``.
 
+    Raised as well for a 404 or a 413 the model API answered, which the platform
+    relays with its message prefixed ``model API: ``. A 404 there is usually a
+    ``model`` name the provider does not know, and a 413 a request the provider
+    found too large; neither is a missing computer or a transfer to page. The
+    platform's own 404 and 413 on these routes carry no prefix and stay
+    :class:`NotFoundError` and :class:`FileTooLargeError`. :attr:`status` says
+    which one this is.
+
     A subclass of :class:`APIError` and not of :class:`PlanLimitError`, so a
     handler written for the plan does not catch it and tell the caller to
-    upgrade something that is not the problem. Fix the model account, then run
-    again; :func:`is_transient` answers ``False``. Whatever the run had already
-    done rides on :attr:`~MandalaError.agent`, as on any other mid-run failure.
+    upgrade something that is not the problem. Fix the model account, the model
+    name or the request, then run again; :func:`is_transient` answers ``False``.
+    Whatever the run had already done rides on :attr:`~MandalaError.agent`, as
+    on any other mid-run failure.
     """
 
 
@@ -526,7 +535,11 @@ class RateLimitError(APIError):
         #: per-key half of the account's budget, or the account-wide figure when
         #: other keys have spent more of it. ``None`` when the header was absent
         #: or not a whole number, which includes every 429 reported from inside
-        #: an agent stream.
+        #: an agent stream. ``None`` too on a 429 the model API answered an agent
+        #: run with, streaming or not (the platform prefixes its message
+        #: ``model API: ``): that limit is the model provider's, on the account
+        #: behind ``model_key``, and the Mandala budget these headers describe
+        #: did not refuse the call.
         self.limit = limit
         #: What was left of that budget, from ``RateLimit-Remaining``; ``None``
         #: as for :attr:`limit`.
@@ -541,7 +554,11 @@ class RateLimitError(APIError):
         #: The exception is a 429 the agent loop reported from inside a stream:
         #: the response there was a 200 and the refusal is an event in its body,
         #: so there is no header to read and nothing to guess from. That is the
-        #: one place to expect this to be ``None`` and back off on your own.
+        #: main place to expect this to be ``None`` and back off on your own.
+        #:
+        #: On a 429 the model API answered a non-streaming agent run with, this
+        #: is the model API's own wait, which the platform forwards as
+        #: ``Retry-After``; if the model API named none, it is ``None`` there too.
         self.retry_after = retry_after
 
 

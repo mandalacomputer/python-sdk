@@ -223,8 +223,31 @@ def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
     return _agent_outcome(None, failure)
 
 
+#: The prefix the platform puts on a failure it relays from the model API on
+#: the agent routes. Its own refusals there (no such computer, not running,
+#: already driven, revoked, a request body too large, its own rate limit) carry
+#: none, so this is what tells a status the model API answered from the same
+#: status answered by the platform.
+_MODEL_API_PREFIX = "model API: "
+
+
+def _relayed_from_model(exc: APIError) -> bool:
+    """Whether an agent route's failure is the model API's own, relayed.
+
+    Read off the body: a non-streaming answer's JSON body, or the ``error``
+    frame a stream reported, which :func:`_agent_outcome` hands over as the
+    body. Either way it is the platform's ``error`` text, and the platform
+    prefixes only what the model API said.
+    """
+    body = exc.body
+    if not isinstance(body, Mapping):
+        return False
+    message = body.get("error")
+    return isinstance(message, str) and message.startswith(_MODEL_API_PREFIX)
+
+
 def _agent_route_error(exc: APIError) -> APIError:
-    """The class an agent route's status deserves, which for a 402 is not the plan's.
+    """The class an agent route's status deserves, where it is not the table's.
 
     Nothing inside an agent run consults the Mandala plan. The only 402 these
     routes answer is the model API's own ``billing_error``, relayed as it came,
@@ -233,6 +256,27 @@ def _agent_route_error(exc: APIError) -> APIError:
     (change the plan) would be wrong here. So a 402 is rebuilt as a
     :class:`~mandala_computer.ModelProviderError` carrying everything the first
     one did.
+
+    So is a 404 or a 413 the model API answered, told apart from the platform's
+    own by the ``model API: `` prefix the platform puts on everything it relays
+    (see :func:`_relayed_from_model`). The table would call them
+    :class:`~mandala_computer.NotFoundError` (no such computer) and
+    :class:`~mandala_computer.FileTooLargeError` (page the transfer), and
+    neither is what happened: the model provider did not know the model named,
+    or found the request too large. The platform's own 404 and 413 on these
+    routes carry no prefix and keep their classes.
+
+    A 429 the model API answered stays a
+    :class:`~mandala_computer.RateLimitError`, but without
+    :attr:`~mandala_computer.RateLimitError.limit`,
+    :attr:`~mandala_computer.RateLimitError.remaining` and
+    :attr:`~mandala_computer.RateLimitError.reset`. Those come from the
+    platform's ``RateLimit-*`` headers and describe the caller's Mandala budget,
+    which is not what refused the call; the model provider's limit is. Its
+    :attr:`~mandala_computer.APIError.retry_after` is kept: the platform
+    forwards the model API's own wait, when it named one, as ``Retry-After``.
+    The platform's own 429 on these routes carries no prefix and keeps its
+    budget fields.
 
     A 504 is the other status that needs a second look. The platform relays the
     model API's own ``timeout_error`` on a failed ``agent_once`` run as an HTTP
@@ -246,8 +290,11 @@ def _agent_route_error(exc: APIError) -> APIError:
     """
     if isinstance(exc, ModelProviderError):
         return exc
-    if exc.status == 402:
+    if exc.status == 402 or (exc.status in (404, 413) and _relayed_from_model(exc)):
         cls: type[APIError] = ModelProviderError
+    elif exc.status == 429 and _relayed_from_model(exc):
+        # The constructor's defaults leave limit, remaining and reset None.
+        cls = RateLimitError
     elif (
         exc.status == 504
         and isinstance(exc, GatewayTimeoutError)
@@ -4739,7 +4786,12 @@ class Computer(ComputerFields):
         that ended without saying how the run came out. A 402 there is the model
         API's ``billing_error`` for the account behind ``model_key``, never the
         Mandala plan, and is raised as
-        :class:`~mandala_computer.ModelProviderError`.
+        :class:`~mandala_computer.ModelProviderError`; so is a 404 or a 413 the
+        model API answered (a model it does not know, a request it found too
+        large). A 429 the model API answered is a
+        :class:`~mandala_computer.RateLimitError` whose ``limit``,
+        ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
+        refuse it.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -4797,7 +4849,16 @@ class Computer(ComputerFields):
         own status is relayed as it came, about the account behind
         ``model_key``: 402 ``billing_error`` (raised as
         :class:`~mandala_computer.ModelProviderError`, not
-        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``
+        :class:`~mandala_computer.PlanLimitError`), 404 ``not_found_error``
+        and 413 ``request_too_large`` (both raised as
+        :class:`~mandala_computer.ModelProviderError`, not
+        :class:`~mandala_computer.NotFoundError` or
+        :class:`~mandala_computer.FileTooLargeError`: an unknown model name,
+        or a request the model provider found too large), 429
+        ``rate_limit_error`` (a :class:`~mandala_computer.RateLimitError`
+        whose ``retry_after`` is the model API's own wait when it named one,
+        and whose ``limit``, ``remaining`` and ``reset`` are ``None``, because
+        the Mandala budget did not refuse it), 504 ``timeout_error``
         (raised as a plain :class:`~mandala_computer.APIError`, not
         :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
         with the run's usage and steps), 529 ``overloaded_error``, and a 403
@@ -4833,8 +4894,9 @@ class Computer(ComputerFields):
                 timeout=NO_DEADLINE,
             )
         except APIError as exc:
-            # A 402 here is the model provider's billing refusal, not the plan's
-            # (see :func:`_agent_route_error`). A refusal that arrived mid-run
+            # A 402 here is the model provider's billing refusal, not the plan's,
+            # and a relayed 404/413/429 is the model provider's too (see
+            # :func:`_agent_route_error`). A refusal that arrived mid-run
             # carries what the run had already done; see
             # :func:`_attach_agent_partial`.
             error = _agent_route_error(exc)
