@@ -3405,7 +3405,11 @@ in `~/.ssh/config` uses the name for another computer, as its `Host` or as its
 id: one written with another account's API key, say, which the list of your
 computers does not show. Your computer's own earlier block never counts, and
 `--write` replaces it. Connect with `ssh <id>` then (`--json`'s `host` says
-which); a dotted name such as `ubuntu-24.04` is kept.
+which); a dotted name such as `ubuntu-24.04` is kept. If another computer's
+block in `~/.ssh/config` already has the id itself as its `Host` (a computer
+named after this one's id, say), there is nothing left to fall back to:
+`ssh-config` refuses with a `conflict` error naming that computer, and prints
+and writes nothing. Remove that block, then run it again.
 
 `--write` replaces only the block of the computer it is run for, so a block an
 earlier version of the CLI wrote under such a name stays in `~/.ssh/config`

@@ -2498,21 +2498,16 @@ def _names_another_destination(name: str, computers: Collection[Computer]) -> bo
     return any(o.id.lower() == folded for o in computers)
 
 
-def _names_a_written_block(name: str, computer_id: str, path: Path) -> bool:
-    """Whether a block in the ssh config at *path*, written for a computer
-    other than *computer_id*, has *name* as its ``Host`` or its id, compared
-    without regard to case as the listed ids are. A file that is missing or
-    cannot be read holds no blocks.
+def _other_written_blocks(path: Path, computer_id: str) -> list[tuple[str, str]]:
+    """The blocks in the ssh config at *path* written for computers other
+    than *computer_id*, as :func:`_openssh.written_hosts` reads them. A file
+    that is missing or cannot be read holds none.
     """
     try:
         text = path.read_text()
     except (OSError, ValueError):
-        return False
-    folded = name.lower()
-    return any(
-        other != computer_id and folded in (host.lower(), other.lower())
-        for other, host in _openssh.written_hosts(text)
-    )
+        return []
+    return [(other, host) for other, host in _openssh.written_hosts(text) if other != computer_id]
 
 
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
@@ -2523,8 +2518,6 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # Before a byte of the block is printed or written: the id is its HostName
     # and HostKeyAlias, and its Host when the name cannot be one.
     computer_id = _ssh_id(c)
-    known_hosts = _openssh.known_hosts_path()
-    _openssh.ensure_known_hosts(gw, known_hosts)
     # A name two computers share would give two blocks one Host, and ssh would
     # only ever use the first; the id is unique.
     # A listing that may not hold every computer cannot prove the name is
@@ -2543,9 +2536,28 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # `ssh <name>` whenever it came first. This computer's own block is the
     # one --write replaces, so it never counts.
     path = Path.home() / ".ssh" / "config"
-    clashes = host != computer_id and _names_a_written_block(host, computer_id, path)
+    others = _other_written_blocks(path, computer_id)
+    folded = host.lower()
+    clashes = host != computer_id and any(
+        folded in (h.lower(), other.lower()) for other, h in others
+    )
     if clashes:
         host = computer_id
+    # The id is the last Host there is. When another computer's block already
+    # has it as its Host (one named after this computer's id, say), a second
+    # block under it would never be reached: `ssh <id>` would go to that other
+    # computer. Refused, whatever put the id here, before anything is written.
+    holder = next((other for other, h in others if h.lower() == host.lower()), None)
+    if holder is not None:
+        _die(
+            lambda spell: (
+                f"a block in ~/.ssh/config for computer {spell(holder)} already uses "
+                f"Host {spell(host)}; remove that block, then run again"
+            ),
+            "conflict",
+        )
+    known_hosts = _openssh.known_hosts_path()
+    _openssh.ensure_known_hosts(gw, known_hosts)
     if unchecked:
         print(
             f"{PROG}: could not check other computers' names; using Host {_shown(c.id)} instead",

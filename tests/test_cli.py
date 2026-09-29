@@ -2812,6 +2812,65 @@ def test_ssh_config_never_takes_a_host_a_written_block_uses(
         assert config.read_text() == before
 
 
+def _refuses_every_mode(home: Path, config: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """ssh-config vm-9 refuses in each mode: nothing printed or written."""
+    refusal = (
+        "a block in ~/.ssh/config for computer vm-7 already uses Host vm-9; "
+        "remove that block, then run again"
+    )
+    before = config.read_text()
+    for flags in ([], ["--write"]):
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(["ssh-config", "vm-9", *flags])
+        assert isinstance(caught.value, _cli._Failure)
+        assert caught.value.reason == "conflict"
+        assert str(caught.value.code) == f"mandala-py: {refusal}"
+        assert capsys.readouterr() == ("", "")
+        assert config.read_text() == before
+    assert _cli.main(["ssh-config", "vm-9", "--write", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert json.loads(err)["error"] == {"code": "conflict", "message": refusal}
+    assert config.read_text() == before
+    assert [other for other, _ in _openssh.written_hosts(config.read_text())] == ["vm-7"]
+    assert not (home / ".mandala").exists()
+
+
+# vm-7, of another account, is named vm-9; this computer, vm-9, is named vm-7.
+# The name clashes with that block's id and falls back to the id, which is
+# that block's Host: a second block under it would never be reached.
+@pytest.mark.parametrize("written", ["vm-9", "VM-9"])
+@respx.mock
+def test_ssh_config_refuses_an_id_a_written_block_uses_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], written: str
+) -> None:
+    config = _config_with_block(ssh_home, written)
+    _one_computer(name="vm-7")
+    _refuses_every_mode(ssh_home, config, capsys)
+
+
+@pytest.mark.parametrize("why", ["partial", "unusable", "shared", "taken"])
+@respx.mock
+def test_ssh_config_refuses_an_id_fallback_a_written_block_uses_as_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], why: str
+) -> None:
+    config = _config_with_block(ssh_home, "vm-9")
+    row = {"id": "vm-9", "name": "dev", "status": "running", "os": "linux"}
+    rows, headers = [row], {}
+    if why == "partial":
+        headers = {"X-GC-Incomplete": "1"}
+    elif why == "unusable":
+        rows = [{**row, "name": "my box"}]
+    elif why == "shared":
+        rows = [row, {**row, "id": "vm-2"}]
+    else:
+        rows = [{**row, "name": "github.com"}]
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(200, json=rows, headers=headers)
+    )
+    _refuses_every_mode(ssh_home, config, capsys)
+
+
 @respx.mock
 def test_ssh_config_keeps_the_name_its_own_written_block_uses(
     ssh_home: Path, capsys: pytest.CaptureFixture[str]
