@@ -643,3 +643,77 @@ def test_an_explicit_exists_is_still_file_exists_error_and_unchained():
     assert isinstance(error, builtins.FileExistsError)
     assert error.__cause__ is None
     assert not mc.is_transient(error)
+
+
+@pytest.mark.parametrize(
+    "headers,expected",
+    [
+        (
+            {"RateLimit-Limit": "600", "RateLimit-Remaining": "0", "RateLimit-Reset": "12"},
+            (600, 0, 12),
+        ),
+        ({}, (None, None, None)),
+        (
+            {"RateLimit-Limit": "6e2", "RateLimit-Remaining": "-1", "RateLimit-Reset": " 4 "},
+            (None, None, 4),
+        ),
+    ],
+    ids=["all-three", "absent", "malformed"],
+)
+def test_a_429_carries_the_platforms_budget_headers(headers, expected):
+    """Every metered answer carries RateLimit-*; a caller that was refused should
+    not have to guess the budget it ran out of."""
+
+    def handler(request):
+        return httpx.Response(
+            429, json={"error": "slow down"}, headers={"Retry-After": "3", **headers}
+        )
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        pytest.raises(mc.RateLimitError) as caught,
+    ):
+        client.computers.list()
+    error = caught.value
+    assert (error.limit, error.remaining, error.reset) == expected
+    assert error.retry_after == 3
+
+
+def test_a_response_hook_on_the_http_client_sees_the_budget_on_success():
+    """The README's recipe for reading the budget on a 200."""
+    seen = []
+
+    def handler(request):
+        return httpx.Response(
+            200, json=[], headers={"RateLimit-Remaining": "41", "RateLimit-Limit": "600"}
+        )
+
+    def budget(response):
+        seen.append(response.headers.get("RateLimit-Remaining"))
+
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(handler), event_hooks={"response": [budget]}
+        ) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        client.computers.list()
+    assert seen == ["41"]
+
+
+async def test_an_async_429_carries_the_budget_headers_too():
+    def handler(request):
+        return httpx.Response(
+            429,
+            json={"error": "slow down"},
+            headers={"RateLimit-Limit": "600", "RateLimit-Remaining": "0", "RateLimit-Reset": "9"},
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(mc.RateLimitError) as caught:
+            await client.computers.list()
+    assert (caught.value.limit, caught.value.remaining, caught.value.reset) == (600, 0, 9)

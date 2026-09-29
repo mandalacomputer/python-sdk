@@ -142,6 +142,13 @@ class AgentResult:
     text: str = ""
     usage: AgentUsage = field(default_factory=AgentUsage)
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: The steps the run took, on a result from
+    #: :meth:`~mandala_computer.Computer.agent_once`, whose one body carries them
+    #: as ``steps_taken``. Empty on a result from :meth:`~mandala_computer.Computer.agent`
+    #: or a streamed :class:`AgentDone`: the stream's ``done`` frame does not
+    #: carry them, because each one already arrived as an :class:`AgentStepEvent`.
+    #: Keyword-only, so it changes no existing construction.
+    steps_taken: tuple[AgentStep, ...] = field(default=(), kw_only=True)
 
     @property
     def finished(self) -> bool:
@@ -156,12 +163,17 @@ class AgentResult:
     @classmethod
     def from_api(cls, d: Any) -> AgentResult:
         r = d if isinstance(d, Mapping) else {}
+        taken = r.get("steps_taken")
         return cls(
             steps=_num(r.get("steps")),
             stop=_text(r.get("stop")) or "unknown",
             text=_text(r.get("text")),
             usage=AgentUsage.from_api(r.get("usage")),
             raw=dict(r),
+            steps_taken=tuple(
+                AgentStep.from_api(step, i + 1)
+                for i, step in enumerate(taken if isinstance(taken, list) else ())
+            ),
         )
 
 

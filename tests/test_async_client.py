@@ -247,6 +247,21 @@ async def test_screenshot_returns_bytes(client: mc.AsyncClient) -> None:
 
 
 @respx.mock
+async def test_async_screenshot_info_says_when_the_frame_is_a_saved_one(
+    client: mc.AsyncClient,
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(
+            200,
+            content=b"\xff\xd8",
+            headers={"Content-Type": "image/jpeg", "X-GC-Frame": "suspended"},
+        )
+    )
+    info = await mc.AsyncComputer(client._t, COMPUTER).screenshot_info(320)
+    assert info.suspended is True and info.content_type == "image/jpeg"
+
+
+@respx.mock
 async def test_screenshot_shaping_becomes_query_params(client: mc.AsyncClient) -> None:
     route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
         httpx.Response(200, content=b"jpg", headers={"Content-Type": "image/jpeg"})
@@ -449,6 +464,23 @@ async def test_open_sends_the_same_command_as_the_sync_client(
     body = json.loads(route.calls.last.request.content)
     assert body["command"] == mc._api.open_url_command("https://example.com")
     assert body["session"] == "desktop"
+
+
+@respx.mock
+async def test_async_open_raises_when_no_browser_was_started(client: mc.AsyncClient) -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        httpx.Response(
+            200,
+            json={
+                "exit_code": 127,
+                "stdout_b64": "",
+                "stderr_b64": base64.b64encode(b"no browser on this image").decode(),
+                "timed_out": False,
+            },
+        )
+    )
+    with pytest.raises(mc.MandalaError, match="did not start a browser: no browser"):
+        await mc.AsyncComputer(client._t, COMPUTER).open("https://example.com")
 
 
 # --- the routes added in this pass, on the async side -----------------------
@@ -1485,3 +1517,19 @@ async def test_saved_credentials_close_owned_async_http_client(
     async with mc.AsyncClient(profile="Work") as client:
         await client.computers.list()
     assert client._t._http.is_closed
+
+
+@respx.mock
+async def test_async_waits_fail_at_once_on_a_half_removed_computer(
+    client: mc.AsyncClient,
+) -> None:
+    half = {**COMPUTER, "status": "half-removed", "running_ram_mb": 0}
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=half))
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(500))
+    with pytest.raises(mc.MandalaError, match="partly removed") as running:
+        await mc.AsyncComputer(client._t, COMPUTER).wait_until_running(timeout=30, poll=0)
+    with pytest.raises(mc.MandalaError, match="partly removed") as guest:
+        await mc.AsyncComputer(client._t, half).wait_for_guest(timeout=30, poll=0)
+    assert not isinstance(running.value, mc.TimeoutError)
+    assert not isinstance(guest.value, mc.TimeoutError)
+    assert not probe.called

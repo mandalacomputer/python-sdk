@@ -1927,7 +1927,14 @@ def _keys_parsers(sub: Any) -> None:
     create = verbs.add_parser(
         "create", help="mint a key and print it ONCE; the new key cannot manage keys"
     )
-    create.add_argument("--name", help="a label, up to 60 characters")
+    create.add_argument(
+        "--name",
+        help=(
+            "a label, up to 60 characters; control, bidirectional and invisible "
+            "formatting characters are refused (ZWJ, ZWNJ and emoji variation "
+            "selectors are allowed)"
+        ),
+    )
     create.add_argument(
         "--workspace",
         metavar="ID",

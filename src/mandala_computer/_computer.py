@@ -55,6 +55,7 @@ from ._exceptions import (
     CreateOnlyConflictError,
     FileExistsError,
     MandalaError,
+    ModelProviderError,
     RangeNotSatisfiableError,
     RateLimitError,
     TimeoutError,
@@ -76,6 +77,7 @@ from ._models import (
     GuestDirectory,
     Listing,
     Move,
+    ScreenshotInfo,
     SecretBinding,
     SecretBindingArgs,
     SecretBindings,
@@ -161,6 +163,14 @@ def _require_model_key(model_key: str) -> str:
     return text
 
 
+#: The status of a computer whose deletion stopped partway (platform API
+#: ``Computer.status``): never startable again, cleared only by deleting it.
+HALF_REMOVED = "half-removed"
+_HALF_REMOVED_MESSAGE = (
+    "{id} is half-removed: its files were partly removed; it cannot be started; delete it"
+)
+
+
 def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> AgentResult:
     """What a finished stream comes to, once its events are in.
 
@@ -180,7 +190,7 @@ def _agent_outcome(result: AgentResult | None, failure: AgentFailed | None) -> A
         taken = f" after {n} step{'' if n == 1 else 's'}" if n else ""
         message = f"the agent run failed{taken}: {failure.error}"
         error = (
-            error_for_status(failure.status, message, dict(failure.raw))
+            _agent_route_error(error_for_status(failure.status, message, dict(failure.raw)))
             if failure.status
             else MandalaError(message)
         )
@@ -212,16 +222,82 @@ def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
     return _agent_outcome(None, failure)
 
 
+def _agent_route_error(exc: APIError) -> APIError:
+    """The class an agent route's status deserves, which for a 402 is not the plan's.
+
+    Nothing inside an agent run consults the Mandala plan. The only 402 these
+    routes answer is the model API's own ``billing_error``, relayed as it came,
+    about the account behind the caller's ``model_key``; the transport's table
+    files every 402 as :class:`~mandala_computer.PlanLimitError`, whose advice
+    (change the plan) would be wrong here. So a 402 is rebuilt as a
+    :class:`~mandala_computer.ModelProviderError` carrying everything the first
+    one did, and every other status is returned as it is.
+    """
+    if exc.status != 402 or isinstance(exc, ModelProviderError):
+        return exc
+    error = ModelProviderError(
+        str(exc),
+        status=exc.status,
+        body=exc.body,
+        retry_after=exc.retry_after,
+        request_id=exc.request_id,
+        allow=exc.allow,
+        www_authenticate=exc.www_authenticate,
+        method=exc.method,
+    )
+    error.reason = exc.reason
+    error.agent = exc.agent
+    error.idempotency_key = exc.idempotency_key
+    return error
+
+
+#: The header the platform puts on a suspended computer's saved frame.
+FRAME_HEADER = "X-GC-Frame"
+
+
+def _screenshot_info(data: bytes, headers: httpx.Headers) -> ScreenshotInfo:
+    """A screenshot's bytes, with its type and the platform's suspended marker."""
+    frame = headers.get(FRAME_HEADER, "")
+    return ScreenshotInfo(
+        data=data,
+        content_type=headers.get("content-type", ""),
+        suspended=frame.strip().lower() == "suspended",
+    )
+
+
+def _open_outcome(result: ExecResult) -> ExecResult:
+    """``open()``'s result, or the error for a launch that never happened.
+
+    The command it sends looks for a browser in the foreground and exits 127
+    naming the three it tried when the image has none, so a non-zero exit means
+    no browser was started and nothing will appear on the screen. A wait that
+    timed out never learned whether one was, which is no better an answer to
+    return as a result. That used to come back as a result nobody checks, which
+    is how a missing browser read as success (OPL-3705).
+    """
+    if result.ok:
+        return result
+    if result.timed_out:
+        raise MandalaError("open() could not confirm a browser started: the launch timed out")
+    said = result.stderr_text.strip()
+    detail = said or f"exit code {result.exit_code}"
+    raise MandalaError(f"open() did not start a browser: {detail}")
+
+
 def _attach_agent_partial(exc: APIError) -> None:
     """Carry a refused non-streaming run's own account onto the error it raises.
 
-    A non-streaming agent run can be refused by the API **after** it has already
-    driven the desktop: authorization is rechecked before each further model call
-    and before each tool, so a key revoked, a role dropped, an account suspended
-    or a plan downgraded mid-run stops the loop with an HTTP status — 401, 403 or
-    402 — rather than with a body this SDK reads as a result. The steps already
-    taken stand on the desktop and their tokens are already spent on the caller's
-    model key, and that refusal body is the only place either is ever reported.
+    A non-streaming agent run can be refused **after** it has already driven the
+    desktop. The platform rechecks the credential, the role and the account's
+    standing before each further model call and before each tool, and a failure
+    there is a 401 or a 403 with reason ``revoked``. The model API can end the
+    run too, with its own status for the account behind the caller's model key,
+    relayed as it came: 402 ``billing_error``, 403 ``permission_error``, 429,
+    504 ``timeout_error``, 529 ``overloaded_error``. Either way the loop stops
+    with an HTTP status rather than with a body this SDK reads as a result. The
+    steps already taken stand on the desktop and their tokens are already spent
+    on the caller's model key, and that refusal body is the only place either is
+    ever reported.
 
     So the account is moved onto the exception as
     :attr:`~mandala_computer.MandalaError.agent`, which is where the streaming
@@ -1142,6 +1218,14 @@ class ComputerFields:
         from another computer — starts as ``"building"`` while its disk is
         copied, and becomes ``"build-failed"`` if that copy never finished. See
         :attr:`is_building`.
+
+        ``"half-removed"`` is a computer whose deletion stopped partway and took
+        its disk with it: its files were partly removed, every call that needs
+        a disk is refused on it, it will never start again, and deleting it
+        again is what clears it. The waits raise on it at once.
+
+        The platform documents these six as a closed set: treat anything
+        outside it as not startable rather than as ``"stopped"``.
         """
         return str(self._data.get("status") or "")
 
@@ -1668,8 +1752,11 @@ class ComputerFields:
         for them. A plain clone reserves nothing and still gets the answer it
         always did.
 
-        A failed build is the one absolute: its disk copy is over and nothing
-        will start it, so no reservation could change the answer. An ordinary ``stopped`` used to be absent from this list for a
+        A failed build is one absolute: its disk copy is over and nothing will
+        start it, so no reservation could change the answer. ``half-removed`` is
+        the other: a deletion that stopped partway took the disk with it.
+
+        An ordinary ``stopped`` used to be absent from this list for a
         version of that reason — the wait is FOR a computer somebody is starting
         — but absent it also spent the full budget on a computer nobody was, and
         reported "still stopped" as though it had learned something. It is here
@@ -1679,6 +1766,11 @@ class ComputerFields:
             return MandalaError(
                 f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
             )
+        # As absolute as a failed build: a deletion that stopped partway took the
+        # disk with it, and nothing but deleting it again changes this state.
+        half = self._half_removed()
+        if half is not None:
+            return half
         # A suspended computer will not start on its own either. Left to spin it
         # reports a machine that is one call from running as a timeout — the
         # least informative answer available about the one case the caller can
@@ -1705,12 +1797,25 @@ class ComputerFields:
             )
         return None
 
+    def _half_removed(self) -> MandalaError | None:
+        """The error for a ``half-removed`` computer, or ``None`` for any other.
+
+        A deletion that stopped partway took the disk with it, so nothing but
+        deleting it again changes this state and no wait can outlast it.
+        """
+        if self.status == HALF_REMOVED:
+            return MandalaError(_HALF_REMOVED_MESSAGE.format(id=self.id))
+        return None
+
     def _guest_wait_failure(self) -> MandalaError | None:
         """A cached lifecycle state from which a guest probe cannot recover."""
         if self.build_failed:
             return MandalaError(
                 f"{self.id} could not be built: {self.build_error or 'the disk copy failed'}"
             )
+        half = self._half_removed()
+        if half is not None:
+            return half
         if self.start_error:
             return MandalaError(f"{self.id} did not start: {self.start_error}")
         # Qualified since OPL-4630: a start that has been admitted reads as
@@ -1986,9 +2091,16 @@ class ComputerFields:
         the platform's decision rather than an omission: a desktop credential in
         every list response is a credential in every log line that ever captured
         one, whereas a caller holding a single machine is the caller about to
-        connect to it. Every response that *is* one computer — a create, a clone,
-        a :meth:`Computer.refresh`, a rename — carries it, so
+        connect to it. Every fresh response that *is* one computer — a create, a
+        clone, a :meth:`Computer.refresh`, a rename — carries it, so
         ``c.refresh().vnc`` is how a listed computer gets one.
+
+        Not a REPLAYED one. A create, clone or rename sent again under an
+        ``idempotency_key`` the platform has already answered comes back as the
+        stored answer (``Idempotent-Replayed: true``), and the platform strips
+        the desktop credentials out of what it stores — so that handle's
+        ``vnc`` is ``None`` too, and ``c.refresh()`` fetches it.
+        :meth:`Computers.launch` is unaffected: its waits refresh the handle.
 
         Also ``None`` when the platform could not reach the host holding this
         computer, since a URL built over a missing credential answers 401 forever
@@ -2442,7 +2554,14 @@ class Computer(ComputerFields):
 
         ``None`` clears the override and returns it to its host's own sweep. See
         :attr:`idle_suspend_min` for why that is not the same as reading a
-        number back.
+        number back. The most a host accepts is 10080 (a week); more, or a
+        negative number, is a 400.
+
+        ``0`` means never: no idle suspend, and no eviction under memory
+        pressure either. It is capped per plan — Solo 0, Studio 1, Fleet 4
+        computers pinned this way at once — and pinning one past the cap raises
+        :class:`~mandala_computer.PlanLimitError`. Choose a timeout on another
+        computer, or change the plan, to pin this one.
 
         A suspend is a pause, not a stop — :meth:`start` resumes the same
         session in about a second — and input, exec and file transfers resume it
@@ -3107,10 +3226,13 @@ class Computer(ComputerFields):
         for a thumbnail or a quick "has anything changed" check.
 
         A SUSPENDED computer is not woken: it answers with the JPEG saved when
-        it was suspended, at most 640 pixels wide, with or without ``width`` —
-        so check the bytes (a JPEG starts ``\\xff\\xd8``) before treating them
-        as a PNG. ``fresh=True``, ``region``, ``scale``, ``quality`` or a PNG
-        ``format`` is refused for one, since the saved picture cannot honour it.
+        it was suspended, at most 640 pixels wide, with or without ``width``.
+        The bytes cannot tell you which one you got — with ``width`` set a live
+        capture is a JPEG too — so call :meth:`screenshot_info` when it
+        matters: its :attr:`~mandala_computer.ScreenshotInfo.suspended` is the
+        platform's own ``X-GC-Frame: suspended`` marker. ``fresh=True``,
+        ``region``, ``scale``, ``quality`` or a PNG ``format`` is refused for
+        one, since the saved picture cannot honour it.
 
         PASS ``fresh=True`` WHENEVER THE IMAGE IS FEEDING A DECISION. Without it
         the platform may answer from a frame up to 1.5 seconds old, which is
@@ -3160,6 +3282,37 @@ class Computer(ComputerFields):
             accept="image/png, image/jpeg",
             content_types=("image/", "application/octet-stream"),
         )
+
+    def screenshot_info(
+        self,
+        width: int | None = None,
+        *,
+        fresh: bool = False,
+        region: Sequence[int] | None = None,
+        scale: float | None = None,
+        format: str | None = None,
+        quality: int | None = None,
+    ) -> ScreenshotInfo:
+        """:meth:`screenshot`, with what the response said about the picture.
+
+        Takes the same arguments and makes the same request. What it adds is
+        :attr:`~mandala_computer.ScreenshotInfo.suspended`: ``True`` when the
+        computer is suspended and the platform answered with the JPEG saved when
+        it was suspended (``X-GC-Frame: suspended``) rather than a capture of a
+        live screen, which the bytes alone cannot show when ``width`` is set.
+        :attr:`~mandala_computer.ScreenshotInfo.content_type` says whether the
+        image is a PNG or a JPEG.
+        """
+        data, headers = self._t.binary_with_headers(
+            "GET",
+            _api.computer_action(self.id, "screenshot"),
+            params=_api.screenshot_params(
+                width, fresh, region=region, scale=scale, format=format, quality=quality
+            ),
+            accept="image/png, image/jpeg",
+            content_types=("image/", "application/octet-stream"),
+        )
+        return _screenshot_info(data, headers)
 
     # --- controlling ----------------------------------------------------
 
@@ -3367,9 +3520,11 @@ class Computer(ComputerFields):
         A GUI program does not exit on its own, so launch it detached or the call
         blocks until ``timeout`` ends the wait, while the program may keep running::
 
-            c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+            c.exec("nohup firefox-esr https://example.com >/dev/null 2>&1 &", desktop=True)
 
-        Or call :meth:`open` and let the SDK write that line.
+        The browser's name depends on the image (the Omarchy one has
+        ``chromium`` and no Firefox); call :meth:`open` and let the SDK pick
+        the one installed and write that line.
 
         ``cwd`` is an absolute path inside the guest and ``env`` is extra
         environment for this command alone. A command slower than a few seconds
@@ -3675,19 +3830,25 @@ class Computer(ComputerFields):
 
             c.open("https://example.com")
 
-        Sugar over :meth:`exec` with ``desktop=True``: it names a browser that
-        works on the image, quotes the URL, and detaches the launch so the call
-        returns in well under a second instead of blocking until ``timeout``.
+        Sugar over :meth:`exec` with ``desktop=True``: it picks the browser the
+        image has installed — ``firefox-esr``, then ``firefox``, then
+        ``chromium``, since the images do not share one — quotes the URL, and
+        detaches the launch so the call returns in well under a second instead
+        of blocking until ``timeout``.
 
-        The result describes the *launch*, not the page — a zero exit means the
-        shell started the browser, not that the URL resolved. Take a
+        Raises :class:`~mandala_computer.MandalaError` when no browser was
+        started — an image with none of the three (the command exits 127 and
+        the message says so), or any other non-zero exit — and when the wait
+        timed out, since then whether one started is unknown. A result that
+        comes back describes the *launch*, not the page — the browser was
+        started, not that the URL resolved or that the browser stayed up. Take a
         :meth:`screenshot` to see what actually loaded.
 
         Raises ``ValueError`` for an empty URL or one starting with ``-``, which
         a browser would read as a flag rather than an address. On Windows the
         API rejects it, the same as any ``desktop=True`` exec.
         """
-        return self.exec(_api.open_url_command(url), timeout, desktop=True)
+        return _open_outcome(self.exec(_api.open_url_command(url), timeout, desktop=True))
 
     # --- files ----------------------------------------------------------
 
@@ -4227,6 +4388,15 @@ class Computer(ComputerFields):
         stretch, 400 for a memory snapshot of a computer that is not running. A
         202 means the capture started.
 
+        And a 503, :class:`~mandala_computer.UnavailableError`, from admission.
+        Manual captures on one account are admitted one at a time, so a capture
+        asked for while another is still being admitted is refused with 503 —
+        which is why several ``snapshot()`` calls at once (``asyncio.gather``,
+        a thread pool) fail for all but one; take them one after another. The
+        same 503 answers when admission cannot be confirmed, and in that case
+        the capture may have started: before retrying, look in
+        :meth:`snapshots` for a ``capturing`` row for this computer.
+
         Raises :class:`~mandala_computer.MandalaError` if the capture fails.
         There is no response left to carry that news by then, so the platform
         drops the ``capturing`` row and stores nothing; the row disappearing is
@@ -4528,7 +4698,10 @@ class Computer(ComputerFields):
         check :attr:`~mandala_computer.AgentResult.finished`. What it does raise
         is a failure the platform reported mid-run, as the class that status
         deserves, and a :class:`~mandala_computer.MandalaError` for a stream
-        that ended without saying how the run came out.
+        that ended without saying how the run came out. A 402 there is the model
+        API's ``billing_error`` for the account behind ``model_key``, never the
+        Mandala plan, and is raised as
+        :class:`~mandala_computer.ModelProviderError`.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -4576,23 +4749,37 @@ class Computer(ComputerFields):
         coming back as a run of no steps that ended for no reason — the same
         check :meth:`agent` makes on the content type, made on the body.
 
-        **A run can be refused part-way through.** Authorization is checked again
-        before each further model call and before each tool, so a key revoked, a
-        role dropped, an account suspended or a plan downgraded mid-run ends the
-        request with an HTTP status — 401, 403 or 402 — after some steps have
-        already run on the desktop and been billed to your model key. Where the
-        refusal says how far it got, that account rides on the exception as
+        **A run can be refused part-way through.** The platform rechecks the
+        credential, the role and the account's standing before each further
+        model call and before each tool, so a key revoked, a role dropped or an
+        account suspended mid-run ends the request with a 401 or a 403 carrying
+        reason ``revoked``, after some steps have already run on the desktop and
+        been billed to your model key. The Mandala plan is not rechecked, and no
+        status here is about it. The model API can end the run as well, and its
+        own status is relayed as it came, about the account behind
+        ``model_key``: 402 ``billing_error`` (raised as
+        :class:`~mandala_computer.ModelProviderError`, not
+        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``, 529
+        ``overloaded_error``, and a 403 without reason ``revoked`` may be its
+        ``permission_error``. Where the refusal says how far it got, that
+        account rides on the exception as
         :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
-        :meth:`agent`. None of the three is worth retrying unchanged; the
-        credential, the role or the plan is what has to change first.
+        :meth:`agent`. A ``revoked`` refusal or a 402 is not worth retrying
+        unchanged: the credential, the role, or the model account's billing is
+        what has to change first.
 
-        The proxy in front of ``app.mandala.computer`` gives up at about two
-        minutes, measured — so on that deployment this is not a risk but a
-        certainty for any run longer than that, and it arrives as
-        :class:`~mandala_computer.GatewayTimeoutError`. The remedy is
-        :meth:`agent`, not ``start_exec``: a stream sends its headers at once
-        and heartbeats every ten seconds, so nothing about it looks idle to the
-        hop that would otherwise stop waiting.
+        **The hosted API cuts it off at about two minutes.** The edge in front of
+        ``app.mandala.computer`` ends a request that is not streaming after
+        about 120 seconds with a body-less 524, raised as
+        :class:`~mandala_computer.GatewayTimeoutError`. Unlike most gateway
+        timeouts, the work does not carry on: the dropped connection stops the
+        run where it was, and its usage and the steps it took are lost with the
+        response, so there is nothing to attach as
+        :attr:`~mandala_computer.MandalaError.agent`. Use :meth:`agent` or
+        :meth:`agent_stream` for anything that may take longer — not
+        ``start_exec``: a stream sends its headers at once and heartbeats every
+        ten seconds, so nothing about it looks idle to the hop that would
+        otherwise stop waiting.
         """
         model_key = _require_model_key(model_key)
         try:
@@ -4606,10 +4793,15 @@ class Computer(ComputerFields):
                 timeout=NO_DEADLINE,
             )
         except APIError as exc:
-            # A refusal that arrived mid-run carries what the run had already
-            # done. See :func:`_attach_agent_partial`.
-            _attach_agent_partial(exc)
-            raise
+            # A 402 here is the model provider's billing refusal, not the plan's
+            # (see :func:`_agent_route_error`). A refusal that arrived mid-run
+            # carries what the run had already done; see
+            # :func:`_attach_agent_partial`.
+            error = _agent_route_error(exc)
+            _attach_agent_partial(error)
+            if error is exc:
+                raise
+            raise error from None
         return _agent_once_outcome(data)
 
     # --- events ---------------------------------------------------------

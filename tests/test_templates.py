@@ -121,6 +121,56 @@ def test_publish_sends_the_document_as_bytes(client: mc.Client) -> None:
 
 
 @respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "acc-1/devbox@1.0.0 is already published, as a different document"},
+        {"error": "You have published 100 templates", "reason": "  "},
+        {"error": "acc-1/devbox@1.0.0 was retired", "reason": "a-word-from-later"},
+        {"error": "acc-1/devbox@1.0.0 is already published", "reason": "exists"},
+    ],
+    ids=["no-reason", "blank-reason", "unknown-reason", "platform-exists"],
+)
+def test_a_publish_conflict_is_never_called_worth_retrying(
+    client: mc.Client, body: dict[str, str]
+) -> None:
+    """None of the four publish refusals clears by waiting, and without a reason
+    a 409 reads as a passing conflict, so a retry loop would resend the same
+    document until it gave up."""
+    respx.post(f"{BASE}/templates").mock(return_value=httpx.Response(409, json=body))
+    with pytest.raises(mc.ConflictError) as error:
+        client.templates.publish("apiVersion: mandala/v1")
+    assert type(error.value) is mc.ConflictError
+    assert error.value.reason == "exists" and error.value.status == 409
+    assert str(error.value) == body["error"]
+    assert mc.is_transient(error.value) is False
+
+
+@respx.mock
+def test_a_publish_conflict_keeps_the_platforms_own_word(client: mc.Client) -> None:
+    respx.post(f"{BASE}/templates").mock(
+        return_value=httpx.Response(409, json={"error": "later", "reason": "unsupported"})
+    )
+    with pytest.raises(mc.ConflictError) as error:
+        client.templates.publish("apiVersion: mandala/v1")
+    assert error.value.reason == "unsupported"
+    assert mc.is_transient(error.value) is False
+
+
+@respx.mock
+async def test_an_async_publish_conflict_is_never_called_worth_retrying(
+    async_client: mc.AsyncClient,
+) -> None:
+    respx.post(f"{BASE}/templates").mock(
+        return_value=httpx.Response(409, json={"error": "a different document"})
+    )
+    with pytest.raises(mc.ConflictError) as error:
+        await async_client.templates.publish("apiVersion: mandala/v1")
+    assert error.value.reason == "exists"
+    assert mc.is_transient(error.value) is False
+
+
+@respx.mock
 def test_publish_refuses_an_empty_document_without_a_round_trip(client: mc.Client) -> None:
     route = respx.post(f"{BASE}/templates")
     with pytest.raises(ValueError):

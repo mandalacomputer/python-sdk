@@ -16,7 +16,10 @@ from . import _api
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport
 from ._computer import Computer, _poll_delay, _ride_out, check_wait_args
 from ._exceptions import (
+    _REASON_CLEARS,
+    _REASON_PERMANENT,
     ConflictError,
+    FileExistsError,
     MandalaError,
     OperationFailedError,
     TimeoutError,
@@ -251,15 +254,18 @@ class Computers:
         arguments and that key answers the first call's result instead of
         building a second computer, or a :class:`~mandala_computer.ConflictError`
         with :attr:`~mandala_computer.APIError.code` ``idempotency_in_progress``
-        while it is still running (send it again later). After a ``5xx``, the
-        key never answers the result: every resend raises a ``ConflictError``
-        with code ``idempotency_outcome_unknown``, and so does one sent after an
-        ``idempotency_in_progress`` the platform gave up on. Then read the
-        computer, or the operation the error's
-        :attr:`~mandala_computer.APIError.operation_id` names
-        (:attr:`Client.operations`), rather than sending the create again under
-        a new key, which may build a second computer. Keys last 24 hours, and a
-        key sent with different arguments raises an ``APIError`` (422).
+        while it is still running (send it again later). After a ``5xx`` that
+        names an :attr:`~mandala_computer.APIError.operation_id`, the key is
+        spent and never answers the result: every resend raises a
+        ``ConflictError`` with code ``idempotency_outcome_unknown``, and so does
+        one sent after an ``idempotency_in_progress`` the platform gave up on.
+        Then read the computer, or that operation (:attr:`Client.operations`),
+        rather than sending the create again under a new key, which may build a
+        second computer. A ``5xx`` that names no operation may have been refused
+        before the call was sent anywhere, which releases the key, and a resend
+        under it is carried out. Resending under the same key is safe after any
+        ``5xx``; a new key is what is not. Keys last 24 hours, and a key sent
+        with different arguments raises an ``APIError`` (422).
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -438,6 +444,9 @@ class Computers:
                     computer.wait_until_built(timeout=0, poll=poll)
                 if computer.start_error:
                     raise MandalaError(f"did not start: {computer.start_error}")
+                half = computer._half_removed()
+                if half is not None:
+                    raise half
                 status = computer.raw.get("status")
                 if isinstance(status, str) and status in ("running", "stopped", "suspended"):
                     break
@@ -926,6 +935,45 @@ class Snapshots:
         return Retention.from_api(self._t.json_object("GET", _api.RETENTION))
 
 
+def _publish_refusal(err: ConflictError) -> ConflictError:
+    """A template publish's 409, never left looking like a passing conflict.
+
+    The platform's four publish refusals — a different document under a
+    published ref, a retired ref, and the two per-account ceilings — do not
+    clear by waiting, and they have been sent with no ``reason``, which
+    :func:`~mandala_computer.is_transient` reads as a conflict worth sending
+    again. The request's own context decides here what the body did not: a
+    reason this version knows as permanent is kept, a clearing word is kept as
+    the platform's explicit advice, and anything else — none, blank, or a word
+    this version does not know — becomes ``"exists"``.
+
+    Returned as a plain :class:`ConflictError` in every case. A body that did
+    carry ``exists`` arrives from the transport as
+    :class:`~mandala_computer.FileExistsError`, whose meaning is a create-only
+    upload's taken path, which is not what happened here.
+    """
+    reason = err.reason
+    if reason in _REASON_CLEARS:
+        return err
+    if type(err) is ConflictError and reason in _REASON_PERMANENT:
+        return err
+    if type(err) not in (ConflictError, FileExistsError):
+        # A subclass with a meaning of its own, which publishing never sends.
+        return err
+    refusal = ConflictError(
+        str(err),
+        status=err.status,
+        body=err.body,
+        retry_after=err.retry_after,
+        request_id=err.request_id,
+        allow=err.allow,
+        www_authenticate=err.www_authenticate,
+        method=err.method,
+    )
+    refusal.reason = reason if reason in _REASON_PERMANENT else "exists"
+    return refusal
+
+
 class Templates:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
@@ -1000,11 +1048,30 @@ class Templates:
         A ref you have RETIRED stays spoken for and cannot be republished,
         identical bytes included. See :meth:`retire`.
 
+        NONE OF ITS 409s IS WORTH RETRYING UNCHANGED: a different document under
+        a published ref, a retired ref, and the two per-account ceilings (the
+        templates stored, and the refs ever claimed) all answer the same until
+        something else changes. So a :class:`~mandala_computer.ConflictError`
+        from here always carries a permanent
+        :attr:`~mandala_computer.APIError.reason` — the platform's own, or
+        ``"exists"`` where it sent none — and
+        :func:`~mandala_computer.is_transient` answers ``False`` for it. Bump
+        ``metadata.version`` (or retire a template, for the first ceiling) and
+        publish again.
+
         An invalid document is refused with an
         :class:`~mandala_computer.APIError` (400) whose ``body["problems"]``
         lists every problem, as :meth:`validate` reports them.
         """
-        data = self._t.json_object("POST", _api.TEMPLATES, content=_api.template_document(document))
+        try:
+            data = self._t.json_object(
+                "POST", _api.TEMPLATES, content=_api.template_document(document)
+            )
+        except ConflictError as exc:
+            refusal = _publish_refusal(exc)
+            if refusal is exc:
+                raise
+            raise refusal from None
         return PublishedTemplate.from_api(data)
 
     def get(self, namespace: str, name: str, *, version: str | None = None) -> PublishedTemplate:
@@ -1128,9 +1195,31 @@ class Builds:
         ``golden-<your account id>`` or that and a ``-`` and a name of your
         choosing.
 
-        A :class:`~mandala_computer.ConflictError` means a hypervisor is busy —
-        one build runs per host at a time — rather than that anything is wrong
-        with the document, and is worth retrying.
+        ``spec.from`` has to name a ``system/...`` template; anything else is a
+        400. A document that declares ``spec.build`` steps or ``spec.env`` is
+        one that has to be built.
+
+        BUILD SECRETS. ``spec.secrets`` lets build steps read secrets you
+        stored, each named by its id and the environment name it is read as
+        (``{id: csec-…, as: NAME}``), never by value. They are resolved in this
+        client's key's scope when the build is submitted, and the revision each
+        one had then is the one the build reads, even if it is replaced later.
+        A document may name at most 32; :meth:`Templates.validate` does not
+        check that limit, so a longer list first fails here.
+
+        Which refusals are worth retrying:
+
+        - A malformed reference is a 400 that says what is wrong, and a
+          reference that does not resolve in your scope — deleted, never there,
+          or another workspace's — is a 400 with one sentence for all of them.
+          Neither clears by retrying; fix the document.
+        - A secret whose value could not be read is a
+          :class:`~mandala_computer.ConflictError`, and a platform with no
+          secrets keyring is an :class:`~mandala_computer.UnavailableError`
+          (503). Both are worth retrying.
+        - Any other :class:`~mandala_computer.ConflictError` means a hypervisor
+          is busy — one build runs per host at a time — rather than that
+          anything is wrong with the document, and is worth retrying too.
 
         ``no_reuse`` builds again even when an image already carries this
         document's build digest. Identical documents normally share an image,
@@ -1892,6 +1981,11 @@ class ApiKeys:
         caller naming another is refused. Not retried on a 503: a mint that may
         already have happened is a key nobody holds, so list and revoke rather
         than send it again. An account holds at most 1000 keys.
+
+        A ``name`` containing a control, bidirectional or invisible formatting
+        character (U+200B, U+2060 or U+202E, for example) is refused with a
+        400. The joiners ZWJ and ZWNJ and the emoji variation selectors are
+        allowed, so emoji sequences and scripts that need them work.
         """
         body = _api.api_key_body(name, workspace_id)
         return ApiKeyCreated.from_api(self._t.json_object("POST", _api.API_KEYS, json=body))
@@ -2052,6 +2146,13 @@ class Operations:
         ``idempotency_key`` keeps the one a lifecycle call sent with that key
         recorded — found even when its answer was lost — within the key's 24
         hours; ``limit`` is 1 to 100, and the platform's default is 20.
+
+        Keys are kept per credential scope, so ``idempotency_key`` finds only
+        an operation that a credential of the same scope as this client's
+        reserved. The same key sent by another workspace's key, or by a
+        workspace's key when this client's is account-wide, is a different key
+        and is not found by it, even when the unfiltered listing shows that
+        operation.
         """
         params = _api.operations_params(computer_id, limit, cursor, idempotency_key)
         data = self._t.json_object("GET", _api.OPERATIONS, params=params)

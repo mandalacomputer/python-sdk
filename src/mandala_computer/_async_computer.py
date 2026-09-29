@@ -45,6 +45,7 @@ from ._computer import (
     ComputerFields,
     _agent_once_outcome,
     _agent_outcome,
+    _agent_route_error,
     _attach_agent_partial,
     _browser_proxy_timeout,
     _bytes_written,
@@ -58,11 +59,13 @@ from ._computer import (
     _guest_not_running,
     _mechanism,
     _no_wake_refusal,
+    _open_outcome,
     _poll_delay,
     _require_background_pid,
     _require_model_key,
     _ride_out,
     _schedule_window,
+    _screenshot_info,
     _secrets_timeout,
     _snapshots_deleted,
     _upload_refusal,
@@ -108,6 +111,7 @@ from ._models import (
     GuestDirectory,
     Listing,
     Move,
+    ScreenshotInfo,
     SecretBindingArgs,
     SecretBindings,
     SignalPage,
@@ -489,7 +493,14 @@ class AsyncComputer(ComputerFields):
 
         ``None`` clears the override and returns it to its host's own sweep. See
         :attr:`idle_suspend_min` for why that is not the same as reading a
-        number back.
+        number back. The most a host accepts is 10080 (a week); more, or a
+        negative number, is a 400.
+
+        ``0`` means never: no idle suspend, and no eviction under memory
+        pressure either. It is capped per plan — Solo 0, Studio 1, Fleet 4
+        computers pinned this way at once — and pinning one past the cap raises
+        :class:`~mandala_computer.PlanLimitError`. Choose a timeout on another
+        computer, or change the plan, to pin this one.
 
         A suspend is a pause, not a stop — :meth:`start` resumes the same
         session in about a second — and input, exec and file transfers resume it
@@ -1019,10 +1030,13 @@ class AsyncComputer(ComputerFields):
         for a thumbnail or a quick "has anything changed" check.
 
         A SUSPENDED computer is not woken: it answers with the JPEG saved when
-        it was suspended, at most 640 pixels wide, with or without ``width`` —
-        so check the bytes (a JPEG starts ``\\xff\\xd8``) before treating them
-        as a PNG. ``fresh=True``, ``region``, ``scale``, ``quality`` or a PNG
-        ``format`` is refused for one, since the saved picture cannot honour it.
+        it was suspended, at most 640 pixels wide, with or without ``width``.
+        The bytes cannot tell you which one you got — with ``width`` set a live
+        capture is a JPEG too — so call :meth:`screenshot_info` when it
+        matters: its :attr:`~mandala_computer.ScreenshotInfo.suspended` is the
+        platform's own ``X-GC-Frame: suspended`` marker. ``fresh=True``,
+        ``region``, ``scale``, ``quality`` or a PNG ``format`` is refused for
+        one, since the saved picture cannot honour it.
 
         PASS ``fresh=True`` WHENEVER THE IMAGE IS FEEDING A DECISION. Without it
         the platform may answer from a frame up to 1.5 seconds old, which is
@@ -1072,6 +1086,37 @@ class AsyncComputer(ComputerFields):
             accept="image/png, image/jpeg",
             content_types=("image/", "application/octet-stream"),
         )
+
+    async def screenshot_info(
+        self,
+        width: int | None = None,
+        *,
+        fresh: bool = False,
+        region: Sequence[int] | None = None,
+        scale: float | None = None,
+        format: str | None = None,
+        quality: int | None = None,
+    ) -> ScreenshotInfo:
+        """:meth:`screenshot`, with what the response said about the picture.
+
+        Takes the same arguments and makes the same request. What it adds is
+        :attr:`~mandala_computer.ScreenshotInfo.suspended`: ``True`` when the
+        computer is suspended and the platform answered with the JPEG saved when
+        it was suspended (``X-GC-Frame: suspended``) rather than a capture of a
+        live screen, which the bytes alone cannot show when ``width`` is set.
+        :attr:`~mandala_computer.ScreenshotInfo.content_type` says whether the
+        image is a PNG or a JPEG.
+        """
+        data, headers = await self._t.binary_with_headers(
+            "GET",
+            _api.computer_action(self.id, "screenshot"),
+            params=_api.screenshot_params(
+                width, fresh, region=region, scale=scale, format=format, quality=quality
+            ),
+            accept="image/png, image/jpeg",
+            content_types=("image/", "application/octet-stream"),
+        )
+        return _screenshot_info(data, headers)
 
     # --- controlling ----------------------------------------------------
 
@@ -1265,9 +1310,11 @@ class AsyncComputer(ComputerFields):
         A GUI program does not exit on its own, so launch it detached or the call
         blocks until ``timeout`` ends the wait, while the program may keep running::
 
-            await c.exec("nohup firefox https://example.com >/dev/null 2>&1 &", desktop=True)
+            await c.exec("nohup firefox-esr https://example.com >/dev/null 2>&1 &", desktop=True)
 
-        Or call :meth:`open` and let the SDK write that line.
+        The browser's name depends on the image (the Omarchy one has
+        ``chromium`` and no Firefox); call :meth:`open` and let the SDK pick
+        the one installed and write that line.
 
         ``cwd`` is an absolute path inside the guest and ``env`` is extra
         environment for this command alone. A command slower than a few seconds
@@ -1572,19 +1619,25 @@ class AsyncComputer(ComputerFields):
 
             await c.open("https://example.com")
 
-        Sugar over :meth:`exec` with ``desktop=True``: it names a browser that
-        works on the image, quotes the URL, and detaches the launch so the call
-        returns in well under a second instead of blocking until ``timeout``.
+        Sugar over :meth:`exec` with ``desktop=True``: it picks the browser the
+        image has installed — ``firefox-esr``, then ``firefox``, then
+        ``chromium``, since the images do not share one — quotes the URL, and
+        detaches the launch so the call returns in well under a second instead
+        of blocking until ``timeout``.
 
-        The result describes the *launch*, not the page — a zero exit means the
-        shell started the browser, not that the URL resolved. Take a
+        Raises :class:`~mandala_computer.MandalaError` when no browser was
+        started — an image with none of the three (the command exits 127 and
+        the message says so), or any other non-zero exit — and when the wait
+        timed out, since then whether one started is unknown. A result that
+        comes back describes the *launch*, not the page — the browser was
+        started, not that the URL resolved or that the browser stayed up. Take a
         :meth:`screenshot` to see what actually loaded.
 
         Raises ``ValueError`` for an empty URL or one starting with ``-``, which
         a browser would read as a flag rather than an address. On Windows the
         API rejects it, the same as any ``desktop=True`` exec.
         """
-        return await self.exec(_api.open_url_command(url), timeout, desktop=True)
+        return _open_outcome(await self.exec(_api.open_url_command(url), timeout, desktop=True))
 
     # --- files ----------------------------------------------------------
 
@@ -1974,6 +2027,15 @@ class AsyncComputer(ComputerFields):
         stretch, 400 for a memory snapshot of a computer that is not running. A
         202 means the capture started.
 
+        And a 503, :class:`~mandala_computer.UnavailableError`, from admission.
+        Manual captures on one account are admitted one at a time, so a capture
+        asked for while another is still being admitted is refused with 503 —
+        which is why several ``snapshot()`` calls at once (``asyncio.gather``,
+        a thread pool) fail for all but one; take them one after another. The
+        same 503 answers when admission cannot be confirmed, and in that case
+        the capture may have started: before retrying, look in
+        :meth:`snapshots` for a ``capturing`` row for this computer.
+
         Raises :class:`~mandala_computer.MandalaError` if the capture fails.
         There is no response left to carry that news by then, so the platform
         drops the ``capturing`` row and stores nothing; the row disappearing is
@@ -2246,7 +2308,10 @@ class AsyncComputer(ComputerFields):
         check :attr:`~mandala_computer.AgentResult.finished`. What it does raise
         is a failure the platform reported mid-run, as the class that status
         deserves, and a :class:`~mandala_computer.MandalaError` for a stream
-        that ended without saying how the run came out.
+        that ended without saying how the run came out. A 402 there is the model
+        API's ``billing_error`` for the account behind ``model_key``, never the
+        Mandala plan, and is raised as
+        :class:`~mandala_computer.ModelProviderError`.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -2291,23 +2356,37 @@ class AsyncComputer(ComputerFields):
         coming back as a run of no steps that ended for no reason — the same
         check :meth:`agent` makes on the content type, made on the body.
 
-        **A run can be refused part-way through.** Authorization is checked again
-        before each further model call and before each tool, so a key revoked, a
-        role dropped, an account suspended or a plan downgraded mid-run ends the
-        request with an HTTP status — 401, 403 or 402 — after some steps have
-        already run on the desktop and been billed to your model key. Where the
-        refusal says how far it got, that account rides on the exception as
+        **A run can be refused part-way through.** The platform rechecks the
+        credential, the role and the account's standing before each further
+        model call and before each tool, so a key revoked, a role dropped or an
+        account suspended mid-run ends the request with a 401 or a 403 carrying
+        reason ``revoked``, after some steps have already run on the desktop and
+        been billed to your model key. The Mandala plan is not rechecked, and no
+        status here is about it. The model API can end the run as well, and its
+        own status is relayed as it came, about the account behind
+        ``model_key``: 402 ``billing_error`` (raised as
+        :class:`~mandala_computer.ModelProviderError`, not
+        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``, 529
+        ``overloaded_error``, and a 403 without reason ``revoked`` may be its
+        ``permission_error``. Where the refusal says how far it got, that
+        account rides on the exception as
         :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
-        :meth:`agent`. None of the three is worth retrying unchanged; the
-        credential, the role or the plan is what has to change first.
+        :meth:`agent`. A ``revoked`` refusal or a 402 is not worth retrying
+        unchanged: the credential, the role, or the model account's billing is
+        what has to change first.
 
-        The proxy in front of ``app.mandala.computer`` gives up at about two
-        minutes, measured — so on that deployment this is not a risk but a
-        certainty for any run longer than that, and it arrives as
-        :class:`~mandala_computer.GatewayTimeoutError`. The remedy is
-        :meth:`agent`, not ``start_exec``: a stream sends its headers at once
-        and heartbeats every ten seconds, so nothing about it looks idle to the
-        hop that would otherwise stop waiting.
+        **The hosted API cuts it off at about two minutes.** The edge in front of
+        ``app.mandala.computer`` ends a request that is not streaming after
+        about 120 seconds with a body-less 524, raised as
+        :class:`~mandala_computer.GatewayTimeoutError`. Unlike most gateway
+        timeouts, the work does not carry on: the dropped connection stops the
+        run where it was, and its usage and the steps it took are lost with the
+        response, so there is nothing to attach as
+        :attr:`~mandala_computer.MandalaError.agent`. Use :meth:`agent` or
+        :meth:`agent_stream` for anything that may take longer — not
+        ``start_exec``: a stream sends its headers at once and heartbeats every
+        ten seconds, so nothing about it looks idle to the hop that would
+        otherwise stop waiting.
         """
         model_key = _require_model_key(model_key)
         try:
@@ -2321,10 +2400,15 @@ class AsyncComputer(ComputerFields):
                 timeout=NO_DEADLINE,
             )
         except APIError as exc:
-            # A refusal that arrived mid-run carries what the run had already
-            # done. See :func:`_attach_agent_partial`.
-            _attach_agent_partial(exc)
-            raise
+            # A 402 here is the model provider's billing refusal, not the plan's
+            # (see :func:`_agent_route_error`). A refusal that arrived mid-run
+            # carries what the run had already done; see
+            # :func:`_attach_agent_partial`.
+            error = _agent_route_error(exc)
+            _attach_agent_partial(error)
+            if error is exc:
+                raise
+            raise error from None
         return _agent_once_outcome(data)
 
     # --- events ---------------------------------------------------------

@@ -104,6 +104,7 @@ from ._resources import (
     _operation_id_arg,
     _operation_settled,
     _operation_timed_out,
+    _publish_refusal,
     _wait_timed_out,
     classify_poll_failure,
     deletion_timed_out,
@@ -223,15 +224,18 @@ class AsyncComputers:
         arguments and that key answers the first call's result instead of
         building a second computer, or a :class:`~mandala_computer.ConflictError`
         with :attr:`~mandala_computer.APIError.code` ``idempotency_in_progress``
-        while it is still running (send it again later). After a ``5xx``, the
-        key never answers the result: every resend raises a ``ConflictError``
-        with code ``idempotency_outcome_unknown``, and so does one sent after an
-        ``idempotency_in_progress`` the platform gave up on. Then read the
-        computer, or the operation the error's
-        :attr:`~mandala_computer.APIError.operation_id` names
-        (:attr:`Client.operations`), rather than sending the create again under
-        a new key, which may build a second computer. Keys last 24 hours, and a
-        key sent with different arguments raises an ``APIError`` (422).
+        while it is still running (send it again later). After a ``5xx`` that
+        names an :attr:`~mandala_computer.APIError.operation_id`, the key is
+        spent and never answers the result: every resend raises a
+        ``ConflictError`` with code ``idempotency_outcome_unknown``, and so does
+        one sent after an ``idempotency_in_progress`` the platform gave up on.
+        Then read the computer, or that operation (:attr:`Client.operations`),
+        rather than sending the create again under a new key, which may build a
+        second computer. A ``5xx`` that names no operation may have been refused
+        before the call was sent anywhere, which releases the key, and a resend
+        under it is carried out. Resending under the same key is safe after any
+        ``5xx``; a new key is what is not. Keys last 24 hours, and a key sent
+        with different arguments raises an ``APIError`` (422).
 
         Anything omitted falls back to the template's defaults. Sizing is capped
         by the account's plan; exceeding a cap raises
@@ -410,6 +414,9 @@ class AsyncComputers:
                     await computer.wait_until_built(timeout=0, poll=poll)
                 if computer.start_error:
                     raise MandalaError(f"did not start: {computer.start_error}")
+                half = computer._half_removed()
+                if half is not None:
+                    raise half
                 status = computer.raw.get("status")
                 if isinstance(status, str) and status in ("running", "stopped", "suspended"):
                     break
@@ -785,9 +792,15 @@ class AsyncTemplates:
         return TemplateCheck.from_api(data)
 
     async def publish(self, document: str) -> PublishedTemplate:
-        data = await self._t.json_object(
-            "POST", _api.TEMPLATES, content=_api.template_document(document)
-        )
+        try:
+            data = await self._t.json_object(
+                "POST", _api.TEMPLATES, content=_api.template_document(document)
+            )
+        except ConflictError as exc:
+            refusal = _publish_refusal(exc)
+            if refusal is exc:
+                raise
+            raise refusal from None
         return PublishedTemplate.from_api(data)
 
     async def get(
@@ -1314,6 +1327,8 @@ class AsyncOperations:
         params = _api.operations_params(computer_id, limit, cursor, idempotency_key)
         data = await self._t.json_object("GET", _api.OPERATIONS, params=params)
         return OperationPage.from_api(data)
+
+    list.__doc__ = Operations.list.__doc__
 
     async def wait(
         self,

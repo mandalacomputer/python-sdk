@@ -253,6 +253,29 @@ def test_screenshot_returns_bytes(client: mc.Client) -> None:
 
 
 @respx.mock
+def test_screenshot_info_says_when_the_frame_is_a_saved_one(client: mc.Client) -> None:
+    """With ``width`` set a live capture is a JPEG too, so the bytes cannot tell
+    a suspended computer's saved frame from the screen as it is; the header can."""
+    jpeg = b"\xff\xd8\xff\xe0"
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                content=jpeg,
+                headers={"Content-Type": "image/jpeg", "X-GC-Frame": "suspended"},
+            ),
+            httpx.Response(200, content=jpeg, headers={"Content-Type": "image/jpeg"}),
+        ]
+    )
+    c = mc.Computer(client._t, COMPUTER)
+    saved = c.screenshot_info(320)
+    live = c.screenshot_info(320)
+    assert saved == mc.ScreenshotInfo(data=jpeg, content_type="image/jpeg", suspended=True)
+    assert live.suspended is False and live.data == jpeg
+    assert route.calls.last.request.url.params["w"] == "320"
+
+
+@respx.mock
 def test_screenshot_refuses_a_json_success_body(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
         httpx.Response(200, json={"error": "sign in again"})
@@ -532,6 +555,7 @@ def test_a_stale_running_handle_is_still_verified_while_there_is_budget(
         ("suspended", "call start\\(\\) to resume it"),
         ("build-failed", "could not be built"),
         ("building", "call wait_until_built"),
+        ("half-removed", "partly removed; it cannot be started; delete it"),
     ],
 )
 def test_an_expired_budget_still_names_the_state_that_will_not_start(
@@ -1474,6 +1498,48 @@ def test_open_does_not_ask_for_the_default_handler(client: mc.Client) -> None:
     command = json.loads(route.calls.last.request.content)["command"]
     for handler in ("xdg-open", "exo-open", "sensible-browser", "x-www-browser"):
         assert handler not in command
+
+
+def test_open_picks_a_browser_the_image_has_in_the_foreground() -> None:
+    """The images do not share one browser: the Omarchy one has Chromium and no
+    Firefox, so a fixed ``firefox`` opened nothing there while exiting 0. The
+    lookup has to run before the detach, or its failure is backgrounded too."""
+    command = mc._api.open_url_command("https://example.com")
+    lookup, launch = command.split("; nohup ", 1)
+    for browser in ("firefox-esr", "firefox", "chromium"):
+        assert f"command -v {browser}" in lookup
+    assert lookup.index("firefox-esr") < lookup.index("chromium")
+    assert "exit 127" in lookup and "&" not in lookup.replace(">&2", "")
+    assert launch.startswith('"$b" ') and launch.endswith("&")
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("answer", "said"),
+    [
+        (
+            {
+                "exit_code": 127,
+                "stdout_b64": "",
+                "stderr_b64": base64.b64encode(
+                    b"no browser (firefox-esr, firefox or chromium) on this image\n"
+                ).decode(),
+                "timed_out": False,
+            },
+            "no browser",
+        ),
+        ({"exit_code": 1, "stdout_b64": "", "stderr_b64": "", "timed_out": False}, "exit code 1"),
+        ({"exit_code": None, "stdout_b64": "", "stderr_b64": "", "timed_out": True}, "timed out"),
+    ],
+    ids=["no-browser", "non-zero", "timed-out"],
+)
+def test_open_raises_when_no_browser_was_started(
+    client: mc.Client, answer: dict[str, Any], said: str
+) -> None:
+    """A launch that did not happen used to come back as a result nobody reads."""
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(200, json=answer))
+    with pytest.raises(mc.MandalaError, match=said):
+        mc.Computer(client._t, COMPUTER).open("https://example.com")
 
 
 def test_open_url_reaches_the_shell_as_one_argument() -> None:
@@ -6206,3 +6272,22 @@ def test_a_503_on_a_change_is_an_unknown_outcome_and_one_on_a_read_is_not(
     with pytest.raises(mc.UnavailableError) as change:
         client.computers.create(template="base")
     assert change.value.method == "POST" and not mc.is_transient(change.value)
+
+
+@respx.mock
+def test_a_half_removed_computer_fails_both_waits_at_once(client: mc.Client) -> None:
+    """A deletion that stopped partway took the disk with it: nothing will ever
+    start it, so a wait that polls on is a timeout reported about a fact the
+    first read already had."""
+    half = {**COMPUTER, "status": "half-removed", "running_ram_mb": 0}
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=half))
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(httpx.Response(500))
+    started = time.monotonic()
+    with pytest.raises(mc.MandalaError, match="partly removed") as running:
+        mc.Computer(client._t, COMPUTER).wait_until_running(timeout=30, poll=0)
+    with pytest.raises(mc.MandalaError, match="partly removed") as guest:
+        mc.Computer(client._t, half).wait_for_guest(timeout=30, poll=0)
+    assert time.monotonic() - started < 5
+    assert not isinstance(running.value, mc.TimeoutError)
+    assert not isinstance(guest.value, mc.TimeoutError)
+    assert not probe.called

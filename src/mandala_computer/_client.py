@@ -965,6 +965,9 @@ class _BaseTransport:
                 status=resp.status_code,
                 body=body,
                 retry_after=_retry_after(resp),
+                limit=_rate_header(resp, "ratelimit-limit"),
+                remaining=_rate_header(resp, "ratelimit-remaining"),
+                reset=_rate_header(resp, "ratelimit-reset"),
                 **metadata,
             )
         if cls is RangeNotSatisfiableError:
@@ -982,6 +985,22 @@ class _BaseTransport:
         return cls(
             message, status=resp.status_code, body=body, retry_after=_retry_after(resp), **metadata
         )
+
+
+def _rate_header(resp: httpx.Response, name: str) -> int | None:
+    """One of the platform's ``RateLimit-*`` budget headers, or ``None``.
+
+    Each is a non-negative whole number on the wire. Anything else — absent,
+    blank, a fraction, a sign, a list a proxy folded two values into — is
+    ``None`` rather than a guess, because a wrong budget is worse than none.
+    """
+    raw = resp.headers.get(name)
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isascii() or not text.isdigit():
+        return None
+    return int(text)
 
 
 def _request_method(resp: httpx.Response) -> str | None:
@@ -1681,6 +1700,19 @@ class Transport(_BaseTransport):
         resp = self.request(method, path, headers={"Accept": accept}, **kw)
         return self._binary_body(method, path, resp, content_types)
 
+    def binary_with_headers(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept: str,
+        content_types: tuple[str, ...],
+        **kw: Any,
+    ) -> tuple[bytes, httpx.Headers]:
+        """:meth:`binary`, with the response's headers beside the body."""
+        resp = self.request(method, path, headers={"Accept": accept}, **kw)
+        return self._binary_body(method, path, resp, content_types), resp.headers
+
     def binary_part(
         self,
         method: str,
@@ -2102,6 +2134,19 @@ class AsyncTransport(_BaseTransport):
         """A successful raw body with an explicit binary ``Accept`` type."""
         resp = await self.request(method, path, headers={"Accept": accept}, **kw)
         return self._binary_body(method, path, resp, content_types)
+
+    async def binary_with_headers(
+        self,
+        method: str,
+        path: str,
+        *,
+        accept: str,
+        content_types: tuple[str, ...],
+        **kw: Any,
+    ) -> tuple[bytes, httpx.Headers]:
+        """:meth:`binary`, with the response's headers beside the body."""
+        resp = await self.request(method, path, headers={"Accept": accept}, **kw)
+        return self._binary_body(method, path, resp, content_types), resp.headers
 
     async def binary_part(
         self,
