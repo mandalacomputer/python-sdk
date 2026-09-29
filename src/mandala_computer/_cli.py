@@ -2498,16 +2498,41 @@ def _names_another_destination(name: str, computers: Collection[Computer]) -> bo
     return any(o.id.lower() == folded for o in computers)
 
 
-def _other_written_blocks(path: Path, computer_id: str) -> list[tuple[str, str]]:
+def _other_written_blocks(
+    path: Path, computer_id: str
+) -> tuple[str, list[_openssh.WrittenBlock], bool]:
     """The blocks in the ssh config at *path* written for computers other
-    than *computer_id*, as :func:`_openssh.written_hosts` reads them. A file
-    that is missing or cannot be read holds none.
+    than *computer_id*, as :func:`_openssh.written_blocks` reads them, the
+    text they stand in, and whether that text is not the file's own (see
+    below). A file that is missing or cannot be read holds none.
+
+    The file is decoded as :func:`_openssh.write_config` reads it, so a block
+    moved from this text is written back with the bytes it had. Only when that
+    decode fails is it decoded as UTF-8 with any byte that is not UTF-8
+    replaced, so one stray byte (a Latin-1 comment, say) does not hide every
+    block in it; its line endings are made ``\\n`` as :meth:`Path.read_text`
+    makes them, and the third value is true. ``--write`` still reads the file
+    strictly, so it fails on such a file without changing it, as it did
+    before; the gateway's known_hosts file has been refreshed by then.
     """
+    undecodable = False
     try:
         text = path.read_text()
-    except (OSError, ValueError):
-        return []
-    return [(other, host) for other, host in _openssh.written_hosts(text) if other != computer_id]
+    except UnicodeDecodeError:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return "", [], False
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        undecodable = True
+    except OSError:
+        return "", [], False
+    return text, [b for b in _openssh.written_blocks(text) if b.id != computer_id], undecodable
+
+
+def _uses_host(block: _openssh.WrittenBlock, host: str) -> bool:
+    """Whether *block* has *host* among its ``Host`` aliases, compared without regard to case."""
+    return any(h.lower() == host.lower() for h in block.hosts)
 
 
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
@@ -2536,26 +2561,76 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # `ssh <name>` whenever it came first. This computer's own block is the
     # one --write replaces, so it never counts.
     path = Path.home() / ".ssh" / "config"
-    others = _other_written_blocks(path, computer_id)
+    config, others, undecodable = _other_written_blocks(path, computer_id)
     folded = host.lower()
     clashes = host != computer_id and any(
-        folded in (h.lower(), other.lower()) for other, h in others
+        folded == b.id.lower() or _uses_host(b, folded) for b in others
     )
     if clashes:
         host = computer_id
     # The id is the last Host there is. When another computer's block already
-    # has it as its Host (one named after this computer's id, say), a second
-    # block under it would never be reached: `ssh <id>` would go to that other
-    # computer. Refused, whatever put the id here, before anything is written.
-    holder = next((other for other, h in others if h.lower() == host.lower()), None)
-    if holder is not None:
-        _die(
-            lambda spell: (
-                f"a block in ~/.ssh/config for computer {spell(holder)} already uses "
-                f"Host {spell(host)}; remove that block, then run again"
-            ),
-            "conflict",
+    # has it among its Host aliases (one named after this computer's id, say),
+    # a second block under it would never be reached: `ssh <id>` would go to
+    # that other computer. Refused, whatever put the id here, before anything
+    # is written. Aliases are compared as written: a wildcard pattern such as
+    # `vm-*` is not expanded.
+    holders = [b for b in others if _uses_host(b, host)]
+    moved: _openssh.WrittenBlock | None = None
+    if holders:
+        holder = holders[0]
+        # One shape has a way out: the two computers are named after each
+        # other's ids (they are in different accounts, so neither listing
+        # shows the other). The holder is under this computer's id, which is
+        # its name, and this computer's name is the holder's id. Whichever
+        # block is written second falls back to its id, which the first holds,
+        # so removing a block and running again only swaps which one refuses.
+        # The one state where neither refuses is both under their ids, so
+        # --write moves the holder's block there too: only its single Host
+        # line, which must be the one alias the CLI writes, and only when no
+        # other block holds the holder's id and that id can be a Host. Print
+        # and --json write nothing, so they refuse and say how to get there.
+        mutual = (
+            len(holders) == 1
+            and host == computer_id
+            and (c.name or "").lower() == holder.id.lower()
+            and holder.id.lower() != computer_id.lower()
+            and len(holder.host_lines) == 1
+            and len(holder.host_lines[0]) == 1
+            and _SSH_ID.fullmatch(holder.id) is not None
+            and not any(
+                b is not holder and (b.id == holder.id or _uses_host(b, holder.id)) for b in others
+            )
         )
+        if mutual and undecodable:
+            # --write reads the file strictly and fails on it, so pointing
+            # there would only fail; the byte has to go first.
+            _die(
+                lambda spell: (
+                    f"a block in ~/.ssh/config for computer {spell(holder.id)} already uses "
+                    f"Host {spell(host)}, and ~/.ssh/config holds a byte that is not valid "
+                    "in the system's text encoding; fix that byte, then run again"
+                ),
+                "conflict",
+            )
+        if not mutual:
+            _die(
+                lambda spell: (
+                    f"a block in ~/.ssh/config for computer {spell(holder.id)} already uses "
+                    f"Host {spell(host)}; remove that block, then run again"
+                ),
+                "conflict",
+            )
+        if not args.write:
+            _die(
+                lambda spell: (
+                    f"a block in ~/.ssh/config for computer {spell(holder.id)} already uses "
+                    f"Host {spell(host)}, and the two computers are named after each other's "
+                    f"ids; run this command with --write to move both to their ids "
+                    f"(Host {spell(holder.id)} and Host {spell(computer_id)})"
+                ),
+                "conflict",
+            )
+        moved = holder
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
     if unchecked:
@@ -2582,7 +2657,17 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     snippet = _openssh.config_snippet(host, computer_id, gw, known_hosts)
-    changed = _openssh.write_config(path, snippet) if args.write else None
+    # The moved block rides along with this computer's, so the one merge
+    # replaces both where they stand; the printed and --json config stay this
+    # computer's own.
+    written = snippet + _openssh.under_its_id(config, moved) + "\n" if moved else snippet
+    changed = _openssh.write_config(path, written) if args.write else None
+    if moved is not None:
+        print(
+            f"{PROG}: computer {_shown(moved.id)} is named after this computer's id; "
+            f"moved its block to Host {_shown(moved.id)} as well",
+            file=sys.stderr,
+        )
     if args.json:
         _json(
             {

@@ -9,6 +9,7 @@ right routes. The HTTP layer is respx, same as the client tests.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -2807,15 +2808,24 @@ def test_ssh_config_never_takes_a_host_a_written_block_uses(
     else:
         assert out == f"wrote Host vm-9 in {config}\nconnect with: ssh vm-9\n"
     if mode == "write":
-        assert _openssh.written_hosts(config.read_text()) == [("vm-7", written), ("vm-9", "vm-9")]
+        assert _openssh.written_hosts(config.read_text()) == [
+            ("vm-7", (written,)),
+            ("vm-9", ("vm-9",)),
+        ]
     else:
         assert config.read_text() == before
 
 
-def _refuses_every_mode(home: Path, config: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def _refuses_every_mode(
+    home: Path,
+    config: Path,
+    capsys: pytest.CaptureFixture[str],
+    ids: tuple[str, ...] = ("vm-7",),
+    holder: str = "vm-7",
+) -> None:
     """ssh-config vm-9 refuses in each mode: nothing printed or written."""
     refusal = (
-        "a block in ~/.ssh/config for computer vm-7 already uses Host vm-9; "
+        f"a block in ~/.ssh/config for computer {holder} already uses Host vm-9; "
         "remove that block, then run again"
     )
     before = config.read_text()
@@ -2832,21 +2842,375 @@ def _refuses_every_mode(home: Path, config: Path, capsys: pytest.CaptureFixture[
     assert out == ""
     assert json.loads(err)["error"] == {"code": "conflict", "message": refusal}
     assert config.read_text() == before
-    assert [other for other, _ in _openssh.written_hosts(config.read_text())] == ["vm-7"]
+    assert tuple(other for other, _ in _openssh.written_hosts(config.read_text())) == ids
     assert not (home / ".mandala").exists()
+
+
+def _config_text(home: Path, text: str | bytes) -> Path:
+    """A ~/.ssh/config holding exactly *text*."""
+    config = home / ".ssh" / "config"
+    config.parent.mkdir(exist_ok=True)
+    config.write_bytes(text.encode() if isinstance(text, str) else text)
+    return config
+
+
+def _hand_edited(home: Path, host_line: str, computer_id: str = "vm-7") -> str:
+    """The text of a config whose block for *computer_id* has *host_line* as its Host line."""
+    kh = home / ".mandala" / "ssh_known_hosts"
+    block = _openssh.config_snippet("x", computer_id, _openssh.gateway({}), kh)
+    return _openssh.merge_config("Host work\n  User me\n", block).replace(
+        "\nHost x\n", f"\n{host_line}\n"
+    )
 
 
 # vm-7, of another account, is named vm-9; this computer, vm-9, is named vm-7.
 # The name clashes with that block's id and falls back to the id, which is
-# that block's Host: a second block under it would never be reached.
-@pytest.mark.parametrize("written", ["vm-9", "VM-9"])
+# that block's Host. That block is moved to its own id by --write (see the
+# two-computers test below) unless it holds more than the one alias the CLI
+# writes, or its id is another block's Host too, or cannot be a Host: then a
+# second block under vm-9 would never be reached, so every mode refuses.
+@pytest.mark.parametrize(
+    ("host_line", "extra", "ids", "holder"),
+    [
+        ("Host vm-9 spare", "", ("vm-7",), "vm-7"),
+        ("Host vm-9\nHost spare", "", ("vm-7",), "vm-7"),
+        ("Host VM-9 spare # mine", "", ("vm-7",), "vm-7"),
+        ("Host vm-9", "x vm-7", ("vm-7", "vm-3"), "vm-7"),
+        ("Host vm-9", "vm-9", ("vm-7", "vm-3"), "vm-7"),
+    ],
+)
 @respx.mock
 def test_ssh_config_refuses_an_id_a_written_block_uses_as_host(
-    ssh_home: Path, capsys: pytest.CaptureFixture[str], written: str
+    ssh_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    host_line: str,
+    extra: str,
+    ids: tuple[str, ...],
+    holder: str,
 ) -> None:
-    config = _config_with_block(ssh_home, written)
+    text = _hand_edited(ssh_home, host_line)
+    if extra:
+        text += "\n" + _hand_edited(ssh_home, f"Host {extra}", "vm-3")
+    config = _config_text(ssh_home, text)
     _one_computer(name="vm-7")
+    _refuses_every_mode(ssh_home, config, capsys, ids, holder)
+
+
+@respx.mock
+def test_ssh_config_refuses_to_move_a_block_whose_id_cannot_be_a_host(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A hand-edited marker: the id the block would move to is two words.
+    config = _config_text(ssh_home, _hand_edited(ssh_home, "Host vm-9", "vm 7"))
+    _one_computer(name="vm 7")
+    _refuses_every_mode(ssh_home, config, capsys, ("vm 7",), "vm 7")
+
+
+def _block_of(text: str, computer_id: str) -> str:
+    start = text.index(f"# >>> mandala computer {computer_id} >>>")
+    return text[start : text.index(f"# <<< mandala computer {computer_id} <<<")]
+
+
+# vm-7 is named vm-9 and vm-9 is named vm-7, in two accounts, so neither
+# listing shows the other. Whichever is written second falls back to its id,
+# which the first block holds; ids for both is the one state in which neither
+# refuses.
+@pytest.mark.parametrize(("first", "second"), [("vm-7", "vm-9"), ("vm-9", "vm-7")])
+@respx.mock
+def test_ssh_config_moves_two_computers_named_after_each_others_ids_to_their_ids(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], first: str, second: str
+) -> None:
+    config = _config_text(ssh_home, "Host work\n  User me\n")
+
+    def run(who: str, *flags: str) -> int:
+        _one_computer(who, "vm-7" if who == "vm-9" else "vm-9")
+        return _cli.main(["ssh-config", who, *flags])
+
+    assert run(first, "--write") == 0
+    capsys.readouterr()
+    # The first is written under its name, which is the second's id.
+    assert _openssh.written_hosts(config.read_text()) == [(first, (second,))]
+    before = config.read_text()
+    refusal = (
+        f"a block in ~/.ssh/config for computer {first} already uses Host {second}, and the "
+        "two computers are named after each other's ids; run this command with --write to "
+        f"move both to their ids (Host {first} and Host {second})"
+    )
+    with pytest.raises(SystemExit) as caught:
+        run(second)
+    assert isinstance(caught.value, _cli._Failure)
+    assert caught.value.reason == "conflict"
+    assert str(caught.value.code) == f"mandala-py: {refusal}"
+    assert capsys.readouterr() == ("", "")
+    assert run(second, "--json") == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert json.loads(err)["error"] == {"code": "conflict", "message": refusal}
+    assert config.read_text() == before
+
+    assert run(second, "--write", "--json") == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        f"mandala-py: a block in ~/.ssh/config already uses the name {first} for another "
+        f"computer; using Host {second} instead\n"
+        f"mandala-py: computer {first} is named after this computer's id; moved its block "
+        f"to Host {first} as well\n"
+    )
+    shown = json.loads(out)
+    assert (shown["host"], shown["changed"], shown["path"]) == (second, True, str(config))
+    # The printed config is this computer's alone.
+    assert f"mandala computer {first}" not in shown["config"]
+    after = config.read_text()
+    assert _openssh.written_hosts(after) == [(first, (first,)), (second, (second,))]
+    # Only the moved block's Host line changed, where it stands.
+    assert _block_of(after, first) == _block_of(before, first).replace(
+        f"\nHost {second}\n", f"\nHost {first}\n"
+    )
+    assert after.startswith("Host work\n  User me\n\n# >>> mandala gateway >>>")
+    assert after.count("# >>> mandala computer") == 2
+
+    # Neither refuses from here on, in either order, in any mode.
+    for who in (second, first, second):
+        assert run(who, "--write") == 0
+        out, _ = capsys.readouterr()
+        assert out == f"already up to date: Host {who} in {config}\nconnect with: ssh {who}\n"
+        assert run(who) == 0
+        assert run(who, "--json") == 0
+        capsys.readouterr()
+    assert config.read_text() == after
+
+
+def _latin1_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text files read and written as Latin-1, as under a Latin-1 LC_CTYPE or
+    on Windows without UTF-8 mode, where the default is not UTF-8."""
+    read_text = Path.read_text
+    fdopen = os.fdopen
+
+    def latin1_read_text(self: Path, encoding: str | None = None, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return read_text(self, encoding or "latin-1", *args, **kwargs)
+
+    def latin1_fdopen(fd: int, mode: str = "r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        if "b" not in mode and not args:
+            kwargs.setdefault("encoding", "latin-1")
+        return fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", latin1_read_text)
+    monkeypatch.setattr(os, "fdopen", latin1_fdopen)
+
+
+def _utf8_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text files read as UTF-8, as under a UTF-8 LC_CTYPE, so a byte that is
+    not UTF-8 fails the read whatever the locale running the tests is."""
+    read_text = Path.read_text
+
+    def utf8_read_text(self: Path, encoding: str | None = None, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return read_text(self, encoding or "utf-8", *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", utf8_read_text)
+
+
+# The moved block's text came from a UTF-8 decode while --write read and wrote
+# the file in the locale's encoding: under a Latin-1 locale a UTF-8 config had
+# the moved block's known_hosts path rewritten to other bytes, and a Latin-1
+# one failed to write at all. The moved block keeps its bytes either way.
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1"])
+@respx.mock
+def test_ssh_config_move_keeps_the_moved_blocks_bytes_under_a_latin1_locale(
+    ssh_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    encoding: str,
+) -> None:
+    kh = str(ssh_home / ".mandala" / "ssh_known_hosts")
+    text = _hand_edited(ssh_home, "Host vm-9").replace(kh, "/home/José/kh")
+    config = _config_text(ssh_home, text.encode(encoding))
+    path_bytes = "/home/José/kh".encode(encoding)
+    assert path_bytes in _block_of(config.read_bytes().decode("latin-1"), "vm-7").encode("latin-1")
+    _latin1_locale(monkeypatch)
+    _one_computer(name="vm-7")
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    _, err = capsys.readouterr()
+    assert "moved its block to Host vm-7 as well" in err
+    after = config.read_bytes().decode("latin-1")
+    assert _openssh.written_hosts(after) == [("vm-7", ("vm-7",)), ("vm-9", ("vm-9",))]
+    moved = _block_of(after, "vm-7").encode("latin-1")
+    assert b"\nHost vm-7\n" in moved
+    assert b"UserKnownHostsFile " + path_bytes in moved
+
+
+# A hand-edited block counts under every alias of every Host line in it.
+@pytest.mark.parametrize(
+    "host_line",
+    [
+        "Host dev # mine",
+        "Host other dev",
+        "  host=DEV",
+        'Host "dev"',
+        "Host x\nHost dev",
+        "Host 'dev'",
+        "Host other\u00a0# dev",
+    ],
+)
+@respx.mock
+def test_ssh_config_reads_every_alias_of_a_hand_edited_block(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], host_line: str
+) -> None:
+    _config_text(ssh_home, _hand_edited(ssh_home, host_line))
+    _one_computer(name="dev")
+    assert _cli.main(["ssh-config", "vm-9", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        "mandala-py: a block in ~/.ssh/config already uses the name dev for another "
+        "computer; using Host vm-9 instead\n"
+    )
+    assert json.loads(out)["host"] == "vm-9"
+
+
+@pytest.mark.parametrize(
+    "host_line",
+    [
+        "Host vm-9 extra",
+        "Host extra VM-9 # mine",
+        "Host=vm-9",
+        # ssh reads `other<NBSP>#` and `vm-9`: a no-break space splits nothing.
+        "Host other\u00a0# vm-9",
+        "Host 'vm-9'",
+    ],
+)
+@respx.mock
+def test_ssh_config_refuses_when_a_hand_edited_alias_holds_the_id(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], host_line: str
+) -> None:
+    config = _config_text(ssh_home, _hand_edited(ssh_home, host_line))
+    _one_computer(name="my box")
     _refuses_every_mode(ssh_home, config, capsys)
+
+
+# Under a Latin-1 locale the byte A0 reads as a no-break space, which ssh
+# (reading bytes) does not split on either: vm-9 is still that block's Host.
+@respx.mock
+def test_ssh_config_refuses_an_id_after_a_latin1_no_break_space(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _hand_edited(ssh_home, "Host other\u00a0# vm-9").encode("latin-1")
+    assert b"\nHost other\xa0# vm-9\n" in text
+    config = _config_text(ssh_home, text)
+    _latin1_locale(monkeypatch)
+    _one_computer(name="my box")
+    _refuses_every_mode(ssh_home, config, capsys)
+
+
+@respx.mock
+def test_ssh_config_does_not_count_a_negated_pattern(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _config_text(ssh_home, _hand_edited(ssh_home, "Host x !dev"))
+    _one_computer(name="dev")
+    assert _cli.main(["ssh-config", "vm-9", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert json.loads(out)["host"] == "dev"
+
+
+# One byte that is not UTF-8 (a Latin-1 comment, say) hid every block in the
+# file, so a name another block used went unnoticed.
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"])
+@pytest.mark.parametrize("mode", ["print", "json"])
+@respx.mock
+def test_ssh_config_reads_the_blocks_of_a_config_that_is_not_utf8(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], mode: str, line_end: str
+) -> None:
+    text = _hand_edited(ssh_home, "Host dev").replace("\n", line_end)
+    config = _config_text(ssh_home, b"# caf\xe9\n" + text.encode())
+    before = config.read_bytes()
+    _one_computer(name="dev")
+    assert _cli.main(["ssh-config", "vm-9", *(["--json"] if mode == "json" else [])]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        "mandala-py: a block in ~/.ssh/config already uses the name dev for another "
+        "computer; using Host vm-9 instead\n"
+    )
+    if mode == "json":
+        assert json.loads(out)["host"] == "vm-9"
+    else:
+        assert "\nHost vm-9\n  HostName vm-9\n" in out
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"])
+@respx.mock
+def test_ssh_config_refuses_a_held_id_in_a_config_that_is_not_utf8(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], line_end: str
+) -> None:
+    text = _hand_edited(ssh_home, "Host vm-9").replace("\n", line_end)
+    config = _config_text(ssh_home, b"# caf\xe9\n" + text.encode())
+    before = config.read_bytes()
+    _one_computer(name="my box")
+    refusal = (
+        "a block in ~/.ssh/config for computer vm-7 already uses Host vm-9; "
+        "remove that block, then run again"
+    )
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh-config", "vm-9"])
+    assert str(caught.value.code) == f"mandala-py: {refusal}"
+    assert capsys.readouterr() == ("", "")
+    assert _cli.main(["ssh-config", "vm-9", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert json.loads(err)["error"] == {"code": "conflict", "message": refusal}
+    assert config.read_bytes() == before
+
+
+# The two computers are named after each other's ids, but the config holds a
+# byte that is not valid text here. --write reads the file strictly and fails
+# on it, so no mode may send the user there: each refuses, says so, and
+# writes nothing (not even the gateway's known_hosts).
+@respx.mock
+def test_ssh_config_does_not_point_at_write_for_a_config_it_cannot_decode(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0xE9 is not UTF-8 but is Latin-1: pin a UTF-8 read so the byte is
+    # invalid here under any locale the tests run in.
+    _utf8_locale(monkeypatch)
+    config = _config_text(ssh_home, b"# caf\xe9\n" + _hand_edited(ssh_home, "Host vm-9").encode())
+    before = config.read_bytes()
+    _one_computer(name="vm-7")
+    refusal = (
+        "a block in ~/.ssh/config for computer vm-7 already uses Host vm-9, and "
+        "~/.ssh/config holds a byte that is not valid in the system's text encoding; "
+        "fix that byte, then run again"
+    )
+    for flags in ([], ["--write"]):
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(["ssh-config", "vm-9", *flags])
+        assert isinstance(caught.value, _cli._Failure)
+        assert caught.value.reason == "conflict"
+        assert str(caught.value.code) == f"mandala-py: {refusal}"
+        assert capsys.readouterr() == ("", "")
+    for flags in (["--json"], ["--write", "--json"]):
+        assert _cli.main(["ssh-config", "vm-9", *flags]) == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert json.loads(err)["error"] == {"code": "conflict", "message": refusal}
+    assert config.read_bytes() == before
+    assert not (ssh_home / ".mandala").exists()
+
+
+@respx.mock
+def test_ssh_config_write_replaces_its_block_in_a_crlf_config(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _config_text(
+        ssh_home, _hand_edited(ssh_home, "Host old", "vm-9").replace("\n", "\r\n")
+    )
+    _one_computer(name="dev")
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    out, _ = capsys.readouterr()
+    assert out == f"wrote Host dev in {config}\nconnect with: ssh dev\n"
+    after = config.read_bytes().decode()
+    assert "\r" not in after
+    assert after.count("# >>> mandala computer vm-9 >>>") == 1
+    assert _openssh.written_hosts(after) == [("vm-9", ("dev",))]
 
 
 @pytest.mark.parametrize("why", ["partial", "unusable", "shared", "taken"])
