@@ -469,11 +469,76 @@ def under_its_id(text: str, block: WrittenBlock) -> str:
     )
 
 
+# A ``Match`` line's keyword, split off as OpenSSH's readconf splits it.
+_MATCH_KEYWORD = re.compile(r"[ \t]*match(?:[ \t=]|$)", re.IGNORECASE | re.ASCII)
+# A line ssh skips: blank, or a comment.
+_BLANK_OR_COMMENT = re.compile(r"[ \t]*(?:#|[ \t\r\f]*$)")
+
+
+def _stanza_ends_at(text: str, pos: int) -> bool:
+    """Whether the stanza an end marker closes ends with it.
+
+    True when the lines of *text* after the one *pos* ends (the marker's), up
+    to the next ``Host`` or ``Match`` line or the end, are all blank or
+    comments. OpenSSH does not end a stanza at a comment, so an unmarked
+    directive after the marker still belongs to the block's last ``Host``.
+    """
+    # *pos* is the marker's end: the line break there, or the end of *text*.
+    for line in text[pos + 1 :].split("\n"):
+        if _host_line_args(line) is not None or _MATCH_KEYWORD.match(line):
+            return True
+        if not _BLANK_OR_COMMENT.match(line):
+            return False
+    return True
+
+
+def _without_later_copies(text: str, label: str, pos: int) -> str:
+    """*text* without any block for *label* that starts at *pos* or later.
+
+    A block whose last stanza goes on past its end marker (see
+    :func:`_stanza_ends_at`) is left where it stands. A begin marker for
+    *label* with no end marker of its own stops the removal there: it and
+    every copy after it are left as they are. Each removed block goes with its
+    end marker's line break and, when a blank line comes before it, that blank
+    line: the shape an append left.
+    """
+    pattern = _block_pattern(label)
+    while (found := pattern.search(text, pos)) is not None:
+        start, end = found.span()
+        # A begin marker whose end marker was lost runs on to a later copy's
+        # end marker, over whatever stands between, so another block begins
+        # inside the span. Stop there: removing the later copy would take the
+        # end marker the orphan borrows, and with it the orphan's aliases from
+        # written_blocks (so from the name-clash checks) while OpenSSH still
+        # reads its stanza.
+        if text.find("\n# >>> mandala ", start, end) >= 0:
+            break
+        if not _stanza_ends_at(text, end):
+            pos = end
+            continue
+        if text[end : end + 1] == "\n":
+            end += 1
+        if start >= 2 and text[start - 2 : start] == "\n\n":
+            start -= 1
+        text = text[:start] + text[end:]
+        pos = start
+    return text
+
+
 def merge_config(current: str, snippet: str) -> str:
     """*current* with each marked block of *snippet* replaced, or appended.
 
     Everything outside the markers is kept byte for byte. A block already
-    there is replaced where it stands, so writing twice changes nothing.
+    there is replaced where it stands, so writing twice changes nothing. A
+    later copy of a block *snippet* carries (one an earlier ``mandala`` CLI
+    appended to a CRLF config) is removed, with the blank line before it,
+    unless an unmarked directive follows it before the next ``Host`` or
+    ``Match`` line: removing that copy would move the directive under another
+    stanza, so it is left as it is. A later begin marker with no end marker
+    of its own is left as it is, with every copy after it: it reads the next
+    copy's end marker as its own, so removing that copy would hide the
+    aliases under it from :func:`written_hosts`. Another label's copies are
+    left as they are.
     """
     text = current
     labels = re.findall(r"^# >>> mandala (.+?) >>>$", snippet, re.MULTILINE)
@@ -484,6 +549,7 @@ def merge_config(current: str, snippet: str) -> str:
         block = block_match.group(0)
         found = _block_pattern(label).search(text)
         if found is not None:
+            text = _without_later_copies(text, label, found.end())
             text = text[: found.start()] + block + text[found.end() :]
             continue
         if text and not text.endswith("\n"):
