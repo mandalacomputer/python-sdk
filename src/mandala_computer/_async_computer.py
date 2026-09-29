@@ -2312,7 +2312,12 @@ class AsyncComputer(ComputerFields):
         that ended without saying how the run came out. A 402 there is the model
         API's ``billing_error`` for the account behind ``model_key``, never the
         Mandala plan, and is raised as
-        :class:`~mandala_computer.ModelProviderError`.
+        :class:`~mandala_computer.ModelProviderError`; so is a 404 or a 413 the
+        model API answered (a model it does not know, a request it found too
+        large). A 429 the model API answered is a
+        :class:`~mandala_computer.RateLimitError` whose ``limit``,
+        ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
+        refuse it.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -2367,7 +2372,16 @@ class AsyncComputer(ComputerFields):
         own status is relayed as it came, about the account behind
         ``model_key``: 402 ``billing_error`` (raised as
         :class:`~mandala_computer.ModelProviderError`, not
-        :class:`~mandala_computer.PlanLimitError`), 504 ``timeout_error``
+        :class:`~mandala_computer.PlanLimitError`), 404 ``not_found_error``
+        and 413 ``request_too_large`` (both raised as
+        :class:`~mandala_computer.ModelProviderError`, not
+        :class:`~mandala_computer.NotFoundError` or
+        :class:`~mandala_computer.FileTooLargeError`: an unknown model name,
+        or a request the model provider found too large), 429
+        ``rate_limit_error`` (a :class:`~mandala_computer.RateLimitError`
+        whose ``retry_after`` is the model API's own wait when it named one,
+        and whose ``limit``, ``remaining`` and ``reset`` are ``None``, because
+        the Mandala budget did not refuse it), 504 ``timeout_error``
         (raised as a plain :class:`~mandala_computer.APIError`, not
         :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
         with the run's usage and steps), 529 ``overloaded_error``, and a 403
@@ -2403,8 +2417,9 @@ class AsyncComputer(ComputerFields):
                 timeout=NO_DEADLINE,
             )
         except APIError as exc:
-            # A 402 here is the model provider's billing refusal, not the plan's
-            # (see :func:`_agent_route_error`). A refusal that arrived mid-run
+            # A 402 here is the model provider's billing refusal, not the plan's,
+            # and a relayed 404/413/429 is the model provider's too (see
+            # :func:`_agent_route_error`). A refusal that arrived mid-run
             # carries what the run had already done; see
             # :func:`_attach_agent_partial`.
             error = _agent_route_error(exc)
