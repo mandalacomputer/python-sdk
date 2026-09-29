@@ -3112,6 +3112,49 @@ def test_ssh_config_does_not_count_a_negated_pattern(
     assert json.loads(out)["host"] == "dev"
 
 
+# A copy of vm-7's block that lost its end marker borrows the next copy's.
+# Writing vm-7 once removed that next copy, and with it the orphan's ``dev``
+# from the blocks the clash check reads, while ssh still routed dev to vm-7.
+def test_ssh_config_keeps_the_aliases_of_a_copy_that_lost_its_end_marker(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    kh = ssh_home / ".mandala" / "ssh_known_hosts"
+
+    def blocks(host: str) -> str:
+        return _openssh.config_snippet(host, "vm-7", _openssh.gateway({}), kh)
+
+    def computer_block(host: str) -> str:
+        whole = blocks(host)
+        return whole[whole.index("# >>> mandala computer") :].removesuffix("\n")
+
+    dev = computer_block("dev")
+    orphan = dev[: dev.rindex("\n")]
+    config = _config_text(
+        ssh_home,
+        _openssh.merge_config("Host work\n  User me\n", blocks("a"))
+        + f"\n{orphan}\n\n{computer_block('stale')}\n",
+    )
+    before = config.read_text()
+    with respx.mock:
+        _one_computer("vm-7", name="a")
+        assert _cli.main(["ssh-config", "vm-7", "--write"]) == 0
+    out, _ = capsys.readouterr()
+    assert out == f"already up to date: Host a in {config}\nconnect with: ssh a\n"
+    assert config.read_text() == before
+    with respx.mock:
+        _one_computer(name="dev")
+        assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        "mandala-py: a block in ~/.ssh/config already uses the name dev for another "
+        "computer; using Host vm-9 instead\n"
+    )
+    assert out == f"wrote Host vm-9 in {config}\nconnect with: ssh vm-9\n"
+    written = _openssh.written_hosts(config.read_text())
+    assert [i for i, hosts in written if "dev" in hosts] == ["vm-7"]
+    assert written[-1] == ("vm-9", ("vm-9",))
+
+
 # One byte that is not UTF-8 (a Latin-1 comment, say) hid every block in the
 # file, so a name another block used went unnoticed.
 @pytest.mark.parametrize("line_end", ["\n", "\r\n"])

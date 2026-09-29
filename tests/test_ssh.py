@@ -414,37 +414,68 @@ def test_merge_config_still_removes_a_copy_its_stanza_ends_with(tail: str) -> No
     )
 
 
-# A begin marker whose end marker is gone runs on to a later copy's end marker;
-# what stands between is not part of any copy.
-def test_merge_config_keeps_what_stands_after_a_copy_that_lost_its_end_marker() -> None:
+# A begin marker whose end marker is gone runs on to a later copy's end marker,
+# which OpenSSH does not care about but written_hosts reads as the orphan's own:
+# removing that copy would hide the orphan's aliases from the name-clash checks.
+# The removal stops at the orphan.
+def _without_end_marker(block: str) -> str:
+    cut = block[: block.rindex("\n")]
+    assert "<<<" not in cut
+    return cut
+
+
+def test_merge_config_keeps_a_copy_that_lost_its_end_marker_and_everything_after_it() -> None:
     gateway, computer = _blocks_of(snippet("old"))
-    _, broken_full = _blocks_of(snippet("broken"))
-    broken = broken_full[: broken_full.rindex("\n")]
-    assert "<<<" not in broken
+    broken = _without_end_marker(_blocks_of(snippet("broken"))[1])
     other = _block("a", "vm-7").removesuffix("\n")
     _, later = _blocks_of(snippet("later"))
-    text = (
-        f"Host work\n  User me\n\n{gateway}\n\n{computer}\n\n{broken}\n\n{other}\n\n"
-        f"Host mine\n  User x\n\n{later}\n"
-    )
+    tail = f"{broken}\n\n{other}\n\nHost mine\n  User x\n\n{later}\n"
+    text = f"Host work\n  User me\n\n{gateway}\n\n{computer}\n\n{tail}"
     new_gateway, new_computer = _blocks_of(snippet("dev"))
     merged = _openssh.merge_config(text, snippet("dev"))
-    assert merged == (
-        f"Host work\n  User me\n\n{new_gateway}\n\n{new_computer}\n\n{broken}\n\n"
-        f"{other}\n\nHost mine\n  User x\n"
-    )
-    assert "Host later" not in merged
+    assert merged == f"Host work\n  User me\n\n{new_gateway}\n\n{new_computer}\n\n{tail}"
     assert _openssh.merge_config(merged, snippet("dev")) == merged
+
+
+def test_merge_config_removes_a_whole_copy_before_a_copy_that_lost_its_end_marker() -> None:
+    gateway, computer = _blocks_of(snippet("old"))
+    _, stale = _blocks_of(snippet("stale"))
+    broken = _without_end_marker(_blocks_of(snippet("broken"))[1])
+    _, later = _blocks_of(snippet("later"))
+    tail = f"{broken}\n\n{later}\n"
+    text = f"Host work\n  User me\n\n{gateway}\n\n{computer}\n\n{stale}\n\n{tail}"
+    new_gateway, new_computer = _blocks_of(snippet("dev"))
+    assert _openssh.merge_config(text, snippet("dev")) == (
+        f"Host work\n  User me\n\n{new_gateway}\n\n{new_computer}\n\n{tail}"
+    )
 
 
 def test_merge_config_keeps_a_hand_written_stanza_after_a_stray_gateway_begin_marker() -> None:
     prod = "Host prod\n  ProxyJump bastion\n  StrictHostKeyChecking yes\n"
     stray = f"\n# >>> mandala gateway >>>\n# half\n\n{prod}"
+    stale_gateway, _ = _blocks_of(snippet("stale"))
     text = f"Host work\n  User me\n\n{snippet('old')}{stray}\n{snippet('stale')}"
     merged = _openssh.merge_config(text, snippet("dev"))
-    assert merged == f"Host work\n  User me\n\n{snippet('dev')}{stray}"
+    # The stray marker borrows the stale gateway copy's end marker, so that copy
+    # stays; the stale computer copy after it goes.
+    assert merged == f"Host work\n  User me\n\n{snippet('dev')}{stray}\n{stale_gateway}\n"
     assert "stale" not in merged
     assert _openssh.merge_config(merged, snippet("dev")) == merged
+
+
+def test_merge_config_keeps_the_aliases_of_a_copy_that_lost_its_end_marker() -> None:
+    # The orphan borrows the stale copy's end marker; removing that copy
+    # dropped ``dev`` from written_hosts while OpenSSH still routed it to vm-9.
+    orphan = _without_end_marker(_blocks_of(snippet("dev"))[1])
+    _, stale = _blocks_of(snippet("stale"))
+    text = (
+        _openssh.merge_config("Host work\n  User me\n", snippet("a")) + f"\n{orphan}\n\n{stale}\n"
+    )
+    hosts = [("vm-9", ("a",)), ("vm-9", ("dev", "stale")), ("vm-9", ("stale",))]
+    assert _openssh.written_hosts(text) == hosts
+    merged = _openssh.merge_config(text, snippet("a"))
+    assert merged == text
+    assert _openssh.written_hosts(merged) == hosts
 
 
 def test_a_second_computer_adds_its_block_and_shares_the_gateway(tmp_path: Path) -> None:
