@@ -496,13 +496,24 @@ def _without_later_copies(text: str, label: str, pos: int) -> str:
     """*text* without any block for *label* that starts at *pos* or later.
 
     A block whose last stanza goes on past its end marker (see
-    :func:`_stanza_ends_at`) is left where it stands. Each removed block goes
-    with its end marker's line break and, when a blank line comes before it,
-    that blank line: the shape an append left.
+    :func:`_stanza_ends_at`) is left where it stands, and so is a begin marker
+    with no end marker of its own, with everything after it up to the next
+    marked block. Each removed block goes with its end marker's line break
+    and, when a blank line comes before it, that blank line: the shape an
+    append left.
     """
     pattern = _block_pattern(label)
     while (found := pattern.search(text, pos)) is not None:
         start, end = found.span()
+        # A begin marker whose end marker was lost runs on to a later copy's
+        # end marker, over whatever stands between. When another block begins
+        # inside the span, the span is not one block: go on from that inner
+        # marker, so a whole copy after it is judged by itself and nothing
+        # between is removed.
+        inner = text.find("\n# >>> mandala ", start, end)
+        if inner >= 0:
+            pos = inner + 1
+            continue
         if not _stanza_ends_at(text, end):
             pos = end
             continue
@@ -524,8 +535,9 @@ def merge_config(current: str, snippet: str) -> str:
     appended to a CRLF config) is removed, with the blank line before it,
     unless an unmarked directive follows it before the next ``Host`` or
     ``Match`` line: removing that copy would move the directive under another
-    stanza, so it is left as it is. Another label's copies are left as they
-    are.
+    stanza, so it is left as it is. A begin marker with no end marker of its
+    own is left with what follows it, up to the next marked block. Another
+    label's copies are left as they are.
     """
     text = current
     labels = re.findall(r"^# >>> mandala (.+?) >>>$", snippet, re.MULTILINE)

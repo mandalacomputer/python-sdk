@@ -414,6 +414,39 @@ def test_merge_config_still_removes_a_copy_its_stanza_ends_with(tail: str) -> No
     )
 
 
+# A begin marker whose end marker is gone runs on to a later copy's end marker;
+# what stands between is not part of any copy.
+def test_merge_config_keeps_what_stands_after_a_copy_that_lost_its_end_marker() -> None:
+    gateway, computer = _blocks_of(snippet("old"))
+    _, broken_full = _blocks_of(snippet("broken"))
+    broken = broken_full[: broken_full.rindex("\n")]
+    assert "<<<" not in broken
+    other = _block("a", "vm-7").removesuffix("\n")
+    _, later = _blocks_of(snippet("later"))
+    text = (
+        f"Host work\n  User me\n\n{gateway}\n\n{computer}\n\n{broken}\n\n{other}\n\n"
+        f"Host mine\n  User x\n\n{later}\n"
+    )
+    new_gateway, new_computer = _blocks_of(snippet("dev"))
+    merged = _openssh.merge_config(text, snippet("dev"))
+    assert merged == (
+        f"Host work\n  User me\n\n{new_gateway}\n\n{new_computer}\n\n{broken}\n\n"
+        f"{other}\n\nHost mine\n  User x\n"
+    )
+    assert "Host later" not in merged
+    assert _openssh.merge_config(merged, snippet("dev")) == merged
+
+
+def test_merge_config_keeps_a_hand_written_stanza_after_a_stray_gateway_begin_marker() -> None:
+    prod = "Host prod\n  ProxyJump bastion\n  StrictHostKeyChecking yes\n"
+    stray = f"\n# >>> mandala gateway >>>\n# half\n\n{prod}"
+    text = f"Host work\n  User me\n\n{snippet('old')}{stray}\n{snippet('stale')}"
+    merged = _openssh.merge_config(text, snippet("dev"))
+    assert merged == f"Host work\n  User me\n\n{snippet('dev')}{stray}"
+    assert "stale" not in merged
+    assert _openssh.merge_config(merged, snippet("dev")) == merged
+
+
 def test_a_second_computer_adds_its_block_and_shares_the_gateway(tmp_path: Path) -> None:
     path = tmp_path / "config"
     _openssh.write_config(path, snippet())
