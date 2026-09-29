@@ -369,16 +369,51 @@ def test_written_hosts_lists_the_computer_blocks_and_only_those() -> None:
         "# <<< mandala computer vm-5 <<<\n"
         "Host after\n"
     )
-    assert _openssh.written_hosts(text) == [("vm-7", "dev"), ("vm-8", "vm-8")]
-    assert _openssh.written_hosts(_openssh.merge_config("", snippet())) == [("vm-9", "dev")]
+    assert _openssh.written_hosts(text) == [("vm-7", ("dev",)), ("vm-8", ("vm-8",))]
+    assert _openssh.written_hosts(_openssh.merge_config("", snippet())) == [("vm-9", ("dev",))]
     assert _openssh.written_hosts("") == []
     # A marker must stand on its own line, as merge_config reads it.
     assert _openssh.written_hosts(" " + _block("dev", "vm-7")) == []
-    assert _openssh.written_hosts(_block("dev", "vm-7").replace("Host dev\n", "")) == [("vm-7", "")]
+    assert _openssh.written_hosts(_block("dev", "vm-7").replace("Host dev\n", "")) == [("vm-7", ())]
     # A begin marker that does not end its line opens no block, so the block
     # after it is listed once.
     crlf = "# >>> mandala computer vm-7 >>>\r\n" + _block("dev", "vm-7")
-    assert _openssh.written_hosts(crlf) == [("vm-7", "dev")]
+    assert _openssh.written_hosts(crlf) == [("vm-7", ("dev",))]
+
+
+@pytest.mark.parametrize(
+    ("line", "hosts"),
+    [
+        ("Host a b", ("a", "b")),
+        ("Host vm-1 # note", ("vm-1",)),
+        ("Host vm-1 #note b", ("vm-1",)),
+        ("Host a#b", ("a#b",)),
+        ("  host  x", ("x",)),
+        ("\tHOST\tx", ("x",)),
+        ("Host=x", ("x",)),
+        ("Host = x y", ("x", "y")),
+        ('Host "x y" z', ("x y", "z")),
+        ('Host "#x"', ("#x",)),
+        ("Host a !b", ("a",)),
+        ('Host "!b" c', ("c",)),
+        ("Host vm-*", ("vm-*",)),
+        ("Host", ()),
+        ("Host # only a comment", ()),
+        ("Hostname x", ()),
+        ("Match host x", ()),
+        ("# Host x", ()),
+    ],
+)
+def test_written_hosts_reads_every_alias_of_a_hand_edited_host_line(
+    line: str, hosts: tuple[str, ...]
+) -> None:
+    block = _block("dev", "vm-7").replace("Host dev", line)
+    assert _openssh.written_hosts(block) == [("vm-7", hosts)]
+
+
+def test_written_hosts_reads_the_aliases_of_every_host_line_in_a_block() -> None:
+    block = _block("dev", "vm-7").replace("Host dev", "Host dev\nHost other box")
+    assert _openssh.written_hosts(block) == [("vm-7", ("dev", "other", "box"))]
 
 
 # --- keys on disk ----------------------------------------------------------

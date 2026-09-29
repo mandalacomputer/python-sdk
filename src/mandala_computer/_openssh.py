@@ -359,23 +359,95 @@ def _block_pattern(label: str) -> re.Pattern[str]:
     )
 
 
-def written_hosts(text: str) -> list[tuple[str, str]]:
-    """The computer blocks written in the ssh config *text*.
+_HOST_KEYWORD = re.compile(r"\s*host(?:\s*=\s*|\s+|$)", re.IGNORECASE)
 
-    For each ``mandala computer <id>`` block whose markers :func:`merge_config`
-    would find, its id and the value of its first ``Host`` line (``""`` when
-    it has none). Only the marked blocks are read: the gateway's block, one
-    with no end marker and anything outside the markers are left out.
+
+def _host_line_args(line: str) -> list[str] | None:
+    """The arguments of *line* when it is a ``Host`` line, else ``None``.
+
+    Read as OpenSSH reads a config line: leading whitespace allowed, the
+    keyword in any case and then whitespace and/or one ``=``, the arguments
+    split on whitespace, a ``"double quoted"`` one unquoted, and an unquoted
+    one starting with ``#`` ending the line as a comment. Any other line (a
+    ``Match`` line included) is ``None``. Negated patterns (``!x``) are kept
+    here.
     """
+    keyword = _HOST_KEYWORD.match(line)
+    if keyword is None:
+        return None
+    args: list[str] = []
+    arg, started, quoted = "", False, False
+    for c in line[keyword.end() :]:
+        if not quoted and c.isspace():
+            if started:
+                args.append(arg)
+            arg, started = "", False
+            continue
+        if not quoted and not started and c == "#":
+            return args
+        started = True
+        if c == '"':
+            quoted = not quoted
+        else:
+            arg += c
+    if started:
+        args.append(arg)
+    return args
+
+
+@dataclass(frozen=True)
+class WrittenBlock:
+    """One marked computer block of an ssh config, as :func:`written_blocks` reads it."""
+
+    id: str
+    #: Every alias of every ``Host`` line in the block, negated patterns left out.
+    hosts: tuple[str, ...]
+    #: The arguments of each ``Host`` line in the block, one tuple per line.
+    host_lines: tuple[tuple[str, ...], ...]
+    #: Where the block stands in the text it was read from.
+    start: int
+    end: int
+
+
+def written_blocks(text: str) -> list[WrittenBlock]:
+    """The marked computer blocks in the ssh config *text*, as :func:`written_hosts` describes."""
     written = []
     for begin in re.finditer(r"^# >>> mandala computer (.+?) >>>$", text, re.MULTILINE):
         computer_id = begin.group(1)
         block = _block_pattern(f"computer {computer_id}").match(text, begin.start())
         if block is None:
             continue
-        host = re.search(r"^Host (.+)$", block.group(0), re.MULTILINE)
-        written.append((computer_id, host.group(1).strip() if host else ""))
+        host_lines = tuple(
+            tuple(args)
+            for args in map(_host_line_args, block.group(0).split("\n"))
+            if args is not None
+        )
+        hosts = tuple(a for args in host_lines for a in args if a and not a.startswith("!"))
+        written.append(WrittenBlock(computer_id, hosts, host_lines, block.start(), block.end()))
     return written
+
+
+def written_hosts(text: str) -> list[tuple[str, tuple[str, ...]]]:
+    """The computer blocks written in the ssh config *text*.
+
+    For each ``mandala computer <id>`` block whose markers :func:`merge_config`
+    would find, its id and every alias of every ``Host`` line inside it, read
+    as OpenSSH reads the line (see :func:`_host_line_args`): a hand-edited
+    ``Host dev # mine``, ``Host a b``, ``  host=x`` or ``Host "x"`` counts.
+    Negated patterns (``!x``) name no host and are left out; wildcard patterns
+    are kept as written, not expanded. A block with no ``Host`` line has no
+    hosts. Only the marked blocks are read: the gateway's block, one with no
+    end marker and anything outside the markers are left out.
+    """
+    return [(b.id, b.hosts) for b in written_blocks(text)]
+
+
+def under_its_id(text: str, block: WrittenBlock) -> str:
+    """*block*, read from *text*, with its ``Host`` line made ``Host <its id>``."""
+    return "\n".join(
+        line if _host_line_args(line) is None else f"Host {block.id}"
+        for line in text[block.start : block.end].split("\n")
+    )
 
 
 def merge_config(current: str, snippet: str) -> str:

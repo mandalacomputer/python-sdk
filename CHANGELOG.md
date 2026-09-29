@@ -133,6 +133,32 @@ This is the summary you read to decide whether to upgrade.
   tuple such as `("shift",)`. The click methods take their modifiers as
   separate arguments and are unchanged.
 
+- **`mandala-py ssh-config` reads a `~/.ssh/config` that holds a byte that
+  is not UTF-8**, such as a Latin-1 comment. Such a file read as holding no
+  blocks at all, so a name or id another computer's block already used went
+  unnoticed in print and `--json` modes. The byte is now read as a
+  replacement character and the blocks around it are found. `--write` still
+  fails on such a file, as before.
+
+- **`mandala-py ssh-config` counts every alias of a hand-edited block's
+  `Host` lines**, read the way OpenSSH reads them: `Host dev # mine`,
+  `Host other dev`, `  host=dev`, `Host "dev"` and a second `Host` line all
+  put `dev` in that block. Only the whole first `Host` line counted before,
+  so a name such a block used could still be written under, and
+  `ssh <name>` went to whichever block came first. Negated patterns (`!dev`)
+  do not count, and a wildcard pattern is compared as written, not expanded.
+
+- **`mandala-py ssh-config` no longer refuses forever when two computers
+  are named after each other's ids** (say `vm-1` named `vm-other` and
+  `vm-other` named `vm-1`, in two accounts). The one written second fell
+  back to its id, which the first one's block held, and removing that block
+  only moved the refusal to the other computer. `--write` now puts both
+  under their ids in one write: it changes only the other block's `Host`
+  line, to its id, and a note on stderr says so. Without `--write` it still
+  refuses, and the `conflict` error says that `--write` moves both. A block
+  with more than the one alias the CLI writes, or whose id another block
+  uses as a `Host`, is refused as before.
+
 ## [0.7.0] — 2026-09-27
 
 ### Added
