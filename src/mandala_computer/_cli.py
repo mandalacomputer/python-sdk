@@ -2503,17 +2503,24 @@ def _other_written_blocks(path: Path, computer_id: str) -> tuple[str, list[_open
     than *computer_id*, as :func:`_openssh.written_blocks` reads them, and the
     text they stand in. A file that is missing or cannot be read holds none.
 
-    The file is decoded as UTF-8 with any byte that is not UTF-8 replaced, so
-    one stray byte (a Latin-1 comment, say) does not hide every block in it,
-    and its line endings are made ``\\n`` as :meth:`Path.read_text` makes them.
-    ``--write`` still reads the file strictly, so it fails on such a file as
-    it did before.
+    The file is decoded as :func:`_openssh.write_config` reads it, so a block
+    moved from this text is written back with the bytes it had. Only when that
+    decode fails is it decoded as UTF-8 with any byte that is not UTF-8
+    replaced, so one stray byte (a Latin-1 comment, say) does not hide every
+    block in it; its line endings are made ``\\n`` as :meth:`Path.read_text`
+    makes them. ``--write`` still reads the file strictly, so it fails on such
+    a file, before writing anything, as it did before.
     """
     try:
-        raw = path.read_bytes()
+        text = path.read_text()
+    except UnicodeDecodeError:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return "", []
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     except OSError:
         return "", []
-    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     return text, [b for b in _openssh.written_blocks(text) if b.id != computer_id]
 
 

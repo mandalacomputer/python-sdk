@@ -136,9 +136,11 @@ This is the summary you read to decide whether to upgrade.
 - **`mandala-py ssh-config` reads a `~/.ssh/config` that holds a byte that
   is not UTF-8**, such as a Latin-1 comment. Such a file read as holding no
   blocks at all, so a name or id another computer's block already used went
-  unnoticed in print and `--json` modes. The byte is now read as a
-  replacement character and the blocks around it are found. `--write` still
-  fails on such a file, as before.
+  unnoticed in print and `--json` modes. The file is read in the system's
+  text encoding, as `--write` reads it, so a block `--write` moves keeps its
+  bytes; only when that fails is the byte read as a replacement character,
+  and the blocks around it are found. `--write` still fails on such a file,
+  as before.
 
 - **`mandala-py ssh-config` counts every alias of a hand-edited block's
   `Host` lines**, read the way OpenSSH reads them: `Host dev # mine`,

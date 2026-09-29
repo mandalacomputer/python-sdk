@@ -9,6 +9,7 @@ right routes. The HTTP layer is respx, same as the client tests.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -2977,6 +2978,53 @@ def test_ssh_config_moves_two_computers_named_after_each_others_ids_to_their_ids
         assert run(who, "--json") == 0
         capsys.readouterr()
     assert config.read_text() == after
+
+
+def _latin1_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text files read and written as Latin-1, as under a Latin-1 LC_CTYPE or
+    on Windows without UTF-8 mode, where the default is not UTF-8."""
+    read_text = Path.read_text
+    fdopen = os.fdopen
+
+    def latin1_read_text(self: Path, encoding: str | None = None, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return read_text(self, encoding or "latin-1", *args, **kwargs)
+
+    def latin1_fdopen(fd: int, mode: str = "r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        if "b" not in mode and not args:
+            kwargs.setdefault("encoding", "latin-1")
+        return fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", latin1_read_text)
+    monkeypatch.setattr(os, "fdopen", latin1_fdopen)
+
+
+# The moved block's text came from a UTF-8 decode while --write read and wrote
+# the file in the locale's encoding: under a Latin-1 locale a UTF-8 config had
+# the moved block's known_hosts path rewritten to other bytes, and a Latin-1
+# one failed to write at all. The moved block keeps its bytes either way.
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1"])
+@respx.mock
+def test_ssh_config_move_keeps_the_moved_blocks_bytes_under_a_latin1_locale(
+    ssh_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    encoding: str,
+) -> None:
+    kh = str(ssh_home / ".mandala" / "ssh_known_hosts")
+    text = _hand_edited(ssh_home, "Host vm-9").replace(kh, "/home/José/kh")
+    config = _config_text(ssh_home, text.encode(encoding))
+    path_bytes = "/home/José/kh".encode(encoding)
+    assert path_bytes in _block_of(config.read_bytes().decode("latin-1"), "vm-7").encode("latin-1")
+    _latin1_locale(monkeypatch)
+    _one_computer(name="vm-7")
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    _, err = capsys.readouterr()
+    assert "moved its block to Host vm-7 as well" in err
+    after = config.read_bytes().decode("latin-1")
+    assert _openssh.written_hosts(after) == [("vm-7", ("vm-7",)), ("vm-9", ("vm-9",))]
+    moved = _block_of(after, "vm-7").encode("latin-1")
+    assert b"\nHost vm-7\n" in moved
+    assert b"UserKnownHostsFile " + path_bytes in moved
 
 
 # A hand-edited block counts under every alias of every Host line in it.
