@@ -2998,6 +2998,17 @@ def _latin1_locale(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "fdopen", latin1_fdopen)
 
 
+def _utf8_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text files read as UTF-8, as under a UTF-8 LC_CTYPE, so a byte that is
+    not UTF-8 fails the read whatever the locale running the tests is."""
+    read_text = Path.read_text
+
+    def utf8_read_text(self: Path, encoding: str | None = None, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return read_text(self, encoding or "utf-8", *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", utf8_read_text)
+
+
 # The moved block's text came from a UTF-8 decode while --write read and wrote
 # the file in the locale's encoding: under a Latin-1 locale a UTF-8 config had
 # the moved block's known_hosts path rewritten to other bytes, and a Latin-1
@@ -3156,8 +3167,11 @@ def test_ssh_config_refuses_a_held_id_in_a_config_that_is_not_utf8(
 # writes nothing (not even the gateway's known_hosts).
 @respx.mock
 def test_ssh_config_does_not_point_at_write_for_a_config_it_cannot_decode(
-    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # 0xE9 is not UTF-8 but is Latin-1: pin a UTF-8 read so the byte is
+    # invalid here under any locale the tests run in.
+    _utf8_locale(monkeypatch)
     config = _config_text(ssh_home, b"# caf\xe9\n" + _hand_edited(ssh_home, "Host vm-9").encode())
     before = config.read_bytes()
     _one_computer(name="vm-7")
