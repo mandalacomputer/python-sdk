@@ -2687,12 +2687,52 @@ NAMES_OF_OTHER_DESTINATIONS = [
     "10.5",  # the resolver reads this as 10.0.0.5
     "167772165",
     "0x0A000005",  # 10.0.0.5 too, in any case
+    "08.0.0.1",  # macOS reads this as 8.0.0.1, though inet_aton refuses it
+    "192.168.1.09",  # and this as an address
+    "0x.1",  # and this as 0.0.0.1
     "mandala-gateway",
     "Mandala-Gateway",
     "localhost",
     "vm-7",  # the other listed computer's id
     "VM-7",
 ]
+
+
+# Every form some resolver reads, macOS's looser ones included: it takes
+# 08.0.0.1 as 8.0.0.1, 192.168.1.09 as an address and 0x.1 as 0.0.0.1, where
+# inet_aton refuses all three. No range check: a part too big for its bytes
+# still reads as an address to be safe.
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("10.0.0.5", True),
+        ("10.5", True),
+        ("0x0A.0.0.5", True),
+        ("0X0a.0.0.5", True),
+        ("012.0.0.5", True),
+        ("00.1", True),
+        ("167772165", True),
+        ("08.0.0.1", True),
+        ("192.168.1.09", True),
+        ("0x.1", True),
+        ("0X.1", True),
+        ("0x.0.0.1", True),
+        ("0x", True),
+        ("1.2.3.256", True),
+        ("256.1", True),
+        ("1.16777216", True),
+        ("1..2", False),
+        ("1.2.3.", False),
+        ("1.2.3.4.5", False),
+        ("", False),
+        ("ubuntu-24.04", False),
+        ("a.1", False),
+        ("0x1g.1", False),
+        ("\u0661.1", False),  # a digit to str.isdigit, not to a resolver
+    ],
+)
+def test_reads_as_ipv4(text: str, want: bool) -> None:
+    assert _cli._reads_as_ipv4(text) is want
 
 
 @pytest.mark.parametrize("name", NAMES_OF_OTHER_DESTINATIONS)
@@ -2725,6 +2765,81 @@ def test_ssh_config_never_writes_a_name_another_destination_has_as_host(
     # The gateway's own block, then the computer's under its id: no block for
     # the name, and none but the gateway's under the gateway's alias.
     assert hosts == [_openssh.GATEWAY_ALIAS, "vm-9"]
+
+
+def _config_with_block(home: Path, host: str, computer_id: str = "vm-7") -> Path:
+    """A ~/.ssh/config holding a block for *computer_id*, which no listing shows."""
+    config = home / ".ssh" / "config"
+    config.parent.mkdir()
+    kh = home / ".mandala" / "ssh_known_hosts"
+    block = _openssh.config_snippet(host, computer_id, _openssh.gateway({}), kh)
+    config.write_text(_openssh.merge_config("Host work\n  User me\n", block))
+    return config
+
+
+# The listing holds only this key's account: a block written for a computer of
+# another account, under the name or with it as its id, is found in the file.
+@pytest.mark.parametrize(
+    ("name", "written"),
+    [("dev", "dev"), ("DEV", "dev"), ("dev", "Dev"), ("vm-7", "dev"), ("VM-7", "dev")],
+)
+@pytest.mark.parametrize("mode", ["print", "json", "write"])
+@respx.mock
+def test_ssh_config_never_takes_a_host_a_written_block_uses(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], name: str, written: str, mode: str
+) -> None:
+    config = _config_with_block(ssh_home, written)
+    before = config.read_text()
+    _one_computer(name=name)
+    flags = {"print": [], "json": ["--json"], "write": ["--write"]}[mode]
+    assert _cli.main(["ssh-config", "vm-9", *flags]) == 0
+    out, err = capsys.readouterr()
+    assert err == (
+        f"mandala-py: a block in ~/.ssh/config already uses the name {name} for another "
+        "computer; using Host vm-9 instead\n"
+    )
+    if mode == "print":
+        assert "# >>> mandala computer vm-9 >>>\nHost vm-9\n  HostName vm-9\n" in out
+    elif mode == "json":
+        shown = json.loads(out)
+        assert shown["host"] == "vm-9"
+        assert "\nHost vm-9\n" in shown["config"]
+    else:
+        assert out == f"wrote Host vm-9 in {config}\nconnect with: ssh vm-9\n"
+    if mode == "write":
+        assert _openssh.written_hosts(config.read_text()) == [("vm-7", written), ("vm-9", "vm-9")]
+    else:
+        assert config.read_text() == before
+
+
+@respx.mock
+def test_ssh_config_keeps_the_name_its_own_written_block_uses(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _config_with_block(ssh_home, "dev", "vm-9")
+    before = config.read_text()
+    _one_computer(name="dev")
+    assert _cli.main(["ssh-config", "vm-9", "--write"]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert out == f"already up to date: Host dev in {config}\nconnect with: ssh dev\n"
+    assert config.read_text() == before
+
+
+@pytest.mark.parametrize("config", ["other-block", "none", "unreadable"])
+@respx.mock
+def test_ssh_config_keeps_a_name_no_written_block_uses(
+    ssh_home: Path, capsys: pytest.CaptureFixture[str], config: str
+) -> None:
+    if config == "other-block":
+        _config_with_block(ssh_home, "other")
+    elif config == "unreadable":
+        (ssh_home / ".ssh" / "config").mkdir(parents=True)
+    _one_computer(name="dev")
+    assert _cli.main(["ssh-config", "vm-9", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert json.loads(out)["host"] == "dev"
 
 
 @respx.mock

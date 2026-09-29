@@ -351,6 +351,36 @@ def test_a_second_computer_adds_its_block_and_shares_the_gateway(tmp_path: Path)
     assert "Host ci\n" in text
 
 
+def _block(host: str, computer_id: str) -> str:
+    whole = _openssh.config_snippet(host, computer_id, _openssh.gateway({}), kh(Path("/h")))
+    return whole[whole.index("# >>> mandala computer") :]
+
+
+def test_written_hosts_lists_the_computer_blocks_and_only_those() -> None:
+    text = (
+        "Host work\n  User me\n"
+        "# >>> mandala computer vm-9 >>>\n"
+        "Host outside-the-markers-before\n\n"
+        + snippet("dev").replace("vm-9", "vm-7")
+        + "\n"
+        + _block("vm-8", "vm-8")
+        + "# >>> mandala computer vm-6 >>>\n"
+        "Host never-closed\n"
+        "# <<< mandala computer vm-5 <<<\n"
+        "Host after\n"
+    )
+    assert _openssh.written_hosts(text) == [("vm-7", "dev"), ("vm-8", "vm-8")]
+    assert _openssh.written_hosts(_openssh.merge_config("", snippet())) == [("vm-9", "dev")]
+    assert _openssh.written_hosts("") == []
+    # A marker must stand on its own line, as merge_config reads it.
+    assert _openssh.written_hosts(" " + _block("dev", "vm-7")) == []
+    assert _openssh.written_hosts(_block("dev", "vm-7").replace("Host dev\n", "")) == [("vm-7", "")]
+    # A begin marker that does not end its line opens no block, so the block
+    # after it is listed once.
+    crlf = "# >>> mandala computer vm-7 >>>\r\n" + _block("dev", "vm-7")
+    assert _openssh.written_hosts(crlf) == [("vm-7", "dev")]
+
+
 # --- keys on disk ----------------------------------------------------------
 
 

@@ -75,7 +75,6 @@ import select
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -2454,18 +2453,36 @@ def _cmd_ssh_access(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reads_as_ipv4(text: str) -> bool:
+    """Whether some resolver may read *text* as an IPv4 address.
+
+    One to four dot-separated parts, each digits or ``0x`` and hex digits.
+    That takes in every form ``inet_aton`` reads (decimal, ``0x`` hex,
+    leading-``0`` octal, the last part filling the bytes the others leave, so
+    ``10.5`` is 10.0.0.5 and ``167772165`` is too) and the looser ones macOS
+    reads as well: ``08.0.0.1`` is 8.0.0.1 there, ``192.168.1.09`` an address
+    and ``0x.1`` 0.0.0.1. No range check either: refusing a name no resolver
+    would take costs only the name, missing one some resolver takes lets a
+    block capture that address. Pure: no DNS.
+    """
+    parts = text.split(".")
+    return len(parts) <= 4 and all(
+        re.fullmatch(r"0[xX][0-9a-fA-F]*|[0-9]+", part) for part in parts
+    )
+
+
 def _names_another_destination(name: str, computers: Collection[Computer]) -> bool:
     """Whether ssh would also read ``name``, as a ``Host``, as some other place.
 
     OpenSSH matches ``Host`` patterns without regard to case, so these are
     compared lowercased: the gateway's own alias, ``localhost``, a bare number
-    (``ssh 167772165`` is 10.0.0.5), any IPv4 address in the forms the resolver
-    reads (``10.5`` is 10.0.0.5 too), a dotted name shaped like a hostname
-    (its last label empty, as in ``github.com.``, all letters like a top-level
-    domain, or an ``xn--`` one), and any listed computer's id, which is that
-    computer's Host when its own name cannot be one. A dotted name whose last
-    label has a digit, such as ``ubuntu-24.04``, names no other place: no
-    top-level domain has one.
+    (``ssh 167772165`` is 10.0.0.5), any IPv4 address in the forms a resolver
+    reads (``10.5`` is 10.0.0.5 too; see :func:`_reads_as_ipv4`), a dotted
+    name shaped like a hostname (its last label empty, as in ``github.com.``,
+    all letters like a top-level domain, or an ``xn--`` one), and any listed
+    computer's id, which is that computer's Host when its own name cannot be
+    one. A dotted name whose last label has a digit, such as ``ubuntu-24.04``,
+    names no other place: no top-level domain has one.
     """
     folded = name.lower()
     if folded in (_openssh.GATEWAY_ALIAS, "localhost"):
@@ -2473,16 +2490,29 @@ def _names_another_destination(name: str, computers: Collection[Computer]) -> bo
     if re.fullmatch(r"[0-9]+|0x[0-9a-f]*", folded):
         return True
     if "." in folded:
-        try:
-            socket.inet_aton(folded)
-        except (OSError, ValueError):
-            pass
-        else:
+        if _reads_as_ipv4(folded):
             return True
         last = folded.rsplit(".", 1)[1]
         if not last or re.fullmatch(r"[a-z]+", last) or last.startswith("xn--"):
             return True
     return any(o.id.lower() == folded for o in computers)
+
+
+def _names_a_written_block(name: str, computer_id: str, path: Path) -> bool:
+    """Whether a block in the ssh config at *path*, written for a computer
+    other than *computer_id*, has *name* as its ``Host`` or its id, compared
+    without regard to case as the listed ids are. A file that is missing or
+    cannot be read holds no blocks.
+    """
+    try:
+        text = path.read_text()
+    except (OSError, ValueError):
+        return False
+    folded = name.lower()
+    return any(
+        other != computer_id and folded in (host.lower(), other.lower())
+        for other, host in _openssh.written_hosts(text)
+    )
 
 
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
@@ -2507,6 +2537,15 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
     # send the user's pushes through the gateway to their own guest.
     taken = bool(c.name) and _names_another_destination(c.name, computers)
     host = computer_id if unchecked or shared or taken else _openssh.host_alias(c.name, computer_id)
+    # The listing holds only this key's account, so the blocks already in
+    # ~/.ssh/config count too: one written for another computer, from another
+    # account say, under this name (or with it as its id) would get
+    # `ssh <name>` whenever it came first. This computer's own block is the
+    # one --write replaces, so it never counts.
+    path = Path.home() / ".ssh" / "config"
+    clashes = host != computer_id and _names_a_written_block(host, computer_id, path)
+    if clashes:
+        host = computer_id
     if unchecked:
         print(
             f"{PROG}: could not check other computers' names; using Host {_shown(c.id)} instead",
@@ -2524,8 +2563,13 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
             f"use it for another destination; using Host {_shown(c.id)} instead",
             file=sys.stderr,
         )
+    elif clashes:
+        print(
+            f"{PROG}: a block in ~/.ssh/config already uses the name {_shown(c.name)} "
+            f"for another computer; using Host {_shown(c.id)} instead",
+            file=sys.stderr,
+        )
     snippet = _openssh.config_snippet(host, computer_id, gw, known_hosts)
-    path = Path.home() / ".ssh" / "config"
     changed = _openssh.write_config(path, snippet) if args.write else None
     if args.json:
         _json(
