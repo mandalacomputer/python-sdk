@@ -9,6 +9,24 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **`computers.launch()` now waits for the desktop session** on a Linux
+  computer, sync and async, after its guest, secrets and proxy waits and
+  inside the same readiness budget. The guest agent answers a few seconds
+  before the desktop user is logged in, and an `exec(..., desktop=True)` sent
+  in between was refused with a `ConflictError` "no active desktop session". A
+  computer that never gets a desktop session now makes `launch()` raise a
+  `TimeoutError` instead of returning.
+
+### Added
+
+- **`Computer.wait_for_desktop()`** (and the `AsyncComputer` twin) polls a
+  no-output `true` in the desktop session until it finishes with exit 0; a
+  probe that times out inside the guest is polled through, not taken as a
+  session. It returns at once for a Windows guest or a computer whose `os` is not reported. An absent
+  `desktop` field is an X11 desktop and is waited on.
+
 ## [0.8.0] — 2026-09-29
 
 ### Added

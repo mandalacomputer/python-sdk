@@ -39,6 +39,7 @@ from ._client import (
 )
 from ._computer import (
     CAPTURING,
+    DESKTOP_PROBE,
     GUEST_PROBE,
     UNICODE_TYPE_TIMEOUT,
     BackgroundCommandFields,
@@ -52,6 +53,9 @@ from ._computer import (
     _clipboard_text,
     _continues,
     _cursor,
+    _desktop_timeout,
+    _desktop_wait_fatal,
+    _desktop_wait_skipped,
     _download_sink,
     _egress_proxy_timeout,
     _empty_guest_file,
@@ -914,6 +918,40 @@ class AsyncComputer(ComputerFields):
             if remaining <= 0:
                 raise TimeoutError(f"{self.id} guest did not respond within {timeout:g}s")
             await asyncio.sleep(min(delay, remaining))
+
+    async def wait_for_desktop(self, timeout: float = 180.0, poll: float = 3.0) -> AsyncComputer:
+        """Await until this computer's desktop session exists, by running a
+        trivial command in it.
+
+        See :meth:`Computer.wait_for_desktop`: this is its twin, and
+        :meth:`AsyncComputers.launch` calls it for you.
+        """
+        check_wait_args(timeout, poll)
+        if _desktop_wait_skipped(self._data):
+            return self
+        deadline = time.monotonic() + timeout
+        while True:
+            delay = poll
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_desktop_timeout(self.id, timeout))
+            try:
+                probe_timeout = max(1, min(5, math.ceil(remaining)))
+                res = await self._exec(
+                    DESKTOP_PROBE, probe_timeout, desktop=True, timeout_cap=remaining
+                )
+                # Only a finished exit 0 is evidence of a session; a probe that
+                # timed out in the guest is polled through (see Computer).
+                if res.ok:
+                    return self
+            except MandalaError as err:
+                if _desktop_wait_fatal(err):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(_desktop_timeout(self.id, timeout)) from err
+                delay = _poll_delay(err, poll)
+            await asyncio.sleep(min(delay, max(deadline - time.monotonic(), 0)))
 
     async def wait_for_secrets(
         self, timeout: float = 180.0, poll: float = 2.0, *, expect_secrets: bool = False
