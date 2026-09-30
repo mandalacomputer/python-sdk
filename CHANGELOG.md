@@ -30,9 +30,25 @@ This is the summary you read to decide whether to upgrade.
 - **`mandala-py logout` with no saved profile exits 0** and says `Not logged
   in; nothing to remove.` (with `--json`, `removed: false`). A named profile
   that is not saved while others are is still `not_logged_in`.
+- **`mandala-py workspaces get` and `workspaces members` take a workspace
+  name** as well as an id, resolved as `rename` and `rm` resolve one: an id is
+  sent as it is, a name that fits one workspace becomes its id, and a name
+  that fits more than one is refused (`ambiguous_workspace`) with their ids.
 
 ### Added
 
+- **`mandala-py move COMPUTER --ram-mb N [--cpu N] [--disk-gb N] [--wait]` and
+  `mandala-py moves list [--computer C]`**: move a stopped computer to another
+  host in its region that can run a size its own host cannot (the step a
+  resize refused with `move_required` offers), and list the moves running or
+  finished in the last day. With `--wait`, `move` exits 0 only when the move's
+  state is `done`; `moved`, `failed` and `lost` exit 1 with a note. `move` is a
+  top-level verb, as `terminal` and `scp` are: this CLI has no `computers`
+  group.
+- **`mandala-py secrets get NAME|ID [--workspace ID]`**: one secret's metadata
+  (id, name, scope, revision and dates, never its value), found by name or id
+  as `secrets rm` finds one, in the saved default workspace when `--workspace`
+  is not given.
 - **`mandala-py workspaces use` and `workspaces current`**: save a default
   workspace, by name or id, for a saved profile; `secrets list`, `set` and
   `rm` and `api-keys create` then use it when `--workspace` is not given (an

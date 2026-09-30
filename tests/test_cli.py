@@ -2383,9 +2383,10 @@ MEMBER_ROW = {**WSP_MEMBERS[0], "user_id": f"usr-{RLO}1", "accepted_at": "2026-0
             2,
         ),
         (
-            ["workspaces", "members", "wsp-1"],
+            # An id, so it is read without resolving a name first.
+            ["workspaces", "members", "wsp-000000000001"],
             "GET",
-            "/workspaces/wsp-1/members",
+            "/workspaces/wsp-000000000001/members",
             [MEMBER_ROW],
             ["usr-\\u202e1", "2026-09-02\\u000a\\u001b[31m"],
             2,

@@ -3380,12 +3380,14 @@ mandala-py ssh dev                    # real OpenSSH, through the platform's gat
 mandala-py scp .env dev:/home/user/app/.env
 mandala-py scp dev:/home/user/report.csv .
 mandala-py webhooks list              # and create, get, update, delete, rotate, test, deliveries
-mandala-py secrets list               # names and revisions, never values
+mandala-py secrets list               # names and revisions, never values; get NAME for one
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
-mandala-py workspaces list            # and get ID, members ID, create, rename, rm --yes
+mandala-py workspaces list            # and get, members (a name or id), create, rename, rm --yes
 mandala-py workspaces use research    # a default workspace for this profile; current, use --clear
 mandala-py operations list            # and get ID, wait ID; --computer takes a name or id
+mandala-py move dev --ram-mb 65536 --wait   # after a resize answered move_required
+mandala-py moves list                 # running, or finished in the last day; --computer
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
 mandala-py egress-proxy set dev https://proxy.example.com:3128 --credentials csec-0123456789abcdef
@@ -3459,13 +3461,16 @@ secret or replaces its value, and reads the value from stdin — dropping one
 trailing newline (`\n` or `\r\n`, never a lone `\r`), which `--keep-newline` keeps — or, at a terminal, from a prompt
 that does not echo. Never from the command line, where it would land in shell
 history and in every process listing. `rm NAME` deletes by name at the revision
-it read. `--workspace ID` names a workspace's scope on all three; without it
-they work on the account-wide secrets. No command prints a value, because the
-platform returns none.
+it read. `get NAME` prints one secret's id, name, scope, revision and dates,
+found by name or id as `rm` finds it (`--json` for the platform's record).
+`--workspace ID` names a workspace's scope on all four; without it they work
+on the account-wide secrets. No command prints a value, because the platform
+returns none.
 
 ```sh
 printf %s "$OPENAI_API_KEY" | mandala-py secrets set OPENAI_API_KEY
 mandala-py secrets set KUBECONFIG --keep-newline < ~/.kube/config
+mandala-py secrets get OPENAI_API_KEY
 mandala-py secrets rm OPENAI_API_KEY
 ```
 
@@ -3480,11 +3485,16 @@ It is shown once.
 
 `workspaces list` prints the workspaces the key reaches, with the ids that
 `secrets --workspace` and `api-keys create --workspace` take; `workspaces get
-ID` prints one, and one the key cannot see is `not_found`. `workspaces members
-ID` lists the people who reach it (the account's accepted members, with their
+WORKSPACE` prints one, by name or id, and one the key cannot see is
+`not_found`. `workspaces members WORKSPACE` lists the people who reach it (the account's accepted members, with their
 role and whether they are suspended) and needs an account-wide key: a key
 confined to a workspace gets the platform's 403 (`--json`: `code`
 `permission_denied`). Each takes `--json` for the platform's rows.
+
+`get` and `members` resolve a name as `rename` and `rm` do: a value shaped
+like a workspace id is sent as that id, a name that fits exactly one workspace
+this key can reach becomes its id, and a name that fits more than one is
+refused (`ambiguous_workspace`) with their ids.
 
 `workspaces create NAME`, `workspaces rename WORKSPACE NEW_NAME` and
 `workspaces rm WORKSPACE --yes` need an owner's account-wide key; `rename` and
@@ -3522,6 +3532,22 @@ A profile whose key is confined to a workspace already has that one:
 an account-wide key), and of its own saves nothing. With `MANDALA_API_KEY` set
 there is no profile to save a default in, so `workspaces use` is refused and no
 default applies.
+
+`move COMPUTER --ram-mb N [--cpu N] [--disk-gb N]` is the step the platform
+offers when a resize is refused with `move_required` (`MoveRequiredError`,
+with `move_possible` true): it copies the stopped computer to another host in
+its region and applies the new size there. `--ram-mb` is required, as the size
+that did not fit; the others are left alone unless given. It prints the move
+as it was accepted (state, whether it is live, the target size, when it
+started). `--wait` waits for it to finish (`--timeout-ms`, 15 minutes unless
+set, and `--poll-ms`) and exits 0 only when its state is `done`; `moved` (on
+the new host at its OLD size: resize it again there), `failed` (nothing
+changed) and `lost` (read the computer) exit 1 with a note on stderr. One move
+runs per account at a time. `moves list` prints the moves still running and
+those finished in the last day, one row per computer; `--computer` keeps one
+computer's, by name or id. Both take `--json` for the platform's records.
+`move` is a top-level verb, as `terminal` and `scp` are, since this CLI has no
+`computers` group.
 
 `logout [--profile NAME]` forgets one profile that `mandala login` saved in
 `~/.mandala/credentials.json` — the one `--profile` or `MANDALA_PROFILE` names,
