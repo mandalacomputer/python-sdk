@@ -2613,8 +2613,7 @@ has the same methods, awaited.
 
 A workspace partitions the account's computers: a key confined to one reaches
 that workspace's computers only, and a computer's `workspace_id` names the
-workspace it is in. They are read here and created, renamed and deleted in the
-dashboard.
+workspace it is in.
 
 ```python
 for ws in client.workspaces.list():  # oldest first
@@ -2622,7 +2621,17 @@ for ws in client.workspaces.list():  # oldest first
 ws = client.workspaces.get("wsp-0123456789ab")
 for m in client.workspaces.members(ws.id):  # the account's accepted members
     print(m.email, m.role, "suspended" if m.suspended else "")
+
+acme = client.workspaces.create("customer-acme")
+client.workspaces.rename(acme.id, "customer-acme-prod")
+print(client.workspaces.delete(acme.id).revoked_keys, "keys revoked")
 ```
+
+Creating, renaming and deleting need an owner's account-wide key; a key
+confined to a workspace is refused them with `PermissionDeniedError`. Deleting
+a workspace REVOKES every API key confined to it, whoever holds it, and
+`revoked_keys` says how many. Its computers are not touched: they keep the
+deleted workspace's id, and account-wide keys reach them as before.
 
 A key confined to a workspace lists that one workspace and no other, and `get`
 of any other id raises `NotFoundError`, the same as one that does not exist (so
@@ -3343,7 +3352,7 @@ mandala-py webhooks list              # and create, get, update, delete, rotate,
 mandala-py secrets list               # names and revisions, never values
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
-mandala-py workspaces list            # and get ID, members ID; read only
+mandala-py workspaces list            # and get ID, members ID, create, rename, rm --yes
 mandala-py operations list            # and get ID, wait ID; --computer takes a name or id
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
@@ -3444,6 +3453,12 @@ ID` lists the people who reach it (the account's accepted members, with their
 role and whether they are suspended) and needs an account-wide key: a key
 confined to a workspace gets the platform's 403 (`--json`: `code`
 `permission_denied`). Each takes `--json` for the platform's rows.
+
+`workspaces create NAME`, `workspaces rename WORKSPACE NEW_NAME` and
+`workspaces rm WORKSPACE --yes` need an owner's account-wide key; `rename` and
+`rm` take a name or an id. `rm` does nothing without `--yes`
+(`confirmation_required`), because deleting a workspace revokes every API key
+confined to it; it prints how many. Its computers are kept.
 
 `logout [--profile NAME]` forgets one profile that `mandala login` saved in
 `~/.mandala/credentials.json` — the one `--profile` or `MANDALA_PROFILE` names,

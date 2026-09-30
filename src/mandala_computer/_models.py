@@ -93,6 +93,7 @@ __all__ = [
     "Window",
     "WindowResult",
     "Workspace",
+    "WorkspaceDeleted",
     "WorkspaceMember",
 ]
 
@@ -4294,8 +4295,8 @@ class Workspace:
 
     A workspace partitions the account's computers: a key confined to one
     reaches that workspace's computers only, and a computer's ``workspace_id``
-    names the workspace it is in. Read only here: workspaces are created,
-    renamed and deleted in the dashboard.
+    names the workspace it is in. Created, renamed and deleted with an owner's
+    account-wide key (platform OPL-5473), or in the dashboard.
     """
 
     #: ``wsp-`` and twelve hex characters. What a computer's ``workspace_id`` names.
@@ -4317,6 +4318,30 @@ class Workspace:
             created_at=_text(d.get("created_at")),
             raw=dict(d),
         )
+
+
+@dataclass(frozen=True)
+class WorkspaceDeleted:
+    """What deleting a workspace answers (platform OPL-5473).
+
+    Every API key confined to the workspace was revoked with it, whoever held
+    it; ``revoked_keys`` says how many. Its computers are not touched.
+    """
+
+    #: The API keys confined to the workspace, revoked in the same step.
+    revoked_keys: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "workspace deletion") -> WorkspaceDeleted:
+        """Strict: a delete that cannot say how many keys it revoked is not one
+        to report as having revoked none."""
+        if not isinstance(d, Mapping) or d.get("ok") is not True:
+            raise MandalaError(f"{where}: not ok: true")
+        n = d.get("revoked_keys")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise MandalaError(f"{where}: revoked_keys is not a count of keys")
+        return cls(revoked_keys=n, raw=dict(d))
 
 
 @dataclass(frozen=True)

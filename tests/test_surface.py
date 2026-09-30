@@ -693,9 +693,13 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=OPERATION)
     if path.endswith("/whoami"):
         return httpx.Response(200, json=WHOAMI)
+    # A create is a 201 and the workspace; a delete is the ack with the count of
+    # keys it revoked (OPL-5473).
     if path.endswith("/workspaces"):
-        return httpx.Response(200, json=[WORKSPACE])
+        return httpx.Response(200 if get else 201, json=[WORKSPACE] if get else WORKSPACE)
     if "/workspaces/" in path:
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"ok": True, "revoked_keys": 2})
         return httpx.Response(
             200, json=[WORKSPACE_MEMBER] if path.endswith("/members") else WORKSPACE
         )
@@ -1046,6 +1050,10 @@ def exercise_everything(client: mc.Client) -> None:
     client.workspaces.list()
     client.workspaces.get(WORKSPACE["id"])
     client.workspaces.members(WORKSPACE["id"])
+    # And their writes (OPL-5473).
+    client.workspaces.create("acme-2")
+    client.workspaces.rename(WORKSPACE["id"], "acme-3")
+    client.workspaces.delete(WORKSPACE["id"])
     # Lifecycle operations (OPL-5055): a read, a page with every parameter it
     # sends, and the wait over the read.
     client.operations.get(OPERATION["id"])
@@ -1309,6 +1317,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.workspaces.list()
     await client.workspaces.get(WORKSPACE["id"])
     await client.workspaces.members(WORKSPACE["id"])
+    await client.workspaces.create("acme-2")
+    await client.workspaces.rename(WORKSPACE["id"], "acme-3")
+    await client.workspaces.delete(WORKSPACE["id"])
     await client.operations.get(OPERATION["id"])
     await client.operations.list()
     await client.operations.list(computer_id="vm-1", limit=5, cursor="op_00000000000000000000000a")

@@ -1,5 +1,5 @@
 """``client.workspaces`` (platform OPL-5057): the account's workspaces and their
-members, read only, on both clients."""
+members, and their create, rename and delete (OPL-5473), on both clients."""
 
 from __future__ import annotations
 
@@ -136,3 +136,90 @@ def test_a_row_it_cannot_read_is_refused(route: str, body: object, where: str) -
             c.workspaces.list()
         else:
             c.workspaces.members("wsp-1")
+
+
+# --- the writes (platform OPL-5473) -------------------------------------------
+
+DELETED: dict[str, Any] = {"ok": True, "revoked_keys": 2}
+
+
+def mock_writes() -> tuple[respx.Route, respx.Route, respx.Route]:
+    made = respx.post(f"{BASE}/workspaces").mock(
+        return_value=httpx.Response(201, json={**WORKSPACE, "name": "acme-2"})
+    )
+    renamed = respx.patch(f"{BASE}/workspaces/{WORKSPACE['id']}").mock(
+        return_value=httpx.Response(200, json={**WORKSPACE, "name": "acme-3"})
+    )
+    gone = respx.delete(f"{BASE}/workspaces/{WORKSPACE['id']}").mock(
+        return_value=httpx.Response(200, json=DELETED)
+    )
+    return made, renamed, gone
+
+
+@respx.mock
+def test_create_rename_delete_send_name_only_and_decode() -> None:
+    import json
+
+    made, renamed, gone = mock_writes()
+    with client() as c:
+        assert c.workspaces.create("acme-2").name == "acme-2"
+        assert c.workspaces.rename(WORKSPACE["id"], "acme-3").name == "acme-3"
+        result = c.workspaces.delete(WORKSPACE["id"])
+    assert result == mc.WorkspaceDeleted(revoked_keys=2) and result.raw == DELETED
+    assert json.loads(made.calls.last.request.content) == {"name": "acme-2"}
+    assert json.loads(renamed.calls.last.request.content) == {"name": "acme-3"}
+    assert gone.calls.last.request.content == b""
+
+
+@respx.mock
+async def test_the_async_client_creates_renames_and_deletes() -> None:
+    import json
+
+    made, renamed, gone = mock_writes()
+    async with mc.AsyncClient("com_test", base_url=BASE) as c:
+        assert (await c.workspaces.create("acme-2")).name == "acme-2"
+        assert (await c.workspaces.rename(WORKSPACE["id"], "acme-3")).name == "acme-3"
+        assert (await c.workspaces.delete(WORKSPACE["id"])).revoked_keys == 2
+    assert json.loads(made.calls.last.request.content) == {"name": "acme-2"}
+    assert json.loads(renamed.calls.last.request.content) == {"name": "acme-3"}
+    assert gone.called
+
+
+@respx.mock
+@pytest.mark.parametrize("name", ["", "   ", None, 7])
+def test_a_missing_or_empty_name_is_refused_before_any_request(name: Any) -> None:
+    made, renamed, _ = mock_writes()
+    with client() as c:
+        with pytest.raises((ValueError, TypeError)):
+            c.workspaces.create(name)
+        with pytest.raises((ValueError, TypeError)):
+            c.workspaces.rename(WORKSPACE["id"], name)
+    assert not made.called and not renamed.called
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "answer", [{"ok": True}, {"ok": True, "revoked_keys": -1}, {"revoked_keys": 0}, {}]
+)
+def test_a_delete_answer_that_cannot_count_its_keys_is_refused(answer: dict[str, Any]) -> None:
+    respx.delete(f"{BASE}/workspaces/{WORKSPACE['id']}").mock(
+        return_value=httpx.Response(200, json=answer)
+    )
+    with client() as c, pytest.raises(mc.MandalaError):
+        c.workspaces.delete(WORKSPACE["id"])
+
+
+@respx.mock
+def test_a_scoped_key_is_permission_denied_and_a_foreign_id_not_found() -> None:
+    sentence = "Workspaces cannot be created, renamed or deleted with a workspace-scoped API key."
+    respx.post(f"{BASE}/workspaces").mock(
+        return_value=httpx.Response(403, json={"error": sentence})
+    )
+    respx.patch(f"{BASE}/workspaces/wsp-ffffffffffff").mock(
+        return_value=httpx.Response(404, json={"error": "workspace not found"})
+    )
+    with client() as c:
+        with pytest.raises(mc.PermissionDeniedError):
+            c.workspaces.create("x")
+        with pytest.raises(mc.NotFoundError):
+            c.workspaces.rename("wsp-ffffffffffff", "x")

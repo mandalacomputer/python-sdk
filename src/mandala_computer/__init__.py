@@ -172,6 +172,7 @@ from ._models import (
     Window,
     WindowResult,
     Workspace,
+    WorkspaceDeleted,
     WorkspaceMember,
 )
 from ._resources import (
@@ -347,6 +348,7 @@ __all__ = [
     "Window",
     "WindowResult",
     "Workspace",
+    "WorkspaceDeleted",
     "WorkspaceMember",
     "__version__",
     "is_transient",
