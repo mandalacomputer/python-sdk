@@ -288,15 +288,15 @@ class Computers:
         this desktop — computer-use accuracy is resolution-sensitive, and every
         coordinate the model produces is in this space.
 
-        ``secrets`` binds secrets from the account (Settings → Secrets), each a
-        :class:`~mandala_computer.SecretBindingArgs` delivered into the desktop
-        session each time the computer starts: as an environment variable
-        (``env``) or as a file under ``/run/mandala-secrets/user/files``
-        (``file``). Linux only, and only on a template whose image can receive
-        them. At most 32, at most 8 of them as files, and no secret, variable or
-        file name twice; a list the platform would refuse raises
-        :class:`ValueError` before any request is made. Omitted, no ``secrets``
-        key is sent.
+        ``secrets`` binds secrets from the account (Settings → Credentials →
+        Secrets), each a :class:`~mandala_computer.SecretBindingArgs` delivered
+        into the desktop session each time the computer starts: as an
+        environment variable (``env``) or as a file under
+        ``/run/mandala-secrets/user/files`` (``file``). Linux only, and only on
+        a template whose image can receive them. At most 32, at most 8 of them
+        as files, and no secret, variable or file name twice; a list the
+        platform would refuse raises :class:`ValueError` before any request is
+        made. Omitted, no ``secrets`` key is sent.
 
         ``browser_proxy`` sends the computer's browsers — Chromium, Chrome and
         Firefox, nothing else on it — through a proxy, a
