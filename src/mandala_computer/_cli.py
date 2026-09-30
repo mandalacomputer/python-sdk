@@ -43,7 +43,7 @@ Two subcommands address a computer by name or id:
     dashboard session turns on; without it the platform's own sentence is
     printed, and it says exactly that. ``create`` prints the new key ONCE.
 
-``mandala-py workspaces <list|get|members|create|rename|rm>``
+``mandala-py workspaces <list|get|members|create|rename|rm|use|current>``
     The account's workspaces: their ids (what ``secrets --workspace`` and
     ``api-keys create --workspace`` take) and the people who reach one.
     ``members`` needs an account-wide key; a key confined to a workspace is
@@ -51,6 +51,10 @@ Two subcommands address a computer by name or id:
     ``rm`` need an owner's account-wide key; ``rename`` and ``rm`` take a name
     or an id. ``rm`` does nothing without ``--yes``, because deleting a
     workspace revokes every API key confined to it (its computers are kept).
+    ``use`` saves a default workspace for a saved profile, in
+    ``~/.mandala/defaults.json``, which ``secrets`` and ``api-keys create`` use
+    when ``--workspace`` is not given (``use --clear`` removes it); ``current``
+    says which workspace applies and why.
 
 ``mandala-py operations <list|get|wait>``
     The lifecycle operations this key's calls started, as ``mandala operations``
@@ -100,6 +104,16 @@ from . import _api, _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
+from ._defaults import (
+    DEFAULTS_PATH,
+    DefaultsError,
+    WorkspaceDefault,
+    read_defaults,
+    remove_workspace_default,
+    save_workspace_default,
+    saved_profile,
+    workspace_default,
+)
 from ._exceptions import (
     APIError,
     AuthenticationError,
@@ -744,12 +758,12 @@ def _terminal_size(fd: int) -> tuple[int, int]:
     return columns, rows
 
 
-def _client() -> Client:
+def _client(profile: str | None = None) -> Client:
     # Imported at call time: the package's __init__ imports nothing from here,
     # so the cycle stays one-way.
     from mandala_computer import Client
 
-    return Client()
+    return Client() if profile is None else Client(profile=profile)
 
 
 def _resolve(client: Client, target: str, computers: Listing[Computer] | None = None) -> Computer:
@@ -1584,7 +1598,7 @@ def _secret_rows(secrets: Sequence[Secret]) -> str:
 
 def _cmd_secrets_list(args: argparse.Namespace) -> int:
     with _client() as client:
-        listed = client.secrets.list(workspace_id=args.workspace)
+        listed = client.secrets.list(workspace_id=_scope(args))
     if args.json:
         _json(listed.raw)
     elif listed.secrets:
@@ -1642,7 +1656,7 @@ def _secret_value(keep_newline: bool) -> str:
 def _cmd_secrets_set(args: argparse.Namespace) -> int:
     value = _secret_value(args.keep_newline)
     with _client() as client:
-        stored = client.secrets.set(args.name, value, workspace_id=args.workspace)
+        stored = client.secrets.set(args.name, value, workspace_id=_scope(args))
     if args.json:
         _json(stored.raw)
     else:
@@ -1679,12 +1693,13 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
 
 def _cmd_secrets_rm(args: argparse.Namespace) -> int:
     with _client() as client:
-        listed = client.secrets.list(workspace_id=args.workspace).secrets
+        workspace = _scope(args)
+        listed = client.secrets.list(workspace_id=workspace).secrets
         found = _secret_to_remove(listed, args.name)
         if found is None:
-            scope = f"workspace {args.workspace}" if args.workspace else "the account-wide scope"
+            scope = f"workspace {workspace}" if workspace else "the account-wide scope"
             _die(f"no secret named {args.name!r} in {scope}", "not_found")
-        client.secrets.delete(found.id, revision_id=found.revision_id, workspace_id=args.workspace)
+        client.secrets.delete(found.id, revision_id=found.revision_id, workspace_id=workspace)
     print(f"deleted {_shown(found.name)}  {_shown(found.id)}")
     return 0
 
@@ -1692,7 +1707,10 @@ def _cmd_secrets_rm(args: argparse.Namespace) -> int:
 def _secrets_parser(sub: Any) -> None:
     store = sub.add_parser("secrets", help="the account's secret store")
     verbs = store.add_subparsers(dest="verb", required=True)
-    scope = "the workspace (default: the account-wide secrets)"
+    scope = (
+        "the workspace (default: the saved profile's workspace from `workspaces use`, "
+        "else the account-wide secrets)"
+    )
 
     listing = verbs.add_parser("list", help="names, ids and revisions — never values")
     listing.add_argument("--workspace", metavar="ID", help=scope)
@@ -1865,7 +1883,7 @@ def _cmd_api_keys_list(args: argparse.Namespace) -> int:
 
 def _cmd_api_keys_create(args: argparse.Namespace) -> int:
     with _client() as client:
-        created = client.api_keys.create(name=args.name, workspace_id=args.workspace)
+        created = client.api_keys.create(name=args.name, workspace_id=_scope(args))
     # The key alone on stdout, so `KEY=$(mandala-py api-keys create)` captures
     # it and nothing else; what it is and the warning go to stderr.
     if args.json:
@@ -1895,7 +1913,7 @@ def _cmd_api_keys_revoke(args: argparse.Namespace) -> int:
 
 
 def _cmd_logout(args: argparse.Namespace) -> int:
-    from ._credentials import remove_profile
+    from ._credentials import CredentialError, remove_profile
 
     removed = remove_profile(args.profile)
     # Nothing saved at all: the store names a default whenever it holds a
@@ -1942,6 +1960,14 @@ def _cmd_logout(args: argparse.Namespace) -> int:
         notes.append(
             "MANDALA_API_KEY is set in this environment, and it still authenticates every command."
         )
+    # Best effort: the profile is gone whatever happens to its default.
+    try:
+        remove_workspace_default(removed.profile)
+    except (DefaultsError, CredentialError) as e:
+        why = e.reason if isinstance(e, DefaultsError) else str(e)
+        notes.append(
+            f"the profile was removed, but its default workspace in {DEFAULTS_PATH} was not: {why}"
+        )
     for note in notes:
         print(f"{PROG}: {note}", file=sys.stderr)
     if args.json:
@@ -1981,7 +2007,10 @@ def _keys_parsers(sub: Any) -> None:
     create.add_argument(
         "--workspace",
         metavar="ID",
-        help="confine the key to this workspace (default: the calling key's own scope)",
+        help=(
+            "confine the key to this workspace (default: the saved profile's workspace from "
+            "`workspaces use`, else the calling key's own scope)"
+        ),
     )
     create.add_argument("--json", action="store_true", help="the new key as JSON, under raw")
     create.set_defaults(fn=_cmd_api_keys_create)
@@ -2279,6 +2308,180 @@ def _cmd_workspaces_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _environment_key() -> bool:
+    """Whether MANDALA_API_KEY supplies the key, as it does before any profile."""
+    from ._credentials import _trim
+
+    return bool(_trim(os.environ.get("MANDALA_API_KEY", "")))
+
+
+def _defaults_or_note(note: Callable[[str], None]) -> dict[str, WorkspaceDefault]:
+    """``defaults.json`` for a command that only reads it: one that cannot be
+    used is reported in a line and read as holding nothing."""
+    try:
+        return read_defaults()
+    except DefaultsError as e:
+        note(f"{PROG}: ignoring {DEFAULTS_PATH}: {e.reason}")
+        return {}
+
+
+def _scope(args: argparse.Namespace) -> str | None:
+    """``secrets`` and ``api-keys create``: ``--workspace``, else the saved
+    profile's default from ``workspaces use`` — when the key is account-wide and
+    the default was saved for the account the profile is logged in to now.
+    Otherwise None, and the command goes on as it always has."""
+    if args.workspace is not None:
+        return str(args.workspace)
+    if _environment_key():
+        return None
+    name, entry = saved_profile(None)
+    if entry["scope"]["type"] != "account":
+        return None
+    quiet = bool(getattr(args, "json", False))
+
+    def note(line: str) -> None:
+        if not quiet:
+            print(line, file=sys.stderr)
+
+    found, _ignored = workspace_default(_defaults_or_note(note), name, entry["account"]["id"])
+    if found is None:
+        return None
+    note(
+        f"(workspace {_printable(found.workspace_name)} from `workspaces use`; "
+        "`workspaces use --clear` for account-wide)"
+    )
+    return found.workspace_id
+
+
+def _workspace_text(workspace_id: str, name: str) -> str:
+    return f"workspace {_printable(name)} ({_printable(workspace_id)})"
+
+
+def _cmd_workspaces_use(args: argparse.Namespace) -> int:
+    if args.clear and args.workspace is not None:
+        _die("give a workspace or --clear, not both", "invalid_arguments")
+    if not args.clear and args.workspace is None:
+        _die(
+            "say which workspace, by name or ID, or --clear to go back to account-wide",
+            "invalid_arguments",
+        )
+    if _environment_key():
+        _die(
+            "workspaces use saves a default in a saved profile; MANDALA_API_KEY is set, "
+            "so there is no profile to save it in.",
+            "no_saved_profile",
+        )
+    name, entry = saved_profile(args.profile)
+    if args.clear:
+        removed = remove_workspace_default(name)
+        if args.json:
+            _json({"profile": name, "workspace": None, "removed": removed})
+        elif removed:
+            print(
+                f"Profile {name} no longer has a default workspace; "
+                "secrets and api-keys create use the key's own scope."
+            )
+        else:
+            print(f"Profile {name} has no default workspace; nothing to clear.")
+        return 0
+    scope = entry["scope"]
+    if scope["type"] == "workspace":
+        own_id, own_name = str(scope["workspace_id"]), str(scope["workspace_name"])
+        if args.workspace not in (own_id, own_name):
+            _die(
+                lambda s: (
+                    f"This profile's key is confined to workspace {s(own_name)} ({s(own_id)}); "
+                    "it cannot use another workspace. Log in again without --workspace for an "
+                    "account-wide key."
+                ),
+                "workspace_confined",
+            )
+        if args.json:
+            _json({"profile": name, "workspace": {"id": own_id, "name": own_name}, "source": "key"})
+        else:
+            print(
+                f"Profile {name}'s key is already confined to "
+                f"{_workspace_text(own_id, own_name)}; nothing was saved."
+            )
+        return 0
+    with _client(name) as client:
+        found = client.workspaces.get(_workspace_id(client, args.workspace))
+    save_workspace_default(
+        name, WorkspaceDefault(str(entry["account"]["id"]), found.id, found.name)
+    )
+    if args.json:
+        _json(
+            {
+                "profile": name,
+                "workspace": {"id": found.id, "name": found.name},
+                "source": "profile",
+            }
+        )
+    else:
+        print(
+            f"Profile {name} now uses {_workspace_text(found.id, found.name)} by default "
+            "for secrets and api-keys create."
+        )
+    return 0
+
+
+def _cmd_workspaces_current(args: argparse.Namespace) -> int:
+    if _environment_key():
+        if args.json:
+            _json({"profile": None, "workspace": None, "source": "none"})
+        else:
+            print(
+                "none: MANDALA_API_KEY is set, so no saved default applies; commands use that "
+                f"key's own scope (`{PROG} whoami` shows it)."
+            )
+        return 0
+    name, entry = saved_profile(args.profile)
+    scope = entry["scope"]
+    if scope["type"] == "workspace":
+        own_id, own_name = str(scope["workspace_id"]), str(scope["workspace_name"])
+        if args.json:
+            _json({"profile": name, "workspace": {"id": own_id, "name": own_name}, "source": "key"})
+        else:
+            print(f"{_workspace_text(own_id, own_name)}: profile {name}'s key is confined to it.")
+        return 0
+
+    def note(line: str) -> None:
+        print(line, file=sys.stderr)
+
+    found, ignored = workspace_default(_defaults_or_note(note), name, entry["account"]["id"])
+    if ignored is not None:
+        note(
+            f"{PROG}: The default "
+            f"{_workspace_text(ignored.workspace_id, ignored.workspace_name)} saved for profile "
+            f"{name} is ignored: it was saved for account {_printable(ignored.account_id)}, and "
+            f"the profile is now logged in to {_printable(entry['account']['id'])}. Run "
+            "workspaces use again, or workspaces use --clear."
+        )
+    if args.json:
+        _json(
+            {
+                "profile": name,
+                "workspace": (
+                    None
+                    if found is None
+                    else {"id": found.workspace_id, "name": found.workspace_name}
+                ),
+                "source": "none" if found is None else "profile",
+            }
+        )
+    elif found is not None:
+        print(
+            f"{_workspace_text(found.workspace_id, found.workspace_name)}: profile {name}'s "
+            "default from workspaces use (workspaces use --clear for account-wide)."
+        )
+    else:
+        print(
+            f"none: account-wide (profile {name} has no default workspace; "
+            "set one with workspaces use)."
+        )
+    return 0
+
+
 def _workspaces_parser(sub: Any) -> None:
     spaces = sub.add_parser("workspaces", help="the account's workspaces")
     verbs = spaces.add_subparsers(dest="verb", required=True)
@@ -2318,6 +2521,29 @@ def _workspaces_parser(sub: Any) -> None:
     )
     rm.add_argument("--json", action="store_true", help="the answer as JSON")
     rm.set_defaults(fn=_cmd_workspaces_rm)
+    profile_help = "the saved profile (default: MANDALA_PROFILE, then the saved default)"
+    use = verbs.add_parser(
+        "use",
+        help=(
+            "save a default workspace, by name or id, in a saved profile for secrets and "
+            "api-keys create (an explicit --workspace still wins); never changes the key"
+        ),
+    )
+    use.add_argument("workspace", metavar="WORKSPACE", nargs="?")
+    use.add_argument("--clear", action="store_true", help="remove the profile's default workspace")
+    use.add_argument("--profile", metavar="NAME", help=profile_help)
+    use.add_argument("--json", action="store_true", help="the result as JSON")
+    use.set_defaults(fn=_cmd_workspaces_use)
+    current = verbs.add_parser(
+        "current",
+        help=(
+            "the workspace secrets and api-keys create use, and why: the key's own, the "
+            "profile's default, or none (account-wide); needs no network"
+        ),
+    )
+    current.add_argument("--profile", metavar="NAME", help=profile_help)
+    current.add_argument("--json", action="store_true", help="the result as JSON")
+    current.set_defaults(fn=_cmd_workspaces_current)
 
 
 def _webhooks_parser(sub: Any) -> None:

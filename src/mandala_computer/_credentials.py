@@ -4,6 +4,10 @@ The TypeScript CLI's ``mandala login`` adds to the store; the one write made
 here is :func:`remove_profile` (``mandala-py logout``), under the same lock
 file and the same checks. Paths and parsed values never appear in errors: both
 can contain credentials supplied by an untrusted local file.
+
+The reading and replacing below also serve ``~/.mandala/defaults.json``
+(``_defaults``), a sibling file with its own lock, read and written with the
+same checks.
 """
 
 from __future__ import annotations
@@ -16,9 +20,12 @@ import os
 import re
 import stat
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+_T = TypeVar("_T")
 
 from ._exceptions import MandalaError
 
@@ -187,7 +194,8 @@ def _check_stat(info: os.stat_result, *, directory: bool) -> None:
         raise CredentialError("file_too_large")
 
 
-def _read_store() -> bytes:
+def _read_store(name: str = "credentials.json") -> bytes:
+    """The bytes of ``~/.mandala/<name>``; a missing one is ``missing_credentials``."""
     deadline = time.monotonic() + _READ_SECONDS
     descriptors: list[int] = []
     stage = "unsafe_directory"
@@ -211,7 +219,7 @@ def _read_store() -> bytes:
         _check_stat(os.fstat(directory_fd), directory=True)
         check_time()
         stage = "unsafe_file"
-        file_fd = os.open("credentials.json", flags, dir_fd=directory_fd)
+        file_fd = os.open(name, flags, dir_fd=directory_fd)
         descriptors.append(file_fd)
         _check_stat(os.fstat(file_fd), directory=False)
         result = bytearray()
@@ -386,12 +394,12 @@ def _same(a: os.stat_result, b: os.stat_result) -> bool:
     return a.st_dev == b.st_dev and a.st_ino == b.st_ino
 
 
-def _read_in(directory_fd: int) -> bytes | None:
-    """The store's bytes, read relative to an already-checked directory, or
+def _read_in(directory_fd: int, name: str = _STORE) -> bytes | None:
+    """A store's bytes, read relative to an already-checked directory, or
     ``None`` when there is no store."""
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
     try:
-        fd = os.open(_STORE, flags, dir_fd=directory_fd)
+        fd = os.open(name, flags, dir_fd=directory_fd)
     except FileNotFoundError:
         return None
     try:
@@ -429,12 +437,68 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
     )
     if selected is not None:
         selected = _profile(selected)
+
+    def compute(old: bytes | None, path: str) -> tuple[bytes | None | object, RemovedProfile]:
+        data = None if old is None else _parse_store(old)
+        name = selected or (data["default_profile"] if data else "default")
+        if data is None or name not in data["profiles"]:
+            return KEEP, RemovedProfile(
+                name, False, path, None, data["default_profile"] if data else None
+            )
+        key_id = str(data["profiles"][name]["key_id"])
+        profiles = {k: v for k, v in data["profiles"].items() if k != name}
+        left = sorted(profiles)
+        if not left:
+            return None, RemovedProfile(name, True, path, key_id, None)
+        default = left[0] if data["default_profile"] == name else data["default_profile"]
+        payload = (
+            json.dumps(
+                {"version": 1, "default_profile": default, "profiles": profiles},
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        _parse_store(payload)
+        if len(payload) > _MAX_BYTES:
+            raise CredentialError("file_too_large")
+        return payload, RemovedProfile(name, True, path, key_id, default)
+
+    return rewrite_locked(_STORE, _LOCK, ".credentials-", compute, lock_timeout=lock_timeout)
+
+
+#: What a :func:`rewrite_locked` computation returns to write nothing.
+KEEP = object()
+
+
+def rewrite_locked(
+    store: str,
+    lock: str,
+    temp_prefix: str,
+    compute: Callable[[bytes | None, str], tuple[bytes | None | object, _T]],
+    *,
+    lock_timeout: float = 5.0,
+) -> _T:
+    """A store's one writer: ``~/.mandala/<store>`` under ``~/.mandala/<lock>``.
+
+    ``compute`` is handed the store's bytes read under the lock (``None`` when
+    there is none) and its path, and answers the next bytes and a result:
+    :data:`KEEP` writes nothing, ``None`` removes the store, and bytes replace
+    it through a flushed private temporary file renamed over it, once the store
+    is re-read and found unchanged. The lock is never stolen from another
+    writer. A missing ``~/.mandala`` is left missing: ``compute`` sees no store,
+    and a write it asks for then fails.
+
+    Failures are :class:`CredentialError`: ``compute``'s own, a check's, or
+    ``credential_remove_failed`` (nothing changed) and
+    ``credential_remove_unconfirmed`` (changed, not confirmed durable).
+    """
     if not _supported():
         raise CredentialError("unsupported_file_protection")
     home = Path.home()
     if not home.is_absolute():
         raise CredentialError("unsafe_directory")
-    path = str(home / ".mandala" / _STORE)
+    path = str(home / ".mandala" / store)
     descriptors: list[int] = []
     lock_info: os.stat_result | None = None
     temp: str | None = None
@@ -450,7 +514,10 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
                 dir_fd=home_fd,
             )
         except FileNotFoundError:
-            return RemovedProfile(selected or "default", False, path, None, None)
+            payload, result = compute(None, path)
+            if payload is KEEP:
+                return result
+            raise CredentialError("credential_remove_failed") from None
         descriptors.append(directory_fd)
         _check_stat(os.fstat(directory_fd), directory=True)
 
@@ -458,7 +525,7 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
         while True:
             try:
                 lock_fd = os.open(
-                    _LOCK,
+                    lock,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o600,
                     dir_fd=directory_fd,
@@ -477,31 +544,14 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
         lock_info = os.fstat(lock_fd)
         _check_stat(lock_info, directory=False)
 
-        old = _read_in(directory_fd)
-        data = None if old is None else _parse_store(old)
-        name = selected or (data["default_profile"] if data else "default")
-        if data is None or name not in data["profiles"]:
-            return RemovedProfile(
-                name, False, path, None, data["default_profile"] if data else None
-            )
-        key_id = str(data["profiles"][name]["key_id"])
-        profiles = {k: v for k, v in data["profiles"].items() if k != name}
-        left = sorted(profiles)
-        default = None
-        if left:
-            default = left[0] if data["default_profile"] == name else data["default_profile"]
-            payload = (
-                json.dumps(
-                    {"version": 1, "default_profile": default, "profiles": profiles},
-                    indent=2,
-                    ensure_ascii=False,
-                )
-                + "\n"
-            ).encode("utf-8")
-            _parse_store(payload)
-            if len(payload) > _MAX_BYTES:
-                raise CredentialError("file_too_large")
-            temp = f".credentials-{os.urandom(16).hex()}.tmp"
+        old = _read_in(directory_fd, store)
+        payload, result = compute(old, path)
+        if payload is KEEP:
+            return result
+        if payload is not None:
+            if not isinstance(payload, bytes):
+                raise TypeError("a store's next contents are bytes")
+            temp = f"{temp_prefix}{os.urandom(16).hex()}.tmp"
             temp_fd = os.open(
                 temp,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -515,21 +565,21 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
                 view = view[os.write(temp_fd, view) :]
             os.fsync(temp_fd)
         # The store was read under the lock; it must still be exactly that.
-        if _read_in(directory_fd) != old:
+        if _read_in(directory_fd, store) != old:
             raise CredentialError("unsafe_file")
-        if not _same(os.stat(_LOCK, dir_fd=directory_fd, follow_symlinks=False), lock_info):
+        if not _same(os.stat(lock, dir_fd=directory_fd, follow_symlinks=False), lock_info):
             raise CredentialError("unsafe_file")
         if temp is not None:
-            os.replace(temp, _STORE, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            os.replace(temp, store, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
             temp = None
         else:
-            os.unlink(_STORE, dir_fd=directory_fd)
+            os.unlink(store, dir_fd=directory_fd)
         committed = True
         try:
             os.fsync(directory_fd)
         except OSError:
             raise CredentialError("credential_remove_unconfirmed") from None
-        return RemovedProfile(name, True, path, key_id, default)
+        return result
     except CredentialError:
         raise
     except (OSError, RuntimeError, ValueError):
@@ -543,8 +593,8 @@ def remove_profile(profile: str | None = None, *, lock_timeout: float = 5.0) -> 
                     os.unlink(temp, dir_fd=directory_fd)
             if lock_info is not None:
                 with contextlib.suppress(OSError):
-                    if _same(os.stat(_LOCK, dir_fd=directory_fd, follow_symlinks=False), lock_info):
-                        os.unlink(_LOCK, dir_fd=directory_fd)
+                    if _same(os.stat(lock, dir_fd=directory_fd, follow_symlinks=False), lock_info):
+                        os.unlink(lock, dir_fd=directory_fd)
         for descriptor in reversed(descriptors):
             with contextlib.suppress(OSError):
                 os.close(descriptor)

@@ -24,6 +24,17 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **`mandala-py workspaces use` and `workspaces current`**: save a default
+  workspace, by name or id, for a saved profile; `secrets list`, `set` and
+  `rm` and `api-keys create` then use it when `--workspace` is not given (an
+  explicit `--workspace` wins; `workspaces use --clear` goes back to
+  account-wide). `current` says which workspace applies and why: the key's own,
+  the profile's default, or none. The default is kept in a new
+  `~/.mandala/defaults.json`, keyed by profile and account and shared with the
+  npm `mandala` CLI, so `credentials.json` and older readers of it are
+  unaffected. `use` is refused with `MANDALA_API_KEY` set, and for another
+  workspace when the profile's key is confined to one; `logout` removes the
+  profile's default.
 - **Workspace create, rename and delete**: `client.workspaces.create(name)`,
   `rename(workspace_id, name)` and `delete(workspace_id)` (sync and async), and
   `mandala-py workspaces create`, `rename` and `rm --yes` (by name or id). They
