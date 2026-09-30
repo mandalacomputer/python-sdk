@@ -125,6 +125,7 @@ from ._models import (
     Snapshot,
     SnapshotHoldings,
     SshAccess,
+    TypeResult,
     Window,
     WindowResult,
     _optional_result_id,
@@ -1214,16 +1215,33 @@ class AsyncComputer(ComputerFields):
         context: bool,
     ) -> InputContext | None:
         params = _api.input_params(context)
-        data = await self._input(_api.click_body(action, x, y, modifiers, count), params=params)
+        return await self._acted(_api.click_body(action, x, y, modifiers, count), params)
+
+    async def _acted(
+        self,
+        body: dict[str, Any],
+        params: dict[str, str] | None,
+        *,
+        timeout: float | None = None,
+    ) -> InputContext | None:
+        """Send an input action, and answer the context after it when asked.
+
+        ``params`` comes from :func:`_api.input_params`, which each caller runs
+        before it builds ``body`` so that a malformed ``context`` is refused
+        before anything is sent.
+        """
+        data = await self._input(body, timeout=timeout, params=params)
         return _input_context(data) if params else None
 
-    async def move(self, x: int, y: int) -> None:
+    async def move(self, x: int, y: int, *, context: bool = False) -> InputContext | None:
         """Move the pointer to ``(x, y)`` in this computer's screen space.
 
         Coordinates are in the computer's own :attr:`resolution`, which is a
-        create-time choice — not a fixed 1280x800.
+        create-time choice — not a fixed 1280x800. Takes ``context`` as
+        :meth:`click` does.
         """
-        await self._input(_api.pointer_body("move", x, y))
+        params = _api.input_params(context)
+        return await self._acted(_api.pointer_body("move", x, y), params)
 
     async def click(
         self,
@@ -1290,7 +1308,8 @@ class AsyncComputer(ComputerFields):
         from_x: int | None = None,
         from_y: int | None = None,
         modifiers: tuple[str, ...] = (),
-    ) -> None:
+        context: bool = False,
+    ) -> InputContext | None:
         """Press, move, release — one gesture.
 
         The pointer passes through intermediate positions, which is what makes
@@ -1305,22 +1324,31 @@ class AsyncComputer(ComputerFields):
         ``await c.drag(400, 300, from_x=100, from_y=200, modifiers=("shift",))`` to
         extend a selection. They are pressed before the pointer moves and
         released after the button. Give a tuple of key names: a single string
-        such as ``"shift"`` is refused with ``ValueError``.
+        such as ``"shift"`` is refused with ``ValueError``. Takes ``context``
+        as :meth:`click` does.
         """
-        await self._input(_api.drag_body(from_x, from_y, to_x, to_y, modifiers))
+        params = _api.input_params(context)
+        return await self._acted(_api.drag_body(from_x, from_y, to_x, to_y, modifiers), params)
 
-    async def mouse_down(self, x: int | None = None, y: int | None = None) -> None:
+    async def mouse_down(
+        self, x: int | None = None, y: int | None = None, *, context: bool = False
+    ) -> InputContext | None:
         """Press the left button and leave it down.
 
         Pair with :meth:`mouse_up`. Between the two the desktop is mid-gesture,
         so a call that raises in between leaves the button held — wrap them in
-        ``try``/``finally`` if that matters.
+        ``try``/``finally`` if that matters. Takes ``context`` as :meth:`click`
+        does.
         """
-        await self._input(_api.button_body("left_mouse_down", x, y))
+        params = _api.input_params(context)
+        return await self._acted(_api.button_body("left_mouse_down", x, y), params)
 
-    async def mouse_up(self, x: int | None = None, y: int | None = None) -> None:
-        """Release the left button."""
-        await self._input(_api.button_body("left_mouse_up", x, y))
+    async def mouse_up(
+        self, x: int | None = None, y: int | None = None, *, context: bool = False
+    ) -> InputContext | None:
+        """Release the left button. Takes ``context`` as :meth:`click` does."""
+        params = _api.input_params(context)
+        return await self._acted(_api.button_body("left_mouse_up", x, y), params)
 
     async def scroll(
         self,
@@ -1330,7 +1358,8 @@ class AsyncComputer(ComputerFields):
         direction: str = "down",
         amount: int = 3,
         modifiers: tuple[str, ...] = (),
-    ) -> None:
+        context: bool = False,
+    ) -> InputContext | None:
         """Scroll the wheel, first moving to ``(x, y)`` when a point is given.
 
         With no coordinate it scrolls whatever is under the pointer, which is
@@ -1342,52 +1371,80 @@ class AsyncComputer(ComputerFields):
 
         ``modifiers`` are held down for the scroll, e.g. ``modifiers=("ctrl",)``.
         Give a tuple of key names: a single string such as ``"ctrl"`` is
-        refused with ``ValueError``.
+        refused with ``ValueError``. Takes ``context`` as :meth:`click` does.
         """
-        await self._input(_api.scroll_body(x, y, direction, amount, modifiers))
+        params = _api.input_params(context)
+        return await self._acted(_api.scroll_body(x, y, direction, amount, modifiers), params)
 
-    async def type(self, text: str) -> str | None:
+    @overload
+    async def type(self, text: str, *, context: Literal[False] = ...) -> str | None: ...
+
+    @overload
+    async def type(self, text: str, *, context: Literal[True]) -> TypeResult: ...
+
+    @overload
+    async def type(self, text: str, *, context: bool) -> str | TypeResult | None: ...
+
+    async def type(self, text: str, *, context: bool = False) -> str | TypeResult | None:
         """Type text as keystrokes, and say how it was typed.
 
         See :meth:`mandala_computer.Computer.type`.
         """
+        params = _api.input_params(context)
         body = _api.type_body(text)
         timeout = None if body["text"].isascii() else UNICODE_TYPE_TIMEOUT
-        return _mechanism(await self._input(body, timeout=timeout))
+        data = await self._input(body, timeout=timeout, params=params)
+        if params:
+            return TypeResult(mechanism=_mechanism(data), context=_input_context(data))
+        return _mechanism(data)
 
-    async def paste(self, text: str, *, shift: bool = False) -> None:
+    async def paste(
+        self, text: str, *, shift: bool = False, context: bool = False
+    ) -> InputContext | None:
         """Put ``text`` on the desktop clipboard and press Ctrl+V.
 
         See :meth:`mandala_computer.Computer.paste`.
         """
-        await self._input(_api.paste_body(text, shift))
+        params = _api.input_params(context)
+        return await self._acted(_api.paste_body(text, shift), params)
 
-    async def key(self, *keys: str) -> None:
+    async def key(self, *keys: str, context: bool = False) -> InputContext | None:
         """Press a chord, e.g. ``await key("ctrl", "c")``.
 
         Both this SDK's names and X11 keysyms are accepted, so the spellings a
         computer-use model produces — ``Page_Down``, ``BackSpace``, ``period`` —
         work without translation. An unknown key raises and names itself rather
-        than being silently dropped from the chord.
+        than being silently dropped from the chord. Takes ``context`` as
+        :meth:`click` does.
         """
-        await self._input(_api.key_body(keys))
+        params = _api.input_params(context)
+        return await self._acted(_api.key_body(keys), params)
 
-    async def hold_key(self, *keys: str, seconds: float) -> None:
+    async def hold_key(
+        self, *keys: str, seconds: float, context: bool = False
+    ) -> InputContext | None:
         """Hold a chord down for ``seconds``, then release it.
 
         For the keys that mean something while held rather than when tapped — an
-        arrow key that repeats, a modifier that changes what a UI shows.
+        arrow key that repeats, a modifier that changes what a UI shows. Takes
+        ``context`` as :meth:`click` does, read after the chord is released.
         """
-        await self._input(_api.hold_key_body(keys, seconds), timeout=seconds + DEADLINE_SLACK)
+        params = _api.input_params(context)
+        body = _api.hold_key_body(keys, seconds)
+        return await self._acted(body, params, timeout=seconds + DEADLINE_SLACK)
 
-    async def wait(self, seconds: float) -> None:
+    async def wait(self, seconds: float, *, context: bool = False) -> InputContext | None:
         """Pause, inside the platform, without holding this computer's monitor.
 
         Sleeping locally does the same thing for a script. This exists because a
         computer-use model emits ``wait`` as an action, and because it does not
-        block the screenshot polls of anything else watching the desktop.
+        block the screenshot polls of anything else watching the desktop. Takes
+        ``context`` as :meth:`click` does, read when the pause ends — the way to
+        see what a slow action has opened by then.
         """
-        await self._input(_api.wait_body(seconds), timeout=seconds + DEADLINE_SLACK)
+        params = _api.input_params(context)
+        body = _api.wait_body(seconds)
+        return await self._acted(body, params, timeout=seconds + DEADLINE_SLACK)
 
     async def cursor_position(self) -> tuple[int, int] | None:
         """Where the pointer is, or ``None`` if nothing has placed it yet.

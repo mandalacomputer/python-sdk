@@ -79,6 +79,7 @@ __all__ = [
     "Template",
     "TemplateBuild",
     "TemplateCheck",
+    "TypeResult",
     "UsagePeriod",
     "UsageReport",
     "UsageTotals",
@@ -2407,7 +2408,7 @@ class Window:
 
 @dataclass(frozen=True)
 class InputContext:
-    """The desktop just after a click, for a call made with ``context=True``.
+    """The desktop just after an input action, for a call made with ``context=True``.
 
     ``windows`` is what :meth:`Computer.windows` lists by default, read once
     straight after the action — there is no settle wait, so a window still
@@ -2416,13 +2417,27 @@ class InputContext:
 
     ``windows`` is ``None``, never ``[]``, when the platform could not read them
     — a Windows guest, no desktop session, a guest agent slow to answer — and
-    ``error`` then says why. The click itself still happened: do not send it
+    ``error`` then says why. The action itself still happened: do not send it
     again.
     """
 
     windows: list[Window] | None
     focused: Window | None
     error: str | None
+
+
+@dataclass(frozen=True)
+class TypeResult:
+    """What :meth:`Computer.type` answers when called with ``context=True``.
+
+    Without ``context`` it answers the ``mechanism`` alone, as it always has.
+    """
+
+    #: ``"physical"``, ``"unicode"`` or ``"mixed"``, or ``None`` from a
+    #: platform that does not report one.
+    mechanism: str | None
+    #: The desktop just after the typing.
+    context: InputContext
 
 
 @dataclass(frozen=True)

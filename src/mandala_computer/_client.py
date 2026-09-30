@@ -12,6 +12,7 @@ import asyncio
 import json as jsonlib
 import math
 import re
+import sys
 import time
 from collections.abc import AsyncGenerator, Generator, Mapping
 from datetime import timezone
@@ -442,6 +443,30 @@ def _retained_envelope(resp: httpx.Response, content: bytes) -> tuple[bytes, Map
     return content, headers
 
 
+_USER_AGENT_TOKEN = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+
+
+def user_agent_header(product: str | None, suffix: str | None) -> str:
+    """The ``User-Agent`` a client sends: this SDK and its version, the Python
+    and httpx it runs on, then the caller's own token.
+
+    Refuses a ``suffix`` that is not printable ASCII, or that starts or ends
+    with a space. A CR or LF would be a header injection, and httpx refuses
+    one only when the first request is made, naming neither the option nor
+    this SDK.
+    """
+    if suffix is not None and (
+        not isinstance(suffix, str) or not _USER_AGENT_TOKEN.fullmatch(suffix)
+    ):
+        raise ValueError(
+            "user_agent must be printable ASCII with no leading or trailing space, "
+            f"such as 'my-app/1.2' (got {suffix!r})"
+        )
+    v = sys.version_info
+    parts = [product, f"python/{v.major}.{v.minor}.{v.micro}", f"httpx/{httpx.__version__}", suffix]
+    return " ".join(part for part in parts if part)
+
+
 class _BaseTransport:
     """Auth, URL, and error rules — everything about a request except the IO."""
 
@@ -451,7 +476,12 @@ class _BaseTransport:
         base_url: str | None,
         retries: Mapping[str, int] | None = None,
         profile: str | None = None,
+        user_agent: str | None = None,
+        product: str | None = None,
     ) -> None:
+        # Before anything else, as the retries check below is: a malformed
+        # option is refused before the credentials are read.
+        agent = user_agent_header(product, user_agent)
         if retries is not None and (
             not isinstance(retries, Mapping)
             or set(retries) != {"idempotent"}
@@ -467,6 +497,7 @@ class _BaseTransport:
         self._headers = {
             "Authorization": f"Bearer {credentials.key}",
             "Accept": "application/json",
+            "User-Agent": agent,
         }
 
     def _url(self, path: str) -> str:
@@ -1543,8 +1574,10 @@ class Transport(_BaseTransport):
         timeout: float = DEFAULT_TIMEOUT,
         client: httpx.Client | None = None,
         retries: Mapping[str, int] | None = None,
+        user_agent: str | None = None,
+        product: str | None = None,
     ) -> None:
-        super().__init__(api_key, base_url, retries, profile)
+        super().__init__(api_key, base_url, retries, profile, user_agent, product)
         self._owns_client = client is None
         self._http = client or httpx.Client(timeout=timeout)
 
@@ -1989,8 +2022,10 @@ class AsyncTransport(_BaseTransport):
         timeout: float = DEFAULT_TIMEOUT,
         client: httpx.AsyncClient | None = None,
         retries: Mapping[str, int] | None = None,
+        user_agent: str | None = None,
+        product: str | None = None,
     ) -> None:
-        super().__init__(api_key, base_url, retries, profile)
+        super().__init__(api_key, base_url, retries, profile, user_agent, product)
         self._owns_client = client is None
         self._http = client or httpx.AsyncClient(timeout=timeout)
 
