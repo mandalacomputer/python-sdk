@@ -3479,9 +3479,12 @@ profile and by the account the profile was logged in to: after a login to
 another account it is ignored, and `workspaces current` says so. The npm
 `mandala` CLI reads and writes the same file. `credentials.json` is never
 changed, so an older SDK or CLI reading it is unaffected. A `defaults.json`
-that cannot be read is ignored with a note by the commands that read it, and
-never overwritten: `workspaces use` asks you to delete or fix it. `logout`
-removes the profile's default as well.
+that cannot be read (not valid JSON, another version, or readable by others)
+is ignored with a note by `secrets list`, which only reads. `secrets set`,
+`secrets rm` and `api-keys create` refuse instead, sending nothing, rather than
+act account-wide: pass `--workspace`, or fix or delete the file. It is never
+overwritten: `workspaces use` asks you to delete or fix it. `logout` removes
+the profile's default as well.
 
 A profile whose key is confined to a workspace already has that one:
 `workspaces use` of another is refused (log in again without `--workspace` for

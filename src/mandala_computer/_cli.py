@@ -1598,7 +1598,7 @@ def _secret_rows(secrets: Sequence[Secret]) -> str:
 
 def _cmd_secrets_list(args: argparse.Namespace) -> int:
     with _client() as client:
-        listed = client.secrets.list(workspace_id=_scope(args))
+        listed = client.secrets.list(workspace_id=_scope(args, mutating=False))
     if args.json:
         _json(listed.raw)
     elif listed.secrets:
@@ -1655,8 +1655,9 @@ def _secret_value(keep_newline: bool) -> str:
 
 def _cmd_secrets_set(args: argparse.Namespace) -> int:
     value = _secret_value(args.keep_newline)
+    workspace = _scope(args)
     with _client() as client:
-        stored = client.secrets.set(args.name, value, workspace_id=_scope(args))
+        stored = client.secrets.set(args.name, value, workspace_id=workspace)
     if args.json:
         _json(stored.raw)
     else:
@@ -1692,8 +1693,8 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
 
 
 def _cmd_secrets_rm(args: argparse.Namespace) -> int:
+    workspace = _scope(args)
     with _client() as client:
-        workspace = _scope(args)
         listed = client.secrets.list(workspace_id=workspace).secrets
         found = _secret_to_remove(listed, args.name)
         if found is None:
@@ -1882,8 +1883,9 @@ def _cmd_api_keys_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_api_keys_create(args: argparse.Namespace) -> int:
+    workspace = _scope(args)
     with _client() as client:
-        created = client.api_keys.create(name=args.name, workspace_id=_scope(args))
+        created = client.api_keys.create(name=args.name, workspace_id=workspace)
     # The key alone on stdout, so `KEY=$(mandala-py api-keys create)` captures
     # it and nothing else; what it is and the warning go to stderr.
     if args.json:
@@ -2325,11 +2327,29 @@ def _defaults_or_note(note: Callable[[str], None]) -> dict[str, WorkspaceDefault
         return {}
 
 
-def _scope(args: argparse.Namespace) -> str | None:
+def _defaults_or_refuse() -> dict[str, WorkspaceDefault]:
+    """``defaults.json`` for a command that writes: one that cannot be used
+    fails the command before any request. Read as holding nothing, it would
+    send a create, a replace or a delete account-wide when the profile's
+    default says a workspace, and with ``--json`` not even a note would say so."""
+    try:
+        return read_defaults()
+    except DefaultsError as e:
+        _die(
+            f"{DEFAULTS_PATH} cannot be read ({e.reason}), so this command was not sent: "
+            "without the profile's default workspace it would act account-wide. "
+            "Pass --workspace, or fix or delete the file.",
+            "defaults_unreadable",
+        )
+
+
+def _scope(args: argparse.Namespace, *, mutating: bool = True) -> str | None:
     """``secrets`` and ``api-keys create``: ``--workspace``, else the saved
     profile's default from ``workspaces use`` — when the key is account-wide and
     the default was saved for the account the profile is logged in to now.
-    Otherwise None, and the command goes on as it always has."""
+    Otherwise None, and the command goes on as it always has. A command that
+    writes (``mutating``) is refused, not widened, when ``defaults.json``
+    cannot be read; only ``secrets list`` reads past it."""
     if args.workspace is not None:
         return str(args.workspace)
     if _environment_key():
@@ -2343,7 +2363,8 @@ def _scope(args: argparse.Namespace) -> str | None:
         if not quiet:
             print(line, file=sys.stderr)
 
-    found, _ignored = workspace_default(_defaults_or_note(note), name, entry["account"]["id"])
+    defaults = _defaults_or_refuse() if mutating else _defaults_or_note(note)
+    found, _ignored = workspace_default(defaults, name, entry["account"]["id"])
     if found is None:
         return None
     note(

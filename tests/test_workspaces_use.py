@@ -408,6 +408,101 @@ def test_a_defaults_file_others_can_read_is_read_as_none_with_a_note(
     )
 
 
+def _malformed(home: Path) -> None:
+    path = _defaults_path(home)
+    path.write_text('{"version":1,')
+    path.chmod(0o600)
+
+
+def _readable_by_others(home: Path) -> None:
+    defaults.save_workspace_default("default", _default(OTHER))
+    _defaults_path(home).chmod(0o644)
+
+
+_BROKEN = [
+    pytest.param(_malformed, "it is not valid JSON", id="malformed"),
+    pytest.param(_readable_by_others, "it must be a regular file", id="mode-0644"),
+]
+# `secrets rm` has no --json.
+_WRITERS = [
+    pytest.param(["secrets", "set", "NEW_SECRET"], False, id="secrets-set-human"),
+    pytest.param(["secrets", "set", "NEW_SECRET", "--json"], True, id="secrets-set-json"),
+    pytest.param(["secrets", "rm", "OPENAI_API_KEY"], False, id="secrets-rm-human"),
+    pytest.param(["api-keys", "create", "--name", "ci"], False, id="api-keys-create-human"),
+    pytest.param(["api-keys", "create", "--name", "ci", "--json"], True, id="api-keys-create-json"),
+]
+
+
+def _run(argv: list[str]) -> tuple[int, str]:
+    """The exit status, and the sentence a human-mode refusal exits with."""
+    try:
+        return _cli.main(argv), ""
+    except SystemExit as e:
+        return (e.code if isinstance(e.code, int) else 1), str(e.code)
+
+
+@pytest.mark.parametrize(("command", "json_mode"), _WRITERS)
+@pytest.mark.parametrize(("make", "why"), _BROKEN)
+def test_a_command_that_writes_refuses_an_unreadable_defaults_file(
+    home: Path,
+    api: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    make: Any,
+    why: str,
+    command: list[str],
+    json_mode: bool,
+) -> None:
+    _store(home, "default", default=_profile())
+    make(home)
+    before = _defaults_path(home).read_bytes()
+    monkeypatch.setattr(sys, "stdin", _Stdin(io.BytesIO(b"sk-value\n"), encoding="utf-8"))
+    code, exit_text = _run(command)
+    assert code != 0
+    out, err = capsys.readouterr()
+    said = exit_text + out + err
+    assert f"~/.mandala/defaults.json cannot be read ({why}" in said
+    assert "Pass --workspace, or fix or delete the file." in said
+    if json_mode:
+        assert "defaults_unreadable" in said
+    assert [c for c in api.calls if c.request.method != "GET"] == []
+    assert _defaults_path(home).read_bytes() == before
+
+
+@pytest.mark.parametrize(("command", "json_mode"), _WRITERS)
+@pytest.mark.parametrize(("make", "why"), _BROKEN)
+def test_a_command_that_writes_goes_ahead_with_workspace_despite_the_file(
+    home: Path,
+    api: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    make: Any,
+    why: str,
+    command: list[str],
+    json_mode: bool,
+) -> None:
+    _store(home, "default", default=_profile())
+    make(home)
+    monkeypatch.setattr(sys, "stdin", _Stdin(io.BytesIO(b"sk-value\n"), encoding="utf-8"))
+    assert _cli.main([*command, "--workspace", WORKSPACE["id"]]) == 0
+    writes = [c.request for c in api.calls if c.request.method != "GET"]
+    assert writes
+    assert [_sent(r) for r in writes] == [WORKSPACE["id"]] * len(writes)
+    assert "defaults.json" not in capsys.readouterr().err
+
+
+def test_a_command_that_writes_ignores_the_file_for_a_confined_or_environment_key(
+    home: Path, api: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _store(home, "default", default=_profile(CONFINED))
+    _malformed(home)
+    assert _cli.main(["api-keys", "create", "--json"]) == 0
+    _store(home, "default", default=_profile())
+    monkeypatch.setenv("MANDALA_API_KEY", "com_env_key")
+    monkeypatch.setenv("MANDALA_BASE_URL", BASE)
+    assert _cli.main(["api-keys", "create", "--json"]) == 0
+
+
 # --- logout ---------------------------------------------------------------------
 
 

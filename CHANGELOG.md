@@ -34,7 +34,10 @@ This is the summary you read to decide whether to upgrade.
   npm `mandala` CLI, so `credentials.json` and older readers of it are
   unaffected. `use` is refused with `MANDALA_API_KEY` set, and for another
   workspace when the profile's key is confined to one; `logout` removes the
-  profile's default.
+  profile's default. A `defaults.json` that cannot be read is ignored with a
+  note by `secrets list`, but `secrets set`, `secrets rm` and `api-keys create`
+  refuse without sending anything rather than act account-wide (pass
+  `--workspace`, or fix or delete the file).
 - **Workspace create, rename and delete**: `client.workspaces.create(name)`,
   `rename(workspace_id, name)` and `delete(workspace_id)` (sync and async), and
   `mandala-py workspaces create`, `rename` and `rm --yes` (by name or id). They
