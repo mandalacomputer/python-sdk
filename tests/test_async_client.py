@@ -11,6 +11,7 @@ import asyncio
 import base64
 import io
 import json
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -223,16 +224,19 @@ async def test_modifiers_given_as_one_string_are_refused_before_any_request(
 
 
 @respx.mock
-async def test_long_input_actions_widen_the_request_budget(client: mc.AsyncClient) -> None:
+async def test_long_input_actions_widen_the_request_budget() -> None:
+    # A short client timeout, so the platform's 30-second ceiling still has
+    # something to widen past.
+    client = mc.AsyncClient("gck_test", base_url=BASE, timeout=10)
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = mc.AsyncComputer(client._t, COMPUTER)
-    await c.wait(120)
+    await c.wait(30)
     assert route.calls.last.request.extensions["timeout"]["read"] == (
-        120 + mc._client.DEADLINE_SLACK
+        30 + mc._client.DEADLINE_SLACK
     )
-    await c.hold_key("shift", seconds=90)
+    await c.hold_key("shift", seconds=25)
     assert route.calls.last.request.extensions["timeout"]["read"] == (
-        90 + mc._client.DEADLINE_SLACK
+        25 + mc._client.DEADLINE_SLACK
     )
     await client.aclose()
 
@@ -1541,3 +1545,99 @@ async def test_async_waits_fail_at_once_on_a_half_removed_computer(
         with pytest.raises(mc.MandalaError, match="partly removed; it cannot be started") as e:
             await wait(mc.AsyncComputer(client._t, half))
         assert not isinstance(e.value, mc.TimeoutError)
+
+
+# --- OPL-5521: parity fixes ---------------------------------------------------
+
+
+@respx.mock
+async def test_ephemeral_whose_block_deleted_the_computer_is_not_an_error(
+    client: mc.AsyncClient,
+) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(
+        side_effect=[httpx.Response(200, json={}), httpx.Response(404, json={"error": "gone"})]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        async with client.computers.ephemeral() as c:
+            await c.delete()
+    assert route.call_count == 2
+    await client.aclose()
+
+
+@respx.mock
+async def test_ephemeral_cleanup_404_on_the_failure_path_is_not_billable(
+    client: mc.AsyncClient,
+) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(404, json={"error": "gone"}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ZeroDivisionError):
+            async with client.computers.ephemeral():
+                raise ZeroDivisionError("the caller's own bug")
+    await client.aclose()
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "suspend", "restart"])
+@respx.mock
+async def test_a_failed_read_after_a_lifecycle_call_says_the_call_succeeded(
+    client: mc.AsyncClient, action: str
+) -> None:
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    post = respx.post(f"{BASE}/computers/vm-1/{action}").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(side_effect=httpx.ConnectError("reset"))
+    with pytest.raises(mc.MandalaError, match=f"{action} succeeded") as caught:
+        await getattr(c, action)()
+    assert post.call_count == 1
+    assert type(caught.value) is mc.MandalaError
+    assert isinstance(caught.value.__cause__, mc.ConnectionError)
+    assert not mc.is_transient(caught.value)
+    await client.aclose()
+
+
+@respx.mock
+async def test_input_ranges_are_capped_before_the_request(client: mc.AsyncClient) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    with pytest.raises(ValueError, match="50"):
+        await c.scroll(direction="down", amount=51)
+    with pytest.raises(ValueError, match="30 seconds"):
+        await c.wait(31)
+    with pytest.raises(ValueError, match="30 seconds"):
+        await c.hold_key("shift", seconds=31)
+    assert not route.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_write_file_over_the_ceiling_raises_file_too_large(
+    client: mc.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200))
+    monkeypatch.setattr(mc._computer, "FILE_SIZE_LIMIT", 2)
+    with pytest.raises(mc.FileTooLargeError) as caught:
+        await mc.AsyncComputer(client._t, COMPUTER).write_file("/tmp/a", b"abc")
+    assert isinstance(caught.value, ValueError)
+    assert caught.value.status == 413
+    assert not put.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_delete_snapshots_is_purge_snapshots_under_its_other_name(
+    client: mc.AsyncClient,
+) -> None:
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"snapshots_deleted": 1})
+    )
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    await c.delete(delete_snapshots=True, expect="fp")
+    assert dict(route.calls.last.request.url.params) == {"snapshots": "delete", "expect": "fp"}
+    with pytest.raises(TypeError, match="different values"):
+        await c.delete(delete_snapshots=False, purge_snapshots=True, expect="fp")
+    assert route.call_count == 1
+    await client.aclose()

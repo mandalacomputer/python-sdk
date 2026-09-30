@@ -2677,7 +2677,9 @@ period has closed — `until` on its own is measured from the current period's
 start, which is after it.
 
 `since` and `until` are sent as `from` and `to`; the other spelling exists
-because `from` is a Python keyword. Both take an **aware** `datetime` or an RFC
+because `from` is a Python keyword. `from_=` and `to=` are accepted too, as the
+same two bounds under the wire's names — `client.usage.read(from_=..., to=...)`
+— and naming one bound both ways raises `TypeError`. Both take an **aware** `datetime` or an RFC
 3339 string carrying a zone — `"2026-08-01T00:00:00Z"`, not
 `"2026-08-01T00:00:00"`. A naive datetime is refused rather than rendered,
 because the zone that would have to be assumed is not necessarily yours, and a
@@ -2913,7 +2915,9 @@ overwriting.
 
 **One request moves at most 64 MiB**, and that is a limit on the request rather
 than on the file. An oversized write is refused locally, before anything is
-sent; an oversized `read_file()` raises `FileTooLargeError`, which is a signpost
+sent, with `FileTooLargeError` — the platform's own class for a 413, with
+`status` 413 — which is also a `ValueError`, as this refusal always was. An
+oversized `read_file()` raises `FileTooLargeError` too, which is a signpost
 rather than a dead end.
 
 #### A window of a file
@@ -3172,7 +3176,10 @@ Four whose wording predates that rule raise `TypeError` — a pointer coordinate
 a schedule's `hour` and `minute`, an idle-suspend minute count, and a download
 window's `offset` and `length` — so `except (ValueError, TypeError)` is the
 catch that covers all of it. It sits outside the table above deliberately: this
-is a mistake in your own code rather than something the platform said.
+is a mistake in your own code rather than something the platform said. One
+refusal is both: a `write_file()` body over 64 MiB raises `FileTooLargeError`,
+the class the platform's own 413 arrives as, and that local one is also a
+`ValueError`.
 
 `PlanLimitError`'s message names the limit that was hit.
 
@@ -3311,7 +3318,9 @@ window, two minutes after a start, a restart or a reboot inside the guest)
 make `is_transient()` answer `True`; `unavailable` (the computer is not
 running — start it), `running` (the computer IS running and the request needs
 it stopped, such as a resize — stop it; waiting never helps), `unsupported`,
-`exists` and `revoked` make it answer `False`. The set is open: an absent or unknown word is treated as unclassified
+`exists`, `revoked`, `name_taken` (a secret name the account already uses —
+pick another) and `stale_revision` (a secret write naming a `revision_id` that
+has moved — read it again) make it answer `False`. The set is open: an absent or unknown word is treated as unclassified
 and falls back to the exception type, so a `ConflictError` without one still
 answers `True`. Not every 409 has a word yet — a seventeenth background command
 on one computer is refused without one, and waiting does not necessarily help —

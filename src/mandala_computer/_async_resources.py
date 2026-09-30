@@ -13,7 +13,7 @@ from typing import Any
 from . import _api
 from ._async_computer import AsyncComputer
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport
-from ._exceptions import ConflictError, MandalaError, TimeoutError
+from ._exceptions import ConflictError, MandalaError, NotFoundError, TimeoutError
 from ._models import (
     AccountQuota,
     ApiKey,
@@ -106,6 +106,8 @@ from ._resources import (
     _operation_settled,
     _operation_timed_out,
     _publish_refusal,
+    _replayed,
+    _usage_window,
     _wait_timed_out,
     classify_poll_failure,
     deletion_timed_out,
@@ -320,10 +322,16 @@ class AsyncComputers:
             egress_proxy=egress_proxy,
             size=size,
         )
-        data = await self._t.json_object(
+        return (await self._create(body, idempotency_key))[0]
+
+    async def _create(
+        self, body: Mapping[str, Any], idempotency_key: str | None
+    ) -> tuple[AsyncComputer, bool]:
+        """:meth:`create`, also saying whether the answer replayed an earlier call's."""
+        data, headers = await self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
         )
-        return AsyncComputer(self._t, _api.computer_payload(data))
+        return AsyncComputer(self._t, _api.computer_payload(data)), _replayed(headers)
 
     async def launch(
         self,
@@ -348,7 +356,9 @@ class AsyncComputers:
 
         Every create argument is preserved. ``start=False`` defers starting
         until the disk is built; launch still starts it before returning.
-        An admitted start is waited on, and a failed start is never retried.
+        An admitted start is waited on, and a failed start is not retried
+        within one call; a launch resent under its key reads the computer
+        afresh and starts it again.
 
         With ``secrets`` bound it also waits until they have reached the
         desktop (:meth:`AsyncComputer.wait_for_secrets`), so a command run on
@@ -374,20 +384,40 @@ class AsyncComputers:
         after creation retain their type and include its id. Task cancellation
         propagates unchanged. Use ``ephemeral`` for scoped cleanup.
 
-        ``idempotency_key`` is the create's key (see :meth:`create`): after a
-        dropped connection or a timeout on the create, calling ``launch`` again
-        with the same arguments and ``idempotency_key=err.idempotency_key``
-        answers the first create's computer, and launch then carries on
-        waiting for it. A failure of a start launch sends itself (for
-        ``start=False``, or when the create's own start was not admitted), or
-        of a later wait, carries a different key (the start's) or none, so
-        recover from those through the computer's id, which the error's
-        message names, rather than by launching again.
+        ``idempotency_key`` is sent on the create only (see :meth:`create`),
+        and one is made when none is given. An error from the create itself is
+        the create's, and follows :meth:`create`'s rules: after a dropped
+        connection or a timeout, calling ``launch`` again with the same
+        arguments and ``idempotency_key=err.idempotency_key`` answers the first
+        create's computer, and launch then carries on waiting for it.
+
+        An error raised AFTER the create returned (its message starts
+        ``launch of <id> failed:``) that carries an ``idempotency_key`` carries
+        the CREATE's key, even when the stage that failed was a later start. So
+        resending ``launch(..., idempotency_key=err.idempotency_key)`` with the
+        same arguments returns the same computer and runs the rest again; the
+        start's own key is never handed out, because sent on a create it would
+        build a second computer. When such an error names an
+        :attr:`~mandala_computer.APIError.operation_id`, that one is the failed
+        stage's own.
+
+        Such an error whose ``idempotency_key`` is ``None`` (a readiness wait
+        that ran out of time, say, or a start that succeeded but whose refresh
+        failed) also came after a successful create: the computer exists and
+        is billable. Recover through the id its message names
+        (``computers.get`` or a ``wait_*`` method), or delete it. Do not launch
+        again without a key: ``idempotency_key=None`` makes a fresh key, and
+        that launch creates a second computer.
+
+        A replayed create answer (``Idempotent-Replayed: true``) is the first
+        attempt's, up to 24 hours old, so launch reads the computer afresh
+        before acting on it: a start that attempt reported failed is sent
+        again rather than raised again, and a computer stopped or suspended
+        since is started.
         """
         check_wait_args(timeout, poll)
-        computer = await self.create(
+        body = _api.create_body(
             name=name,
-            size=size,
             template=template,
             template_transfer=template_transfer,
             cpu=cpu,
@@ -398,8 +428,11 @@ class AsyncComputers:
             secrets=secrets,
             browser_proxy=browser_proxy,
             egress_proxy=egress_proxy,
-            idempotency_key=idempotency_key,
+            size=size,
         )
+        # See the sync twin: the create's key, settled before the create.
+        launch_key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
+        computer, replayed = await self._create(body, launch_key)
         computer_id = computer.id
         deadline = time.monotonic() + timeout
 
@@ -410,23 +443,28 @@ class AsyncComputers:
             return left
 
         try:
-            start_admitted = _launch_start_admitted(computer.raw)
+            # See the sync twin: a replayed create's body is the first
+            # attempt's, so nothing is read from it until a fresh read.
+            stale = replayed
+            start_admitted = not stale and _launch_start_admitted(computer.raw)
             delay = 0.0
             while True:
-                if computer.build_failed:
-                    await computer.wait_until_built(timeout=0, poll=poll)
-                if computer.start_error:
-                    raise MandalaError(f"did not start: {computer.start_error}")
-                half = computer._half_removed()
-                if half is not None:
-                    raise half
-                status = computer.raw.get("status")
-                if isinstance(status, str) and status in ("running", "stopped", "suspended"):
-                    break
+                if not stale:
+                    if computer.build_failed:
+                        await computer.wait_until_built(timeout=0, poll=poll)
+                    if computer.start_error:
+                        raise MandalaError(f"did not start: {computer.start_error}")
+                    half = computer._half_removed()
+                    if half is not None:
+                        raise half
+                    status = computer.raw.get("status")
+                    if isinstance(status, str) and status in ("running", "stopped", "suspended"):
+                        break
                 # Immediate transports may never yield; zero-delay polls must still do so.
                 await asyncio.sleep(min(delay, remaining()))
                 try:
                     await computer._refresh(timeout_cap=remaining())
+                    stale = False
                     # A later stopped row must not erase an earlier admitted attempt.
                     start_admitted = start_admitted or _launch_start_admitted(computer.raw)
                     delay = poll
@@ -479,6 +517,9 @@ class AsyncComputers:
         except MandalaError as err:
             # Preserve the error object, API attributes and original cause.
             err.args = (f"launch of {computer_id} failed: {err}",)
+            # See the sync twin: the create's key, never a later stage's.
+            if err.idempotency_key is not None:
+                err.idempotency_key = launch_key
             raise
 
     @asynccontextmanager
@@ -491,12 +532,19 @@ class AsyncComputers:
             # caller's exception.
             try:
                 await computer.delete()
+            except NotFoundError:
+                # See the sync half: the block deleted it itself.
+                pass
             except Exception as cleanup_failed:  # noqa: BLE001
                 # See the sync half: every failure, transport errors included.
                 warn_cleanup_failed(computer.id, cleanup_failed)
             raise
         else:
-            await computer.delete()
+            try:
+                await computer.delete()
+            except NotFoundError:
+                # See the sync half: the block deleted it itself.
+                pass
 
     # Rewriting the sentence that names the keyword, not appending a note to
     # the end of it. The first attempt replaced strings the doc does not contain
@@ -1069,6 +1117,8 @@ class AsyncUsage:
         *,
         since: datetime | str | None = None,
         until: datetime | str | None = None,
+        from_: datetime | str | None = None,
+        to: datetime | str | None = None,
     ) -> UsageReport:
         """Running hours weighted by cores and memory, the storage held, and
         the per-computer breakdown behind the totals.
@@ -1087,12 +1137,18 @@ class AsyncUsage:
         sent as ``from``/``to``, which ``from`` being a keyword is the whole
         reason for the other spelling.
 
+        ``from_`` and ``to`` are the same two bounds under the names the wire
+        and the other clients use: ``from_=`` is ``since=`` and ``to=`` is
+        ``until=``. Naming one bound both ways raises :class:`TypeError`, even
+        with the same value.
+
         Check :attr:`~mandala_computer.UsageReport.degraded` and
         :attr:`~mandala_computer.UsageReport.unmetered` on the way out. Each
         figure is a sum across the fleet, so a hypervisor that did not answer
         leaves a total that is quietly short rather than an obviously missing
         row, and those two flags are the only thing that says so.
         """
+        since, until = _usage_window(since, until, from_, to)
         data = await self._t.json_object("GET", _api.USAGE, params=_api.usage_params(since, until))
         return UsageReport.from_api(data)
 

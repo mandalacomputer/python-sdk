@@ -724,3 +724,71 @@ async def test_an_async_429_carries_the_budget_headers_too():
         with pytest.raises(mc.RateLimitError) as caught:
             await client.computers.list()
     assert (caught.value.limit, caught.value.remaining, caught.value.reset) == (600, 0, 9)
+
+
+# --- OPL-5521 ------------------------------------------------------------------
+
+
+def _mapped(status, **kw):
+    request = httpx.Request("GET", f"{BASE}/computers")
+    return _client._BaseTransport._error(httpx.Response(status, request=request, **kw))
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        (
+            {"title": "Forbidden", "detail": "blocked by the edge", "status": 403},
+            "blocked by the edge",
+        ),
+        ({"title": "Forbidden", "status": 403}, "Forbidden"),
+        ({"title": "Forbidden", "detail": "  "}, "Forbidden"),
+        ({"error": {"code": 7}, "detail": "blocked by the edge"}, "blocked by the edge"),
+        ({"error": "the platform's own", "detail": "an edge's"}, "the platform's own"),
+    ],
+)
+def test_an_rfc_9457_body_gives_the_message(body, message):
+    err = _mapped(403, json=body)
+    assert isinstance(err, mc.PermissionDeniedError)
+    assert str(err) == message
+    assert err.body == body
+
+
+@pytest.mark.parametrize(
+    "status, wording",
+    [
+        (504, _client.GATEWAY_TIMEOUT_MESSAGE),
+        (524, _client.GATEWAY_TIMEOUT_MESSAGE),
+        (520, _client.ORIGIN_RESPONSE_MESSAGE),
+    ],
+)
+def test_an_rfc_9457_body_is_not_the_platform_naming_the_failure(status, wording):
+    # Read for the message, never as the platform's own account: a status this
+    # SDK has wording for keeps it.
+    err = _mapped(status, json={"title": "Gateway Timeout", "detail": "the edge gave up"})
+    assert str(err) == f"{wording} (HTTP {status})"
+
+
+def test_a_502_is_a_bare_api_error():
+    err = _mapped(502, json={"title": "Bad Gateway", "detail": "the edge could not"})
+    assert type(err) is mc.APIError
+    assert str(err) == "the edge could not"
+
+
+@pytest.mark.parametrize("status", [521, 522, 523])
+def test_an_unreachable_origin_gets_the_sdks_wording_whatever_the_body(status):
+    err = _mapped(status, json={"title": "Web server is down", "detail": "the edge says"})
+    assert type(err) is mc.OriginUnreachableError
+    assert str(err) == f"{_client.ORIGIN_UNREACHABLE_MESSAGE} (HTTP {status})"
+
+
+@pytest.mark.parametrize("reason", ["name_taken", "stale_revision"])
+def test_the_secret_stores_409_words_are_permanent(reason):
+    from mandala_computer._resources import _publish_refusal
+
+    err = _mapped(409, json={"error": "refused", "reason": reason})
+    assert type(err) is mc.ConflictError
+    assert err.reason == reason
+    assert mc.is_transient(err) is False
+    # A publish keeps a permanent word as the platform sent it, unchanged.
+    assert _publish_refusal(err) is err

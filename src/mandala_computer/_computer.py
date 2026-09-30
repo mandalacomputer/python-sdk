@@ -61,6 +61,7 @@ from ._exceptions import (
     RateLimitError,
     TimeoutError,
     _is_transient_for_poll,
+    _UploadTooLargeError,
 )
 from ._executions import ExecutionMetadata, ExecutionOutput, decode_metadata, decode_output
 from ._models import (
@@ -540,6 +541,22 @@ def _bytes_written(resp: httpx.Response) -> int | None:
     return int(written) if written >= 0 else None
 
 
+def _snapshot_sweep(purge_snapshots: object, delete_snapshots: object) -> bool:
+    """``delete``'s snapshot sweep, from whichever spelling of it was used.
+
+    Each is checked as a real ``bool`` before they are compared, so ``"false"``
+    is refused under its own name rather than compared as a truthy string.
+    """
+    purge = None if purge_snapshots is None else _api.flag(purge_snapshots, "purge_snapshots")
+    sweep = None if delete_snapshots is None else _api.flag(delete_snapshots, "delete_snapshots")
+    if purge is not None and sweep is not None and purge != sweep:
+        raise TypeError(
+            "delete() got purge_snapshots and delete_snapshots with different values; "
+            "pass delete_snapshots only"
+        )
+    return bool(sweep if sweep is not None else purge)
+
+
 def _file_body(data: bytes | str) -> bytes:
     if isinstance(data, str):
         # Unpaired surrogates are not UTF-8; ``encode`` raises
@@ -553,7 +570,10 @@ def _file_body(data: bytes | str) -> bytes:
     else:
         body = data
     if len(body) > FILE_SIZE_LIMIT:
-        raise ValueError(f"file data may not exceed {FILE_SIZE_LIMIT // (1024 * 1024)} MiB")
+        # FileTooLargeError, as the platform's own 413 is, and still a ValueError.
+        raise _UploadTooLargeError(
+            f"file data may not exceed {FILE_SIZE_LIMIT // (1024 * 1024)} MiB"
+        )
     return body
 
 
@@ -2419,6 +2439,24 @@ class Computer(ComputerFields):
         )
         return self
 
+    def _refresh_after(self, action: str) -> Computer:
+        """The read that follows a lifecycle call the platform has already accepted.
+
+        A failure here is not the action's. Raised as is, a dropped connection
+        on this GET would read as a :class:`~mandala_computer.ConnectionError`
+        worth sending again, and resending a restart resets the computer twice.
+        So it becomes a plain :class:`~mandala_computer.MandalaError` saying the
+        action succeeded, with the read's own error as its cause.
+        """
+        try:
+            return self.refresh()
+        except MandalaError as cause:
+            raise MandalaError(
+                f"{action} succeeded, but refreshing {self.id} failed; this handle "
+                "still has its previous state. Do not send the action again because "
+                f"of this refresh failure: {cause}"
+            ) from cause
+
     def start(self, *, resume_only: bool = False, idempotency_key: str | None = None) -> Computer:
         """Start this computer, or resume it if its session was suspended.
 
@@ -2444,7 +2482,7 @@ class Computer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return self.refresh()
+        return self._refresh_after("start")
 
     def stop(self, *, force: bool = False, idempotency_key: str | None = None) -> Computer:
         """Stop this computer, discarding a suspended session if it has one.
@@ -2463,7 +2501,7 @@ class Computer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return self.refresh()
+        return self._refresh_after("stop")
 
     def suspend(self, *, idempotency_key: str | None = None) -> Computer:
         """Write this computer's RAM to disk and give the host its memory back.
@@ -2484,7 +2522,7 @@ class Computer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return self.refresh()
+        return self._refresh_after("suspend")
 
     def restart(self, *, idempotency_key: str | None = None) -> Computer:
         """Reset this computer.
@@ -2514,7 +2552,7 @@ class Computer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return self.refresh()
+        return self._refresh_after("restart")
 
     def clone(self, name: str | None = None, *, idempotency_key: str | None = None) -> Computer:
         """Copy this computer into a new one. The source must be stopped or
@@ -2894,7 +2932,8 @@ class Computer(ComputerFields):
     def delete(
         self,
         *,
-        purge_snapshots: bool = ...,
+        purge_snapshots: bool | None = ...,
+        delete_snapshots: bool | None = ...,
         expect: str | None = ...,
         detailed: Literal[False] = ...,
         idempotency_key: str | None = ...,
@@ -2904,7 +2943,8 @@ class Computer(ComputerFields):
     def delete(
         self,
         *,
-        purge_snapshots: bool = ...,
+        purge_snapshots: bool | None = ...,
+        delete_snapshots: bool | None = ...,
         expect: str | None = ...,
         detailed: Literal[True],
         idempotency_key: str | None = ...,
@@ -2913,7 +2953,8 @@ class Computer(ComputerFields):
     def delete(
         self,
         *,
-        purge_snapshots: bool = False,
+        purge_snapshots: bool | None = None,
+        delete_snapshots: bool | None = None,
         expect: str | None = None,
         detailed: bool = False,
         idempotency_key: str | None = None,
@@ -2924,14 +2965,14 @@ class Computer(ComputerFields):
         can still be cloned into a new computer but can no longer be restored —
         a restore puts the disk back on a source that no longer exists.
 
-        ``purge_snapshots=True`` destroys them with it, and needs ``expect``: the
+        ``delete_snapshots=True`` destroys them with it, and needs ``expect``: the
         fingerprint from :meth:`snapshot_holdings`, which binds the sweep to the
         set you were actually shown. Read the holdings, check the count and the
         size are what you meant to destroy, then pass the fingerprint you read::
 
             held = c.snapshot_holdings()
             if held.count == 2:
-                c.delete(purge_snapshots=True, expect=held.fingerprint)
+                c.delete(delete_snapshots=True, expect=held.fingerprint)
 
         Do not fetch the fingerprint on the line above the delete. That binds
         the purge to whatever the set is now rather than to what anyone agreed
@@ -2954,11 +2995,17 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.ConflictError`; one whose outcome is unknown
         is a 503 :class:`~mandala_computer.UnavailableError`, which is not safe
         to send again blind — read :meth:`snapshot_holdings` first.
+
+        ``delete_snapshots`` is the same switch under the name the other
+        clients use, and the one to prefer; ``purge_snapshots`` is deprecated
+        in its favour and still works. Passing both with different values
+        raises :class:`TypeError`.
         """
+        sweep = _snapshot_sweep(purge_snapshots, delete_snapshots)
         data = self._t.json_object_or_empty(
             "DELETE",
             _api.computer(self.id),
-            params=_api.delete_params(purge_snapshots=purge_snapshots, expect=expect),
+            params=_api.delete_params(purge_snapshots=sweep, expect=expect),
             headers=_api.idempotency_headers(idempotency_key),
         )
         # `None` is an empty body — a 204, or a 200 with nothing in it — which is
@@ -4349,7 +4396,9 @@ class Computer(ComputerFields):
         A ``str`` is written as UTF-8. The path rules are :meth:`read_file`'s.
         The bytes land exactly as given — this is how a credential reaches a
         guest ``.env`` without echoing it through a shell command line.
-        Bodies over 64 MiB are refused before any request is made.
+        Bodies over 64 MiB are refused before any request is made, with
+        :class:`~mandala_computer.FileTooLargeError` (which is also a
+        :class:`ValueError`, as this refusal was before).
 
         ``overwrite=False`` makes the write create-only: the file is written
         only if nothing is at ``path`` yet. When something is, the platform

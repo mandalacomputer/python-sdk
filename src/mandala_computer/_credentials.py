@@ -346,8 +346,13 @@ def resolve_credentials(
         key = _trim(os.environ.get("MANDALA_API_KEY", ""))
         source = "environment"
     if key:
-        # Preserve the SDK's existing base precedence and URL behavior here.
+        # Preserve the SDK's existing base precedence and URL behavior here,
+        # except for a query or a fragment: every path is appended to the base
+        # as a string, so either would swallow the path joined after it. The
+        # same refusal a credential file's base URL gets.
         base = (base_url or os.environ.get("MANDALA_BASE_URL") or default_base).rstrip("/")
+        if "?" in base or "#" in base:
+            raise CredentialError("invalid_base_url")
         return Credentials(key, base, source)
     selected = (
         profile if profile is not None else _trim(os.environ.get("MANDALA_PROFILE", "")) or None

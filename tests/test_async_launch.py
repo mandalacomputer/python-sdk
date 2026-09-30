@@ -7,7 +7,17 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from tests.test_launch import BASE, COMPUTER, CREATE_ARGS, GUEST, Scenario, state, step
+from tests.test_launch import (
+    BASE,
+    COMPUTER,
+    CREATE_ARGS,
+    GUEST,
+    STALE_CREATES,
+    Replay,
+    Scenario,
+    state,
+    step,
+)
 
 import mandala_computer as mc
 import mandala_computer._async_computer as computers
@@ -496,3 +506,39 @@ async def test_launch_refuses_a_bad_idempotency_key_before_any_request():
         with pytest.raises(ValueError, match="idempotency_key"):
             await client.computers.launch(template="base", idempotency_key="has space")
     assert requests == []
+
+
+@pytest.mark.parametrize("stale", STALE_CREATES)
+async def test_a_replayed_create_is_read_afresh_and_started(monkeypatch, stale):
+    scenario = Replay(stale)
+    scenario.install(monkeypatch, resources, computers)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = await client.computers.launch(idempotency_key="k-1", timeout=30, poll=0)
+    assert c.status == "running"
+    assert scenario.starts == 1
+    assert scenario.requests[0].headers["Idempotency-Key"] == "k-1"
+    assert (scenario.requests[1].method, scenario.requests[1].url.path) == (
+        "GET",
+        "/api/v1/computers/launch-42",
+    )
+
+
+async def test_a_failed_later_stage_carries_the_creates_key():
+    scenario = Scenario(
+        [
+            step("POST", "", state("stopped", 0)),
+            step("POST", "/launch-42/start", {"error": "start failed"}, 500),
+        ]
+    )
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(mc.APIError, match="launch-42") as caught:
+            await client.computers.launch(idempotency_key="create-key")
+    assert not scenario.steps
+    assert scenario.requests[1].headers["Idempotency-Key"] != "create-key"
+    assert caught.value.idempotency_key == "create-key"

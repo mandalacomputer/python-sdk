@@ -9,6 +9,7 @@ import json
 import math
 import shlex
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1748,13 +1749,16 @@ def test_hold_key_and_wait_refuse_nan() -> None:
 
 
 @respx.mock
-def test_long_input_actions_widen_the_request_budget(client: mc.Client) -> None:
+def test_long_input_actions_widen_the_request_budget() -> None:
+    # A short client timeout, so the platform's 30-second ceiling still has
+    # something to widen past.
+    client = mc.Client("gck_test", base_url=BASE, timeout=10)
     route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
     c = _computer(client)
-    c.wait(120)
-    assert _budget(route)["read"] == 120 + mc._client.DEADLINE_SLACK
-    c.hold_key("shift", seconds=90)
-    assert _budget(route)["read"] == 90 + mc._client.DEADLINE_SLACK
+    c.wait(30)
+    assert _budget(route)["read"] == 30 + mc._client.DEADLINE_SLACK
+    c.hold_key("shift", seconds=25)
+    assert _budget(route)["read"] == 25 + mc._client.DEADLINE_SLACK
 
 
 # --- resolution (OPL-3567) -------------------------------------------------
@@ -6312,3 +6316,114 @@ def test_a_half_removed_computer_fails_the_delivery_waits_at_once(client: mc.Cli
     with pytest.raises(mc.MandalaError, match="partly removed; it cannot be started") as error:
         wait(mc.Computer(client._t, half))
     assert not isinstance(error.value, mc.TimeoutError)
+
+
+# --- OPL-5521: parity fixes ---------------------------------------------------
+
+
+@respx.mock
+def test_ephemeral_whose_block_deleted_the_computer_is_not_an_error(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(
+        side_effect=[httpx.Response(200, json={}), httpx.Response(404, json={"error": "gone"})]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with client.computers.ephemeral() as c:
+            c.delete()
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_ephemeral_cleanup_404_on_the_failure_path_is_not_billable(client: mc.Client) -> None:
+    respx.post(f"{BASE}/computers").mock(httpx.Response(200, json=COMPUTER))
+    respx.delete(f"{BASE}/computers/vm-1").mock(httpx.Response(404, json={"error": "gone"}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ZeroDivisionError), client.computers.ephemeral():
+            raise ZeroDivisionError("the caller's own bug")
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "suspend", "restart"])
+@respx.mock
+def test_a_failed_read_after_a_lifecycle_call_says_the_call_succeeded(
+    client: mc.Client, action: str
+) -> None:
+    c = _computer(client)
+    post = respx.post(f"{BASE}/computers/vm-1/{action}").mock(
+        httpx.Response(200, json={"ok": True})
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(side_effect=httpx.ConnectError("reset"))
+    with pytest.raises(mc.MandalaError, match=f"{action} succeeded") as caught:
+        getattr(c, action)()
+    assert post.call_count == 1
+    assert type(caught.value) is mc.MandalaError
+    assert isinstance(caught.value.__cause__, mc.ConnectionError)
+    assert caught.value.idempotency_key is None
+    assert not mc.is_transient(caught.value)
+
+
+@pytest.mark.parametrize(
+    "base", ["https://h.test/api/v1?t=x", "https://h.test/api/v1#frag", "https://h.test/?"]
+)
+def test_a_base_url_with_a_query_or_fragment_is_refused(
+    base: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(mc.MandalaError, match="without credentials, query, or fragment"):
+        mc.Client("gck_test", base_url=base)
+    monkeypatch.setenv("MANDALA_BASE_URL", base)
+    with pytest.raises(mc.MandalaError, match="without credentials, query, or fragment"):
+        mc.Client("gck_test")
+
+
+@respx.mock
+def test_input_ranges_are_capped_before_the_request(client: mc.Client) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(httpx.Response(200, json={"ok": True}))
+    c = _computer(client)
+    with pytest.raises(ValueError, match="50"):
+        c.scroll(direction="down", amount=51)
+    with pytest.raises(ValueError, match="30 seconds"):
+        c.wait(31)
+    with pytest.raises(ValueError, match="30 seconds"):
+        c.hold_key("shift", seconds=30.5)
+    assert not route.called
+    c.scroll(direction="down", amount=50)
+    c.wait(30)
+    c.hold_key("shift", seconds=30)
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_write_file_over_the_ceiling_raises_file_too_large(client: mc.Client) -> None:
+    put = respx.put(f"{BASE}/computers/vm-1/files").mock(httpx.Response(200))
+    c = _computer(client)
+    with pytest.raises(mc.FileTooLargeError, match="64 MiB") as caught:
+        c.write_file("/tmp/a", bytes(mc._client.FILE_SIZE_LIMIT + 1))
+    assert isinstance(caught.value, ValueError)
+    assert caught.value.status == 413
+    assert caught.value.method is None
+    assert not mc.is_transient(caught.value)
+    assert not put.called
+
+
+@respx.mock
+def test_delete_snapshots_is_purge_snapshots_under_its_other_name(client: mc.Client) -> None:
+    route = respx.delete(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(200, json={"snapshots_deleted": 1})
+    )
+    c = _computer(client)
+    c.delete(purge_snapshots=True, expect="fp")
+    classic = dict(route.calls.last.request.url.params)
+    c.delete(delete_snapshots=True, expect="fp")
+    assert dict(route.calls.last.request.url.params) == classic
+    assert classic == {"snapshots": "delete", "expect": "fp"}
+    c.delete(delete_snapshots=True, purge_snapshots=True, expect="fp")
+    assert dict(route.calls.last.request.url.params) == classic
+    c.delete(delete_snapshots=False)
+    assert dict(route.calls.last.request.url.params) == {}
+    calls = route.call_count
+    with pytest.raises(TypeError, match="different values"):
+        c.delete(delete_snapshots=True, purge_snapshots=False, expect="fp")
+    with pytest.raises(ValueError, match="delete_snapshots"):
+        c.delete(delete_snapshots="false")  # type: ignore[arg-type]
+    assert route.call_count == calls
