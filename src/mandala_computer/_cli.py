@@ -49,9 +49,16 @@ Two subcommands address a computer by name or id:
     ``members`` needs an account-wide key; a key confined to a workspace is
     refused, since the list is the whole account's.
 
+``mandala-py operations <list|get|wait>``
+    The lifecycle operations this key's calls started, as ``mandala operations``
+    reads them: ``list`` newest first (``--computer`` takes a name or an id),
+    ``get`` one, and ``wait`` until one succeeds (exit 0) or fails (exit 1,
+    ``operation_failed``). Succeeded is not a booted desktop.
+
 ``mandala-py logout [--profile NAME]``
     Forget a profile saved in ``~/.mandala/credentials.json`` by
-    ``mandala login``. The key it held stays valid until it is revoked.
+    ``mandala login``. The key it held stays valid until it is revoked. With no
+    profile saved at all it says so and exits 0.
 
 ``mandala-py ssh <computer> [ssh-args…]``
     Real OpenSSH, through the platform's SSH gateway, with the gateway's host
@@ -105,6 +112,7 @@ from ._exceptions import (
     MethodNotAllowedError,
     MoveRequiredError,
     NotFoundError,
+    OperationFailedError,
     OriginResponseError,
     OriginTLSError,
     OriginUnreachableError,
@@ -120,6 +128,7 @@ from ._models import (
     BrowserProxyArgs,
     EgressProxyArgs,
     Listing,
+    Operation,
     Secret,
     SshAccess,
     SshKey,
@@ -129,7 +138,7 @@ from ._models import (
     Workspace,
     WorkspaceMember,
 )
-from ._resources import _named_secret
+from ._resources import OPERATION_WAIT_POLL, OPERATION_WAIT_TIMEOUT, _named_secret
 
 if TYPE_CHECKING:
     from websockets.sync.client import ClientConnection
@@ -270,6 +279,15 @@ def _error_info(err: BaseException) -> dict[str, Any]:
         return _with_ids({"code": "connection_failed", "message": str(err)}, err)
     if isinstance(err, TimeoutError):
         return _with_ids({"code": "timeout", "message": str(err)}, err)
+    # Before the branch below: the operation's own code (``start_failed``) is
+    # not this CLI's error vocabulary, and is kept as a detail, as ``mandala``
+    # keeps it.
+    if isinstance(err, OperationFailedError):
+        return {
+            "code": "operation_failed",
+            "message": str(err),
+            "details": {"operation": dict(err.operation.raw)},
+        }
     if isinstance(err, MandalaError):
         return _with_ids({"code": "failed", "message": str(err)}, err)
     if isinstance(err, ValueError):
@@ -1877,6 +1895,28 @@ def _cmd_logout(args: argparse.Namespace) -> int:
     from ._credentials import remove_profile
 
     removed = remove_profile(args.profile)
+    # Nothing saved at all: the store names a default whenever it holds a
+    # profile, so a missing one here means there is nothing to be wrong about.
+    # A profile missing while others are saved is still refused below.
+    if not removed.removed and removed.default_profile is None:
+        print(f"{PROG}: Not logged in; nothing to remove.", file=sys.stderr)
+        if os.environ.get("MANDALA_API_KEY", "").strip():
+            print(
+                f"{PROG}: MANDALA_API_KEY is set in this environment, and it still "
+                "authenticates every command.",
+                file=sys.stderr,
+            )
+        if args.json:
+            _json(
+                {
+                    "profile": removed.profile,
+                    "removed": False,
+                    "path": removed.path,
+                    "key_id": None,
+                    "default_profile": None,
+                }
+            )
+        return 0
     if not removed.removed:
         also = (
             f" The default profile is {removed.default_profile}." if removed.default_profile else ""
@@ -1957,6 +1997,149 @@ def _keys_parsers(sub: Any) -> None:
     )
     logout.add_argument("--json", action="store_true", help="the result as JSON")
     logout.set_defaults(fn=_cmd_logout)
+
+
+# --- operations (platform OPL-5055) ------------------------------------------
+
+
+def _operation_rows(operations: Sequence[Operation]) -> str:
+    rows = [
+        (
+            o.id,
+            o.kind,
+            o.state,
+            o.computer_id or "-",
+            o.created_at,
+            o.error.code if o.error is not None and o.error.code else "-",
+        )
+        for o in operations
+    ]
+    return _table(("ID", "KIND", "STATE", "COMPUTER", "CREATED", "ERROR"), rows)
+
+
+def _operations_computer(client: Client, target: str) -> str:
+    """``operations list --computer``: a computer by name or id, as ``mandala``
+    takes one. A value that is neither a listed computer's id nor its name is
+    sent as typed, because an operation outlives its computer: a deleted one's
+    id is how its operations are found. Said on stderr, so the empty page a
+    mistyped name gets is not read as "no operations"."""
+    computers = client.computers.list(allow_partial=True)
+    if any(c.id == target for c in computers):
+        return target
+    named = [c for c in computers if c.name == target]
+    if len(named) == 1:
+        return named[0].id
+    if named:
+        _die(
+            lambda s: (
+                f"{target!r} names {len(named)} computers — use an id: "
+                + ", ".join(s(c.id) for c in named)
+            ),
+            "ambiguous_computer",
+        )
+    print(
+        f"{PROG}: no listed computer is named {_printable(target)} or has that id; "
+        f"listing the operations recorded under the id {_printable(target)}",
+        file=sys.stderr,
+    )
+    return target
+
+
+def _cmd_operations_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        computer_id = None if args.computer is None else _operations_computer(client, args.computer)
+        page = client.operations.list(
+            computer_id=computer_id,
+            idempotency_key=args.idempotency_key,
+            limit=args.limit,
+            cursor=args.cursor,
+        )
+    if args.json:
+        _json(
+            {
+                "operations": [dict(o.raw) for o in page.operations],
+                "next_cursor": page.next_cursor,
+            }
+        )
+        return 0
+    if page.operations:
+        print(_operation_rows(page.operations))
+    else:
+        print("no operations", file=sys.stderr)
+    if page.next_cursor is not None:
+        print(f"{PROG}: more: --cursor {_printable(page.next_cursor)}", file=sys.stderr)
+    return 0
+
+
+def _print_operation(op: Operation, as_json: bool) -> None:
+    if as_json:
+        _json(dict(op.raw))
+        return
+    print(_operation_rows([op]))
+    if op.error is not None and op.error.message:
+        print(f"{PROG}: {_printable(op.error.message)}", file=sys.stderr)
+
+
+def _cmd_operations_get(args: argparse.Namespace) -> int:
+    with _client() as client:
+        op = client.operations.get(args.id)
+    _print_operation(op, args.json)
+    return 0
+
+
+def _milliseconds(name: str, value: int | None, default: float) -> float:
+    if value is None:
+        return default
+    if value <= 0:
+        raise ValueError(f"--{name} must be a positive number of milliseconds")
+    return value / 1000
+
+
+def _cmd_operations_wait(args: argparse.Namespace) -> int:
+    timeout = _milliseconds("timeout-ms", args.timeout_ms, OPERATION_WAIT_TIMEOUT)
+    poll = _milliseconds("poll-ms", args.poll_ms, OPERATION_WAIT_POLL)
+    with _client() as client:
+        op = client.operations.wait(args.id, timeout=timeout, poll=poll)
+    _print_operation(op, args.json)
+    return 0
+
+
+def _operations_parser(sub: Any) -> None:
+    ops = sub.add_parser("operations", help="the lifecycle operations this key's calls started")
+    verbs = ops.add_subparsers(dest="verb", required=True)
+    listing = verbs.add_parser(
+        "list",
+        help="lifecycle operations, newest first; pass the next cursor back as --cursor",
+    )
+    listing.add_argument(
+        "--computer",
+        metavar="COMPUTER",
+        help="only this computer, by name or id (for a clone, the new computer); "
+        "a deleted one by its id",
+    )
+    listing.add_argument(
+        "--idempotency-key",
+        metavar="KEY",
+        help="only the operation a call sent with this Idempotency-Key started",
+    )
+    listing.add_argument("--limit", type=int, help="page size, 1 to 100 (default 20)")
+    listing.add_argument("--cursor", help="the next_cursor of the page before")
+    listing.add_argument("--json", action="store_true", help="the page as JSON")
+    listing.set_defaults(fn=_cmd_operations_list)
+    get = verbs.add_parser("get", help="one lifecycle operation")
+    get.add_argument("id", metavar="ID")
+    get.add_argument("--json", action="store_true", help="the operation as JSON")
+    get.set_defaults(fn=_cmd_operations_get)
+    wait = verbs.add_parser(
+        "wait",
+        help="wait until an operation succeeds (exit 0) or fails (operation_failed); "
+        "succeeded is not a booted desktop",
+    )
+    wait.add_argument("id", metavar="ID")
+    wait.add_argument("--timeout-ms", type=int, help="wait deadline in milliseconds")
+    wait.add_argument("--poll-ms", type=int, help="poll interval in milliseconds")
+    wait.add_argument("--json", action="store_true", help="the operation as JSON")
+    wait.set_defaults(fn=_cmd_operations_wait)
 
 
 # --- workspaces (platform OPL-5057) ------------------------------------------
@@ -3074,6 +3257,7 @@ def _parser() -> _Parser:
     _webhooks_parser(sub)
     _secrets_parser(sub)
     _keys_parsers(sub)
+    _operations_parser(sub)
     _workspaces_parser(sub)
     return parser
 
