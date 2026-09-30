@@ -115,7 +115,16 @@ _REASON_CLEARS = frozenset({"contention", "starting"})
 #: Stopping the computer is the fix. Without it here this would be an ordinary
 #: :class:`ConflictError`, which :func:`is_transient` calls worth sending again,
 #: and a caller looping on that would resend the same resize until it gave up.
-_REASON_PERMANENT = frozenset({"unavailable", "unsupported", "revoked", "exists", "running"})
+#:
+#: ``name_taken`` and ``stale_revision`` are the secret store's 409s: a secret
+#: name the account already uses, and a write naming a ``revision_id`` that is
+#: no longer the current one. Neither clears by waiting — pick another name, or
+#: read the secret again and decide with its current revision — so both are
+#: permanent, where an ordinary :class:`ConflictError` would read as worth
+#: sending again.
+_REASON_PERMANENT = frozenset(
+    {"unavailable", "unsupported", "revoked", "exists", "running", "name_taken", "stale_revision"}
+)
 
 
 def _refusal_reason(body: object) -> str | None:
@@ -179,8 +188,8 @@ class APIError(MandalaError):
         self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
         #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
-        #: ``"unsupported"`` (OPL-3898), ``"revoked"``, ``"exists"`` or
-        #: ``"running"``. ``None``
+        #: ``"unsupported"`` (OPL-3898), ``"revoked"``, ``"exists"``,
+        #: ``"running"``, ``"name_taken"`` or ``"stale_revision"``. ``None``
         #: where it sent nothing, which is most errors and always will be — not
         #: every refusal has a word, and the platform is explicit that absent
         #: means unclassified rather than "none of them". An OPEN set: a word
@@ -310,9 +319,25 @@ class FileTooLargeError(APIError):
 
     An upload raises it too, and there it really is a limit on the file: ``PUT``
     takes no range. :meth:`~mandala_computer.Computer.write_file` refuses an
-    oversized body before the request is made, so from that direction this
-    arrives only if the platform's ceiling is lower than the one mirrored here.
+    oversized body before the request is made, with this class too: ``status``
+    is ``413`` as the platform's would be, and ``method``, ``body`` and
+    ``request_id`` are ``None`` because nothing was sent. That local refusal is
+    also a :class:`ValueError`, which is what it raised before, so an
+    ``except ValueError`` written for it still catches it.
     """
+
+
+class _UploadTooLargeError(FileTooLargeError, ValueError):
+    """``write_file``'s own refusal of a body over the ceiling, before any request.
+
+    A :class:`FileTooLargeError`, so it is caught the way the platform's 413 is,
+    and a :class:`ValueError`, which is what this refusal raised before
+    (the same dual inheritance :class:`FileExistsError` uses). Private: catch
+    either public class, never this one.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=413)
 
 
 class RangeNotSatisfiableError(APIError):

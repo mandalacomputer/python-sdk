@@ -473,3 +473,95 @@ def test_launch_refuses_a_bad_idempotency_key_before_any_request():
     ):
         client.computers.launch(template="base", idempotency_key="has space")
     assert requests == []
+
+
+class Replay(Scenario):
+    """A create answered from the platform's store, for a computer that has
+    since been stopped: every read says so until launch starts it."""
+
+    def __init__(self, stale):
+        super().__init__([])
+        self.stale = stale
+        self.starts = 0
+
+    def handle(self, request):
+        self.requests.append(request)
+        # Each request costs a second, so a launch that waits on the stale
+        # answer runs out its budget rather than spinning.
+        self.now += 1
+        path = request.url.path
+        if path == "/api/v1/computers":
+            return httpx.Response(200, json=self.stale, headers={"Idempotent-Replayed": "true"})
+        if path.endswith("/start"):
+            self.starts += 1
+            return httpx.Response(200, json={"ok": True})
+        if path.endswith("/exec"):
+            return httpx.Response(200, json=GUEST)
+        return httpx.Response(200, json=COMPUTER if self.starts else state("stopped", 0))
+
+
+#: What a create answered the first time, replayed under its key a day later.
+STALE_CREATES = [
+    pytest.param({**state("stopped", 0), "start_error": "boot refused"}, id="stale-start-error"),
+    pytest.param(state("stopped", 2048), id="stale-admitted-start"),
+    pytest.param(state("running", 2048), id="stale-running"),
+]
+
+
+@pytest.mark.parametrize("stale", STALE_CREATES)
+def test_a_replayed_create_is_read_afresh_and_started(monkeypatch, stale):
+    # The body of a replayed create is the first attempt's. Its start_error,
+    # status and held RAM say nothing about now, so launch reads the computer
+    # before acting on any of them, and starts the stopped computer it finds.
+    scenario = Replay(stale)
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        c = client.computers.launch(idempotency_key="k-1", timeout=30, poll=0)
+    assert c.status == "running"
+    assert scenario.starts == 1
+    assert scenario.requests[0].headers["Idempotency-Key"] == "k-1"
+    assert (scenario.requests[1].method, scenario.requests[1].url.path) == (
+        "GET",
+        "/api/v1/computers/launch-42",
+    )
+
+
+def test_a_failed_later_stage_carries_the_creates_key():
+    # The start's key sent on a create would build a second computer; the
+    # create's replays this one, so that is the key the error hands back.
+    scenario = Scenario(
+        [
+            step("POST", "", state("stopped", 0)),
+            step("POST", "/launch-42/start", {"error": "start failed"}, 500),
+        ]
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        pytest.raises(mc.APIError, match="launch-42") as caught,
+    ):
+        client.computers.launch(idempotency_key="create-key")
+    assert not scenario.steps
+    assert scenario.requests[1].headers["Idempotency-Key"] != "create-key"
+    assert caught.value.idempotency_key == "create-key"
+
+
+def test_a_failed_later_stage_carries_the_key_launch_made():
+    scenario = Scenario(
+        [
+            step("POST", "", state("stopped", 0)),
+            step("POST", "/launch-42/start", {"error": "start failed"}, 500),
+        ]
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        pytest.raises(mc.APIError) as caught,
+    ):
+        client.computers.launch()
+    made = scenario.requests[0].headers["Idempotency-Key"]
+    assert caught.value.idempotency_key == made
+    assert scenario.requests[1].headers["Idempotency-Key"] != made

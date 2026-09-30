@@ -72,6 +72,7 @@ from ._computer import (
     _schedule_window,
     _screenshot_info,
     _secrets_timeout,
+    _snapshot_sweep,
     _snapshots_deleted,
     _upload_refusal,
     _windows_from_response,
@@ -174,6 +175,24 @@ class AsyncComputer(ComputerFields):
         )
         return self
 
+    async def _refresh_after(self, action: str) -> AsyncComputer:
+        """The read that follows a lifecycle call the platform has already accepted.
+
+        A failure here is not the action's. Raised as is, a dropped connection
+        on this GET would read as a :class:`~mandala_computer.ConnectionError`
+        worth sending again, and resending a restart resets the computer twice.
+        So it becomes a plain :class:`~mandala_computer.MandalaError` saying the
+        action succeeded, with the read's own error as its cause.
+        """
+        try:
+            return await self.refresh()
+        except MandalaError as cause:
+            raise MandalaError(
+                f"{action} succeeded, but refreshing {self.id} failed; this handle "
+                "still has its previous state. Do not send the action again because "
+                f"of this refresh failure: {cause}"
+            ) from cause
+
     async def start(
         self, *, resume_only: bool = False, idempotency_key: str | None = None
     ) -> AsyncComputer:
@@ -201,7 +220,7 @@ class AsyncComputer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return await self.refresh()
+        return await self._refresh_after("start")
 
     async def stop(
         self, *, force: bool = False, idempotency_key: str | None = None
@@ -222,7 +241,7 @@ class AsyncComputer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return await self.refresh()
+        return await self._refresh_after("stop")
 
     async def suspend(self, *, idempotency_key: str | None = None) -> AsyncComputer:
         """Write this computer's RAM to disk and give the host its memory back.
@@ -243,7 +262,7 @@ class AsyncComputer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return await self.refresh()
+        return await self._refresh_after("suspend")
 
     async def restart(self, *, idempotency_key: str | None = None) -> AsyncComputer:
         """Reset this computer.
@@ -273,7 +292,7 @@ class AsyncComputer(ComputerFields):
             headers=_api.idempotency_headers(idempotency_key),
         )
         self._operation_id = answered_operation_id(resp)
-        return await self.refresh()
+        return await self._refresh_after("restart")
 
     async def clone(
         self, name: str | None = None, *, idempotency_key: str | None = None
@@ -628,7 +647,8 @@ class AsyncComputer(ComputerFields):
     async def delete(
         self,
         *,
-        purge_snapshots: bool = ...,
+        purge_snapshots: bool | None = ...,
+        delete_snapshots: bool | None = ...,
         expect: str | None = ...,
         detailed: Literal[False] = ...,
         idempotency_key: str | None = ...,
@@ -638,7 +658,8 @@ class AsyncComputer(ComputerFields):
     async def delete(
         self,
         *,
-        purge_snapshots: bool = ...,
+        purge_snapshots: bool | None = ...,
+        delete_snapshots: bool | None = ...,
         expect: str | None = ...,
         detailed: Literal[True],
         idempotency_key: str | None = ...,
@@ -647,7 +668,8 @@ class AsyncComputer(ComputerFields):
     async def delete(
         self,
         *,
-        purge_snapshots: bool = False,
+        purge_snapshots: bool | None = None,
+        delete_snapshots: bool | None = None,
         expect: str | None = None,
         detailed: bool = False,
         idempotency_key: str | None = None,
@@ -658,14 +680,14 @@ class AsyncComputer(ComputerFields):
         can still be cloned into a new computer but can no longer be restored —
         a restore puts the disk back on a source that no longer exists.
 
-        ``purge_snapshots=True`` destroys them with it, and needs ``expect``: the
+        ``delete_snapshots=True`` destroys them with it, and needs ``expect``: the
         fingerprint from :meth:`snapshot_holdings`, which binds the sweep to the
         set you were actually shown. Read the holdings, check the count and the
         size are what you meant to destroy, then pass the fingerprint you read::
 
             held = await c.snapshot_holdings()
             if held.count == 2:
-                await c.delete(purge_snapshots=True, expect=held.fingerprint)
+                await c.delete(delete_snapshots=True, expect=held.fingerprint)
 
         Do not fetch the fingerprint on the line above the delete. That binds
         the purge to whatever the set is now rather than to what anyone agreed
@@ -688,11 +710,17 @@ class AsyncComputer(ComputerFields):
         :class:`~mandala_computer.ConflictError`; one whose outcome is unknown
         is a 503 :class:`~mandala_computer.UnavailableError`, which is not safe
         to send again blind — read :meth:`snapshot_holdings` first.
+
+        ``delete_snapshots`` is the same switch under the name the other
+        clients use, and the one to prefer; ``purge_snapshots`` is deprecated
+        in its favour and still works. Passing both with different values
+        raises :class:`TypeError`.
         """
+        sweep = _snapshot_sweep(purge_snapshots, delete_snapshots)
         data = await self._t.json_object_or_empty(
             "DELETE",
             _api.computer(self.id),
-            params=_api.delete_params(purge_snapshots=purge_snapshots, expect=expect),
+            params=_api.delete_params(purge_snapshots=sweep, expect=expect),
             headers=_api.idempotency_headers(idempotency_key),
         )
         # `None` is an empty body — a 204, or a 200 with nothing in it — which is

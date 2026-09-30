@@ -1923,6 +1923,11 @@ def button_body(action: str, x: int | None, y: int | None) -> dict[str, Any]:
 
 _SCROLL_DIRECTIONS = ("up", "down", "left", "right")
 
+#: The most wheel clicks one scroll takes, and the longest ``wait`` or held key,
+#: in seconds. The platform's own ceilings, refused here before a request.
+SCROLL_MAX_AMOUNT = 50
+INPUT_MAX_SECONDS = 30
+
 
 def scroll_body(
     x: int | None, y: int | None, direction: str, amount: int, modifiers: tuple[str, ...] = ()
@@ -1942,6 +1947,11 @@ def scroll_body(
     amount = whole(amount, "amount", exc=ValueError, message="amount must be positive")
     if amount <= 0:
         raise ValueError("amount must be positive")
+    if amount > SCROLL_MAX_AMOUNT:
+        raise ValueError(
+            f"the platform caps a scroll at {SCROLL_MAX_AMOUNT} clicks; "
+            "call scroll() again for more"
+        )
     _whole_point(x, y)
     body: dict[str, Any] = {
         "action": "scroll",
@@ -2016,6 +2026,11 @@ def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
     if not keys:
         raise ValueError("hold_key() needs at least one key")
     seconds = _positive_seconds(seconds)
+    if seconds > INPUT_MAX_SECONDS:
+        raise ValueError(
+            f"the platform caps a held key at {INPUT_MAX_SECONDS} seconds; "
+            "call hold_key() again for longer"
+        )
     return {
         "action": "hold_key",
         "keys": [canonical(key, "key") for key in keys],
@@ -2025,6 +2040,10 @@ def hold_key_body(keys: tuple[str, ...], seconds: float) -> dict[str, Any]:
 
 def wait_body(seconds: float) -> dict[str, Any]:
     seconds = _positive_seconds(seconds)
+    if seconds > INPUT_MAX_SECONDS:
+        raise ValueError(
+            f"the platform caps a wait at {INPUT_MAX_SECONDS} seconds; call wait() again for longer"
+        )
     return {"action": "wait", "duration": seconds}
 
 

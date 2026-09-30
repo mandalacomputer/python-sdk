@@ -18,6 +18,15 @@ This is the summary you read to decide whether to upgrade.
   in between was refused with a `ConflictError` "no active desktop session". A
   computer that never gets a desktop session now makes `launch()` raise a
   `TimeoutError` instead of returning.
+- **`reason` words `name_taken` and `stale_revision` are permanent.** The
+  secret store's 409s for a name the account already uses and for a stale
+  `revision_id` now carry them, and `is_transient()` answers `False` for a 409
+  carrying either rather than calling it a conflict worth sending again.
+  `Secrets.set()` still reads again and retries as before.
+- **413 stays `FileTooLargeError`** (the TypeScript SDK calls it
+  `TooLargeError`); 502 stays a bare `APIError`, and 521-523 stay
+  `OriginUnreachableError` with the SDK's own wording, as in the TypeScript
+  SDK. Now pinned by tests.
 - **`mandala-py logout` with no saved profile exits 0** and says `Not logged
   in; nothing to remove.` (with `--json`, `removed: false`). A named profile
   that is not saved while others are is still `not_logged_in`.
@@ -71,6 +80,49 @@ This is the summary you read to decide whether to upgrade.
   probe that times out inside the guest is polled through, not taken as a
   session. It returns at once for a Windows guest or a computer whose `os` is not reported. An absent
   `desktop` field is an X11 desktop and is waited on.
+
+- **`Computer.delete(delete_snapshots=...)`** (and the async twin), the name
+  the other clients use for `purge_snapshots=`, which still works and is
+  deprecated in the docstring only. Both with different values raise
+  `TypeError`.
+- **`usage.read(from_=..., to=...)`**, the wire's names for `since=`/`until=`.
+  Naming one bound both ways raises `TypeError`.
+
+### Fixed
+
+- **`computers.launch()` resent under its key no longer trusts a replayed
+  create answer.** A create answered with `Idempotent-Replayed: true` is the
+  first call's, up to 24 hours old, so launch now reads the computer afresh
+  before acting on it: a start that attempt reported failed is sent again
+  instead of raising "did not start" at once, and a computer stopped or
+  suspended since is started instead of waited on until the budget ran out.
+- **A failed `launch()` carries the create's `idempotency_key`**, not the key
+  of the later stage that failed (such as the start's). Resending `launch()`
+  with `idempotency_key=err.idempotency_key` returns the same computer; the
+  start's key, sent on a create, would have built a second one.
+- **`ephemeral()` whose block deleted the computer itself** no longer raises
+  `NotFoundError` on the way out, and no longer warns that the computer is
+  "still running and still billable" when the block raised. A 404 from the
+  cleanup delete is success.
+- **A failed read after `start()`, `stop()`, `suspend()` or `restart()`** now
+  raises a `MandalaError` saying the action succeeded and must not be sent
+  again, with the read's error as its cause, instead of a `ConnectionError`
+  that `is_transient()` called worth retrying (a retried restart resets the
+  computer twice).
+- **Error messages from RFC 9457 bodies**: a `{title, detail}` body, which an
+  edge in front of the platform answers with, now gives `detail` (or `title`)
+  as the message instead of `HTTP <status>`. Statuses this SDK words itself
+  keep that wording.
+- **A base URL with a query or a fragment is refused**, given to the
+  constructor or in `MANDALA_BASE_URL`, with the same `CredentialError` a
+  credential file's base URL gets. Every path is joined onto it as a string,
+  so a query swallowed the path after it.
+- **`scroll()` `amount` is capped at 50 and `wait()`/`hold_key()` at 30
+  seconds**, the platform's own limits, and refused locally with `ValueError`
+  before a request is made.
+- **A `write_file()` body over 64 MiB raises `FileTooLargeError`**, the class
+  the platform's 413 arrives as, instead of a bare `ValueError`. It is also a
+  `ValueError`, so existing handlers still catch it.
 
 ### Documentation
 

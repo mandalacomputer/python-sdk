@@ -267,3 +267,44 @@ class TestTheAsyncHalf:
             with pytest.raises(ValueError, match="aware datetime"):
                 await c.usage.read(until=datetime(2026, 7, 1))  # noqa: DTZ001
         assert not route.called
+
+
+class TestTheWireSpelling:
+    """``from_``/``to``: the same two bounds under the names the wire uses."""
+
+    @respx.mock
+    def test_from_and_to_send_what_since_and_until_send(self, client: mc.Client) -> None:
+        route = answering()
+        client.usage.read(since="2026-07-01T00:00:00Z", until="2026-08-01T00:00:00Z")
+        classic = dict(route.calls.last.request.url.params)
+        client.usage.read(from_="2026-07-01T00:00:00Z", to="2026-08-01T00:00:00Z")
+        assert dict(route.calls.last.request.url.params) == classic
+        assert classic == {"from": "2026-07-01T00:00:00Z", "to": "2026-08-01T00:00:00Z"}
+
+    @pytest.mark.parametrize(
+        "bounds",
+        [
+            {"since": "2026-07-01T00:00:00Z", "from_": "2026-07-01T00:00:00Z"},
+            {"until": "2026-08-01T00:00:00Z", "to": "2026-08-01T00:00:00Z"},
+        ],
+    )
+    @respx.mock
+    def test_one_bound_named_both_ways_is_refused(
+        self, client: mc.Client, bounds: dict[str, str]
+    ) -> None:
+        route = answering()
+        with pytest.raises(TypeError, match="not both"):
+            client.usage.read(**bounds)  # type: ignore[arg-type]
+        assert not route.called
+
+    @respx.mock
+    async def test_the_async_half_takes_them_too(self, async_client: mc.AsyncClient) -> None:
+        route = answering()
+        async with async_client as c:
+            await c.usage.read(from_="2026-07-01T00:00:00Z", to="2026-08-01T00:00:00Z")
+            assert dict(route.calls.last.request.url.params) == {
+                "from": "2026-07-01T00:00:00Z",
+                "to": "2026-08-01T00:00:00Z",
+            }
+            with pytest.raises(TypeError, match="not both"):
+                await c.usage.read(until="2026-08-01T00:00:00Z", to="2026-08-01T00:00:00Z")

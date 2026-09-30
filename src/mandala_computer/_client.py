@@ -202,9 +202,13 @@ _STATUS_ERRORS = {
     # different sides — see FILE_SIZE_LIMIT. Their own classes rather than a
     # bare APIError because each one has a specific next move attached: a 413
     # says ask for part of it, and a 416 hands over the length to ask against.
+    # The name differs from the TypeScript SDK's TooLargeError deliberately:
+    # renaming a public exception would break every caller catching it.
     413: FileTooLargeError,
     416: RangeNotSatisfiableError,
     429: RateLimitError,
+    # 502 is absent on purpose and arrives as a bare APIError, as it does in the
+    # TypeScript SDK.
     # A fan-out listing that would have been short, without allow_partial. Its
     # own class rather than a bare APIError because it is the one 5xx on this
     # surface that is not a fault: nothing is broken from the caller's side, the
@@ -875,6 +879,18 @@ class _BaseTransport:
                 if isinstance(candidate, str) and candidate.strip():
                     message = candidate
                     named = True
+            if not named and isinstance(body, dict):
+                # RFC 9457's fields, which is what an edge in front of the
+                # platform answers a JSON request with for the statuses it
+                # generates itself. Read for the MESSAGE only, never as the
+                # platform naming the failure: a status this SDK has wording
+                # for still gets that wording below, because the edge's
+                # sentence says nothing a caller can act on.
+                for field in ("detail", "title"):
+                    said = body.get(field)
+                    if isinstance(said, str) and said.strip():
+                        message = said
+                        break
         except ValueError:
             text = resp.text.strip()
             if text:
@@ -1775,11 +1791,21 @@ class Transport(_BaseTransport):
         is a sentence about the platform, describing something that never
         reached it — the same failure, and the same complaint, either way.
         """
+        return self.json_object_with_headers(method, path, **kw)[0]
+
+    def json_object_with_headers(
+        self, method: str, path: str, **kw: Any
+    ) -> tuple[Mapping[str, Any], httpx.Headers]:
+        """:meth:`json_object`, with the response's headers beside the body.
+
+        Internal: a create reads ``Idempotent-Replayed`` off it, which is the
+        only thing that says its answer is a stored one rather than today's.
+        """
         resp = self.request(method, path, **kw)
         data = self._parse(resp)
         if not isinstance(data, Mapping):
             raise self._not_an_object(method, path, resp)
-        return data
+        return data, resp.headers
 
     def json_array(self, method: str, path: str, **kw: Any) -> list[Mapping[str, Any]]:
         """A JSON route whose successful answer must be an array of objects."""
@@ -2206,11 +2232,17 @@ class AsyncTransport(_BaseTransport):
 
         See :meth:`Transport.json_object`.
         """
+        return (await self.json_object_with_headers(method, path, **kw))[0]
+
+    async def json_object_with_headers(
+        self, method: str, path: str, **kw: Any
+    ) -> tuple[Mapping[str, Any], httpx.Headers]:
+        """See :meth:`Transport.json_object_with_headers`."""
         resp = await self.request(method, path, **kw)
         data = self._parse(resp)
         if not isinstance(data, Mapping):
             raise self._not_an_object(method, path, resp)
-        return data
+        return data, resp.headers
 
     async def json_array(self, method: str, path: str, **kw: Any) -> list[Mapping[str, Any]]:
         """A JSON route whose successful answer must be an array of objects."""
