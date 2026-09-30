@@ -43,11 +43,14 @@ Two subcommands address a computer by name or id:
     dashboard session turns on; without it the platform's own sentence is
     printed, and it says exactly that. ``create`` prints the new key ONCE.
 
-``mandala-py workspaces <list|get|members>``
-    The account's workspaces, read only: their ids (what ``secrets --workspace``
-    and ``api-keys create --workspace`` take) and the people who reach one.
+``mandala-py workspaces <list|get|members|create|rename|rm>``
+    The account's workspaces: their ids (what ``secrets --workspace`` and
+    ``api-keys create --workspace`` take) and the people who reach one.
     ``members`` needs an account-wide key; a key confined to a workspace is
-    refused, since the list is the whole account's.
+    refused, since the list is the whole account's. ``create``, ``rename`` and
+    ``rm`` need an owner's account-wide key; ``rename`` and ``rm`` take a name
+    or an id. ``rm`` does nothing without ``--yes``, because deleting a
+    workspace revokes every API key confined to it (its computers are kept).
 
 ``mandala-py operations <list|get|wait>``
     The lifecycle operations this key's calls started, as ``mandala operations``
@@ -2199,8 +2202,85 @@ def _cmd_workspaces_members(args: argparse.Namespace) -> int:
     return 0
 
 
+_WORKSPACE_ID = re.compile(r"wsp-[0-9a-f]{12}")
+
+
+def _workspace_id(client: Client, target: str) -> str:
+    """The workspace ``target`` names, by id or name, as ``mandala`` takes one.
+
+    A target shaped like a workspace id (``wsp-`` and twelve lowercase hex) is
+    that id and is never matched against names: otherwise a retried
+    ``workspaces rm <id> --yes``, whose workspace the first attempt already
+    deleted, would land on another workspace NAMED that id string and revoke
+    its keys. Sent as the id, the retry is the platform's 404.
+
+    Anything else is looked up in the listing, which is the whole of what this
+    key can reach: a name that fits exactly one workspace becomes its id, and a
+    name that fits more than one is refused with their ids. A name that fits
+    none is sent as typed, and the platform's 404 says there is no such
+    workspace.
+    """
+    _api.workspace(target)
+    if _WORKSPACE_ID.fullmatch(target):
+        return target
+    listed = client.workspaces.list()
+    if any(w.id == target for w in listed):
+        return target
+    named = [w for w in listed if w.name == target]
+    if len(named) > 1:
+        _die(
+            lambda s: (
+                f"{s(target)} names {len(named)} workspaces — use an id: "
+                + ", ".join(s(w.id) for w in named)
+            ),
+            "ambiguous_workspace",
+        )
+    return named[0].id if named else target
+
+
+def _cmd_workspaces_create(args: argparse.Namespace) -> int:
+    _api.workspace_name_body(args.name)
+    with _client() as client:
+        made = client.workspaces.create(args.name)
+    if args.json:
+        _json(made.raw)
+    else:
+        print(_workspace_rows([made]))
+    return 0
+
+
+def _cmd_workspaces_rename(args: argparse.Namespace) -> int:
+    _api.workspace_name_body(args.new_name)
+    with _client() as client:
+        renamed = client.workspaces.rename(_workspace_id(client, args.workspace), args.new_name)
+    if args.json:
+        _json(renamed.raw)
+    else:
+        print(_workspace_rows([renamed]))
+    return 0
+
+
+def _cmd_workspaces_rm(args: argparse.Namespace) -> int:
+    if not args.yes:
+        _die(
+            lambda s: (
+                f"deleting workspace {s(args.workspace)} revokes every API key confined to it; "
+                "its computers are kept. Pass --yes to delete it"
+            ),
+            "confirmation_required",
+        )
+    with _client() as client:
+        workspace_id = _workspace_id(client, args.workspace)
+        gone = client.workspaces.delete(workspace_id)
+    if args.json:
+        _json(gone.raw)
+    else:
+        print(f"deleted {_shown(workspace_id)}; {gone.revoked_keys} API key(s) revoked")
+    return 0
+
+
 def _workspaces_parser(sub: Any) -> None:
-    spaces = sub.add_parser("workspaces", help="the account's workspaces, read only")
+    spaces = sub.add_parser("workspaces", help="the account's workspaces")
     verbs = spaces.add_subparsers(dest="verb", required=True)
     listing = verbs.add_parser("list", help="the workspaces this key can reach")
     listing.add_argument("--json", action="store_true", help="the rows as JSON")
@@ -2215,6 +2295,29 @@ def _workspaces_parser(sub: Any) -> None:
     members.add_argument("id", metavar="ID")
     members.add_argument("--json", action="store_true", help="the rows as JSON")
     members.set_defaults(fn=_cmd_workspaces_members)
+    owner = "needs an owner's key that is not confined to a workspace"
+    create = verbs.add_parser("create", help=f"make a workspace ({owner})")
+    create.add_argument("name", metavar="NAME")
+    create.add_argument("--json", action="store_true", help="the workspace as JSON")
+    create.set_defaults(fn=_cmd_workspaces_create)
+    rename = verbs.add_parser(
+        "rename",
+        help=f"rename a workspace, by name or id; its id, keys and computers stay ({owner})",
+    )
+    rename.add_argument("workspace", metavar="WORKSPACE")
+    rename.add_argument("new_name", metavar="NEW_NAME")
+    rename.add_argument("--json", action="store_true", help="the workspace as JSON")
+    rename.set_defaults(fn=_cmd_workspaces_rename)
+    rm = verbs.add_parser(
+        "rm",
+        help=f"delete a workspace, by name or id, REVOKING every API key confined to it ({owner})",
+    )
+    rm.add_argument("workspace", metavar="WORKSPACE")
+    rm.add_argument(
+        "--yes", action="store_true", help="confirm the deletion and the key revocation (required)"
+    )
+    rm.add_argument("--json", action="store_true", help="the answer as JSON")
+    rm.set_defaults(fn=_cmd_workspaces_rm)
 
 
 def _webhooks_parser(sub: Any) -> None:

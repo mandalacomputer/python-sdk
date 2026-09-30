@@ -58,6 +58,7 @@ from ._models import (
     WebhookDelivery,
     Whoami,
     Workspace,
+    WorkspaceDeleted,
     WorkspaceMember,
     build_contradiction,
     move_rows,
@@ -2015,11 +2016,15 @@ class ApiKeys:
 
 
 class Workspaces:
-    """The account's workspaces, read only (platform OPL-5057).
+    """The account's workspaces (platform OPL-5057).
 
     A workspace partitions the account's computers; a key confined to one
-    reaches that workspace's computers only. Workspaces are created, renamed
-    and deleted in the dashboard, so there is nothing here to change one.
+    reaches that workspace's computers only.
+
+    :meth:`create`, :meth:`rename` and :meth:`delete` (platform OPL-5473) need
+    an owner's ACCOUNT-WIDE key: any key confined to a workspace is refused
+    them with :class:`~mandala_computer.PermissionDeniedError`, and so is a
+    member or viewer.
     """
 
     def __init__(self, transport: Transport) -> None:
@@ -2051,6 +2056,34 @@ class Workspaces:
         """
         rows = self._t.json_array("GET", _api.workspace_members(workspace_id))
         return [WorkspaceMember.from_api(m, f"workspace member {i}") for i, m in enumerate(rows)]
+
+    def create(self, name: str) -> Workspace:
+        """Make a workspace. The platform trims the name, which must be 1 to 40
+        characters and one the account does not already use; an account holds
+        at most 500. Each of those is an
+        :class:`~mandala_computer.APIError` with status 400.
+
+        Not retried: a create whose answer was lost may have happened, so list
+        before sending it again."""
+        body = _api.workspace_name_body(name)
+        return Workspace.from_api(self._t.json_object("POST", _api.WORKSPACES, json=body))
+
+    def rename(self, workspace_id: str, name: str) -> Workspace:
+        """Rename a workspace. Its id does not change, so the keys confined to it
+        and the computers in it are untouched. The name follows :meth:`create`'s
+        rules; an id this key cannot see is a
+        :class:`~mandala_computer.NotFoundError`."""
+        path = _api.workspace(workspace_id)
+        body = _api.workspace_name_body(name)
+        return Workspace.from_api(self._t.json_object("PATCH", path, json=body))
+
+    def delete(self, workspace_id: str) -> WorkspaceDeleted:
+        """Delete a workspace. Every API key confined to it is REVOKED in the
+        same step, whoever holds it, and ``revoked_keys`` says how many. The
+        computers in it are not touched: they keep the deleted workspace's id,
+        and account-wide keys reach them as before."""
+        path = _api.workspace(workspace_id)
+        return WorkspaceDeleted.from_api(self._t.json_object("DELETE", path))
 
 
 #: How long :meth:`Operations.wait` waits by default: the length of a long clone.

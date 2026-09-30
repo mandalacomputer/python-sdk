@@ -47,6 +47,7 @@ from ._models import (
     WebhookDelivery,
     Whoami,
     Workspace,
+    WorkspaceDeleted,
     WorkspaceMember,
     build_contradiction,
     move_rows,
@@ -1304,9 +1305,25 @@ class AsyncWorkspaces:
         rows = await self._t.json_array("GET", _api.workspace_members(workspace_id))
         return [WorkspaceMember.from_api(m, f"workspace member {i}") for i, m in enumerate(rows)]
 
+    async def create(self, name: str) -> Workspace:
+        body = _api.workspace_name_body(name)
+        return Workspace.from_api(await self._t.json_object("POST", _api.WORKSPACES, json=body))
+
+    async def rename(self, workspace_id: str, name: str) -> Workspace:
+        path = _api.workspace(workspace_id)
+        body = _api.workspace_name_body(name)
+        return Workspace.from_api(await self._t.json_object("PATCH", path, json=body))
+
+    async def delete(self, workspace_id: str) -> WorkspaceDeleted:
+        path = _api.workspace(workspace_id)
+        return WorkspaceDeleted.from_api(await self._t.json_object("DELETE", path))
+
     list.__doc__ = Workspaces.list.__doc__
     get.__doc__ = Workspaces.get.__doc__
     members.__doc__ = Workspaces.members.__doc__
+    create.__doc__ = Workspaces.create.__doc__
+    rename.__doc__ = Workspaces.rename.__doc__
+    delete.__doc__ = Workspaces.delete.__doc__
 
 
 class AsyncOperations:

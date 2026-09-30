@@ -2406,6 +2406,20 @@ def workspace_members(workspace_id: str) -> str:
     return f"workspaces/{seg(workspace_id)}/members"
 
 
+def workspace_name_body(name: object) -> dict[str, Any]:
+    """``POST workspaces`` and ``PATCH workspaces/:id``: ``{"name": …}`` and
+    nothing else.
+
+    The platform trims the name and judges it (1 to 40 characters, no control
+    characters, unique within the account); a name that is empty once trimmed
+    is refused here, before a request is spent on a certain 400.
+    """
+    n = canonical(name, "name")
+    if not n.strip():
+        raise ValueError("name must not be empty")
+    return {"name": n}
+
+
 #: The header every lifecycle call carries so that sending it again cannot do
 #: it twice (platform OPL-5127). The platform records a call that carries one
 #: before carrying it out, and for 24 hours answers the same key with the same

@@ -24,6 +24,18 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **Workspace create, rename and delete**: `client.workspaces.create(name)`,
+  `rename(workspace_id, name)` and `delete(workspace_id)` (sync and async), and
+  `mandala-py workspaces create`, `rename` and `rm --yes` (by name or id). They
+  need an owner's account-wide key; a key confined to a workspace is refused
+  with `PermissionDeniedError`. Deleting a workspace revokes every API key
+  confined to it and returns a `WorkspaceDeleted` whose `revoked_keys` says how
+  many; its computers are kept. `mandala-py workspaces rm` without `--yes` is
+  refused before any request (`confirmation_required`). A `rename` or `rm`
+  target shaped like a workspace id (`wsp-` and twelve hex) is always sent as
+  that id, never matched against workspace names, so a retried `rm` of an
+  already-deleted workspace answers not found instead of deleting one named
+  like it. Needs a platform that has these routes; an older one answers 405.
 - **A click repeat count**: `click`, `right_click` and `middle_click` (sync
   and async) take `count=`, 1 to 10, pressing the button that many times at
   double-click pacing. Needs a platform that accepts `count`; an older one

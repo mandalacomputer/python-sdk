@@ -2007,6 +2007,118 @@ def test_workspaces_members_with_a_scoped_key_is_refused(
     assert (error["code"], error["status"]) == ("permission_denied", 403)
 
 
+# --- workspace writes (platform OPL-5473) -------------------------------------
+
+
+@respx.mock
+def test_workspaces_create_sends_the_name(capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    made = respx.post(f"{BASE}/workspaces").mock(return_value=httpx.Response(201, json=WSP))
+    assert _cli.main(["workspaces", "create", "acme", "--json"]) == 0
+    assert json.loads(made.calls.last.request.content) == {"name": "acme"}
+    assert json.loads(capsys.readouterr().out) == WSP
+
+
+def test_workspaces_create_refuses_an_empty_name_before_any_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    with respx.mock(assert_all_called=False) as mock:
+        assert _cli.main(["workspaces", "create", "  ", "--json"]) == 1
+        assert not mock.calls
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_arguments"
+
+
+@pytest.mark.parametrize(("target", "listed"), [("acme", True), ("wsp-0123456789ab", False)])
+def test_workspaces_rename_takes_a_name_or_an_id(target: str, listed: bool) -> None:
+    """A name is resolved through the listing; an id is sent with no listing."""
+    import json
+
+    with respx.mock(assert_all_called=False) as mock:
+        listing = mock.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
+        renamed = mock.patch(f"{BASE}/workspaces/wsp-0123456789ab").mock(
+            return_value=httpx.Response(200, json={**WSP, "name": "acme-2"})
+        )
+        assert _cli.main(["workspaces", "rename", target, "acme-2"]) == 0
+        assert json.loads(renamed.calls.last.request.content) == {"name": "acme-2"}
+        assert listing.called is listed
+
+
+@pytest.mark.parametrize(("target", "listed"), [("acme", True), ("wsp-0123456789ab", False)])
+def test_workspaces_rm_with_yes_deletes_and_says_how_many_keys_went(
+    target: str, listed: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        listing = mock.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
+        gone = mock.delete(f"{BASE}/workspaces/wsp-0123456789ab").mock(
+            return_value=httpx.Response(200, json={"ok": True, "revoked_keys": 2})
+        )
+        assert _cli.main(["workspaces", "rm", target, "--yes"]) == 0
+        assert gone.called
+        assert listing.called is listed
+    assert capsys.readouterr().out == "deleted wsp-0123456789ab; 2 API key(s) revoked\n"
+
+
+def test_workspaces_rm_without_yes_is_refused_before_any_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    with respx.mock(assert_all_called=False) as mock:
+        assert _cli.main(["workspaces", "rm", "acme", "--json"]) == 1
+        assert not mock.calls
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "confirmation_required"
+    assert "revokes every API key confined to it" in error["message"]
+    assert "--yes" in error["message"]
+
+
+@respx.mock
+def test_workspaces_rm_refuses_a_name_that_fits_two(capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    twin = {**WSP, "id": "wsp-bbbbbbbbbbbb"}
+    respx.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP, twin]))
+    gone = respx.delete(url__regex=rf"{BASE}/workspaces/.*").mock(
+        return_value=httpx.Response(200, json={"ok": True, "revoked_keys": 0})
+    )
+    assert _cli.main(["workspaces", "rm", "acme", "--yes", "--json"]) == 1
+    assert not gone.called
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "ambiguous_workspace"
+    assert "wsp-0123456789ab, wsp-bbbbbbbbbbbb" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "method"),
+    [
+        (["workspaces", "rm", "wsp-0123456789ab", "--yes", "--json"], "DELETE"),
+        (["workspaces", "rename", "wsp-0123456789ab", "x", "--json"], "PATCH"),
+    ],
+)
+def test_an_id_shaped_workspace_target_is_never_resolved_as_a_name(
+    argv: list[str], method: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A retried rm (or rename) of a workspace already gone must not land on
+    another workspace whose NAME is that id: an id-shaped target is always an
+    id, and the platform's 404 is the answer."""
+    named_like_it = {**WSP, "id": "wsp-bbbbbbbbbbbb", "name": "wsp-0123456789ab"}
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[named_like_it]))
+        gone = mock.route(method=method, url=f"{BASE}/workspaces/wsp-0123456789ab").mock(
+            return_value=httpx.Response(404, json={"error": "workspace not found"})
+        )
+        other = mock.route(url__regex=rf"{BASE}/workspaces/wsp-bbbbbbbbbbbb.*").mock(
+            return_value=httpx.Response(200, json={"ok": True, "revoked_keys": 3})
+        )
+        assert _cli.main(argv) == 1
+        assert gone.called
+        assert not other.called
+    capsys.readouterr()
+
+
 # --- every value the CLI prints is escaped, not only whoami's (OPL-5367, OPL-5366) --
 #
 # A name another member of the account or workspace chose (a computer, a
