@@ -3344,6 +3344,7 @@ mandala-py secrets list               # names and revisions, never values
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
 mandala-py workspaces list            # and get ID, members ID; read only
+mandala-py operations list            # and get ID, wait ID; --computer takes a name or id
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
 mandala-py egress-proxy set dev https://proxy.example.com:3128 --credentials csec-0123456789abcdef
@@ -3449,9 +3450,11 @@ confined to a workspace gets the platform's 403 (`--json`: `code`
 else the default — under the same lock the npm CLI's login takes. **The key it
 held stays valid** until it is revoked, and logout prints its id for that.
 Removing the default while other profiles remain makes the first of them by name
-the default, and says so; removing the last removes the file. A profile that is
-not saved is an error (`not_logged_in`) and nothing is written. An API key in
-`MANDALA_API_KEY` is untouched and still authenticates every command.
+the default, and says so; removing the last removes the file. With no profile
+saved at all it says `Not logged in; nothing to remove.` and exits 0. A profile
+that is not saved while others are is an error (`not_logged_in`) and nothing is
+written. An API key in `MANDALA_API_KEY` is untouched and still authenticates
+every command.
 
 ### SSH access
 

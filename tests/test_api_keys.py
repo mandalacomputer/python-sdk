@@ -646,11 +646,30 @@ def test_logout_warns_about_an_environment_key(
     assert "MANDALA_API_KEY is set" in capsys.readouterr().err
 
 
-def test_logout_refuses_a_profile_that_is_not_saved(
+def test_logout_with_nothing_saved_succeeds_and_says_so(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # It exited 1 (`not_logged_in`), failing a script that logs out before it
+    # logs in (OPL-5471).
+    monkeypatch.delenv("MANDALA_API_KEY")
+    assert _cli.main(["logout"]) == 0
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Not logged in; nothing to remove." in err
+    assert _cli.main(["logout", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "profile": "default",
+        "removed": False,
+        "path": str(home / ".mandala" / "credentials.json"),
+        "key_id": None,
+        "default_profile": None,
+    }
+    assert not (home / ".mandala").exists()
+
+
+def test_logout_refuses_a_profile_that_is_not_saved_while_others_are(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert _cli.main(["logout", "--json"]) == 1
-    assert json.loads(capsys.readouterr().err)["error"]["code"] == "not_logged_in"
     path = _store(home, "home", home=_profile("com_one", "key-000000000001"))
     before = path.read_bytes()
     with pytest.raises(SystemExit, match="no saved profile named work"):

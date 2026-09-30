@@ -18,8 +18,17 @@ This is the summary you read to decide whether to upgrade.
   in between was refused with a `ConflictError` "no active desktop session". A
   computer that never gets a desktop session now makes `launch()` raise a
   `TimeoutError` instead of returning.
+- **`mandala-py logout` with no saved profile exits 0** and says `Not logged
+  in; nothing to remove.` (with `--json`, `removed: false`). A named profile
+  that is not saved while others are is still `not_logged_in`.
 
 ### Added
+
+- **`mandala-py operations list|get|wait`**, as `mandala operations` has them:
+  `list` newest first with `--computer` (a name or an id), `--idempotency-key`,
+  `--limit` and `--cursor`; `get ID`; and `wait ID` with `--timeout-ms` and
+  `--poll-ms`, exiting 1 with `operation_failed` when the operation fails.
+  Each takes `--json`.
 
 - **`Computer.wait_for_desktop()`** (and the `AsyncComputer` twin) polls a
   no-output `true` in the desktop session until it finishes with exit 0; a
