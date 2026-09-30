@@ -69,8 +69,8 @@ Authentication is selected once when a client is constructed, in this order:
 
 `None` means an option is absent. Profile names are case-sensitive. Explicit or
 environment keys bypass the credential file completely, including an unused
-profile selector. You can still create a key at Settings → API keys and pass
-`Client(api_key=...)` or set `MANDALA_API_KEY`.
+profile selector. You can still create a key at Settings → Credentials → API
+keys and pass `Client(api_key=...)` or set `MANDALA_API_KEY`.
 
 A saved profile binds its key to its stored canonical base URL. A supplied
 `base_url`, or otherwise a nonempty `MANDALA_BASE_URL`, must match that entire
@@ -92,8 +92,9 @@ provider keys or passwords.
 
 A running client keeps its selected key and base after the file changes. Create
 a new client to load a replacement. Revoking the device-named key in Settings →
-API keys makes requests fail with `AuthenticationError` and the server's reason;
-the SDK does not switch profiles, reread the store, or start login after a 401.
+Credentials → API keys makes requests fail with `AuthenticationError` and the
+server's reason; the SDK does not switch profiles, reread the store, or start
+login after a 401.
 The existing Python CLI inherits file authentication, with `MANDALA_PROFILE=Work`
 selecting a profile for terminal, SCP and webhook commands.
 
