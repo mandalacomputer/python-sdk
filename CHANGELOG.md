@@ -72,6 +72,12 @@ This is the summary you read to decide whether to upgrade.
   session. It returns at once for a Windows guest or a computer whose `os` is not reported. An absent
   `desktop` field is an X11 desktop and is waited on.
 
+### Documentation
+
+- The `secrets` argument's docstring on `computers.create()` (sync and async)
+  now points to Settings → Credentials → Secrets, where the account's secrets
+  are kept; it named a Settings → Secrets tab that no longer exists.
+
 ## [0.8.0] — 2026-09-29
 
 ### Added
