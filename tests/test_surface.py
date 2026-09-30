@@ -619,6 +619,12 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"text": "on the clipboard"} if get else {"ok": True})
     if path.endswith("/windows"):
         return httpx.Response(200, json={"windows": [WINDOW]})
+    # An input call that asked for the desktop afterwards (OPL-5472) gets it, in
+    # the platform's shape; one that did not falls through to the plain ack.
+    if path.endswith("/input") and request.url.params.get("context") == "1":
+        return httpx.Response(
+            200, json={"ok": True, "context": {"windows": [WINDOW], "focused": WINDOW}}
+        )
     if "/windows/" in path:
         return httpx.Response(200, json={"ok": True, "window": WINDOW, "gone": False})
     if path.endswith("/templates/schema"):
@@ -846,6 +852,7 @@ def exercise_everything(client: mc.Client) -> None:
     c.double_click(1, 2)
     c.triple_click(1, 2)
     c.click(1, 2, "shift")
+    c.click(1, 2, count=3, context=True)
     c.click()
     c.drag(9, 9, from_x=1, from_y=2)
     c.mouse_down(1, 2)
@@ -1135,6 +1142,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.double_click(1, 2)
     await c.triple_click(1, 2)
     await c.click(1, 2, "shift")
+    await c.click(1, 2, count=3, context=True)
     await c.click()
     await c.drag(9, 9, from_x=1, from_y=2)
     await c.mouse_down(1, 2)

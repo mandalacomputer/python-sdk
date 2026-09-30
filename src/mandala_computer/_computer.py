@@ -76,6 +76,7 @@ from ._models import (
     ExecStatus,
     FilePart,
     GuestDirectory,
+    InputContext,
     Listing,
     Move,
     ScreenshotInfo,
@@ -823,6 +824,33 @@ def _windows_from_response(data: Mapping[str, Any]) -> list[Window]:
                 "so a listing carrying one that names nothing is drift rather than a desktop"
             )
     return windows
+
+
+def _input_context(data: Mapping[str, Any]) -> InputContext:
+    """The context an input answer carries, for a request that asked for one.
+
+    Refused when the answer carries neither a context nor the reason it has
+    none: an answer with nothing in it is not an empty desktop, and calling it
+    one is the coercion :func:`_windows_from_response` refuses.
+    """
+    context = data.get("context")
+    if isinstance(context, Mapping):
+        if not isinstance(context.get("windows"), list):
+            raise MandalaError("POST input answered a context whose windows is not an array")
+        focused = context.get("focused")
+        if focused is not None and not isinstance(focused, Mapping):
+            raise MandalaError("POST input answered a context whose focused is not a window")
+        return InputContext(
+            windows=_windows_from_response(context),
+            focused=None if focused is None else Window.from_api(focused),
+            error=None,
+        )
+    error = data.get("context_error")
+    if isinstance(error, str) and error:
+        return InputContext(windows=None, focused=None, error=error)
+    raise MandalaError(
+        "POST input was asked for context and answered neither context nor context_error"
+    )
 
 
 def _clipboard_text(data: Mapping[str, Any]) -> str:
@@ -3528,10 +3556,33 @@ class Computer(ComputerFields):
 
     # --- controlling ----------------------------------------------------
 
-    def _input(self, body: dict[str, Any], *, timeout: float | None = None) -> Mapping[str, Any]:
+    def _input(
+        self,
+        body: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        params: dict[str, str] | None = None,
+    ) -> Mapping[str, Any]:
         return self._t.json_object(
-            "POST", _api.computer_action(self.id, "input"), json=body, timeout=timeout
+            "POST",
+            _api.computer_action(self.id, "input"),
+            json=body,
+            params=params,
+            timeout=timeout,
         )
+
+    def _click(
+        self,
+        action: str,
+        x: int | None,
+        y: int | None,
+        modifiers: tuple[str, ...],
+        count: int | None,
+        context: bool,
+    ) -> InputContext | None:
+        params = _api.input_params(context)
+        data = self._input(_api.click_body(action, x, y, modifiers, count), params=params)
+        return _input_context(data) if params else None
 
     def move(self, x: int, y: int) -> None:
         """Move the pointer to ``(x, y)`` in this computer's screen space.
@@ -3541,26 +3592,62 @@ class Computer(ComputerFields):
         """
         self._input(_api.pointer_body("move", x, y))
 
-    def click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
+    def click(
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *modifiers: str,
+        count: int | None = None,
+        context: bool = False,
+    ) -> InputContext | None:
         """Click. With no coordinate, clicks wherever the pointer already is.
 
         ``modifiers`` are held down for the click, e.g.
         ``click(100, 200, "shift")`` to extend a selection.
+
+        ``count=4`` presses the button four times (1 to 10), paced as a
+        double-click is. ``context=True`` returns the desktop's windows as they
+        stand just after the click — see :class:`InputContext` — which saves
+        listing them separately; without it this returns ``None``.
         """
-        self._input(_api.click_body("left_click", x, y, modifiers))
+        return self._click("left_click", x, y, modifiers, count, context)
 
-    def right_click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
-        self._input(_api.click_body("right_click", x, y, modifiers))
+    def right_click(
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *modifiers: str,
+        count: int | None = None,
+        context: bool = False,
+    ) -> InputContext | None:
+        """A right click. Takes ``count`` and ``context`` as :meth:`click` does."""
+        return self._click("right_click", x, y, modifiers, count, context)
 
-    def middle_click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
-        self._input(_api.click_body("middle_click", x, y, modifiers))
+    def middle_click(
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *modifiers: str,
+        count: int | None = None,
+        context: bool = False,
+    ) -> InputContext | None:
+        """A middle click. Takes ``count`` and ``context`` as :meth:`click` does."""
+        return self._click("middle_click", x, y, modifiers, count, context)
 
-    def double_click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
-        self._input(_api.click_body("double_click", x, y, modifiers))
+    def double_click(
+        self, x: int | None = None, y: int | None = None, *modifiers: str, context: bool = False
+    ) -> InputContext | None:
+        """Two clicks. Takes ``context`` as :meth:`click` does."""
+        return self._click("double_click", x, y, modifiers, None, context)
 
-    def triple_click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
-        """Three clicks, which is how most editors select a whole line."""
-        self._input(_api.click_body("triple_click", x, y, modifiers))
+    def triple_click(
+        self, x: int | None = None, y: int | None = None, *modifiers: str, context: bool = False
+    ) -> InputContext | None:
+        """Three clicks, which is how most editors select a whole line.
+
+        Takes ``context`` as :meth:`click` does.
+        """
+        return self._click("triple_click", x, y, modifiers, None, context)
 
     def drag(
         self,

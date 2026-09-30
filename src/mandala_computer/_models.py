@@ -50,6 +50,7 @@ __all__ = [
     "ExecStatus",
     "FilePart",
     "GuestDirectory",
+    "InputContext",
     "LifecycleAck",
     "Listing",
     "Move",
@@ -2401,6 +2402,26 @@ class Window:
             visible=_wire(d, "visible") is _Wire.TRUE,
             raw=dict(d),
         )
+
+
+@dataclass(frozen=True)
+class InputContext:
+    """The desktop just after a click, for a call made with ``context=True``.
+
+    ``windows`` is what :meth:`Computer.windows` lists by default, read once
+    straight after the action — there is no settle wait, so a window still
+    opening is not in it yet. ``focused`` is the one of them holding the
+    keyboard, or ``None`` when none does (focus on the desktop itself included).
+
+    ``windows`` is ``None``, never ``[]``, when the platform could not read them
+    — a Windows guest, no desktop session, a guest agent slow to answer — and
+    ``error`` then says why. The click itself still happened: do not send it
+    again.
+    """
+
+    windows: list[Window] | None
+    focused: Window | None
+    error: str | None
 
 
 @dataclass(frozen=True)
