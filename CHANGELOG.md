@@ -76,7 +76,7 @@ This is the summary you read to decide whether to upgrade.
 
 - The `secrets` argument's docstring on `computers.create()` (sync and async)
   now points to Settings → Credentials → Secrets, where the account's secrets
-  are kept; it named a Settings → Secrets tab that no longer exists.
+  are kept, instead of a Secrets tab under Settings that no longer exists.
 
 ## [0.8.0] — 2026-09-29
 
