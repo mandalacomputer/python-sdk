@@ -31,11 +31,12 @@ Two subcommands address a computer by name or id:
     receive webhooks; a receiver is a server, and :func:`mandala_computer.verify`
     is what it calls. ``create`` and ``rotate`` print the secret ONCE.
 
-``mandala-py secrets <list|set|rm>``
+``mandala-py secrets <list|get|set|rm>``
     The account's secret store. ``set NAME`` reads the value from stdin, or
     prompts for it without echo — never from the command line, where it would
     land in shell history and ``ps`` — and creates the secret or replaces its
-    value. No command ever prints a value: the platform returns none.
+    value. ``get`` reads one secret's metadata by name or id. No command ever
+    prints a value: the platform returns none.
 
 ``mandala-py whoami`` / ``mandala-py api-keys <list|create|revoke>``
     Who the credential is, and the holder's own API keys. The ``api-keys``
@@ -46,8 +47,9 @@ Two subcommands address a computer by name or id:
 ``mandala-py workspaces <list|get|members|create|rename|rm|use|current>``
     The account's workspaces: their ids (what ``secrets --workspace`` and
     ``api-keys create --workspace`` take) and the people who reach one.
-    ``members`` needs an account-wide key; a key confined to a workspace is
-    refused, since the list is the whole account's. ``create``, ``rename`` and
+    ``get`` and ``members`` take a name or an id. ``members`` needs an
+    account-wide key; a key confined to a workspace is refused, since the list
+    is the whole account's. ``create``, ``rename`` and
     ``rm`` need an owner's account-wide key; ``rename`` and ``rm`` take a name
     or an id. ``rm`` does nothing without ``--yes``, because deleting a
     workspace revokes every API key confined to it (its computers are kept).
@@ -61,6 +63,14 @@ Two subcommands address a computer by name or id:
     reads them: ``list`` newest first (``--computer`` takes a name or an id),
     ``get`` one, and ``wait`` until one succeeds (exit 0) or fails (exit 1,
     ``operation_failed``). Succeeded is not a booted desktop.
+
+``mandala-py move <computer> --ram-mb N [--cpu N] [--disk-gb N] [--wait]`` / ``mandala-py moves list``
+    Move a stopped computer to another host in its region that can run a size
+    its own host cannot — the step the platform offers when a resize is refused
+    with ``move_required`` — and list the moves still running or finished in
+    the last day. A top-level verb, as ``terminal`` and ``scp`` are: this
+    command has no ``computers`` group. With ``--wait`` it exits 0 only when
+    the move is ``done``.
 
 ``mandala-py logout [--profile NAME]``
     Forget a profile saved in ``~/.mandala/credentials.json`` by
@@ -145,6 +155,7 @@ from ._models import (
     BrowserProxyArgs,
     EgressProxyArgs,
     Listing,
+    Move,
     Operation,
     Secret,
     SshAccess,
@@ -1692,6 +1703,46 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
     return by_name or by_id
 
 
+_SECRET_ID = re.compile(r"csec-[0-9a-f]{16}")
+
+
+def _cmd_secrets_get(args: argparse.Namespace) -> int:
+    """``secrets get NAME``: one secret's metadata, found as ``rm`` finds one.
+
+    By name or id in the scope's listing first, so a name works and a name that
+    also spells another secret's id is refused rather than guessed; then read
+    by id. An id the listing does not hold is read as typed, and the platform's
+    404 says whether it is there. Never a value: the platform answers none.
+    """
+    workspace = _scope(args, mutating=False)
+    with _client() as client:
+        listed = client.secrets.list(workspace_id=workspace).secrets
+        found = _secret_to_remove(listed, args.name)
+        if found is None and not _SECRET_ID.fullmatch(args.name):
+            # Not repeated: what was typed as the name may be the value itself.
+            scope = f"workspace {workspace}" if workspace else "the account-wide scope"
+            _die(f"no secret with that name or id in {scope}", "not_found")
+        secret = client.secrets.get(
+            found.id if found is not None else args.name, workspace_id=workspace
+        )
+    if args.json:
+        _json(dict(secret.raw))
+        return 0
+    rows = [
+        (
+            secret.id,
+            _printable(secret.name),
+            secret.workspace_id or "account",
+            secret.revision_id,
+            secret.created_at,
+            secret.updated_at,
+            secret.last_used_at or "never",
+        )
+    ]
+    print(_table(("ID", "NAME", "SCOPE", "REVISION", "CREATED", "UPDATED", "LAST USED"), rows))
+    return 0
+
+
 def _cmd_secrets_rm(args: argparse.Namespace) -> int:
     workspace = _scope(args)
     with _client() as client:
@@ -1733,11 +1784,19 @@ def _secrets_parser(sub: Any) -> None:
     put.set_defaults(fn=_cmd_secrets_set)
     put.unnamed_hint = "secrets set reads the value from stdin or a prompt"
 
+    get = verbs.add_parser(
+        "get", help="one secret's metadata, by name or id: id, revision, dates — never its value"
+    )
+    get.add_argument("name", metavar="NAME")
+    get.add_argument("--workspace", metavar="ID", help=scope)
+    get.add_argument("--json", action="store_true", help="the secret as JSON")
+    get.set_defaults(fn=_cmd_secrets_get)
+
     rm = verbs.add_parser("rm", help="delete a secret, by name or id")
     rm.add_argument("name", metavar="NAME")
     rm.add_argument("--workspace", metavar="ID", help=scope)
     rm.set_defaults(fn=_cmd_secrets_rm)
-    for verb in (store, listing, put, rm):
+    for verb in (store, listing, put, get, rm):
         verb.quotes_input = False
 
 
@@ -2051,7 +2110,7 @@ def _operation_rows(operations: Sequence[Operation]) -> str:
     return _table(("ID", "KIND", "STATE", "COMPUTER", "CREATED", "ERROR"), rows)
 
 
-def _operations_computer(client: Client, target: str) -> str:
+def _operations_computer(client: Client, target: str, listed: str = "operations") -> str:
     """``operations list --computer``: a computer by name or id, as ``mandala``
     takes one. A value that is neither a listed computer's id nor its name is
     sent as typed, because an operation outlives its computer: a deleted one's
@@ -2073,7 +2132,7 @@ def _operations_computer(client: Client, target: str) -> str:
         )
     print(
         f"{PROG}: no listed computer is named {_printable(target)} or has that id; "
-        f"listing the operations recorded under the id {_printable(target)}",
+        f"listing the {listed} recorded under the id {_printable(target)}",
         file=sys.stderr,
     )
     return target
@@ -2176,6 +2235,121 @@ def _operations_parser(sub: Any) -> None:
     wait.set_defaults(fn=_cmd_operations_wait)
 
 
+# --- moves -------------------------------------------------------------------
+
+
+def _move_rows(moves: Sequence[Move]) -> str:
+    def size(v: int | None) -> str:
+        return "-" if v is None else str(v)
+
+    rows = [
+        (
+            m.computer_id,
+            _printable(m.state),
+            "yes" if m.live else "no",
+            size(m.cpu),
+            size(m.ram_mb),
+            size(m.disk_gb),
+            m.started_at or "-",
+            m.finished_at or "-",
+        )
+        for m in moves
+    ]
+    return _table(
+        ("COMPUTER", "STATE", "LIVE", "CPU", "RAM MB", "DISK GB", "STARTED", "FINISHED"), rows
+    )
+
+
+def _cmd_move(args: argparse.Namespace) -> int:
+    """``move COMPUTER --ram-mb N``: the second half of a resize refused with
+    ``move_required``. The body is checked before any request; with ``--wait``
+    the command waits for the move and exits 0 only when it is ``done``."""
+    _api.move_body(ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb)
+    if not args.wait and (args.timeout_ms is not None or args.poll_ms is not None):
+        _die("--timeout-ms and --poll-ms go with --wait", "invalid_arguments")
+    timeout = _milliseconds("timeout-ms", args.timeout_ms, 900.0)
+    poll = _milliseconds("poll-ms", args.poll_ms, 3.0)
+    with _client() as client:
+        c = _resolve(client, args.target)
+        move = c.relocate(ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb)
+        if args.wait:
+            move = c.wait_for_move(timeout=timeout, poll=poll)
+    if args.json:
+        _json(dict(move.raw))
+    else:
+        print(_move_rows([move]))
+    if not args.wait or move.state == "done":
+        return 0
+    # The three ways a move ends other than `done` are three situations, and
+    # none of them is the size that was asked for (see Move.state).
+    detail = f": {_printable(move.detail)}" if move.detail else ""
+    if move.state == "moved":
+        note = (
+            f"{_shown(c.id)} moved to another host at its OLD size; the resize did not "
+            "apply there: resize it again"
+        )
+    elif move.state == "failed":
+        note = f"the move of {_shown(c.id)} failed; the computer is where it was{detail}"
+    else:
+        note = (
+            f"the move of {_shown(c.id)} ended {_shown(move.state)}; "
+            f"read the computer to see where it is{detail}"
+        )
+    print(f"{PROG}: {note}", file=sys.stderr)
+    return 1
+
+
+def _cmd_moves_list(args: argparse.Namespace) -> int:
+    with _client() as client:
+        only = (
+            None if args.computer is None else _operations_computer(client, args.computer, "moves")
+        )
+        moves = [m for m in client.moves.list() if only is None or m.computer_id == only]
+    if args.json:
+        _json({"moves": [dict(m.raw) for m in moves]})
+    elif moves:
+        print(_move_rows(moves))
+    else:
+        print("no moves", file=sys.stderr)
+    return 0
+
+
+def _moves_parsers(sub: Any) -> None:
+    move = sub.add_parser(
+        "move",
+        help=(
+            "move a stopped computer to another host in its region that can run a size its "
+            "own host cannot (after a resize answered move_required), resizing it there"
+        ),
+    )
+    move.add_argument("target", metavar="computer", help="computer name or id")
+    move.add_argument(
+        "--ram-mb",
+        type=int,
+        required=True,
+        help="RAM in MiB: the size that did not fit, more than the computer has now",
+    )
+    move.add_argument("--cpu", type=int, help="vCPU count to apply with the move")
+    move.add_argument("--disk-gb", type=int, help="disk in GiB to apply with the move")
+    move.add_argument(
+        "--wait",
+        action="store_true",
+        help="wait for the move to finish; exit 0 only when it is done",
+    )
+    move.add_argument("--timeout-ms", type=int, help="wait deadline in milliseconds (15 min)")
+    move.add_argument("--poll-ms", type=int, help="poll interval in milliseconds")
+    move.add_argument("--json", action="store_true", help="the move as JSON")
+    move.set_defaults(fn=_cmd_move)
+    moves = sub.add_parser("moves", help="the account's moves, running or finished in a day")
+    verbs = moves.add_subparsers(dest="verb", required=True)
+    listing = verbs.add_parser(
+        "list", help="moves still running and those finished in the last day"
+    )
+    listing.add_argument("--computer", metavar="COMPUTER", help="only this computer, by name or id")
+    listing.add_argument("--json", action="store_true", help="the moves as JSON")
+    listing.set_defaults(fn=_cmd_moves_list)
+
+
 # --- workspaces (platform OPL-5057) ------------------------------------------
 
 
@@ -2213,7 +2387,7 @@ def _cmd_workspaces_list(args: argparse.Namespace) -> int:
 
 def _cmd_workspaces_get(args: argparse.Namespace) -> int:
     with _client() as client:
-        workspace = client.workspaces.get(args.id)
+        workspace = client.workspaces.get(_workspace_id(client, args.workspace))
     if args.json:
         _json(workspace.raw)
     else:
@@ -2223,7 +2397,7 @@ def _cmd_workspaces_get(args: argparse.Namespace) -> int:
 
 def _cmd_workspaces_members(args: argparse.Namespace) -> int:
     with _client() as client:
-        members = client.workspaces.members(args.id)
+        members = client.workspaces.members(_workspace_id(client, args.workspace))
     if args.json:
         _json([m.raw for m in members])
     elif members:
@@ -2509,14 +2683,16 @@ def _workspaces_parser(sub: Any) -> None:
     listing = verbs.add_parser("list", help="the workspaces this key can reach")
     listing.add_argument("--json", action="store_true", help="the rows as JSON")
     listing.set_defaults(fn=_cmd_workspaces_list)
-    get = verbs.add_parser("get", help="one workspace; one this key cannot see is not found")
-    get.add_argument("id", metavar="ID")
+    get = verbs.add_parser(
+        "get", help="one workspace, by name or id; one this key cannot see is not found"
+    )
+    get.add_argument("workspace", metavar="WORKSPACE")
     get.add_argument("--json", action="store_true", help="the workspace as JSON")
     get.set_defaults(fn=_cmd_workspaces_get)
     members = verbs.add_parser(
-        "members", help="who reaches a workspace (needs an account-wide key)"
+        "members", help="who reaches a workspace, by name or id (needs an account-wide key)"
     )
-    members.add_argument("id", metavar="ID")
+    members.add_argument("workspace", metavar="WORKSPACE")
     members.add_argument("--json", action="store_true", help="the rows as JSON")
     members.set_defaults(fn=_cmd_workspaces_members)
     owner = "needs an owner's key that is not confined to a workspace"
@@ -3608,6 +3784,7 @@ def _parser() -> _Parser:
     _secrets_parser(sub)
     _keys_parsers(sub)
     _operations_parser(sub)
+    _moves_parsers(sub)
     _workspaces_parser(sub)
     return parser
 

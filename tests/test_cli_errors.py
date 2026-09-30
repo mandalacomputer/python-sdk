@@ -174,7 +174,7 @@ def test_an_unknown_verb_under_secrets_is_not_repeated(
         " (the word typed is not repeated here, as under secrets it may be a secret value)"
     )
     # Some Python versions quote the choices and some do not.
-    assert re.search(r"choose from '?list'?, '?set'?, '?rm'? \(", first)
+    assert re.search(r"choose from '?list'?, '?set'?, '?get'?, '?rm'? \(", first)
     assert "'x'" not in err
 
 
@@ -276,7 +276,7 @@ def test_an_early_option_is_named_alone_however_its_value_is_typed(
 
 
 # Some Python versions quote argparse's choices and some do not.
-_VERB_CHOICES = r"'?list'?, '?set'?, '?rm'?"
+_VERB_CHOICES = r"'?list'?, '?set'?, '?get'?, '?rm'?"
 
 
 @pytest.mark.parametrize(
