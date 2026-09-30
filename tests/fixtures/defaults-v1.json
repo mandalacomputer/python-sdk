@@ -1,0 +1,87 @@
+{
+  "format": "mandala.defaults.conformance.v1",
+  "description": "Synthetic offline vectors for ~/.mandala/defaults.json, the per-profile default workspace saved by `workspaces use`. The TypeScript and Python CLIs carry these same bytes and must read them the same way.",
+  "valid": [
+    {
+      "name": "two profiles, one default each",
+      "text": "{\"version\":1,\"profiles\":{\"default\":{\"account_id\":\"acc-000000000001\",\"workspace\":{\"id\":\"wsp-0123456789ab\",\"name\":\"customers\"}},\"work\":{\"account_id\":\"acc-000000000002\",\"workspace\":{\"id\":\"wsp-ba9876543210\",\"name\":\"Research été\"}}}}",
+      "lookups": [
+        {
+          "profile": "default",
+          "account_id": "acc-000000000001",
+          "entry": { "id": "wsp-0123456789ab", "name": "customers" },
+          "ignored": null
+        },
+        {
+          "profile": "work",
+          "account_id": "acc-000000000002",
+          "entry": { "id": "wsp-ba9876543210", "name": "Research été" },
+          "ignored": null
+        },
+        {
+          "profile": "work",
+          "account_id": "acc-000000000009",
+          "entry": null,
+          "ignored": { "id": "wsp-ba9876543210", "name": "Research été" }
+        },
+        { "profile": "other", "account_id": "acc-000000000001", "entry": null, "ignored": null }
+      ]
+    },
+    {
+      "name": "no profiles",
+      "text": "{\"version\":1,\"profiles\":{}}",
+      "lookups": [
+        { "profile": "default", "account_id": "acc-000000000001", "entry": null, "ignored": null }
+      ]
+    }
+  ],
+  "invalid": [
+    { "name": "not JSON", "text": "{\"version\":1,", "code": "invalid_json" },
+    {
+      "name": "another version",
+      "text": "{\"version\":2,\"profiles\":{}}",
+      "code": "unsupported_version"
+    },
+    { "name": "no version", "text": "{\"profiles\":{}}", "code": "invalid_schema" },
+    {
+      "name": "a boolean version",
+      "text": "{\"version\":true,\"profiles\":{}}",
+      "code": "invalid_schema"
+    },
+    {
+      "name": "a fractional version",
+      "text": "{\"version\":1.5,\"profiles\":{}}",
+      "code": "invalid_schema"
+    },
+    {
+      "name": "an extra top-level field",
+      "text": "{\"version\":1,\"profiles\":{},\"extra\":true}",
+      "code": "invalid_schema"
+    },
+    {
+      "name": "an extra entry field",
+      "text": "{\"version\":1,\"profiles\":{\"default\":{\"account_id\":\"acc-1\",\"workspace\":{\"id\":\"wsp-1\",\"name\":\"a\"},\"extra\":1}}}",
+      "code": "invalid_schema"
+    },
+    {
+      "name": "an empty workspace id",
+      "text": "{\"version\":1,\"profiles\":{\"default\":{\"account_id\":\"acc-1\",\"workspace\":{\"id\":\"\",\"name\":\"a\"}}}}",
+      "code": "invalid_schema"
+    },
+    {
+      "name": "a workspace name that is not a string",
+      "text": "{\"version\":1,\"profiles\":{\"default\":{\"account_id\":\"acc-1\",\"workspace\":{\"id\":\"wsp-1\",\"name\":7}}}}",
+      "code": "invalid_schema"
+    },
+    {
+      "name": "an invalid profile name",
+      "text": "{\"version\":1,\"profiles\":{\"../x\":{\"account_id\":\"acc-1\",\"workspace\":{\"id\":\"wsp-1\",\"name\":\"a\"}}}}",
+      "code": "invalid_profile"
+    },
+    {
+      "name": "profiles is a list",
+      "text": "{\"version\":1,\"profiles\":[]}",
+      "code": "invalid_schema"
+    }
+  ]
+}

@@ -3353,6 +3353,7 @@ mandala-py secrets list               # names and revisions, never values
 mandala-py whoami                     # person, account, role, workspace, key
 mandala-py api-keys list              # and create, revoke; needs Manage keys
 mandala-py workspaces list            # and get ID, members ID, create, rename, rm --yes
+mandala-py workspaces use research    # a default workspace for this profile; current, use --clear
 mandala-py operations list            # and get ID, wait ID; --computer takes a name or id
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
@@ -3459,6 +3460,37 @@ confined to a workspace gets the platform's 403 (`--json`: `code`
 `rm` take a name or an id. `rm` does nothing without `--yes`
 (`confirmation_required`), because deleting a workspace revokes every API key
 confined to it; it prints how many. Its computers are kept.
+
+`workspaces use WORKSPACE [--profile NAME]` saves a default workspace, by name
+or id, for a saved profile (`--profile`, else `MANDALA_PROFILE`, else the
+default). `secrets list`, `set` and `rm`, and `api-keys create`, then use it
+whenever `--workspace` is not given, and say so in one stderr line; an explicit
+`--workspace` always wins, and `workspaces use --clear` is the way back to
+account-wide (there is no per-command override). The workspace is resolved
+through the API as `rename` resolves it; no key is minted, and the profile's
+key and scope are unchanged. `workspaces current` says which workspace applies
+and why; with `--json`, `{"profile", "workspace": {"id", "name"} | null,
+"source"}`, where `source` is `key` (the key is confined to it), `profile` (the
+saved default) or `none` (account-wide). It needs no network.
+
+The default lives in `~/.mandala/defaults.json` (mode 0600, written under its
+own `.defaults.lock` with the same checks as `credentials.json`), keyed by
+profile and by the account the profile was logged in to: after a login to
+another account it is ignored, and `workspaces current` says so. The npm
+`mandala` CLI reads and writes the same file. `credentials.json` is never
+changed, so an older SDK or CLI reading it is unaffected. A `defaults.json`
+that cannot be read (not valid JSON, another version, or readable by others)
+is ignored with a note by `secrets list`, which only reads. `secrets set`,
+`secrets rm` and `api-keys create` refuse instead, sending nothing, rather than
+act account-wide: pass `--workspace`, or fix or delete the file. It is never
+overwritten: `workspaces use` asks you to delete or fix it. `logout` removes
+the profile's default as well.
+
+A profile whose key is confined to a workspace already has that one:
+`workspaces use` of another is refused (log in again without `--workspace` for
+an account-wide key), and of its own saves nothing. With `MANDALA_API_KEY` set
+there is no profile to save a default in, so `workspaces use` is refused and no
+default applies.
 
 `logout [--profile NAME]` forgets one profile that `mandala login` saved in
 `~/.mandala/credentials.json` — the one `--profile` or `MANDALA_PROFILE` names,
