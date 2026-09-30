@@ -2031,30 +2031,33 @@ def test_workspaces_create_refuses_an_empty_name_before_any_request(
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_arguments"
 
 
-@respx.mock
-@pytest.mark.parametrize("target", ["acme", "wsp-0123456789ab"])
-def test_workspaces_rename_takes_a_name_or_an_id(target: str) -> None:
+@pytest.mark.parametrize(("target", "listed"), [("acme", True), ("wsp-0123456789ab", False)])
+def test_workspaces_rename_takes_a_name_or_an_id(target: str, listed: bool) -> None:
+    """A name is resolved through the listing; an id is sent with no listing."""
     import json
 
-    respx.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
-    renamed = respx.patch(f"{BASE}/workspaces/wsp-0123456789ab").mock(
-        return_value=httpx.Response(200, json={**WSP, "name": "acme-2"})
-    )
-    assert _cli.main(["workspaces", "rename", target, "acme-2"]) == 0
-    assert json.loads(renamed.calls.last.request.content) == {"name": "acme-2"}
+    with respx.mock(assert_all_called=False) as mock:
+        listing = mock.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
+        renamed = mock.patch(f"{BASE}/workspaces/wsp-0123456789ab").mock(
+            return_value=httpx.Response(200, json={**WSP, "name": "acme-2"})
+        )
+        assert _cli.main(["workspaces", "rename", target, "acme-2"]) == 0
+        assert json.loads(renamed.calls.last.request.content) == {"name": "acme-2"}
+        assert listing.called is listed
 
 
-@respx.mock
-@pytest.mark.parametrize("target", ["acme", "wsp-0123456789ab"])
+@pytest.mark.parametrize(("target", "listed"), [("acme", True), ("wsp-0123456789ab", False)])
 def test_workspaces_rm_with_yes_deletes_and_says_how_many_keys_went(
-    target: str, capsys: pytest.CaptureFixture[str]
+    target: str, listed: bool, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    respx.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
-    gone = respx.delete(f"{BASE}/workspaces/wsp-0123456789ab").mock(
-        return_value=httpx.Response(200, json={"ok": True, "revoked_keys": 2})
-    )
-    assert _cli.main(["workspaces", "rm", target, "--yes"]) == 0
-    assert gone.called
+    with respx.mock(assert_all_called=False) as mock:
+        listing = mock.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[WSP]))
+        gone = mock.delete(f"{BASE}/workspaces/wsp-0123456789ab").mock(
+            return_value=httpx.Response(200, json={"ok": True, "revoked_keys": 2})
+        )
+        assert _cli.main(["workspaces", "rm", target, "--yes"]) == 0
+        assert gone.called
+        assert listing.called is listed
     assert capsys.readouterr().out == "deleted wsp-0123456789ab; 2 API key(s) revoked\n"
 
 
@@ -2086,6 +2089,34 @@ def test_workspaces_rm_refuses_a_name_that_fits_two(capsys: pytest.CaptureFixtur
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["code"] == "ambiguous_workspace"
     assert "wsp-0123456789ab, wsp-bbbbbbbbbbbb" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "method"),
+    [
+        (["workspaces", "rm", "wsp-0123456789ab", "--yes", "--json"], "DELETE"),
+        (["workspaces", "rename", "wsp-0123456789ab", "x", "--json"], "PATCH"),
+    ],
+)
+def test_an_id_shaped_workspace_target_is_never_resolved_as_a_name(
+    argv: list[str], method: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A retried rm (or rename) of a workspace already gone must not land on
+    another workspace whose NAME is that id: an id-shaped target is always an
+    id, and the platform's 404 is the answer."""
+    named_like_it = {**WSP, "id": "wsp-bbbbbbbbbbbb", "name": "wsp-0123456789ab"}
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/workspaces").mock(return_value=httpx.Response(200, json=[named_like_it]))
+        gone = mock.route(method=method, url=f"{BASE}/workspaces/wsp-0123456789ab").mock(
+            return_value=httpx.Response(404, json={"error": "workspace not found"})
+        )
+        other = mock.route(url__regex=rf"{BASE}/workspaces/wsp-bbbbbbbbbbbb.*").mock(
+            return_value=httpx.Response(200, json={"ok": True, "revoked_keys": 3})
+        )
+        assert _cli.main(argv) == 1
+        assert gone.called
+        assert not other.called
+    capsys.readouterr()
 
 
 # --- every value the CLI prints is escaped, not only whoami's (OPL-5367, OPL-5366) --

@@ -2202,16 +2202,27 @@ def _cmd_workspaces_members(args: argparse.Namespace) -> int:
     return 0
 
 
+_WORKSPACE_ID = re.compile(r"wsp-[0-9a-f]{12}")
+
+
 def _workspace_id(client: Client, target: str) -> str:
     """The workspace ``target`` names, by id or name, as ``mandala`` takes one.
 
-    The listing is the whole of what this key can reach, so it decides: an id
-    in it wins over a name, a name that fits exactly one workspace becomes its
-    id, and a name that fits more than one is refused with their ids. Anything
-    else is sent as typed, and the platform's 404 says there is no such
+    A target shaped like a workspace id (``wsp-`` and twelve lowercase hex) is
+    that id and is never matched against names: otherwise a retried
+    ``workspaces rm <id> --yes``, whose workspace the first attempt already
+    deleted, would land on another workspace NAMED that id string and revoke
+    its keys. Sent as the id, the retry is the platform's 404.
+
+    Anything else is looked up in the listing, which is the whole of what this
+    key can reach: a name that fits exactly one workspace becomes its id, and a
+    name that fits more than one is refused with their ids. A name that fits
+    none is sent as typed, and the platform's 404 says there is no such
     workspace.
     """
     _api.workspace(target)
+    if _WORKSPACE_ID.fullmatch(target):
+        return target
     listed = client.workspaces.list()
     if any(w.id == target for w in listed):
         return target
