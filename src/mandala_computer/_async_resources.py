@@ -401,6 +401,14 @@ class AsyncComputers:
         :attr:`~mandala_computer.APIError.operation_id`, that one is the failed
         stage's own.
 
+        Such an error whose ``idempotency_key`` is ``None`` (a readiness wait
+        that ran out of time, say, or a start that succeeded but whose refresh
+        failed) also came after a successful create: the computer exists and
+        is billable. Recover through the id its message names
+        (``computers.get`` or a ``wait_*`` method), or delete it. Do not launch
+        again without a key: ``idempotency_key=None`` makes a fresh key, and
+        that launch creates a second computer.
+
         A replayed create answer (``Idempotent-Replayed: true``) is the first
         attempt's, up to 24 hours old, so launch reads the computer afresh
         before acting on it: a start that attempt reported failed is sent

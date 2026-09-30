@@ -565,3 +565,31 @@ def test_a_failed_later_stage_carries_the_key_launch_made():
     made = scenario.requests[0].headers["Idempotency-Key"]
     assert caught.value.idempotency_key == made
     assert scenario.requests[1].headers["Idempotency-Key"] != made
+
+
+def test_a_keyless_later_stage_error_names_the_computer_and_no_key(monkeypatch):
+    # A readiness timeout after the create carries no key. Resending launch
+    # with that None would mint a fresh key and build a second computer, so
+    # launch's docstring must tell callers to recover through the id instead.
+    scenario = Scenario(
+        [
+            step("POST", "", COMPUTER),
+            step("GET", "/launch-42", COMPUTER),
+            step("POST", "/launch-42/exec", {"error": "guest booting"}, 503, 1),
+        ]
+    )
+    scenario.install(monkeypatch, resources, computers)
+    with (
+        httpx.Client(transport=httpx.MockTransport(scenario.handle), timeout=60) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        pytest.raises(mc.TimeoutError) as caught,
+    ):
+        client.computers.launch(idempotency_key="create-key", timeout=1, poll=0)
+    assert str(caught.value).startswith("launch of launch-42 failed:")
+    assert caught.value.idempotency_key is None
+    for cls in (mc.Computers, mc.AsyncComputers):
+        doc = " ".join((cls.launch.__doc__ or "").split())
+        assert "``idempotency_key`` is ``None``" in doc, cls.__name__
+        assert "the computer exists and is billable" in doc, cls.__name__
+        assert "Do not launch again without a key" in doc, cls.__name__
+        assert "creates a second computer" in doc, cls.__name__
