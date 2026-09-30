@@ -246,6 +246,9 @@ PARAMETERS: dict[str, set[str]] = {
         "body:amount",
         "body:scroll_amount",
         "body:duration",
+        # A click's repeat count and the post-action window context (OPL-5472).
+        "body:count",
+        "query:context",
     },
     "POST computers/:id/exec": {
         "body:command",

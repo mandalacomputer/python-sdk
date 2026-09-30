@@ -24,6 +24,16 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **A click repeat count**: `click`, `right_click` and `middle_click` (sync
+  and async) take `count=`, 1 to 10, pressing the button that many times at
+  double-click pacing. Needs a platform that accepts `count`; an older one
+  answers 400.
+- **Post-action window context**: every click takes `context=True` and then
+  returns an `InputContext` — the windows `windows()` lists by default and the
+  `focused` one, as they stand just after the click — instead of `None`. When
+  the windows cannot be read, `windows` is `None` and `error` says why; the
+  click still happened. New export: `InputContext`.
+
 - **`mandala-py operations list|get|wait`**, as `mandala operations` has them:
   `list` newest first with `--computer` (a name or an id), `--idempotency-key`,
   `--limit` and `--cursor`; `get ID`; and `wait ID` with `--timeout-ms` and

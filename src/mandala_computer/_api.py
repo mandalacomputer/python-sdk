@@ -1825,14 +1825,26 @@ def _modifier_text(modifiers: tuple[str, ...]) -> str | None:
     return "+".join(modifiers) if modifiers else None
 
 
+#: The most presses one click action makes (``count``), as the platform bounds it.
+MAX_CLICK_COUNT = 10
+
+
 def click_body(
-    action: str, x: int | None, y: int | None, modifiers: tuple[str, ...]
+    action: str,
+    x: int | None,
+    y: int | None,
+    modifiers: tuple[str, ...],
+    count: int | None = None,
 ) -> dict[str, Any]:
     """A click, optionally at a point and optionally with keys held down.
 
     No coordinate means "where the pointer already is", which is a real and
     different request from clicking (0, 0) — so the keys are omitted rather than
     sent as zeros.
+
+    ``count`` repeats a ``left_click``, ``right_click`` or ``middle_click``, 1 to
+    :data:`MAX_CLICK_COUNT` times, and is refused here where the platform would
+    refuse it: on the two clicks named by their count, and out of range.
     """
     text = _modifier_text(modifiers)
     _whole_point(x, y)
@@ -1842,7 +1854,25 @@ def click_body(
         body["y"] = y
     if text is not None:
         body["text"] = text
+    if count is not None:
+        if action not in ("left_click", "right_click", "middle_click"):
+            raise ValueError(f"{action} takes no count; it is a fixed number of clicks by name")
+        # bool is an int; True is not a count.
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= MAX_CLICK_COUNT
+        ):
+            raise ValueError(
+                f"count must be a whole number from 1 to {MAX_CLICK_COUNT}, not {count!r}"
+            )
+        body["count"] = count
     return body
+
+
+def input_params(context: bool) -> dict[str, str] | None:
+    """``context=1`` to have an input answer carry the desktop's windows after it."""
+    return {"context": "1"} if flag(context, "context") else None
 
 
 def drag_body(

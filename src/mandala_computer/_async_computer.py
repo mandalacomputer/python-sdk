@@ -61,6 +61,7 @@ from ._computer import (
     _empty_guest_file,
     _file_body,
     _guest_not_running,
+    _input_context,
     _mechanism,
     _no_wake_refusal,
     _open_outcome,
@@ -113,6 +114,7 @@ from ._models import (
     ExecStatus,
     FilePart,
     GuestDirectory,
+    InputContext,
     Listing,
     Move,
     ScreenshotInfo,
@@ -1160,11 +1162,32 @@ class AsyncComputer(ComputerFields):
     # --- controlling ----------------------------------------------------
 
     async def _input(
-        self, body: dict[str, Any], *, timeout: float | None = None
+        self,
+        body: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        params: dict[str, str] | None = None,
     ) -> Mapping[str, Any]:
         return await self._t.json_object(
-            "POST", _api.computer_action(self.id, "input"), json=body, timeout=timeout
+            "POST",
+            _api.computer_action(self.id, "input"),
+            json=body,
+            params=params,
+            timeout=timeout,
         )
+
+    async def _click(
+        self,
+        action: str,
+        x: int | None,
+        y: int | None,
+        modifiers: tuple[str, ...],
+        count: int | None,
+        context: bool,
+    ) -> InputContext | None:
+        params = _api.input_params(context)
+        data = await self._input(_api.click_body(action, x, y, modifiers, count), params=params)
+        return _input_context(data) if params else None
 
     async def move(self, x: int, y: int) -> None:
         """Move the pointer to ``(x, y)`` in this computer's screen space.
@@ -1174,34 +1197,62 @@ class AsyncComputer(ComputerFields):
         """
         await self._input(_api.pointer_body("move", x, y))
 
-    async def click(self, x: int | None = None, y: int | None = None, *modifiers: str) -> None:
+    async def click(
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *modifiers: str,
+        count: int | None = None,
+        context: bool = False,
+    ) -> InputContext | None:
         """Click. With no coordinate, clicks wherever the pointer already is.
 
         ``modifiers`` are held down for the click, e.g.
         ``await c.click(100, 200, "shift")`` to extend a selection.
+
+        ``count=4`` presses the button four times (1 to 10), paced as a
+        double-click is. ``context=True`` returns the desktop's windows as they
+        stand just after the click — see :class:`InputContext` — which saves
+        listing them separately; without it this returns ``None``.
         """
-        await self._input(_api.click_body("left_click", x, y, modifiers))
+        return await self._click("left_click", x, y, modifiers, count, context)
 
     async def right_click(
-        self, x: int | None = None, y: int | None = None, *modifiers: str
-    ) -> None:
-        await self._input(_api.click_body("right_click", x, y, modifiers))
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *modifiers: str,
+        count: int | None = None,
+        context: bool = False,
+    ) -> InputContext | None:
+        """A right click. Takes ``count`` and ``context`` as :meth:`click` does."""
+        return await self._click("right_click", x, y, modifiers, count, context)
 
     async def middle_click(
-        self, x: int | None = None, y: int | None = None, *modifiers: str
-    ) -> None:
-        await self._input(_api.click_body("middle_click", x, y, modifiers))
+        self,
+        x: int | None = None,
+        y: int | None = None,
+        *modifiers: str,
+        count: int | None = None,
+        context: bool = False,
+    ) -> InputContext | None:
+        """A middle click. Takes ``count`` and ``context`` as :meth:`click` does."""
+        return await self._click("middle_click", x, y, modifiers, count, context)
 
     async def double_click(
-        self, x: int | None = None, y: int | None = None, *modifiers: str
-    ) -> None:
-        await self._input(_api.click_body("double_click", x, y, modifiers))
+        self, x: int | None = None, y: int | None = None, *modifiers: str, context: bool = False
+    ) -> InputContext | None:
+        """Two clicks. Takes ``context`` as :meth:`click` does."""
+        return await self._click("double_click", x, y, modifiers, None, context)
 
     async def triple_click(
-        self, x: int | None = None, y: int | None = None, *modifiers: str
-    ) -> None:
-        """Three clicks, which is how most editors select a whole line."""
-        await self._input(_api.click_body("triple_click", x, y, modifiers))
+        self, x: int | None = None, y: int | None = None, *modifiers: str, context: bool = False
+    ) -> InputContext | None:
+        """Three clicks, which is how most editors select a whole line.
+
+        Takes ``context`` as :meth:`click` does.
+        """
+        return await self._click("triple_click", x, y, modifiers, None, context)
 
     async def drag(
         self,
