@@ -63,11 +63,20 @@ This is the summary you read to decide whether to upgrade.
   and async) take `count=`, 1 to 10, pressing the button that many times at
   double-click pacing. Needs a platform that accepts `count`; an older one
   answers 400.
-- **Post-action window context**: every click takes `context=True` and then
-  returns an `InputContext` — the windows `windows()` lists by default and the
-  `focused` one, as they stand just after the click — instead of `None`. When
-  the windows cannot be read, `windows` is `None` and `error` says why; the
-  click still happened. New export: `InputContext`.
+- **Post-action window context on every input action** (sync and async): the
+  clicks, `move`, `drag`, `mouse_down`, `mouse_up`, `scroll`, `paste`, `key`,
+  `hold_key` and `wait` take `context=True` and then return an `InputContext`
+  — the windows `windows()` lists by default and the `focused` one, as they
+  stand just after the action — instead of `None`. `type(..., context=True)`
+  returns a `TypeResult` with the `mechanism` and the `context`; without
+  `context` it returns the mechanism as before. When the windows cannot be
+  read, `windows` is `None` and `error` says why; the action still happened.
+  New exports: `InputContext`, `TypeResult`.
+- **A `User-Agent` naming this SDK and its version**:
+  `mandala-computer-py/<version> python/<version> httpx/<version>`, in place of
+  httpx's default, so the platform can tell which client and release sent a
+  request. The new `user_agent=` option on `Client` and `AsyncClient` appends
+  your own token, such as `my-app/1.2`.
 
 - **`mandala-py operations list|get|wait`**, as `mandala operations` has them:
   `list` newest first with `--computer` (a name or an id), `--idempotency-key`,

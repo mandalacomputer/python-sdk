@@ -158,6 +158,7 @@ from ._models import (
     Template,
     TemplateBuild,
     TemplateCheck,
+    TypeResult,
     UsagePeriod,
     UsageReport,
     UsageTotals,
@@ -332,6 +333,7 @@ __all__ = [
     "TemplateBuild",
     "TemplateCheck",
     "TimeoutError",
+    "TypeResult",
     "UnavailableError",
     "UsagePeriod",
     "UsageReport",
@@ -363,6 +365,10 @@ class Client:
     :param profile: saved profile, otherwise ``MANDALA_PROFILE`` or the file default.
     :param base_url: with a key, defaults to ``MANDALA_BASE_URL``, then the public API;
         with a saved profile, an override must match its stored base.
+    :param user_agent: your own product token, such as ``"my-app/1.2"``, appended to
+        the ``User-Agent`` every request carries:
+        ``mandala-computer-py/<version> python/<version> httpx/<version>``. It
+        replaces httpx's default, including one set on ``http_client``.
     """
 
     def __init__(
@@ -374,6 +380,7 @@ class Client:
         timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.Client | None = None,
         retries: Mapping[str, int] | None = None,
+        user_agent: str | None = None,
     ) -> None:
         self._t = Transport(
             api_key,
@@ -382,6 +389,8 @@ class Client:
             timeout=timeout,
             client=http_client,
             retries=retries,
+            user_agent=user_agent,
+            product=f"mandala-computer-py/{__version__}",
         )
         self.account = Account(self._t)
         self.builds = Builds(self._t)
@@ -434,6 +443,7 @@ class AsyncClient:
         timeout: float = DEFAULT_TIMEOUT,
         http_client: httpx.AsyncClient | None = None,
         retries: Mapping[str, int] | None = None,
+        user_agent: str | None = None,
     ) -> None:
         self._t = AsyncTransport(
             api_key,
@@ -442,6 +452,8 @@ class AsyncClient:
             timeout=timeout,
             client=http_client,
             retries=retries,
+            user_agent=user_agent,
+            product=f"mandala-computer-py/{__version__}",
         )
         self.account = AsyncAccount(self._t)
         self.builds = AsyncBuilds(self._t)

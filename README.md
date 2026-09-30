@@ -100,7 +100,10 @@ selecting a profile for terminal, SCP and webhook commands.
 
 `timeout` is the per-request budget, 60 seconds unless a call knows it needs
 longer. `http_client` takes an `httpx.Client` (or `httpx.AsyncClient`) of your own
-if you have proxies or certificates to configure.
+if you have proxies or certificates to configure. Every request carries
+`User-Agent: mandala-computer-py/<version> python/<version> httpx/<version>`,
+which replaces httpx's default (one set on your `http_client` included);
+`user_agent="my-app/1.2"` appends your own token to it.
 
 ```python
 from mandala_computer import Client
@@ -930,6 +933,24 @@ with no `from_x`/`from_y` starts there too — refused if nothing has moved it
 yet, rather than guessing at an origin. `mouse_down()`/`mouse_up()` are the two
 halves of a gesture for the cases `drag()` does not cover; between them the
 button is held, so pair them in `try`/`finally`.
+
+Every one of these but `cursor_position()` takes `context=True` and then answers
+the desktop as it stands just after the action: the windows `windows()` lists by
+default and the `focused` one, saving a second request. An action that returns
+nothing returns that `InputContext` instead of `None`, and `type()` returns a
+`TypeResult` carrying both the `mechanism` and the `context`:
+
+```python
+after = c.key("ctrl", "l", context=True)
+after.focused  # what has the keyboard now
+typed = c.type("hello", context=True)
+typed.mechanism, typed.context.windows
+```
+
+The windows are read once, straight after the action, with no settle wait, so a
+window still opening may not be listed yet. When they cannot be read — a Windows
+guest, no desktop session — `windows` is `None` and `error` says why; the action
+itself still happened, so do not send it again.
 
 **Pass `fresh=True` whenever the image is feeding a decision.** A bare
 `screenshot()` may be answered from a frame up to 1.5 seconds old. That is the
