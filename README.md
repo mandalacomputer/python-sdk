@@ -2611,15 +2611,15 @@ with Client() as client:
     client.api_keys.revoke(ci.id)
 ```
 
-**Every `api_keys` call needs the calling key's "Manage keys" permission.** It
-is off for every key until its holder turns it on in a signed-in dashboard
-session (**Credentials** in the dashboard, the **Manage keys** checkbox), and no
-API call turns it on. Without it each call raises `PermissionDeniedError` whose
-message says exactly that. A key minted here never has the permission — asking
-for one is refused, so the SDK has no argument for it — so a leaked manage-keys
-key cannot pass the permission on. The plain keys it minted DO keep working
-after it is revoked: find them by `minted_by_key_id` and revoke them too (the
-dashboard can do this in one step).
+**Every `api_keys` call needs the calling key to be allowed to manage keys.**
+That permission is off for every key until its holder turns it on in a signed-in
+dashboard session (Settings → Credentials → API keys → the key's menu → **Allow
+managing keys**), and no API call turns it on. Without it each call raises
+`PermissionDeniedError` whose message says exactly that. A key minted here never
+has the permission — asking for one is refused, so the SDK has no argument for
+it — so a leaked manage-keys key cannot pass the permission on. The plain keys
+it minted DO keep working after it is revoked: find them by `minted_by_key_id`
+and revoke them too (the dashboard can do this in one step).
 
 Reach follows the key: its holder's own keys only (anybody else's answers like
 an id that does not exist, `NotFoundError`), and a key confined to a workspace
@@ -3068,7 +3068,7 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `AuthenticationError` | 401 — a credential was refused |
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
 | `ModelProviderError` | 402 on the agent routes — the model API's `billing_error` for the account behind `model_key`, not the plan |
-| `PermissionDeniedError` | 403 — the credential is valid but lacks the role, membership or permission (such as Manage keys), or the account or person is suspended |
+| `PermissionDeniedError` | 403 — the credential is valid but lacks the role, membership or permission (such as a key's permission to manage keys), or the account or person is suspended |
 | `NotFoundError` | 404 — no such computer, snapshot, guest file, or route |
 | `MethodNotAllowedError` | 405 — method unsupported; see `allow` |
 | `ConflictError` | 409 — refused for the state something is in; `reason` says whether waiting helps |
@@ -3394,7 +3394,7 @@ mandala-py scp dev:/home/user/report.csv .
 mandala-py webhooks list              # and create, get, update, delete, rotate, test, deliveries
 mandala-py secrets list               # names and revisions, never values; get NAME for one
 mandala-py whoami                     # person, account, role, workspace, key
-mandala-py api-keys list              # and create, revoke; needs Manage keys
+mandala-py api-keys list              # and create, revoke; key must be allowed to manage keys
 mandala-py workspaces list            # and get, members (a name or id), create, rename, rm --yes
 mandala-py workspaces use research    # a default workspace for this profile; current, use --clear
 mandala-py operations list            # and get ID, wait ID; --computer takes a name or id
@@ -3487,9 +3487,10 @@ mandala-py secrets rm OPENAI_API_KEY
 ```
 
 `whoami` prints who the credential is. `api-keys list | create | revoke` manage
-the holder's keys and need the calling key's **Manage keys** permission, which
-only a dashboard session turns on; without it the platform's own sentence is
-printed, which names the page and the checkbox (`--json`: `code`
+the holder's keys and need the calling key to be allowed to manage keys, which
+only a dashboard session turns on (Settings → Credentials → API keys → the
+key's menu → **Allow managing keys**); without it the platform's own sentence
+is printed, which says where to allow it (`--json`: `code`
 `permission_denied`, `status` 403). `create` prints only the new key on stdout,
 so `KEY=$(mandala-py api-keys create --name ci)` captures it, and says what it
 made on stderr; `--json` prints the platform's object with the key under `raw`.

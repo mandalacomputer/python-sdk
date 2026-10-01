@@ -40,9 +40,10 @@ Two subcommands address a computer by name or id:
 
 ``mandala-py whoami`` / ``mandala-py api-keys <list|create|revoke>``
     Who the credential is, and the holder's own API keys. The ``api-keys``
-    verbs need the calling key's "Manage keys" permission, which only a
-    dashboard session turns on; without it the platform's own sentence is
-    printed, and it says exactly that. ``create`` prints the new key ONCE.
+    verbs need the calling key to be allowed to manage keys, which only a
+    dashboard session turns on (the key's menu → Allow managing keys); without
+    it the platform's own sentence is printed, and it says exactly that.
+    ``create`` prints the new key ONCE.
 
 ``mandala-py workspaces <list|get|members|create|rename|rm|use|current>``
     The account's workspaces: their ids (what ``secrets --workspace`` and
@@ -2049,7 +2050,18 @@ def _keys_parsers(sub: Any) -> None:
     who.add_argument("--json", action="store_true", help="the platform's answer as JSON")
     who.set_defaults(fn=_cmd_whoami)
 
-    keys = sub.add_parser("api-keys", help="your API keys (needs the key's Manage keys permission)")
+    keys = sub.add_parser(
+        "api-keys",
+        help=(
+            "your API keys; the key must be allowed to manage keys "
+            "(dashboard: the key's menu → Allow managing keys)"
+        ),
+        description=(
+            "Your own API keys. Every verb needs the calling key to be allowed to "
+            "manage keys, which only a dashboard session turns on: Settings → "
+            "Credentials → API keys → the key's menu → Allow managing keys."
+        ),
+    )
     verbs = keys.add_subparsers(dest="verb", required=True)
     listing = verbs.add_parser("list", help="your keys this key can reach — never the keys")
     listing.add_argument("--json", action="store_true", help="the keys as JSON")

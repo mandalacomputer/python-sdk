@@ -235,7 +235,8 @@ class AuthenticationError(APIError):
 class PermissionDeniedError(APIError):
     """Authenticated, but not allowed (403): the credential is valid but lacks
     the role, the workspace membership or the permission (such as a key's
-    "Manage keys") the request needs, or the account or person is suspended."""
+    permission to manage keys) the request needs, or the account or person is
+    suspended."""
 
 
 class NotFoundError(APIError):
