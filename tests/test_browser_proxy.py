@@ -197,8 +197,10 @@ def test_wait_reads_again_even_when_the_handle_says_applied(monkeypatch):
     with pytest.raises(mc.TimeoutError) as caught:
         wait_sync(
             monkeypatch,
+            # The get, then reads at 0, 0.25, 0.75 and 1.75s: the sleep ramps
+            # from 0.25s up to the 1s poll (OPL-5536).
             [step("GET", "/launch-42", proxied(None))]
-            + [step("GET", "/launch-42", proxied(True)) for _ in range(3)],
+            + [step("GET", "/launch-42", proxied(True)) for _ in range(4)],
             timeout=2,
             poll=1,
         )
@@ -290,7 +292,7 @@ def test_wait_expecting_a_proxy_waits_past_a_read_that_leaves_it_out(monkeypatch
     with pytest.raises(mc.TimeoutError) as caught:
         wait_sync(
             monkeypatch,
-            [step("GET", "/launch-42", COMPUTER) for _ in range(4)],
+            [step("GET", "/launch-42", COMPUTER) for _ in range(5)],
             timeout=2,
             poll=1,
             expect_browser_proxy=True,

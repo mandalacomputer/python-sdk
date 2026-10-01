@@ -235,7 +235,8 @@ def test_wait_times_out_naming_the_credentials(monkeypatch):
     with pytest.raises(mc.TimeoutError) as caught:
         run_sync(
             monkeypatch,
-            [step("GET", "/launch-42", egressed(True)) for _ in range(3)],
+            # Reads at 0, 0.25, 0.75 and 1.75s: the sleep ramps to the poll.
+            [step("GET", "/launch-42", egressed(True)) for _ in range(4)],
             lambda client: mc.Computer(client._t, egressed(True)).wait_for_egress_proxy(
                 timeout=2, poll=1
             ),

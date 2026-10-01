@@ -149,8 +149,8 @@ def test_wait_reads_again_even_when_the_handle_says_delivered(monkeypatch):
             monkeypatch,
             [
                 step("GET", "/launch-42", bound(False)),
-                step("GET", "/launch-42", bound(True)),
-                step("GET", "/launch-42", bound(True)),
+                # Reads at 0, 0.25, 0.75 and 1.75s: the sleep ramps to the poll.
+                *[step("GET", "/launch-42", bound(True)) for _ in range(4)],
             ],
             timeout=2,
             poll=1,
@@ -209,7 +209,7 @@ def test_wait_times_out_saying_the_bindings_went_unreported(monkeypatch):
     with pytest.raises(mc.TimeoutError) as caught:
         wait_sync(
             monkeypatch,
-            [step("GET", "/launch-42", unreported()) for _ in range(4)],
+            [step("GET", "/launch-42", unreported()) for _ in range(5)],
             timeout=2,
             poll=1,
             expect_secrets=True,
@@ -271,7 +271,7 @@ def test_wait_still_waits_past_left_out_bindings_when_admission_is_unsaid(monkey
     with pytest.raises(mc.TimeoutError, match="without reporting its bindings"):
         wait_sync(
             monkeypatch,
-            [step("GET", "/launch-42", silent) for _ in range(4)],
+            [step("GET", "/launch-42", silent) for _ in range(5)],
             timeout=2,
             poll=1,
             expect_secrets=True,

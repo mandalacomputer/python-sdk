@@ -378,7 +378,11 @@ class AsyncComputers:
         and desktop waits share the remaining time, and
         elapsed start work consumes it too. Create and start retain their usual
         transport deadlines: this is not a total wall-clock limit on launch.
-        ``poll`` is the delay in seconds between polls in every stage.
+        ``poll`` is the delay in seconds between polls in every stage, and the
+        ceiling for the secrets, browser proxy, egress proxy and desktop stages,
+        which poll 0.25s after their first read and double from there: an answer
+        that lands just after a read is noticed within moments rather than a
+        whole interval later.
 
         The computer is persistent and is never deleted on failure. SDK errors
         after creation retain their type and include its id. Task cancellation
