@@ -9,6 +9,16 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **A bound `computers.launch()` returns within moments of its secrets
+  landing**, rather than up to a whole poll interval later, sync and async.
+  `wait_for_secrets`, `wait_for_browser_proxy`, `wait_for_egress_proxy` and
+  `wait_for_desktop` (and the matching `launch()` stages) now poll 0.25s after
+  their first read, doubling up to `poll`, which stays the ceiling and keeps
+  its default. A poll that failed still waits `poll`, or the `Retry-After` the
+  platform sent.
+
 ## [0.9.0] — 2026-09-30
 
 ### Changed

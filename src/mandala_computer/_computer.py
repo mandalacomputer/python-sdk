@@ -1153,6 +1153,24 @@ def _poll_delay(err: MandalaError, poll: float) -> float:
     return poll
 
 
+FIRST_POLL = 0.25
+"""The first sleep of a ramped wait, in seconds; see :func:`_ramp_delay`."""
+
+
+def _ramp_delay(turn: int, poll: float) -> float:
+    """The sleep after a wait's ``turn``-th ordinary "not yet" (counting from 0).
+
+    0.25s, doubling, and never more than ``poll``, so the caller's ``poll`` is
+    the ceiling (one below 0.25s is used as is). For the readiness waits whose
+    answer usually arrives within a second or two of the first read: a flat
+    interval rounded every one of those up to a whole ``poll``, so a secret that
+    landed just after a read made ``launch`` sleep out the rest of three
+    seconds before noticing. A poll that FAILED does not ramp; that is
+    :func:`_poll_delay`'s business, and it still honours ``Retry-After``.
+    """
+    return min(FIRST_POLL * 2.0 ** min(turn, 30), poll)
+
+
 def _guest_not_running(err: BaseException) -> bool:
     """Whether this is the guest routes' 400 for a machine that is not up yet.
 
@@ -3296,13 +3314,21 @@ class Computer(ComputerFields):
         on: the platform leaves it out for an X11 desktop.
 
         Like :meth:`wait_for_guest`, the probe resumes a suspended computer.
+
+        Probes again 0.25s after the first probe, then doubling up to ``poll``,
+        so a session that appears a moment after a probe is not a whole
+        interval late; a refusal polled through waits ``poll`` (or its
+        ``Retry-After``).
         """
         check_wait_args(timeout, poll)
         if _desktop_wait_skipped(self._data):
             return self
         deadline = time.monotonic() + timeout
+        # Ordinary "not yet" answers so far, which ramp the sleep (see
+        # _ramp_delay); a refusal polled through sets its own delay instead.
+        not_yet = 0
         while True:
-            delay = poll
+            delay: float | None = None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_desktop_timeout(self.id, timeout))
@@ -3323,6 +3349,9 @@ class Computer(ComputerFields):
                 if remaining <= 0:
                     raise TimeoutError(_desktop_timeout(self.id, timeout)) from err
                 delay = _poll_delay(err, poll)
+            if delay is None:
+                delay = _ramp_delay(not_yet, poll)
+                not_yet += 1
             time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
 
     def wait_for_secrets(
@@ -3354,6 +3383,11 @@ class Computer(ComputerFields):
         one that just created the computer with them. A read that leaves the
         bindings out then counts as "cannot tell" and is waited past, rather
         than as "nothing bound", which would return before anything arrived.
+
+        Reads again 0.25s after the first read, then doubling up to ``poll``,
+        as :meth:`wait_for_browser_proxy` and :meth:`wait_for_egress_proxy` do:
+        a delivery usually finishes a second or two in, and a flat interval made
+        the caller wait out the rest of it.
         """
         return self._wait_for_state(
             timeout,
@@ -3394,6 +3428,10 @@ class Computer(ComputerFields):
         such as one that just created the computer with it. A read that leaves
         the setting out then counts as "cannot tell" and is waited past, rather
         than as "none set", which would return before the guest had anything.
+
+        Reads again 0.25s after the first read, then doubling up to ``poll``,
+        as :meth:`wait_for_secrets` does; a read that failed and is polled
+        through waits ``poll`` (or its ``Retry-After``).
         """
         return self._wait_for_state(
             timeout,
@@ -3431,6 +3469,10 @@ class Computer(ComputerFields):
         credentials, such as one that just created the computer with them: a
         read that leaves the setting out is then not taken for "none" while the
         computer is not running yet.
+
+        Reads again 0.25s after the first read, then doubling up to ``poll``,
+        as :meth:`wait_for_secrets` does; a read that failed and is polled
+        through waits ``poll`` (or its ``Retry-After``).
         """
         return self._wait_for_state(
             timeout,
@@ -3454,6 +3496,8 @@ class Computer(ComputerFields):
         :meth:`wait_for_egress_proxy` share: read the computer, ask ``judge`` where things are, and return on
         ``done``, raise the refusal ``judge`` hands back, or sleep and read
         again until the deadline, when ``timed_out`` words the TimeoutError.
+        The sleep after a read that answered ramps (:func:`_ramp_delay`); after
+        one that failed it is :func:`_ride_out`'s.
 
         No verdict on state read before this call, and the timeout sentence
         says whether the last read answered — wait_until_running's rules.
@@ -3471,9 +3515,12 @@ class Computer(ComputerFields):
         fresh = False
         start_failed = self.start_error
         state = ""
+        # Reads that answered "not yet", which ramp the sleep (see
+        # _ramp_delay); a read that failed sets its own delay instead.
+        not_yet = 0
         while True:
             remaining = deadline - time.monotonic()
-            delay = poll
+            delay: float | None = None
             if remaining > 0:
                 try:
                     self._refresh(timeout_cap=remaining)
@@ -3493,6 +3540,9 @@ class Computer(ComputerFields):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(timed_out(observed, fresh, state))
+            if delay is None:
+                delay = _ramp_delay(not_yet, poll)
+                not_yet += 1
             time.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------

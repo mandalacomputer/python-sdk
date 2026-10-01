@@ -66,6 +66,7 @@ from ._computer import (
     _no_wake_refusal,
     _open_outcome,
     _poll_delay,
+    _ramp_delay,
     _require_background_pid,
     _require_model_key,
     _ride_out,
@@ -961,8 +962,9 @@ class AsyncComputer(ComputerFields):
         if _desktop_wait_skipped(self._data):
             return self
         deadline = time.monotonic() + timeout
+        not_yet = 0
         while True:
-            delay = poll
+            delay: float | None = None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_desktop_timeout(self.id, timeout))
@@ -982,6 +984,9 @@ class AsyncComputer(ComputerFields):
                 if remaining <= 0:
                     raise TimeoutError(_desktop_timeout(self.id, timeout)) from err
                 delay = _poll_delay(err, poll)
+            if delay is None:
+                delay = _ramp_delay(not_yet, poll)
+                not_yet += 1
             await asyncio.sleep(min(delay, max(deadline - time.monotonic(), 0)))
 
     async def wait_for_secrets(
@@ -1057,9 +1062,10 @@ class AsyncComputer(ComputerFields):
         fresh = False
         start_failed = self.start_error
         state = ""
+        not_yet = 0
         while True:
             remaining = deadline - time.monotonic()
-            delay = poll
+            delay: float | None = None
             if remaining > 0:
                 try:
                     await self._refresh(timeout_cap=remaining)
@@ -1079,6 +1085,9 @@ class AsyncComputer(ComputerFields):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(timed_out(observed, fresh, state))
+            if delay is None:
+                delay = _ramp_delay(not_yet, poll)
+                not_yet += 1
             await asyncio.sleep(min(delay, remaining))
 
     # --- observing ------------------------------------------------------
