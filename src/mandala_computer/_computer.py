@@ -3428,6 +3428,10 @@ class Computer(ComputerFields):
         such as one that just created the computer with it. A read that leaves
         the setting out then counts as "cannot tell" and is waited past, rather
         than as "none set", which would return before the guest had anything.
+
+        Reads again 0.25s after the first read, then doubling up to ``poll``,
+        as :meth:`wait_for_secrets` does; a read that failed and is polled
+        through waits ``poll`` (or its ``Retry-After``).
         """
         return self._wait_for_state(
             timeout,
@@ -3465,6 +3469,10 @@ class Computer(ComputerFields):
         credentials, such as one that just created the computer with them: a
         read that leaves the setting out is then not taken for "none" while the
         computer is not running yet.
+
+        Reads again 0.25s after the first read, then doubling up to ``poll``,
+        as :meth:`wait_for_secrets` does; a read that failed and is polled
+        through waits ``poll`` (or its ``Retry-After``).
         """
         return self._wait_for_state(
             timeout,
