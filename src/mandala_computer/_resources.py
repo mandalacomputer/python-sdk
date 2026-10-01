@@ -2048,13 +2048,14 @@ def _named(**fields: Any) -> dict[str, Any]:
 class ApiKeys:
     """The API keys of the person this key belongs to (platform OPL-5053).
 
-    EVERY CALL HERE NEEDS THE KEY'S "MANAGE KEYS" PERMISSION. It is off for
+    EVERY CALL HERE NEEDS THE KEY TO BE ALLOWED TO MANAGE KEYS. That is off for
     every key until its holder turns it on from a signed-in dashboard session
-    (Credentials, "Manage keys"), and nothing a key can call turns it on —
-    without it each method raises :class:`~mandala_computer.PermissionDeniedError`
-    whose message says so. A key minted here never has the permission, so a
-    leaked key that manages keys cannot pass the permission on — but the plain
-    keys it minted survive its revocation (see :meth:`revoke`).
+    (Settings → Credentials → API keys → the key's menu → Allow managing keys),
+    and nothing a key can call turns it on — without it each method raises
+    :class:`~mandala_computer.PermissionDeniedError` whose message says so. A
+    key minted here never has the permission, so a leaked key that manages keys
+    cannot pass the permission on — but the plain keys it minted survive its
+    revocation (see :meth:`revoke`).
 
     Reach: the holder's own keys on the account this key acts on — never
     another person's, which answer like an id that does not exist. A key

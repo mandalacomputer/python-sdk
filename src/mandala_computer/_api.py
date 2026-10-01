@@ -69,8 +69,8 @@ SSH_KEYS = "ssh-keys"
 #: it acts with, the workspace it is confined to, and the key itself. Needs no
 #: permission, and answers a suspended account too.
 WHOAMI = "whoami"
-#: The holder's own API keys (platform OPL-5053). Every verb needs the key's
-#: opt-in "Manage keys" permission, which only a dashboard session turns on;
+#: The holder's own API keys (platform OPL-5053). Every verb needs the key to be
+#: allowed to manage keys, an opt-in only a dashboard session turns on;
 #: without it the platform answers 403 with a sentence that says so.
 API_KEYS = "api-keys"
 #: Lifecycle operations (platform OPL-5055): what each accepted create, clone,

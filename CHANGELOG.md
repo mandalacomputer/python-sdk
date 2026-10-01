@@ -151,6 +151,11 @@ This is the summary you read to decide whether to upgrade.
 
 ### Documentation
 
+- The `api-keys` CLI help, the README and the `ApiKeys` and
+  `PermissionDeniedError` docstrings name the real dashboard control that
+  allows a key to manage keys: Settings → Credentials → API keys → the key's
+  menu → **Allow managing keys**. They used to point at a "Manage keys"
+  checkbox that does not exist.
 - The `secrets` argument's docstring on `computers.create()` (sync and async)
   now points to Settings → Credentials → Secrets, where the account's secrets
   are kept, instead of a Secrets tab under Settings that no longer exists.

@@ -21,8 +21,8 @@ from mandala_computer import _credentials as credentials
 BASE = "https://api.test/api/v1"
 
 NO_PERMISSION = (
-    "This API key cannot manage API keys. Turn on “Manage keys” for it under Credentials "
-    "in the dashboard, or use a key that has it."
+    "This API key cannot manage API keys. Allow it in the dashboard under Settings → "
+    "Credentials → API keys → the key’s menu → Allow managing keys, or use a key that has it."
 )
 
 API_KEY: dict[str, Any] = {
@@ -727,3 +727,30 @@ def test_logout_refuses_an_invalid_profile_name(home: Path) -> None:
     with pytest.raises(credentials.CredentialError) as caught:
         credentials.remove_profile("../x")
     assert caught.value.rule == "invalid_profile"
+
+
+# The dashboard control is the key's menu → "Allow managing keys"; there is no
+# "Manage keys" checkbox to look for, so neither the help nor the README names one.
+README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def test_api_keys_help_names_the_permission_as_the_dashboard_does(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _cli._parser().parse_args(["--help"])
+    top = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        _cli._parser().parse_args(["api-keys", "--help"])
+    own = capsys.readouterr().out
+    for text in (top, own):
+        assert "Manage keys" not in text
+    assert "allowed to manage keys" in " ".join(top.split())
+    assert "Allow managing keys" in " ".join(own.split())
+
+
+def test_readme_names_the_permission_as_the_dashboard_does() -> None:
+    readme = README.read_text(encoding="utf-8")
+    assert "Manage keys" not in readme
+    assert "checkbox" not in readme
+    assert "the key's menu → **Allow managing keys**" in " ".join(readme.split())
