@@ -3169,8 +3169,10 @@ class SshKey:
     """One of your SSH public keys, from the ``ssh_keys`` resource.
 
     A key belongs to a person, not to an account: the list is the same
-    whichever account the API key acts on, and the key reaches the computers of
-    every account where you are an owner or member.
+    whichever account the API key acts on. A key added from the dashboard
+    reaches the computers of every account where you are an owner or member; a
+    key added through an API key or a connected app reaches only that
+    credential's account, until the credential is revoked.
     """
 
     #: ``sshk-`` and sixteen hex characters.

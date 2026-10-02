@@ -1839,10 +1839,13 @@ class SshKeys:
     """Your SSH public keys: the ones the platform's jump host and your
     computers accept when you connect with OpenSSH.
 
-    A key belongs to a PERSON, not to an account. This is the same list
-    whichever account the API key acts on, and a key reaches the computers of
-    every account where you are an owner or member. Whether a given computer
-    accepts logins at all is its own setting:
+    A key belongs to a PERSON, not to an account, and this is the same list
+    whichever account the API key acts on. A key added here, with an API key or
+    a connected app, is bound to the account that credential acts on and to
+    the credential itself: it reaches that account's computers only, and is
+    removed when the credential is revoked. A key added from the dashboard
+    instead reaches the computers of every account where you are an owner or
+    member. Whether a given computer accepts logins at all is its own setting:
     :meth:`~mandala_computer.Computer.set_ssh_access`.
 
     An API key confined to a workspace cannot add or remove keys: the platform
@@ -1858,7 +1861,9 @@ class SshKeys:
         return [SshKey.from_api(k) for k in self._t.json_array("GET", _api.SSH_KEYS)]
 
     def add(self, public_key: str, *, name: str | None = None) -> SshKey:
-        """Register one public key: a line from a ``.pub`` file, as read.
+        """Register one public key: a line from a ``.pub`` file, as read. It
+        is bound to the account this client's API key acts on, and removed
+        when that key is revoked.
 
         ``name`` is a label, up to 60 characters; without one the platform uses
         the comment on the line. Accepted: Ed25519, ECDSA, their security-key
