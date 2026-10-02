@@ -11,6 +11,13 @@ This is the summary you read to decide whether to upgrade.
 
 ### Changed
 
+- **The `ssh_keys` documentation says a key added through the API is bound to
+  its credential**, sync and async. A key registered with
+  `client.ssh_keys.add()` now reaches only the account the API key (or
+  connected app) acts on, and is removed when that credential is revoked; a
+  key added from the dashboard still reaches every account where you are an
+  owner or member. No API change.
+
 - **A bound `computers.launch()` returns within moments of its secrets
   landing**, rather than up to a whole poll interval later, sync and async.
   `wait_for_secrets`, `wait_for_browser_proxy`, `wait_for_egress_proxy` and

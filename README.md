@@ -3618,8 +3618,10 @@ mandala-py ssh-access dev             # the status; --json for the object
 mandala-py ssh-access dev on          # or off
 ```
 
-A key belongs to you rather than to an account, and reaches the computers of
-every account you are an owner or member of. Each person holds eight.
+A key belongs to you rather than to an account. One added from the dashboard
+reaches the computers of every account you are an owner or member of; one added
+with an API key (the CLI and this SDK) reaches only the account that key acts
+on, and is removed when the key is revoked. Each person holds eight.
 
 #### Without the CLI: `ssh-config`, VS Code, scp and sftp
 
