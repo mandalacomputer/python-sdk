@@ -56,6 +56,15 @@ This is the summary you read to decide whether to upgrade.
   key added from the dashboard still reaches every account where you are an
   owner or member. No API change.
 
+- **`ssh_keys.remove()` documents that it removes only a key bound to this
+  account**, sync and async. With an API key or connected app, the platform now
+  removes only a key whose `reach` is `this_account`. A key added from the
+  dashboard, or with an API key before keys were bound to an account (`reach`
+  `everywhere`), raises `NotFoundError` like a key bound to another account, so
+  a leaked credential cannot take away SSH access you use on your other
+  accounts; remove such a key from the dashboard. `mandala-py ssh-key rm`
+  behaves the same way. Documentation only; no SDK change.
+
 - **The `builds` and `templates` documentation says which methods need an
   account-wide key**, sync and async. The platform refuses an API key confined
   to a workspace with a 403 (`PermissionDeniedError`) on every build route and
