@@ -182,7 +182,13 @@ class Computers:
     def __init__(self, transport: Transport) -> None:
         self._t = transport
 
-    def list(self, *, allow_partial: bool = False, state: str | None = None) -> Listing[Computer]:
+    def list(
+        self,
+        *,
+        allow_partial: bool = False,
+        state: str | None = None,
+        workspace_id: str | None = None,
+    ) -> Listing[Computer]:
         """Every computer on the account, or every one in the key's workspace.
 
         No ``vnc`` on these rows — fetch one computer to get its desktop
@@ -215,10 +221,20 @@ class Computers:
         cannot do without it. The two terminal states need nothing: they are
         answered from the record alone and no host was asked, so there is no
         outage to acknowledge.
+
+        ``workspace_id`` narrows the listing to one workspace (an id from
+        :attr:`Client.workspaces`), or with ``"unassigned"`` to the computers in
+        none, and combines with ``state``. A workspace the key cannot reach —
+        another account's, one that does not exist, or any but its own for a
+        key confined to a workspace — raises
+        :class:`~mandala_computer.NotFoundError`, and so does ``"unassigned"``
+        from a confined key.
         """
         data, incomplete = self._t.listing(
             _api.COMPUTERS,
-            params=_api.computer_listing_params(allow_partial=allow_partial, state=state),
+            params=_api.computer_listing_params(
+                allow_partial=allow_partial, state=state, workspace_id=workspace_id
+            ),
         )
         return Listing.of([Computer(self._t, c) for c in data or []], incomplete)
 
@@ -241,6 +257,7 @@ class Computers:
         secrets: Sequence[SecretBindingArgs] | None = None,
         browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
+        workspace_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> Computer:
         """Provision a computer.
@@ -327,6 +344,15 @@ class Computers:
         answers 409 with reason ``unsupported`` if its host cannot launch a
         proxy yet.
 
+        ``workspace_id`` creates the computer in that workspace (an id from
+        :attr:`Client.workspaces`) rather than the key's own, and names its
+        ``secrets`` and an egress proxy's ``credentials_secret_id`` from that
+        workspace's scope: its own secrets and the account-wide ones. Omitted,
+        it goes in the key's workspace, or in none for an account-wide key. A
+        workspace the key cannot reach — another account's, one that does not
+        exist, or any but its own for a key confined to a workspace — raises
+        :class:`~mandala_computer.NotFoundError`, and nothing is created.
+
         ``egress_proxy`` sends ALL of the computer's outbound TCP — ``exec``,
         terminals, package managers and browsers alike — through a proxy, an
         :class:`~mandala_computer.EgressProxyArgs`, taken on its host so nothing
@@ -363,6 +389,7 @@ class Computers:
             browser_proxy=browser_proxy,
             egress_proxy=egress_proxy,
             size=size,
+            workspace_id=workspace_id,
         )
         return self._create(body, idempotency_key)[0]
 
@@ -390,6 +417,7 @@ class Computers:
         secrets: Sequence[SecretBindingArgs] | None = None,
         browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
+        workspace_id: str | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
         idempotency_key: str | None = None,
@@ -475,6 +503,7 @@ class Computers:
             browser_proxy=browser_proxy,
             egress_proxy=egress_proxy,
             size=size,
+            workspace_id=workspace_id,
         )
         # Settled here rather than in create, so an error from a later stage
         # can be handed back with the key that replays THIS create.

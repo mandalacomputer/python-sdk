@@ -800,6 +800,8 @@ def exercise_everything(client: mc.Client) -> None:
         start=False,
     )
     client.computers.create(size="small")
+    # Into a workspace, by an account-wide key (OPL-5543).
+    client.computers.create(template="base", workspace_id="wsp-0123456789ab")
     # Secrets bound at create, one as a variable and one as a file.
     client.computers.create(
         template="base",
@@ -969,6 +971,9 @@ def exercise_everything(client: mc.Client) -> None:
     # one: `deleted` and `lost` are answered from the platform's record alone
     # and are the only rows this parameter is the sole way to see.
     client.computers.list(state="deleted")
+    # One workspace's computers, and the ones in none (OPL-5543).
+    client.computers.list(workspace_id="wsp-0123456789ab")
+    client.computers.list(workspace_id="unassigned")
     client.snapshots.list()
     client.snapshots.list(include_unfinished=True, allow_partial=True)
     client.snapshots.restore("snap-1")
@@ -1100,6 +1105,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         start=False,
     )
     await client.computers.create(size="small")
+    await client.computers.create(template="base", workspace_id="wsp-0123456789ab")
     await client.computers.create(
         template="base",
         secrets=[
@@ -1250,6 +1256,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
             break
     await client.computers.list(allow_partial=True)
     await client.computers.list(state="deleted")
+    await client.computers.list(workspace_id="wsp-0123456789ab")
+    await client.computers.list(workspace_id="unassigned")
     await client.snapshots.list()
     await client.snapshots.list(include_unfinished=True, allow_partial=True)
     await client.snapshots.restore("snap-1")

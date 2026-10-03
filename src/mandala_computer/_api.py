@@ -915,7 +915,9 @@ def partial_params(allow_partial: bool) -> dict[str, str] | None:
     return {"allow_partial": "1"} if allow_partial else None
 
 
-def computer_listing_params(*, allow_partial: bool, state: str | None) -> dict[str, str] | None:
+def computer_listing_params(
+    *, allow_partial: bool, state: str | None, workspace_id: str | None = None
+) -> dict[str, str] | None:
     """The query on ``GET /computers``.
 
     ``state`` narrows the listing to one lifecycle state — the control plane's
@@ -940,10 +942,17 @@ def computer_listing_params(*, allow_partial: bool, state: str | None) -> dict[s
     this by forwarding an absent CLI argument meant ``None`` — "every computer
     that exists or may exist" — rather than a request that fails.
 
-    ``None`` rather than an empty dict when neither is asked for, so the default
+    ``workspace_id`` (platform OPL-5543) narrows it to one workspace, or with
+    ``"unassigned"`` to the computers in none; it is checked as a secret's
+    scope is, and also read and stripped by the control plane.
+
+    ``None`` rather than an empty dict when none is asked for, so the default
     listing builds a bare URL, the same way :func:`usage_params` does.
     """
     params = dict(partial_params(allow_partial) or {})
+    workspace = _workspace(workspace_id)
+    if workspace is not None:
+        params["workspace_id"] = workspace
     if state is not None:
         # Canonical BEFORE the emptiness check, for the reason `canonical`
         # documents: httpx serialises a query value with `str(value)`, so a str
@@ -1078,6 +1087,7 @@ def create_body(
     secrets: object = None,
     browser_proxy: object = None,
     egress_proxy: object = None,
+    workspace_id: object = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -1095,6 +1105,9 @@ def create_body(
     :func:`egress_proxy_body`. ``browser_proxy`` alone has an explicit "none":
     :data:`~mandala_computer.NO_BROWSER_PROXY` sends ``null``, which opts out
     of a template's default proxy that an omitted key inherits.
+
+    ``workspace_id`` (platform OPL-5543) is the workspace to create in, checked
+    as a secret's scope is; ``None`` sends no key, the credential's own scope.
     """
     from ._models import NO_BROWSER_PROXY  # a cycle at import time; not at call time
 
@@ -1142,6 +1155,9 @@ def create_body(
         body["browser_proxy"] = browser_proxy_body(browser_proxy)
     if egress_proxy is not None:
         body["egress_proxy"] = egress_proxy_body(egress_proxy)
+    workspace = _workspace(workspace_id)
+    if workspace is not None:
+        body["workspace_id"] = workspace
     return body
 
 
