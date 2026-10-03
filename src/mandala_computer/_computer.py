@@ -4782,7 +4782,8 @@ class Computer(ComputerFields):
         this is a computer created before then — and a computer keeps the image
         it was created from. The refusal is a **400** and it is permanent:
         install ``xclip`` in the guest, which you can do since you have root
-        there, or create a new computer. Do not retry it.
+        there, or create a new computer from an image that includes it. Do not
+        retry it.
 
         A read, not a subscription. Nothing notices a Ctrl-C in the guest on its
         own, and this does NOT resume a suspended computer: what somebody copied

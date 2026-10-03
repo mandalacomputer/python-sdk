@@ -1461,7 +1461,7 @@ keep its retry loop bounded.
 
 Two others worth knowing. A **400** never clears: a computer built from a golden
 that predates `xclip` is refused permanently — install `xclip` in the guest, or
-create a new computer. And an over-cap read raises `FileTooLargeError`, whose
+create a new computer from an image that includes it. And an over-cap read raises `FileTooLargeError`, whose
 usual remedy does not apply: there is no `Range` on a selection, so the text is
 either under 128 KiB or out of reach.
 
