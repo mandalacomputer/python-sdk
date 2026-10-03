@@ -9,6 +9,23 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **`SshKey.reach` says whether this account accepts a listed key**, sync and
+  async: `"everywhere"` (added from the dashboard), `"this_account"` or
+  `"another_account"` (added through an API key or connected app on that
+  account), relative to the account the API key acts on and never naming
+  another. `None` from a platform that does not report it.
+
+### Fixed
+
+- **`mandala-py ssh --setup` no longer reports success with a key bound to
+  another of your accounts.** It used to see the fingerprint in the listing,
+  print "already registered" and switch SSH on, and the gateway then refused the
+  key. It now exits 1 with `ssh_key_elsewhere`, leaves SSH as it was, and says
+  what to do: remove the key and add it again from the dashboard to use it on
+  every account, or pass `--key` with a separate key.
+
 ### Changed
 
 - **The `ssh_keys` documentation says a key added through the API is bound to

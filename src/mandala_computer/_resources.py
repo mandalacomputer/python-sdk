@@ -1845,7 +1845,9 @@ class SshKeys:
     the credential itself: it reaches that account's computers only, and is
     removed when the credential is revoked. A key added from the dashboard
     instead reaches the computers of every account where you are an owner or
-    member. Whether a given computer accepts logins at all is its own setting:
+    member. Each listed key's :attr:`~mandala_computer.SshKey.reach` says which
+    of those it is, from the account the API key acts on. Whether a given
+    computer accepts logins at all is its own setting:
     :meth:`~mandala_computer.Computer.set_ssh_access`.
 
     An API key confined to a workspace cannot add or remove keys: the platform
@@ -1873,6 +1875,13 @@ class SshKeys:
         A key already registered — to you or to anybody — is a
         :class:`~mandala_computer.ConflictError`, and so is a ninth key: each
         person holds eight. Neither clears by waiting.
+
+        A fingerprint in :meth:`list` proves only that a key is registered to
+        you, not that this account accepts it: a key whose
+        :attr:`~mandala_computer.SshKey.reach` is ``"another_account"`` is
+        refused here. Adding it again is a conflict and this client cannot
+        remove it, so to use that key on every account remove it and add it
+        again from the dashboard; otherwise add a separate key here.
         """
         body = _api.ssh_key_body(public_key, name)
         return SshKey.from_api(self._t.json_object("POST", _api.SSH_KEYS, json=body))
@@ -1880,7 +1889,10 @@ class SshKeys:
     def remove(self, key_id: str) -> None:
         """Remove one of your keys. New connections with it are refused at once;
         a session already open goes on until it disconnects. An unknown id is a
-        :class:`~mandala_computer.NotFoundError`."""
+        :class:`~mandala_computer.NotFoundError`, and so is a key whose
+        :attr:`~mandala_computer.SshKey.reach` is ``"another_account"``: an API
+        key cannot remove one bound to a different account. Remove it from the
+        dashboard."""
         self._t.request("DELETE", _api.ssh_key(key_id))
 
 
