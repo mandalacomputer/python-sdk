@@ -625,6 +625,46 @@ def test_rm_never_deletes_a_different_secret_on_the_retry(
 
 
 @respx.mock
+def test_rm_does_not_repeat_a_value_typed_as_the_name_when_it_moves_on_the_retry(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A secret whose NAME is value-shaped is chosen; before the retry it is
+    # renamed and another secret takes that name. The conflict refusal must
+    # name both ids, never the operand.
+    typed = tok("ghp_", body(36))
+    other_id = "csec-fedcba9876543210"
+    respx.get(f"{BASE}/secrets").mock(
+        side_effect=[
+            httpx.Response(200, json={**LISTING, "secrets": [{**SECRET, "name": typed}]}),
+            httpx.Response(
+                200,
+                json={
+                    **LISTING,
+                    "secrets": [
+                        {**SECRET, "name": "x", "revision_id": REV2},
+                        {**SECRET, "id": other_id, "name": typed},
+                    ],
+                },
+            ),
+        ]
+    )
+    mine = respx.delete(f"{BASE}/secrets/{ID}").mock(httpx.Response(409, json=STALE))
+    theirs = respx.delete(f"{BASE}/secrets/{other_id}").mock(httpx.Response(204))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["secrets", "rm", typed])
+    failure = caught.value
+    assert failure.reason == "conflict"
+    assert failure.message.startswith("that name or id changed while it was being removed")
+    assert ID in failure.message and other_id in failure.message
+    assert "nothing was deleted" in failure.message
+    assert typed not in failure.message and typed not in str(failure)
+    assert typed not in str(failure.code)
+    assert mine.call_count == 1 and theirs.call_count == 0
+    out, err = capsys.readouterr()
+    assert typed not in out and typed not in err
+
+
+@respx.mock
 def test_list_shows_each_secrets_revision(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json=LISTING))
     assert _cli.main(["secrets", "list"]) == 0
