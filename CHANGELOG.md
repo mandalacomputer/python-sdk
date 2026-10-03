@@ -45,6 +45,16 @@ This is the summary you read to decide whether to upgrade.
   key added from the dashboard still reaches every account where you are an
   owner or member. No API change.
 
+- **The `builds` and `templates` documentation says which methods need an
+  account-wide key**, sync and async. The platform refuses an API key confined
+  to a workspace with a 403 (`PermissionDeniedError`) on every build route and
+  on publishing, reading the account's own template back and retiring one;
+  such a key can still list templates, read `system` ones and launch a
+  computer from a template by its ref. `builds.start()` no longer says build
+  secrets resolve in the key's scope: they resolve among the account-wide
+  secrets. `builds.list()` no longer describes what a workspace-scoped key
+  sees in a build listing. Documentation only; no API change.
+
 - **A bound `computers.launch()` returns within moments of its secrets
   landing**, rather than up to a whole poll interval later, sync and async.
   `wait_for_secrets`, `wait_for_browser_proxy`, `wait_for_egress_proxy` and
