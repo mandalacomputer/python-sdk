@@ -436,6 +436,11 @@ def test_a_webhook_decodes_every_field_and_keeps_null_as_none() -> None:
     # Disabled by the customer is not failing.
     mine = mc.Webhook.from_api({**WEBHOOK, "disabled_reason": "customer"})
     assert not mine.enabled and not mine.is_failing
+    # Disabled for the account's plan is the platform's, but not failing: the
+    # endpoint is fine and the plan's change brings it back.
+    plan = mc.Webhook.from_api({**WEBHOOK, "disabled_reason": "plan"})
+    assert plan.disabled_reason == "plan"
+    assert not plan.enabled and not plan.is_failing
 
 
 def test_a_webhook_never_carries_a_secret() -> None:
