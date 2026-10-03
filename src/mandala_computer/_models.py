@@ -3172,7 +3172,8 @@ class SshKey:
     whichever account the API key acts on. A key added from the dashboard
     reaches the computers of every account where you are an owner or member; a
     key added through an API key or a connected app reaches only that
-    credential's account, until the credential is revoked.
+    credential's account, until the credential is revoked. :attr:`reach` says
+    which, from the account the API key acts on.
     """
 
     #: ``sshk-`` and sixteen hex characters.
@@ -3189,6 +3190,19 @@ class SshKey:
     #: When this key last opened a connection to a computer. ``None`` until it has.
     last_used_at: str | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: Where this key can connect, from the account the API key acts on
+    #: (platform OPL-5617): ``"everywhere"`` (added from the dashboard, accepted
+    #: on every account where you are an owner or member), ``"this_account"``
+    #: (added through an API key or connected app on this account, accepted
+    #: here only) or ``"another_account"`` (added through one on a different
+    #: account, and refused here; which account is never said). Any other
+    #: string is a value a newer platform added, kept as it is. ``None`` from a
+    #: platform that does not report it.
+    #:
+    #: KEYWORD-ONLY, after ``raw``: this class is exported, so its field order
+    #: is its constructor, and ``raw`` was the eighth positional slot before
+    #: this field existed (see the note on :attr:`Template.ref`).
+    reach: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SshKey:
@@ -3200,6 +3214,7 @@ class SshKey:
             key_type=_text(d.get("key_type")),
             created_at=_text(d.get("created_at")),
             last_used_at=_opt_text(d.get("last_used_at")),
+            reach=_nullable_text(d, "reach", "an SSH key"),
             raw=dict(d),
         )
 

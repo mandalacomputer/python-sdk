@@ -34,6 +34,7 @@ KEY = {
     "key_type": "ssh-ed25519",
     "created_at": "2026-09-16T12:00:00Z",
     "last_used_at": None,
+    "reach": "everywhere",
 }
 OTHER_KEY = {**KEY, "id": "sshk-0000000000000001", "fingerprint": "SHA256:other", "name": "work"}
 ON = {
@@ -635,6 +636,7 @@ def test_ssh_keys_and_access_decode() -> None:
             key_type="ssh-ed25519",
             created_at="2026-09-16T12:00:00Z",
             last_used_at=None,
+            reach="everywhere",
         )
         client.ssh_keys.add(f"  {PUBLIC_KEY} me@laptop\n")
         assert json.loads(add.calls.last.request.content) == {
@@ -653,6 +655,28 @@ def test_ssh_keys_and_access_decode() -> None:
         assert access.available is None
         assert access.pending is True
         assert access.key_count == 1
+
+
+def test_ssh_key_keeps_its_positional_constructor() -> None:
+    # SshKey is exported, so its field order is its constructor. ``raw`` was
+    # the eighth positional slot before ``reach`` existed; a positional call
+    # from that release must still bind the mapping to ``raw``, leave
+    # ``reach`` unset, and build a hashable key. ``reach`` is keyword-only.
+    payload = {"id": "sshk-1", "reach": "everywhere"}
+    key = mc.SshKey(
+        "sshk-1",
+        "laptop",
+        PUBLIC_KEY,
+        FINGERPRINT,
+        "ssh-ed25519",
+        "2026-09-16T12:00:00Z",
+        None,
+        payload,
+    )
+    assert key.raw == payload
+    assert key.reach is None
+    hash(key)
+    assert mc.SshKey.from_api(KEY).reach == "everywhere"
 
 
 def test_access_reads_a_missing_enabled_as_off() -> None:
@@ -1040,6 +1064,84 @@ def test_setup_refuses_a_key_somebody_else_owns(
     assert err == (
         "mandala-py: That key is already registered. A key can belong to one person only.\n"
     )
+
+
+#: What --setup says for a listed key bound to another account (OPL-5617).
+ELSEWHERE = (
+    f"key {FINGERPRINT} (laptop) is registered for another of your accounts, so this "
+    "account's computers refuse it. To use it on every account, remove it and add it again "
+    "from the dashboard (a computer's Settings, SSH tab); or use a separate key: "
+    "mandala-py ssh --setup dev --key PATH"
+)
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_setup_refuses_a_listed_key_bound_to_another_account(
+    pub: Path, env: Path, capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    """The fingerprint is in the listing, but this account's computers refuse
+    the key: nothing is uploaded, SSH is not switched on, and nothing reads as
+    success."""
+    with respx.mock:
+        add, put = mock_setup([{**KEY, "reach": "another_account"}])
+        argv = ["ssh", "--setup", "dev", *(["--json"] if as_json else [])]
+        if as_json:
+            assert _cli.main(argv) == 1
+            assert json.loads(capsys.readouterr().err)["error"] == {
+                "code": "ssh_key_elsewhere",
+                "message": ELSEWHERE,
+            }
+        else:
+            with pytest.raises(SystemExit) as caught:
+                _cli.main(argv)
+            assert caught.value.code == f"mandala-py: {ELSEWHERE}"
+        assert not add.called
+        assert not put.called
+    assert capsys.readouterr().out == ""
+    assert not kh(env).exists()
+
+
+@respx.mock
+def test_setup_refuses_a_conflict_that_is_its_own_key_bound_elsewhere(
+    pub: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
+    respx.get(f"{BASE}/ssh-keys").mock(
+        side_effect=[
+            httpx.Response(200, json=[]),
+            httpx.Response(200, json=[{**KEY, "reach": "another_account"}]),
+        ]
+    )
+    respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(409, json={"error": "That key is already registered."})
+    )
+    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
+    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 1
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "ssh_key_elsewhere"
+    assert not put.called
+
+
+@pytest.mark.parametrize("reach", ["everywhere", "this_account", None])
+def test_setup_carries_on_with_a_key_that_works_here(
+    pub: Path, capsys: pytest.CaptureFixture[str], reach: str | None
+) -> None:
+    listed = {k: v for k, v in KEY.items() if k != "reach"}
+    if reach is not None:
+        listed["reach"] = reach
+    with respx.mock:
+        add, put = mock_setup([listed])
+        assert _cli.main(["ssh", "--setup", "dev"]) == 0
+        assert not add.called
+        assert put.called
+    assert f"key {FINGERPRINT} (laptop) already registered\nSSH is on for dev\n" in (
+        capsys.readouterr().out
+    )
+
+
+def test_a_reach_that_is_not_a_string_is_refused() -> None:
+    with pytest.raises(mc.MandalaError, match="reach is neither a string nor null"):
+        mc.SshKey.from_api({**KEY, "reach": 1})
 
 
 @respx.mock

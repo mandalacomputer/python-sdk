@@ -3063,6 +3063,11 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
                 registered = existing
         else:
             registered = existing
+        # Listed is not accepted (platform OPL-5617): a key bound to another
+        # of the person's accounts is refused here, so SSH is not switched on
+        # for it and nothing reads as success.
+        if registered.reach == "another_account":
+            _die(lambda s: _key_elsewhere(registered, target, s), "ssh_key_elsewhere")
         access = c.set_ssh_access(True)
     label = c.name or c.id
     # Checked before anything is printed: a setup that cannot work must not
@@ -3104,6 +3109,20 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def _key_elsewhere(key: SshKey, target: str, spell: _Spell) -> str:
+    """Why ``--setup`` stops for a key this account refuses: it is registered
+    to the caller, bound to another of their accounts. Adding it again is a
+    conflict, since a key is registered once, and an API key cannot remove a
+    key bound elsewhere; the dashboard can, and a key added there works
+    everywhere."""
+    return (
+        f"key {spell(key.fingerprint)} ({spell(key.name)}) is registered for another of your "
+        "accounts, so this account's computers refuse it. To use it on every account, remove "
+        "it and add it again from the dashboard (a computer's Settings, SSH tab); or use a "
+        f"separate key: {PROG} ssh --setup {shlex.quote(target)} --key PATH"
+    )
 
 
 def _own_key(client: Client, fingerprint: str) -> SshKey | None:
