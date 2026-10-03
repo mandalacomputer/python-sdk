@@ -303,9 +303,12 @@ def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
         # is shell-quoted (a `;` or `$` in it would otherwise start a second
         # command or expand), and one starting with `-` is joined with `=`,
         # since argparse reads a separate `-abc` as an option and refuses it.
+        # The dash test is on the key itself: a quoted one starts with `'`,
+        # yet the shell strips the quotes and argparse still sees the `-`.
         # A key of the SDK's own (hex) prints exactly as `mandala` prints it.
-        key = shlex.quote(_printable(str(ids["idempotency_key"])))
-        flag = f"--idempotency-key={key}" if key.startswith("-") else f"--idempotency-key {key}"
+        raw = _printable(str(ids["idempotency_key"]))
+        key = shlex.quote(raw)
+        flag = f"--idempotency-key={key}" if raw.startswith("-") else f"--idempotency-key {key}"
         line += f" (find its operation with: {PROG} operations list {flag}"
         if resendable:
             line += (

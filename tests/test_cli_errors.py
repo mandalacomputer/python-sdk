@@ -780,7 +780,9 @@ def shell_words(fragment: str) -> list[str]:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs a POSIX shell")
-@pytest.mark.parametrize("key", ["a;b$X", "abc;printf${IFS}PWNED", "-abc", "it's", "k-1"])
+@pytest.mark.parametrize(
+    "key", ["a;b$X", "abc;printf${IFS}PWNED", "-abc", "it's", "k-1", "-a;b", "-$X", "-it's"]
+)
 def test_the_commands_a_recovery_line_suggests_survive_a_shell(key: str) -> None:
     # The key is the caller's own --idempotency-key, so any printable ASCII
     # but a space: pasted back into a shell, an unquoted `;` would run a
