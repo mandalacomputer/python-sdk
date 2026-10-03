@@ -172,8 +172,11 @@ class AsyncComputer(ComputerFields):
 
     async def _refresh(self, *, timeout_cap: float | None = None) -> AsyncComputer:
         """Refresh with an optional cap used by deadline-bound wait helpers."""
-        self._data = _api.computer_payload(
-            await self._t.json_object("GET", _api.computer(self.id), timeout_cap=timeout_cap)
+        # Guarded: assigned unchecked, an answer with no id would blank this
+        # handle, and its next call would fail on the empty id instead of here.
+        path = _api.computer(self.id)
+        self._data = _api.computer_record(
+            await self._t.json_object("GET", path, timeout_cap=timeout_cap), "GET", path
         )
         return self
 
@@ -194,6 +197,33 @@ class AsyncComputer(ComputerFields):
                 "still has its previous state. Do not send the action again because "
                 f"of this refresh failure: {cause}"
             ) from cause
+
+    async def _patch(
+        self, action: str, body: Mapping[str, Any], idempotency_key: str | None
+    ) -> AsyncComputer:
+        """One ``PATCH`` of this computer, and the handle brought up to date by it.
+
+        :attr:`operation_id` is replaced by what the PATCH answer carried on
+        every call, so one that starts no operation — a rename, an idle window,
+        a proxy — leaves ``None`` rather than an earlier call's id that
+        ``operations.wait`` would then wait on. An answer that names the
+        computer is used as it is; one that does not (an acknowledgement such
+        as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
+        rather than leaving this handle holding a record with no id.
+        """
+        data = _api.computer_payload(
+            await self._t.json_object(
+                "PATCH",
+                _api.computer(self.id),
+                json=body,
+                headers=_api.idempotency_headers(idempotency_key),
+            )
+        )
+        self._operation_id = operation_id_of(data)
+        if _api.names_a_computer(data):
+            self._data = data
+            return self
+        return await self._refresh_after(action)
 
     async def start(
         self, *, resume_only: bool = False, idempotency_key: str | None = None
@@ -307,13 +337,14 @@ class AsyncComputer(ComputerFields):
         ``"building"`` and fills in behind you. Follow with
         :meth:`wait_until_built` before starting it.
         """
+        path = _api.computer_action(self.id, "clone")
         data = await self._t.json_object(
             "POST",
-            _api.computer_action(self.id, "clone"),
+            path,
             json=_api.name_body(name),
             headers=_api.idempotency_headers(idempotency_key),
         )
-        return AsyncComputer(self._t, _api.computer_payload(data))
+        return AsyncComputer(self._t, _api.computer_record(data, "POST", path))
 
     async def rename(self, name: str, *, idempotency_key: str | None = None) -> AsyncComputer:
         """Give this computer a new name, and return it renamed.
@@ -331,16 +362,7 @@ class AsyncComputer(ComputerFields):
         deleted they fall back to what it was called at the time, which is then
         all that is left of it.
         """
-        self._data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.rename_body(name),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
-        )
-        self._operation_id = operation_id_of(self._data)
-        return self
+        return await self._patch("rename", _api.rename_body(name), idempotency_key)
 
     async def resize(
         self,
@@ -365,16 +387,9 @@ class AsyncComputer(ComputerFields):
         :class:`~mandala_computer.PlanLimitError` naming the limit. The screen is
         not part of this — see :attr:`resolution`, which is fixed at create.
         """
-        self._data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return await self._patch(
+            "resize", _api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb), idempotency_key
         )
-        self._operation_id = operation_id_of(self._data)
-        return self
 
     async def relocate(
         self,
@@ -535,15 +550,9 @@ class AsyncComputer(ComputerFields):
         automatically. Screenshots deliberately do not, so a loop that only
         polls the screen is the one thing this setting can surprise.
         """
-        self._data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.idle_suspend_body(minutes),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return await self._patch(
+            "set_idle_suspend", _api.idle_suspend_body(minutes), idempotency_key
         )
-        return self
 
     async def set_browser_proxy(
         self,
@@ -556,15 +565,9 @@ class AsyncComputer(ComputerFields):
         Replaces the setting whole; ``None`` removes it. See
         :meth:`Computer.set_browser_proxy`: this is its twin.
         """
-        self._data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.browser_proxy_update_body(proxy),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return await self._patch(
+            "set_browser_proxy", _api.browser_proxy_update_body(proxy), idempotency_key
         )
-        return self
 
     async def set_egress_proxy(
         self,
@@ -577,15 +580,9 @@ class AsyncComputer(ComputerFields):
         Replaces the setting whole; ``None`` removes it. See
         :meth:`Computer.set_egress_proxy`: this is its twin.
         """
-        self._data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.egress_proxy_update_body(proxy),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return await self._patch(
+            "set_egress_proxy", _api.egress_proxy_update_body(proxy), idempotency_key
         )
-        return self
 
     async def ssh_access(self) -> SshAccess:
         """Whether SSH is on for this computer, and whether it can work here.

@@ -1403,12 +1403,13 @@ class ComputerFields:
         """The lifecycle operation the last lifecycle call made through this
         handle started (platform OPL-5055): the create or clone that returned
         it, or the latest ``start``, ``stop``, ``suspend``, ``restart``,
-        ``rename`` or ``resize`` since. ``client.operations.wait(id)`` polls it
-        to its end.
+        ``rename``, ``resize``, ``set_idle_suspend``, ``set_browser_proxy`` or
+        ``set_egress_proxy`` since. ``client.operations.wait(id)`` polls it to
+        its end.
 
-        Each of those calls replaces it with what its answer carried, so a
-        ``rename`` — which starts no operation — leaves it ``None``. A refresh
-        leaves it alone: reads never carry one. ``None`` on a handle from
+        Each of those calls replaces it with what its answer carried, so one
+        that starts no operation — a ``rename`` or a setting change — leaves it
+        ``None``. A refresh leaves it alone: reads never carry one. ``None`` on a handle from
         ``computers.get()`` or a listing, and wherever the platform could not
         record the operation, with the call done either way.
 
@@ -2462,8 +2463,11 @@ class Computer(ComputerFields):
 
     def _refresh(self, *, timeout_cap: float | None = None) -> Computer:
         """Refresh with an optional cap used by deadline-bound wait helpers."""
-        self._data = _api.computer_payload(
-            self._t.json_object("GET", _api.computer(self.id), timeout_cap=timeout_cap)
+        # Guarded: assigned unchecked, an answer with no id would blank this
+        # handle, and its next call would fail on the empty id instead of here.
+        path = _api.computer(self.id)
+        self._data = _api.computer_record(
+            self._t.json_object("GET", path, timeout_cap=timeout_cap), "GET", path
         )
         return self
 
@@ -2484,6 +2488,31 @@ class Computer(ComputerFields):
                 "still has its previous state. Do not send the action again because "
                 f"of this refresh failure: {cause}"
             ) from cause
+
+    def _patch(self, action: str, body: Mapping[str, Any], idempotency_key: str | None) -> Computer:
+        """One ``PATCH`` of this computer, and the handle brought up to date by it.
+
+        :attr:`operation_id` is replaced by what the PATCH answer carried on
+        every call, so one that starts no operation — a rename, an idle window,
+        a proxy — leaves ``None`` rather than an earlier call's id that
+        ``operations.wait`` would then wait on. An answer that names the
+        computer is used as it is; one that does not (an acknowledgement such
+        as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
+        rather than leaving this handle holding a record with no id.
+        """
+        data = _api.computer_payload(
+            self._t.json_object(
+                "PATCH",
+                _api.computer(self.id),
+                json=body,
+                headers=_api.idempotency_headers(idempotency_key),
+            )
+        )
+        self._operation_id = operation_id_of(data)
+        if _api.names_a_computer(data):
+            self._data = data
+            return self
+        return self._refresh_after(action)
 
     def start(self, *, resume_only: bool = False, idempotency_key: str | None = None) -> Computer:
         """Start this computer, or resume it if its session was suspended.
@@ -2591,13 +2620,14 @@ class Computer(ComputerFields):
         ``"building"`` and fills in behind you. Follow with
         :meth:`wait_until_built` before starting it.
         """
+        path = _api.computer_action(self.id, "clone")
         data = self._t.json_object(
             "POST",
-            _api.computer_action(self.id, "clone"),
+            path,
             json=_api.name_body(name),
             headers=_api.idempotency_headers(idempotency_key),
         )
-        return Computer(self._t, _api.computer_payload(data))
+        return Computer(self._t, _api.computer_record(data, "POST", path))
 
     def rename(self, name: str, *, idempotency_key: str | None = None) -> Computer:
         """Give this computer a new name, and return it renamed.
@@ -2615,16 +2645,7 @@ class Computer(ComputerFields):
         deleted they fall back to what it was called at the time, which is then
         all that is left of it.
         """
-        self._data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.rename_body(name),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
-        )
-        self._operation_id = operation_id_of(self._data)
-        return self
+        return self._patch("rename", _api.rename_body(name), idempotency_key)
 
     def resize(
         self,
@@ -2649,16 +2670,9 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.PlanLimitError` naming the limit. The screen is
         not part of this — see :attr:`resolution`, which is fixed at create.
         """
-        self._data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return self._patch(
+            "resize", _api.resize_body(cpu=cpu, ram_mb=ram_mb, disk_gb=disk_gb), idempotency_key
         )
-        self._operation_id = operation_id_of(self._data)
-        return self
 
     def relocate(
         self,
@@ -2820,15 +2834,7 @@ class Computer(ComputerFields):
         automatically. Screenshots deliberately do not, so a loop that only
         polls the screen is the one thing this setting can surprise.
         """
-        self._data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.idle_suspend_body(minutes),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
-        )
-        return self
+        return self._patch("set_idle_suspend", _api.idle_suspend_body(minutes), idempotency_key)
 
     def set_browser_proxy(
         self,
@@ -2851,15 +2857,9 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.APIError` (400) carrying its sentence, and
         only the shape is checked here (:class:`ValueError`).
         """
-        self._data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.browser_proxy_update_body(proxy),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return self._patch(
+            "set_browser_proxy", _api.browser_proxy_update_body(proxy), idempotency_key
         )
-        return self
 
     def set_egress_proxy(
         self,
@@ -2888,15 +2888,9 @@ class Computer(ComputerFields):
         have taken effect: :meth:`refresh`, and send the setting again if it
         stays pending. Only the shape is checked here (:class:`ValueError`).
         """
-        self._data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=_api.egress_proxy_update_body(proxy),
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        return self._patch(
+            "set_egress_proxy", _api.egress_proxy_update_body(proxy), idempotency_key
         )
-        return self
 
     def ssh_access(self) -> SshAccess:
         """Whether SSH is on for this computer, and whether it can work here.

@@ -236,11 +236,18 @@ class Computers:
                 allow_partial=allow_partial, state=state, workspace_id=workspace_id
             ),
         )
-        return Listing.of([Computer(self._t, c) for c in data or []], incomplete)
+        return Listing.of(
+            [
+                Computer(self._t, c)
+                for c in _api.computer_records(data or [], "GET", _api.COMPUTERS)
+            ],
+            incomplete,
+        )
 
     def get(self, computer_id: str) -> Computer:
-        data = self._t.json_object("GET", _api.computer(computer_id))
-        return Computer(self._t, _api.computer_payload(data))
+        path = _api.computer(computer_id)
+        data = self._t.json_object("GET", path)
+        return Computer(self._t, _api.computer_record(data, "GET", path))
 
     def create(
         self,
@@ -400,7 +407,8 @@ class Computers:
         data, headers = self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
         )
-        return Computer(self._t, _api.computer_payload(data)), _replayed(headers)
+        record = _api.computer_record(data, "POST", _api.COMPUTERS)
+        return Computer(self._t, record), _replayed(headers)
 
     def launch(
         self,
@@ -857,13 +865,14 @@ class Snapshots:
         the disk, and the returned computer's :attr:`memory_dropped` says so;
         check it before assuming the session came across.
         """
+        path = _api.snapshot_action(snapshot_id, "clone")
         data = self._t.json_object(
             "POST",
-            _api.snapshot_action(snapshot_id, "clone"),
+            path,
             json=_api.snapshot_clone_body(name, memory, inherit_secrets),
             headers=_api.idempotency_headers(idempotency_key),
         )
-        return Computer(self._t, _api.computer_payload(data))
+        return Computer(self._t, _api.computer_record(data, "POST", path))
 
     def delete(
         self,

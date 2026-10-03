@@ -40,6 +40,22 @@ This is the summary you read to decide whether to upgrade.
 
 ### Fixed
 
+- **A setting change resets `operation_id`, and an answer that is not a
+  computer is refused rather than wiping the handle**, sync and async.
+  `set_idle_suspend()`, `set_browser_proxy()` and `set_egress_proxy()` now
+  replace `Computer.operation_id` with what their answer carried, as
+  `rename()` and `resize()` already did, so after `start()` and then a setting
+  change it is `None` rather than the start's id, which
+  `operations.wait(c.operation_id)` would have waited on. `computers.create()`,
+  `launch()`, `ephemeral()`, `get()`, `Computer.clone()`, `snapshots.clone()`
+  and `refresh()` raise `MandalaError("expected a computer from <METHOD>
+  <path>")` for an answer with no `id`, and `computers.list()` raises for a
+  row with none, naming the row, instead of returning a computer whose id is
+  `""` and whose next call fails with a `ValueError` blaming the caller. A
+  `rename()`, `resize()` or setting change answered without a computer reads
+  the computer again rather than blanking the handle. The platform does not
+  send such answers; this matches `mandala-computer` for TypeScript.
+
 - **`mandala-py` shows an SSH key's reach, and stops before `ssh` when no key
   you hold is accepted here.** `mandala-py ssh-key list` has a REACH column
   (`every account`, `this account`, or `another account (refused here)`) and,

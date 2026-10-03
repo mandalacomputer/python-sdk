@@ -1653,7 +1653,9 @@ def test_O02_profile_cli_paths(
             respx.get(base + "/computers/vm-1/files").mock(httpx.Response(200, content=b"fixture"))
             argv = ["scp", "dev:/fixture.txt", str(tmp_path / "download.txt")]
         else:
-            respx.get(base + "/computers/vm-1").mock(httpx.Response(200, json=_TERMINAL_COMPUTER))
+            respx.get(base + "/computers/vm-1").mock(
+                httpx.Response(200, json={**_TERMINAL_COMPUTER, "id": "vm-1", "name": "dev"})
+            )
             monkeypatch.setattr(_cli, "_terminal_fd", lambda: None)
             monkeypatch.setattr(_cli, "_interact", lambda url: 0)
             argv = ["terminal", "dev"]
