@@ -4464,7 +4464,8 @@ class WorkspaceDeleted:
     """What deleting a workspace answers (platform OPL-5473).
 
     Every API key confined to the workspace was revoked with it, whoever held
-    it; ``revoked_keys`` says how many. Its computers are not touched.
+    it; ``revoked_keys`` says how many. Only an empty workspace is deleted, so
+    there is no answer for one that holds computers.
     """
 
     #: The API keys confined to the workspace, revoked in the same step.
