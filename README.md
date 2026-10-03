@@ -3434,12 +3434,15 @@ Your own terminal against a computer, addressed by name or id. Authentication
 is the SDK's: `MANDALA_API_KEY` in the environment.
 
 `mandala-py` is the Python package's command. The npm package
-(`npm install -g mandala-computer`) installs `mandala`, which does what every
-command below does (`move` and the proxy commands sit under `computers` there)
-and adds `login`, the computer lifecycle, `exec`, files, screenshots,
-snapshots, templates, usage and agent runs; reach for it where Node is
-available. Through 0.5.0 both packages installed `mandala`, and whichever came
-first on PATH won.
+(`npm install -g mandala-computer`) installs `mandala`, which does what the
+commands below do (`move` and the proxy commands sit under `computers` there),
+except two: it has no `browser-proxy get` or `egress-proxy get` (`mandala
+computers get` shows both proxies), and its proxy `set` and `clear` take no
+`--wait` (run `mandala computers wait NAME --until browser-proxy` or `--until
+egress-proxy` instead). It adds `login`, the computer lifecycle, `exec`, files,
+screenshots, snapshots, templates, usage and agent runs; reach for it where
+Node is available. Through 0.5.0 both packages installed `mandala`, and
+whichever came first on PATH won.
 
 Some of the API has a command in neither CLI, and is in the SDK (and the MCP
 server) only: [desktop input](#driving-the-desktop), [windows](#what-is-on-the-desktop)
