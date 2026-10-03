@@ -627,8 +627,9 @@ rather than going stale. Keep the route below whichever you get.
 [`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
 — the reliable one, not merely the fallback — because they need nothing of the
 *hardware*: no cold boot, no permission from a browser. They ask one thing of
-the image (`xclip`, in every golden since August 2026) and say so in the answer
-when it is missing, which is one condition stated instead of two inferred. Where
+the image (its desktop's clipboard tool: `xclip` on X11, `wl-clipboard` on
+Wayland) and say so in the answer when it is missing, which is one condition
+stated instead of two inferred. Where
 the socket *does* carry the clipboard the two do not fight over it: those
 methods write the same X `CLIPBOARD` selection the agent then offers onward.
 
@@ -1423,10 +1424,12 @@ five windows, four of which are not applications. Linux only.
 The desktop's `CLIPBOARD` selection — what Ctrl-C writes and Ctrl-V pastes —
 read and written from outside the guest. Linux only, and it needs nothing of
 the *hardware*: no cold boot, no permission from a browser. What it does need is
-`xclip` in the guest, which every golden built since August 2026 carries — so in
-practice this is the road that works on every computer, and where it is not, the
-refusal says so. (The other road is RFB extended cut text over the desktop
-socket, which is live and conditional; see
+the desktop's clipboard tool in the guest — `xclip` on an X11 image, or
+`wl-clipboard` (`wl-paste`/`wl-copy`) on a Wayland one such as Omarchy, and
+`c.desktop` says which — and every current image carries the tool its desktop
+needs. So in practice this is the road that works on every computer, and where
+it is not, the refusal says so. (The other road is RFB extended cut text over
+the desktop socket, which is live and conditional; see
 [Showing somebody the desktop](#showing-somebody-the-desktop).)
 
 ```python
@@ -1459,9 +1462,10 @@ platform response has no recognised reason, the SDK preserves the historical
 responses should verify the computer state and
 keep its retry loop bounded.
 
-Two others worth knowing. A **400** never clears: a computer built from a golden
-that predates `xclip` is refused permanently — install `xclip` in the guest, or
-create a new computer from an image that includes it. And an over-cap read raises `FileTooLargeError`, whose
+Two others worth knowing. A **400** never clears: a computer whose image lacks
+its desktop's clipboard tool (`xclip` on X11, `wl-clipboard` on Wayland) is
+refused permanently, and the refusal names the tool — install that tool in the
+guest, or create a new computer from an image that includes it. And an over-cap read raises `FileTooLargeError`, whose
 usual remedy does not apply: there is no `Range` on a selection, so the text is
 either under 128 KiB or out of reach.
 

@@ -231,6 +231,14 @@ This is the summary you read to decide whether to upgrade.
   includes it, matching the platform's corrected refusal. The refusal's
   sentence comes from the platform. Documentation only; no API change.
 
+- **The clipboard docs name the Wayland tool.** `clipboard()` and
+  `set_clipboard()` on `Computer` and `AsyncComputer`, `VncConnect` and the
+  README said the clipboard needs `xclip` in the guest, which is only the X11
+  half: a Wayland image such as Omarchy needs `wl-clipboard`
+  (`wl-paste`/`wl-copy`) instead, and the platform's permanent 400 there names
+  that tool. They now name the tool each desktop needs, with `desktop` saying
+  which. Documentation only; no API change.
+
 ## [0.9.0] — 2026-09-30
 
 ### Changed

@@ -724,10 +724,11 @@ class VncConnect:
         :meth:`Computer.clipboard` and :meth:`Computer.set_clipboard` are the
         route to build on — the reliable one, not merely the fallback — because
         they need nothing of the HARDWARE: no cold boot, and no permission from
-        a browser. What they do want is a Linux guest with a display and
-        ``xclip`` in the image, since they drive the guest's own desktop
-        session; Windows is refused outright, and a computer built from a golden
-        that predates ``xclip`` gets a permanent 400 that says so. That is a
+        a browser. What they do want is a Linux guest with a display and its
+        desktop's clipboard tool in the image (``xclip`` on X11,
+        ``wl-clipboard`` on Wayland), since they drive the guest's own desktop
+        session; Windows is refused outright, and a computer whose image lacks
+        that tool gets a permanent 400 that names it. That is a
         much smaller set than the socket's two conditions, and unlike them it is
         stated in the answer rather than left to be inferred. Where the socket
         does carry the clipboard the two do not fight over it — those methods

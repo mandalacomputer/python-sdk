@@ -3293,6 +3293,47 @@ def test_the_clipboard_cap_is_counted_in_bytes_not_characters() -> None:
         mc._api.clipboard_body("\U0001f600" * (cap // 4 + 1))
 
 
+def _paragraphs_naming_xclip(text: str) -> list[str]:
+    """The paragraphs of ``text`` that mention ``xclip``, whitespace folded."""
+    paragraphs = [" ".join(p.split()) for p in text.split("\n\n")]
+    naming = [p for p in paragraphs if "xclip" in p]
+    assert naming, "the passage no longer names the clipboard tool at all"
+    return naming
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        mc.Computer.clipboard,
+        mc.Computer.set_clipboard,
+        mc.AsyncComputer.clipboard,
+        mc.AsyncComputer.set_clipboard,
+        mc.VncConnect,
+    ],
+    ids=lambda o: o.__qualname__,
+)
+def test_the_clipboard_docstrings_name_the_tool_each_desktop_needs(doc: object) -> None:
+    """A Wayland image drives wl-paste/wl-copy from wl-clipboard, and the
+    platform's permanent 400 there names that tool. A paragraph stating the
+    image requirement with ``xclip`` alone sends a Wayland caller to install
+    something its compositor never uses. Checked per paragraph, so one that
+    names both cannot cover for another that names only ``xclip``."""
+    for paragraph in _paragraphs_naming_xclip(doc.__doc__ or ""):
+        assert "wl-clipboard" in paragraph, paragraph
+
+
+def test_the_readme_clipboard_passages_name_the_tool_each_desktop_needs() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    # Up to the subsection on the exec recipe these replace, which is about
+    # that X11 recipe rather than about what the image needs.
+    start = readme.index("### The clipboard\n")
+    section = readme[start : readme.index("#### What these replace", start)]
+    route_at = readme.index("[`clipboard()` and `set_clipboard()`](#the-clipboard) are the route")
+    route = readme[route_at : readme.index("\n\n", route_at)]
+    for paragraph in _paragraphs_naming_xclip(section) + _paragraphs_naming_xclip(route):
+        assert "wl-clipboard" in paragraph, paragraph
+
+
 # --- resize and the idle window ---------------------------------------------
 
 

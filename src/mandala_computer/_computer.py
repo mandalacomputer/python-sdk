@@ -4777,13 +4777,16 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.VncConnect`.
 
         It does want one thing of the IMAGE, and unlike the socket's conditions
-        it is stated in the answer rather than left to be inferred: ``xclip`` in
-        the guest. Every golden built since August 2026 carries it, so in practice
-        this is a computer created before then — and a computer keeps the image
-        it was created from. The refusal is a **400** and it is permanent:
-        install ``xclip`` in the guest, which you can do since you have root
-        there, or create a new computer from an image that includes it. Do not
-        retry it.
+        it is stated in the answer rather than left to be inferred: the
+        desktop's clipboard tool in the guest — ``xclip`` on an X11 image,
+        ``wl-clipboard`` (``wl-paste``/``wl-copy``) on a Wayland one such as
+        Omarchy; :attr:`desktop` says which. Every current image carries the
+        tool its desktop needs, so in practice a computer without it was
+        created from an older or custom image — and a computer keeps the image
+        it was created from. The refusal is a **400** that names the tool, and
+        it is permanent: install that tool in the guest, which you can do since
+        you have root there, or create a new computer from an image that
+        includes it. Do not retry it.
 
         A read, not a subscription. Nothing notices a Ctrl-C in the guest on its
         own, and this does NOT resume a suspended computer: what somebody copied
@@ -4838,8 +4841,9 @@ class Computer(ComputerFields):
         such responses should verify the computer state and bound its retries.
 
         And two 400s here never clear at all, which matters more on this method
-        than on the read for exactly that reason: the guest needs ``xclip`` in
-        its image (see :meth:`clipboard`), and Windows is refused outright. Both
+        than on the read for exactly that reason: the guest needs its desktop's
+        clipboard tool in its image (``xclip`` on X11, ``wl-clipboard`` on
+        Wayland; see :meth:`clipboard`), and Windows is refused outright. Both
         say which they are.
 
         Linux only.
