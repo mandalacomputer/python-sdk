@@ -224,6 +224,13 @@ This is the summary you read to decide whether to upgrade.
   `"customer"` and `"failing"`. The field stays a plain string, and
   `is_failing` stays false for `"plan"`. Documentation only; no API change.
 
+- **`clipboard()` says which new computer fixes a missing `xclip`.** A
+  computer whose image has no `xclip` is refused with a permanent 400; the
+  documentation used to say to install `xclip` in the guest or create a new
+  computer, and now says the new computer must be created from an image that
+  includes it, matching the platform's corrected refusal. The refusal's
+  sentence comes from the platform. Documentation only; no API change.
+
 ## [0.9.0] — 2026-09-30
 
 ### Changed
