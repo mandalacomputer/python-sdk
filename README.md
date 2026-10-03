@@ -2244,8 +2244,9 @@ that answers; see [Readiness](#readiness).
 `client.operations.list(computer_id=..., idempotency_key=..., limit=...,
 cursor=...)` pages through them newest first — pass `next_cursor` back as
 `cursor`. An API key confined to a workspace sees only its computers'
-operations, and anything else is a `NotFoundError`. Calls made from the
-dashboard record none. The async client has the same three, awaited.
+operations, and anything else is a `NotFoundError`. The same calls made from
+the dashboard are recorded and listed too, on the same terms, except a move.
+The async client has the same three, awaited.
 
 **Every lifecycle call sends an `Idempotency-Key`** — create, clone, start,
 stop, suspend, restart, rename, resize, `set_idle_suspend`,

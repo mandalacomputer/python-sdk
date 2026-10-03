@@ -2321,8 +2321,8 @@ def _operation_timed_out(op_id: str, timeout: float, last: Operation | None, ans
 
 
 class Operations:
-    """The lifecycle operations this account's API calls started (platform
-    OPL-5055).
+    """The lifecycle operations started on this account, from the API or the
+    dashboard (platform OPL-5055).
 
     Every accepted create, clone, start, stop, suspend, restart, snapshot
     restore, resize, move and delete records one and answers its id: as
@@ -2331,8 +2331,9 @@ class Operations:
     :attr:`~mandala_computer.Move.operation_id` or
     :attr:`~mandala_computer.ComputerDeletion.operation_id`. A refused call records
     nothing, since its error is its outcome, and calls made from the dashboard
-    record none. Operations are kept for a limited time, after which a read is
-    a :class:`~mandala_computer.NotFoundError`.
+    are recorded and listed too, on the same terms, except a move. Operations
+    are kept for a limited time, after which a read is a
+    :class:`~mandala_computer.NotFoundError`.
 
     An API key confined to a workspace sees the operations of computers in
     that workspace only; any other id is a
