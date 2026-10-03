@@ -3501,6 +3501,25 @@ package's README — never a class name. `status` and the platform's `reason` wo
 ride beside it when there are any. A mistyped command prints its whole help, not
 one line.
 
+Every command whose call is keyed takes `--idempotency-key KEY` (1 to 255
+printable ASCII characters, no space) and sends it instead of a key of its own:
+`move`, `browser-proxy set` and `clear`, and `egress-proxy set` and `clear`. So
+a command whose answer was lost, and whose error named a key, can be sent again
+with that key: the platform does not carry one key out twice. Without
+`--json`, such a failure ends with a line naming the key (and the request id),
+and, when it names no operation, the two ways on: `(find its operation with:
+mandala-py operations list --idempotency-key KEY; or send the same command
+again with --idempotency-key KEY, which the platform does not carry out
+twice)`. A key of your own is shell-quoted in both commands, and one starting
+with `-` is written `--idempotency-key=KEY`, so they paste back into a shell as
+they read. With `--json` they are the error's `idempotency_key` and `request_id`.
+A key the platform would refuse is refused before any request
+(`invalid_arguments`). `operations list --idempotency-key` stays a filter.
+
+```sh
+mandala-py move dev --ram-mb 65536 --idempotency-key 3f2a9c        # the key the failure named
+```
+
 `terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
 server-side, running as the desktop user. Disconnecting *detaches* rather than
 ends it — the shell and whatever it was running keep going, and running the

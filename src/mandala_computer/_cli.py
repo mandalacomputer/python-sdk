@@ -271,13 +271,18 @@ def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
     return info
 
 
-def _recovery_line(err: MandalaError) -> str | None:
+def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
     """The text-mode line naming the ids a failure carries, or ``None``.
 
     Read from :func:`_with_ids`, so text and ``--json`` name the same ids.
     What a person needs to find out how a call whose answer was lost ended.
     Each value is escaped with :func:`_printable`: a request id is a response
     header, and an operation id comes from the response body.
+
+    A key with no operation id is followed by the command that finds the
+    operation it started, and, when the command that failed takes
+    ``--idempotency-key`` (``resendable``), by the resend under it, as
+    ``mandala`` says both.
     """
     ids = _with_ids({}, err)
     parts = [
@@ -289,7 +294,56 @@ def _recovery_line(err: MandalaError) -> str | None:
         )
         if key in ids
     ]
-    return f"{PROG}: {'; '.join(parts)}" if parts else None
+    if not parts:
+        return None
+    line = f"{PROG}: {'; '.join(parts)}"
+    if "idempotency_key" in ids and "operation_id" not in ids:
+        # The two commands are for pasting into a shell, and the key may be the
+        # caller's own --idempotency-key: any printable ASCII but a space. So it
+        # is shell-quoted (a `;` or `$` in it would otherwise start a second
+        # command or expand), and one starting with `-` is joined with `=`,
+        # since argparse reads a separate `-abc` as an option and refuses it.
+        # The dash test is on the key itself: a quoted one starts with `'`,
+        # yet the shell strips the quotes and argparse still sees the `-`.
+        # A key of the SDK's own (hex) prints exactly as `mandala` prints it.
+        raw = _printable(str(ids["idempotency_key"]))
+        key = shlex.quote(raw)
+        flag = f"--idempotency-key={key}" if raw.startswith("-") else f"--idempotency-key {key}"
+        line += f" (find its operation with: {PROG} operations list {flag}"
+        if resendable:
+            line += (
+                f"; or send the same command again with {flag}, "
+                "which the platform does not carry out twice"
+            )
+        line += ")"
+    return line
+
+
+def _key_option(parser: argparse.ArgumentParser) -> None:
+    """``--idempotency-key KEY`` on a command whose call is keyed: sent instead
+    of a key of the command's own, so a command whose answer was lost, and
+    whose error named its key, can be sent again under it and not be carried
+    out twice."""
+    parser.add_argument(
+        "--idempotency-key",
+        metavar="KEY",
+        help="send this Idempotency-Key instead of a fresh one (1 to 255 printable "
+        "ASCII characters, no space): the key a failed attempt named, to send it "
+        "again without it being carried out twice",
+    )
+    parser.set_defaults(resendable=True)
+
+
+def _sent_key(args: argparse.Namespace) -> str | None:
+    """The ``--idempotency-key`` given, checked as ``mandala`` checks it,
+    before any request; ``None`` when none was."""
+    key: str | None = args.idempotency_key
+    if key is None:
+        return None
+    try:
+        return _api.idempotency_key(key, "--idempotency-key")
+    except ValueError as e:
+        _die(str(e), "invalid_arguments")
 
 
 def _error_info(err: BaseException) -> dict[str, Any]:
@@ -2694,13 +2748,16 @@ def _cmd_move(args: argparse.Namespace) -> int:
     ``move_required``. The body is checked before any request; with ``--wait``
     the command waits for the move and exits 0 only when it is ``done``."""
     _api.move_body(ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb)
+    key = _sent_key(args)
     if not args.wait and (args.timeout_ms is not None or args.poll_ms is not None):
         _die("--timeout-ms and --poll-ms go with --wait", "invalid_arguments")
     timeout = _milliseconds("timeout-ms", args.timeout_ms, 900.0)
     poll = _milliseconds("poll-ms", args.poll_ms, 3.0)
     with _client() as client:
         c = _resolve(client, args.target)
-        move = c.relocate(ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb)
+        move = c.relocate(
+            ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb, idempotency_key=key
+        )
         if args.wait:
             move = c.wait_for_move(timeout=timeout, poll=poll, move=move)
     if args.json:
@@ -2767,6 +2824,7 @@ def _moves_parsers(sub: Any) -> None:
     )
     move.add_argument("--timeout-ms", type=int, help="wait deadline in milliseconds (15 min)")
     move.add_argument("--poll-ms", type=int, help="poll interval in milliseconds")
+    _key_option(move)
     move.add_argument("--json", action="store_true", help="the move as JSON")
     move.set_defaults(fn=_cmd_move)
     moves = sub.add_parser("moves", help="the account's moves, running or finished in a day")
@@ -4088,6 +4146,7 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
     # Checked before the computer is looked up, so a malformed value costs no
     # request. The platform's rules on the URL itself are its own to apply.
     _api.browser_proxy_body(proxy)
+    key = _sent_key(args)
     with _client() as client:
         c = _resolve(client, args.target)
         if args.credentials is None and not args.no_credentials:
@@ -4109,15 +4168,16 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
                         "invalid_arguments",
                     )
                 proxy["credentials_secret_id"] = current.credentials_secret_id
-        c = c.set_browser_proxy(proxy)
+        c = c.set_browser_proxy(proxy, idempotency_key=key)
         if args.wait:
             _wait_for_proxy(c)
     return _proxy_result(args, c, record=True)
 
 
 def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
+    key = _sent_key(args)
     with _client() as client:
-        c = _resolve(client, args.target).set_browser_proxy(None)
+        c = _resolve(client, args.target).set_browser_proxy(None, idempotency_key=key)
         if args.wait:
             _wait_for_proxy(c)
     return _proxy_result(args, c, record=True)
@@ -4163,6 +4223,7 @@ def _browser_proxy_parser(sub: Any) -> None:
         action="store_true",
         help="return once the computer's browsers have it (a stopped one gets it as it starts)",
     )
+    _key_option(put)
     put.add_argument("--json", action="store_true", help="the computer's record as JSON")
     put.set_defaults(fn=_cmd_browser_proxy_set)
     clear = verbs.add_parser(
@@ -4174,6 +4235,7 @@ def _browser_proxy_parser(sub: Any) -> None:
         action="store_true",
         help="return once the computer's browsers no longer use it (a stopped one: as it starts)",
     )
+    _key_option(clear)
     clear.add_argument("--json", action="store_true", help="the computer's record as JSON")
     clear.set_defaults(fn=_cmd_browser_proxy_clear)
 
@@ -4226,6 +4288,7 @@ def _cmd_egress_proxy_set(args: argparse.Namespace) -> int:
     # Checked before the computer is looked up, so a malformed value costs no
     # request. The platform's rules on the URL itself are its own to apply.
     _api.egress_proxy_body(proxy)
+    key = _sent_key(args)
     with _client() as client:
         c = _resolve(client, args.target)
         if args.credentials is None and not args.no_credentials:
@@ -4246,13 +4309,14 @@ def _cmd_egress_proxy_set(args: argparse.Namespace) -> int:
                         "invalid_arguments",
                     )
                 proxy["credentials_secret_id"] = current.credentials_secret_id
-        c = c.set_egress_proxy(proxy)
+        c = c.set_egress_proxy(proxy, idempotency_key=key)
     return _egress_proxy_result(args, c, record=True)
 
 
 def _cmd_egress_proxy_clear(args: argparse.Namespace) -> int:
+    key = _sent_key(args)
     with _client() as client:
-        c = _resolve(client, args.target).set_egress_proxy(None)
+        c = _resolve(client, args.target).set_egress_proxy(None, idempotency_key=key)
     return _egress_proxy_result(args, c, record=True)
 
 
@@ -4285,12 +4349,14 @@ def _egress_proxy_parser(sub: Any) -> None:
         action="store_true",
         help="remove the proxy's credentials rather than keep them",
     )
+    _key_option(put)
     put.add_argument("--json", action="store_true", help="the computer's record as JSON")
     put.set_defaults(fn=_cmd_egress_proxy_set)
     clear = verbs.add_parser(
         "clear", help="remove a computer's egress proxy; its traffic goes out directly"
     )
     clear.add_argument("target", metavar="computer", help="computer name or id")
+    _key_option(clear)
     clear.add_argument("--json", action="store_true", help="the computer's record as JSON")
     clear.set_defaults(fn=_cmd_egress_proxy_clear)
 
@@ -4348,6 +4414,9 @@ def _parser() -> _Parser:
 def main(argv: list[str] | None = None) -> int:
     words = list(sys.argv[1:] if argv is None else argv)
     as_json = False
+    # Whether the command takes --idempotency-key, which the recovery line
+    # then offers to resend under.
+    resendable = False
     try:
         if words[:1] == ["ssh"]:
             # Parsed by hand: everything after the computer belongs to ssh,
@@ -4366,6 +4435,7 @@ def main(argv: list[str] | None = None) -> int:
         # Past parsing, the command's own flag decides: one that has no --json
         # was never going to answer in JSON.
         as_json = bool(getattr(args, "json", False))
+        resendable = bool(getattr(args, "resendable", False))
         if extra:
             # parse_args reports these against the TOP parser, whose usage says
             # nothing about the command that was typed. Reported against that
@@ -4395,7 +4465,7 @@ def main(argv: list[str] | None = None) -> int:
             # The message can be the response's own text: escaped, so a
             # newline in it cannot forge a recovery line below it.
             print(f"{PROG}: {_printable(str(e))}", file=sys.stderr)
-            recovery = _recovery_line(e) if isinstance(e, MandalaError) else None
+            recovery = _recovery_line(e, resendable) if isinstance(e, MandalaError) else None
             if recovery is not None:
                 print(recovery, file=sys.stderr)
         return 1
