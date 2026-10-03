@@ -47,6 +47,23 @@ This is the summary you read to decide whether to upgrade.
   what to do: remove the key and add it again from the dashboard to use it on
   every account, or pass `--key` with a separate key.
 
+- **`mandala-py secrets set` refuses a value typed where the NAME goes, and no
+  `secrets` command repeats one.** `mandala-py secrets set "$GITHUB_TOKEN"`
+  used to store the token as the secret's name, where every member who can
+  list the scope reads it, and print it back. A NAME that looks like a secret's
+  value (a known token prefix, an AWS key id, a UUID, a random-looking run, or
+  random base64) is now refused with `invalid_arguments` before the value is
+  read and before any request, as the TypeScript CLI refuses it; a real name
+  the check misreads goes through with the new `--no-value-check`. `secrets rm`
+  no longer quotes such an operand in its not-found error ("no secret with
+  that name or id"), and prints only the id when the secret it deleted has a
+  name shaped like a value.
+- **`mandala-py secrets rm` reads the secret again when its revision moved**
+  between the read and the delete, up to three attempts in all, instead of
+  failing on the first 409, as the TypeScript CLI does.
+- **`mandala-py secrets list` prints each secret's revision**, in a REVISION
+  column after SCOPE, as it was documented to.
+
 ### Changed
 
 - **A request timeout now raises `RequestTimeoutError`, a

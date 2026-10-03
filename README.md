@@ -3535,8 +3535,14 @@ mandala-py webhooks test whk-2b7d4c809f3c1a7e && mandala-py webhooks deliveries 
 secret or replaces its value, and reads the value from stdin — dropping one
 trailing newline (`\n` or `\r\n`, never a lone `\r`), which `--keep-newline` keeps — or, at a terminal, from a prompt
 that does not echo. Never from the command line, where it would land in shell
-history and in every process listing. `rm NAME` deletes by name at the revision
-it read. `get NAME` prints one secret's id, name, scope, revision and dates,
+history and in every process listing. A NAME that looks like a secret's value
+rather than a name — `secrets set "$GITHUB_TOKEN"`, a token typed where the
+name goes — is refused with `invalid_arguments` before the value is read, with
+nothing sent and without repeating it; `--no-value-check` sends a real name the
+check misreads as typed. `list` prints each secret's id, name, scope, revision
+and dates. `rm NAME` deletes by name or id at the revision it read, reading it
+again if somebody changed it in between (up to three attempts), and never
+repeats an operand that looks like a value. `get NAME` prints one secret's id, name, scope, revision and dates,
 found by name or id as `rm` finds it (`--json` for the platform's record).
 `--workspace ID` names a workspace's scope on all four; without it they work
 on the account-wide secrets. No command prints a value, because the platform
