@@ -82,6 +82,29 @@ def test_a_usage_error_under_json_is_the_error_object(capsys: pytest.CaptureFixt
     assert "usage: mandala-py webhooks list" in str(error["usage"])
 
 
+@pytest.mark.parametrize(
+    ("argv", "usage"),
+    [
+        # An unknown first word shows the whole command list, as `mandala` does.
+        (["bogus"], "usage: mandala-py [-h] [--version]"),
+        # One under a group shows that group's verbs.
+        (["webhooks", "bogus"], "usage: mandala-py webhooks [-h]"),
+    ],
+)
+def test_an_unknown_command_exits_2_with_the_help_it_was_typed_under(
+    capsys: pytest.CaptureFixture[str], argv: list[str], usage: str
+) -> None:
+    # The exit status `mandala` uses for a usage error too (OPL-5660); every
+    # other failure exits 1, as the tests further down pin.
+    with pytest.raises(SystemExit) as caught:
+        _cli.main([*argv, "--json"])
+    assert caught.value.code == 2
+    error = failure(capsys)
+    assert error["code"] == "invalid_arguments"
+    assert "bogus" in str(error["message"])
+    assert str(error["usage"]).startswith(usage)
+
+
 TOKEN = "sk-live-0123456789-do-not-echo"
 
 
