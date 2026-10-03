@@ -675,12 +675,8 @@ def test_cli_clears_and_waits(cli_env, capsys, monkeypatch):
     assert _cli.main(["browser-proxy", "clear", "dev", "--wait", "--json"]) == 0
     assert json.loads(patch.calls.last.request.content) == {"browser_proxy": None}
     assert reads.call_count == 2
-    assert json.loads(capsys.readouterr().out) == {
-        "id": "launch-42",
-        "name": "dev",
-        "browser_proxy": None,
-        "browser_proxy_pending": False,
-    }
+    # The computer's record as the wait last read it, as `mandala` prints it.
+    assert json.loads(capsys.readouterr().out) == {**COMPUTER, "name": "dev"}
 
 
 @respx.mock

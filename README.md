@@ -3478,14 +3478,25 @@ mandala-py --version
 ```
 
 With `--json`, a command's result is printed as the API's own record, in its
-snake_case. A failure prints nothing on stdout: it writes its `error` object as
-one JSON line on stderr and exits nonzero. `code` is one snake_case word naming
-the kind of failure, the same word the npm `mandala` CLI reports — `not_found`,
-`unauthenticated`, `permission_denied`, `conflict`, `rate_limited`,
-`unavailable`, `invalid_arguments`, `ambiguous_computer`, `exists`, `timeout`,
-`io_error` (with `details.errno`) and the rest listed in that package's README —
-never a class name. `status` and the platform's `reason` word ride beside it
-when there are any. A mistyped command prints its whole help, not one line.
+snake_case. Every command accepts `--json` except `terminal` and a plain `ssh`
+(not `ssh --setup`), which refuse it with `unsupported_mode`. A delete prints
+`{"id", "deleted": true}` (`secrets rm` adds the `name` unless it looks like a
+value; `ssh-key rm` prints `"removed": true`), and `scp` prints `{"source",
+"destination", "bytes", "confirmed"}` — on an upload `bytes` is what was sent
+and `confirmed` says whether the platform reported what it wrote.
+`browser-proxy` and `egress-proxy` `set` and `clear` print the computer's record
+without its `vnc` desktop URLs, as `mandala` does; their `get` prints the
+setting alone, with the computer's `id` and `name`. A failure prints nothing on
+stdout: it writes its `error` object as one JSON line on stderr and exits
+nonzero. `code` is one snake_case word naming the kind of failure, the same word
+the npm `mandala` CLI reports — `not_found`, `unauthenticated`,
+`permission_denied`, `conflict`, `rate_limited`, `unavailable`,
+`invalid_arguments`, `ambiguous_computer`, `unsupported_mode`,
+`missing_credentials` (and the other local credential stages), `exists`,
+`timeout`, `io_error` (with `details.errno`) and the rest listed in that
+package's README — never a class name. `status` and the platform's `reason` word
+ride beside it when there are any. A mistyped command prints its whole help, not
+one line.
 
 `terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
 server-side, running as the desktop user. Disconnecting *detaches* rather than
