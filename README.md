@@ -3142,8 +3142,8 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `OriginTLSError` | 525/526 — a certificate the two cannot agree on; report it |
 | `APIError` | any other unsuccessful response |
 | `ConnectionError` | the request never completed: DNS, refused socket, broken TLS — except the case below |
-| `ConnectionInterruptedError` | the request was dispatched and the answer was lost; do not replay a create |
-| `TimeoutError` | a `wait_*` helper gave up, or a request outran its budget |
+| `ConnectionInterruptedError` | the request was dispatched and the answer was lost, including a request that outran the client's timeout (`RequestTimeoutError`); resend under its `idempotency_key`, do not replay a create under a new one |
+| `TimeoutError` | a `wait_*` helper gave up; a request timeout is also a `TimeoutError`, through `RequestTimeoutError` |
 
 Every `APIError` exposes optional `request_id`, `allow` and `www_authenticate`
 properties, and `code` and `operation_id` read off the body: `code` is a word a
@@ -3277,6 +3277,13 @@ body was being read, a protocol error on the way back. The platform may have
 acted. Do not replay a create on the strength of it; check whether the first
 attempt took effect. `is_transient` says no, matching `MoveRequiredError` under
 `ConflictError`.
+
+A request that outran the client's timeout is one of these too:
+`RequestTimeoutError`, a `ConnectionInterruptedError` as in the TypeScript SDK,
+because a deadline that fires says nothing about whether the request went out.
+It is also a `TimeoutError`, so `except TimeoutError` written before it existed
+still catches it. A `wait_*` helper that gives up raises a plain `TimeoutError`
+instead, so `except mc.RequestTimeoutError` tells the two apart.
 
 `FileTooLargeError` and `RangeNotSatisfiableError` are the two size statuses,
 and each has a next move attached, which is why neither is a bare `APIError`.

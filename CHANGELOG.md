@@ -49,6 +49,17 @@ This is the summary you read to decide whether to upgrade.
 
 ### Changed
 
+- **A request timeout now raises `RequestTimeoutError`, a
+  `ConnectionInterruptedError` (as in the TypeScript SDK) that is still a
+  `TimeoutError`**, sync and async. A deadline that fires says nothing about
+  whether the request went out, so `except ConnectionInterruptedError` written
+  to resend under the same `idempotency_key` now sees it; `except TimeoutError`
+  and `except ConnectionError` both still catch it, `is_transient()` still
+  answers `False`, and a keyed call's timeout still carries its key. A
+  `wait_*` helper that gives up still raises a plain `TimeoutError`. Under
+  `--json`, `mandala-py` reports a request timeout with the code
+  `connection_interrupted` rather than `timeout`, as `mandala` does.
+
 - **The SSH documentation says what the platform does**, sync and async.
   `ssh_keys.remove()` said a session already open with the removed key goes
   on until it disconnects; the platform closes it once each computer receives

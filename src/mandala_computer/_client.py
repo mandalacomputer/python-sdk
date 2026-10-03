@@ -43,6 +43,7 @@ from ._exceptions import (
     PlanLimitError,
     RangeNotSatisfiableError,
     RateLimitError,
+    RequestTimeoutError,
     TimeoutError,
     UnavailableError,
     _refusal_reason,
@@ -1127,18 +1128,23 @@ def error_for_status(status: int, message: str, body: object = None) -> APIError
     return cls(message, status=status, body=body)
 
 
-def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutError:
+def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> RequestTimeoutError:
     """The SDK's own error for a request the transport stopped waiting on.
 
     ``httpx.TimeoutException`` is not a :class:`MandalaError`, so letting it out
     raw means ``except MandalaError`` — the one handler the README tells callers
     to write — misses the failure entirely.
 
+    :class:`RequestTimeoutError` for every phase, as the TypeScript SDK raises
+    its ``ConnectionInterruptedError`` for every deadline: a deadline that fires
+    says nothing about whether the request went out. It is still a
+    :class:`TimeoutError`, so handlers written before it existed catch it.
+
     The distinction in the message matters: nothing has been cancelled. The
     command is still running in the guest and the file is still being written;
     what was lost is this request's view of the outcome.
     """
-    return TimeoutError(
+    return RequestTimeoutError(
         f"{method} {path} did not answer within the client's timeout "
         f"({type(exc).__name__}). This is the SDK giving up, not the platform "
         "refusing — the work may still be running."
@@ -1160,12 +1166,12 @@ def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> TimeoutEr
 #:
 #: The two timeouts are here and are unreachable through this function today,
 #: which is deliberate rather than an oversight. Every ``httpx.TimeoutException``
-#: is caught one clause earlier and becomes :class:`TimeoutError`, which carries
-#: the same pair of answers :class:`ConnectionInterruptedError` does — fatal to
-#: :func:`is_transient`, polled through — so a timeout was never part of this
-#: hole. They are named so that this tuple states the phase correctly on its own
-#: terms, and so that reordering those clauses cannot quietly turn a connect
-#: timeout into a possible dispatch.
+#: is caught one clause earlier and becomes :class:`RequestTimeoutError`, a
+#: :class:`ConnectionInterruptedError` — fatal to :func:`is_transient`, polled
+#: through — even for a connect-phase timeout, as in the TypeScript SDK. So a
+#: timeout was never part of this hole. They are named so that this tuple states
+#: the phase correctly on its own terms, and so that reordering those clauses
+#: cannot quietly turn a connect timeout into a possible dispatch.
 _NEVER_DISPATCHED = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
