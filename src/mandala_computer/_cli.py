@@ -3,9 +3,9 @@ terminal, and the account's webhooks.
 
 Named ``mandala-py`` rather than ``mandala`` since OPL-4985. The npm package
 ``mandala-computer`` installs the full ``mandala`` CLI — every command below
-plus ``login``, ``computers``, ``snapshots``, ``templates``, ``--json`` and a
-manifest — and while both packages installed a ``mandala``, whichever came
-first on PATH won and the other's docs described a command that was not there.
+plus ``login``, ``computers``, ``snapshots``, ``templates`` and a manifest —
+and while both packages installed a ``mandala``, whichever came first on PATH
+won and the other's docs described a command that was not there.
 This one stays for a machine with Python and no Node; the commands and their
 behaviour are unchanged, only the name.
 
@@ -118,6 +118,7 @@ from . import _api, _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
 from ._client import FILE_SIZE_LIMIT
 from ._computer import Computer
+from ._credentials import CredentialError
 from ._defaults import (
     DEFAULTS_PATH,
     DefaultsError,
@@ -320,6 +321,11 @@ def _error_info(err: BaseException) -> dict[str, Any]:
             "message": str(err),
             "details": {"operation": dict(err.operation.raw)},
         }
+    # A local credential refusal names its own stage (``missing_credentials``,
+    # ``invalid_json``), as ``mandala`` names it, rather than the bare
+    # ``failed`` of the branch below.
+    if isinstance(err, CredentialError):
+        return {"code": err.rule, "message": str(err)}
     if isinstance(err, MandalaError):
         return _with_ids({"code": "failed", "message": str(err)}, err)
     if isinstance(err, ValueError):
@@ -831,6 +837,14 @@ def _resolve(client: Client, target: str, computers: Listing[Computer] | None = 
 
 
 def _cmd_terminal(args: argparse.Namespace) -> int:
+    # Declared so that it is refused in the same words as ``mandala``'s, rather
+    # than as an unknown option: a shell is not something a script can read.
+    if args.json:
+        _die(
+            "Interactive terminal does not support --json; for machine-readable output "
+            "run the command with `mandala computers exec` or the SDK's Computer.exec()",
+            "unsupported_mode",
+        )
     if LOCAL_WINDOWS:
         _die("interactive terminal requires a Unix-like local terminal")
     with _client() as client:
@@ -1403,7 +1417,18 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         # was there alone.
         with _client() as client:
             written = _resolve(client, target).download_file(remote_path, local)
-        print(f"{target}:{remote_path} -> {local} ({written} bytes)", file=sys.stderr)
+        if args.json:
+            # ``confirmed``: the count is the bytes this copy wrote locally.
+            _json(
+                {
+                    "source": f"{target}:{remote_path}",
+                    "destination": local,
+                    "bytes": written,
+                    "confirmed": True,
+                }
+            )
+        else:
+            print(f"{target}:{remote_path} -> {local} ({written} bytes)", file=sys.stderr)
         return 0
 
     assert dst is not None
@@ -1427,7 +1452,9 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
     with _client() as client:
         try:
-            _resolve(client, target).write_file(remote_path, data, overwrite=not args.no_overwrite)
+            stored = _resolve(client, target).write_file(
+                remote_path, data, overwrite=not args.no_overwrite
+            )
         except FileExistsError:
             # Only THIS upload is known to have written nothing: an earlier
             # attempt whose answer was lost may have written the file itself.
@@ -1449,7 +1476,29 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                 "dropping --no-overwrite.",
                 "conflict",
             )
-    print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
+    # A count that differs from what was sent means the guest holds something
+    # other than this file: refused in both modes, as ``mandala scp`` refuses
+    # it, so ``confirmed: true`` always means the platform counted every byte.
+    if stored is not None and stored != len(data):
+        _die(
+            f"upload was incomplete: sent {len(data)} bytes but the guest reported {stored}",
+            "invalid_arguments",
+        )
+    if args.json:
+        # ``bytes`` is what was sent; ``confirmed`` says whether the platform
+        # reported a count of what it wrote (one that matched, as checked
+        # above), as ``mandala scp --json`` says it. A platform that reports
+        # none is not evidence that everything landed.
+        _json(
+            {
+                "source": args.src,
+                "destination": f"{target}:{remote_path}",
+                "bytes": len(data),
+                "confirmed": stored is not None,
+            }
+        )
+    else:
+        print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
     return 0
 
 
@@ -1567,7 +1616,10 @@ def _cmd_webhooks_update(args: argparse.Namespace) -> int:
 def _cmd_webhooks_delete(args: argparse.Namespace) -> int:
     with _client() as client:
         client.webhooks.delete(args.id)
-    print(f"deleted {args.id}")
+    if args.json:
+        _json({"id": args.id, "deleted": True})
+    else:
+        print(f"deleted {args.id}")
     return 0
 
 
@@ -2098,8 +2150,16 @@ def _cmd_secrets_rm(args: argparse.Namespace) -> int:
                 continue
             removed = found
     # A name that looks like a value (a token stored as a name by mistake, the
-    # likeliest reason to delete it) is left out rather than printed whole.
-    if _quoted_operand(removed.name) is None:
+    # likeliest reason to delete it) is left out rather than printed whole, in
+    # JSON too.
+    safe = _quoted_operand(removed.name) is not None
+    if args.json:
+        _json(
+            {"id": removed.id, "name": removed.name, "deleted": True}
+            if safe
+            else {"id": removed.id, "deleted": True}
+        )
+    elif not safe:
         print(f"deleted {_shown(removed.id)}")
     else:
         print(f"deleted {_shown(removed.name)}  {_shown(removed.id)}")
@@ -2150,6 +2210,9 @@ def _secrets_parser(sub: Any) -> None:
     rm = verbs.add_parser("rm", help="delete a secret, by name or id")
     rm.add_argument("name", metavar="NAME")
     rm.add_argument("--workspace", metavar="ID", help=scope)
+    rm.add_argument(
+        "--json", action="store_true", help="the result as JSON; a name like a value is left out"
+    )
     rm.set_defaults(fn=_cmd_secrets_rm)
     for verb in (store, listing, put, get, rm):
         verb.quotes_input = False
@@ -3109,6 +3172,12 @@ def _workspaces_parser(sub: Any) -> None:
     current.set_defaults(fn=_cmd_workspaces_current)
 
 
+#: The help of a ``--json`` on a command that prints JSON with or without it:
+#: accepted on every command, as ``mandala`` accepts it, so a script that
+#: passes it everywhere is not refused here.
+_ALREADY_JSON = "accepted for parity; the record is printed as JSON either way"
+
+
 def _webhooks_parser(sub: Any) -> None:
     hooks = sub.add_parser("webhooks", help="the account's webhook subscriptions")
     verbs = hooks.add_subparsers(dest="verb", required=True)
@@ -3135,10 +3204,12 @@ def _webhooks_parser(sub: Any) -> None:
         help="a computer id to deliver for; repeat for several. Omit for every computer",
     )
     create.add_argument("--disabled", action="store_true", help="create it switched off")
+    create.add_argument("--json", action="store_true", help=_ALREADY_JSON)
     create.set_defaults(fn=_cmd_webhooks_create)
 
     get = verbs.add_parser("get", help="one subscription, with its health")
     get.add_argument("id", metavar="ID")
+    get.add_argument("--json", action="store_true", help=_ALREADY_JSON)
     get.set_defaults(fn=_cmd_webhooks_get)
 
     update = verbs.add_parser("update", help="change the endpoint, filters, or enabled")
@@ -3156,18 +3227,22 @@ def _webhooks_parser(sub: Any) -> None:
     switch = update.add_mutually_exclusive_group()
     switch.add_argument("--enable", action="store_true", help="resume deliveries")
     switch.add_argument("--disable", action="store_true", help="stop deliveries")
+    update.add_argument("--json", action="store_true", help=_ALREADY_JSON)
     update.set_defaults(fn=_cmd_webhooks_update)
 
     delete = verbs.add_parser("delete", help="remove it, and every delivery record it holds")
     delete.add_argument("id", metavar="ID")
+    delete.add_argument("--json", action="store_true", help="the result as JSON")
     delete.set_defaults(fn=_cmd_webhooks_delete)
 
     rotate = verbs.add_parser("rotate", help="mint a new secret; prints it ONCE")
     rotate.add_argument("id", metavar="ID")
+    rotate.add_argument("--json", action="store_true", help=_ALREADY_JSON)
     rotate.set_defaults(fn=_cmd_webhooks_rotate)
 
     test = verbs.add_parser("test", help="queue one signed delivery of a synthetic event")
     test.add_argument("id", metavar="ID")
+    test.add_argument("--json", action="store_true", help=_ALREADY_JSON)
     test.set_defaults(fn=_cmd_webhooks_test)
 
     deliveries = verbs.add_parser("deliveries", help="the newest hundred deliveries, newest first")
@@ -3252,10 +3327,12 @@ class _SshWords:
 
     @property
     def as_json(self) -> bool:
-        """Whether a failure is reported as JSON: ``--json`` read as OUR flag,
-        which it is only with ``--setup``. After the computer of a plain
-        ``ssh`` it is the remote command's, and says nothing about ours."""
-        return self.json and self.setup
+        """Whether a failure is reported as JSON: ``--json`` read as OUR flag.
+        :func:`_parse_ssh` sets it only when it is ours — before the computer,
+        or after it with ``--setup``. After the computer of a plain ``ssh`` it
+        is the remote command's, is left in :attr:`rest`, and says nothing
+        about ours."""
+        return self.json
 
     def fail(self, message: str) -> None:
         if self.error is None:
@@ -3317,7 +3394,12 @@ def _cmd_ssh(parsed: _SshWords) -> int:
     if parsed.setup:
         return _ssh_setup(target, parsed.key, as_json=parsed.json)
     if parsed.json:
-        return _ssh_usage_error("ssh is interactive and has no --json output")
+        # ``mandala``'s word and exit status for it: the mode is refused, not
+        # the words, so not ``invalid_arguments``.
+        _json_failure(
+            {"code": "unsupported_mode", "message": "ssh is interactive and has no --json output"}
+        )
+        return 2
     if parsed.key is not None:
         return _ssh_usage_error(
             "--key goes with --setup; to connect with a particular key, pass -i PATH "
@@ -3514,7 +3596,10 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
 def _cmd_ssh_key_rm(args: argparse.Namespace) -> int:
     with _client() as client:
         client.ssh_keys.remove(args.id)
-    print(f"removed {args.id}")
+    if args.json:
+        _json({"id": args.id, "removed": True})
+    else:
+        print(f"removed {args.id}")
     return 0
 
 
@@ -3814,6 +3899,7 @@ def _ssh_parsers(sub: Any) -> None:
     add.set_defaults(fn=_cmd_ssh_key_add)
     rm = verbs.add_parser("rm", help="remove a key")
     rm.add_argument("id", metavar="ID")
+    rm.add_argument("--json", action="store_true", help="the result as JSON")
     rm.set_defaults(fn=_cmd_ssh_key_rm)
 
     access = sub.add_parser("ssh-access", help="show, or switch, SSH for a computer")
@@ -3870,9 +3956,25 @@ def _wait_for_proxy(c: Computer) -> None:
     c.wait_for_browser_proxy()
 
 
-def _proxy_result(args: argparse.Namespace, c: Computer) -> int:
+def _computer_record(c: Computer) -> dict[str, Any]:
+    """The computer's own record, as ``--json`` prints it after a change: the
+    API's answer verbatim, less ``vnc``.
+
+    ``mandala`` prints the same record, with ``vnc`` left out the same way: its
+    URLs carry the desktop's credentials, and a change's result is not where a
+    script should be handed them."""
+    return {key: value for key, value in c.raw.items() if key != "vnc"}
+
+
+def _proxy_result(args: argparse.Namespace, c: Computer, *, record: bool = False) -> int:
+    """What a ``browser-proxy`` verb prints. ``record``: ``set`` and ``clear``,
+    whose ``--json`` is the computer's record, as ``mandala``'s is; ``get``'s
+    is the setting alone, with the computer's id and name."""
     proxy = c.browser_proxy
     pending = c.browser_proxy_pending
+    if args.json and record:
+        _json(_computer_record(c))
+        return 0
     if args.json:
         _json(
             {
@@ -3955,7 +4057,7 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
         c = c.set_browser_proxy(proxy)
         if args.wait:
             _wait_for_proxy(c)
-    return _proxy_result(args, c)
+    return _proxy_result(args, c, record=True)
 
 
 def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
@@ -3963,7 +4065,7 @@ def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
         c = _resolve(client, args.target).set_browser_proxy(None)
         if args.wait:
             _wait_for_proxy(c)
-    return _proxy_result(args, c)
+    return _proxy_result(args, c, record=True)
 
 
 def _browser_proxy_parser(sub: Any) -> None:
@@ -3971,7 +4073,9 @@ def _browser_proxy_parser(sub: Any) -> None:
     verbs = proxy.add_subparsers(dest="verb", required=True)
     get = verbs.add_parser("get", help="show a computer's browser proxy")
     get.add_argument("target", metavar="computer", help="computer name or id")
-    get.add_argument("--json", action="store_true", help="the setting as JSON")
+    get.add_argument(
+        "--json", action="store_true", help="the setting as JSON, with the computer's id and name"
+    )
     get.set_defaults(fn=_cmd_browser_proxy_get)
     put = verbs.add_parser(
         "set",
@@ -4004,7 +4108,7 @@ def _browser_proxy_parser(sub: Any) -> None:
         action="store_true",
         help="return once the computer's browsers have it (a stopped one gets it as it starts)",
     )
-    put.add_argument("--json", action="store_true", help="the setting as JSON")
+    put.add_argument("--json", action="store_true", help="the computer's record as JSON")
     put.set_defaults(fn=_cmd_browser_proxy_set)
     clear = verbs.add_parser(
         "clear", help="remove a computer's browser proxy; its browsers go out directly"
@@ -4015,16 +4119,20 @@ def _browser_proxy_parser(sub: Any) -> None:
         action="store_true",
         help="return once the computer's browsers no longer use it (a stopped one: as it starts)",
     )
-    clear.add_argument("--json", action="store_true", help="the setting as JSON")
+    clear.add_argument("--json", action="store_true", help="the computer's record as JSON")
     clear.set_defaults(fn=_cmd_browser_proxy_clear)
 
 
 # --- egress proxy ----------------------------------------------------------
 
 
-def _egress_proxy_result(args: argparse.Namespace, c: Computer) -> int:
+def _egress_proxy_result(args: argparse.Namespace, c: Computer, *, record: bool = False) -> int:
+    """What an ``egress-proxy`` verb prints; ``record`` as in :func:`_proxy_result`."""
     proxy = c.egress_proxy
     pending = c.egress_proxy_pending
+    if args.json and record:
+        _json(_computer_record(c))
+        return 0
     if args.json:
         _json(
             {
@@ -4084,13 +4192,13 @@ def _cmd_egress_proxy_set(args: argparse.Namespace) -> int:
                     )
                 proxy["credentials_secret_id"] = current.credentials_secret_id
         c = c.set_egress_proxy(proxy)
-    return _egress_proxy_result(args, c)
+    return _egress_proxy_result(args, c, record=True)
 
 
 def _cmd_egress_proxy_clear(args: argparse.Namespace) -> int:
     with _client() as client:
         c = _resolve(client, args.target).set_egress_proxy(None)
-    return _egress_proxy_result(args, c)
+    return _egress_proxy_result(args, c, record=True)
 
 
 def _egress_proxy_parser(sub: Any) -> None:
@@ -4098,7 +4206,9 @@ def _egress_proxy_parser(sub: Any) -> None:
     verbs = proxy.add_subparsers(dest="verb", required=True)
     get = verbs.add_parser("get", help="show a computer's egress proxy")
     get.add_argument("target", metavar="computer", help="computer name or id")
-    get.add_argument("--json", action="store_true", help="the setting as JSON")
+    get.add_argument(
+        "--json", action="store_true", help="the setting as JSON, with the computer's id and name"
+    )
     get.set_defaults(fn=_cmd_egress_proxy_get)
     put = verbs.add_parser(
         "set",
@@ -4120,13 +4230,13 @@ def _egress_proxy_parser(sub: Any) -> None:
         action="store_true",
         help="remove the proxy's credentials rather than keep them",
     )
-    put.add_argument("--json", action="store_true", help="the setting as JSON")
+    put.add_argument("--json", action="store_true", help="the computer's record as JSON")
     put.set_defaults(fn=_cmd_egress_proxy_set)
     clear = verbs.add_parser(
         "clear", help="remove a computer's egress proxy; its traffic goes out directly"
     )
     clear.add_argument("target", metavar="computer", help="computer name or id")
-    clear.add_argument("--json", action="store_true", help="the setting as JSON")
+    clear.add_argument("--json", action="store_true", help="the computer's record as JSON")
     clear.set_defaults(fn=_cmd_egress_proxy_clear)
 
 
@@ -4150,6 +4260,9 @@ def _parser() -> _Parser:
         default="main",
         help="named session to attach; sessions persist across disconnects (default: main)",
     )
+    terminal.add_argument(
+        "--json", action="store_true", help="refused (unsupported_mode): a shell has no JSON"
+    )
     terminal.set_defaults(fn=_cmd_terminal)
 
     scp = sub.add_parser("scp", help="copy one file in or out of the guest")
@@ -4159,6 +4272,9 @@ def _parser() -> _Parser:
         "--no-overwrite",
         action="store_true",
         help="upload only: create the guest file, refusing if something is there",
+    )
+    scp.add_argument(
+        "--json", action="store_true", help="the copy as JSON: source, destination, bytes"
     )
     scp.set_defaults(fn=_cmd_scp)
 

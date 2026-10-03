@@ -65,6 +65,25 @@ This is the summary you read to decide whether to upgrade.
   it deletes nothing more and fails with `conflict`.
 - **`mandala-py secrets list` prints each secret's revision**, in a REVISION
   column after SCOPE, as it was documented to.
+- **Every `mandala-py` command accepts `--json`, and reports `mandala`'s error
+  codes.** `webhooks create/get/update/delete/rotate/test`, `secrets rm`,
+  `ssh-key rm` and `scp` refused the flag as a usage error. They take it now:
+  the webhook verbs that already printed JSON print the same, `webhooks delete`
+  prints `{"id", "deleted": true}`, `secrets rm` `{"id", "name", "deleted":
+  true}` (no `name` when it looks like a value), `ssh-key rm` `{"id",
+  "removed": true}` and `scp` `{"source", "destination", "bytes",
+  "confirmed"}`; an upload whose reported count differs from what was sent
+  is refused with `invalid_arguments` ("upload was incomplete"), with or
+  without `--json`, as `mandala` refuses it, rather than reported as sent. A local credential refusal is reported under its own code
+  (`missing_credentials`, `invalid_base_url`, ...) rather than `failed`;
+  `terminal --json` is refused with `unsupported_mode` (exit 1) rather than as
+  an unknown option, and `ssh --json <computer>` with an `unsupported_mode`
+  JSON line (exit 2) rather than plain usage text. An `ssh` usage error is JSON
+  whenever `--json` came before the computer, not only with `--setup`.
+- **`mandala-py browser-proxy` and `egress-proxy` `set` and `clear` print the
+  computer's record with `--json`**, as `mandala` does, without its `vnc`
+  desktop URLs, instead of four of its fields. `get --json` still prints the
+  setting with the computer's `id` and `name`.
 
 ### Changed
 

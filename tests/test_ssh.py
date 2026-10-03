@@ -828,7 +828,6 @@ def test_ssh_without_an_ssh_binary_exits_127(
     ("argv", "message"),
     [
         (["ssh"], "name a computer"),
-        (["ssh", "--json", "dev"], "ssh is interactive and has no --json output"),
         (["ssh", "--key", "k.pub", "dev"], "--key goes with --setup"),
         (["ssh", "-L", "1:h:2", "dev"], "unrecognized option -L before the computer"),
         (["ssh", "--setup", "dev", "-i", "k"], "unrecognized option -i with --setup"),

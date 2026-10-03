@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from pathlib import Path
 
 import httpx
 import pytest
@@ -449,6 +450,68 @@ def test_ssh_setup_usage_errors_are_json_under_json(
     assert "mandala-py ssh <computer>" in str(error["usage"])
 
 
+def test_ssh_json_is_refused_as_an_unsupported_mode(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # mandala's word and exit status: the mode is refused, as one JSON line,
+    # since --json before the computer is this CLI's own flag (OPL-5649).
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    monkeypatch.setattr(_cli, "_exec", lambda argv: pytest.fail("must not run ssh"))
+    assert _cli.main(["ssh", "--json", "dev"]) == 2
+    assert failure(capsys) == {
+        "code": "unsupported_mode",
+        "message": "ssh is interactive and has no --json output",
+    }
+
+
+def test_an_ssh_usage_error_under_json_is_json_without_setup_too(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    assert _cli.main(["ssh", "--json"]) == 2
+    error = failure(capsys)
+    assert (error["code"], error["message"]) == ("invalid_arguments", "name a computer")
+
+
+def test_terminal_json_is_refused_as_an_unsupported_mode(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_cli, "_client", lambda: pytest.fail("must not make an API request"))
+    assert _cli.main(["terminal", "dev", "--json"]) == 1
+    error = failure(capsys)
+    assert error["code"] == "unsupported_mode"
+    assert "does not support --json" in str(error["message"])
+
+
+@pytest.mark.parametrize(
+    ("environment", "code"),
+    [
+        ({}, "missing_credentials"),
+        (
+            {"MANDALA_API_KEY": "com_test", "MANDALA_BASE_URL": "https://api.test/?x"},
+            "invalid_base_url",
+        ),
+    ],
+)
+def test_a_local_credential_refusal_names_its_stage(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    environment: dict[str, str],
+    code: str,
+) -> None:
+    # mandala reports the credential stage that refused, not a bare "failed".
+    for name in ("MANDALA_API_KEY", "MANDALA_BASE_URL", "MANDALA_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _cli.main(["webhooks", "list", "--json"]) == 1
+    error = failure(capsys)
+    assert error["code"] == code
+    assert error["message"]
+
+
 def test_flags_that_belong_to_the_remote_command_do_not_make_a_failure_json(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -502,7 +565,7 @@ def test_a_refusal_of_the_clis_own_carries_its_word(capsys: pytest.CaptureFixtur
 
 
 @respx.mock
-def test_a_command_with_no_json_flag_fails_in_text(capsys: pytest.CaptureFixture[str]) -> None:
+def test_a_command_run_without_json_fails_in_text(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(200, json=SECRETS))
     with pytest.raises(SystemExit) as caught:
         _cli.main(["secrets", "rm", "NOPE"])

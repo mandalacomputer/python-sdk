@@ -1,9 +1,12 @@
 """``mandala-py move``, ``moves list``, ``secrets get``, and ``workspaces get`` and
-``members`` by name (OPL-5524): the audit's coverage gaps in this CLI."""
+``members`` by name (OPL-5524): the audit's coverage gaps in this CLI. And
+``--json`` on every command, with ``mandala``'s results (OPL-5649)."""
 
 from __future__ import annotations
 
+import argparse
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -263,3 +266,213 @@ def test_workspaces_get_refuses_a_name_two_workspaces_share(
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["code"] == "ambiguous_workspace"
     assert len(respx.calls) == 1
+
+
+# --- --json on every command (OPL-5649) ------------------------------------------
+
+
+def _leaves(
+    parser: argparse.ArgumentParser, words: tuple[str, ...] = ()
+) -> list[tuple[tuple[str, ...], argparse.ArgumentParser]]:
+    """Every command under ``parser``, with the words that name it."""
+    subcommands = _cli._subcommands(parser)
+    if subcommands is None:
+        return [(words, parser)]
+    return [
+        leaf
+        for name, child in subcommands.choices.items()
+        for leaf in _leaves(child, (*words, name))
+    ]
+
+
+def test_every_command_accepts_json() -> None:
+    # ``mandala``'s README: every command accepts --json. A script that passes
+    # it everywhere must not be refused with a usage error by this CLI. ssh is
+    # parsed by hand (and refuses --json by name: see test_cli_errors).
+    leaves = [(words, leaf) for words, leaf in _leaves(_cli._parser()) if words != ("ssh",)]
+    assert len(leaves) > 30
+    missing = [
+        " ".join(words) for words, leaf in leaves if "--json" not in leaf._option_string_actions
+    ]
+    assert missing == []
+    for words, leaf in leaves:
+        action = leaf._option_string_actions["--json"]
+        assert action.nargs == 0 and action.default is False, words
+
+
+WEBHOOK = {"id": "whk-2b7d4c809f3c1a7e", "url": "https://ci.example.com/m", "enabled": True}
+
+
+@pytest.mark.parametrize("verb", ["get", "rotate", "test"])
+@respx.mock
+def test_webhook_verbs_that_print_json_take_the_flag(
+    verb: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = f"{BASE}/webhooks/{WEBHOOK['id']}"
+    respx.get(path).mock(return_value=httpx.Response(200, json=WEBHOOK))
+    respx.post(f"{path}/rotate").mock(
+        return_value=httpx.Response(200, json={**WEBHOOK, "secret": "whsec_x"})
+    )
+    respx.post(f"{path}/test").mock(
+        return_value=httpx.Response(202, json={"id": "whd-1", "state": "pending"})
+    )
+    assert _cli.main(["webhooks", verb, WEBHOOK["id"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["id"] in (WEBHOOK["id"], "whd-1")
+
+
+@respx.mock
+def test_webhooks_delete_json(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.delete(f"{BASE}/webhooks/{WEBHOOK['id']}").mock(return_value=httpx.Response(204))
+    assert _cli.main(["webhooks", "delete", WEBHOOK["id"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"id": WEBHOOK["id"], "deleted": True}
+
+
+@respx.mock
+def test_secrets_rm_json_names_the_secret(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(200, json=SECRET_LIST))
+    respx.delete(f"{BASE}/secrets/{SECRET['id']}").mock(return_value=httpx.Response(204))
+    assert _cli.main(["secrets", "rm", "OPENAI_API_KEY", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "id": SECRET["id"],
+        "name": "OPENAI_API_KEY",
+        "deleted": True,
+    }
+
+
+@respx.mock
+def test_secrets_rm_json_leaves_out_a_name_that_looks_like_a_value(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    value = "9f86d081-884c-4d63-a6c5-2a1f0e8b7c3d"
+    assert _cli._quoted_operand(value) is None
+    stored = {**SECRET, "name": value}
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(200, json={**SECRET_LIST, "secrets": [stored]})
+    )
+    respx.delete(f"{BASE}/secrets/{SECRET['id']}").mock(return_value=httpx.Response(204))
+    assert _cli.main(["secrets", "rm", SECRET["id"], "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out) == {"id": SECRET["id"], "deleted": True}
+    assert value not in out and value not in err
+
+
+@respx.mock
+def test_ssh_key_rm_json(capsys: pytest.CaptureFixture[str]) -> None:
+    respx.delete(f"{BASE}/ssh-keys/sshk-1").mock(return_value=httpx.Response(200, json={}))
+    assert _cli.main(["ssh-key", "rm", "sshk-1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"id": "sshk-1", "removed": True}
+
+
+RUNNING = [{"id": "vm-1", "name": "dev", "status": "running", "os": "linux"}]
+
+
+@respx.mock
+def test_scp_download_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    respx.get(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(200, content=b"report,1\n")
+    )
+    local = str(tmp_path / "r.csv")
+    assert _cli.main(["scp", "dev:/home/user/report.csv", local, "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out) == {
+        "source": "dev:/home/user/report.csv",
+        "destination": local,
+        "bytes": 9,
+        "confirmed": True,
+    }
+    assert err == ""
+
+
+@pytest.mark.parametrize(("answer", "confirmed"), [({"bytes": 4}, True), (None, False)])
+@respx.mock
+def test_scp_upload_json_says_whether_the_platform_counted_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    answer: dict[str, int] | None,
+    confirmed: bool,
+) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(200, json=answer) if answer else httpx.Response(200)
+    )
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"abcd")
+    assert _cli.main(["scp", str(src), "dev:/home/user/", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "source": str(src),
+        "destination": "dev:/home/user/notes.txt",
+        "bytes": 4,
+        "confirmed": confirmed,
+    }
+
+
+@pytest.mark.parametrize("reported", [0, 1, 99])
+@pytest.mark.parametrize("json_mode", [True, False])
+@respx.mock
+def test_scp_upload_refuses_a_count_that_differs_from_what_was_sent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    reported: int,
+    json_mode: bool,
+) -> None:
+    # mandala dies "upload was incomplete" here, so its confirmed: true always
+    # means the guest counted every byte sent; this must not print a success.
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(200, json={"bytes": reported})
+    )
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"abcd")
+    message = f"upload was incomplete: sent 4 bytes but the guest reported {reported}"
+    if json_mode:
+        assert _cli.main(["scp", str(src), "dev:/home/user/", "--json"]) == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        lines = err.splitlines()
+        assert len(lines) == 1
+        error = json.loads(lines[0])["error"]
+        assert (error["code"], error["message"]) == ("invalid_arguments", message)
+    else:
+        # The text mode exits with the refusal as its message (printed to
+        # stderr, exit 1), and never the "src -> dst (N bytes)" success line.
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(["scp", str(src), "dev:/home/user/"])
+        assert caught.value.code == f"mandala-py: {message}"
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "->" not in err
+
+
+PROXIED = {
+    "id": "vm-1",
+    "name": "dev",
+    "status": "running",
+    "os": "linux",
+    "browser_proxy": {"server": "http://proxy.example.com:3128"},
+    "browser_proxy_pending": True,
+    "egress_proxy": None,
+    "egress_proxy_pending": False,
+    "vnc": {"url": "wss://desk.example.com/vnc?token=t0", "password": "pw"},
+}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["browser-proxy", "set", "dev", "http://proxy.example.com:3128", "--no-credentials"],
+        ["browser-proxy", "clear", "dev"],
+        ["egress-proxy", "set", "dev", "https://proxy.example.com:3128", "--no-credentials"],
+        ["egress-proxy", "clear", "dev"],
+    ],
+)
+@respx.mock
+def test_a_proxy_change_json_is_the_computers_record(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # mandala prints the computer the change returned, less its desktop URLs.
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    respx.patch(f"{BASE}/computers/vm-1").mock(return_value=httpx.Response(200, json=PROXIED))
+    assert _cli.main([*argv, "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == {key: value for key, value in PROXIED.items() if key != "vnc"}
