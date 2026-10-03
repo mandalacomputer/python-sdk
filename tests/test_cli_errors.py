@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -760,6 +763,42 @@ def test_a_key_on_a_command_without_the_flag_names_only_the_listing() -> None:
     assert _cli._recovery_line(err, resendable=True) == "mandala-py: idempotency key k-1" + resend(
         "k-1"
     )
+
+
+def shell_words(fragment: str) -> list[str]:
+    """``fragment`` as a POSIX shell reads it, pasted after ``printf``: one
+    word a line, after the shell's own splitting, expansion and any second
+    command a ``;`` would start."""
+    done = subprocess.run(
+        ["/bin/sh", "-c", "printf '%s\\n' " + fragment],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", ""), "X": "EXPANDED"},
+        check=False,
+    )
+    return done.stdout.splitlines()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs a POSIX shell")
+@pytest.mark.parametrize("key", ["a;b$X", "abc;printf${IFS}PWNED", "-abc", "it's", "k-1"])
+def test_the_commands_a_recovery_line_suggests_survive_a_shell(key: str) -> None:
+    # The key is the caller's own --idempotency-key, so any printable ASCII
+    # but a space: pasted back into a shell, an unquoted `;` would run a
+    # second command and a `$` would expand, and a key starting with `-` as a
+    # separate argument is read by argparse as an option and refused. Each
+    # suggested command, read by a real shell, must give back the key.
+    err = _cli.MandalaError("lost")
+    err.idempotency_key = key
+    line = _cli._recovery_line(err, resendable=True)
+    assert line is not None
+    listing = line.split("find its operation with: ", 1)[1].split("; or send", 1)[0]
+    resend_cmd = line.split("send the same command again with ", 1)[1].split(", which", 1)[0]
+    listing_words = shell_words(listing)
+    assert listing_words[:3] == ["mandala-py", "operations", "list"]
+    for argv in (listing_words[3:], shell_words(resend_cmd)):
+        parser = argparse.ArgumentParser(exit_on_error=False)
+        parser.add_argument("--idempotency-key")
+        assert parser.parse_args(argv).idempotency_key == key
 
 
 @respx.mock

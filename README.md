@@ -3510,7 +3510,9 @@ with that key: the platform does not carry one key out twice. Without
 and, when it names no operation, the two ways on: `(find its operation with:
 mandala-py operations list --idempotency-key KEY; or send the same command
 again with --idempotency-key KEY, which the platform does not carry out
-twice)`; with `--json` they are the error's `idempotency_key` and `request_id`.
+twice)`. A key of your own is shell-quoted in both commands, and one starting
+with `-` is written `--idempotency-key=KEY`, so they paste back into a shell as
+they read. With `--json` they are the error's `idempotency_key` and `request_id`.
 A key the platform would refuse is refused before any request
 (`invalid_arguments`). `operations list --idempotency-key` stays a filter.
 

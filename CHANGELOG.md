@@ -46,7 +46,9 @@ This is the summary you read to decide whether to upgrade.
   characters without a space is refused before any request
   (`invalid_arguments`). The text-mode line that names a failure's key now
   says, when it names no operation, how to find that operation and how to
-  resend under the key.
+  resend under the key; a key of your own is shell-quoted there, and one that
+  starts with `-` is written `--idempotency-key=KEY`, so both commands paste
+  back into a shell as they read.
 
 ### Fixed
 

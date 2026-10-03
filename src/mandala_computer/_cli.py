@@ -298,11 +298,18 @@ def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
         return None
     line = f"{PROG}: {'; '.join(parts)}"
     if "idempotency_key" in ids and "operation_id" not in ids:
-        key = _printable(str(ids["idempotency_key"]))
-        line += f" (find its operation with: {PROG} operations list --idempotency-key {key}"
+        # The two commands are for pasting into a shell, and the key may be the
+        # caller's own --idempotency-key: any printable ASCII but a space. So it
+        # is shell-quoted (a `;` or `$` in it would otherwise start a second
+        # command or expand), and one starting with `-` is joined with `=`,
+        # since argparse reads a separate `-abc` as an option and refuses it.
+        # A key of the SDK's own (hex) prints exactly as `mandala` prints it.
+        key = shlex.quote(_printable(str(ids["idempotency_key"])))
+        flag = f"--idempotency-key={key}" if key.startswith("-") else f"--idempotency-key {key}"
+        line += f" (find its operation with: {PROG} operations list {flag}"
         if resendable:
             line += (
-                f"; or send the same command again with --idempotency-key {key}, "
+                f"; or send the same command again with {flag}, "
                 "which the platform does not carry out twice"
             )
         line += ")"
