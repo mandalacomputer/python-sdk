@@ -3347,8 +3347,9 @@ class SshAccess:
     #: The computer's host has yet to receive the current setting and key list.
     #: It is sent again automatically, and a connection attempt sends it first.
     pending: bool
-    #: How many keys may log in: every key of every owner and member of the
-    #: account. ``0`` while SSH is off.
+    #: How many keys may log in: the keys of the account's active owners and
+    #: members, less keys bound to another account and those of seat-suspended
+    #: members. ``0`` while SSH is off.
     key_count: int
     #: How many of those the computer is given. Fewer than :attr:`key_count`
     #: only when the account holds more keys than one computer accepts.

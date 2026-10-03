@@ -1943,8 +1943,9 @@ class SshKeys:
         return SshKey.from_api(self._t.json_object("POST", _api.SSH_KEYS, json=body))
 
     def remove(self, key_id: str) -> None:
-        """Remove one of your keys. New connections with it are refused at once;
-        a session already open goes on until it disconnects. An unknown id is a
+        """Remove one of your keys. New connections with it are refused at once,
+        and a session opened with it is closed once each computer receives the
+        new key list (within moments). An unknown id is a
         :class:`~mandala_computer.NotFoundError`. So is any key whose
         :attr:`~mandala_computer.SshKey.reach` is not ``"this_account"``: an API
         key or connected app removes only a key bound to the account it acts

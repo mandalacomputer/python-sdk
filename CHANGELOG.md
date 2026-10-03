@@ -49,6 +49,17 @@ This is the summary you read to decide whether to upgrade.
 
 ### Changed
 
+- **The SSH documentation says what the platform does**, sync and async.
+  `ssh_keys.remove()` said a session already open with the removed key goes
+  on until it disconnects; the platform closes it once each computer receives
+  the new key list, within moments. `set_ssh_access()` and
+  `SshAccess.key_count` said every owner's and member's key logs in; keys bound
+  to another account and the keys of a member whose seat is suspended do not,
+  and viewers' keys never do. `ssh_access()` said it is answered without
+  waiting on the computer's host; it asks the host (after retrying any pending
+  key push), so it can take a few seconds, though an unreachable host does not
+  fail it. Documentation only.
+
 - **Deleting a workspace is documented as the platform does it: only an
   empty one.** `workspaces.delete()`, `WorkspaceDeleted`, the README and
   `mandala-py workspaces rm`'s help and confirmation said a deleted

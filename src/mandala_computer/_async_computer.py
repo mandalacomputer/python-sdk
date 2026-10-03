@@ -590,8 +590,10 @@ class AsyncComputer(ComputerFields):
     async def ssh_access(self) -> SshAccess:
         """Whether SSH is on for this computer, and whether it can work here.
 
-        See :class:`~mandala_computer.SshAccess`. Any role may read it, and it
-        is answered without waiting on the computer's host.
+        See :class:`~mandala_computer.SshAccess`. Any role may read it. The
+        read asks the computer's host whether its SSH server is running, after
+        retrying any pending key push, so it can take a few seconds when the
+        host is slow; an unreachable host does not fail the read.
         """
         return SshAccess.from_api(await self._t.json_object("GET", _api.computer_ssh(self.id)))
 
@@ -599,9 +601,11 @@ class AsyncComputer(ComputerFields):
         """Switch SSH on or off for this computer, and answer the setting as stored.
 
         On, the computer runs an SSH server reachable only through the
-        platform's jump host, and accepts the keys of every owner and member of
-        the account (:attr:`~mandala_computer.Client.ssh_keys`). Off, the
-        server stops and open SSH sessions are closed. No restart either way.
+        platform's jump host, and accepts the registered keys of the account's
+        owners and members (:attr:`~mandala_computer.Client.ssh_keys`), except
+        keys bound to another account and the keys of a member whose seat is
+        suspended. Viewers' keys never log in. Off, the server stops and open
+        SSH sessions are closed. No restart either way.
 
         ``enabled`` must be a real ``bool``. A computer made from a template
         image that predates SSH stores the setting and answers
