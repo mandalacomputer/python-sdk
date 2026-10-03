@@ -1070,6 +1070,45 @@ def computer_payload(data: Any) -> dict[str, Any]:
     return out
 
 
+def names_a_computer(payload: Mapping[str, Any]) -> bool:
+    """Whether a flattened answer names a computer: a non-empty string ``id``."""
+    ident = payload.get("id")
+    return isinstance(ident, str) and bool(ident)
+
+
+def computer_record(data: Any, method: str, path: str) -> dict[str, Any]:
+    """The one computer a route promised, refused when the answer was not one.
+
+    Wrapped unchecked, an empty or id-less answer becomes a handle whose
+    :attr:`~mandala_computer.Computer.id` is ``""``, and everything that handle
+    can do then fails somewhere else entirely — a ``ValueError`` out of a path
+    builder that blames the caller and names neither the request that came back
+    empty nor the route it came from. So the route is named here instead.
+    """
+    payload = computer_payload(data)
+    if not names_a_computer(payload):
+        raise MandalaError(f"expected a computer from {method} {path}")
+    return payload
+
+
+def computer_records(rows: Sequence[Any], method: str, path: str) -> list[dict[str, Any]]:
+    """:func:`computer_record` over a listing, refusing it WHOLE on one id-less row.
+
+    Refused rather than dropped, as a windows listing is: a listing quietly one
+    shorter is a complete-looking answer that is wrong.
+    """
+    out: list[dict[str, Any]] = []
+    for position, row in enumerate(rows):
+        payload = computer_payload(row)
+        if not names_a_computer(payload):
+            raise MandalaError(
+                f"expected a computer from {method} {path} "
+                f"(row {position} of {len(rows)} has no id)"
+            )
+        out.append(payload)
+    return out
+
+
 # --- bodies ---------------------------------------------------------------
 
 
