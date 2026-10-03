@@ -1140,6 +1140,13 @@ class Templates:
     def publish(self, document: str) -> PublishedTemplate:
         """Store a document under a ref of your own, so a create can launch it.
 
+        NEEDS AN ACCOUNT-WIDE KEY. Templates are the account's catalogue, not a
+        workspace's: an API key confined to a workspace is refused this with a
+        :class:`~mandala_computer.PermissionDeniedError` (403) whatever it
+        sends, as it is :meth:`get` on the account's own namespace and
+        :meth:`retire`. Such a key can still :meth:`list` templates and launch
+        a computer from one by its ref.
+
         THE NAMESPACE IS YOUR ACCOUNT. ``metadata.namespace`` has to be your
         account id — anything else is a
         :class:`~mandala_computer.PermissionDeniedError`, ``system`` included —
@@ -1193,6 +1200,12 @@ class Templates:
         :class:`~mandala_computer.NotFoundError`, the same answer a name that
         does not exist gets.
 
+        Your account's own namespace needs an account-wide key: an API key
+        confined to a workspace is a
+        :class:`~mandala_computer.PermissionDeniedError` (403) there, because
+        the document is the account's and may carry its build steps and
+        scripts. It can still read ``system`` templates.
+
         Without ``version`` this is the newest published version of that name —
         which is also what a create naming the unpinned ``namespace/name``
         resolves to. :attr:`~mandala_computer.PublishedTemplate.versions` lists
@@ -1230,6 +1243,10 @@ class Templates:
         bytes included, and
         :attr:`~mandala_computer.RetiredTemplates.refs_claimed` does not go
         down. Publish the next version instead.
+
+        Retiring is for an account-wide key: an API key confined to a workspace
+        is a :class:`~mandala_computer.PermissionDeniedError` (403) whatever it
+        names.
         """
         data = self._t.json_object(
             "DELETE",
@@ -1287,6 +1304,12 @@ class Builds:
     DOCUMENT, not a ref, and the job it answers with outlives the request and is
     read back by its own id. Publishing and building are separate acts with very
     different costs, and the platform keeps them apart for that reason.
+
+    ACCOUNT-WIDE KEYS ONLY. Builds are the account's, like the templates they
+    build: an API key confined to a workspace is refused every method here with
+    a :class:`~mandala_computer.PermissionDeniedError` (403) — starting,
+    listing, reading, polling, streaming and waiting alike. Such a key launches
+    a computer from a published template by its ref instead.
     """
 
     def __init__(self, transport: Transport) -> None:
@@ -1312,17 +1335,19 @@ class Builds:
 
         BUILD SECRETS. ``spec.secrets`` lets build steps read secrets you
         stored, each named by its id and the environment name it is read as
-        (``{id: csec-…, as: NAME}``), never by value. They are resolved in this
-        client's key's scope when the build is submitted, and the revision each
-        one had then is the one the build reads, even if it is replaced later.
+        (``{id: csec-…, as: NAME}``), never by value. They are resolved among
+        the account-wide secrets when the build is submitted, and the revision
+        each one had then is the one the build reads, even if it is replaced
+        later.
         A document may name at most 32; :meth:`Templates.validate` does not
         check that limit, so a longer list first fails here.
 
         Which refusals are worth retrying:
 
         - A malformed reference is a 400 that says what is wrong, and a
-          reference that does not resolve in your scope — deleted, never there,
-          or another workspace's — is a 400 with one sentence for all of them.
+          reference that does not resolve among the account-wide secrets —
+          deleted, never there, a workspace's, or another account's — is a 400
+          with one sentence for all of them.
           Neither clears by retrying; fix the document.
         - A secret whose value could not be read is a
           :class:`~mandala_computer.ConflictError`, and a platform with no
@@ -1367,11 +1392,10 @@ class Builds:
         :class:`~mandala_computer.Listing` saying ``is_complete`` is false is the
         only evidence there is.
 
-        A short computer listing can include marked rows for both account-wide
-        and workspace-scoped keys. Marked snapshot rows are returned only to
-        account-wide keys; workspace-scoped snapshot listings omit unreachable
-        rows. Build listings have no marked rows under either scope. Check
-        ``is_complete`` for all three, including when no marked row is present.
+        A short computer listing can include marked rows, and a short snapshot
+        listing can for an account-wide key; a build listing never has any.
+        Check ``is_complete`` for all three, including when no marked row is
+        present.
         """
         data, incomplete = self._t.listing(_api.BUILDS, params=_api.partial_params(allow_partial))
         return Listing.of([TemplateBuild.from_api(b) for b in data or []], incomplete)

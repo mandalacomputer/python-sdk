@@ -221,6 +221,12 @@ A template is a `mandala/v1` document — the image family it resolves to, what 
 is layered onto, and the shape a computer gets when the create names no numbers.
 Publishing one gives it a ref you can launch by name.
 
+Templates are the account's catalogue, not a workspace's, so publishing,
+reading one of the account's own back and retiring need an account-wide key.
+An API key confined to a workspace is refused all three with a
+`PermissionDeniedError` (403); it can still list templates, read `system` ones
+and launch a computer from a template by its ref.
+
 ```python
 from pathlib import Path
 
@@ -429,14 +435,20 @@ if out.status != "succeeded":
 
 `spec.from` has to name a `system/...` template; anything else is a `400`.
 
+**Builds need an account-wide key.** Builds are the account's, like the
+templates they build: an API key confined to a workspace gets a
+`PermissionDeniedError` (403) from every `builds` method — `start`, `list`,
+`get`, `progress`, `events` and `wait` alike. It launches a computer from a
+published template by its ref instead.
+
 **Build secrets.** `spec.secrets` lets build steps read secrets you have stored,
 each named by id and by the environment name it is read as — `{id: csec-…, as:
-NAME}` — and never by value. They are resolved in your key's scope when the
-build is submitted, and the revision each had then is the one the build reads.
-A document may name at most 32, and `templates.validate()` does not check that
-limit. A malformed reference is a `400` saying what is wrong; one that does not
-resolve in your scope is a `400` with one sentence for every reason (deleted,
-never there, another workspace's) — neither is worth retrying. A value that
+NAME}` — and never by value. They are resolved among the account-wide secrets
+when the build is submitted, and the revision each had then is the one the
+build reads. A document may name at most 32, and `templates.validate()` does
+not check that limit. A malformed reference is a `400` saying what is wrong; one
+that does not resolve is a `400` with one sentence for every reason (deleted,
+never there, a workspace's, another account's) — neither is worth retrying. A value that
 could not be read is a `409` and a platform with no secrets keyring a `503`;
 both are worth retrying. Any other `409` from `start()` is a busy hypervisor,
 one build per host at a time, and is worth retrying too.
@@ -2815,10 +2827,11 @@ that has never built anything are the same rows; only the `Listing` tells them
 apart.
 
 Marked *snapshot* rows are an account-wide key's alone. A key scoped to one
-workspace gets none, on snapshots or on builds: naming the missing ids means
-reading them out of a placement cache with no workspace column, which would hand
-a confined credential ids from the workspaces it is confined away from. With
-such a key, `is_complete` is the only signal on those two. Computers are the
+workspace gets none: naming the missing ids means reading them out of a
+placement cache with no workspace column, which would hand a confined credential
+ids from the workspaces it is confined away from. With such a key,
+`is_complete` is the only signal on a snapshot listing (and it cannot list
+builds at all: every `builds` method is a 403 for it). Computers are the
 exception since the platform started keeping its own record of them — that
 record has the workspace column the cache lacks, so it can name a scoped key's
 missing computers without crossing the scope.
