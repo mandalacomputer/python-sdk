@@ -424,7 +424,8 @@ class AsyncComputer(ComputerFields):
         ANSWERS BEFORE IT FINISHES. The returned :class:`~mandala_computer.Move`
         is the operation as it stood the moment it was accepted, with ``live``
         True and the disk copy running behind it; :meth:`wait_for_move` is the
-        other half. One move runs per account at a time.
+        other half, and takes it as ``move``. One move runs per account at a
+        time.
 
         Everything is decided again at the moment this runs — the plan, the state
         of the computer, and which host it goes to — so it can still refuse even
@@ -447,8 +448,28 @@ class AsyncComputer(ComputerFields):
             )
         )
 
-    async def wait_for_move(self, timeout: float = 900.0, poll: float = 3.0) -> Move:
+    async def wait_for_move(
+        self, timeout: float = 900.0, poll: float = 3.0, *, move: Move | None = None
+    ) -> Move:
         """Block until this computer's move stops running, and answer what happened.
+
+        Pass the :class:`~mandala_computer.Move` :meth:`relocate` returned as
+        ``move``, so the wait follows THAT move::
+
+            started = await c.relocate(ram_mb=32768)
+            outcome = await c.wait_for_move(move=started)
+
+        The platform keeps one move row per computer and a later move of the
+        same computer REPLACES it, so once a move has finished, another caller
+        can start a second one and the listing then describes the second. With
+        ``move`` the wait matches only the row whose ``started_at`` equals the
+        move's, and raises :class:`~mandala_computer.MandalaError` at once if
+        this computer's row now carries a different one: the outcome of the move
+        being waited on is no longer recorded, and that does not un-happen.
+        Without ``move`` it answers whatever this computer's row says, which may
+        be a later move's outcome. A ``move`` with no ``started_at`` raises
+        :class:`~mandala_computer.MandalaError` before any request; anything
+        other than a ``Move`` raises :class:`TypeError`.
 
         Polls the account's moves and picks out this computer's. It does NOT
         raise for a move that ended badly, and that is the decision worth
@@ -472,6 +493,9 @@ class AsyncComputer(ComputerFields):
         more when the target has to be sent the image this computer was built
         from first.
         """
+        # Before the deadline is set: no request can repair a bad anchor, so
+        # none is sent.
+        anchor = self._move_anchor(move)
         check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         last: Move | None = None
@@ -511,7 +535,7 @@ class AsyncComputer(ComputerFields):
                         "stopped, only this wait has)"
                     ) from err
                 continue
-            mine = self._my_move(listed)
+            mine = self._my_move(listed, anchor)
             if mine is None:
                 raise MandalaError(
                     f"{self.id} has no move any more; the platform reaps one "

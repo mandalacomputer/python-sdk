@@ -578,3 +578,138 @@ def test_the_key_leaves_ties_to_position() -> None:
     assert key("2026-08-23T02:00:12Z") == key("2026-08-23T02:00:12+00:00")
     assert len(key("2026-08-23T02:00:12Z")) == 2
     assert key("nope") == key("also nope")
+
+
+# --- the anchor (OPL-5656) ------------------------------------------------------
+#
+# The platform keeps ONE move row per computer and writes a move with
+# `INSERT OR REPLACE`, so a second move of the same computer, started once the
+# first has finished, replaces the first's row. A wait with no anchor reads that
+# second move's outcome as the first's. `move=` is the anchor: the wait matches
+# only the row carrying the started move's `started_at`.
+
+#: A second move of vm-1, started after the first finished, that took its row.
+REPLACED = {
+    **MOVING,
+    "state": "failed",
+    "live": False,
+    "ram_mb": 4096,
+    "started_at": "2026-08-23T02:05:00.000Z",
+    "finished_at": "2026-08-23T02:05:03.000Z",
+}
+
+
+class TestWaitForMoveAnchor:
+    @respx.mock
+    def test_a_row_replaced_by_a_newer_move_raises_at_once(self, client: mc.Client) -> None:
+        c = computer(client)
+        started = mc.Move.from_api(MOVING)
+        moves = respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [REPLACED]}))
+        with pytest.raises(mc.MandalaError) as caught:
+            c.wait_for_move(timeout=5, poll=0.01, move=started)
+        # Fast, not a timeout: the replacement does not un-happen.
+        assert not isinstance(caught.value, mc.TimeoutError)
+        assert moves.call_count == 1
+        text = str(caught.value)
+        assert MOVING["started_at"] in text
+        assert REPLACED["started_at"] in text
+        assert "a newer move replaced it" in text
+        assert "moves.list" in text
+
+    @respx.mock
+    def test_a_live_replacement_is_not_waited_on_either(self, client: mc.Client) -> None:
+        c = computer(client)
+        live_other = {**MOVING, "started_at": REPLACED["started_at"]}
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [live_other]}))
+        with pytest.raises(mc.MandalaError, match="a newer move replaced it"):
+            c.wait_for_move(timeout=5, poll=0.01, move=mc.Move.from_api(MOVING))
+
+    @respx.mock
+    def test_the_matching_row_is_followed_until_it_finishes(self, client: mc.Client) -> None:
+        c = computer(client)
+        moves = respx.get(f"{BASE}/moves").mock(
+            side_effect=[
+                httpx.Response(200, json={"moves": [MOVING]}),
+                httpx.Response(200, json={"moves": [DONE]}),
+            ]
+        )
+        move = c.wait_for_move(poll=0.01, move=mc.Move.from_api(MOVING))
+        assert (move.state, move.started_at, move.finished_at) == (
+            "done",
+            MOVING["started_at"],
+            DONE["finished_at"],
+        )
+        assert moves.call_count == 2
+
+    @respx.mock
+    def test_without_an_anchor_the_behaviour_is_unchanged(self, client: mc.Client) -> None:
+        # No anchor, no way to tell: the row this computer has is the answer,
+        # which is why the docstring recommends passing the Move.
+        c = computer(client)
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [REPLACED]}))
+        assert c.wait_for_move(poll=0.01).started_at == REPLACED["started_at"]
+
+    @respx.mock
+    def test_positional_timeout_and_poll_still_work(self, client: mc.Client) -> None:
+        c = computer(client)
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE]}))
+        assert c.wait_for_move(5).state == "done"
+        assert c.wait_for_move(5, 0.01).state == "done"
+
+    @respx.mock
+    def test_an_anchor_with_no_start_is_refused_before_any_request(self, client: mc.Client) -> None:
+        c = computer(client)
+        moves = respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE]}))
+        with pytest.raises(mc.MandalaError, match="no started_at"):
+            c.wait_for_move(move=mc.Move.from_api({**MOVING, "started_at": ""}))
+        with pytest.raises(TypeError, match="Move that relocate"):
+            c.wait_for_move(move=600)  # type: ignore[arg-type]
+        assert not moves.called
+
+    @respx.mock
+    def test_move_wait_in_the_cli_passes_the_move_it_started(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``mandala-py move --wait`` must not report the replacement's
+        ``failed`` as the outcome of the move it started."""
+        from mandala_computer import _cli
+
+        monkeypatch.setenv("MANDALA_API_KEY", "com_test")
+        monkeypatch.setenv("MANDALA_BASE_URL", BASE)
+        respx.get(f"{BASE}/computers").mock(httpx.Response(200, json=[COMPUTER]))
+        respx.post(f"{BASE}/computers/vm-1/move").mock(httpx.Response(202, json=MOVING))
+        respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [REPLACED]}))
+        assert _cli.main(["move", "dev", "--ram-mb", "26000", "--wait", "--json"]) == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "a newer move replaced it" in err
+
+
+class TestAsyncAnchor:
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_the_async_twin_anchors_the_same_way(self) -> None:
+        async with mc.AsyncClient("com_test", base_url=BASE) as client:
+            respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+            c = await client.computers.get("vm-1")
+            started = mc.Move.from_api(MOVING)
+
+            respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [REPLACED]}))
+            with pytest.raises(mc.MandalaError, match="a newer move replaced it") as caught:
+                await c.wait_for_move(timeout=5, poll=0.01, move=started)
+            assert not isinstance(caught.value, mc.TimeoutError)
+            # Unanchored, unchanged.
+            assert (await c.wait_for_move(poll=0.01)).started_at == REPLACED["started_at"]
+
+            respx.get(f"{BASE}/moves").mock(
+                side_effect=[
+                    httpx.Response(200, json={"moves": [MOVING]}),
+                    httpx.Response(200, json={"moves": [DONE]}),
+                ]
+            )
+            assert (await c.wait_for_move(poll=0.01, move=started)).state == "done"
+
+            respx.get(f"{BASE}/moves").mock(httpx.Response(200, json={"moves": [DONE]}))
+            assert (await c.wait_for_move(5, 0.01)).state == "done"
+            with pytest.raises(mc.MandalaError, match="no started_at"):
+                await c.wait_for_move(move=mc.Move.from_api({**MOVING, "started_at": ""}))
