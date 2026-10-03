@@ -183,7 +183,7 @@ PARAMETERS: dict[str, set[str]] = {
     # not a question any one hypervisor could answer — it is read here and
     # stripped before the forward, on the same footing as `allow_partial`. It is
     # also the only way the two terminal states are ever listed.
-    "GET computers": {"query:allow_partial", "query:state"},
+    "GET computers": {"query:allow_partial", "query:state", "query:workspace_id"},
     "POST computers": {
         "body:name",
         "body:size",
@@ -197,6 +197,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:secrets",
         "body:browser_proxy",
         "body:egress_proxy",
+        "body:workspace_id",
         # Every lifecycle call carries one (platform OPL-5127).
         "header:Idempotency-Key",
     },

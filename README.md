@@ -2662,6 +2662,24 @@ is the whole account's roster, since everybody on the account reaches every
 workspace at their account role, so a key confined to a workspace cannot list
 it: `PermissionDeniedError` (403). `AsyncClient` has the same methods, awaited.
 
+An account-wide key can create a computer in a workspace, and list one
+workspace's computers, without a key confined to it:
+
+```python
+c = client.computers.create(template="base", workspace_id="wsp-0123456789ab")
+ci = client.computers.list(workspace_id="wsp-0123456789ab")
+loose = client.computers.list(workspace_id="unassigned")  # in no workspace
+```
+
+`launch()` and `ephemeral()` take `workspace_id` too. A create in a workspace
+names its `secrets` (and an egress proxy's `credentials_secret_id`) from that
+workspace's scope: its own secrets and the account-wide ones. Without
+`workspace_id` nothing changes: a key confined to a workspace creates and lists
+in it, and an account-wide key creates in none and lists everything. A
+workspace the key cannot reach (another account's, one that does not exist, or
+any but its own for a confined key) raises `NotFoundError`, and so does
+`"unassigned"` from a confined key. The listing filter combines with `state`.
+
 ### Usage
 
 What the account has spent, in the same figures the dashboard shows and the

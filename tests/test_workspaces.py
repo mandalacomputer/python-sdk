@@ -223,3 +223,76 @@ def test_a_scoped_key_is_permission_denied_and_a_foreign_id_not_found() -> None:
             c.workspaces.create("x")
         with pytest.raises(mc.NotFoundError):
             c.workspaces.rename("wsp-ffffffffffff", "x")
+
+
+# --- computers in a workspace (platform OPL-5543) ---------------------------
+#
+# An account-wide key names the workspace to create in with ``workspace_id``,
+# and narrows the listing to one workspace, or to ``"unassigned"``.
+
+COMPUTER: dict[str, Any] = {"id": "vm-1", "name": "dev", "status": "stopped", "os": "linux"}
+
+
+def mock_computers() -> tuple[respx.Route, respx.Route]:
+    made = respx.post(f"{BASE}/computers").mock(return_value=httpx.Response(201, json=COMPUTER))
+    listed = respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[COMPUTER]))
+    return made, listed
+
+
+@respx.mock
+def test_create_and_list_send_the_workspace() -> None:
+    import json
+
+    made, listed = mock_computers()
+    with client() as c:
+        c.computers.create(template="base", workspace_id=WORKSPACE["id"])
+        assert json.loads(made.calls.last.request.content)["workspace_id"] == WORKSPACE["id"]
+        c.computers.list(workspace_id=WORKSPACE["id"])
+        assert dict(listed.calls.last.request.url.params) == {"workspace_id": WORKSPACE["id"]}
+        c.computers.list(workspace_id="unassigned", state="live")
+        assert dict(listed.calls.last.request.url.params) == {
+            "workspace_id": "unassigned",
+            "state": "live",
+        }
+        c.computers.create(template="base")
+        assert "workspace_id" not in json.loads(made.calls.last.request.content)
+        c.computers.list()
+        assert dict(listed.calls.last.request.url.params) == {}
+
+
+@respx.mock
+def test_launch_sends_the_workspace_on_its_create() -> None:
+    import json
+
+    made, _ = mock_computers()
+    with client() as c, pytest.raises(Exception):  # noqa: B017 - only the create is asserted
+        c.computers.launch(template="base", workspace_id=WORKSPACE["id"], timeout=0.01)
+    assert json.loads(made.calls.last.request.content)["workspace_id"] == WORKSPACE["id"]
+
+
+@respx.mock
+async def test_the_async_client_sends_the_workspace() -> None:
+    import json
+
+    made, listed = mock_computers()
+    async with mc.AsyncClient("com_test", base_url=BASE) as c:
+        await c.computers.create(template="base", workspace_id=WORKSPACE["id"])
+        assert json.loads(made.calls.last.request.content)["workspace_id"] == WORKSPACE["id"]
+        await c.computers.list(workspace_id="unassigned")
+        assert dict(listed.calls.last.request.url.params) == {"workspace_id": "unassigned"}
+
+
+@respx.mock
+@pytest.mark.parametrize("bad", ["", " wsp-0123456789ab", 7])
+def test_a_workspace_id_the_platform_would_refuse_is_refused_before_any_request(
+    bad: Any,
+) -> None:
+    made, listed = mock_computers()
+    # ValueError, not TypeError: a client without the parameter raises the
+    # latter for the keyword itself, which must not pass for this check.
+    with client() as c:
+        with pytest.raises(ValueError, match="workspace_id must be"):
+            c.computers.create(template="base", workspace_id=bad)
+        with pytest.raises(ValueError, match="workspace_id must be"):
+            c.computers.list(workspace_id=bad)
+    assert not made.called and not listed.called

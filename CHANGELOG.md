@@ -11,6 +11,14 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **Create a computer in a workspace, and list one workspace's computers, with
+  an account-wide key**, sync and async. `computers.create()`, `launch()` and
+  `ephemeral()` take `workspace_id`, which also names the create's secrets from
+  that workspace's scope; `computers.list()` takes `workspace_id`, a workspace
+  id or `"unassigned"` for the computers in none. A workspace the key cannot
+  reach raises `NotFoundError`. Needs a platform that accepts `workspace_id` on
+  these two routes; an older one creates in no workspace and lists everything.
+
 - **`SshKey.reach` says whether this account accepts a listed key**, sync and
   async: `"everywhere"` (added from the dashboard), `"this_account"` or
   `"another_account"` (added through an API key or connected app on that
