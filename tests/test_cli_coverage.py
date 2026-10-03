@@ -476,3 +476,88 @@ def test_a_proxy_change_json_is_the_computers_record(
     assert _cli.main([*argv, "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed == {key: value for key, value in PROXIED.items() if key != "vnc"}
+
+
+# --- --idempotency-key (OPL-5658) ------------------------------------------------
+
+#: Every mandala-py command whose call is keyed, and the request it keys.
+KEYED = [
+    pytest.param(["move", "dev", "--ram-mb", "26000"], "post", "/move", STARTED, id="move"),
+    pytest.param(
+        ["browser-proxy", "set", "dev", "http://proxy.example.com:3128", "--no-credentials"],
+        "patch",
+        "",
+        PROXIED,
+        id="browser-proxy-set",
+    ),
+    pytest.param(["browser-proxy", "clear", "dev"], "patch", "", PROXIED, id="browser-proxy-clear"),
+    pytest.param(
+        ["egress-proxy", "set", "dev", "https://proxy.example.com:3128", "--no-credentials"],
+        "patch",
+        "",
+        PROXIED,
+        id="egress-proxy-set",
+    ),
+    pytest.param(["egress-proxy", "clear", "dev"], "patch", "", PROXIED, id="egress-proxy-clear"),
+]
+
+
+@pytest.mark.parametrize(("argv", "method", "suffix", "answer"), KEYED)
+@respx.mock
+def test_a_keyed_command_sends_the_key_it_is_given(
+    argv: list[str], method: str, suffix: str, answer: dict[str, object]
+) -> None:
+    # The key a failed attempt named, sent again: the platform answers from
+    # the first call rather than carrying it out twice. Without the flag the
+    # command refused it as an unrecognized option, exit 2.
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    route = respx.route(method=method.upper(), url=f"{BASE}/computers/vm-1{suffix}").mock(
+        return_value=httpx.Response(200 if method == "patch" else 202, json=answer)
+    )
+    assert _cli.main([*argv, "--idempotency-key", "abc", "--json"]) == 0
+    assert route.calls.last.request.headers["Idempotency-Key"] == "abc"
+    # A key at the platform's longest is sent as it is.
+    longest = "k" * 255
+    assert _cli.main([*argv, f"--idempotency-key={longest}", "--json"]) == 0
+    assert route.calls.last.request.headers["Idempotency-Key"] == longest
+
+
+@pytest.mark.parametrize(("argv", "method", "suffix", "answer"), KEYED)
+@respx.mock
+def test_a_keyed_command_sends_a_key_of_its_own_without_the_flag(
+    argv: list[str], method: str, suffix: str, answer: dict[str, object]
+) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    route = respx.route(method=method.upper(), url=f"{BASE}/computers/vm-1{suffix}").mock(
+        return_value=httpx.Response(200 if method == "patch" else 202, json=answer)
+    )
+    assert _cli.main([*argv, "--json"]) == 0
+    first = route.calls.last.request.headers["Idempotency-Key"]
+    assert _cli.main([*argv, "--json"]) == 0
+    assert first and route.calls.last.request.headers["Idempotency-Key"] != first
+
+
+@pytest.mark.parametrize("key", ["", "a b", "k" * 256, "café", "tab\there"])
+@pytest.mark.parametrize(("argv", "method", "suffix", "answer"), KEYED)
+@respx.mock
+def test_a_keyed_command_refuses_a_key_the_platform_would(
+    argv: list[str],
+    method: str,
+    suffix: str,
+    answer: dict[str, object],
+    key: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Refused before any request, in mandala's words, rather than after the
+    # name was looked up and by the SDK's own wording for its parameter.
+    assert _cli.main([*argv, "--idempotency-key", key, "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert (error["code"], error["message"]) == (
+        "invalid_arguments",
+        "--idempotency-key must be 1 to 255 characters, each printable ASCII other than a space",
+    )
+    assert not respx.calls
+    with pytest.raises(SystemExit) as caught:
+        _cli.main([*argv, "--idempotency-key", key])
+    assert str(caught.value.code).startswith("mandala-py: --idempotency-key must be 1 to 255")
+    assert not respx.calls

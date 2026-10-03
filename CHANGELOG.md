@@ -38,6 +38,16 @@ This is the summary you read to decide whether to upgrade.
   keyword-only, after `raw`, so a positional `SshKey(...)` call from an
   earlier release still binds its eighth argument to `raw`.
 
+- **`mandala-py` keyed commands take `--idempotency-key KEY`**: `move`,
+  `browser-proxy set` and `clear`, and `egress-proxy set` and `clear` send the
+  key given instead of a fresh one, so a command whose answer was lost, and
+  whose error named its key, can be sent again under it and is not carried out
+  twice, as `mandala`'s can. A key that is not 1 to 255 printable ASCII
+  characters without a space is refused before any request
+  (`invalid_arguments`). The text-mode line that names a failure's key now
+  says, when it names no operation, how to find that operation and how to
+  resend under the key.
+
 ### Fixed
 
 - **Waiting for a move can follow the move you started, not a later one**,

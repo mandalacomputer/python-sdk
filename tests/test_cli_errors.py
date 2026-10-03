@@ -643,6 +643,16 @@ def keyed_clear(response: httpx.Response | Exception) -> respx.Route:
     return route.mock(return_value=response)
 
 
+def resend(key: str) -> str:
+    """What the recovery line says after a key with no operation id, on a
+    command that takes ``--idempotency-key`` (OPL-5658), as ``mandala`` says it."""
+    return (
+        f" (find its operation with: mandala-py operations list --idempotency-key {key}; "
+        f"or send the same command again with --idempotency-key {key}, "
+        "which the platform does not carry out twice)"
+    )
+
+
 def text_failure(capsys: pytest.CaptureFixture[str]) -> list[str]:
     out, err = capsys.readouterr()
     assert out == ""
@@ -663,7 +673,7 @@ def test_a_text_failure_names_the_key_it_was_sent_with(
     assert key
     assert text_failure(capsys) == [
         "mandala-py: gone quiet",
-        f"mandala-py: idempotency key {key}; request id req-42",
+        f"mandala-py: idempotency key {key}; request id req-42" + resend(key),
     ]
 
 
@@ -693,20 +703,21 @@ def test_a_lost_answer_names_its_key_in_text(capsys: pytest.CaptureFixture[str])
     key = route.calls.last.request.headers["Idempotency-Key"]
     lines = text_failure(capsys)
     assert len(lines) == 2
-    assert lines[1] == f"mandala-py: idempotency key {key}"
+    assert lines[1] == f"mandala-py: idempotency key {key}" + resend(key)
 
 
 @respx.mock
 def test_a_request_id_is_escaped_in_text(capsys: pytest.CaptureFixture[str]) -> None:
     # A header the response chose, printed to a terminal: an escape sequence
     # in it must not drive the terminal.
-    keyed_clear(
+    route = keyed_clear(
         httpx.Response(503, json={"error": "gone quiet"}, headers={"X-Request-ID": "req\x1b[2J"})
     )
     assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    key = route.calls.last.request.headers["Idempotency-Key"]
     lines = text_failure(capsys)
     assert "\x1b" not in lines[1]
-    assert lines[1].endswith("; request id req\\u001b[2J")
+    assert lines[1].endswith("; request id req\\u001b[2J" + resend(key))
 
 
 @respx.mock
@@ -729,8 +740,36 @@ def test_a_text_failure_message_cannot_forge_the_recovery_line(
     assert len(lines) == 2
     assert lines[0] == "mandala-py: down\\u000amandala-py: idempotency key forged\\u001b[2J"
     assert all("\x1b" not in line for line in lines)
-    assert lines[1] == f"mandala-py: idempotency key {key}; request id r1"
+    assert lines[1] == f"mandala-py: idempotency key {key}; request id r1" + resend(key)
 
 
 def test_a_failure_with_no_ids_has_no_recovery_line() -> None:
     assert _cli._recovery_line(_cli.MandalaError("nothing to recover")) is None
+
+
+def test_a_key_on_a_command_without_the_flag_names_only_the_listing() -> None:
+    # Every mandala-py command that sends a key takes --idempotency-key, but a
+    # line that offered a resend under a flag the command refuses would send
+    # a person to `unrecognized option`: only the listing is named then.
+    err = _cli.MandalaError("lost")
+    err.idempotency_key = "k-1"
+    assert _cli._recovery_line(err) == (
+        "mandala-py: idempotency key k-1 "
+        "(find its operation with: mandala-py operations list --idempotency-key k-1)"
+    )
+    assert _cli._recovery_line(err, resendable=True) == "mandala-py: idempotency key k-1" + resend(
+        "k-1"
+    )
+
+
+@respx.mock
+def test_a_resend_under_the_named_key_sends_that_key(capsys: pytest.CaptureFixture[str]) -> None:
+    # The line's own advice, followed: the same command under the key it
+    # named sends that key, so the platform answers from the first call.
+    route = keyed_clear(httpx.Response(503, json={"error": "gone quiet"}))
+    assert _cli.main(["egress-proxy", "clear", "dev"]) == 1
+    key = route.calls.last.request.headers["Idempotency-Key"]
+    text_failure(capsys)
+    route.mock(return_value=httpx.Response(200, json=COMPUTER))
+    assert _cli.main(["egress-proxy", "clear", "dev", "--idempotency-key", key]) == 0
+    assert route.calls.last.request.headers["Idempotency-Key"] == key
