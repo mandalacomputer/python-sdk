@@ -14,8 +14,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 import mandala_computer as mc
 from mandala_computer import _async_resources, _resources
+from mandala_computer._client import _timed_out
 
 
 def test_the_installed_package_declares_its_inline_types() -> None:
@@ -380,3 +383,17 @@ def test_retained_models_and_options_are_public_and_frozen() -> None:
         assert name in mc.__all__ and hasattr(mc, name)
     for cls in (mc.ResultOutput, mc.Artifact, mc.BackgroundResult, mc.SynchronousResult):
         assert dataclasses.is_dataclass(cls) and cls.__dataclass_params__.frozen
+
+
+def test_a_request_timeout_is_the_class_the_typescript_sdk_raises() -> None:
+    """A request deadline is a ``ConnectionInterruptedError`` in
+    mandala-computer-typescript, and ``RequestTimeoutError`` is one here: the
+    same ``except`` catches the same failure in both (OPL-5645). It stays a
+    ``TimeoutError`` too, so this SDK's earlier handlers keep catching it."""
+    assert "RequestTimeoutError" in mc.__all__
+    assert issubclass(mc.RequestTimeoutError, mc.ConnectionInterruptedError)
+    assert issubclass(mc.RequestTimeoutError, mc.ConnectionError)
+    assert issubclass(mc.RequestTimeoutError, mc.TimeoutError)
+    assert not issubclass(mc.TimeoutError, mc.ConnectionError)
+    for phase in (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ReadTimeout, httpx.WriteTimeout):
+        assert type(_timed_out("POST", "/computers", phase("deadline"))) is mc.RequestTimeoutError

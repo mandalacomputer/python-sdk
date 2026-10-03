@@ -4,6 +4,7 @@ filter that finds a call whose answer was lost — sync and async."""
 
 from __future__ import annotations
 
+import builtins
 import re
 import uuid
 from collections.abc import Callable
@@ -198,6 +199,69 @@ def failing_start(response: httpx.Response | Exception) -> Callable[[], mc.Manda
 def test_an_unknown_outcome_carries_the_key(response: httpx.Response | Exception) -> None:
     err = failing_start(response)()
     assert err.idempotency_key == "k-unknown"
+
+
+def assert_a_request_timeout(err: BaseException, key: str) -> None:
+    """The class a request deadline arrives as: the interrupted one, as in the
+    TypeScript SDK, and still a timeout for handlers written before (OPL-5645)."""
+    assert type(err) is mc.RequestTimeoutError
+    assert isinstance(err, mc.ConnectionInterruptedError)
+    assert isinstance(err, mc.ConnectionError)
+    assert isinstance(err, builtins.ConnectionError)
+    assert isinstance(err, mc.TimeoutError)
+    assert isinstance(err, builtins.TimeoutError)
+    assert isinstance(err, mc.MandalaError)
+    assert err.idempotency_key == key
+    assert mc.is_transient(err) is False
+    assert "did not answer within the client's timeout" in str(err)
+
+
+def test_a_keyed_create_that_times_out_is_a_connection_interrupted_error() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(f"{BASE}/computers").mock(side_effect=httpx.ReadTimeout("no answer in time"))
+        with pytest.raises(mc.ConnectionInterruptedError) as caught:
+            client().computers.create(template="base", idempotency_key="k1")
+    assert_a_request_timeout(caught.value, "k1")
+
+
+async def test_async_a_keyed_create_that_times_out_is_a_connection_interrupted_error() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(f"{BASE}/computers").mock(side_effect=httpx.ReadTimeout("no answer in time"))
+        c = aclient()
+        try:
+            with pytest.raises(mc.ConnectionInterruptedError) as caught:
+                await c.computers.create(template="base", idempotency_key="k1")
+        finally:
+            await c.aclose()
+    assert_a_request_timeout(caught.value, "k1")
+
+
+def test_a_wait_helper_that_gives_up_still_raises_a_plain_timeout_error() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/computers/vm-1").mock(
+            return_value=httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+        )
+        vm = mc.Computer(client()._t, {**COMPUTER, "status": "stopped"})
+        with pytest.raises(mc.TimeoutError, match="still 'stopped'") as caught:
+            vm.wait_until_running(timeout=0.05, poll=0)
+    assert type(caught.value) is mc.TimeoutError
+    assert not isinstance(caught.value, mc.ConnectionError)
+
+
+async def test_async_a_wait_helper_that_gives_up_still_raises_a_plain_timeout_error() -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/computers/vm-1").mock(
+            return_value=httpx.Response(200, json={**COMPUTER, "status": "stopped"})
+        )
+        c = aclient()
+        try:
+            vm = mc.AsyncComputer(c._t, {**COMPUTER, "status": "stopped"})
+            with pytest.raises(mc.TimeoutError, match="still 'stopped'") as caught:
+                await vm.wait_until_running(timeout=0.05, poll=0)
+        finally:
+            await c.aclose()
+    assert type(caught.value) is mc.TimeoutError
+    assert not isinstance(caught.value, mc.ConnectionError)
 
 
 def test_a_refusal_that_released_the_key_does_not_carry_it() -> None:

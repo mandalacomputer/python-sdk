@@ -33,6 +33,7 @@ __all__ = [
     "PlanLimitError",
     "RangeNotSatisfiableError",
     "RateLimitError",
+    "RequestTimeoutError",
     "TimeoutError",
     "UnavailableError",
     "is_transient",
@@ -867,7 +868,10 @@ class ConnectionError(MandalaError, builtins.ConnectionError):
     Named to match, and to be the same thing as, ``ConnectionError`` in
     mandala-computer-typescript and ``ConnectivityError`` in
     mandala-computer-mcp. All three now name it in the same retry predicate
-    (OPL-3724), and until this class existed this SDK could not.
+    (OPL-3724), and until this class existed this SDK could not. A request
+    timeout is one here as it is in the TypeScript SDK:
+    :class:`RequestTimeoutError`, a :class:`ConnectionInterruptedError`, where
+    that SDK raises its ``ConnectionInterruptedError``.
     """
 
 
@@ -908,6 +912,10 @@ class ConnectionInterruptedError(ConnectionError):
     a read whose outcome was lost can simply be read again. Only a caller who
     might be replaying a **write** needs the distinction, which is exactly the
     caller :func:`is_transient` is exported for.
+
+    A request that outran the client's timeout is one too, as
+    :class:`RequestTimeoutError`: a deadline that fires says nothing about
+    whether the request went out.
     """
 
 
@@ -916,6 +924,8 @@ class TimeoutError(MandalaError, builtins.TimeoutError):
 
     Two things raise it: a wait helper that gave up before the computer reached
     the expected state, and a request that outran the transport's budget for it.
+    The second arrives as :class:`RequestTimeoutError`, which is also a
+    :class:`ConnectionInterruptedError`; a wait helper raises this class itself.
 
     It is both a :class:`MandalaError` and Python's built-in
     :class:`TimeoutError`, so either the SDK-wide handler or an ordinary timeout
@@ -926,6 +936,26 @@ class TimeoutError(MandalaError, builtins.TimeoutError):
     call's view of the outcome, which is why a command slower than its request
     wants :meth:`~mandala_computer.Computer.start_exec` rather than a longer
     deadline.
+    """
+
+
+class RequestTimeoutError(ConnectionInterruptedError, TimeoutError):
+    """A request the client stopped waiting on: its deadline fired before the answer.
+
+    The outcome is unknown, as for any :class:`ConnectionInterruptedError`:
+    resend under ``err.idempotency_key``, which a keyed call's timeout carries,
+    to learn how it went without doing it twice. Also a :class:`TimeoutError`,
+    for code written before it existed, so ``except TimeoutError`` still
+    catches it — and so does Python's built-in ``TimeoutError``.
+
+    Matches ``ConnectionInterruptedError`` in mandala-computer-typescript, which
+    raises that class for every request deadline. Not raised by the ``wait_*``
+    helpers: a wait that gave up raises a plain :class:`TimeoutError`, because
+    nothing about the request it was polling with is unknown.
+
+    :func:`is_transient` answers ``False``, as it does for its parent, and the
+    poll predicate rides it out, as it did when this was a plain
+    :class:`TimeoutError`.
     """
 
 
@@ -1141,10 +1171,11 @@ def _is_transient_for_poll(err: BaseException) -> bool:
       caller's deadline before reporting the wrong cause; a bare
       :class:`MandalaError` is a verdict this SDK reached about a poll that
       *succeeded*, and polling through a verdict is a loop with a deadline on
-      it. :class:`TimeoutError` is in the set because in this SDK it is also the
-      transport's own give-up, which the next poll may well survive — the one
-      place the three clients differ in spelling rather than in meaning, since
-      an equivalent failure is a ``ConnectionError`` in the TypeScript SDK.
+      it. :class:`TimeoutError` is in the set for the transport's own give-up,
+      which the next poll may well survive. That give-up arrives as
+      :class:`RequestTimeoutError`, which is a :class:`ConnectionError` too —
+      the class the TypeScript SDK raises for the same failure — so the
+      clients no longer differ in how they spell it.
     * :class:`MoveRequiredError` — a decision about the size that was asked for.
     * :class:`OriginTLSError` (525, 526) — a certificate the edge and the
       platform cannot agree on fails identically on every retry, so waiting one
