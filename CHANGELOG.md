@@ -40,6 +40,18 @@ This is the summary you read to decide whether to upgrade.
 
 ### Fixed
 
+- **Waiting for a move can follow the move you started, not a later one**,
+  sync and async. `Computer.wait_for_move()` takes a keyword-only `move`, the
+  `Move` that `relocate()` returned, and then matches only the row whose
+  `started_at` equals that move's. The platform keeps one move row per
+  computer, so once a move has finished another caller can start a second and
+  replace the row; with `move` that now raises `MandalaError` saying a newer
+  move replaced it, instead of returning the newer move's outcome as yours. A
+  `move` with no `started_at` raises `MandalaError` before any request.
+  `wait_for_move()`, `wait_for_move(600)` and `wait_for_move(600, 5)` behave
+  as before. `mandala-py move --wait` passes the move it started. This matches
+  `waitForMove(move)` in `mandala-computer` for TypeScript.
+
 - **A setting change resets `operation_id`, and an answer that is not a
   computer is refused rather than wiping the handle**, sync and async.
   `set_idle_suspend()`, `set_browser_proxy()` and `set_egress_proxy()` now

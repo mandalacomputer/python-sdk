@@ -2702,7 +2702,7 @@ def _cmd_move(args: argparse.Namespace) -> int:
         c = _resolve(client, args.target)
         move = c.relocate(ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb)
         if args.wait:
-            move = c.wait_for_move(timeout=timeout, poll=poll)
+            move = c.wait_for_move(timeout=timeout, poll=poll, move=move)
     if args.json:
         _json(dict(move.raw))
     else:

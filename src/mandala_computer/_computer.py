@@ -2347,7 +2347,31 @@ class ComputerFields:
         """The API response verbatim, including any fields this SDK predates."""
         return dict(self._data)
 
-    def _my_move(self, listing: Mapping[str, Any]) -> Move | None:
+    @staticmethod
+    def _move_anchor(move: Move | None) -> str | None:
+        """The ``started_at`` a move wait matches rows against, or ``None``.
+
+        Checked before anything is sent, because a bad anchor is the caller's
+        mistake (or, for a :class:`~mandala_computer.Move` with no start, the
+        platform's) and no request can repair it. An empty ``started_at`` is
+        refused rather than matched: it would match only a row whose start the
+        platform never sent, and is no way to tell this move from a newer one.
+        """
+        if move is None:
+            return None
+        if not isinstance(move, Move):
+            raise TypeError(
+                "move must be the Move that relocate() returned, got "
+                f"{type(move).__name__}; timeout and poll are its own arguments"
+            )
+        if not move.started_at:
+            raise MandalaError(
+                f"this Move of {move.computer_id or 'a computer'} has no started_at to wait "
+                "from, which is what wait_for_move matches the listing on"
+            )
+        return move.started_at
+
+    def _my_move(self, listing: Mapping[str, Any], anchor: str | None = None) -> Move | None:
         """This computer's move out of the account's listing, if it has one.
 
         On ``ComputerFields`` because both halves need exactly this and the only
@@ -2356,33 +2380,42 @@ class ComputerFields:
         time, and a FINISHED row for another computer stays for a day — so "the
         first row" is the wrong answer often enough to matter.
 
-        THE LIVE ONE, and not merely the first one wearing this id. That day of
-        retention applies to this computer's own finished moves too, and nothing
-        orders the listing — so a machine moved this morning and moved again now
-        has two rows, and taking the first meant
-        :meth:`Computer.wait_for_move` could return the morning's outcome while
-        the disk copy was still running. ``moved`` in particular reads as "the
-        move landed and the resize did not", so the caller goes on to resize a
-        computer that is mid-flight (adversarial review, OPL-4222).
+        ONE ROW PER COMPUTER, at most. The platform keys its moves table by
+        computer id and writes a move with ``INSERT OR REPLACE``, so a second
+        move of this computer does not sit beside the first: it REPLACES the
+        first's row. That is what ``anchor`` is for. With it — the
+        ``started_at`` of the move :meth:`Computer.relocate` returned — the
+        answer is the row that carries exactly that string, and a row of this
+        computer's carrying any other raises
+        :class:`~mandala_computer.MandalaError`: another move took the computer
+        over, and the outcome of the one being waited on is no longer recorded
+        anywhere. Reading the replacement's ``state`` as this move's is the
+        misread the anchor exists to prevent; ``moved`` in particular reads as
+        "the move landed and the resize did not".
 
-        One move runs at a time, so there is at most one live row to find. Where
-        there is none, the answer is the row with the LATEST ``started_at``,
-        read off the rows rather than off their order. The platform sends them
-        newest-first, so position would answer this correctly today — and it
-        is not what this has
-        to depend on: the first version of this fix guessed oldest-first and
-        picked the stale row it was written to avoid (/code-review, OPL-4222).
-        A stamp is a fact about the move; an index is a fact about the query
-        behind it.
-
-        Ties and unreadable stamps fall back to position, which is the
-        platform's order and therefore still newest-first.
+        Without an anchor the answer is whatever row this computer has. The
+        selection below still prefers a live row, then the latest
+        ``started_at`` (read off the rows rather than off their order, ties to
+        position, which is the platform's newest-first), so a listing that ever
+        did carry two rows for one computer would not hand back a stale one —
+        but on this platform it never does, and the row it does return may
+        belong to a LATER move of this computer than the one the caller started.
         """
         mine = [
             Move.from_api(row) for row in move_rows(listing) if row.get("computer_id") == self.id
         ]
         if not mine:
             return None
+        if anchor is not None:
+            match = next((m for m in mine if m.started_at == anchor), None)
+            if match is not None:
+                return match
+            other = ", ".join(m.started_at or "(none)" for m in mine)
+            raise MandalaError(
+                f"{self.id}'s move started at {anchor}, but the row for it on GET /moves now "
+                f"starts at {other}: a newer move replaced it, and this move's outcome is no "
+                "longer recorded. Read the move that replaced it with moves.list."
+            )
         newest = max(range(len(mine)), key=lambda i: (_started_key(mine[i].started_at), -i))
         return next((m for m in mine if m.live), mine[newest])
 
@@ -2707,7 +2740,8 @@ class Computer(ComputerFields):
         ANSWERS BEFORE IT FINISHES. The returned :class:`~mandala_computer.Move`
         is the operation as it stood the moment it was accepted, with ``live``
         True and the disk copy running behind it; :meth:`wait_for_move` is the
-        other half. One move runs per account at a time.
+        other half, and takes it as ``move``. One move runs per account at a
+        time.
 
         Everything is decided again at the moment this runs — the plan, the state
         of the computer, and which host it goes to — so it can still refuse even
@@ -2730,8 +2764,28 @@ class Computer(ComputerFields):
             )
         )
 
-    def wait_for_move(self, timeout: float = 900.0, poll: float = 3.0) -> Move:
+    def wait_for_move(
+        self, timeout: float = 900.0, poll: float = 3.0, *, move: Move | None = None
+    ) -> Move:
         """Block until this computer's move stops running, and answer what happened.
+
+        Pass the :class:`~mandala_computer.Move` :meth:`relocate` returned as
+        ``move``, so the wait follows THAT move::
+
+            started = c.relocate(ram_mb=32768)
+            outcome = c.wait_for_move(move=started)
+
+        The platform keeps one move row per computer and a later move of the
+        same computer REPLACES it, so once a move has finished, another caller
+        can start a second one and the listing then describes the second. With
+        ``move`` the wait matches only the row whose ``started_at`` equals the
+        move's, and raises :class:`~mandala_computer.MandalaError` at once if
+        this computer's row now carries a different one: the outcome of the move
+        being waited on is no longer recorded, and that does not un-happen.
+        Without ``move`` it answers whatever this computer's row says, which may
+        be a later move's outcome. A ``move`` with no ``started_at`` raises
+        :class:`~mandala_computer.MandalaError` before any request; anything
+        other than a ``Move`` raises :class:`TypeError`.
 
         Polls the account's moves and picks out this computer's. It does NOT
         raise for a move that ended badly, and that is the decision worth
@@ -2755,6 +2809,9 @@ class Computer(ComputerFields):
         more when the target has to be sent the image this computer was built
         from first.
         """
+        # Before the deadline is set: no request can repair a bad anchor, so
+        # none is sent.
+        anchor = self._move_anchor(move)
         check_wait_args(timeout, poll)
         deadline = time.monotonic() + timeout
         last: Move | None = None
@@ -2795,7 +2852,7 @@ class Computer(ComputerFields):
                         "stopped, only this wait has)"
                     ) from err
                 continue
-            mine = self._my_move(listed)
+            mine = self._my_move(listed, anchor)
             if mine is None:
                 raise MandalaError(
                     f"{self.id} has no move any more; the platform reaps one "
