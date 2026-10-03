@@ -155,6 +155,13 @@ This is the summary you read to decide whether to upgrade.
   `--json`, `mandala-py` reports a request timeout with the code
   `connection_interrupted` rather than `timeout`, as `mandala` does.
 
+- **The README says what `mandala-py` exits with on a failure: 1, or 2 for a
+  usage error** (a command line the parser refuses: an unknown command or
+  option, a missing or extra argument, or an option value of the wrong type or
+  outside its choices) and for `ssh --json`. It said only "nonzero". The npm
+  `mandala` CLI now exits 2 for the same mistakes, as `mandala-py` already did.
+  Documentation only.
+
 - **The SSH documentation says what the platform does**, sync and async.
   `ssh_keys.remove()` said a session already open with the removed key goes
   on until it disconnects; the platform closes it once each computer receives

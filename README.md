@@ -3490,8 +3490,11 @@ modes), as `mandala` refuses it.
 `browser-proxy` and `egress-proxy` `set` and `clear` print the computer's record
 without its `vnc` desktop URLs, as `mandala` does; their `get` prints the
 setting alone, with the computer's `id` and `name`. A failure prints nothing on
-stdout: it writes its `error` object as one JSON line on stderr and exits
-nonzero. `code` is one snake_case word naming the kind of failure, the same word
+stdout: it writes its `error` object as one JSON line on stderr and exits 1,
+or 2 for a usage error — a command line the parser refuses: an unknown command
+or option, a missing or extra argument, or an option value of the wrong type or
+outside its listed choices — and for `ssh --json`, as `mandala` does. `code` is
+one snake_case word naming the kind of failure, the same word
 the npm `mandala` CLI reports — `not_found`, `unauthenticated`,
 `permission_denied`, `conflict`, `rate_limited`, `unavailable`,
 `invalid_arguments`, `ambiguous_computer`, `unsupported_mode`,
