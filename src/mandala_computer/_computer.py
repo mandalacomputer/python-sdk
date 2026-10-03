@@ -80,6 +80,7 @@ from ._models import (
     InputContext,
     Listing,
     Move,
+    PageContext,
     ScreenshotInfo,
     SecretBinding,
     SecretBindingArgs,
@@ -861,10 +862,18 @@ def _input_context(data: Mapping[str, Any]) -> InputContext:
         focused = context.get("focused")
         if focused is not None and not isinstance(focused, Mapping):
             raise MandalaError("POST input answered a context whose focused is not a window")
+        # Beside a context, context_error says why it has no page (OPL-5544).
+        beside = data.get("context_error")
+        if beside is not None and not isinstance(beside, str):
+            raise MandalaError("POST input answered a context_error that is not a string")
+        dom = context.get("dom")
         return InputContext(
             windows=_windows_from_response(context),
             focused=None if focused is None else Window.from_api(focused),
-            error=None,
+            error=beside or None,
+            # Absent from a platform that predates page context, and whenever
+            # the focused window is not Chromium.
+            dom=None if dom is None else PageContext.from_api(dom),
         )
     error = data.get("context_error")
     if isinstance(error, str) and error:

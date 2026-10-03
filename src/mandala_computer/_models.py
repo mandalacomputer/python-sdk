@@ -58,6 +58,8 @@ __all__ = [
     "Operation",
     "OperationError",
     "OperationPage",
+    "PageContext",
+    "PageElement",
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
@@ -2407,6 +2409,103 @@ class Window:
 
 
 @dataclass(frozen=True)
+class PageElement:
+    """One interactive element of the page in a focused Chromium window.
+
+    The box is the element's visible part in SCREEN pixels — the coordinates
+    :meth:`Computer.click` takes. Click its centre: ``x + width // 2``,
+    ``y + height // 2``.
+    """
+
+    #: The lower-case tag name: ``"a"``, ``"button"``, ``"input"``.
+    tag: str
+    #: Its ``role`` attribute, or ``""``.
+    role: str
+    #: Its accessible label (aria-label, title, placeholder, alt or name), or ``""``.
+    name: str
+    #: Its text, or a field's value. A password field's value is never read.
+    text: str
+    x: int
+    y: int
+    width: int
+    height: int
+    #: A link's resolved target; ``None`` on anything but a link.
+    href: str | None = None
+
+
+@dataclass(frozen=True)
+class PageContext:
+    """The page on screen in the focused Chromium window, after an input action."""
+
+    url: str
+    title: str
+    #: The interactive elements visible in the viewport, in document order:
+    #: links, buttons, form fields and elements with an interactive role. At
+    #: most 150.
+    elements: list[PageElement]
+    #: The page had more interactive elements than :attr:`elements` holds.
+    truncated: bool
+
+    @classmethod
+    def from_api(cls, d: object) -> PageContext:
+        """Decode ``context.dom`` strictly: a page with a field missing is refused."""
+
+        def bad(what: str) -> MandalaError:
+            return MandalaError(f"POST input answered a context.dom whose {what}")
+
+        if not isinstance(d, Mapping):
+            raise bad("value is not an object")
+        url, title, truncated, rows = (
+            d.get("url"),
+            d.get("title"),
+            d.get("truncated"),
+            d.get("elements"),
+        )
+        if not isinstance(url, str):
+            raise bad("url is not a string")
+        if not isinstance(title, str):
+            raise bad("title is not a string")
+        if not isinstance(truncated, bool):
+            raise bad("truncated is not a boolean")
+        if not isinstance(rows, list):
+            raise bad("elements is not an array")
+        elements = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                raise bad(f"elements[{i}] is not an object")
+            strings: dict[str, str] = {}
+            for k in ("tag", "role", "name", "text"):
+                v = row.get(k)
+                if not isinstance(v, str):
+                    raise bad(f"elements[{i}].{k} is not a string")
+                strings[k] = v
+            numbers: dict[str, int] = {}
+            for k in ("x", "y", "width", "height"):
+                n = row.get(k)
+                # bool is an int to Python and is not a coordinate.
+                if not isinstance(n, int) or isinstance(n, bool):
+                    raise bad(f"elements[{i}].{k} is not a whole number")
+                numbers[k] = n
+            href = row.get("href")
+            if href is not None and not isinstance(href, str):
+                raise bad(f"elements[{i}].href is not a string")
+            elements.append(
+                PageElement(
+                    tag=strings["tag"],
+                    role=strings["role"],
+                    name=strings["name"],
+                    text=strings["text"],
+                    x=numbers["x"],
+                    y=numbers["y"],
+                    width=numbers["width"],
+                    height=numbers["height"],
+                    href=href,
+                )
+            )
+        return cls(url=url, title=title, elements=elements, truncated=truncated)
+
+
+@dataclass(frozen=True)
 class InputContext:
     """The desktop just after an input action, for a call made with ``context=True``.
 
@@ -2415,15 +2514,23 @@ class InputContext:
     opening is not in it yet. ``focused`` is the one of them holding the
     keyboard, or ``None`` when none does (focus on the desktop itself included).
 
+    ``dom`` is the page on screen when ``focused`` is Chromium: its URL, title
+    and the interactive elements visible in it, with boxes in screen pixels.
+    It is ``None`` for any other focused window (Firefox, the default browser,
+    included), and whenever the page could not be read.
+
     ``windows`` is ``None``, never ``[]``, when the platform could not read them
     — a Windows guest, no desktop session, a guest agent slow to answer — and
-    ``error`` then says why. The action itself still happened: do not send it
-    again.
+    ``error`` then says why. ``error`` can also sit beside ``windows``, saying
+    why ``dom`` is ``None``: no window has focus, the focused window is not
+    Chromium, Chromium is not listening, or the page was not read in time. The
+    action itself still happened either way: do not send it again.
     """
 
     windows: list[Window] | None
     focused: Window | None
     error: str | None
+    dom: PageContext | None = None
 
 
 @dataclass(frozen=True)

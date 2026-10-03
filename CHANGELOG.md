@@ -19,6 +19,17 @@ This is the summary you read to decide whether to upgrade.
   reach raises `NotFoundError`. Needs a platform that accepts `workspace_id` on
   these two routes; an older one creates in no workspace and lists everything.
 
+- **An input action's context carries the page in Chromium**, sync and async.
+  `InputContext.dom` is a `PageContext` — the page's URL and title and the
+  interactive elements visible in it (`PageElement`: tag, role, name, text,
+  `href` on links, and a box in screen pixels to click) — when the focused
+  window is Chromium, and `None` otherwise. `InputContext.error` can now be set
+  beside `windows`, saying why `dom` is `None` (another window focused,
+  Chromium not listening, an older computer image); with `windows` of `None`
+  it still means the windows could not be read. `dom` is the last field, with
+  a default, so a positional `InputContext(...)` from an earlier release still
+  works, and a platform without page context decodes as before.
+
 - **`SshKey.reach` says whether this account accepts a listed key**, sync and
   async: `"everywhere"` (added from the dashboard), `"this_account"` or
   `"another_account"` (added through an API key or connected app on that

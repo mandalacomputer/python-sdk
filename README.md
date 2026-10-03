@@ -964,6 +964,28 @@ window still opening may not be listed yet. When they cannot be read — a Windo
 guest, no desktop session — `windows` is `None` and `error` says why; the action
 itself still happened, so do not send it again.
 
+When the focused window is Chromium, the context also carries the page on
+screen as `dom`, a `PageContext`: its `url`, `title`, and the interactive
+elements visible in it — links, buttons, form fields — each a `PageElement`
+with a box in screen pixels, so you can click one without a screenshot to find
+it:
+
+```python
+ctx = c.click(640, 400, context=True)
+nxt = next((e for e in ctx.dom.elements if e.text == "Next"), None) if ctx.dom else None
+if nxt:
+    c.click(nxt.x + nxt.width // 2, nxt.y + nxt.height // 2)
+else:
+    print(ctx.error)  # why there is no page, when there is none
+```
+
+Firefox, the default browser, has no `dom`, and neither does any other window:
+`dom` is `None` and `error` says why, beside the windows. Open the page in
+Chromium to get one:
+`c.exec("nohup chromium https://example.com >/dev/null 2>&1 &", desktop=True)`.
+A password field's value is never read, and a computer made from an image built
+before page context answers `error` saying so.
+
 **Pass `fresh=True` whenever the image is feeding a decision.** A bare
 `screenshot()` may be answered from a frame up to 1.5 seconds old. That is the
 right trade for a thumbnail and the wrong one for a loop: a model shown the
