@@ -809,6 +809,35 @@ def test_ssh_refuses_and_never_falls_back_to_the_terminal(
     assert execs == []
 
 
+@respx.mock
+def test_ssh_refuses_when_every_key_is_bound_to_another_account(
+    env: Path, execs: list[list[str]]
+) -> None:
+    # OPL-5653: a listed key is not an accepted one. Holding only keys bound
+    # to another account would end in an authentication failure inside ssh.
+    elsewhere = {**KEY, "reach": "another_account"}
+    mock_connect(ON, [elsewhere, {**elsewhere, "id": "sshk-2"}])
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["ssh", "dev"])
+    assert caught.value.code == (
+        "mandala-py: every SSH key you hold is bound to another account, so this account's "
+        'computers refuse it; run "mandala-py ssh --setup dev --key PATH" with a separate key, '
+        "or re-add it from the dashboard"
+    )
+    assert execs == []
+    assert not kh(env).exists()
+
+
+@pytest.mark.parametrize("reach", ["this_account", "everywhere", None, "some_new_word"])
+@respx.mock
+def test_ssh_runs_when_one_key_beside_a_refused_one_is_usable(
+    reach: str | None, env: Path, execs: list[list[str]]
+) -> None:
+    mock_connect(ON, [{**KEY, "reach": "another_account"}, {**KEY, "id": "sshk-2", "reach": reach}])
+    assert _cli.main(["ssh", "dev"]) == 0
+    assert execs == [expected_argv(env)]
+
+
 def test_ssh_without_an_ssh_binary_exits_127(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], execs: list[list[str]]
 ) -> None:
@@ -1157,16 +1186,54 @@ def test_setup_reports_a_pending_setting(pub: Path, capsys: pytest.CaptureFixtur
 def test_ssh_key_list(capsys: pytest.CaptureFixture[str]) -> None:
     route = respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[KEY]))
     assert _cli.main(["ssh-key", "list"]) == 0
-    assert capsys.readouterr().out == (
+    out, err = capsys.readouterr()
+    assert out == (
         "ID                     TYPE         FINGERPRINT"
-        "                                         LAST USED  NAME\n"
-        f"sshk-74025eba1b658b99  ssh-ed25519  {FINGERPRINT}  never      laptop\n"
+        "                                         LAST USED  REACH          NAME\n"
+        f"sshk-74025eba1b658b99  ssh-ed25519  {FINGERPRINT}  never      every account  laptop\n"
     )
+    assert err == ""
     assert _cli.main(["ssh-key", "list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == [KEY]
     route.mock(return_value=httpx.Response(200, json=[]))
     assert _cli.main(["ssh-key", "list"]) == 0
     assert capsys.readouterr() == ("", "no SSH keys\n")
+
+
+@respx.mock
+def test_ssh_key_list_shows_reach_and_what_to_do_about_a_refused_key(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # OPL-5653: reach says whether this account accepts a key and whether this
+    # credential can remove it.
+    keys = [
+        KEY,
+        {**KEY, "id": "sshk-2", "name": "ci", "reach": "this_account"},
+        {**KEY, "id": "sshk-3", "name": "old\x1b[2Jbox", "reach": "another_account"},
+        {**KEY, "id": "sshk-4", "name": "legacy", "reach": None},
+    ]
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=keys))
+    assert _cli.main(["ssh-key", "list"]) == 0
+    out, err = capsys.readouterr()
+    head = f"ssh-ed25519  {FINGERPRINT}  never      "
+    assert out == (
+        "ID                     TYPE         FINGERPRINT"
+        "                                         LAST USED  REACH                           NAME\n"
+        f"sshk-74025eba1b658b99  {head}every account                   laptop\n"
+        f"sshk-2                 {head}this account                    ci\n"
+        f"sshk-3                 {head}another account (refused here)  old\\u001b[2Jbox\n"
+        f"sshk-4                 {head}-                               legacy\n"
+    )
+    assert err == (
+        f"mandala-py: key {FINGERPRINT} (old\\u001b[2Jbox) is registered for another of your "
+        "accounts, so this account's computers refuse it. To use it on every account, remove it "
+        "and add it again from the dashboard (a computer's Settings, SSH tab); or use a separate "
+        "key: mandala-py ssh --setup <computer> --key PATH\n"
+    )
+    assert _cli.main(["ssh-key", "list", "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out) == keys
+    assert err == ""
 
 
 @respx.mock
@@ -1194,7 +1261,38 @@ def test_ssh_key_rm_of_an_unknown_key_fails(capsys: pytest.CaptureFixture[str]) 
         return_value=httpx.Response(404, json={"error": "ssh key not found"})
     )
     assert _cli.main(["ssh-key", "rm", "sshk-x"]) == 1
-    assert capsys.readouterr().err == "mandala-py: ssh key not found\n"
+    assert capsys.readouterr().err == f"mandala-py: {RM_NOT_FOUND}\n"
+
+
+#: What ``ssh-key rm sshk-x`` says for a 404 (OPL-5653): the platform answers
+#: it for an unknown id and for a key this credential may not remove alike.
+RM_NOT_FOUND = (
+    "no SSH key sshk-x that this API key can remove: a key added from the dashboard (reach "
+    "every account) or bound to another account (reach another account) is removed from the "
+    "dashboard; `ssh-key list` shows each key's reach"
+)
+
+
+@respx.mock
+def test_ssh_key_rm_of_a_404_keeps_its_code_status_and_ids(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    respx.delete(f"{BASE}/ssh-keys/sshk-x").mock(
+        return_value=httpx.Response(
+            404, json={"error": "ssh key not found"}, headers={"X-Request-ID": "req-1"}
+        )
+    )
+    assert _cli.main(["ssh-key", "rm", "sshk-x"]) == 1
+    assert capsys.readouterr().err == f"mandala-py: {RM_NOT_FOUND}\nmandala-py: request id req-1\n"
+    assert _cli.main(["ssh-key", "rm", "sshk-x", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert json.loads(err)["error"] == {
+        "code": "not_found",
+        "message": RM_NOT_FOUND,
+        "status": 404,
+        "request_id": "req-1",
+    }
 
 
 @respx.mock
