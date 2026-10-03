@@ -407,6 +407,43 @@ def test_scp_upload_json_says_whether_the_platform_counted_it(
     }
 
 
+@pytest.mark.parametrize("reported", [0, 1, 99])
+@pytest.mark.parametrize("json_mode", [True, False])
+@respx.mock
+def test_scp_upload_refuses_a_count_that_differs_from_what_was_sent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    reported: int,
+    json_mode: bool,
+) -> None:
+    # mandala dies "upload was incomplete" here, so its confirmed: true always
+    # means the guest counted every byte sent; this must not print a success.
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=RUNNING))
+    respx.put(f"{BASE}/computers/vm-1/files").mock(
+        return_value=httpx.Response(200, json={"bytes": reported})
+    )
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"abcd")
+    message = f"upload was incomplete: sent 4 bytes but the guest reported {reported}"
+    if json_mode:
+        assert _cli.main(["scp", str(src), "dev:/home/user/", "--json"]) == 1
+        out, err = capsys.readouterr()
+        assert out == ""
+        lines = err.splitlines()
+        assert len(lines) == 1
+        error = json.loads(lines[0])["error"]
+        assert (error["code"], error["message"]) == ("invalid_arguments", message)
+    else:
+        # The text mode exits with the refusal as its message (printed to
+        # stderr, exit 1), and never the "src -> dst (N bytes)" success line.
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(["scp", str(src), "dev:/home/user/"])
+        assert caught.value.code == f"mandala-py: {message}"
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert "->" not in err
+
+
 PROXIED = {
     "id": "vm-1",
     "name": "dev",

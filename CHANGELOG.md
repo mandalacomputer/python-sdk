@@ -72,7 +72,9 @@ This is the summary you read to decide whether to upgrade.
   prints `{"id", "deleted": true}`, `secrets rm` `{"id", "name", "deleted":
   true}` (no `name` when it looks like a value), `ssh-key rm` `{"id",
   "removed": true}` and `scp` `{"source", "destination", "bytes",
-  "confirmed"}`. A local credential refusal is reported under its own code
+  "confirmed"}`; an upload whose reported count differs from what was sent
+  is refused with `invalid_arguments` ("upload was incomplete"), with or
+  without `--json`, as `mandala` refuses it, rather than reported as sent. A local credential refusal is reported under its own code
   (`missing_credentials`, `invalid_base_url`, ...) rather than `failed`;
   `terminal --json` is refused with `unsupported_mode` (exit 1) rather than as
   an unknown option, and `ssh --json <computer>` with an `unsupported_mode`

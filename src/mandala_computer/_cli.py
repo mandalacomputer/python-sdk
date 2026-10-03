@@ -1476,10 +1476,19 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                 "dropping --no-overwrite.",
                 "conflict",
             )
+    # A count that differs from what was sent means the guest holds something
+    # other than this file: refused in both modes, as ``mandala scp`` refuses
+    # it, so ``confirmed: true`` always means the platform counted every byte.
+    if stored is not None and stored != len(data):
+        _die(
+            f"upload was incomplete: sent {len(data)} bytes but the guest reported {stored}",
+            "invalid_arguments",
+        )
     if args.json:
         # ``bytes`` is what was sent; ``confirmed`` says whether the platform
-        # reported a count of what it wrote, as ``mandala scp --json`` says it.
-        # A platform that reports none is not evidence that everything landed.
+        # reported a count of what it wrote (one that matched, as checked
+        # above), as ``mandala scp --json`` says it. A platform that reports
+        # none is not evidence that everything landed.
         _json(
             {
                 "source": args.src,

@@ -3483,7 +3483,9 @@ snake_case. Every command accepts `--json` except `terminal` and a plain `ssh`
 `{"id", "deleted": true}` (`secrets rm` adds the `name` unless it looks like a
 value; `ssh-key rm` prints `"removed": true`), and `scp` prints `{"source",
 "destination", "bytes", "confirmed"}` — on an upload `bytes` is what was sent
-and `confirmed` says whether the platform reported what it wrote.
+and `confirmed` says whether the platform reported what it wrote; a reported
+count that differs from what was sent is refused (`invalid_arguments`, in both
+modes), as `mandala` refuses it.
 `browser-proxy` and `egress-proxy` `set` and `clear` print the computer's record
 without its `vnc` desktop URLs, as `mandala` does; their `get` prints the
 setting alone, with the computer's `id` and `name`. A failure prints nothing on
