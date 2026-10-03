@@ -657,6 +657,28 @@ def test_ssh_keys_and_access_decode() -> None:
         assert access.key_count == 1
 
 
+def test_ssh_key_keeps_its_positional_constructor() -> None:
+    # SshKey is exported, so its field order is its constructor. ``raw`` was
+    # the eighth positional slot before ``reach`` existed; a positional call
+    # from that release must still bind the mapping to ``raw``, leave
+    # ``reach`` unset, and build a hashable key. ``reach`` is keyword-only.
+    payload = {"id": "sshk-1", "reach": "everywhere"}
+    key = mc.SshKey(
+        "sshk-1",
+        "laptop",
+        PUBLIC_KEY,
+        FINGERPRINT,
+        "ssh-ed25519",
+        "2026-09-16T12:00:00Z",
+        None,
+        payload,
+    )
+    assert key.raw == payload
+    assert key.reach is None
+    hash(key)
+    assert mc.SshKey.from_api(KEY).reach == "everywhere"
+
+
 def test_access_reads_a_missing_enabled_as_off() -> None:
     access = mc.SshAccess.from_api({"computer": "vm-9", "available": False})
     assert access.enabled is False

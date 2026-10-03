@@ -15,7 +15,9 @@ This is the summary you read to decide whether to upgrade.
   async: `"everywhere"` (added from the dashboard), `"this_account"` or
   `"another_account"` (added through an API key or connected app on that
   account), relative to the account the API key acts on and never naming
-  another. `None` from a platform that does not report it.
+  another. `None` from a platform that does not report it. It is
+  keyword-only, after `raw`, so a positional `SshKey(...)` call from an
+  earlier release still binds its eighth argument to `raw`.
 
 ### Fixed
 

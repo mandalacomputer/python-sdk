@@ -3189,6 +3189,7 @@ class SshKey:
     created_at: str
     #: When this key last opened a connection to a computer. ``None`` until it has.
     last_used_at: str | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
     #: Where this key can connect, from the account the API key acts on
     #: (platform OPL-5617): ``"everywhere"`` (added from the dashboard, accepted
     #: on every account where you are an owner or member), ``"this_account"``
@@ -3197,8 +3198,11 @@ class SshKey:
     #: account, and refused here; which account is never said). Any other
     #: string is a value a newer platform added, kept as it is. ``None`` from a
     #: platform that does not report it.
-    reach: str | None = None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #:
+    #: KEYWORD-ONLY, after ``raw``: this class is exported, so its field order
+    #: is its constructor, and ``raw`` was the eighth positional slot before
+    #: this field existed (see the note on :attr:`Template.ref`).
+    reach: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SshKey:
