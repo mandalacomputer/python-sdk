@@ -2075,6 +2075,23 @@ def test_workspaces_rm_without_yes_is_refused_before_any_request(
     assert "--yes" in error["message"]
 
 
+def test_workspaces_rm_says_a_workspace_holding_computers_cannot_be_deleted(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The platform deletes only an empty workspace (409 while it holds any), so
+    # neither the confirmation nor the module's help may say they are kept.
+    import json
+
+    with respx.mock(assert_all_called=False):
+        assert _cli.main(["workspaces", "rm", "acme", "--json"]) == 1
+    message = json.loads(capsys.readouterr().err)["error"]["message"]
+    assert "a workspace that still holds computers cannot be deleted" in message
+    assert "kept" not in message and "not touched" not in message
+    doc = _cli.__doc__ or ""
+    assert "(it must hold no computers)" in doc
+    assert "computers are kept" not in doc
+
+
 @respx.mock
 def test_workspaces_rm_refuses_a_name_that_fits_two(capsys: pytest.CaptureFixture[str]) -> None:
     import json

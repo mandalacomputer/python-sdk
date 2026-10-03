@@ -2686,8 +2686,11 @@ print(client.workspaces.delete(acme.id).revoked_keys, "keys revoked")
 Creating, renaming and deleting need an owner's account-wide key; a key
 confined to a workspace is refused them with `PermissionDeniedError`. Deleting
 a workspace REVOKES every API key confined to it, whoever holds it, and
-`revoked_keys` says how many. Its computers are not touched: they keep the
-deleted workspace's id, and account-wide keys reach them as before.
+`revoked_keys` says how many. Only an empty workspace can be deleted: one that
+still holds computers is refused with `ConflictError` (409) saying how many,
+and nothing is deleted or revoked; delete those computers first. If the
+platform cannot confirm the workspace is empty, the answer is
+`UnavailableError` (503), also with nothing deleted; try again shortly.
 
 A key confined to a workspace lists that one workspace and no other, and `get`
 of any other id raises `NotFoundError`, the same as one that does not exist (so
@@ -3566,7 +3569,9 @@ refused (`ambiguous_workspace`) with their ids.
 `workspaces rm WORKSPACE --yes` need an owner's account-wide key; `rename` and
 `rm` take a name or an id. `rm` does nothing without `--yes`
 (`confirmation_required`), because deleting a workspace revokes every API key
-confined to it; it prints how many. Its computers are kept.
+confined to it; it prints how many. A workspace that still holds computers
+cannot be deleted: the platform refuses it (`conflict`, 409) saying how many,
+and nothing is deleted or revoked.
 
 `workspaces use WORKSPACE [--profile NAME]` saves a default workspace, by name
 or id, for a saved profile (`--profile`, else `MANDALA_PROFILE`, else the

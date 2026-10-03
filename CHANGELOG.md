@@ -49,6 +49,15 @@ This is the summary you read to decide whether to upgrade.
 
 ### Changed
 
+- **Deleting a workspace is documented as the platform does it: only an
+  empty one.** `workspaces.delete()`, `WorkspaceDeleted`, the README and
+  `mandala-py workspaces rm`'s help and confirmation said a deleted
+  workspace's computers were kept. The platform refuses to delete a workspace
+  that still holds computers, with `ConflictError` (409) saying how many, and
+  deletes and revokes nothing; when it cannot confirm the workspace is empty it
+  answers `UnavailableError` (503), also with nothing deleted. Documentation
+  only.
+
 - **The `ssh_keys` documentation says a key added through the API is bound to
   its credential**, sync and async. A key registered with
   `client.ssh_keys.add()` now reaches only the account the API key (or
