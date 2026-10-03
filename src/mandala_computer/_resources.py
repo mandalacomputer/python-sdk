@@ -1905,7 +1905,10 @@ class SshKeys:
 
     An API key confined to a workspace cannot add or remove keys: the platform
     answers :class:`~mandala_computer.PermissionDeniedError`, because a key
-    reaches further than that workspace.
+    reaches further than that workspace. Any other API key or connected app
+    removes only keys whose reach is ``"this_account"``; any other key is a
+    :class:`~mandala_computer.NotFoundError` to :meth:`remove`, and is removed
+    from the dashboard.
     """
 
     def __init__(self, transport: Transport) -> None:
@@ -1942,10 +1945,13 @@ class SshKeys:
     def remove(self, key_id: str) -> None:
         """Remove one of your keys. New connections with it are refused at once;
         a session already open goes on until it disconnects. An unknown id is a
-        :class:`~mandala_computer.NotFoundError`, and so is a key whose
-        :attr:`~mandala_computer.SshKey.reach` is ``"another_account"``: an API
-        key cannot remove one bound to a different account. Remove it from the
-        dashboard."""
+        :class:`~mandala_computer.NotFoundError`. So is any key whose
+        :attr:`~mandala_computer.SshKey.reach` is not ``"this_account"``: an API
+        key or connected app removes only a key bound to the account it acts
+        on, not one added from the dashboard (or through the API before keys
+        were bound to an account), whose reach is ``"everywhere"``, nor one
+        bound to a different account, ``"another_account"``. Remove those from
+        the dashboard."""
         self._t.request("DELETE", _api.ssh_key(key_id))
 
 

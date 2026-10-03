@@ -3682,8 +3682,11 @@ on, and is removed when the key is revoked. Each person holds eight. The listing
 shows every key you hold, whichever account asks; each key's `reach` says where
 it works from there: `everywhere`, `this_account` or `another_account` (which
 account is not said). A key is registered once, so a key bound to another
-account cannot be added again here, and an API key cannot remove it: remove it
-from the dashboard.
+account cannot be added again here. An API key removes only a key whose reach is
+`this_account`: `mandala-py ssh-key rm` on any other key, one added from the
+dashboard (or with an API key before keys were bound to an account) or one bound
+to another account, fails as if the id were unknown. Remove those from the
+dashboard.
 
 #### Without the CLI: `ssh-config`, VS Code, scp and sftp
 
@@ -3787,7 +3790,8 @@ another way.
 In the SDK the same operations are `client.ssh_keys.list()`,
 `client.ssh_keys.add(public_key, name=None)`, `client.ssh_keys.remove(key_id)`,
 whose `SshKey` carries `reach` (`None` from a platform that does not report
-it), and on a computer `c.ssh_access()` and `c.set_ssh_access(enabled)`, which answer
+it; `remove()` raises `NotFoundError` for any key whose reach is not
+`this_account`, as for an unknown id), and on a computer `c.ssh_access()` and `c.set_ssh_access(enabled)`, which answer
 an `SshAccess` (`enabled`, `available`, `pending`, `key_count`, `keys_pushed`,
 `error`). The async client has the same methods.
 
