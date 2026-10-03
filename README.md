@@ -2013,7 +2013,10 @@ An endpoint that keeps failing is switched off: once a delivery runs out of
 attempts and nothing has been accepted for a day, the subscription reads
 `enabled=False` with `disabled_reason="failing"` — `hook.is_failing` — and
 pending deliveries are dropped. `client.webhooks.update(hook.id, enabled=True)`
-starts it fresh. An update sends only what you name; `events=[]` or
+starts it fresh. When the account moves to a plan without webhooks, its
+subscriptions read `disabled_reason="plan"` and `enabled=True` is refused
+(402); choosing a plan with webhooks enables them again, oldest first, as many
+as the plan allows. An update sends only what you name; `events=[]` or
 `computers=[]` clears that filter back to everything, and naming nothing is
 refused rather than sent. `client.webhooks.test(hook.id)` queues one signed
 delivery of a synthetic `webhook.test` event through the ordinary path, and the

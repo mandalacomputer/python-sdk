@@ -3089,12 +3089,19 @@ class Webhook:
     #: name a computer you are about to create.
     computers: builtins.list[str]
     #: Whether deliveries are made. Set ``False`` by the platform when an
-    #: endpoint has failed for a day — see :attr:`disabled_reason` — and back
-    #: to ``True`` by you with an update, which starts fresh.
+    #: endpoint has failed for a day, or when the account moves to a plan
+    #: without webhooks — see :attr:`disabled_reason`. Back to ``True`` by you
+    #: with an update, which starts fresh, or, for ``"plan"``, by the platform
+    #: when you choose a plan that includes webhooks.
     enabled: bool
     #: Why :attr:`enabled` is false: ``"customer"`` when you disabled it,
-    #: ``"failing"`` when the platform did — a delivery ran out of attempts and
-    #: nothing had been accepted for 24 hours. ``None`` while enabled.
+    #: ``"failing"`` when the platform did after a day of failures — a delivery
+    #: ran out of attempts and nothing had been accepted for 24 hours —
+    #: ``"plan"`` when the account moved to a plan without webhooks. A
+    #: ``"plan"`` subscription is enabled again, oldest first, as many as the
+    #: plan allows, when the account chooses a plan that includes webhooks;
+    #: until then ``enabled=True`` is refused (402). A plain string, not a
+    #: closed set: the platform may add reasons. ``None`` while enabled.
     disabled_reason: str | None
     #: RFC 3339, or ``None`` while enabled.
     disabled_at: str | None
