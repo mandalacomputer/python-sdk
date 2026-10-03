@@ -2047,16 +2047,35 @@ def _no_secret_named(typed: str, scope: str) -> NoReturn:
     _die(lambda s: f"no secret named {s(shown)} in {scope}", "not_found")
 
 
+def _secret_moved(typed: str, first: str, now: str) -> NoReturn:
+    """Refuse a ``secrets rm`` retry whose ``typed`` now resolves to secret
+    ``now`` rather than ``first``, the one the first read chose. ``typed`` is
+    repeated only when :func:`_quoted_operand` finds it safe to."""
+    shown = _quoted_operand(typed) or "that name or id"
+    _die(
+        lambda s: (
+            f"{shown} changed while it was being removed: it named secret {s(first)} "
+            f"and now names {s(now)}; nothing was deleted, run the command again"
+        ),
+        "conflict",
+    )
+
+
 def _cmd_secrets_rm(args: argparse.Namespace) -> int:
     """``secrets rm NAME``: delete a secret, by name or id, at the revision read.
 
     A revision that moved between the read and the delete (somebody replaced
     it first) is read again and the delete sent again, up to
     :data:`_REVISION_ATTEMPTS` times in all, as the TypeScript CLI does.
+
+    A retry deletes only the secret the first read chose. If ``NAME`` now
+    resolves to a different secret (somebody created one named like the
+    chosen secret's id, say), nothing more is deleted and the command fails.
     """
     workspace = _scope(args)
     scope = f"workspace {workspace}" if workspace else "the account-wide scope"
     removed: Secret | None = None
+    chosen: str | None = None
     with _client() as client:
         attempt = 0
         while removed is None:
@@ -2065,6 +2084,10 @@ def _cmd_secrets_rm(args: argparse.Namespace) -> int:
             found = _secret_to_remove(listed, args.name)
             if found is None:
                 _no_secret_named(args.name, scope)
+            if chosen is None:
+                chosen = found.id
+            elif found.id != chosen:
+                _secret_moved(args.name, chosen, found.id)
             try:
                 client.secrets.delete(
                     found.id, revision_id=found.revision_id, workspace_id=workspace

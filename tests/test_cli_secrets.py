@@ -597,6 +597,34 @@ def test_rm_surfaces_the_conflict_after_three_attempts(
 
 
 @respx.mock
+def test_rm_never_deletes_a_different_secret_on_the_retry(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Between the first read and the retry, somebody creates a secret NAMED
+    # like the chosen secret's id. An exact name wins a fresh resolution, so
+    # a retry that resolved again would delete that one instead.
+    other_id = "csec-fedcba9876543210"
+    other = {**SECRET, "id": other_id, "name": ID}
+    respx.get(f"{BASE}/secrets").mock(
+        side_effect=[
+            httpx.Response(200, json=LISTING),
+            httpx.Response(
+                200, json={**LISTING, "secrets": [{**SECRET, "revision_id": REV2}, other]}
+            ),
+        ]
+    )
+    mine = respx.delete(f"{BASE}/secrets/{ID}").mock(httpx.Response(409, json=STALE))
+    theirs = respx.delete(f"{BASE}/secrets/{other_id}").mock(httpx.Response(204))
+    with pytest.raises(_cli._Failure) as caught:
+        _cli.main(["secrets", "rm", ID])
+    assert caught.value.reason == "conflict"
+    assert other_id in caught.value.message and "nothing was deleted" in caught.value.message
+    assert mine.call_count == 1
+    assert theirs.call_count == 0
+    assert "deleted" not in capsys.readouterr().out
+
+
+@respx.mock
 def test_list_shows_each_secrets_revision(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/secrets").mock(httpx.Response(200, json=LISTING))
     assert _cli.main(["secrets", "list"]) == 0

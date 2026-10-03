@@ -60,7 +60,9 @@ This is the summary you read to decide whether to upgrade.
   name shaped like a value.
 - **`mandala-py secrets rm` reads the secret again when its revision moved**
   between the read and the delete, up to three attempts in all, instead of
-  failing on the first 409, as the TypeScript CLI does.
+  failing on the first 409, as the TypeScript CLI does. A retry deletes only
+  the secret the first read chose: if the name now resolves to another secret,
+  it deletes nothing more and fails with `conflict`.
 - **`mandala-py secrets list` prints each secret's revision**, in a REVISION
   column after SCOPE, as it was documented to.
 
