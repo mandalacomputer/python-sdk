@@ -40,6 +40,18 @@ This is the summary you read to decide whether to upgrade.
 
 ### Fixed
 
+- **`mandala-py` shows an SSH key's reach, and stops before `ssh` when no key
+  you hold is accepted here.** `mandala-py ssh-key list` has a REACH column
+  (`every account`, `this account`, or `another account (refused here)`) and,
+  for a key bound to another account, prints on stderr what to do about it.
+  `mandala-py ssh-key rm` of a key this API key cannot remove says so and names
+  both causes (a key added from the dashboard, or one bound to another
+  account, is removed from the dashboard) instead of the platform's bare
+  "ssh key not found"; it is still `not_found` with status 404 and exit 1.
+  `mandala-py ssh <computer>` refuses, before running ssh, when every key you
+  hold is bound to another account, rather than leaving ssh to fail
+  authentication. `--json` output is unchanged. The same as `mandala`.
+
 - **The `operations` docs no longer say dashboard calls record none.** The
   platform records the dashboard's lifecycle calls the same way and lists them
   in `operations.list()`, all but a move. The `Operations` docstring and the

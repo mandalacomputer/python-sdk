@@ -3448,10 +3448,22 @@ def _ssh_connect(target: str, extra: list[str]) -> int:
                     f"on, {_terminal_hint(target)}"
                 )
             )
-        if not client.ssh_keys.list():
+        keys = client.ssh_keys.list()
+        if not keys:
             _die(
                 f'you have no SSH keys registered; run "{PROG} ssh --setup {quoted}" to add '
                 f"one, {_terminal_hint(target)}"
+            )
+        # Listed is not accepted: a key bound to another account is refused by
+        # this account's computers, so holding only those keys would end in an
+        # authentication failure inside ssh. A reach the platform did not
+        # report counts as usable.
+        if not any(k.reach != "another_account" for k in keys):
+            _die(
+                "every SSH key you hold is bound to another account, so this account's "
+                f'computers refuse it; run "{PROG} ssh --setup {quoted} --key PATH" with a '
+                "separate key, or re-add it from the dashboard",
+                "ssh_key_elsewhere",
             )
     known_hosts = _openssh.known_hosts_path()
     _openssh.ensure_known_hosts(gw, known_hosts)
@@ -3547,18 +3559,33 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
     return 0
 
 
-def _key_elsewhere(key: SshKey, target: str, spell: _Spell) -> str:
+def _key_elsewhere(key: SshKey, target: str | None, spell: _Spell) -> str:
     """Why ``--setup`` stops for a key this account refuses: it is registered
     to the caller, bound to another of their accounts. Adding it again is a
     conflict, since a key is registered once, and an API key cannot remove a
     key bound elsewhere; the dashboard can, and a key added there works
-    everywhere."""
+    everywhere. ``ssh-key list``, which names no computer, passes ``None``."""
+    computer = "<computer>" if target is None else shlex.quote(target)
     return (
         f"key {spell(key.fingerprint)} ({spell(key.name)}) is registered for another of your "
         "accounts, so this account's computers refuse it. To use it on every account, remove "
         "it and add it again from the dashboard (a computer's Settings, SSH tab); or use a "
-        f"separate key: {PROG} ssh --setup {shlex.quote(target)} --key PATH"
+        f"separate key: {PROG} ssh --setup {computer} --key PATH"
     )
+
+
+def _reach_label(reach: str | None) -> str:
+    """A key's reach as ``ssh-key list`` shows it, in the MCP server's words:
+    whether this account's computers accept the key, and so whether this
+    credential can remove it (only a ``this_account`` key). A word this CLI
+    does not know is shown as sent; a platform that does not report reach
+    shows ``-``."""
+    labels = {
+        "everywhere": "every account",
+        "this_account": "this account",
+        "another_account": "another account (refused here)",
+    }
+    return labels.get(reach or "", reach or "-")
 
 
 def _own_key(client: Client, fingerprint: str) -> SshKey | None:
@@ -3566,8 +3593,11 @@ def _own_key(client: Client, fingerprint: str) -> SshKey | None:
 
 
 def _key_rows(keys: Sequence[SshKey]) -> str:
-    rows = [(k.id, k.key_type, k.fingerprint, k.last_used_at or "never", k.name) for k in keys]
-    return _table(("ID", "TYPE", "FINGERPRINT", "LAST USED", "NAME"), rows)
+    rows = [
+        (k.id, k.key_type, k.fingerprint, k.last_used_at or "never", _reach_label(k.reach), k.name)
+        for k in keys
+    ]
+    return _table(("ID", "TYPE", "FINGERPRINT", "LAST USED", "REACH", "NAME"), rows)
 
 
 def _cmd_ssh_key_list(args: argparse.Namespace) -> int:
@@ -3579,6 +3609,12 @@ def _cmd_ssh_key_list(args: argparse.Namespace) -> int:
         print(_key_rows(keys))
     else:
         print("no SSH keys", file=sys.stderr)
+    if not args.json:
+        # What to do about a key this account refuses, after the table, on
+        # stderr so the table still pipes clean.
+        for k in keys:
+            if k.reach == "another_account":
+                print(f"{PROG}: {_key_elsewhere(k, None, _shown)}", file=sys.stderr)
     return 0
 
 
@@ -3595,7 +3631,26 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
 
 def _cmd_ssh_key_rm(args: argparse.Namespace) -> int:
     with _client() as client:
-        client.ssh_keys.remove(args.id)
+        try:
+            client.ssh_keys.remove(args.id)
+        except NotFoundError as err:
+            # The platform answers 404 both for an id it does not know and for
+            # a key this credential may not remove (reach ``everywhere`` or
+            # ``another_account``). Same class, status and ids, so ``--json``
+            # and the exit status are as they were; only the sentence names
+            # both causes and where the second is fixed.
+            raise NotFoundError(
+                f"no SSH key {args.id} that this API key can remove: a key added from the "
+                "dashboard (reach every account) or bound to another account (reach another "
+                "account) is removed from the dashboard; `ssh-key list` shows each key's reach",
+                status=err.status,
+                body=err.body,
+                retry_after=err.retry_after,
+                request_id=err.request_id,
+                allow=err.allow,
+                www_authenticate=err.www_authenticate,
+                method=err.method,
+            ) from err
     if args.json:
         _json({"id": args.id, "removed": True})
     else:
