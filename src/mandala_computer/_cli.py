@@ -35,8 +35,10 @@ Two subcommands address a computer by name or id:
     The account's secret store. ``set NAME`` reads the value from stdin, or
     prompts for it without echo — never from the command line, where it would
     land in shell history and ``ps`` — and creates the secret or replaces its
-    value. ``get`` reads one secret's metadata by name or id. No command ever
-    prints a value: the platform returns none.
+    value; a NAME that looks like a value typed in its place is refused, with
+    nothing sent, unless ``--no-value-check``. ``get`` reads one secret's
+    metadata by name or id. No command ever prints a value: the platform
+    returns none.
 
 ``mandala-py whoami`` / ``mandala-py api-keys <list|create|revoke>``
     Who the credential is, and the holder's own API keys. The ``api-keys``
@@ -93,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -1602,10 +1605,17 @@ def _cmd_webhooks_deliveries(args: argparse.Namespace) -> int:
 
 def _secret_rows(secrets: Sequence[Secret]) -> str:
     rows = [
-        (x.id, x.name, x.workspace_id or "account", x.last_used_at or "never", x.updated_at)
+        (
+            x.id,
+            x.name,
+            x.workspace_id or "account",
+            x.revision_id,
+            x.last_used_at or "never",
+            x.updated_at,
+        )
         for x in secrets
     ]
-    return _table(("ID", "NAME", "SCOPE", "LAST USED", "UPDATED"), rows)
+    return _table(("ID", "NAME", "SCOPE", "REVISION", "LAST USED", "UPDATED"), rows)
 
 
 def _cmd_secrets_list(args: argparse.Namespace) -> int:
@@ -1666,6 +1676,21 @@ def _secret_value(keep_newline: bool) -> str:
 
 
 def _cmd_secrets_set(args: argparse.Namespace) -> int:
+    """``secrets set NAME``: create the secret, or replace its value.
+
+    A NAME that :func:`_looks_like_secret_value` flags — the value typed where
+    the name goes, ``secrets set "$GITHUB_TOKEN"`` — is refused before the
+    value is read and before any request, and never repeated: sent, it would be
+    stored as a name every member of the scope can read, and printed back.
+    ``--no-value-check`` sends a real name the check misreads.
+    """
+    if not args.no_value_check and _looks_like_secret_value(args.name.strip(_JS_TRIM)):
+        _die(
+            "the NAME given to secrets set looks like a secret's value, not a name; nothing was "
+            "sent. Give the name as NAME and pipe the value on stdin or type it at the prompt; "
+            "if it is a name after all, send it as typed with --no-value-check",
+            "invalid_arguments",
+        )
     value = _secret_value(args.keep_newline)
     workspace = _scope(args)
     with _client() as client:
@@ -1694,9 +1719,11 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
     by_name = _named_secret(listed, name)
     by_id = next((x for x in listed if x.id == name), None)
     if by_name is not None and by_id is not None and by_name.id != by_id.id:
+        # Quoted only when safe to repeat: the operand may be the value itself.
+        typed = _quoted_operand(name) or "that name or id"
         _die(
             lambda s: (
-                f"{name!r} is both a name ({s(by_name.name)}, {s(by_name.id)}) and another "
+                f"{typed} is both a name ({s(by_name.name)}, {s(by_name.id)}) and another "
                 "secret's id; give the exact name"
             ),
             "ambiguous_secret",
@@ -1705,6 +1732,272 @@ def _secret_to_remove(listed: Sequence[Secret], name: str) -> Secret | None:
 
 
 _SECRET_ID = re.compile(r"csec-[0-9a-f]{16}")
+
+
+#: How many times ``secrets rm`` reads a secret again when its revision moved
+#: between the read and the delete (the TypeScript CLI's ``REVISION_ATTEMPTS``).
+_REVISION_ATTEMPTS = 3
+
+# --- whether a NAME is a secret's value typed where the name goes -------------
+#
+# A port of the TypeScript CLI's ``looksLikeSecretValue`` (src/cli-secrets.ts),
+# rule for rule, so ``mandala secrets set "$GITHUB_TOKEN"`` and ``mandala-py
+# secrets set "$GITHUB_TOKEN"`` refuse the same operands. The vectors its tests
+# pin are copied into tests/test_cli_secrets.py; change both together. Every
+# pattern is ASCII-only and spelled without ``re.IGNORECASE`` (which folds
+# Unicode in Python and not in JavaScript), and ``\Z`` stands for JavaScript's
+# ``$``, which without the ``m`` flag matches only at the very end.
+
+#: The prefixes credential issuers put on their tokens: GitHub, OpenAI and
+#: Stripe style ``sk-``/``sk_live_``, Slack, GitLab, Google, Hugging Face, npm,
+#: PyPI, SendGrid, DigitalOcean, Shopify, xAI, Groq, Replicate, Linear, Square,
+#: Perplexity, and a JWT's encoded header.
+_TOKEN_PREFIX = re.compile(
+    r"(?:gh[pousr]_|github_pat_|sk-|sk_(?:live|test)_|rk_(?:live|test)_|xox[abeprs]-|xapp-"
+    r"|glpat-|AIza|hf_|npm_|pypi-|SG\.|dop_v1_|shp(?:at|ca|pa|ss)_|xai-|gsk_|r8_|lin_api_"
+    r"|sq0(?:atp|csp)-|pplx-|eyJ)"
+)
+
+#: An AWS access key id, which is shaped exactly like a variable name.
+_AWS_KEY_ID = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")
+
+#: A UUID, the whole of some providers' API keys, and a valid file name.
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+#: Standard-alphabet base64 of twenty characters or more, padding and all.
+#: URL-safe base64 reads as a name's separators, and a key under twenty
+#: characters is too short to tell from a name, so neither is caught.
+_BASE64 = re.compile(r"[A-Za-z0-9+/]{20,}={0,2}")
+
+#: A camel-case run cut into its segments: an acronym's plural, a word with
+#: or without its capital, or an acronym.
+_CAMEL_SEGMENT = re.compile(r"[A-Z]{2,}s(?![a-z])|[A-Z]?[a-z]+|[A-Z]+(?![a-z])")
+
+#: Two-letter words a camel-case name really holds (``Id``, ``Db``, the ``Ed``
+#: of ``Ed25519``): the only pairs :func:`_word_segment` takes.
+_SHORT_WORDS = frozenset(
+    (  # noqa: SIM905 - one string reads as the list it is
+        "ad ai an as at az be by ca cd cf ci db dc de do dr ec ed eu ex fr gc gh gl go hr id if "
+        "in io ip is it jp js kv lb me ml mq ms mx my nd no of ok on or os pg pk pr py qa rb "
+        "re ro rw rx sa sf so tf to ts tx ui uk up us ux vm vs we wg wp ws"
+    ).split()
+)
+
+#: Words the spelling rules of :func:`_word_segment` would refuse: vowelless
+#: abbreviations (``Http``, ``Ssl``) and names spelled against English.
+_KNOWN_WORDS = frozenset(
+    (  # noqa: SIM905 - one string reads as the list it is
+        "acr aks alb bgp cdn cfg cmd cms cpp cpu crl crm crt csr csrf csv ctx dbt dkim dns dsn dst "
+        "ecr ecs eks elb ftp gcp gcr gcs ghcr gke gpg gpt gpu grpc hsm html http https jwks jwt "
+        "kdf kms ldap lfs llm mcp mfa mgmt mqtt msg mtls nfs nlb nlp npm ntp ocsp pbkdf pdf pfx "
+        "pgp pkg pkcs pki png pnpm prd psk pwd rbac rds rpc rsa rtc scp sdk ses sftp smb sms smtp "
+        "sns spf sql sqs src ssh ssl ssm sso stg sts svc svg svn tcp tls tmp tpm tpu ttl txt udp "
+        "vcs vlan vpc vpn vxlan waf wss xml xsrf xss zfs "
+        "etcd graphql groq jfrog mysql nginx pgbackrest pgbouncer qdrant rabbitmq"
+    ).split()
+)
+
+#: The consonants that follow each consonant inside English words (``y``
+#: counts as a vowel), and each one ahead of a plural ``s``.
+_CONSONANT_PAIRS = frozenset(
+    first + following
+    for first, nexts in {
+        "b": "bcdhjlmnprstv",
+        "c": "chklnqrst",
+        "d": "bcdfghjlmnprsvw",
+        "f": "flrst",
+        "g": "bdghlmnrstw",
+        "h": "bdflmnprstw",
+        "j": "s",
+        "k": "bfhlmnrstw",
+        "l": "bcdfghklmnprstvw",
+        "m": "bflmnps",
+        "n": "bcdfghjklmnpqrstvwz",
+        "p": "bfhlmnprstw",
+        "r": "bcdfghjklmnpqrstvw",
+        "s": "bcdfghklmnpqrstw",
+        "t": "bcdfghlmnprstwz",
+        "v": "s",
+        "w": "bdfhklmnrst",
+        "x": "chpst",
+        "z": "lsz",
+    }.items()
+    for following in nexts
+)
+
+#: The two consonants an English word opens with.
+_ONSETS = frozenset(
+    (  # noqa: SIM905 - one string reads as the list it is
+        "bh bl br ch cl cn cr ct cz dh dr dw fl fr gh gl gn gr kh kl kn kr mn ph pl pn pr ps pt "
+        "rh sc sh sk sl sm sn sp sq st sw th tr ts tw wh wr"
+    ).split()
+)
+
+
+def _entropy(text: str) -> float:
+    """Shannon entropy, in bits per character."""
+    bits = 0.0
+    for n in Counter(text).values():
+        bits -= (n / len(text)) * math.log2(n / len(text))
+    return bits
+
+
+def _letter_share(run: str, words: Sequence[str]) -> float:
+    """The share of ``run``'s letters that sit in ``words``, pieces of it."""
+    letters = len(re.sub(r"[0-9]", "", run))
+    return len("".join(words)) / letters if letters else 0
+
+
+def _camel_words(run: str) -> bool:
+    """Whether a run holding both cases reads as camel-case words rather than
+    at random: 65% of its letters in words, or — once two capitalised words
+    with a vowel hold 40% of them — 65% in words and acronyms together."""
+    if _letter_share(run, re.findall(r"[A-Z]?[a-z]{2,}", run)) >= 0.65:
+        return True
+    words = [w for w in re.findall(r"[A-Z][a-z]{2,}", run) if re.search(r"[aeiou]", w)]
+    return (
+        len(words) >= 2
+        and _letter_share(run, words) >= 0.4
+        and _letter_share(
+            run, re.findall(r"[A-Z]?[a-z]{2,}|[A-Z]{2,}(?=[A-Z][a-z]{2}|[0-9]|\Z)", run)
+        )
+        >= 0.65
+    )
+
+
+def _oddities(word: str) -> int:
+    """How far a lowercased segment strays from English spelling."""
+    count = 1 if re.match(r"[^aeiouy]{2}", word) and word[:2] not in _ONSETS else 0
+    for run in re.findall(r"[^aeiouy]{2,}", word):
+        for i in range(len(run) - 1):
+            if run[i : i + 2] not in _CONSONANT_PAIRS:
+                count += 1
+    return count + len(re.findall(r"q(?![ul])", word))
+
+
+def _word_segment(segment: str, last: bool) -> bool:
+    """Whether one camel-case segment of a name reads as a word."""
+    if len(segment) == 1:
+        return bool(re.search(r"[AEIOUaeiou]", segment)) or (
+            last and bool(re.search(r"[A-Z]", segment))
+        )
+    if re.search(r"^[A-Z]+\Z|^[A-Z]{2,}s\Z", segment):
+        return True
+    word = segment.lower()
+    if word in _KNOWN_WORDS:
+        return True
+    if len(word) == 2:
+        return word in _SHORT_WORDS
+    if not re.search(r"[aeiouy]", word):
+        return False
+    return _oddities(word) <= (1 if len(word) >= 4 else 0)
+
+
+def _prefixed_words(run: str) -> bool:
+    """Whether a digit-free run after a known token prefix reads as camel-case
+    words, every segment of it a word."""
+    if not _camel_words(run):
+        return False
+    segments = _CAMEL_SEGMENT.findall(run)
+    return all(_word_segment(s, i == len(segments) - 1) for i, s in enumerate(segments))
+
+
+def _random_run(run: str) -> bool:
+    """Whether one run of letters and digits reads as random rather than as words."""
+    classes = sum(1 for c in (r"[a-z]", r"[A-Z]", r"[0-9]") if re.search(c, run))
+    if len(run) < 20 or classes < 2 or _entropy(run) < 3:
+        return False
+    hexed = re.search(r"[0-9a-f]{20,}|[0-9A-F]{20,}", run)
+    if hexed and re.search(r"[0-9]", hexed.group(0)) and re.search(r"[a-fA-F]", hexed.group(0)):
+        return True
+    if re.search(r"[a-z]", run) and re.search(r"[A-Z]", run):
+        return not _camel_words(run)
+    letters = len(re.sub(r"[0-9]", "", run))
+    runs = re.findall(r"[a-z]+|[A-Z]+|[0-9]+", run)
+    vowels = len(re.findall(r"[aeiouAEIOU]", run))
+    return len(run) / len(runs) < 3.2 and vowels / letters < 0.3
+
+
+def _name_piece(piece: str) -> bool:
+    """Whether one piece of a base64-shaped string, between ``/`` and ``+``,
+    reads as a name's."""
+    if len(piece) <= 4 or re.fullmatch(r"[a-z0-9]+|[A-Z0-9]+", piece):
+        return True
+    if not re.search(r"[a-z]", piece) or not re.search(r"[A-Z]", piece):
+        return False
+    # A leading acronym (``APIKey``, ``HMACKey``) is one word, as a camel-case
+    # name spells it, so it goes before the words are read.
+    letters = re.sub(r"[0-9]+", "", piece)
+    if _camel_words(re.sub(r"^[A-Z]+(?=[A-Z][a-z])", "", letters, count=1)):
+        return True
+    segments = [s for run in re.split(r"[0-9]+", piece) for s in _CAMEL_SEGMENT.findall(run)]
+    # A two-letter word ahead of one acronym (``MySQLURL``) holds no word of
+    # three letters, so it is taken by its shape alone.
+    short_word_acronym = bool(re.fullmatch(r"[A-Z][a-z][A-Z]{3,}", piece))
+    return (
+        short_word_acronym or any(re.fullmatch(r"[A-Z]?[a-z]{2,}", s) for s in segments)
+    ) and all(_word_segment(s, i == len(segments) - 1) for i, s in enumerate(segments))
+
+
+def _base64_value(text: str) -> bool:
+    """Whether a base64 string that ``/`` or ``+`` cut into short runs is random."""
+    if not _BASE64.fullmatch(text) or not re.search(r"[+/]", text):
+        return False
+    if all(_name_piece(p) for p in re.split(r"[+/]", text)):
+        return False
+    return _random_run(re.sub(r"[+/=]", "", text))
+
+
+def _looks_like_secret_value(text: str) -> bool:
+    """Whether ``text`` looks like a secret's VALUE rather than a name: a known
+    token prefix ahead of a token body, an AWS key id, a UUID, a random-looking
+    run, or random base64 — bare, quoted, after ``Bearer `` or ``NAME=``.
+
+    Best-effort, and erring toward names: a real name it misreads is sent with
+    ``--no-value-check``.
+    """
+    prefix = _TOKEN_PREFIX.match(text)
+    if prefix:
+
+        def token_body(run: str) -> bool:
+            if len(run) < 12:
+                return False
+            # Up to four digits closing it are a name's version or year.
+            core = re.sub(r"[0-9]{1,4}\Z", "", run, count=1)
+            return bool(re.search(r"[0-9]", core)) or (
+                bool(re.search(r"[a-z]", core))
+                and bool(re.search(r"[A-Z]", core))
+                and not _prefixed_words(core)
+            )
+
+        if any(token_body(r) for r in re.split(r"[^A-Za-z0-9]+", text[prefix.end() :])):
+            return True
+    return (
+        bool(_UUID.search(text))
+        or any(_AWS_KEY_ID.fullmatch(r) or _random_run(r) for r in re.split(r"[^A-Za-z0-9]+", text))
+        or any(_base64_value(p) for p in re.split(r"[^A-Za-z0-9+/=]+|=+(?=[A-Za-z0-9+/])", text))
+    )
+
+
+def _quoted_operand(typed: str) -> str | None:
+    """A secret's name or id as typed, quoted for a message to repeat, or
+    ``None`` when it may be a value typed where the name was meant: then the
+    message says "that name or id" instead.
+
+    Quoted only when it is shaped like an id, or when it is a name the platform
+    would take that :func:`_looks_like_secret_value` does not flag. Quoted with
+    :func:`repr`, as this CLI's messages always quoted it; a terminal line
+    still escapes what it prints.
+    """
+    if _SECRET_ID.fullmatch(typed):
+        return repr(typed)
+    try:
+        _api.secret_name(typed)
+    except (TypeError, ValueError):
+        return None
+    if _looks_like_secret_value(typed.strip(_JS_TRIM)):
+        return None
+    return repr(typed)
 
 
 def _cmd_secrets_get(args: argparse.Namespace) -> int:
@@ -1744,16 +2037,72 @@ def _cmd_secrets_get(args: argparse.Namespace) -> int:
     return 0
 
 
+def _no_secret_named(typed: str, scope: str) -> NoReturn:
+    """Refuse ``typed`` as not found in ``scope``, repeating it only when
+    :func:`_quoted_operand` finds it safe to: it may be the value itself."""
+    quoted = _quoted_operand(typed)
+    if quoted is None:
+        _die(f"no secret with that name or id in {scope}", "not_found")
+    shown = quoted
+    _die(lambda s: f"no secret named {s(shown)} in {scope}", "not_found")
+
+
+def _secret_moved(typed: str, first: str, now: str) -> NoReturn:
+    """Refuse a ``secrets rm`` retry whose ``typed`` now resolves to secret
+    ``now`` rather than ``first``, the one the first read chose. ``typed`` is
+    repeated only when :func:`_quoted_operand` finds it safe to."""
+    shown = _quoted_operand(typed) or "that name or id"
+    _die(
+        lambda s: (
+            f"{shown} changed while it was being removed: it named secret {s(first)} "
+            f"and now names {s(now)}; nothing was deleted, run the command again"
+        ),
+        "conflict",
+    )
+
+
 def _cmd_secrets_rm(args: argparse.Namespace) -> int:
+    """``secrets rm NAME``: delete a secret, by name or id, at the revision read.
+
+    A revision that moved between the read and the delete (somebody replaced
+    it first) is read again and the delete sent again, up to
+    :data:`_REVISION_ATTEMPTS` times in all, as the TypeScript CLI does.
+
+    A retry deletes only the secret the first read chose. If ``NAME`` now
+    resolves to a different secret (somebody created one named like the
+    chosen secret's id, say), nothing more is deleted and the command fails.
+    """
     workspace = _scope(args)
+    scope = f"workspace {workspace}" if workspace else "the account-wide scope"
+    removed: Secret | None = None
+    chosen: str | None = None
     with _client() as client:
-        listed = client.secrets.list(workspace_id=workspace).secrets
-        found = _secret_to_remove(listed, args.name)
-        if found is None:
-            scope = f"workspace {workspace}" if workspace else "the account-wide scope"
-            _die(f"no secret named {args.name!r} in {scope}", "not_found")
-        client.secrets.delete(found.id, revision_id=found.revision_id, workspace_id=workspace)
-    print(f"deleted {_shown(found.name)}  {_shown(found.id)}")
+        attempt = 0
+        while removed is None:
+            attempt += 1
+            listed = client.secrets.list(workspace_id=workspace).secrets
+            found = _secret_to_remove(listed, args.name)
+            if found is None:
+                _no_secret_named(args.name, scope)
+            if chosen is None:
+                chosen = found.id
+            elif found.id != chosen:
+                _secret_moved(args.name, chosen, found.id)
+            try:
+                client.secrets.delete(
+                    found.id, revision_id=found.revision_id, workspace_id=workspace
+                )
+            except ConflictError:
+                if attempt >= _REVISION_ATTEMPTS:
+                    raise
+                continue
+            removed = found
+    # A name that looks like a value (a token stored as a name by mistake, the
+    # likeliest reason to delete it) is left out rather than printed whole.
+    if _quoted_operand(removed.name) is None:
+        print(f"deleted {_shown(removed.id)}")
+    else:
+        print(f"deleted {_shown(removed.name)}  {_shown(removed.id)}")
     return 0
 
 
@@ -1780,6 +2129,11 @@ def _secrets_parser(sub: Any) -> None:
         "--keep-newline",
         action="store_true",
         help="keep a trailing newline on the value read from stdin",
+    )
+    put.add_argument(
+        "--no-value-check",
+        action="store_true",
+        help="send NAME as typed, even one that looks like a secret's value rather than a name",
     )
     put.add_argument("--json", action="store_true", help="the stored secret as JSON")
     put.set_defaults(fn=_cmd_secrets_set)
