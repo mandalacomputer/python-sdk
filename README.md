@@ -1021,6 +1021,10 @@ on one answer lands on the same pixels even if the screen has changed since:
 
 ```python
 seen = c.screenshot_info(64, fresh=True)  # small: the size is in the header
+# Both are None from a platform that does not name its captures: without a
+# name the crop would be cut from whatever capture is held, so stop here.
+if seen.capture is None or seen.capture_size is None:
+    raise RuntimeError("this platform does not name its screenshot captures")
 w, h = seen.capture_size
 top_left = c.screenshot(capture=seen.capture, region=(0, 0, w // 2, h // 2))
 ```

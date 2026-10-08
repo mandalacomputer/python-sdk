@@ -146,6 +146,34 @@ def _largest_fit(size: _Size) -> _Size:
     return _Size(width, height_at(width))
 
 
+def _crop_shrink(size: _Size) -> tuple[int | None, float | None]:
+    """How to have the platform shrink a crop of ``size`` to a picture the model
+    takes, as a width or a scale: neither when it fits already, a width when one
+    of at least :data:`_MIN_WIDTH` does, and otherwise a scale.
+
+    A width alone is not enough for a crop (found in review). The platform will
+    not shrink below 64 pixels wide by ``w``, so a tall, narrow region — a strip
+    down a portrait screen — came back 64 pixels wide and still taller than the
+    model takes. A scale has no such floor. The platform rounds ``scale`` to the
+    nearest pixel, halves away from zero, where it floors ``w``, so the scale is
+    the largest whose ROUNDED size fits."""
+    fit = _largest_fit(size)
+    if fit == size:
+        return None, None
+    if _fits(fit):
+        return fit.width, None
+
+    def at(k: float) -> _Size:
+        return _Size(
+            max(1, math.floor(size.width * k + 0.5)), max(1, math.floor(size.height * k + 0.5))
+        )
+
+    scale = _MAX_EDGE / max(size)
+    while not _fits(at(scale)):
+        scale *= 0.99
+    return None, scale
+
+
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -373,9 +401,10 @@ class _View:
 
     def crop(
         self, box: tuple[float, float, float, float], native: _Size
-    ) -> tuple[tuple[int, int, int, int], int | None]:
-        """The rectangle of the capture for ``box``, and the width to shrink the
-        crop to when it is too large for the model.
+    ) -> tuple[tuple[int, int, int, int], int | None, float | None]:
+        """The rectangle of the capture for ``box``, and the width or the scale
+        to shrink the crop by when it is too large for the model; see
+        :func:`_crop_shrink`.
 
         In the capture's own pixels (found in review): the platform crops the
         capture it HOLDS, whose pixels are not the screen's when the two differ
@@ -389,8 +418,7 @@ class _View:
         right = min(native.width, math.ceil(x1 * native.width / frame.width))
         bottom = min(native.height, math.ceil(y1 * native.height / frame.height))
         crop = _Size(max(1, right - left), max(1, bottom - top))
-        fit = _largest_fit(crop)
-        return (left, top, crop.width, crop.height), (None if fit == crop else fit.width)
+        return ((left, top, crop.width, crop.height), *_crop_shrink(crop))
 
     def cursor(self, at: tuple[int, int] | None) -> BetaComputerCursorPositionResult:
         if at is None:
@@ -435,7 +463,10 @@ def _stale(error: ToolError) -> bool:
     """A crop refused because the capture it named was replaced before it
     arrived. Read off the platform's error that :func:`_platform` wraps."""
     cause = error.__cause__
-    return isinstance(cause, APIError) and cause.reason == "stale_capture"
+    # The 409 and the word together (found in review). The platform sends the
+    # word only on a 409; on another status it is some other failure, and
+    # measuring again would bury it under a race that did not happen.
+    return isinstance(cause, APIError) and cause.status == 409 and cause.reason == "stale_capture"
 
 
 def _zoomed(cut: ScreenshotInfo, capture: str) -> BetaScreenshotResult:
@@ -534,13 +565,14 @@ class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
             # needed is the capture's name and size, which are in the headers.
             measured = _platform(self.computer.screenshot_info, _MIN_WIDTH, fresh=True)
             capture, native = _pinned(measured)
-            region, width = self._view.crop(box, native)
+            region, width, scale = self._view.crop(box, native)
             try:
                 cut = _platform(
                     self.computer.screenshot_info,
                     width,
                     capture=capture,
                     region=region,
+                    scale=scale,
                     format="png",
                 )
             except ToolError as error:
@@ -707,13 +739,14 @@ class AsyncMandalaComputerToolset(BetaAsyncAbstractComputerToolset20260801):
         for _ in range(_ZOOM_TRIES):
             measured = await _aplatform(self.computer.screenshot_info, _MIN_WIDTH, fresh=True)
             capture, native = _pinned(measured)
-            region, width = self._view.crop(box, native)
+            region, width, scale = self._view.crop(box, native)
             try:
                 cut = await _aplatform(
                     self.computer.screenshot_info,
                     width,
                     capture=capture,
                     region=region,
+                    scale=scale,
                     format="png",
                 )
             except ToolError as error:

@@ -3694,6 +3694,8 @@ class Computer(ComputerFields):
         one answer land on the same pixels: measure, then crop::
 
             seen = c.screenshot_info(64, fresh=True)  # small; the size is in the header
+            if seen.capture is None or seen.capture_size is None:
+                raise RuntimeError("this platform does not name its screenshot captures")
             width, height = seen.capture_size
             c.screenshot(capture=seen.capture, region=(0, 0, width // 2, height // 2))
 

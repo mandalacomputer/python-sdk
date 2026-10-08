@@ -151,6 +151,11 @@ class Desktop:
         if "w" in query and not self.ignore_width:
             w = min(max(int(query["w"]), 64), src[0])
             out = (w, max(1, src[1] * w // src[0]))
+        if "scale" in query:
+            # The platform's scale: no floor, and rounded halves away from zero
+            # where a width is floored.
+            k = float(query["scale"])
+            out = (max(1, math.floor(src[0] * k + 0.5)), max(1, math.floor(src[1] * k + 0.5)))
         return httpx.Response(200, content=png(*out), headers=headers)
 
     def act(self, request: httpx.Request) -> httpx.Response:
@@ -469,6 +474,61 @@ def test_a_crop_refused_for_another_reason_is_not_retried() -> None:
     r = t.tool_result(use("zoom", region=[0, 0, 100, 100]))
     assert r["is_error"] is True and "suspended" in text(r)
     assert len(d.shots) == 3
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("status", [400, 403, 500])
+async def test_the_stale_capture_word_off_a_409_is_not_retried(
+    asynchronous: bool, status: int
+) -> None:
+    # Only the platform's 409 means another capture replaced the one measured.
+    # The same word on another status is some other failure, and three tries
+    # ending in a capture-race message would hide it.
+    d = Desktop(
+        (1280, 800),
+        refuse_crop=httpx.Response(
+            status, json={"error": "refused for a reason of its own", "reason": "stale_capture"}
+        ),
+    )
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        await a.tool_result(use("screenshot"))
+        r = await a.tool_result(use("zoom", region=[100, 100, 300, 200]))
+    else:
+        t = d.toolset()
+        t.tool_result(use("screenshot"))
+        r = t.tool_result(use("zoom", region=[100, 100, 300, 200]))
+    assert r["is_error"] is True
+    assert "refused for a reason of its own" in text(r)
+    assert "times running" not in text(r)
+    assert len(d.shots) == 3
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_strip_narrower_than_a_width_can_ask_for_is_shrunk_by_scale(
+    asynchronous: bool,
+) -> None:
+    # Found in review: on a portrait screen, a strip 63 pixels wide down the
+    # whole picture is a 94x3840 crop, which `w` cannot shrink below 64 wide —
+    # 64x2614, taller than the model takes. A scale has no floor.
+    d = Desktop((2160, 3840))
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        shot = size_of(image(await a.tool_result(use("screenshot"))))
+        r = await a.tool_result(use("zoom", region=[0, 0, 63, 2576]))
+    else:
+        t = d.toolset()
+        shot = size_of(image(t.tool_result(use("screenshot"))))
+        r = t.tool_result(use("zoom", region=[0, 0, 63, 2576]))
+    assert shot == (1449, 2576)
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == "0,0,94,3840"
+    assert "w" not in d.shots[2]
+    assert 0 < float(d.shots[2]["scale"]) < 1
+    zoomed = size_of(image(r))
+    assert fits(zoomed) and zoomed[1] == 2576
 
 
 @respx.mock
