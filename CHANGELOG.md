@@ -9,6 +9,18 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Drive a computer with Claude's computer toolset.**
+  `mandala_computer.anthropic` has `MandalaComputerToolset` and
+  `AsyncMandalaComputerToolset`, drivers for Anthropic's
+  `computer_toolset_20260801`: pass one as a `tools` entry to
+  `client.beta.messages.tool_runner()` and every action the model asks for runs
+  on the computer. All 17 actions are served, including `zoom`. Screens too
+  large for the model are photographed smaller and its points scaled back up.
+  Install with `pip install 'mandala-computer[anthropic]'`; `mandala_computer`
+  itself does not need `anthropic`.
+
 ## [0.10.0] — 2026-10-03
 
 ### Added

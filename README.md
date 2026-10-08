@@ -1698,6 +1698,73 @@ runs can have a nested OpenAI-style `error` object. A 401 can concern either
 credential. Use the error envelope, reason and request ID for context instead
 of attributing a failure from its status alone.
 
+### Claude's computer toolset
+
+Anthropic's SDK runs the computer-use loop itself when its tool runner is
+given a toolset driver, and this package ships one for a Mandala computer.
+`MandalaComputerToolset` serves every action of `computer_toolset_20260801`,
+so the loop, the prompt and the model stay yours, on your own key, and the
+actions land on the computer. Use it instead of
+[letting the platform drive](#letting-the-platform-drive) when you want to
+choose the model, add your own tools, or approve actions as they happen.
+
+```sh
+pip install 'mandala-computer[anthropic]'   # anthropic 1.12 or newer
+```
+
+```python
+import anthropic
+from mandala_computer import Client
+from mandala_computer.anthropic import MandalaComputerToolset
+
+computer = Client().computers.get("vm-...")
+# confirm is asked before every action. Approving all of them is a decision
+# for a throwaway computer only.
+with MandalaComputerToolset(computer, confirm=lambda context: True) as desktop:
+    runner = anthropic.Anthropic().beta.messages.tool_runner(
+        model="claude-opus-5-5",
+        max_tokens=16000,
+        tools=[desktop],
+        messages=[{"role": "user", "content": "Open a terminal and run date"}],
+    )
+    for message in runner:
+        for block in message.content:
+            if block.type == "text":
+                print(block.text)
+# Leaving the block closes the toolset; the computer keeps running.
+```
+
+`AsyncMandalaComputerToolset` takes an `AsyncComputer` and works with
+`anthropic.AsyncAnthropic()`; `confirm` may then be a plain or an `async`
+callable.
+
+- **`confirm` is required** by Anthropic's class, not by this one: a toolset
+  that can type and press keys refuses to construct without a callable that
+  approves each call, unless `configs` turns `type`, `key` and `hold_key` off.
+  It receives the action's name and input, never the screen.
+- **Screenshots are always fresh**, so a picture never predates the action it
+  answers.
+- **A screen too large for the model**, past 2576 pixels on its long edge or
+  about 3.75 megapixels, is photographed smaller by the platform, and the
+  model's points are scaled back up to the computer's own pixels. Every
+  screenshot's size is read off the picture, not assumed, because a desktop
+  resumed from a capture taken at another size can answer at that size until
+  it is restarted.
+- **A point outside the screenshot is refused**, not moved to the nearest
+  edge. So is the first point after the screen changes size, with the new
+  size in the refusal, because nothing in a call says which picture it was
+  aimed at.
+- **What the platform caps, the driver spans.** A `key` with `repeat` is pressed
+  once per repeat, text longer than 400 characters is typed in pieces, and a
+  `wait` of up to 300 seconds is waited in the platform's 30-second pieces. A
+  `hold_key` is at most 30 seconds, because a hold cannot be split.
+- **`zoom`** crops the platform's capture and shrinks the crop to fit the
+  model. It is refused while the screen is not at the size its computer
+  reports, because there is then no rectangle of the capture that means what
+  the model drew.
+- **A failure is an error result**, in the platform's own words, and the run
+  goes on: the model reads it and adapts.
+
 ### Events
 
 A computer never tells you anything unless you ask, and the only general way to
