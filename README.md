@@ -1760,9 +1760,9 @@ callable.
   `hold_key` is at most 30 seconds, because a hold cannot be split.
 - **`zoom`** crops the platform's capture, in the capture's own pixels, and
   shrinks the crop to fit the model. It needs a screenshot first, because the
-  region is a rectangle of one. When that screenshot was shrunk, the capture
-  is taken whole once more to measure it, because the capture need not be the
-  size its computer reports.
+  region is a rectangle of one. Each zoom takes the screen whole once to
+  measure it, because the capture need not be the size its computer reports,
+  and cuts the crop from that same capture.
 - **A failure is an error result**, in the platform's own words, and the run
   goes on: the model reads it and adapts.
 

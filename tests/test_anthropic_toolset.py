@@ -75,6 +75,10 @@ class Desktop:
         self.ignore_width = ignore_width
         self.answer = answer
         self.shots: list[dict[str, str]] = []
+        # The platform's frame cache: a request without `fresh` is answered
+        # from the last capture taken, as the platform does within its reuse
+        # window, and only a fresh one takes a new capture.
+        self.held: tuple[int, int] | None = None
         self.inputs: list[dict[str, Any]] = []
 
     def record(self) -> dict[str, object]:
@@ -90,9 +94,12 @@ class Desktop:
     def shoot(self, request: httpx.Request) -> httpx.Response:
         query = dict(request.url.params)
         self.shots.append(query)
-        src = self.capture
-        if self.captures:
-            self.capture = self.captures.pop(0)
+        if query.get("fresh") == "1" or self.held is None:
+            src = self.held = self.capture
+            if self.captures:
+                self.capture = self.captures.pop(0)
+        else:
+            src = self.held
         if "region" in query:
             x, y, w, h = (int(n) for n in query["region"].split(","))
             if x + w > src[0] or y + h > src[1]:
@@ -309,21 +316,21 @@ def test_zoom_crops_the_captures_pixels_shrunk_to_fit() -> None:
     shot = size_of(image(t.tool_result(use("screenshot"))))
     r = t.tool_result(use("zoom", region=[0, 0, shot[0], shot[1]]))
     assert fits(size_of(image(r)))
-    # The picture was shrunk, so the capture is measured whole first.
+    # Measured off a capture taken whole, then cut from that same capture.
     assert d.shots[1] == {"fresh": "1"}
     assert d.shots[2]["region"] == "0,0,3840,2160"
+    assert "fresh" not in d.shots[2]
 
 
 @respx.mock
-def test_zoom_takes_a_small_region_whole_without_measuring_again() -> None:
+def test_zoom_takes_a_small_region_whole() -> None:
     d = Desktop((1280, 800))
     t = d.toolset()
     t.tool_result(use("screenshot"))
     r = t.tool_result(use("zoom", region=[100, 100, 300, 200]))
     assert size_of(image(r)) == (200, 100)
-    assert len(d.shots) == 2
-    assert d.shots[1]["region"] == "100,100,200,100"
-    assert "w" not in d.shots[1]
+    assert d.shots[2]["region"] == "100,100,200,100"
+    assert "w" not in d.shots[2]
 
 
 @respx.mock
@@ -339,12 +346,36 @@ def test_zoom_maps_into_a_capture_of_another_size_than_the_record() -> None:
 
 
 @respx.mock
+def test_zoom_cuts_the_crop_from_the_capture_it_measured() -> None:
+    # Found in re-review: the display goes from 3200x1800 to 3840x2160 after
+    # the measurement, and a second fresh capture would be cut with the first
+    # one's arithmetic.
+    d = Desktop((3840, 2160), capture=(3200, 1800), captures=[(3200, 1800), (3840, 2160)])
+    t = d.toolset()
+    t.tool_result(use("screenshot"))
+    r = t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == "1242,621,249,249"
+    assert "fresh" not in d.shots[2]
+
+
+@respx.mock
+async def test_the_async_zoom_cuts_from_the_capture_it_measured() -> None:
+    d = Desktop((3840, 2160), capture=(3200, 1800), captures=[(3200, 1800), (3840, 2160)])
+    t = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+    await t.tool_result(use("screenshot"))
+    await t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
+    assert d.shots[2]["region"] == "1242,621,249,249"
+    assert "fresh" not in d.shots[2]
+
+
+@respx.mock
 def test_zoom_maps_into_an_unshrunk_capture_smaller_than_the_record() -> None:
     d = Desktop((1920, 1080), capture=(1280, 800))
     t = d.toolset()
     t.tool_result(use("screenshot"))
     t.tool_result(use("zoom", region=[100, 100, 300, 200]))
-    assert d.shots[1]["region"] == "100,100,200,100"
+    assert d.shots[2]["region"] == "100,100,200,100"
 
 
 @respx.mock

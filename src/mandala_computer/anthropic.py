@@ -479,15 +479,17 @@ class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
         self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
     ) -> BetaScreenshotResult:
         box = self._view.zoom_box(input.region)
-        # The capture IS the last picture when that was not shrunk; otherwise
-        # it is measured off one picture taken whole.
-        native = self._view.frame
-        if self._view.request is not None:
-            native = _measured(self._shoot(None), retaking=False)
+        # Measured off a capture taken whole, now, and the crop cut from THAT
+        # capture (found in re-review): it is asked for without `fresh`, which
+        # the platform answers from the capture it has just taken for the
+        # measurement rather than taking another, which could be another size.
+        # What this cannot rule out is a third caller's fresh capture, at
+        # another size, landing between the two inside the platform's
+        # 1.5-second reuse window: the platform names no capture a crop could
+        # be pinned to.
+        native = _measured(self._shoot(None), retaking=False)
         region, width = self._view.crop(box, native)
-        return _zoomed(
-            _platform(self.computer.screenshot, width, fresh=True, region=region, format="png")
-        )
+        return _zoomed(_platform(self.computer.screenshot, width, region=region, format="png"))
 
     def cursor_position(
         self, context: BetaToolsetCallContext, input: BetaComputerCursorPositionInput
@@ -643,13 +645,9 @@ class AsyncMandalaComputerToolset(BetaAsyncAbstractComputerToolset20260801):
         self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
     ) -> BetaScreenshotResult:
         box = self._view.zoom_box(input.region)
-        native = self._view.frame
-        if self._view.request is not None:
-            native = _measured(await self._shoot(None), retaking=False)
+        native = _measured(await self._shoot(None), retaking=False)
         region, width = self._view.crop(box, native)
-        data: bytes = await _aplatform(
-            self.computer.screenshot, width, fresh=True, region=region, format="png"
-        )
+        data: bytes = await _aplatform(self.computer.screenshot, width, region=region, format="png")
         return _zoomed(data)
 
     async def cursor_position(
