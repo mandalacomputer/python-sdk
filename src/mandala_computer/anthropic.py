@@ -160,7 +160,10 @@ def _crop_shrink(size: _Size) -> tuple[int | None, float | None]:
     fit = _largest_fit(size)
     if fit == size:
         return None, None
-    if _fits(fit):
+    # At least the platform's floor as well as fitting: a crop one or two pixels
+    # wide fits at a width of 1, which the platform raises back to the crop's own
+    # width, so it would come back unshrunk (found in re-review).
+    if _fits(fit) and fit.width >= _MIN_WIDTH:
         return fit.width, None
 
     def at(k: float) -> _Size:

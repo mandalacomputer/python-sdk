@@ -532,6 +532,49 @@ async def test_a_strip_narrower_than_a_width_can_ask_for_is_shrunk_by_scale(
 
 
 @respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(("x1", "wide"), [(1, 2), (42, 63), (43, 65)])
+async def test_a_strip_of_a_few_pixels_is_shrunk_by_scale(
+    asynchronous: bool, x1: int, wide: int
+) -> None:
+    # Found in re-review: a crop so narrow that a width which fits is below the
+    # platform's floor of 64, which raises it back to the crop's own width. The
+    # toolset takes whole pixels, so a 1-pixel capture strip cannot be asked
+    # for here; the test below covers it.
+    d = Desktop((2160, 3840))
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        await a.tool_result(use("screenshot"))
+        r = await a.tool_result(use("zoom", region=[0, 0, x1, 2576]))
+    else:
+        t = d.toolset()
+        t.tool_result(use("screenshot"))
+        r = t.tool_result(use("zoom", region=[0, 0, x1, 2576]))
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == f"0,0,{wide},3840"
+    assert "w" not in d.shots[2]
+    zoomed = size_of(image(r))
+    assert fits(zoomed) and zoomed[1] == 2576
+
+
+@pytest.mark.parametrize(
+    "crop", [(1, 3840), (2, 3840), (63, 3840), (64, 2577), (3840, 1), (3840, 2), (5000, 5000)]
+)
+def test_a_shrunk_crop_fits_as_the_platform_rounds_it(crop: tuple[int, int]) -> None:
+    from mandala_computer.anthropic import _crop_shrink, _Size
+
+    width, scale = _crop_shrink(_Size(*crop))
+    w, h = crop
+    if width is not None:
+        assert scale is None and width >= 64
+        out = (width, max(1, h * width // w))
+    else:
+        assert scale is not None and 0 < scale <= 1
+        out = (max(1, math.floor(w * scale + 0.5)), max(1, math.floor(h * scale + 0.5)))
+    assert fits(out)
+
+
+@respx.mock
 def test_zoom_maps_into_an_unshrunk_capture_smaller_than_the_record() -> None:
     d = Desktop((1920, 1080), capture=(1280, 800))
     t = d.toolset()
