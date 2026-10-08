@@ -2557,6 +2557,10 @@ class ScreenshotInfo:
     picture a suspended computer saved when it was suspended: with ``width``
     set both are JPEGs, so the image's magic bytes do not tell them apart. The
     platform does, in a response header, and :attr:`suspended` is that header.
+
+    A live picture also names the capture it was cut from, and that capture's
+    size: measure on one answer, then pass :attr:`capture` back with a
+    ``region`` to crop the very pixels you measured.
     """
 
     #: The image, PNG or JPEG as :attr:`content_type` says.
@@ -2567,6 +2571,19 @@ class ScreenshotInfo:
     #: JPEG saved when the computer was suspended, not a capture of a live
     #: screen. A suspended computer is not woken by a screenshot.
     suspended: bool
+    #: The name of the capture this picture was cut from (``X-GC-Capture``),
+    #: to pass back as ``capture=`` so a later screenshot is cut from the same
+    #: capture rather than from the screen as it is by then. ``None`` on a
+    #: suspended computer's saved picture, which is not a capture, and from a
+    #: platform that does not name its captures.
+    capture: str | None = None
+    #: That capture's own ``(width, height)`` in pixels
+    #: (``X-GC-Capture-Size``): the pixels a ``region`` of it is measured in,
+    #: whatever size this picture was shrunk to. Usually the computer's
+    #: :attr:`~mandala_computer.Computer.resolution`, but not always — a desktop
+    #: resumed from a capture taken at another size, or resized from inside the
+    #: guest, can differ. ``None`` where :attr:`capture` is.
+    capture_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)

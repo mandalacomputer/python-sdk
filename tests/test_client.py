@@ -277,6 +277,90 @@ def test_screenshot_info_says_when_the_frame_is_a_saved_one(client: mc.Client) -
 
 
 @respx.mock
+def test_screenshot_info_names_the_capture_it_was_cut_from(client: mc.Client) -> None:
+    """OPL-5852: a live picture names its capture and that capture's own size,
+    so a later crop can be cut from the same capture."""
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(
+            200,
+            content=b"jpg",
+            headers={
+                "Content-Type": "image/jpeg",
+                "X-GC-Capture": "0123456789abcdef",
+                "X-GC-Capture-Size": "3840x2160",
+            },
+        )
+    )
+    c = mc.Computer(client._t, COMPUTER)
+    info = c.screenshot_info(64, fresh=True)
+    assert info.capture == "0123456789abcdef" and info.capture_size == (3840, 2160)
+    c.screenshot(capture=info.capture, region=(0, 0, 640, 360), format="png")
+    params = route.calls.last.request.url.params
+    assert params["capture"] == "0123456789abcdef" and "fresh" not in params
+
+
+@pytest.mark.parametrize(
+    ("name", "size"),
+    [
+        # A name that is not one the platform gives, and the size with it.
+        ("0123456789ABCDEF", "1280x800"),
+        ("0123456789abcde", "1280x800"),
+        ("", "1280x800"),
+        (None, "1280x800"),
+        # A size that does not read as one keeps the name and drops the size.
+        ("0123456789abcdef", "1280x0"),
+        ("0123456789abcdef", "1280 x 800"),
+        ("0123456789abcdef", "-1x800"),
+        ("0123456789abcdef", "1280x800x24"),
+        ("0123456789abcdef", None),
+    ],
+)
+@respx.mock
+def test_screenshot_info_drops_a_capture_header_it_cannot_read(
+    client: mc.Client, name: str | None, size: str | None
+) -> None:
+    headers = {"Content-Type": "image/png"}
+    if name is not None:
+        headers["X-GC-Capture"] = name
+    if size is not None:
+        headers["X-GC-Capture-Size"] = size
+    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(200, content=b"png", headers=headers)
+    )
+    info = mc.Computer(client._t, COMPUTER).screenshot_info()
+    good = name == "0123456789abcdef"
+    assert info.capture == (name if good else None)
+    assert info.capture_size is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"capture": "0123456789ABCDEF"}, "X-GC-Capture header"),
+        ({"capture": "xyz"}, "X-GC-Capture header"),
+        ({"capture": 1234}, "X-GC-Capture header"),
+        ({"capture": "0123456789abcdef", "fresh": True}, "give fresh or capture, not both"),
+    ],
+)
+def test_screenshot_refuses_a_capture_it_cannot_send(
+    client: mc.Client, kwargs: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        mc.Computer(client._t, COMPUTER).screenshot(**kwargs)
+
+
+@respx.mock
+def test_a_replaced_capture_is_a_permanent_conflict(client: mc.Client) -> None:
+    respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(409, json={"error": "replaced", "reason": "stale_capture"})
+    )
+    with pytest.raises(mc.ConflictError) as caught:
+        mc.Computer(client._t, COMPUTER).screenshot(capture="0123456789abcdef")
+    assert caught.value.reason == "stale_capture"
+    assert mc.is_transient(caught.value) is False
+
+
+@respx.mock
 def test_screenshot_refuses_a_json_success_body(client: mc.Client) -> None:
     respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
         httpx.Response(200, json={"error": "sign in again"})

@@ -123,8 +123,24 @@ _REASON_CLEARS = frozenset({"contention", "starting"})
 #: read the secret again and decide with its current revision — so both are
 #: permanent, where an ordinary :class:`ConflictError` would read as worth
 #: sending again.
+#:
+#: ``stale_capture`` is a screenshot asked to be cut from a capture the platform
+#: no longer holds (OPL-5852): a newer capture of the computer replaced it, or
+#: the computer moved or its host restarted since. The same request never works
+#: again, however long it waits, because the pixels it named are gone — so it
+#: is permanent, where an ordinary :class:`ConflictError` would read as worth
+#: sending again. A new screenshot, and the capture it names, is the fix.
 _REASON_PERMANENT = frozenset(
-    {"unavailable", "unsupported", "revoked", "exists", "running", "name_taken", "stale_revision"}
+    {
+        "unavailable",
+        "unsupported",
+        "revoked",
+        "exists",
+        "running",
+        "name_taken",
+        "stale_revision",
+        "stale_capture",
+    }
 )
 
 
@@ -190,7 +206,8 @@ class APIError(MandalaError):
         #: The platform's own word for what kind of refusal this is, when it
         #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
         #: ``"unsupported"`` (OPL-3898), ``"revoked"``, ``"exists"``,
-        #: ``"running"``, ``"name_taken"`` or ``"stale_revision"``. ``None``
+        #: ``"running"``, ``"name_taken"``, ``"stale_revision"`` or
+        #: ``"stale_capture"``. ``None``
         #: where it sent nothing, which is most errors and always will be — not
         #: every refusal has a word, and the platform is explicit that absent
         #: means unclassified rather than "none of them". An OPEN set: a word

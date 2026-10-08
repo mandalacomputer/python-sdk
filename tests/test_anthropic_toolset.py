@@ -58,7 +58,13 @@ def fits(size: tuple[int, int]) -> bool:
 class Desktop:
     """A computer whose record says ``screen`` and whose display is ``capture``
     — the two differ on a desktop resumed from a capture taken at another size.
-    ``captures`` moves the display on, one per screenshot taken."""
+    ``captures`` moves the display on, one per capture taken.
+
+    Each capture is named, and every live answer carries the name and the
+    capture's size, as the platform's do (OPL-5852). ``intrusions`` is how many
+    pinned requests find that another caller's fresh capture landed just before
+    them, replacing the one they name; ``named=False`` is a platform from before
+    captures were named, which sends neither header and refuses ``capture``."""
 
     def __init__(
         self,
@@ -68,17 +74,25 @@ class Desktop:
         captures: list[tuple[int, int]] | None = None,
         ignore_width: bool = False,
         answer: Any = None,
+        intrusions: int = 0,
+        named: bool = True,
+        refuse_crop: httpx.Response | None = None,
     ) -> None:
         self.screen = screen
         self.capture = capture or screen
         self.captures = list(captures or [])
         self.ignore_width = ignore_width
         self.answer = answer
+        self.intrusions = intrusions
+        self.named = named
+        self.refuse_crop = refuse_crop
         self.shots: list[dict[str, str]] = []
         # The platform's frame cache: a request without `fresh` is answered
         # from the last capture taken, as the platform does within its reuse
-        # window, and only a fresh one takes a new capture.
-        self.held: tuple[int, int] | None = None
+        # window, and only a fresh one takes a new capture. It holds one
+        # capture, by name, and the next replaces it.
+        self.held: tuple[str, tuple[int, int]] | None = None
+        self.taken = 0
         self.inputs: list[dict[str, Any]] = []
 
     def record(self) -> dict[str, object]:
@@ -91,15 +105,43 @@ class Desktop:
             "resolution": f"{w}x{h}x24",
         }
 
+    def take(self) -> tuple[str, tuple[int, int]]:
+        self.taken += 1
+        self.held = (f"{self.taken:016x}", self.capture)
+        if self.captures:
+            self.capture = self.captures.pop(0)
+        return self.held
+
+    def name(self, n: int) -> str:
+        """The name of the ``n``th capture taken, counting from 1."""
+        return f"{n:016x}"
+
     def shoot(self, request: httpx.Request) -> httpx.Response:
         query = dict(request.url.params)
         self.shots.append(query)
-        if query.get("fresh") == "1" or self.held is None:
-            src = self.held = self.capture
-            if self.captures:
-                self.capture = self.captures.pop(0)
+        if "capture" in query:
+            if not self.named:
+                return httpx.Response(
+                    400, json={"error": '"capture" is not a screenshot parameter'}
+                )
+            if self.refuse_crop is not None:
+                return self.refuse_crop
+            if self.intrusions:
+                self.intrusions -= 1
+                self.take()
+            if self.held is None or self.held[0] != query["capture"]:
+                return httpx.Response(
+                    409, json={"error": "that capture was replaced", "reason": "stale_capture"}
+                )
+            name, src = self.held
+        elif query.get("fresh") == "1" or self.held is None:
+            name, src = self.take()
         else:
-            src = self.held
+            name, src = self.held
+        headers = {"content-type": "image/png"}
+        if self.named:
+            headers["X-GC-Capture"] = name
+            headers["X-GC-Capture-Size"] = f"{src[0]}x{src[1]}"
         if "region" in query:
             x, y, w, h = (int(n) for n in query["region"].split(","))
             if x + w > src[0] or y + h > src[1]:
@@ -109,7 +151,12 @@ class Desktop:
         if "w" in query and not self.ignore_width:
             w = min(max(int(query["w"]), 64), src[0])
             out = (w, max(1, src[1] * w // src[0]))
-        return httpx.Response(200, content=png(*out), headers={"content-type": "image/png"})
+        if "scale" in query:
+            # The platform's scale: no floor, and rounded halves away from zero
+            # where a width is floored.
+            k = float(query["scale"])
+            out = (max(1, math.floor(src[0] * k + 0.5)), max(1, math.floor(src[1] * k + 0.5)))
+        return httpx.Response(200, content=png(*out), headers=headers)
 
     def act(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -182,11 +229,8 @@ def test_needs_a_confirm_callable_while_it_can_type() -> None:
 
 
 @respx.mock
-def test_serves_every_member_but_zoom() -> None:
-    assert Desktop((1280, 800)).toolset().to_dict() == {
-        "type": "computer_toolset_20260801",
-        "configs": {"zoom": {"enabled": False}},
-    }
+def test_serves_every_member() -> None:
+    assert Desktop((1280, 800)).toolset().to_dict() == {"type": "computer_toolset_20260801"}
 
 
 @respx.mock
@@ -312,15 +356,242 @@ def test_the_pointer_is_answered_in_the_pictures_pixels() -> None:
 # --- zoom ---------------------------------------------------------------------
 
 
+#: The measurement a zoom takes: the smallest fresh picture, for its headers.
+MEASURE = {"w": "64", "fresh": "1"}
+
+
 @respx.mock
-def test_zoom_is_declared_off_and_refused_without_touching_the_desktop() -> None:
-    # A zoom cannot yet be pinned to the capture it was measured on; see the
-    # class's docstring. Anthropic's class answers the call itself.
+def test_zoom_crops_the_captures_pixels_shrunk_to_fit() -> None:
+    d = Desktop((3840, 2160))
+    t = d.toolset()
+    shot = size_of(image(t.tool_result(use("screenshot"))))
+    r = t.tool_result(use("zoom", region=[0, 0, shot[0], shot[1]]))
+    assert fits(size_of(image(r)))
+    # Measured on the smallest fresh picture, and cut from that capture by name.
+    assert d.shots[1] == MEASURE
+    assert d.shots[2]["region"] == "0,0,3840,2160"
+    assert d.shots[2]["capture"] == d.name(2)
+    assert "fresh" not in d.shots[2]
+
+
+@respx.mock
+def test_zoom_takes_a_small_region_whole() -> None:
     d = Desktop((1280, 800))
     t = d.toolset()
     t.tool_result(use("screenshot"))
+    r = t.tool_result(use("zoom", region=[100, 100, 300, 200]))
+    assert size_of(image(r)) == (200, 100)
+    assert d.shots[2]["region"] == "100,100,200,100"
+    assert "w" not in d.shots[2]
+
+
+@respx.mock
+def test_zoom_maps_into_a_capture_of_another_size_than_the_record() -> None:
+    # Found in review: a 3200x1800 capture under a 3840x2160 record shrinks to
+    # the same 2576x1449 picture a 3840x2160 capture does. The size the crop is
+    # worked out in is the one the measurement's header gives.
+    d = Desktop((3840, 2160), capture=(3200, 1800))
+    t = d.toolset()
+    assert size_of(image(t.tool_result(use("screenshot")))) == (2576, 1449)
+    r = t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == "1242,621,249,249"
+
+
+@respx.mock
+def test_zoom_is_never_cut_from_a_capture_that_replaced_the_measured_one() -> None:
+    # The race three review rounds could not close without the platform: the
+    # display goes from 3200x1800 to 3840x2160, and another caller's fresh
+    # capture of it lands between the measurement and the crop. The crop names
+    # the measured capture, is refused, and the zoom measures again — rather
+    # than being cut from the new capture with the old one's arithmetic.
+    d = Desktop(
+        (3840, 2160), capture=(3200, 1800), captures=[(3200, 1800), (3840, 2160)], intrusions=1
+    )
+    t = d.toolset()
+    t.tool_result(use("screenshot"))
+    r = t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
+    assert r.get("is_error") is not True
+    assert [shot.get("capture") for shot in d.shots] == [None, None, d.name(2), None, d.name(4)]
+    assert d.shots[3] == MEASURE
+    # Worked out again in the pixels of the capture it is now cut from.
+    assert d.shots[4]["region"] == "1490,745,299,299"
+
+
+@respx.mock
+async def test_the_async_zoom_is_never_cut_from_a_replaced_capture() -> None:
+    d = Desktop(
+        (3840, 2160), capture=(3200, 1800), captures=[(3200, 1800), (3840, 2160)], intrusions=1
+    )
+    t = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+    await t.tool_result(use("screenshot"))
+    r = await t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
+    assert r.get("is_error") is not True
+    assert [shot.get("capture") for shot in d.shots] == [None, None, d.name(2), None, d.name(4)]
+    assert d.shots[4]["region"] == "1490,745,299,299"
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_zoom_gives_up_on_a_screen_whose_capture_keeps_being_replaced(
+    asynchronous: bool,
+) -> None:
+    d = Desktop((1280, 800), intrusions=3)
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        await a.tool_result(use("screenshot"))
+        r = await a.tool_result(use("zoom", region=[0, 0, 100, 100]))
+    else:
+        t = d.toolset()
+        t.tool_result(use("screenshot"))
+        r = t.tool_result(use("zoom", region=[0, 0, 100, 100]))
+    assert r["is_error"] is True and "3 times running" in text(r)
+    # A screenshot, then three measurements and three refused crops.
+    assert len(d.shots) == 7
+
+
+@respx.mock
+def test_zoom_refuses_on_a_platform_that_does_not_name_its_captures() -> None:
+    # Never an unpinned crop in its place, which is the race back again.
+    d = Desktop((1280, 800), named=False)
+    t = d.toolset()
+    t.tool_result(use("screenshot"))
     r = t.tool_result(use("zoom", region=[0, 0, 100, 100]))
+    assert r["is_error"] is True and "names its screenshot captures" in text(r)
+    assert d.shots[1:] == [MEASURE]
+
+
+@respx.mock
+def test_a_crop_refused_for_another_reason_is_not_retried() -> None:
+    d = Desktop(
+        (1280, 800),
+        refuse_crop=httpx.Response(
+            409, json={"error": "this computer is suspended", "reason": "unavailable"}
+        ),
+    )
+    t = d.toolset()
+    t.tool_result(use("screenshot"))
+    r = t.tool_result(use("zoom", region=[0, 0, 100, 100]))
+    assert r["is_error"] is True and "suspended" in text(r)
+    assert len(d.shots) == 3
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("status", [400, 403, 500])
+async def test_the_stale_capture_word_off_a_409_is_not_retried(
+    asynchronous: bool, status: int
+) -> None:
+    # Only the platform's 409 means another capture replaced the one measured.
+    # The same word on another status is some other failure, and three tries
+    # ending in a capture-race message would hide it.
+    d = Desktop(
+        (1280, 800),
+        refuse_crop=httpx.Response(
+            status, json={"error": "refused for a reason of its own", "reason": "stale_capture"}
+        ),
+    )
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        await a.tool_result(use("screenshot"))
+        r = await a.tool_result(use("zoom", region=[100, 100, 300, 200]))
+    else:
+        t = d.toolset()
+        t.tool_result(use("screenshot"))
+        r = t.tool_result(use("zoom", region=[100, 100, 300, 200]))
     assert r["is_error"] is True
+    assert "refused for a reason of its own" in text(r)
+    assert "times running" not in text(r)
+    assert len(d.shots) == 3
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_strip_narrower_than_a_width_can_ask_for_is_shrunk_by_scale(
+    asynchronous: bool,
+) -> None:
+    # Found in review: on a portrait screen, a strip 63 pixels wide down the
+    # whole picture is a 94x3840 crop, which `w` cannot shrink below 64 wide —
+    # 64x2614, taller than the model takes. A scale has no floor.
+    d = Desktop((2160, 3840))
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        shot = size_of(image(await a.tool_result(use("screenshot"))))
+        r = await a.tool_result(use("zoom", region=[0, 0, 63, 2576]))
+    else:
+        t = d.toolset()
+        shot = size_of(image(t.tool_result(use("screenshot"))))
+        r = t.tool_result(use("zoom", region=[0, 0, 63, 2576]))
+    assert shot == (1449, 2576)
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == "0,0,94,3840"
+    assert "w" not in d.shots[2]
+    assert 0 < float(d.shots[2]["scale"]) < 1
+    zoomed = size_of(image(r))
+    assert fits(zoomed) and zoomed[1] == 2576
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(("x1", "wide"), [(1, 2), (42, 63), (43, 65)])
+async def test_a_strip_of_a_few_pixels_is_shrunk_by_scale(
+    asynchronous: bool, x1: int, wide: int
+) -> None:
+    # Found in re-review: a crop so narrow that a width which fits is below the
+    # platform's floor of 64, which raises it back to the crop's own width. The
+    # toolset takes whole pixels, so a 1-pixel capture strip cannot be asked
+    # for here; the test below covers it.
+    d = Desktop((2160, 3840))
+    if asynchronous:
+        a = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+        await a.tool_result(use("screenshot"))
+        r = await a.tool_result(use("zoom", region=[0, 0, x1, 2576]))
+    else:
+        t = d.toolset()
+        t.tool_result(use("screenshot"))
+        r = t.tool_result(use("zoom", region=[0, 0, x1, 2576]))
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == f"0,0,{wide},3840"
+    assert "w" not in d.shots[2]
+    zoomed = size_of(image(r))
+    assert fits(zoomed) and zoomed[1] == 2576
+
+
+@pytest.mark.parametrize(
+    "crop", [(1, 3840), (2, 3840), (63, 3840), (64, 2577), (3840, 1), (3840, 2), (5000, 5000)]
+)
+def test_a_shrunk_crop_fits_as_the_platform_rounds_it(crop: tuple[int, int]) -> None:
+    from mandala_computer.anthropic import _crop_shrink, _Size
+
+    width, scale = _crop_shrink(_Size(*crop))
+    w, h = crop
+    if width is not None:
+        assert scale is None and width >= 64
+        out = (width, max(1, h * width // w))
+    else:
+        assert scale is not None and 0 < scale <= 1
+        out = (max(1, math.floor(w * scale + 0.5)), max(1, math.floor(h * scale + 0.5)))
+    assert fits(out)
+
+
+@respx.mock
+def test_zoom_maps_into_an_unshrunk_capture_smaller_than_the_record() -> None:
+    d = Desktop((1920, 1080), capture=(1280, 800))
+    t = d.toolset()
+    t.tool_result(use("screenshot"))
+    t.tool_result(use("zoom", region=[100, 100, 300, 200]))
+    assert d.shots[2]["region"] == "100,100,200,100"
+
+
+@respx.mock
+def test_zoom_is_refused_outside_the_picture_and_before_one() -> None:
+    d = Desktop((1280, 800))
+    t = d.toolset()
+    assert "take a screenshot before zooming" in text(
+        t.tool_result(use("zoom", region=[0, 0, 10, 10]))
+    )
+    t.tool_result(use("screenshot"))
+    assert t.tool_result(use("zoom", region=[0, 0, 2000, 10]))["is_error"] is True
     assert len(d.shots) == 1
 
 
@@ -533,9 +804,7 @@ def test_it_is_a_tools_entry_the_runner_sends_and_answers() -> None:
     )
     for _ in runner:
         pass
-    assert sent[0]["tools"] == [
-        {"type": "computer_toolset_20260801", "configs": {"zoom": {"enabled": False}}}
-    ]
+    assert sent[0]["tools"] == [{"type": "computer_toolset_20260801"}]
     answers = sent[1]["messages"][-1]["content"]
     assert [a["toolset_name"] for a in answers] == ["computer", "computer"]
     assert size_of(image(answers[1])) == (1280, 800)

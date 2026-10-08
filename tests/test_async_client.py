@@ -266,6 +266,30 @@ async def test_async_screenshot_info_says_when_the_frame_is_a_saved_one(
 
 
 @respx.mock
+async def test_async_screenshot_info_names_the_capture_it_was_cut_from(
+    client: mc.AsyncClient,
+) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
+        httpx.Response(
+            200,
+            content=b"jpg",
+            headers={
+                "Content-Type": "image/jpeg",
+                "X-GC-Capture": "0123456789abcdef",
+                "X-GC-Capture-Size": "3840x2160",
+            },
+        )
+    )
+    c = mc.AsyncComputer(client._t, COMPUTER)
+    info = await c.screenshot_info(64, fresh=True)
+    assert info.capture == "0123456789abcdef" and info.capture_size == (3840, 2160)
+    await c.screenshot(capture=info.capture, region=(0, 0, 640, 360))
+    assert route.calls.last.request.url.params["capture"] == "0123456789abcdef"
+    with pytest.raises(ValueError, match="give fresh or capture, not both"):
+        await c.screenshot(capture=info.capture, fresh=True)
+
+
+@respx.mock
 async def test_screenshot_shaping_becomes_query_params(client: mc.AsyncClient) -> None:
     route = respx.get(f"{BASE}/computers/vm-1/screenshot").mock(
         httpx.Response(200, content=b"jpg", headers={"Content-Type": "image/jpeg"})

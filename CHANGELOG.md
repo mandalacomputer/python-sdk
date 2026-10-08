@@ -16,10 +16,21 @@ This is the summary you read to decide whether to upgrade.
   `AsyncMandalaComputerToolset`, drivers for Anthropic's
   `computer_toolset_20260801`: pass one as a `tools` entry to
   `client.beta.messages.tool_runner()` and every action the model asks for runs
-  on the computer. Every action but `zoom` is served; `zoom` is declared off. Screens too
-  large for the model are photographed smaller and its points scaled back up.
-  Install with `pip install 'mandala-computer[anthropic]'`; `mandala_computer`
-  itself does not need `anthropic`.
+  on the computer. All 17 actions are served. Screens too large for the model
+  are photographed smaller and its points scaled back up. `zoom` is cut from
+  the capture it was measured on, and needs a platform that names its
+  captures; on an older one it is an error result. Install with
+  `pip install 'mandala-computer[anthropic]'`; `mandala_computer` itself does
+  not need `anthropic`.
+
+- **Crop the capture you measured**, sync and async. `ScreenshotInfo` has
+  `capture`, the name of the capture a live picture was cut from, and
+  `capture_size`, that capture's own `(width, height)`. `screenshot()` and
+  `screenshot_info()` take `capture=`, and answer from that capture and no
+  other; one the platform no longer holds raises `ConflictError` with
+  `reason == "stale_capture"`, which `is_transient()` calls permanent. Needs a
+  platform that names its captures (OPL-5852); an older one leaves both fields
+  `None`.
 
 ## [0.10.0] — 2026-10-03
 
