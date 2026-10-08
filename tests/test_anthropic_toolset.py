@@ -303,33 +303,60 @@ def test_the_pointer_is_answered_in_the_pictures_pixels() -> None:
 
 
 @respx.mock
-def test_zoom_crops_the_screens_pixels_shrunk_to_fit() -> None:
+def test_zoom_crops_the_captures_pixels_shrunk_to_fit() -> None:
     d = Desktop((3840, 2160))
     t = d.toolset()
     shot = size_of(image(t.tool_result(use("screenshot"))))
     r = t.tool_result(use("zoom", region=[0, 0, shot[0], shot[1]]))
     assert fits(size_of(image(r)))
-    assert d.shots[1]["region"] == "0,0,3840,2160"
+    # The picture was shrunk, so the capture is measured whole first.
+    assert d.shots[1] == {"fresh": "1"}
+    assert d.shots[2]["region"] == "0,0,3840,2160"
 
 
 @respx.mock
-def test_zoom_takes_a_small_region_whole() -> None:
+def test_zoom_takes_a_small_region_whole_without_measuring_again() -> None:
     d = Desktop((1280, 800))
-    r = d.toolset().tool_result(use("zoom", region=[100, 100, 300, 200]))
+    t = d.toolset()
+    t.tool_result(use("screenshot"))
+    r = t.tool_result(use("zoom", region=[100, 100, 300, 200]))
     assert size_of(image(r)) == (200, 100)
-    assert d.shots[0]["region"] == "100,100,200,100"
-    assert "w" not in d.shots[0]
+    assert len(d.shots) == 2
+    assert d.shots[1]["region"] == "100,100,200,100"
+    assert "w" not in d.shots[1]
 
 
 @respx.mock
-def test_zoom_is_refused_outside_the_picture_and_on_a_mismatched_screen() -> None:
+def test_zoom_maps_into_a_capture_of_another_size_than_the_record() -> None:
+    # Found in review: a 3200x1800 capture under a 3840x2160 record shrinks to
+    # the same 2576x1449 picture a 3840x2160 capture does.
+    d = Desktop((3840, 2160), capture=(3200, 1800))
+    t = d.toolset()
+    assert size_of(image(t.tool_result(use("screenshot")))) == (2576, 1449)
+    r = t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
+    assert r.get("is_error") is not True
+    assert d.shots[2]["region"] == "1242,621,249,249"
+
+
+@respx.mock
+def test_zoom_maps_into_an_unshrunk_capture_smaller_than_the_record() -> None:
     d = Desktop((1920, 1080), capture=(1280, 800))
     t = d.toolset()
-    assert t.tool_result(use("zoom", region=[0, 0, 2000, 10]))["is_error"] is True
     t.tool_result(use("screenshot"))
-    r = t.tool_result(use("zoom", region=[0, 0, 100, 100]))
-    assert r["is_error"] is True
-    assert "not at the size its computer reports" in text(r)
+    t.tool_result(use("zoom", region=[100, 100, 300, 200]))
+    assert d.shots[1]["region"] == "100,100,200,100"
+
+
+@respx.mock
+def test_zoom_is_refused_outside_the_picture_and_before_one() -> None:
+    d = Desktop((1280, 800))
+    t = d.toolset()
+    assert "take a screenshot before zooming" in text(
+        t.tool_result(use("zoom", region=[0, 0, 10, 10]))
+    )
+    t.tool_result(use("screenshot"))
+    assert t.tool_result(use("zoom", region=[0, 0, 2000, 10]))["is_error"] is True
+    assert len(d.shots) == 1
 
 
 # --- the keyboard ---------------------------------------------------------------
@@ -584,3 +611,71 @@ def test_the_readme_example_compiles_and_names_what_exists() -> None:
     for name in ("MandalaComputerToolset", "AsyncMandalaComputerToolset"):
         assert name in section and hasattr(driver, name)
     assert "from mandala_computer.anthropic import MandalaComputerToolset" in example
+
+
+# --- what the review found in the keyboard ----------------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize("chord", ["+Delete", "ctrl++", "ctrl+ +s"])
+def test_a_malformed_chord_is_refused_not_pressed_in_part(chord: str) -> None:
+    d = Desktop((1280, 800))
+    r = d.toolset().tool_result(use("key", text=chord))
+    assert r["is_error"] is True
+    assert "the + key itself is plus" in text(r)
+    assert d.inputs == []
+
+
+@respx.mock
+def test_a_bare_plus_is_refused_as_modifiers_and_empty_is_none() -> None:
+    d = Desktop((1280, 800))
+    t = d.toolset()
+    assert t.tool_result(use("left_click", coordinate=[1, 1], text="+"))["is_error"] is True
+    assert d.inputs == []
+    t.tool_result(use("left_click", coordinate=[1, 1], text=""))
+    assert len(d.inputs) == 1
+
+
+@respx.mock
+def test_a_piece_never_ends_between_the_halves_of_a_crlf() -> None:
+    d = Desktop((1280, 800))
+    typed = "a" * 399 + "\r\nb"
+    d.toolset().tool_result(use("type", text=typed))
+    assert [b["text"] for b in d.inputs] == ["a" * 399, "\r\nb"]
+
+
+@respx.mock
+def test_typing_says_how_much_went_in_before_a_piece_failed() -> None:
+    n = {"calls": 0}
+
+    def answer(body: dict[str, Any]) -> httpx.Response | None:
+        n["calls"] += 1
+        return (
+            httpx.Response(409, json={"error": "computer vm-1 is stopped"})
+            if n["calls"] > 1
+            else None
+        )
+
+    r = (
+        Desktop((1280, 800), answer=answer)
+        .toolset()
+        .tool_result(use("type", text="a" * 400 + "b" * 450))
+    )
+    assert r["is_error"] is True
+    assert text(r).startswith("typed 400 of 850 characters, then: ")
+    assert "computer vm-1 is stopped" in text(r)
+    assert "may have been typed in part" in text(r)
+
+
+@respx.mock
+async def test_the_async_driver_says_the_same_about_typing() -> None:
+    n = {"calls": 0}
+
+    def answer(body: dict[str, Any]) -> httpx.Response | None:
+        n["calls"] += 1
+        return httpx.Response(409, json={"error": "gone"}) if n["calls"] > 1 else None
+
+    d = Desktop((1280, 800), answer=answer)
+    t = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
+    r = await t.tool_result(use("type", text="a" * 400 + "b"))
+    assert text(r).startswith("typed 400 of 401 characters, then: ")

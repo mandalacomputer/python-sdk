@@ -1758,10 +1758,11 @@ callable.
   once per repeat, text longer than 400 characters is typed in pieces, and a
   `wait` of up to 300 seconds is waited in the platform's 30-second pieces. A
   `hold_key` is at most 30 seconds, because a hold cannot be split.
-- **`zoom`** crops the platform's capture and shrinks the crop to fit the
-  model. It is refused while the screen is not at the size its computer
-  reports, because there is then no rectangle of the capture that means what
-  the model drew.
+- **`zoom`** crops the platform's capture, in the capture's own pixels, and
+  shrinks the crop to fit the model. It needs a screenshot first, because the
+  region is a rectangle of one. When that screenshot was shrunk, the capture
+  is taken whole once more to measure it, because the capture need not be the
+  size its computer reports.
 - **A failure is an error result**, in the platform's own words, and the run
   goes on: the model reads it and adapts.
 

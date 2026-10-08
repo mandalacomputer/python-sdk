@@ -177,7 +177,17 @@ def _chord(text: object, field: str = "text") -> tuple[str, ...]:
         return ()
     if not isinstance(text, str):
         raise ToolError(f"{field} must be a key or a key combination")
-    return tuple(k.strip() for k in text.split("+") if k.strip())
+    if not text.strip():
+        return ()
+    keys = tuple(k.strip() for k in text.split("+"))
+    # An empty part is refused, not dropped (found in review): `+Delete` would
+    # otherwise press Delete alone and `ctrl++` press ctrl alone — an action
+    # the model did not ask for, reported as done.
+    if not all(keys):
+        raise ToolError(
+            f"{field} must be keys joined by +, such as ctrl+s; the + key itself is plus"
+        )
+    return keys
 
 
 def _keys(text: object, example: str) -> tuple[str, ...]:
@@ -188,11 +198,31 @@ def _keys(text: object, example: str) -> tuple[str, ...]:
 
 
 def _pieces(text: object) -> list[str]:
+    """Text as the pieces the platform types, each at most 400 code points —
+    counted as the platform counts, so a piece never ends half way through a
+    character — and never ending between the two halves of a CRLF, which is one
+    Return together and a refused bare CR apart (found in review)."""
     if not isinstance(text, str) or not text:
         raise ToolError("text must be the text to type")
-    # By code point, as the platform counts, so a piece never ends half way
-    # through a character.
-    return [text[i : i + _TYPE_PIECE] for i in range(0, len(text), _TYPE_PIECE)]
+    out = []
+    i = 0
+    while i < len(text):
+        end = min(i + _TYPE_PIECE, len(text))
+        if end < len(text) and text[end - 1] == "\r" and text[end] == "\n":
+            end -= 1
+        out.append(text[i:end])
+        i = end
+    return out
+
+
+def _typed_then(typed: int, total: int, error: ToolError) -> ToolError:
+    # Said, because what is already on the screen stays there: typing the whole
+    # text again would type its start twice, and a newline in it would run a
+    # command twice (found in review).
+    return ToolError(
+        f"typed {typed} of {total} characters, then: {error}. "
+        "The piece that failed may have been typed in part."
+    )
 
 
 def _waits(duration: object) -> list[float]:
@@ -241,12 +271,12 @@ class _View:
     def __init__(self, screen: tuple[int, int]) -> None:
         #: The screen the computer reports: the space the platform takes points in.
         self.screen = _Size(*screen)
-        #: The picture of it asked for before any has been measured.
-        self.expected = _largest_fit(self.screen)
+        # The picture of it asked for before any has been measured.
+        expected = _largest_fit(self.screen)
         #: The size of the last screenshot the model was shown.
-        self.frame = self.expected
+        self.frame = expected
         #: The width to have the platform shrink a screenshot to, once one needs it.
-        self.request: int | None = None if self.expected == self.screen else self.expected.width
+        self.request: int | None = None if expected == self.screen else expected.width
         self.shown = False
         #: Set when a screenshot came back at a size other than the last one's.
         #: A point chosen before that is in the old picture's pixels, and
@@ -313,9 +343,8 @@ class _View:
         self.aiming()
         return out
 
-    def zoom(self, region: object) -> tuple[tuple[int, int, int, int], int | None]:
-        """The screen rectangle for the model's ``region``, and the width to
-        shrink the crop to when it is too large for the model."""
+    def zoom_box(self, region: object) -> tuple[float, float, float, float]:
+        """The model's ``region``, checked against the last picture it saw."""
         if (
             not isinstance(region, (list, tuple))
             or len(region) != 4
@@ -323,26 +352,36 @@ class _View:
         ):
             raise ToolError("region must be [x0, y0, x1, y1], in the pixels of the screenshot")
         x0, y0, x1, y1 = region
-        frame, screen = self.frame, self.screen
+        frame = self.frame
         if not (0 <= x0 < x1 <= frame.width and 0 <= y0 < y1 <= frame.height):
             raise ToolError(
                 f"region [{x0}, {y0}, {x1}, {y1}] is not a rectangle inside the "
                 f"{frame.width}x{frame.height} screenshot"
             )
         self.aiming()
-        # The platform crops the capture it holds, in the screen's pixels. That
-        # is only the picture the model saw when the screenshot was the one
-        # asked for: a screen at another size than its computer reports has no
-        # rectangle here that means what the model meant.
-        if frame != self.expected:
+        if not self.shown:
             raise ToolError(
-                "zoom is unavailable while the screen is not at the size its computer reports; "
-                "take a screenshot instead"
+                "take a screenshot before zooming, so the region has a picture to be in"
             )
-        left = math.floor(x0 * screen.width / frame.width)
-        top = math.floor(y0 * screen.height / frame.height)
-        right = min(screen.width, math.ceil(x1 * screen.width / frame.width))
-        bottom = min(screen.height, math.ceil(y1 * screen.height / frame.height))
+        return x0, y0, x1, y1
+
+    def crop(
+        self, box: tuple[float, float, float, float], native: _Size
+    ) -> tuple[tuple[int, int, int, int], int | None]:
+        """The rectangle of the capture for ``box``, and the width to shrink the
+        crop to when it is too large for the model.
+
+        In the capture's own pixels (found in review): the platform crops the
+        capture it HOLDS, whose pixels are not the screen's when the two differ
+        and not the picture's when the picture was shrunk — a 3200x1800 capture
+        under a 3840x2160 record shrinks to the same 2576x1449 picture as a
+        3840x2160 one."""
+        x0, y0, x1, y1 = box
+        frame = self.frame
+        left = math.floor(x0 * native.width / frame.width)
+        top = math.floor(y0 * native.height / frame.height)
+        right = min(native.width, math.ceil(x1 * native.width / frame.width))
+        bottom = min(native.height, math.ceil(y1 * native.height / frame.height))
         crop = _Size(max(1, right - left), max(1, bottom - top))
         fit = _largest_fit(crop)
         return (left, top, crop.width, crop.height), (None if fit == crop else fit.width)
@@ -439,7 +478,13 @@ class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
     def zoom(
         self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
     ) -> BetaScreenshotResult:
-        region, width = self._view.zoom(input.region)
+        box = self._view.zoom_box(input.region)
+        # The capture IS the last picture when that was not shrunk; otherwise
+        # it is measured off one picture taken whole.
+        native = self._view.frame
+        if self._view.request is not None:
+            native = _measured(self._shoot(None), retaking=False)
+        region, width = self._view.crop(box, native)
         return _zoomed(
             _platform(self.computer.screenshot, width, fresh=True, region=region, format="png")
         )
@@ -516,8 +561,15 @@ class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
         _platform(self.computer.scroll, x, y, direction=direction, amount=amount, modifiers=held)
 
     def type(self, context: BetaToolsetCallContext, input: BetaComputerTypeInput) -> None:
+        typed = 0
         for piece in _pieces(input.text):
-            _platform(self.computer.type, piece)
+            try:
+                _platform(self.computer.type, piece)
+            except ToolError as error:
+                if typed == 0:
+                    raise
+                raise _typed_then(typed, len(input.text), error) from error
+            typed += len(piece)
 
     def key(self, context: BetaToolsetCallContext, input: BetaComputerKeyInput) -> None:
         keys = _keys(input.text, "Return or ctrl+s")
@@ -590,7 +642,11 @@ class AsyncMandalaComputerToolset(BetaAsyncAbstractComputerToolset20260801):
     async def zoom(
         self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
     ) -> BetaScreenshotResult:
-        region, width = self._view.zoom(input.region)
+        box = self._view.zoom_box(input.region)
+        native = self._view.frame
+        if self._view.request is not None:
+            native = _measured(await self._shoot(None), retaking=False)
+        region, width = self._view.crop(box, native)
         data: bytes = await _aplatform(
             self.computer.screenshot, width, fresh=True, region=region, format="png"
         )
@@ -671,8 +727,15 @@ class AsyncMandalaComputerToolset(BetaAsyncAbstractComputerToolset20260801):
         )
 
     async def type(self, context: BetaToolsetCallContext, input: BetaComputerTypeInput) -> None:
+        typed = 0
         for piece in _pieces(input.text):
-            await _aplatform(self.computer.type, piece)
+            try:
+                await _aplatform(self.computer.type, piece)
+            except ToolError as error:
+                if typed == 0:
+                    raise
+                raise _typed_then(typed, len(input.text), error) from error
+            typed += len(piece)
 
     async def key(self, context: BetaToolsetCallContext, input: BetaComputerKeyInput) -> None:
         keys = _keys(input.text, "Return or ctrl+s")
