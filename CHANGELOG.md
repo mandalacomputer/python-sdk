@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-08
+
 ### Added
 
 - **Drive a computer with Claude's computer toolset.**
@@ -1192,6 +1194,7 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
+[0.11.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.7.0...v0.8.0
