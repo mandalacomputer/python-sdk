@@ -1702,7 +1702,7 @@ of attributing a failure from its status alone.
 
 Anthropic's SDK runs the computer-use loop itself when its tool runner is
 given a toolset driver, and this package ships one for a Mandala computer.
-`MandalaComputerToolset` serves every action of `computer_toolset_20260801`,
+`MandalaComputerToolset` serves every action of `computer_toolset_20260801` but `zoom`,
 so the loop, the prompt and the model stay yours, on your own key, and the
 actions land on the computer. Use it instead of
 [letting the platform drive](#letting-the-platform-drive) when you want to
@@ -1758,11 +1758,10 @@ callable.
   once per repeat, text longer than 400 characters is typed in pieces, and a
   `wait` of up to 300 seconds is waited in the platform's 30-second pieces. A
   `hold_key` is at most 30 seconds, because a hold cannot be split.
-- **`zoom`** crops the platform's capture, in the capture's own pixels, and
-  shrinks the crop to fit the model. It needs a screenshot first, because the
-  region is a rectangle of one. Each zoom takes the screen whole once to
-  measure it, because the capture need not be the size its computer reports,
-  and cuts the crop from that same capture.
+- **`zoom` is off.** A zoom crops a capture the platform holds, and the
+  screenshot API cannot yet pin a crop to the capture it was measured on, so a
+  display that changed size mid-zoom would be cropped in the wrong place. The
+  model takes a screenshot instead.
 - **A failure is an error result**, in the platform's own words, and the run
   goes on: the model reads it and adapts.
 

@@ -16,7 +16,7 @@ This is the summary you read to decide whether to upgrade.
   `AsyncMandalaComputerToolset`, drivers for Anthropic's
   `computer_toolset_20260801`: pass one as a `tools` entry to
   `client.beta.messages.tool_runner()` and every action the model asks for runs
-  on the computer. All 17 actions are served, including `zoom`. Screens too
+  on the computer. Every action but `zoom` is served; `zoom` is declared off. Screens too
   large for the model are photographed smaller and its points scaled back up.
   Install with `pip install 'mandala-computer[anthropic]'`; `mandala_computer`
   itself does not need `anthropic`.

@@ -74,7 +74,6 @@ try:
         BetaComputerTripleClickInput,
         BetaComputerTypeInput,
         BetaComputerWaitInput,
-        BetaComputerZoomInput,
     )
 except ImportError as error:  # pragma: no cover - exercised by the import test
     raise ImportError(
@@ -343,49 +342,6 @@ class _View:
         self.aiming()
         return out
 
-    def zoom_box(self, region: object) -> tuple[float, float, float, float]:
-        """The model's ``region``, checked against the last picture it saw."""
-        if (
-            not isinstance(region, (list, tuple))
-            or len(region) != 4
-            or not all(_number(n) for n in region)
-        ):
-            raise ToolError("region must be [x0, y0, x1, y1], in the pixels of the screenshot")
-        x0, y0, x1, y1 = region
-        frame = self.frame
-        if not (0 <= x0 < x1 <= frame.width and 0 <= y0 < y1 <= frame.height):
-            raise ToolError(
-                f"region [{x0}, {y0}, {x1}, {y1}] is not a rectangle inside the "
-                f"{frame.width}x{frame.height} screenshot"
-            )
-        self.aiming()
-        if not self.shown:
-            raise ToolError(
-                "take a screenshot before zooming, so the region has a picture to be in"
-            )
-        return x0, y0, x1, y1
-
-    def crop(
-        self, box: tuple[float, float, float, float], native: _Size
-    ) -> tuple[tuple[int, int, int, int], int | None]:
-        """The rectangle of the capture for ``box``, and the width to shrink the
-        crop to when it is too large for the model.
-
-        In the capture's own pixels (found in review): the platform crops the
-        capture it HOLDS, whose pixels are not the screen's when the two differ
-        and not the picture's when the picture was shrunk — a 3200x1800 capture
-        under a 3840x2160 record shrinks to the same 2576x1449 picture as a
-        3840x2160 one."""
-        x0, y0, x1, y1 = box
-        frame = self.frame
-        left = math.floor(x0 * native.width / frame.width)
-        top = math.floor(y0 * native.height / frame.height)
-        right = min(native.width, math.ceil(x1 * native.width / frame.width))
-        bottom = min(native.height, math.ceil(y1 * native.height / frame.height))
-        crop = _Size(max(1, right - left), max(1, bottom - top))
-        fit = _largest_fit(crop)
-        return (left, top, crop.width, crop.height), (None if fit == crop else fit.width)
-
     def cursor(self, at: tuple[int, int] | None) -> BetaComputerCursorPositionResult:
         if at is None:
             raise ToolError(
@@ -409,13 +365,6 @@ def _measured(data: bytes, retaking: bool) -> _Size:
     return size
 
 
-def _zoomed(data: bytes) -> BetaScreenshotResult:
-    size = _png_size(data)
-    if size is None or not _fits(size):
-        raise ToolError("the zoomed picture came back larger than the model can be shown")
-    return _encoded(data)
-
-
 _T = TypeVar("_T")
 
 
@@ -433,7 +382,11 @@ def _platform(call: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
 class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
     """A Mandala computer as Claude's computer toolset, ``computer_toolset_20260801``.
 
-    Every member is served. Screenshots are always fresh, because a cached
+    Every member is served but ``zoom``, which Anthropic's class therefore
+    declares off. A zoom crops a capture the platform holds, and the screenshot
+    API names no capture a crop could be pinned to, so a display that changes
+    size while a zoom is under way would be cropped in the wrong place and
+    reported as a success. It comes back when the platform can pin one. Screenshots are always fresh, because a cached
     frame can predate the action it is meant to show and the model then repeats
     the action. A screen larger than the model will take a picture of is
     photographed smaller, by the platform, and the model's points are scaled
@@ -474,22 +427,6 @@ class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
             size = _measured(data, retaking=True)
         self._view.accept(size)
         return _encoded(data)
-
-    def zoom(
-        self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
-    ) -> BetaScreenshotResult:
-        box = self._view.zoom_box(input.region)
-        # Measured off a capture taken whole, now, and the crop cut from THAT
-        # capture (found in re-review): it is asked for without `fresh`, which
-        # the platform answers from the capture it has just taken for the
-        # measurement rather than taking another, which could be another size.
-        # What this cannot rule out is a third caller's fresh capture, at
-        # another size, landing between the two inside the platform's
-        # 1.5-second reuse window: the platform names no capture a crop could
-        # be pinned to.
-        native = _measured(self._shoot(None), retaking=False)
-        region, width = self._view.crop(box, native)
-        return _zoomed(_platform(self.computer.screenshot, width, region=region, format="png"))
 
     def cursor_position(
         self, context: BetaToolsetCallContext, input: BetaComputerCursorPositionInput
@@ -640,15 +577,6 @@ class AsyncMandalaComputerToolset(BetaAsyncAbstractComputerToolset20260801):
             size = _measured(data, retaking=True)
         self._view.accept(size)
         return _encoded(data)
-
-    async def zoom(
-        self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
-    ) -> BetaScreenshotResult:
-        box = self._view.zoom_box(input.region)
-        native = _measured(await self._shoot(None), retaking=False)
-        region, width = self._view.crop(box, native)
-        data: bytes = await _aplatform(self.computer.screenshot, width, region=region, format="png")
-        return _zoomed(data)
 
     async def cursor_position(
         self, context: BetaToolsetCallContext, input: BetaComputerCursorPositionInput

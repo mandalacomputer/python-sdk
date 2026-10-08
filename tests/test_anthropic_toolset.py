@@ -182,8 +182,11 @@ def test_needs_a_confirm_callable_while_it_can_type() -> None:
 
 
 @respx.mock
-def test_serves_every_member() -> None:
-    assert Desktop((1280, 800)).toolset().to_dict() == {"type": "computer_toolset_20260801"}
+def test_serves_every_member_but_zoom() -> None:
+    assert Desktop((1280, 800)).toolset().to_dict() == {
+        "type": "computer_toolset_20260801",
+        "configs": {"zoom": {"enabled": False}},
+    }
 
 
 @respx.mock
@@ -310,83 +313,14 @@ def test_the_pointer_is_answered_in_the_pictures_pixels() -> None:
 
 
 @respx.mock
-def test_zoom_crops_the_captures_pixels_shrunk_to_fit() -> None:
-    d = Desktop((3840, 2160))
-    t = d.toolset()
-    shot = size_of(image(t.tool_result(use("screenshot"))))
-    r = t.tool_result(use("zoom", region=[0, 0, shot[0], shot[1]]))
-    assert fits(size_of(image(r)))
-    # Measured off a capture taken whole, then cut from that same capture.
-    assert d.shots[1] == {"fresh": "1"}
-    assert d.shots[2]["region"] == "0,0,3840,2160"
-    assert "fresh" not in d.shots[2]
-
-
-@respx.mock
-def test_zoom_takes_a_small_region_whole() -> None:
+def test_zoom_is_declared_off_and_refused_without_touching_the_desktop() -> None:
+    # A zoom cannot yet be pinned to the capture it was measured on; see the
+    # class's docstring. Anthropic's class answers the call itself.
     d = Desktop((1280, 800))
     t = d.toolset()
     t.tool_result(use("screenshot"))
-    r = t.tool_result(use("zoom", region=[100, 100, 300, 200]))
-    assert size_of(image(r)) == (200, 100)
-    assert d.shots[2]["region"] == "100,100,200,100"
-    assert "w" not in d.shots[2]
-
-
-@respx.mock
-def test_zoom_maps_into_a_capture_of_another_size_than_the_record() -> None:
-    # Found in review: a 3200x1800 capture under a 3840x2160 record shrinks to
-    # the same 2576x1449 picture a 3840x2160 capture does.
-    d = Desktop((3840, 2160), capture=(3200, 1800))
-    t = d.toolset()
-    assert size_of(image(t.tool_result(use("screenshot")))) == (2576, 1449)
-    r = t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
-    assert r.get("is_error") is not True
-    assert d.shots[2]["region"] == "1242,621,249,249"
-
-
-@respx.mock
-def test_zoom_cuts_the_crop_from_the_capture_it_measured() -> None:
-    # Found in re-review: the display goes from 3200x1800 to 3840x2160 after
-    # the measurement, and a second fresh capture would be cut with the first
-    # one's arithmetic.
-    d = Desktop((3840, 2160), capture=(3200, 1800), captures=[(3200, 1800), (3840, 2160)])
-    t = d.toolset()
-    t.tool_result(use("screenshot"))
-    r = t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
-    assert r.get("is_error") is not True
-    assert d.shots[2]["region"] == "1242,621,249,249"
-    assert "fresh" not in d.shots[2]
-
-
-@respx.mock
-async def test_the_async_zoom_cuts_from_the_capture_it_measured() -> None:
-    d = Desktop((3840, 2160), capture=(3200, 1800), captures=[(3200, 1800), (3840, 2160)])
-    t = AsyncMandalaComputerToolset(d.async_computer(), confirm=lambda context: True)
-    await t.tool_result(use("screenshot"))
-    await t.tool_result(use("zoom", region=[1000, 500, 1200, 700]))
-    assert d.shots[2]["region"] == "1242,621,249,249"
-    assert "fresh" not in d.shots[2]
-
-
-@respx.mock
-def test_zoom_maps_into_an_unshrunk_capture_smaller_than_the_record() -> None:
-    d = Desktop((1920, 1080), capture=(1280, 800))
-    t = d.toolset()
-    t.tool_result(use("screenshot"))
-    t.tool_result(use("zoom", region=[100, 100, 300, 200]))
-    assert d.shots[2]["region"] == "100,100,200,100"
-
-
-@respx.mock
-def test_zoom_is_refused_outside_the_picture_and_before_one() -> None:
-    d = Desktop((1280, 800))
-    t = d.toolset()
-    assert "take a screenshot before zooming" in text(
-        t.tool_result(use("zoom", region=[0, 0, 10, 10]))
-    )
-    t.tool_result(use("screenshot"))
-    assert t.tool_result(use("zoom", region=[0, 0, 2000, 10]))["is_error"] is True
+    r = t.tool_result(use("zoom", region=[0, 0, 100, 100]))
+    assert r["is_error"] is True
     assert len(d.shots) == 1
 
 
@@ -599,7 +533,9 @@ def test_it_is_a_tools_entry_the_runner_sends_and_answers() -> None:
     )
     for _ in runner:
         pass
-    assert sent[0]["tools"] == [{"type": "computer_toolset_20260801"}]
+    assert sent[0]["tools"] == [
+        {"type": "computer_toolset_20260801", "configs": {"zoom": {"enabled": False}}}
+    ]
     answers = sent[1]["messages"][-1]["content"]
     assert [a["toolset_name"] for a in answers] == ["computer", "computer"]
     assert size_of(image(answers[1])) == (1280, 800)
