@@ -358,15 +358,25 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
 
 #: The header the platform puts on a suspended computer's saved frame.
 FRAME_HEADER = "X-GC-Frame"
+#: The headers naming the capture a live screenshot was cut from, and its size.
+CAPTURE_HEADER = "X-GC-Capture"
+CAPTURE_SIZE_HEADER = "X-GC-Capture-Size"
 
 
 def _screenshot_info(data: bytes, headers: httpx.Headers) -> ScreenshotInfo:
-    """A screenshot's bytes, with its type and the platform's suspended marker."""
+    """A screenshot's bytes, with its type, the platform's suspended marker, and
+    the capture it was cut from. A name or a size that does not read as one is
+    dropped, and the size goes with the name: a size is only of use for a crop
+    of a capture that can be named."""
     frame = headers.get(FRAME_HEADER, "")
+    capture = _api.capture_name(headers.get(CAPTURE_HEADER))
+    size = _api.capture_size(headers.get(CAPTURE_SIZE_HEADER)) if capture else None
     return ScreenshotInfo(
         data=data,
         content_type=headers.get("content-type", ""),
         suspended=frame.strip().lower() == "suspended",
+        capture=capture,
+        capture_size=size,
     )
 
 
@@ -3620,6 +3630,7 @@ class Computer(ComputerFields):
         scale: float | None = None,
         format: str | None = None,
         quality: int | None = None,
+        capture: str | None = None,
     ) -> bytes:
         """Capture the screen.
 
@@ -3674,12 +3685,42 @@ class Computer(ComputerFields):
         ``"unavailable"`` — not transient; start the computer for a screen that
         can be shaped. ``width`` and ``format="jpeg"`` alone are still answered
         with the saved picture.
+
+        **Cropping the capture you measured.** ``capture`` is the name of a
+        capture an earlier screenshot was cut from —
+        :attr:`~mandala_computer.ScreenshotInfo.capture`, from
+        :meth:`screenshot_info` — and the answer is cut from that capture and no
+        other, without taking a new one. That is what makes a crop worked out on
+        one answer land on the same pixels: measure, then crop::
+
+            seen = c.screenshot_info(64, fresh=True)  # small; the size is in the header
+            width, height = seen.capture_size
+            c.screenshot(capture=seen.capture, region=(0, 0, width // 2, height // 2))
+
+        ``region`` is in the capture's own pixels,
+        :attr:`~mandala_computer.ScreenshotInfo.capture_size`. The platform
+        holds only the newest capture of a computer, so the next one replaces
+        it — any screenshot 1.5 seconds later at the earliest, a fresh one at
+        once — and a name it no longer holds raises
+        :class:`~mandala_computer.ConflictError` with ``reason`` set to
+        ``"stale_capture"``, never a crop of a different picture. Not
+        transient: take a new screenshot and use the capture it names.
+        ``capture`` is refused beside ``fresh=True``, and with a malformed name,
+        with :class:`ValueError` before anything is sent. A suspended computer
+        has no capture to name and answers ``capture`` with ``reason``
+        ``"unavailable"``.
         """
         return self._t.binary(
             "GET",
             _api.computer_action(self.id, "screenshot"),
             params=_api.screenshot_params(
-                width, fresh, region=region, scale=scale, format=format, quality=quality
+                width,
+                fresh,
+                region=region,
+                scale=scale,
+                format=format,
+                quality=quality,
+                capture=capture,
             ),
             accept="image/png, image/jpeg",
             content_types=("image/", "application/octet-stream"),
@@ -3694,6 +3735,7 @@ class Computer(ComputerFields):
         scale: float | None = None,
         format: str | None = None,
         quality: int | None = None,
+        capture: str | None = None,
     ) -> ScreenshotInfo:
         """:meth:`screenshot`, with what the response said about the picture.
 
@@ -3703,13 +3745,23 @@ class Computer(ComputerFields):
         it was suspended (``X-GC-Frame: suspended``) rather than a capture of a
         live screen, which the bytes alone cannot show when ``width`` is set.
         :attr:`~mandala_computer.ScreenshotInfo.content_type` says whether the
-        image is a PNG or a JPEG.
+        image is a PNG or a JPEG, and
+        :attr:`~mandala_computer.ScreenshotInfo.capture` and
+        :attr:`~mandala_computer.ScreenshotInfo.capture_size` name the capture a
+        live picture was cut from, to crop it by ``capture=`` (see
+        :meth:`screenshot`).
         """
         data, headers = self._t.binary_with_headers(
             "GET",
             _api.computer_action(self.id, "screenshot"),
             params=_api.screenshot_params(
-                width, fresh, region=region, scale=scale, format=format, quality=quality
+                width,
+                fresh,
+                region=region,
+                scale=scale,
+                format=format,
+                quality=quality,
+                capture=capture,
             ),
             accept="image/png, image/jpeg",
             content_types=("image/", "application/octet-stream"),

@@ -2114,6 +2114,7 @@ def screenshot_params(
     scale: float | None = None,
     format: str | None = None,
     quality: int | None = None,
+    capture: str | None = None,
 ) -> dict[str, Any] | None:
     """``w`` downscales, ``fresh`` skips the cache; the rest shape the picture.
 
@@ -2129,7 +2130,7 @@ def screenshot_params(
 
     ``region``, ``scale``, ``format`` and ``quality`` are :func:`screenshot_shape`'s,
     and absent from the query when not given, so every call that predates them
-    builds the URL it always did.
+    builds the URL it always did. So is ``capture``, :func:`screenshot_capture`'s.
     """
     params: dict[str, Any] = {}
     if width is not None:
@@ -2137,12 +2138,70 @@ def screenshot_params(
         if width <= 0:
             raise ValueError("width must be positive")
         params["w"] = width
-    if flag(fresh, "fresh"):
+    fresh = flag(fresh, "fresh")
+    if fresh:
         params["fresh"] = 1
+    if capture is not None:
+        params["capture"] = screenshot_capture(capture, fresh)
     params.update(
         screenshot_shape(width, region=region, scale=scale, format=format, quality=quality)
     )
     return params or None
+
+
+#: What a capture's name looks like: the platform names each capture with
+#: sixteen lowercase hex digits, in a screenshot's ``X-GC-Capture`` header.
+CAPTURE_NAME = re.compile(r"[0-9a-f]{16}")
+
+
+def screenshot_capture(capture: object, fresh: bool) -> str:
+    """``capture``, checked: the name of a capture an earlier screenshot carried.
+
+    The platform answers from that capture and no other, so a crop worked out
+    on one answer is cut from the same pixels by the next. A name it no longer
+    holds is its ``409`` with ``reason`` ``"stale_capture"``; a malformed one
+    would be its ``400``, and is refused here instead, since the shape is all
+    there is to check.
+
+    Not beside ``fresh``, which asks for a capture taken after the request: a
+    named capture is one already taken, and the platform refuses the pair
+    rather than picking one.
+    """
+    if not isinstance(capture, str) or not CAPTURE_NAME.fullmatch(capture):
+        raise ValueError(
+            f"capture must be the name in a screenshot's X-GC-Capture header, not {capture!r}"
+        )
+    if fresh:
+        raise ValueError(
+            "give fresh or capture, not both: capture answers from a screenshot already "
+            "taken, and fresh asks for a new one"
+        )
+    return capture
+
+
+#: A capture's size as the platform sends it, ``WIDTHxHEIGHT``.
+CAPTURE_SIZE = re.compile(r"([0-9]{1,6})x([0-9]{1,6})")
+
+
+def capture_size(value: str | None) -> tuple[int, int] | None:
+    """A capture's ``X-GC-Capture-Size``, or ``None`` for one that is absent or
+    is not ``WIDTHxHEIGHT`` with both above zero. Strict, because the size is
+    what a crop of that capture is worked out in: a size read wrongly is a crop
+    of the wrong pixels."""
+    match = CAPTURE_SIZE.fullmatch(value.strip()) if isinstance(value, str) else None
+    if match is None:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def capture_name(value: str | None) -> str | None:
+    """A capture's ``X-GC-Capture``, or ``None`` for one that is absent or not a
+    name the platform gives."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if CAPTURE_NAME.fullmatch(value) else None
 
 
 #: The encodings a screenshot can be asked for. ``jpg`` is the platform's other

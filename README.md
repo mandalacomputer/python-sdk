@@ -1012,6 +1012,27 @@ even where a PNG is the default. The bytes cannot tell you which you got — wit
 `X-GC-Frame: suspended` marker. It cannot shape that picture either: a crop, a scale, `format="png"` or a quality raises
 `ConflictError` with `reason == "unavailable"`, which does not clear by waiting.
 
+**To crop the capture you measured, pass its `capture`.** A live picture's
+`ScreenshotInfo` also has `capture`, the name of the capture it was cut from,
+and `capture_size`, that capture's own `(width, height)` — the pixels a
+`region` is measured in, whatever size the picture was shrunk to. Pass the name
+back and the answer is cut from that capture and no other, so a crop worked out
+on one answer lands on the same pixels even if the screen has changed since:
+
+```python
+seen = c.screenshot_info(64, fresh=True)  # small: the size is in the header
+w, h = seen.capture_size
+top_left = c.screenshot(capture=seen.capture, region=(0, 0, w // 2, h // 2))
+```
+
+The platform holds only the newest capture of a computer, so the next one
+replaces it — any screenshot 1.5 seconds later at the earliest, a fresh one at
+once. A name it no longer holds raises `ConflictError` with
+`reason == "stale_capture"`, never a crop of another picture: take a new
+screenshot and use its name. `capture` is refused beside `fresh=True`. Needs a
+platform that names its captures (OPL-5852); an older one sends no name, and
+`capture` and `capture_size` are `None`.
+
 A non-zero exit is returned, not raised — check `res.ok`.
 
 The guest agent stops capturing a command's output at 16 MiB while the command
@@ -1702,7 +1723,7 @@ of attributing a failure from its status alone.
 
 Anthropic's SDK runs the computer-use loop itself when its tool runner is
 given a toolset driver, and this package ships one for a Mandala computer.
-`MandalaComputerToolset` serves every action of `computer_toolset_20260801` but `zoom`,
+`MandalaComputerToolset` serves every action of `computer_toolset_20260801`,
 so the loop, the prompt and the model stay yours, on your own key, and the
 actions land on the computer. Use it instead of
 [letting the platform drive](#letting-the-platform-drive) when you want to
@@ -1758,10 +1779,15 @@ callable.
   once per repeat, text longer than 400 characters is typed in pieces, and a
   `wait` of up to 300 seconds is waited in the platform's 30-second pieces. A
   `hold_key` is at most 30 seconds, because a hold cannot be split.
-- **`zoom` is off.** A zoom crops a capture the platform holds, and the
-  screenshot API cannot yet pin a crop to the capture it was measured on, so a
-  display that changed size mid-zoom would be cropped in the wrong place. The
-  model takes a screenshot instead.
+- **`zoom`** crops the platform's capture, in the capture's own pixels, and
+  shrinks the crop to fit the model. It needs a screenshot first, because the
+  region is a rectangle of one. Each zoom measures a fresh capture on the
+  smallest picture the platform makes, since the capture need not be the size
+  its computer reports, and cuts the crop from THAT capture by name, so a
+  display that changes size in between cannot put it in the wrong place. A
+  capture replaced before the crop arrives is measured again, up to three
+  times. It needs a platform that names its captures (OPL-5852); on an older
+  one a zoom is an error result and the model takes a screenshot instead.
 - **A failure is an error result**, in the platform's own words, and the run
   goes on: the model reads it and adapts.
 

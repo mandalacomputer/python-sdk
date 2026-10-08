@@ -236,6 +236,7 @@ PARAMETERS: dict[str, set[str]] = {
         "query:quality",
         "query:region",
         "query:scale",
+        "query:capture",
     },
     "POST computers/:id/input": {
         "body:action",

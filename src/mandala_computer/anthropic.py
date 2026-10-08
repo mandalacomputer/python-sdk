@@ -74,6 +74,7 @@ try:
         BetaComputerTripleClickInput,
         BetaComputerTypeInput,
         BetaComputerWaitInput,
+        BetaComputerZoomInput,
     )
 except ImportError as error:  # pragma: no cover - exercised by the import test
     raise ImportError(
@@ -81,9 +82,12 @@ except ImportError as error:  # pragma: no cover - exercised by the import test
         "pip install 'mandala-computer[anthropic]'"
     ) from error
 
+from ._exceptions import APIError
+
 if TYPE_CHECKING:
     from ._async_computer import AsyncComputer
     from ._computer import Computer
+    from ._models import ScreenshotInfo
 
 __all__ = ["AsyncMandalaComputerToolset", "MandalaComputerToolset"]
 
@@ -96,6 +100,9 @@ _MAX_TILES = 4784
 _TILE = 28
 #: The platform's floor for a shrunk screenshot's width.
 _MIN_WIDTH = 64
+#: How many times a zoom measures the screen and cuts its crop before giving up
+#: on a screen whose capture keeps being replaced between the two.
+_ZOOM_TRIES = 3
 
 #: The platform's ceiling on one ``wait`` or one held key, in seconds.
 _PLATFORM_HOLD = 30
@@ -342,6 +349,49 @@ class _View:
         self.aiming()
         return out
 
+    def zoom_box(self, region: object) -> tuple[float, float, float, float]:
+        """The model's ``region``, checked against the last picture it saw."""
+        if (
+            not isinstance(region, (list, tuple))
+            or len(region) != 4
+            or not all(_number(n) for n in region)
+        ):
+            raise ToolError("region must be [x0, y0, x1, y1], in the pixels of the screenshot")
+        x0, y0, x1, y1 = region
+        frame = self.frame
+        if not (0 <= x0 < x1 <= frame.width and 0 <= y0 < y1 <= frame.height):
+            raise ToolError(
+                f"region [{x0}, {y0}, {x1}, {y1}] is not a rectangle inside the "
+                f"{frame.width}x{frame.height} screenshot"
+            )
+        self.aiming()
+        if not self.shown:
+            raise ToolError(
+                "take a screenshot before zooming, so the region has a picture to be in"
+            )
+        return x0, y0, x1, y1
+
+    def crop(
+        self, box: tuple[float, float, float, float], native: _Size
+    ) -> tuple[tuple[int, int, int, int], int | None]:
+        """The rectangle of the capture for ``box``, and the width to shrink the
+        crop to when it is too large for the model.
+
+        In the capture's own pixels (found in review): the platform crops the
+        capture it HOLDS, whose pixels are not the screen's when the two differ
+        and not the picture's when the picture was shrunk — a 3200x1800 capture
+        under a 3840x2160 record shrinks to the same 2576x1449 picture as a
+        3840x2160 one."""
+        x0, y0, x1, y1 = box
+        frame = self.frame
+        left = math.floor(x0 * native.width / frame.width)
+        top = math.floor(y0 * native.height / frame.height)
+        right = min(native.width, math.ceil(x1 * native.width / frame.width))
+        bottom = min(native.height, math.ceil(y1 * native.height / frame.height))
+        crop = _Size(max(1, right - left), max(1, bottom - top))
+        fit = _largest_fit(crop)
+        return (left, top, crop.width, crop.height), (None if fit == crop else fit.width)
+
     def cursor(self, at: tuple[int, int] | None) -> BetaComputerCursorPositionResult:
         if at is None:
             raise ToolError(
@@ -365,6 +415,48 @@ def _measured(data: bytes, retaking: bool) -> _Size:
     return size
 
 
+def _pinned(measured: ScreenshotInfo) -> tuple[str, _Size]:
+    """The capture a zoom is cut from, and its own size, read off the
+    measurement's headers rather than its pixels — which is why the measurement
+    can be the smallest picture the platform makes."""
+    if measured.capture is None or measured.capture_size is None:
+        # Never an unpinned crop instead: that is the crop of whatever capture
+        # the platform holds when it arrives, which a resize in between makes
+        # the wrong part of the screen, reported as a success.
+        raise ToolError(
+            "zoom needs a platform that names its screenshot captures, so the crop can be "
+            "cut from the capture it was measured on, and this one does not; "
+            "take a screenshot instead"
+        )
+    return measured.capture, _Size(*measured.capture_size)
+
+
+def _stale(error: ToolError) -> bool:
+    """A crop refused because the capture it named was replaced before it
+    arrived. Read off the platform's error that :func:`_platform` wraps."""
+    cause = error.__cause__
+    return isinstance(cause, APIError) and cause.reason == "stale_capture"
+
+
+def _zoomed(cut: ScreenshotInfo, capture: str) -> BetaScreenshotResult:
+    # Checked rather than trusted: the one answer a pinned crop exists to rule
+    # out is a crop of some other capture, so a picture that does not say it is
+    # of this one is not handed to the model as though it were.
+    if cut.capture != capture:
+        raise ToolError("the zoom came back cut from another capture than the one measured")
+    size = _png_size(cut.data)
+    if size is None or not _fits(size):
+        raise ToolError("the zoomed picture came back larger than the model can be shown")
+    return _encoded(cut.data)
+
+
+#: What a zoom says when every try found its capture replaced before the crop.
+_KEPT_CHANGING = (
+    "the screen was captured again between measuring it and cutting the zoom, "
+    f"{_ZOOM_TRIES} times running; take a screenshot and zoom again"
+)
+
+
 _T = TypeVar("_T")
 
 
@@ -382,16 +474,21 @@ def _platform(call: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
 class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
     """A Mandala computer as Claude's computer toolset, ``computer_toolset_20260801``.
 
-    Every member is served but ``zoom``, which Anthropic's class therefore
-    declares off. A zoom crops a capture the platform holds, and the screenshot
-    API names no capture a crop could be pinned to, so a display that changes
-    size while a zoom is under way would be cropped in the wrong place and
-    reported as a success. It comes back when the platform can pin one. Screenshots are always fresh, because a cached
+    Every member is served. Screenshots are always fresh, because a cached
     frame can predate the action it is meant to show and the model then repeats
     the action. A screen larger than the model will take a picture of is
     photographed smaller, by the platform, and the model's points are scaled
     back up. ``wait`` is spread over the platform's 30-second waits, ``key``'s
     ``repeat`` is pressed one at a time, and long text is typed in pieces.
+
+    ``zoom`` is cut from the capture it was measured on (OPL-5852). It measures
+    a fresh capture of the screen, maps the model's region into that capture's
+    own pixels, and asks for the crop of THAT capture by the name the platform
+    gave it, so a display that changes size in between cannot put the crop in
+    the wrong place. A capture replaced before the crop arrives is measured
+    again, up to three times. It needs a platform that names its captures; on
+    one that does not, a zoom is an error result and the model takes a
+    screenshot instead.
     """
 
     def __init__(
@@ -427,6 +524,31 @@ class MandalaComputerToolset(BetaAbstractComputerToolset20260801):
             size = _measured(data, retaking=True)
         self._view.accept(size)
         return _encoded(data)
+
+    def zoom(
+        self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
+    ) -> BetaScreenshotResult:
+        box = self._view.zoom_box(input.region)
+        for _ in range(_ZOOM_TRIES):
+            # Measured on the smallest picture the platform makes: what is
+            # needed is the capture's name and size, which are in the headers.
+            measured = _platform(self.computer.screenshot_info, _MIN_WIDTH, fresh=True)
+            capture, native = _pinned(measured)
+            region, width = self._view.crop(box, native)
+            try:
+                cut = _platform(
+                    self.computer.screenshot_info,
+                    width,
+                    capture=capture,
+                    region=region,
+                    format="png",
+                )
+            except ToolError as error:
+                if _stale(error):
+                    continue
+                raise
+            return _zoomed(cut, capture)
+        raise ToolError(_KEPT_CHANGING)
 
     def cursor_position(
         self, context: BetaToolsetCallContext, input: BetaComputerCursorPositionInput
@@ -577,6 +699,29 @@ class AsyncMandalaComputerToolset(BetaAsyncAbstractComputerToolset20260801):
             size = _measured(data, retaking=True)
         self._view.accept(size)
         return _encoded(data)
+
+    async def zoom(
+        self, context: BetaToolsetCallContext, input: BetaComputerZoomInput
+    ) -> BetaScreenshotResult:
+        box = self._view.zoom_box(input.region)
+        for _ in range(_ZOOM_TRIES):
+            measured = await _aplatform(self.computer.screenshot_info, _MIN_WIDTH, fresh=True)
+            capture, native = _pinned(measured)
+            region, width = self._view.crop(box, native)
+            try:
+                cut = await _aplatform(
+                    self.computer.screenshot_info,
+                    width,
+                    capture=capture,
+                    region=region,
+                    format="png",
+                )
+            except ToolError as error:
+                if _stale(error):
+                    continue
+                raise
+            return _zoomed(cut, capture)
+        raise ToolError(_KEPT_CHANGING)
 
     async def cursor_position(
         self, context: BetaToolsetCallContext, input: BetaComputerCursorPositionInput
