@@ -209,7 +209,7 @@ from ._results import (
 )
 from ._webhooks import REPLAY_WINDOW_S, verify
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 __all__ = [
     "CHANNEL_EVENT_TYPES",
