@@ -522,6 +522,49 @@ async def test_tab_reply_followed_by_eof_does_not_wait_for_readiness() -> None:
 
 
 @pytest.mark.asyncio
+async def test_target_destroyed_before_create_reply_wakes_waiter() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    class Socket:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> str:
+            raw = await self.queue.get()
+            if raw is None:
+                raise StopAsyncIteration
+            return raw
+
+        async def send(self, raw: str) -> None:
+            message = json.loads(raw)
+            await self.queue.put(
+                json.dumps({"method": "Target.targetDestroyed", "params": {"targetId": "new"}})
+            )
+            await self.queue.put(json.dumps({"id": message["id"], "result": {"targetId": "new"}}))
+
+        async def close(self) -> None:
+            await self.queue.put(None)
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = Socket()
+    backend.tabs = {"other": {}}
+    backend.sessions = {"other": "existing"}
+    backend.active = "other"
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        with pytest.raises(BrowserError, match="closed during initialization"):
+            await asyncio.wait_for(backend.new_tab(), 1)
+        assert not backend.failed and not backend.ready
+        assert backend.active == "other" and list(backend.tabs) == ["other"]
+    finally:
+        await socket.close()
+        await backend.reader
+
+
+@pytest.mark.asyncio
 async def test_tab_destroyed_during_initialization_preserves_other_tabs() -> None:
     from mandala_computer._browser_cdp import BrowserCDP, BrowserError
 

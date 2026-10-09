@@ -239,6 +239,8 @@ class BrowserCDP:
                     self.tabs[info["targetId"]] = info
             elif method == "Target.targetDestroyed":
                 target = p["targetId"]
+                if target not in self.ready and self.creating is not None:
+                    await asyncio.shield(self.creating)
                 self.drop_tab(target)
             elif method == "Fetch.requestPaused":
                 tab = next((t for t, s in self.sessions.items() if s == session), None)
