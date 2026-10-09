@@ -341,15 +341,18 @@ class BrowserCDP:
             result = await self.send(
                 "Target.createTarget", {"url": "about:blank", "browserContextId": self.context}
             )
+            if self.failed or self.closed:
+                raise BrowserError("Browser connection ended.")
             target = result["targetId"]
-            self.ready[target] = asyncio.Event()
+            ready = asyncio.Event()
+            self.ready[target] = ready
             self.creating.set_result(target)
         except BaseException:
             self.creating.cancel()
             raise
         finally:
             self.creating = None
-        await asyncio.wait_for(self.ready[target].wait(), 15)
+        await asyncio.wait_for(ready.wait(), 15)
         if self.failed or self.closed:
             raise BrowserError("Browser connection ended.")
         self.active = target

@@ -482,3 +482,37 @@ def test_sync_revocation_can_retry_without_retaining_worker(chrome: str, website
     browser.close()
     browser.close()
     assert calls == [IDENT, IDENT]
+
+
+@pytest.mark.asyncio
+async def test_tab_reply_followed_by_eof_does_not_wait_for_readiness() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    class Socket:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[str] = asyncio.Queue()
+            self.delivered = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> str:
+            if self.delivered:
+                raise StopAsyncIteration
+            self.delivered = True
+            return await self.queue.get()
+
+        async def send(self, raw: str) -> None:
+            message = json.loads(raw)
+            await self.queue.put(json.dumps({"id": message["id"], "result": {"targetId": "new"}}))
+
+        async def close(self) -> None:
+            pass
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = Socket()
+    backend.reader = asyncio.create_task(backend._read())
+    with pytest.raises(BrowserError, match="ended"):
+        await asyncio.wait_for(backend.new_tab(), 1)
+    await backend.reader
+    assert not backend.ready and not backend.tabs
