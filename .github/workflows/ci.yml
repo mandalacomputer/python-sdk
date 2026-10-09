@@ -76,3 +76,12 @@ jobs:
       # Catches the metadata that only fails at upload time — a malformed
       # README or a URL PyPI will not take.
       - run: twine check dist/*
+
+  guest-file-quarantine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Linux quotas, protected snapshots and guardian cleanup
+        run: >-
+          sudo unshare --mount --propagation private sh -c
+          'mount -t tmpfs -o mode=0755,size=32m,nr_inodes=1024 tmpfs /run && python3 tests/browser_guest_probe.py'

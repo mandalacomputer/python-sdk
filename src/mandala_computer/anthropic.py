@@ -90,10 +90,18 @@ if TYPE_CHECKING:
     from ._models import ScreenshotInfo
 
 from ._anthropic_browser import AsyncMandalaBrowserToolset, MandalaBrowserToolset
+from ._browser_files import (
+    BrowserDownload,
+    BrowserFilePolicy,
+    BrowserStagedFile,
+)
 
 __all__ = [
     "AsyncMandalaBrowserToolset",
     "AsyncMandalaComputerToolset",
+    "BrowserDownload",
+    "BrowserFilePolicy",
+    "BrowserStagedFile",
     "MandalaBrowserToolset",
     "MandalaComputerToolset",
 ]

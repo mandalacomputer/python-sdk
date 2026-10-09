@@ -58,6 +58,8 @@ class BrowserCDP:
         session_policy: BrowserSessionPolicy | None = None,
     ) -> None:
         self.create, self.revoke, self.policy = create, revoke, policy
+        self.files: Any = None
+        self._starting: asyncio.Task[None] | None = None
         self.renew = renew
         self.session_policy = session_policy
         self.lease: BrowserSessionLease | None = None
@@ -96,11 +98,24 @@ class BrowserCDP:
                 self.terminal_reason
                 or "Browser connection ended. Create a new toolset for a fresh session."
             )
+        # Staging is a public harness API outside the inherited tool-call queue.
+        if self._starting is None:
+            self._starting = asyncio.create_task(self._start())
+        await asyncio.shield(self._starting)
+
+    async def _start(self) -> None:
+        if self.closed or self.failed:
+            raise BrowserError(
+                self.terminal_reason
+                or "Browser connection ended. Create a new toolset for a fresh session."
+            )
         if self.ws is not None:
             return
         try:
             requested = time.monotonic()
             self.grant = await self._invoke(self.create)
+            if self.closed:
+                raise BrowserError("Browser connection ended.")
             if self.session_policy is not None:
                 self._accept_lease(self.grant.lease, time.monotonic() - requested)
             self.ws = await _DirectConnect(
@@ -110,6 +125,8 @@ class BrowserCDP:
                 close_timeout=2,
                 max_size=8 * 1024 * 1024,
             )
+            if self.closed:
+                raise BrowserError("Browser connection ended.")
             self.reader = asyncio.create_task(self._read())
             self.context = (
                 await self.send("Target.createBrowserContext", {"disposeOnDetach": True})
@@ -118,6 +135,8 @@ class BrowserCDP:
                 "Browser.setDownloadBehavior",
                 {"behavior": "deny", "browserContextId": self.context},
             )
+            if self.files is not None:
+                await self.files.setup(self.context)
             await self.send("Target.setDiscoverTargets", {"discover": True})
             await self.send(
                 "Target.setAutoAttach",
@@ -164,6 +183,7 @@ class BrowserCDP:
             if lease and not ended
             else 0.0,
             "terminal_error": self.terminal_reason,
+            "file_cleanup_failed": bool(self.files and self.files.cleanup_failed),
         }
 
     async def _maintain_lease(self) -> None:
@@ -277,6 +297,8 @@ class BrowserCDP:
                     )
             if self.ws is not None:
                 await self.ws.close()
+            if self.files is not None:
+                await self.files.close()
 
     async def _event(self, message: dict[str, Any]) -> None:
         method, p, session = (
@@ -285,6 +307,12 @@ class BrowserCDP:
             message.get("sessionId"),
         )
         try:
+            if self.files is not None and method in (
+                "Browser.downloadWillBegin",
+                "Browser.downloadProgress",
+            ):
+                await self.files.event(method, p)
+                return
             if method == "Target.attachedToTarget":
                 info, child = p["targetInfo"], p["sessionId"]
                 if (
@@ -329,6 +357,9 @@ class BrowserCDP:
                 ]
                 for name, args in initializers:
                     await self.send(name, args, child)
+                if self.files is not None:
+                    tree = await self.send("Page.getFrameTree", session=child)
+                    self.files.frame_tree(tree["frameTree"], target)
                 await self.send("Runtime.runIfWaitingForDebugger", session=child)
                 if ready := self.ready.get(target):
                     ready.set()
@@ -374,8 +405,14 @@ class BrowserCDP:
             else:
                 tab = next((t for t, s in self.sessions.items() if s == session), None)
                 if tab:
+                    if self.files is not None and method == "Page.frameAttached":
+                        self.files.frame(p["frameId"], tab)
+                    if self.files is not None and method == "Page.frameDetached":
+                        self.files.frames.pop(p["frameId"], None)
                     if method == "Page.frameNavigated":
                         self.refs.pop(tab, None)
+                        if self.files is not None:
+                            self.files.frame(p["frame"]["id"], tab)
                     elif method == "Runtime.consoleAPICalled":
                         text = " ".join(
                             str(a.get("value", a.get("description", "")))[:1000]
@@ -398,6 +435,8 @@ class BrowserCDP:
                 await self.ws.close()
 
     def drop_tab(self, target: str) -> None:
+        if self.files is not None:
+            self.files.frames = {f: t for f, t in self.files.frames.items() if t != target}
         if ready := self.ready.get(target):
             ready.set()
         for mapping in (
@@ -866,6 +905,23 @@ class BrowserCDP:
         # AnyIO uses level cancellation: every await in the caller's cancelled
         # scope can raise again. Cleanup must run shielded, including revocation.
         with anyio.CancelScope(shield=True):
+            self.closed = True
+            if (
+                self._starting is not None
+                and self._starting is not asyncio.current_task()
+                and not self._starting.done()
+            ):
+                try:
+                    await asyncio.shield(self._starting)
+                except Exception:  # noqa: BLE001, S110 - failed startup still needs teardown
+                    pass
+            if (
+                self.cleanup is not None
+                and self.cleanup.done()
+                and self.files
+                and self.files.created
+            ):
+                await self.files.close()
             if self.cleanup is None:
                 self.closed = True
                 self.cleanup = asyncio.create_task(self._close())
@@ -876,6 +932,8 @@ class BrowserCDP:
                 raise
 
     async def _close(self) -> None:
+        if self.files is not None:
+            await self.files.close()
         if self.lease_task is not None and self.lease_task is not asyncio.current_task():
             self.lease_task.cancel()
             await asyncio.gather(self.lease_task, return_exceptions=True)
