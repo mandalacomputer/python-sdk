@@ -16,4 +16,4 @@ jobs:
       - name: Exercise sync and async drivers against Chromium
         run: |
           export MANDALA_TEST_CHROMIUM="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
-          pytest -q tests/test_browser_toolset.py
+          pytest -q tests/test_browser_toolset.py tests/test_browser_files.py
