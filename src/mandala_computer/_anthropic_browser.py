@@ -24,6 +24,7 @@ from anthropic.tools.browser import (
     BetaURLPolicy,
 )
 from anthropic.types import beta
+from pydantic import ValidationError
 
 from ._async_computer import AsyncComputer
 from ._browser_cdp import BrowserCDP, BrowserError
@@ -34,9 +35,17 @@ T = TypeVar("T")
 
 async def _perform(backend: BrowserCDP, name: str, input: Any) -> Any:
     try:
-        result = await asyncio.wait_for(
-            backend.perform(name, input.model_dump(by_alias=True, exclude_none=True)), 45
-        )
+        try:
+            data = (
+                type(input)
+                .model_validate(input.model_dump(by_alias=True, exclude_none=True), strict=True)
+                .model_dump(by_alias=True, exclude_none=True)
+            )
+        except ValidationError:
+            raise BrowserError(
+                "Invalid browser action input. Check the required fields and their types."
+            ) from None
+        result = await asyncio.wait_for(backend.perform(name, data), 45)
         if name == "navigate":
             return BetaBrowserNavigateResult(**result)
         if name in ("screenshot", "zoom"):
@@ -350,9 +359,11 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
         return BetaBrowserState(**self._backend.state())
 
     async def close(self) -> None:
-        await super().close()
         try:
-            await self._backend.close()
+            try:
+                await super().close()
+            finally:
+                await self._backend.close()
         except Exception:  # noqa: BLE001 - never expose backend credentials in exceptions
             raise ToolError(
                 "Browser disconnected, but its grant could not be revoked; it expires within ten minutes."

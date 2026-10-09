@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
 
+import anyio
 import pytest
 import respx
 from anthropic.tools import ToolError, ToolsetConfigError
@@ -248,7 +249,13 @@ async def test_async_real_browser(chrome: str, website: Any) -> None:
         return True
 
     async with AsyncMandalaBrowserToolset(
-        computer, configs={"javascript_exec": {"enabled": True}}, confirm=confirm
+        computer,
+        configs={
+            "javascript_exec": {"enabled": True},
+            "read_console": {"enabled": True},
+            "read_network": {"enabled": True},
+        },
+        confirm=confirm,
     ) as browser:
         assert_success(await browser.tool_result(use("navigate", url=base)))
         answer = assert_success(await browser.tool_result(use("javascript_exec", text="6 * 7")))
@@ -259,3 +266,155 @@ async def test_async_real_browser(chrome: str, website: Any) -> None:
         assert_success(await browser.tool_result(use("close_tab", tab_id=state[0]["tab_id"])))
         assert len(tabs(await browser.tool_result(use("list_tabs")))) == 1
     assert revoked == [IDENT]
+
+
+@pytest.mark.asyncio
+async def test_anyio_cancellation_disposes_and_revokes() -> None:
+    revoked: list[str] = []
+
+    class Socket:
+        closed = False
+
+        async def close(self) -> None:
+            await asyncio.sleep(0)
+            self.closed = True
+
+    async def revoke(ident: str) -> None:
+        await asyncio.sleep(0)
+        revoked.append(ident)
+
+    browser = AsyncMandalaBrowserToolset(
+        SimpleNamespace(create_browser_connection=lambda: None, revoke_browser_connection=revoke)
+    )
+    backend = browser._backend
+    backend.grant = SimpleNamespace(id=IDENT)
+    backend.ws = socket = Socket()
+    backend.context = "context"
+    backend.tabs = {"t": {}}
+    backend.sessions = {"t": "s"}
+    backend.active = "t"
+    calls: list[str] = []
+
+    async def send(method: str, *_: Any, **__: Any) -> Any:
+        calls.append(method)
+        await asyncio.sleep(0)
+        return {}
+
+    backend.send = send
+    with anyio.move_on_after(0.01) as scope:
+        await browser.tool_result(use("wait", duration=5))
+    assert scope.cancel_called and socket.closed
+    assert revoked == [IDENT] and "Target.disposeBrowserContext" in calls
+    await browser.close()
+    assert revoked == [IDENT]
+
+
+@pytest.mark.asyncio
+async def test_review_regressions_real_browser(chrome: str, website: Any) -> None:
+    computer, revoked = remote(chrome, True)
+    base, _ = website
+    reject_reload = False
+    pending, release = asyncio.Event(), asyncio.Event()
+
+    async def policy(_ctx: Any, url: str) -> None:
+        if url.endswith("/slow"):
+            pending.set()
+            await release.wait()
+        if reject_reload or url.endswith("/blocked"):
+            raise ToolError("refused")
+
+    async with AsyncMandalaBrowserToolset(
+        computer,
+        configs={
+            "javascript_exec": {"enabled": True},
+            "read_console": {"enabled": True},
+            "read_network": {"enabled": True},
+        },
+        confirm=lambda _: True,
+        url_policy=policy,
+    ) as browser:
+
+        async def call(name: str, **data: Any) -> Any:
+            return assert_success(await browser.tool_result(use(name, **data)))
+
+        async def js(expression: str) -> str:
+            return text(await call("javascript_exec", text=expression))
+
+        first = tabs(await call("navigate", url=base))[0]["tab_id"]
+        await js(
+            "document.body.innerHTML += '<label>Choice <select id=choice><option value=one>First</option><option value=two>Second</option></select></label>'; document.addEventListener('mousemove', e => window.buttons=e.buttons); document.getElementById('name').focus()"
+        )
+        await call("key", text="a")
+        assert await js("document.getElementById('name').value") == "a"
+        await call("key", text="b c Backspace")
+        assert await js("document.getElementById('name').value") == "ab"
+        point = {"type": "coordinate", "x": 20, "y": 20}
+        await call("left_mouse_down", target=point)
+        await call("mouse_move", target={**point, "x": 50})
+        assert await js("window.buttons") == "1"
+        await call("left_mouse_up", target=point)
+        page = await call("read_page", filter="interactive")
+        choice = ref(page, "combobox Choice")
+        await call("form_input", target=choice, value="Second")
+        assert await js("document.getElementById('choice').value") == "two"
+        assert (await browser.tool_result(use("form_input", target=choice, value="missing"))).get(
+            "is_error"
+        )
+        assert await js("document.getElementById('choice').value") == "two"
+        name = ref(page, "textbox Name")
+        assert (await browser.tool_result(use("form_input", target=name, value="x" * 16001))).get(
+            "is_error"
+        )
+        assert await js("document.getElementById('name').value") == "ab"
+        for member, data in [
+            ("scroll", {"target": point, "scroll_direction": "diagonal"}),
+            ("zoom", {}),
+            ("type", {}),
+            ("left_click", {}),
+        ]:
+            assert (await browser.tool_result(use(member, **data))).get("is_error")
+        await call("get_page_text")
+        await js("console.log('unique-console-message')")
+        assert "unique-console-message" in text(await call("read_console"))
+        assert "unique-console-message" not in text(await call("read_console"))
+        await js("fetch('/logged').then(r=>r.text())")
+        assert "/logged" in text(await call("read_network"))
+        assert "/logged" not in text(await call("read_network"))
+        reject_reload = True
+        assert (await browser.tool_result(use("navigate", url="reload"))).get("is_error")
+        reject_reload = False
+        await call("form_input", target=name, value="still valid")
+        second = next(t["tab_id"] for t in tabs(await call("new_tab")) if t["tab_id"] != first)
+        await call("javascript_exec", tab_id=first, text="void fetch('/slow').catch(()=>{})")
+        await asyncio.wait_for(pending.wait(), 2)
+        await call("close_tab", tab_id=first)
+        release.set()
+        await asyncio.sleep(0.1)
+        await call("get_page_text", tab_id=second)
+        assert first not in browser._backend.ready and first not in browser._backend.sessions
+        browser._backend.changes.append({"type": "navigation_refused"})
+        result = await call("list_tabs")
+        assert "refused" in text(result).lower()
+    assert revoked == [IDENT]
+
+
+@pytest.mark.asyncio
+async def test_zoom_uses_scrolled_viewport_origin() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = object()
+    backend.tabs = {"t": {}}
+    backend.sessions = {"t": "s"}
+    backend.active = "t"
+    clip: dict[str, Any] = {}
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getLayoutMetrics":
+            return {"cssVisualViewport": {"pageX": 10, "pageY": 800}}
+        clip.update(params["clip"])
+        return {"data": "image"}
+
+    backend.send = send
+    await backend.perform("zoom", {"region": [0, 20, 100, 120]})
+    assert clip == {"x": 10, "y": 820, "width": 100, "height": 100, "scale": 1}

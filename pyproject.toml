@@ -39,7 +39,7 @@ mandala-py = "mandala_computer._cli:main"
 # The driver for Claude's computer toolset, `mandala_computer.anthropic`
 # (OPL-5851). Optional because nothing else in the package needs it; 1.12 is
 # the release the driver is tested against.
-anthropic = ["anthropic>=1.12"]
+anthropic = ["anthropic>=1.12", "anyio>=3.5", "pydantic>=2"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "ruff>=0.6", "mypy>=1.11", "h2>=4,<5", "openai==3.14.1", "anthropic==1.12.0"]
 
 [project.urls]

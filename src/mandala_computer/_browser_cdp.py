@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
+import anyio
 from websockets.asyncio.client import connect
 
 
@@ -47,6 +48,8 @@ class BrowserCDP:
         self.grant: Any = None
         self.context: str | None = None
         self.closed = False
+        self.cleanup: asyncio.Task[None] | None = None
+        self.buttons: dict[str, int] = {}
         self.failed = False
         self.tabs: dict[str, dict[str, Any]] = {}
         self.sessions: dict[str, str] = {}
@@ -206,26 +209,28 @@ class BrowserCDP:
                     self.tabs[info["targetId"]] = info
             elif method == "Target.targetDestroyed":
                 target = p["targetId"]
-                self.tabs.pop(target, None)
-                self.sessions.pop(target, None)
-                self.refs.pop(target, None)
-                self.console.pop(target, None)
-                self.network.pop(target, None)
+                self.drop_tab(target)
             elif method == "Fetch.requestPaused":
                 tab = next((t for t, s in self.sessions.items() if s == session), None)
+                if tab is None:
+                    return  # The target has already detached; its requests die with it.
+                allowed = True
                 try:
-                    if tab is None:
-                        raise BrowserError("Unknown browser target")
                     await self.check_url(p["request"]["url"], tab)
-                except Exception:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
+                except Exception:  # noqa: BLE001 - fail closed without exposing callback errors
+                    allowed = False
+                if self.sessions.get(tab) != session:
+                    return
+                if not allowed:
                     self.changes.append({"type": "navigation_refused"})
-                    await self.send(
-                        "Fetch.failRequest",
-                        {"requestId": p["requestId"], "errorReason": "BlockedByClient"},
-                        session,
-                    )
-                else:
-                    await self.send("Fetch.continueRequest", {"requestId": p["requestId"]}, session)
+                await self.send(
+                    "Fetch.continueRequest" if allowed else "Fetch.failRequest",
+                    {
+                        "requestId": p["requestId"],
+                        **({} if allowed else {"errorReason": "BlockedByClient"}),
+                    },
+                    session,
+                )
             elif method == "Page.javascriptDialogOpening":
                 self.changes.append(
                     {
@@ -252,10 +257,24 @@ class BrowserCDP:
                             f"{response['status']} {response['url'][:2000]}"
                         )
         except Exception:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
+            if session is not None and session not in self.sessions.values():
+                return  # An in-flight command raced with target destruction.
             # A failed policy installation must never leave an unguarded page.
             self.failed = True
             if self.ws is not None:
                 await self.ws.close()
+
+    def drop_tab(self, target: str) -> None:
+        for mapping in (
+            self.tabs,
+            self.sessions,
+            self.ready,
+            self.refs,
+            self.console,
+            self.network,
+            self.buttons,
+        ):
+            mapping.pop(target, None)
 
     async def check_url(self, url: str, tab: str | None) -> str:
         parsed = urlsplit(url)
@@ -271,7 +290,12 @@ class BrowserCDP:
         if len(url) > 8192:
             raise BrowserError("URL exceeds 8192 characters.")
         if self.policy:
-            await asyncio.wait_for(self._invoke(self.policy, tab, url), 5)
+            try:
+                await asyncio.wait_for(self._invoke(self.policy, tab, url), 5)
+            except Exception:  # noqa: BLE001 - withhold arbitrary callback error text
+                raise BrowserError(
+                    "Navigation was refused by the URL policy or its deadline."
+                ) from None
         return url
 
     async def new_tab(self) -> dict[str, Any]:
@@ -336,7 +360,7 @@ class BrowserCDP:
         if name == "new_tab":
             return await self.new_tab()
         if name == "list_tabs":
-            return self.state()["tabs"]
+            return [self.tab_state(t) for t in self.tabs]
         tab = data.get("tab_id") or self.active
         if tab not in self.tabs:
             raise BrowserError("Tab is missing or closed. List the tabs and choose an open tab.")
@@ -348,11 +372,10 @@ class BrowserCDP:
             return self.tab_state(tab)
         if name == "close_tab":
             await self.send("Target.closeTarget", {"targetId": tab})
-            self.tabs.pop(tab, None)
+            self.drop_tab(tab)
             return None
         if name == "navigate":
             url = data["url"]
-            self.refs.pop(tab, None)
             if url in ("back", "forward"):
                 history = await self.send("Page.getNavigationHistory", session=session)
                 index = history["currentIndex"] + (-1 if url == "back" else 1)
@@ -371,6 +394,7 @@ class BrowserCDP:
                 result = await self.send("Page.navigate", {"url": url}, session)
                 if "errorText" in result:
                     raise BrowserError("Navigation failed or was refused by the URL policy.")
+            self.refs.pop(tab, None)
             for _ in range(100):
                 try:
                     if await self.evaluate(tab, "document.readyState") in (
@@ -399,7 +423,16 @@ class BrowserCDP:
                     number(value, label, limit, integer=True)
                 if x2 <= x1 or y2 <= y1:
                     raise BrowserError("region must have positive width and height")
-                args["clip"] = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1, "scale": 1}
+                viewport = (await self.send("Page.getLayoutMetrics", session=session))[
+                    "cssVisualViewport"
+                ]
+                args["clip"] = {
+                    "x": x1 + viewport["pageX"],
+                    "y": y1 + viewport["pageY"],
+                    "width": x2 - x1,
+                    "height": y2 - y1,
+                    "scale": 1,
+                }
             image = await self.send("Page.captureScreenshot", args, session)
             return {"data": image["data"], "media_type": "image/png"}
         if name in ("read_page", "find"):
@@ -463,7 +496,7 @@ class BrowserCDP:
             return await self.evaluate(tab, "(document.body?.innerText || '').slice(0,24000)")
         if name in ("read_console", "read_network"):
             source = self.console if name == "read_console" else self.network
-            return "\n".join(source.get(tab, []))[-24000:] or "No entries recorded."
+            return "\n".join(source.pop(tab, []))[-24000:] or "No entries recorded."
         if name == "javascript_exec":
             text = data["text"]
             if len(text) > 16000:
@@ -485,6 +518,8 @@ class BrowserCDP:
             await self.send("Input.insertText", {"text": text}, session)
             return None
         if name == "form_input":
+            if isinstance(data["value"], str) and len(data["value"]) > 16000:
+                raise BrowserError("value exceeds 16000 characters")
             node = self.refs.get(tab, {}).get(data["target"]["ref"])
             if node is None:
                 raise BrowserError("Unknown or stale element reference. Read the page again.")
@@ -496,7 +531,7 @@ class BrowserCDP:
                     "Runtime.callFunctionOn",
                     {
                         "objectId": obj,
-                        "functionDeclaration": "function(v){if(!this.isConnected)throw Error(); if(this instanceof HTMLInputElement && this.type==='file')throw Error(); if(this instanceof HTMLInputElement && ['checkbox','radio'].includes(this.type)){if(typeof v!=='boolean')throw Error(); if(this.checked!==v)this.click();}else if(this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this instanceof HTMLSelectElement){const p=this instanceof HTMLInputElement?HTMLInputElement.prototype:this instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLSelectElement.prototype; Object.getOwnPropertyDescriptor(p,'value').set.call(this,String(v));this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}else throw Error();}",
+                        "functionDeclaration": "function(v){if(!this.isConnected)throw Error(); if(this instanceof HTMLInputElement && this.type==='file')throw Error(); if(this instanceof HTMLInputElement && ['checkbox','radio'].includes(this.type)){if(typeof v!=='boolean')throw Error(); if(this.checked!==v)this.click();}else if(this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this instanceof HTMLSelectElement){if(this instanceof HTMLSelectElement){const options=Array.from(this.options);const option=options.find(o=>o.value===String(v))||options.find(o=>o.label===String(v));if(!option||option.disabled||option.parentElement instanceof HTMLOptGroupElement&&option.parentElement.disabled)throw Error();v=option.value;}const p=this instanceof HTMLInputElement?HTMLInputElement.prototype:this instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLSelectElement.prototype; Object.getOwnPropertyDescriptor(p,'value').set.call(this,String(v));this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));}else throw Error();}",
                         "arguments": [{"value": data["value"]}],
                         "returnByValue": True,
                     },
@@ -510,7 +545,10 @@ class BrowserCDP:
                 await self.send("Runtime.releaseObject", {"objectId": obj}, session)
             return None
         if name in ("key", "hold_key"):
-            keys = key_chord(data["text"])
+            pieces = data["text"].split()
+            if not 1 <= len(pieces) <= (100 if name == "key" else 1):
+                raise BrowserError("Use up to 100 key chords, or one chord for hold_key.")
+            sequence = [key_chord(piece) for piece in pieces]
             repeat = int(
                 number(
                     data.get("repeat") if data.get("repeat") is not None else 1,
@@ -522,7 +560,7 @@ class BrowserCDP:
             if repeat < 1:
                 raise BrowserError("repeat must be at least one")
             duration = number(data.get("duration", 0), "duration", 10)
-            for _ in range(repeat):
+            for keys in sequence * repeat:
                 pressed = []
                 try:
                     modifiers = 0
@@ -535,6 +573,11 @@ class BrowserCDP:
                                 "key": key,
                                 "windowsVirtualKeyCode": code,
                                 "modifiers": modifiers,
+                                **(
+                                    {"text": key.upper() if modifiers & 8 else key}
+                                    if len(key) == 1 and not modifiers & 7
+                                    else {}
+                                ),
                             },
                             session,
                         )
@@ -577,7 +620,15 @@ class BrowserCDP:
             return None
         if name in ("hover", "mouse_move"):
             await self.send(
-                "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseMoved",
+                    "x": x,
+                    "y": y,
+                    "buttons": self.buttons.get(tab, 0),
+                    "button": "left" if self.buttons.get(tab) else "none",
+                },
+                session,
             )
             return None
         if name == "left_click_drag":
@@ -616,7 +667,10 @@ class BrowserCDP:
                 await self.send(
                     "Input.dispatchMouseEvent", {**args, "type": "mousePressed"}, session
                 )
+            if name == "left_mouse_down":
+                self.buttons[tab] = 1
             if name != "left_mouse_down":
+                self.buttons.pop(tab, None)
                 await self.send(
                     "Input.dispatchMouseEvent", {**args, "type": "mouseReleased"}, session
                 )
@@ -647,9 +701,19 @@ class BrowserCDP:
             raise BrowserError("Element is no longer visible. Read the page again.") from None
 
     async def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
+        # AnyIO uses level cancellation: every await in the caller's cancelled
+        # scope can raise again. Cleanup must run shielded, including revocation.
+        with anyio.CancelScope(shield=True):
+            if self.cleanup is None:
+                self.closed = True
+                self.cleanup = asyncio.create_task(self._close())
+            try:
+                await asyncio.shield(self.cleanup)
+            except Exception:
+                self.cleanup = None  # Explicit close may retry a failed revocation.
+                raise
+
+    async def _close(self) -> None:
         try:
             if self.ws is not None:
                 if self.context and not self.failed:
@@ -668,7 +732,8 @@ class BrowserCDP:
             await asyncio.gather(*self.tasks, return_exceptions=True)
             self.tabs.clear()
             if self.grant:
-                await self._invoke(self.revoke, self.grant.id)
+                await asyncio.wait_for(self._invoke(self.revoke, self.grant.id), 10)
+                self.grant = None
 
 
 def key_chord(text: str) -> list[tuple[str, int]]:
