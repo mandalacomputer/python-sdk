@@ -1884,9 +1884,11 @@ never trigger file reads or retrieval.
 ```python
 from mandala_computer.anthropic import BrowserFilePolicy, MandalaBrowserToolset
 
+
 def review_browser_action(context):
     print(context.member, context.tab_url, context.input)
     return input("Approve this action? [y/N] ").lower() == "y"
+
 
 policy = BrowserFilePolicy(
     computer,
