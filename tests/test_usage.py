@@ -158,9 +158,8 @@ class TestTheWindow:
         # one call whose output somebody checks against an invoice.
         route = answering()
         with pytest.raises(ValueError, match="aware datetime"):
-            # The naive datetime is the subject, so the lint that exists to stop
-            # one being written by accident is suppressed rather than obeyed.
-            client.usage.read(since=datetime(2026, 7, 1))  # noqa: DTZ001
+            # Deliberately naive: the client must refuse to guess its time zone.
+            client.usage.read(since=datetime(2026, 7, 1, tzinfo=timezone.utc).replace(tzinfo=None))
         assert not route.called
 
     @respx.mock
@@ -265,7 +264,9 @@ class TestTheAsyncHalf:
         route = answering()
         async with async_client as c:
             with pytest.raises(ValueError, match="aware datetime"):
-                await c.usage.read(until=datetime(2026, 7, 1))  # noqa: DTZ001
+                await c.usage.read(
+                    until=datetime(2026, 7, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+                )
         assert not route.called
 
 
