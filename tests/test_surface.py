@@ -91,6 +91,8 @@ UNIMPLEMENTED = {
 # rule: a route nobody calls sends none of its parameters, and that route's own
 # line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
+    # OPL-5866 adds funded-agent options; this client currently sends its own model key.
+    "POST computers/:id/agent  body:max_cost_usd",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
