@@ -316,6 +316,7 @@ PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/clipboard": set(),
     "PUT computers/:id/clipboard": {"body:text"},
     "POST computers/:id/agent": {
+        "body:max_cost_usd",
         "header:X-Model-Key",
         "body:prompt",
         "body:system",
