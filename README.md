@@ -1854,9 +1854,8 @@ revokes its capability; it does not stop Chromium or delete the computer.
   `confirm`, enforced by Anthropic's base class. `confirm` can also approve or
   refuse ordinary navigation, input, and clicks. The policy example below
   limits destinations; it does not decide whether a form submission is safe.
-- **Uploads and downloads are unavailable.** The driver does not accept a
-  local file policy for the remote guest. It leaves `file_upload` unimplemented
-  and denies browser downloads. Do not enable it with local paths or document IDs.
+- Uploads and downloads default to denied. Opt in with the remote file policy
+  described below. A local Anthropic file policy does not authorize guest reads.
 - The URL hook checks direct navigations and **intercepted HTTP(S) requests,
   including redirects**. Background request checks have a tab ID but no tool
   call ID. Allow by returning nothing; refuse by throwing `ToolError`.
@@ -1875,6 +1874,99 @@ revokes its capability; it does not stop Chromium or delete the computer.
   16,000 characters per input/JavaScript action, a 30-second wait, a ten-second
   held key and at most 100 key repeats. Coordinates outside the viewport and
   invalid crop rectangles are refused. Dialogs are dismissed and reported.
+
+**Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
+(and its account authority), task ID, browser context and toolset. It cannot be
+reused with another computer or toolset. The harness stages files before the
+model can select them; model-supplied paths, URLs and unstaged Files API IDs
+never trigger file reads or retrieval.
+
+```python
+from mandala_computer.anthropic import BrowserFilePolicy, MandalaBrowserToolset
+
+def review_browser_action(context):
+    print(context.member, context.tab_url, context.input)
+    return input("Approve this action? [y/N] ").lower() == "y"
+
+policy = BrowserFilePolicy(
+    computer,
+    task_id="task-123",
+    guest_upload_roots=("/home/user/exports",),
+    allowed_mime_types=("text/plain", "application/pdf"),
+)
+with MandalaBrowserToolset(
+    computer,
+    remote_file_policy=policy,
+    configs={"file_upload": {"enabled": True}},
+    confirm=review_browser_action,  # Your approval UI/callback; never omitted.
+) as browser:
+    staged = browser.stage_local_file(b"approved text", filename="notes.txt")
+    # Alternatives, each called by trusted harness code:
+    # staged = browser.stage_guest_file("/home/user/exports/report.pdf")
+    # staged = browser.stage_document("file_123", authorized_bytes, filename="report.pdf")
+    # Give staged.id to the model; file_upload uses document_ids=[staged.id].
+```
+
+The async toolset provides the same three staging methods with `await`.
+`stage_local_file` takes caller-provided bytes, never a host filesystem path.
+`stage_document` takes bytes already retrieved with your Files API authorization;
+it performs no network fetch. `stage_guest_file` snapshots only regular,
+single-link files beneath configured absolute guest roots. It rejects symlinks
+in every path component, dot segments, FIFOs, devices and directories. Reads
+are bounded and checked for concurrent mutation.
+
+The inherited `confirm` gate remains mandatory when `file_upload` is enabled.
+Its input identifies the exact sanitized filenames, byte lengths and SHA-256
+hashes in the staged handles. The callback receives the current target URL,
+and the driver retains the actual file input before asking. Approval cannot
+be replayed against another context, call, input or changed document URL.
+Dispatch consumes the selected handles and transfers immutable bytes in an
+isolated JavaScript world. Refused approval leaves the staged handles available
+for a later explicit request. Uploads into subframes are not supported.
+
+Downloads are a separate opt-in: set `downloads=True` and `approve_download`
+(Python) or `downloads: true` and `approveDownload` (TypeScript) on the policy.
+The callback receives immutable filename, MIME type, size, SHA-256, computer,
+task, context and source URL metadata, with no path. Return exactly `True`/`true`
+within 30 seconds to publish a read-only guest path in `download_completed`.
+Exceptions, timeout, cancellation and any other return value refuse publication.
+Use that event path only while the toolset is alive; copy authorized bytes to
+your durable storage before closing if needed. This driver never executes files.
+
+Defaults and hard ceilings are 1 MiB per file, 4 MiB total staged uploads,
+4 MiB total approved downloads, eight simultaneously staged uploads and eight
+download attempts per context. Configure smaller limits if desired. Downloads
+from untracked frames (including beyond the 256-frame tracking limit) are canceled. Supported
+MIME types are plain text (`.txt`, the default), CSV, JSON, PDF, PNG and JPEG.
+Extension and content screening is limited to UTF-8/JSON validation or file
+signatures; it is not malware scanning. Suspicious filenames are reduced to
+an ASCII basename, while actual download storage uses Chromium GUIDs.
+
+Guest operations require Linux with Python 3.8+ and the Computer API's root
+execution authority. Downloads also require tmpfs mounting and a non-root
+desktop identity. They fail closed when those facilities are unavailable.
+Each context gets a private root-owned quarantine with `noexec`, `nodev`,
+`nosuid`, a 128-inode ceiling and a byte ceiling of twice the configured total
+plus 64 KiB (including the protected copy). Per-file limits govern acceptance;
+a response can temporarily fill this bounded quarantine before cancellation.
+Completed downloads are copied into new protected inodes before approval, so
+an old writable browser descriptor cannot alter the approved copy.
+
+Close, socket loss, lease expiry and revocation stop publication and attempt
+cleanup. A detached guest guardian removes the quarantine after five minutes
+without a heartbeat, or two hours absolute, checked every five seconds. These
+are guest monotonic running-time bounds, not a promise about time spent powered
+off. Unmounting leaves an inaccessible backing directory; open descriptors can
+retain only the bounded detached mount. If remote execution or cleanup cannot
+be confirmed, close reports an error and `file_cleanup_failed`/`fileCleanupFailed`
+in session status stays true; retry close. An exec timeout does not prove the
+guest command stopped, and a late-created quarantine still has its guardian.
+
+This policy controls this SDK's file channel. It is not isolation from guest
+root, another account-authorized shell tool, or another browser-control holder.
+Approval gives the selected page access to the uploaded bytes; it cannot control
+what that page does with them afterward. Apply account permissions and network
+policy separately.
 
 **Renewable sessions (requires the OPL-5880 platform deployment).** Explicitly
 opt in to a 30-minute active lease, renewed on the same socket up to a two-hour
