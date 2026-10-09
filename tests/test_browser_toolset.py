@@ -522,6 +522,57 @@ async def test_tab_reply_followed_by_eof_does_not_wait_for_readiness() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tab_destroyed_during_initialization_preserves_other_tabs() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = object()
+    backend.context = "context"
+    backend.tabs = {"other": {}}
+    backend.sessions = {"other": "existing"}
+    backend.active = "other"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Target.createTarget":
+            return {"targetId": "new"}
+        if method == "Page.enable":
+            entered.set()
+            await release.wait()
+            raise BrowserError("Target closed")
+        assert session == "existing"
+        return {"result": {"value": "Remaining page"}}
+
+    backend.send = send
+    creation = asyncio.create_task(backend.new_tab())
+    await asyncio.sleep(0)
+    initialization = asyncio.create_task(
+        backend._event(
+            {
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": "new-session",
+                    "targetInfo": {
+                        "targetId": "new",
+                        "type": "page",
+                        "browserContextId": "context",
+                    },
+                },
+            }
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    await backend._event({"method": "Target.targetDestroyed", "params": {"targetId": "new"}})
+    release.set()
+    await initialization
+    with pytest.raises(BrowserError, match="closed during initialization"):
+        await asyncio.wait_for(creation, 1)
+    assert not backend.failed and not backend.ready
+    assert backend.active == "other"
+    assert await backend.perform("get_page_text", {}) == "Remaining page"
+
+
+@pytest.mark.asyncio
 async def test_accessibility_rows_without_dom_nodes_do_not_advertise_refs() -> None:
     from mandala_computer._browser_cdp import BrowserCDP
 

@@ -207,6 +207,7 @@ class BrowserCDP:
                     return
                 self.sessions[target] = child
                 self.tabs[target] = info
+                session = child  # Initialization can race with this target's destruction.
                 initializers: list[tuple[str, dict[str, Any]]] = [
                     ("Page.enable", {}),
                     ("Runtime.enable", {}),
@@ -230,7 +231,8 @@ class BrowserCDP:
                 for name, args in initializers:
                     await self.send(name, args, child)
                 await self.send("Runtime.runIfWaitingForDebugger", session=child)
-                self.ready[target].set()
+                if ready := self.ready.get(target):
+                    ready.set()
             elif method == "Target.targetInfoChanged":
                 info = p["targetInfo"]
                 if info["targetId"] in self.tabs:
@@ -295,6 +297,8 @@ class BrowserCDP:
                 await self.ws.close()
 
     def drop_tab(self, target: str) -> None:
+        if ready := self.ready.get(target):
+            ready.set()
         for mapping in (
             self.tabs,
             self.sessions,
@@ -357,6 +361,8 @@ class BrowserCDP:
         await asyncio.wait_for(ready.wait(), 15)
         if self.failed or self.closed:
             raise BrowserError("Browser connection ended.")
+        if target not in self.tabs:
+            raise BrowserError("Browser tab closed during initialization.")
         self.active = target
         return self.tab_state(target)
 
