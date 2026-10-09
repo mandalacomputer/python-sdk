@@ -78,6 +78,9 @@ LIMITS = [
     ("WEBHOOK_DESCRIPTION_MAX", "webhook.descriptionMaxChars"),
     ("WEBHOOK_COMPUTERS_MAX", "webhook.computersMax"),
     ("WEBHOOK_REPLAY_WINDOW_S", "webhook.replayWindowSeconds"),
+    ("BROWSER_MIN_LEASE_SECONDS", "browser.minimumLeaseSeconds"),
+    ("BROWSER_DEFAULT_LEASE_SECONDS", "browser.defaultLeaseSeconds"),
+    ("BROWSER_MAX_SESSION_SECONDS", "browser.maximumSessionSeconds"),
 ]
 
 #: The methods a route entry may begin with. Anything else is not a route this

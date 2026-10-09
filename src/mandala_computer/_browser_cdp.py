@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import math
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -14,6 +15,8 @@ from urllib.parse import urlsplit
 import anyio
 from anthropic.tools import ToolError
 from websockets.asyncio.client import connect
+
+from ._browser_connection import BrowserSessionLease, BrowserSessionPolicy
 
 
 class BrowserError(Exception):
@@ -45,8 +48,22 @@ class BrowserCDP:
     A failed transport is never replayed.
     """
 
-    def __init__(self, create: Callable[..., Any], revoke: Callable[..., Any], policy: Any) -> None:
+    def __init__(
+        self,
+        create: Callable[..., Any],
+        revoke: Callable[..., Any],
+        policy: Any,
+        *,
+        renew: Callable[..., Any] | None = None,
+        session_policy: BrowserSessionPolicy | None = None,
+    ) -> None:
         self.create, self.revoke, self.policy = create, revoke, policy
+        self.renew = renew
+        self.session_policy = session_policy
+        self.lease: BrowserSessionLease | None = None
+        self.lease_deadline = 0.0
+        self.lease_task: asyncio.Task[None] | None = None
+        self.terminal_reason: str | None = None
         self.ws: Any = None
         self.reader: asyncio.Task[None] | None = None
         self.tasks: set[asyncio.Task[None]] = set()
@@ -76,12 +93,16 @@ class BrowserCDP:
     async def start(self) -> None:
         if self.closed or self.failed:
             raise BrowserError(
-                "Browser connection ended. Create a new toolset for a fresh session."
+                self.terminal_reason
+                or "Browser connection ended. Create a new toolset for a fresh session."
             )
         if self.ws is not None:
             return
         try:
+            requested = time.monotonic()
             self.grant = await self._invoke(self.create)
+            if self.session_policy is not None:
+                self._accept_lease(self.grant.lease, time.monotonic() - requested)
             self.ws = await _DirectConnect(
                 self.grant.url,
                 additional_headers={"Authorization": f"Bearer {self.grant.token}"},
@@ -103,16 +124,90 @@ class BrowserCDP:
                 {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True},
             )
             await self.new_tab()
+            if self.lease is not None:
+                self.lease_task = asyncio.create_task(self._maintain_lease())
         except BaseException:
             await self.close()
             raise
+
+    def _accept_lease(self, lease: BrowserSessionLease | None, elapsed: float) -> None:
+        if lease is None:
+            raise BrowserError(
+                "The server did not provide the requested renewable browser session."
+            )
+        previous = self.lease
+        if previous is not None and (
+            lease.id != previous.id
+            or lease.attach_expires_at != previous.attach_expires_at
+            or lease.absolute_expires_at != previous.absolute_expires_at
+            or lease.lease_seconds != previous.lease_seconds
+            or lease.server_time < previous.server_time
+            or lease.lease_expires_at < previous.lease_expires_at
+        ):
+            raise BrowserError("Browser renewal returned an inconsistent session lease.")
+        # Server time avoids dependence on the SDK host's wall clock. Subtract
+        # the whole request duration so network latency never extends a lease.
+        remaining = (lease.lease_expires_at - lease.server_time).total_seconds() - elapsed
+        if remaining <= 0:
+            raise BrowserError("Browser session lease expired before its response arrived.")
+        self.lease = lease
+        self.lease_deadline = time.monotonic() + remaining
+
+    def session_status(self) -> dict[str, Any]:
+        lease, deadline = self.lease, self.lease_deadline
+        ended = self.failed or self.closed
+        return {
+            "state": "ended" if ended else "active" if self.ws is not None else "not_started",
+            "lease_expires_at": lease.lease_expires_at if lease else None,
+            "absolute_expires_at": lease.absolute_expires_at if lease else None,
+            "remaining_seconds": max(0.0, deadline - time.monotonic())
+            if lease and not ended
+            else 0.0,
+            "terminal_error": self.terminal_reason,
+        }
+
+    async def _maintain_lease(self) -> None:
+        try:
+            while not self.closed and not self.failed:
+                assert self.lease is not None and self.session_policy is not None
+                remaining = self.lease_deadline - time.monotonic()
+                can_renew = (
+                    self.session_policy.auto_renew
+                    and self.renew is not None
+                    and self.lease.lease_expires_at < self.lease.absolute_expires_at
+                )
+                await asyncio.sleep(
+                    max(0.0, remaining - min(60.0, remaining / 3))
+                    if can_renew
+                    else max(0.0, remaining)
+                )
+                if self.closed or self.failed:
+                    return
+                if not can_renew or time.monotonic() >= self.lease_deadline:
+                    self.terminal_reason = "Browser session lease expired or its absolute limit was reached. Create a new toolset to continue."
+                    break
+                assert self.renew is not None
+                requested = time.monotonic()
+                lease = await asyncio.wait_for(
+                    self._invoke(self.renew, self.grant.id),
+                    min(10.0, self.lease_deadline - requested),
+                )
+                self._accept_lease(lease, time.monotonic() - requested)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - never expose credentials or account error bodies
+            self.terminal_reason = "Browser session renewal failed. The session ended; create a new toolset to continue."
+        self.failed = True
+        if self.ws is not None:
+            await self.ws.close()  # Version 2 disconnect revokes the grant on the server.
 
     async def send(
         self, method: str, params: dict[str, Any] | None = None, session: str | None = None
     ) -> Any:
         if self.ws is None or self.failed:
             raise BrowserError(
-                "Browser connection ended. Create a new toolset for a fresh session."
+                self.terminal_reason
+                or "Browser connection ended. Create a new toolset for a fresh session."
             )
         self.counter += 1
         ident = self.counter
@@ -157,6 +252,8 @@ class BrowserCDP:
             pass
         finally:
             self.failed = True
+            if self.lease_task is not None and self.lease_task is not asyncio.current_task():
+                self.lease_task.cancel()
             for ready in self.ready.values():
                 ready.set()
             for mapping in (
@@ -174,7 +271,9 @@ class BrowserCDP:
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(
-                        BrowserError("Browser connection ended or its ten-minute grant expired.")
+                        BrowserError(
+                            self.terminal_reason or "Browser connection ended or its lease expired."
+                        )
                     )
             if self.ws is not None:
                 await self.ws.close()
@@ -777,6 +876,9 @@ class BrowserCDP:
                 raise
 
     async def _close(self) -> None:
+        if self.lease_task is not None and self.lease_task is not asyncio.current_task():
+            self.lease_task.cancel()
+            await asyncio.gather(self.lease_task, return_exceptions=True)
         try:
             if self.ws is not None:
                 if self.context and not self.failed:
