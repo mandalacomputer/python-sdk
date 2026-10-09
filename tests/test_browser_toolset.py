@@ -439,3 +439,26 @@ async def test_zoom_uses_scrolled_viewport_origin() -> None:
     backend.send = send
     await backend.perform("zoom", {"region": [0, 20, 100, 120]})
     assert clip == {"x": 10, "y": 820, "width": 100, "height": 100, "scale": 1}
+
+
+@pytest.mark.asyncio
+async def test_navigation_fails_promptly_after_transport_loss() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = object()
+    backend.tabs = {"t": {}}
+    backend.sessions = {"t": "s"}
+    backend.active = "t"
+
+    async def send(*_: Any, **__: Any) -> Any:
+        return {}
+
+    async def evaluate(*_: Any) -> Any:
+        backend.failed = True
+        raise BrowserError("Browser connection ended.")
+
+    backend.send = send
+    backend.evaluate = evaluate
+    with pytest.raises(BrowserError, match="ended"):
+        await asyncio.wait_for(backend.perform("navigate", {"url": "https://example.com"}), 1)

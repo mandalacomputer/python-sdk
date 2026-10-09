@@ -157,7 +157,20 @@ class BrowserCDP:
             pass
         finally:
             self.failed = True
-            self.tabs.clear()
+            for ready in self.ready.values():
+                ready.set()
+            for mapping in (
+                self.tabs,
+                self.sessions,
+                self.ready,
+                self.refs,
+                self.console,
+                self.network,
+                self.buttons,
+            ):
+                mapping.clear()
+            self.active = None
+            self.changes.clear()
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(
@@ -337,6 +350,8 @@ class BrowserCDP:
         finally:
             self.creating = None
         await asyncio.wait_for(self.ready[target].wait(), 15)
+        if self.failed or self.closed:
+            raise BrowserError("Browser connection ended.")
         self.active = target
         return self.tab_state(target)
 
@@ -422,7 +437,8 @@ class BrowserCDP:
                     ):
                         break
                 except BrowserError:
-                    pass
+                    if self.failed or self.closed:
+                        raise
                 await asyncio.sleep(0.1)
             info = await self.evaluate(tab, "({url:location.href,title:document.title})")
             return info
