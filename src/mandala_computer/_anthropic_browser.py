@@ -341,26 +341,28 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
         url_policy: BetaAsyncURLPolicy | None = None,
         tool_configs: BetaToolConfigs | None = None,
     ) -> None:
-        options: dict[str, Any] = {
-            "configs": configs,
-            "confirm": confirm,
-            "tool_configs": tool_configs,
-        }
-        if url_policy is not None:
-            options["url_policy"] = url_policy
-        super().__init__(**options)
-
-        async def policy(tab: str | None, url: str) -> None:
+        async def apply_policy(context: BetaURLContext, url: str) -> None:
             if url_policy is not None:
-                context = BetaURLContext(tab_id=tab)
                 callback: Any = url_policy
-                returned = callback(context, url)
+                returned = await asyncio.to_thread(callback, context, url)
                 if inspect.isawaitable(returned):
                     returned = await returned
                 if returned is not None:
                     raise BrowserError(
                         "URL policy must allow with no return value or refuse by throwing."
                     )
+
+        options: dict[str, Any] = {
+            "configs": configs,
+            "confirm": confirm,
+            "tool_configs": tool_configs,
+        }
+        if url_policy is not None:
+            options["url_policy"] = apply_policy
+        super().__init__(**options)
+
+        async def policy(tab: str | None, url: str) -> None:
+            await apply_policy(BetaURLContext(tab_id=tab), url)
 
         self._backend = BrowserCDP(
             computer.create_browser_connection, computer.revoke_browser_connection, policy

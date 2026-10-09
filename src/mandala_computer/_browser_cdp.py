@@ -305,6 +305,8 @@ class BrowserCDP:
             self.buttons,
         ):
             mapping.pop(target, None)
+        if self.active == target:
+            self.active = next(iter(self.tabs), None)
 
     async def check_url(self, url: str, tab: str | None) -> str:
         parsed = urlsplit(url)
@@ -521,11 +523,13 @@ class BrowserCDP:
                     continue
                 if query and query not in (role + " " + label + " " + value).casefold():
                     continue
-                self.ref_counter += 1
-                ref = f"e{self.ref_counter}"
+                prefix = ""
                 if node.get("backendDOMNodeId"):
+                    self.ref_counter += 1
+                    ref = f"e{self.ref_counter}"
                     refs[ref] = node["backendDOMNodeId"]
-                lines.append(f"[{ref}] {role} {label} {value}".strip())
+                    prefix = f"[{ref}] "
+                lines.append(f"{prefix}{role} {label} {value}".strip())
                 if len(lines) >= 500:
                     break
             self.refs[tab] = refs
@@ -580,7 +584,10 @@ class BrowserCDP:
                         "Reference is not a supported form field or its value is invalid."
                     )
             finally:
-                await self.send("Runtime.releaseObject", {"objectId": obj}, session)
+                try:
+                    await self.send("Runtime.releaseObject", {"objectId": obj}, session)
+                except BrowserError:
+                    pass  # Detach/navigation may have already released the object.
             return None
         if name in ("key", "hold_key"):
             pieces = data["text"].split()
@@ -651,12 +658,15 @@ class BrowserCDP:
                 )
                 * 100
             )
+            direction = data.get("scroll_direction")
+            if direction not in ("up", "down", "left", "right"):
+                raise BrowserError("scroll_direction must be up, down, left or right")
             dx, dy = {
                 "up": (0, -amount),
                 "down": (0, amount),
                 "left": (-amount, 0),
                 "right": (amount, 0),
-            }[data["scroll_direction"]]
+            }[direction]
             await self.send(
                 "Input.dispatchMouseEvent",
                 {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy},

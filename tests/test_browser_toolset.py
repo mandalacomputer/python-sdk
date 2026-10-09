@@ -516,3 +516,54 @@ async def test_tab_reply_followed_by_eof_does_not_wait_for_readiness() -> None:
         await asyncio.wait_for(backend.new_tab(), 1)
     await backend.reader
     assert not backend.ready and not backend.tabs
+
+
+@pytest.mark.asyncio
+async def test_accessibility_rows_without_dom_nodes_do_not_advertise_refs() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = object()
+    backend.tabs = {"t": {}}
+    backend.sessions = {"t": "s"}
+    backend.active = "t"
+
+    async def send(*_: Any, **__: Any) -> Any:
+        return {
+            "nodes": [
+                {"role": {"value": "paragraph"}, "name": {"value": "Virtual text"}},
+                {
+                    "role": {"value": "button"},
+                    "name": {"value": "Real button"},
+                    "backendDOMNodeId": 42,
+                },
+            ]
+        }
+
+    backend.send = send
+    page = await backend.perform("read_page", {})
+    assert page.splitlines() == ["paragraph Virtual text", "[e1] button Real button"]
+    assert backend.refs["t"] == {"e1": 42}
+
+
+@pytest.mark.asyncio
+async def test_async_driver_sync_url_policy_does_not_block_event_loop() -> None:
+    entered, release = threading.Event(), threading.Event()
+    completed: list[bool] = []
+
+    def policy(_context: Any, _url: str) -> None:
+        entered.set()
+        completed.append(release.wait(2))
+        raise ToolError("Expected test refusal")
+
+    async with AsyncMandalaBrowserToolset(
+        SimpleNamespace(
+            create_browser_connection=lambda: None, revoke_browser_connection=lambda _: None
+        ),
+        url_policy=policy,
+    ) as browser:
+        call = asyncio.create_task(browser.tool_result(use("navigate", url="https://example.com")))
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), 3)
+        release.set()
+        result = await call
+        assert result.get("is_error") and completed == [True]
