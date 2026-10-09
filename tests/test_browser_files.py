@@ -464,3 +464,69 @@ def test_json_content_rejects_nonstandard_or_invalid_values(content: bytes) -> N
 
     with pytest.raises(ValueError):
         content_type("data.json", content, ("application/json",))
+
+
+@pytest.mark.parametrize(
+    "destination,valid",
+    [
+        ({"url": 42, "multiple": True}, False),
+        ({"url": "https://example.test/", "multiple": "yes"}, False),
+        ({"url": "https://example.test/", "multiple": 1}, False),
+        ({"url": "https://example.test/"}, False),
+        (None, False),
+        ({"url": "https://example.test/", "multiple": False}, True),
+    ],
+)
+async def test_upload_confirmation_requires_typed_destination(
+    destination: Any, valid: bool
+) -> None:
+    from mandala_computer._browser_file_session import BrowserFiles
+
+    operations: list[str] = []
+
+    async def start() -> None:
+        pass
+
+    async def send(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        operations.append(method)
+        return {
+            "Page.getFrameTree": {"frameTree": {"frame": {"id": "frame"}}},
+            "Page.createIsolatedWorld": {"executionContextId": 1},
+            "DOM.resolveNode": {"object": {"objectId": "input"}},
+            "Runtime.callFunctionOn": {"result": {"value": destination}},
+        }.get(method, {})
+
+    backend = SimpleNamespace(
+        closed=False,
+        failed=False,
+        active="tab",
+        tabs={"tab": {}},
+        refs={"tab": {"upload": 1}},
+        sessions={"tab": "session"},
+        start=start,
+        send=send,
+    )
+    computer = SimpleNamespace(id="vm")
+    files = BrowserFiles(computer, BrowserFilePolicy(computer, task_id="task"), backend)
+    files.context = files.adapter.context = "context"
+    item = files.adapter.add("upload.txt", b"approved", "local")
+    context = SimpleNamespace(
+        tool_use=SimpleNamespace(id="call"),
+        input=SimpleNamespace(
+            model_dump=lambda **_: {
+                "target": {"ref": "upload"},
+                "document_ids": [item.id],
+            }
+        ),
+        model_copy=lambda *, update: SimpleNamespace(**update),
+    )
+    if valid:
+        reviewed = await files.prepare(context)
+        assert reviewed.tab_url == "https://example.test/"
+        await files.approved(False)
+    else:
+        with pytest.raises(ToolError, match="Remote browser file operation"):
+            await files.prepare(context)
+    assert "Runtime.releaseObject" in operations
+    assert files.prepared is None
+    await files.close()

@@ -287,7 +287,12 @@ class BrowserFiles:
             if "exceptionDetails" in result or not self.live():
                 raise ToolError(FILE_ERROR)
             destination = result["result"]["value"]
-            if len(selected) > 1 and not destination["multiple"]:
+            if (
+                not isinstance(destination, dict)
+                or not isinstance(destination.get("url"), str)
+                or type(destination.get("multiple")) is not bool
+                or (len(selected) > 1 and not destination["multiple"])
+            ):
                 raise ToolError(FILE_ERROR)
             self.prepared["url"] = destination["url"]
             self.prepared["target"] = data["target"]
