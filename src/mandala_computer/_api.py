@@ -23,6 +23,11 @@ from ._exceptions import APIError, MandalaError
 
 T = TypeVar("T")
 
+# Browser session bounds are mirrored in the platform surface manifest.
+BROWSER_MIN_LEASE_SECONDS = 60
+BROWSER_DEFAULT_LEASE_SECONDS = 1800
+BROWSER_MAX_SESSION_SECONDS = 7200
+
 # --- paths ----------------------------------------------------------------
 
 TEMPLATES = "templates"

@@ -28,6 +28,7 @@ from pydantic import ValidationError
 
 from ._async_computer import AsyncComputer
 from ._browser_cdp import BrowserCDP, BrowserError
+from ._browser_connection import BrowserSessionPolicy
 from ._computer import Computer
 
 T = TypeVar("T")
@@ -84,7 +85,7 @@ class _Loop:
 
 
 class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
-    """An isolated ten-minute browser session on a running Mandala computer.
+    """An isolated browser session; session_policy opts into bounded lease renewal.
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that. Popups,
@@ -102,6 +103,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
         confirm: BetaConfirmCallable | None = None,
         url_policy: BetaURLPolicy | None = None,
         tool_configs: BetaToolConfigs | None = None,
+        session_policy: BrowserSessionPolicy | None = None,
     ) -> None:
         options: dict[str, Any] = {
             "configs": configs,
@@ -125,14 +127,32 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
                     )
 
         async def create() -> Any:
-            return await asyncio.to_thread(computer.create_browser_connection)
+            if session_policy is None:
+                return await asyncio.to_thread(computer.create_browser_connection)
+            return await asyncio.to_thread(
+                computer.create_browser_connection, session_policy=session_policy
+            )
 
         async def revoke(ident: str) -> None:
             await asyncio.to_thread(computer.revoke_browser_connection, ident)
 
         self._revoke_connection = computer.revoke_browser_connection
-        self._backend = BrowserCDP(create, revoke, policy)
+
+        async def renew(ident: str) -> Any:
+            return await asyncio.to_thread(computer.renew_browser_connection, ident)
+
+        self._backend = BrowserCDP(
+            create, revoke, policy, renew=renew, session_policy=session_policy
+        )
         self._worker: _Loop | None = None
+
+    @property
+    def session_status(self) -> dict[str, Any]:
+        """Renewable lease deadlines, conservative remaining time, and terminal failure."""
+
+        # Advisory immutable deadline snapshots need no work on the CDP loop.
+        # In particular, observing close must never enqueue onto a closing loop.
+        return self._backend.session_status()
 
     def _run(self, coroutine: Coroutine[Any, Any, T]) -> T:
         if self._worker is None:
@@ -155,7 +175,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
                     self._revoke_connection(self._backend.grant.id)
                 except Exception:  # noqa: BLE001 - never expose backend credentials
                     raise ToolError(
-                        "Browser disconnected, but its grant could not be revoked; it expires within ten minutes."
+                        "Browser disconnected, but its grant could not be revoked; it remains subject to its server lease deadline."
                     ) from None
                 self._backend.grant = None
             return
@@ -163,7 +183,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
             self._run(self._backend.close())
         except Exception:  # noqa: BLE001 - never expose backend credentials in exceptions
             raise ToolError(
-                "Browser disconnected, but its grant could not be revoked; it expires within ten minutes."
+                "Browser disconnected, but its grant could not be revoked; it remains subject to its server lease deadline."
             ) from None
         finally:
             self._worker.close()
@@ -323,7 +343,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
 
 
 class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
-    """An isolated ten-minute browser session on a running Mandala computer.
+    """An isolated browser session; session_policy opts into bounded lease renewal.
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that. Popups,
@@ -340,6 +360,7 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
         confirm: BetaAsyncConfirmCallable | None = None,
         url_policy: BetaAsyncURLPolicy | None = None,
         tool_configs: BetaToolConfigs | None = None,
+        session_policy: BrowserSessionPolicy | None = None,
     ) -> None:
         async def apply_policy(context: BetaURLContext, url: str) -> None:
             if url_policy is not None:
@@ -364,9 +385,26 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
         async def policy(tab: str | None, url: str) -> None:
             await apply_policy(BetaURLContext(tab_id=tab), url)
 
+        async def create() -> Any:
+            if session_policy is None:
+                return await computer.create_browser_connection()
+            return await computer.create_browser_connection(session_policy=session_policy)
+
+        async def renew(ident: str) -> Any:
+            return await computer.renew_browser_connection(ident)
+
         self._backend = BrowserCDP(
-            computer.create_browser_connection, computer.revoke_browser_connection, policy
+            create,
+            computer.revoke_browser_connection,
+            policy,
+            renew=renew,
+            session_policy=session_policy,
         )
+
+    @property
+    def session_status(self) -> dict[str, Any]:
+        """Renewable lease deadlines, conservative remaining time, and terminal failure."""
+        return self._backend.session_status()
 
     async def _browser_state(self, context: BetaToolsetCallContext) -> BetaBrowserState:
         return BetaBrowserState(**self._backend.state())
@@ -379,7 +417,7 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
                 await self._backend.close()
         except Exception:  # noqa: BLE001 - never expose backend credentials in exceptions
             raise ToolError(
-                "Browser disconnected, but its grant could not be revoked; it expires within ten minutes."
+                "Browser disconnected, but its grant could not be revoked; it remains subject to its server lease deadline."
             ) from None
 
     async def navigate(

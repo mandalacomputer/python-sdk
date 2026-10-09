@@ -499,6 +499,18 @@ def async_client() -> mc.AsyncClient:
 def api_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     get = request.method == "GET"
+    browser_lease = {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "lifecycle_version": 2,
+        "server_time": "2026-10-09T00:50:00Z",
+        "attach_expires_at": "2026-10-09T01:00:00Z",
+        "lease_expires_at": "2026-10-09T01:20:00Z",
+        "absolute_expires_at": "2026-10-09T02:50:00Z",
+        "lease_seconds": 1800,
+        "idle_timeout_seconds": 0,
+    }
+    if "/browser-connections/" in path and path.endswith("/renew"):
+        return httpx.Response(200, json=browser_lease)
     if path.endswith("/browser-connections"):
         return httpx.Response(
             201,
@@ -507,6 +519,11 @@ def api_handler(request: httpx.Request) -> httpx.Response:
                 "url": f"wss://api.test{path}/{'a' * 32}/cdp",
                 "token": "bcdp_" + "b" * 64,
                 "expires_at": "2026-10-09T01:00:00Z",
+                **(
+                    browser_lease
+                    if json.loads(request.content).get("lifecycle_version") == 2
+                    else {}
+                ),
             },
         )
     if path.endswith("/files/list"):
@@ -1034,7 +1051,8 @@ def exercise_everything(client: mc.Client) -> None:
     client.ssh_keys.add(SSH_KEY["public_key"])
     client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
     client.ssh_keys.remove(SSH_KEY["id"])
-    connection = c.create_browser_connection()
+    connection = c.create_browser_connection(session_policy=mc.BrowserSessionPolicy())
+    c.renew_browser_connection(connection.id)
     c.revoke_browser_connection(connection.id)
     c.ssh_access()
     c.set_ssh_access(True)
@@ -1311,7 +1329,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.ssh_keys.add(SSH_KEY["public_key"])
     await client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
     await client.ssh_keys.remove(SSH_KEY["id"])
-    connection = await c.create_browser_connection()
+    connection = await c.create_browser_connection(session_policy=mc.BrowserSessionPolicy())
+    await c.renew_browser_connection(connection.id)
     await c.revoke_browser_connection(connection.id)
     await c.ssh_access()
     await c.set_ssh_access(True)

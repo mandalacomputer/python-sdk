@@ -51,6 +51,7 @@ ALLOWED = {
     ("POST", "computers/:id/exec"),
     ("POST", "computers/:id/browser-connections"),
     ("DELETE", "computers/:id/browser-connections/:connection"),
+    ("POST", "computers/:id/browser-connections/:connection/renew"),
     ("GET", "computers/:id/exec/:pid"),
     ("DELETE", "computers/:id/exec/:pid"),
     ("GET", "computers/:id/executions/:executionId"),
@@ -155,7 +156,12 @@ ALLOWED = {
 # a stop, `fresh` on a screenshot and `env` on an exec are each the difference
 # between a call that works and a call that works wrongly and says nothing.
 PARAMETERS: dict[str, set[str]] = {
-    "POST computers/:id/browser-connections": set(),
+    "POST computers/:id/browser-connections": {
+        "body:lifecycle_version",
+        "body:lease_seconds",
+        "body:max_duration_seconds",
+    },
+    "POST computers/:id/browser-connections/:connection/renew": set(),
     "DELETE computers/:id/browser-connections/:connection": set(),
     "GET templates": set(),
     # Neither takes a query parameter or a header. The validate route's body is
