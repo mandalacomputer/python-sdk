@@ -321,7 +321,7 @@ async def test_review_regressions_real_browser(chrome: str, website: Any) -> Non
             pending.set()
             await release.wait()
         if reject_reload or url.endswith("/blocked"):
-            raise ToolError("refused")
+            raise ToolError("Allowed origin only.")
 
     async with AsyncMandalaBrowserToolset(
         computer,
@@ -400,7 +400,8 @@ async def test_review_regressions_real_browser(chrome: str, website: Any) -> Non
         pending.clear()
         release.clear()
         reject_reload = True
-        assert (await browser.tool_result(use("navigate", url="reload"))).get("is_error")
+        refused = await browser.tool_result(use("navigate", url="reload"))
+        assert refused.get("is_error") and "Allowed origin only." in text(refused)
         reject_reload = False
         await call("form_input", target=name, value="still valid")
         second = next(t["tab_id"] for t in tabs(await call("new_tab")) if t["tab_id"] != first)

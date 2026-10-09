@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import anyio
+from anthropic.tools import ToolError
 from websockets.asyncio.client import connect
 
 
@@ -39,7 +40,10 @@ def number(value: Any, name: str, maximum: int, *, integer: bool = False) -> flo
 
 
 class BrowserCDP:
-    """One capability, one isolated context. A failed transport is never replayed."""
+    """One capability and context, behind Anthropic's serialized call pipeline.
+
+    A failed transport is never replayed.
+    """
 
     def __init__(self, create: Callable[..., Any], revoke: Callable[..., Any], policy: Any) -> None:
         self.create, self.revoke, self.policy = create, revoke, policy
@@ -305,6 +309,8 @@ class BrowserCDP:
         if self.policy:
             try:
                 await asyncio.wait_for(self._invoke(self.policy, tab, url), 5)
+            except ToolError as error:
+                raise BrowserError(str(error)) from None
             except Exception:  # noqa: BLE001 - withhold arbitrary callback error text
                 raise BrowserError(
                     "Navigation was refused by the URL policy or its deadline."
