@@ -125,8 +125,17 @@ try:
     while other.exists() and time.monotonic() < limit:
         time.sleep(0.1)
     assert not other.exists(), "guardian did not expire quarantine"
+    # The registry lock must not consume one of the 32 quarantine slots.
+    for _ in range(32):
+        create()
+    assert len([p for p in root.iterdir() if p.name != ".registry"]) == 32
+    try:
+        create()
+        raise AssertionError("33rd quarantine scope accepted")
+    except ValueError:
+        pass
     print(
-        "PASS: concurrent guardians, protected snapshot, wrong context/traversal, byte/inode quotas, close and expiry"
+        "PASS: concurrent guardians, protected snapshot, wrong context/traversal, byte/inode quotas, close, expiry and 32-scope boundary"
     )
 finally:
     for scope in scopes:

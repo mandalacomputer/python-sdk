@@ -406,6 +406,7 @@ class BrowserFiles:
             if params.get("frameId") not in self.frames:
                 await self.cancel_untracked(guid)
                 return
+            # Limit attempts, including failures, for this context's lifetime.
             # Reserve before the first await; event handlers run concurrently.
             if len(self.downloads) >= self.policy.max_files:
                 await self.cancel_untracked(guid)

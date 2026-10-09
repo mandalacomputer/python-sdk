@@ -238,7 +238,8 @@ def create(path: str, request: dict[str, Any]) -> dict[str, Any]:
     total = request["total"]
     if type(total) is not int or not 1 <= total <= MAX_TOTAL:
         raise ValueError()
-    if len(os.listdir(ROOT)) >= 32:
+    # The global lock is metadata, not one of the 32 quarantine scopes.
+    if sum(name != ".registry" for name in os.listdir(ROOT)) >= 32:
         raise ValueError()
     os.mkdir(path, 0)
     mounted = False
