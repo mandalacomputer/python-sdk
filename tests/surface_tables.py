@@ -49,6 +49,8 @@ ALLOWED = {
     ("GET", "computers/:id/screenshot"),
     ("POST", "computers/:id/input"),
     ("POST", "computers/:id/exec"),
+    ("POST", "computers/:id/browser-connections"),
+    ("DELETE", "computers/:id/browser-connections/:connection"),
     ("GET", "computers/:id/exec/:pid"),
     ("DELETE", "computers/:id/exec/:pid"),
     ("GET", "computers/:id/executions/:executionId"),
@@ -153,6 +155,8 @@ ALLOWED = {
 # a stop, `fresh` on a screenshot and `env` on an exec are each the difference
 # between a call that works and a call that works wrongly and says nothing.
 PARAMETERS: dict[str, set[str]] = {
+    "POST computers/:id/browser-connections": set(),
+    "DELETE computers/:id/browser-connections/:connection": set(),
     "GET templates": set(),
     # Neither takes a query parameter or a header. The validate route's body is
     # the document itself, raw rather than a JSON envelope with named fields —

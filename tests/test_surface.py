@@ -68,6 +68,10 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
+    # GAP (OPL-5878): authenticated CDP transport ships on the platform first.
+    # Use direct HTTP until the browser driver adds connection lifecycle wrappers.
+    ("POST", "computers/:id/browser-connections"),
+    ("DELETE", "computers/:id/browser-connections/:connection"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -466,6 +470,8 @@ def pattern_for(path: str) -> str:
             return ":pid"
         if i == 3 and parts[0] == "computers" and parts[2] == "executions":
             return ":executionId"
+        if i == 3 and parts[0] == "computers" and parts[2] == "browser-connections":
+            return ":connection"
         if i == 3 and parts[0] == "computers" and parts[2] == "results":
             return ":resultId"
         if i == 3 and parts[0] == "computers" and parts[2] == "artifacts":
