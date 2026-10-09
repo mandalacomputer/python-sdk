@@ -48,8 +48,8 @@ def test_file_policy_bindings_and_limits() -> None:
             adapter.selected(ids)
     with pytest.raises(ValueError):
         adapter.add("next.txt", b"ab", "local")
-    with pytest.raises(ValueError):
-        adapter.add("evil.exe", b"MZ", "local")
+    with pytest.raises(ValueError, match="File type is not allowed"):
+        adapter.add("evil.exe", b"M", "local")
     with pytest.raises(ToolError):
         adapter.resolve_upload_paths(None, ["/etc/passwd"])
     adapter.clear()
