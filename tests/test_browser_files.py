@@ -242,13 +242,13 @@ async def test_parallel_staging_and_close_during_start(monkeypatch: Any) -> None
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_is_visible_and_retryable() -> None:
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_cleanup_failure_is_visible_and_retryable(asynchronous: bool) -> None:
     computer = SimpleNamespace(
         id="vm", create_browser_connection=lambda: None, revoke_browser_connection=lambda _: None
     )
-    browser = AsyncMandalaBrowserToolset(
-        computer, remote_file_policy=BrowserFilePolicy(computer, task_id="task")
-    )
+    cls = AsyncMandalaBrowserToolset if asynchronous else MandalaBrowserToolset
+    browser = cls(computer, remote_file_policy=BrowserFilePolicy(computer, task_id="task"))
     files = browser._files()
     files.created = True
     calls = []
@@ -260,12 +260,163 @@ async def test_cleanup_failure_is_visible_and_retryable() -> None:
         return {}
 
     files.remote = remote
+
+    async def close() -> None:
+        if asynchronous:
+            await browser.close()
+        else:
+            await asyncio.to_thread(browser.close)
+            assert browser._worker is None
+
     with pytest.raises(ToolError, match="cleanup"):
-        await browser.close()
+        await close()
     assert browser.session_status["file_cleanup_failed"]
-    await browser.close()
+    if not asynchronous:
+        assert browser._worker is None
+    await close()
     assert calls == ["close", "close"] and not files.created
     assert not browser.session_status["file_cleanup_failed"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("upload", [None, True, 1, [], "bad"])
+def test_malformed_upload_config_has_config_error(asynchronous: bool, upload: Any) -> None:
+    computer, _ = remote("", asynchronous)
+    cls = AsyncMandalaBrowserToolset if asynchronous else MandalaBrowserToolset
+    with pytest.raises(ToolsetConfigError, match="file_upload config"):
+        cls(computer, configs={"file_upload": upload})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "asynchronous,mode,async_callback",
+    [
+        (False, "interrupt", False),
+        (False, "timeout", False),
+        (True, "interrupt", False),
+        (True, "interrupt", True),
+        (True, "cancel", True),
+        (True, "timeout", False),
+    ],
+)
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_upload_failure_closes_context_without_masking_error(
+    asynchronous: bool,
+    mode: str,
+    async_callback: bool,
+    cleanup_fails: bool,
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    computer, _ = remote("", asynchronous)
+    computer.id = "vm"
+    entered = asyncio.Event()
+    marker = "SENSITIVE_REVOKE_FAILURE_MARKER"
+    revocations = []
+
+    def revoke(ident: str) -> None:
+        revocations.append(ident)
+        if cleanup_fails:
+            raise RuntimeError(marker)
+
+    async def async_revoke(ident: str) -> None:
+        revoke(ident)
+
+    computer.revoke_browser_connection = async_revoke if asynchronous else revoke
+
+    def confirm(_: Any) -> bool:
+        if mode == "interrupt":
+            raise KeyboardInterrupt
+        return True
+
+    async def async_confirm(context: Any) -> bool:
+        if mode == "cancel":
+            entered.set()
+            await asyncio.Event().wait()
+        return confirm(context)
+
+    cls = AsyncMandalaBrowserToolset if asynchronous else MandalaBrowserToolset
+    browser = cls(
+        computer,
+        remote_file_policy=BrowserFilePolicy(computer, task_id="task"),
+        confirm=async_confirm if async_callback else confirm,
+        configs={"file_upload": {"enabled": True}},
+    )
+    files, backend = browser._files(), browser._backend
+    backend.grant = SimpleNamespace(id="grant")
+    files.context = files.adapter.context = backend.context = "context"
+    backend.active = "tab"
+    backend.tabs = {"tab": {}}
+    backend.refs = {"tab": {"e1": 1}}
+    backend.sessions = {"tab": "session"}
+    backend.state = lambda: {"tabs": [], "state_changes": []}
+    operations = []
+
+    async def start() -> None:
+        pass
+
+    async def close_socket() -> None:
+        operations.append("socket.close")
+
+    async def send(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        operations.append(method)
+        if (
+            mode == "timeout"
+            and method == "Runtime.callFunctionOn"
+            and operations.count(method) == 2
+        ):
+            await asyncio.Event().wait()
+        return {
+            "Page.getFrameTree": {"frameTree": {"frame": {"id": "frame"}}},
+            "Page.createIsolatedWorld": {"executionContextId": 1},
+            "DOM.resolveNode": {"object": {"objectId": "pinned"}},
+            "Runtime.callFunctionOn": {
+                "result": {"value": {"url": "https://example.test/", "multiple": False}}
+            },
+        }.get(method, {})
+
+    backend.start, backend.send = start, send
+    backend.ws = SimpleNamespace(close=close_socket)
+    wait_for = asyncio.wait_for
+
+    async def short_upload_timeout(awaitable: Any, timeout: float) -> Any:
+        return await wait_for(awaitable, 0.01 if timeout == 45 else timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", short_upload_timeout)
+    item = files.adapter.add("a.txt", b"a", "local")
+    call = use("file_upload", target={"type": "ref", "ref": "e1"}, document_ids=[item.id])
+
+    async def execute() -> Any:
+        if asynchronous:
+            return await browser.tool_result(call)
+        return await asyncio.to_thread(browser.tool_result, call)
+
+    try:
+        if mode == "timeout":
+            result = await execute()
+            assert result.get("is_error") and "Remote browser file operation" in text(result)
+            assert marker not in str(result)
+        elif mode == "cancel":
+            task = asyncio.create_task(execute())
+            await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                await execute()
+        assert backend.closed and files.prepared is None and not files.adapter.files
+        assert "Target.disposeBrowserContext" in operations and "socket.close" in operations
+        assert revocations == ["grant"] and marker not in caplog.text
+        assert (backend.grant is not None) == cleanup_fails
+    finally:
+        cleanup_fails = False
+        if asynchronous:
+            await browser.close()
+        else:
+            await asyncio.to_thread(browser.close)
+            assert browser._worker is None
+    assert backend.grant is None
 
 
 def test_sync_ended_state_is_readable_without_reviving_a_worker() -> None:

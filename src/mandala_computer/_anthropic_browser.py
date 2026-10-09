@@ -8,7 +8,7 @@ import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar, cast
 
-from anthropic.tools import ToolError
+from anthropic.tools import ToolError, ToolsetConfigError
 from anthropic.tools.browser import (
     BetaAbstractBrowserToolset20260801,
     BetaAsyncAbstractBrowserToolset20260801,
@@ -40,10 +40,20 @@ def _file_configs(configs: Any, policy: BrowserFilePolicy | None) -> Any:
     if policy is not None:
         return configs
     configs = dict(configs or {})
-    if configs.get("file_upload", {}).get("enabled") is True:
+    upload = configs.get("file_upload", {})
+    if not isinstance(upload, dict):
+        raise ToolsetConfigError("file_upload config must be an object")
+    if upload.get("enabled") is True:
         raise ValueError("file_upload requires remote_file_policy and confirm")
     configs["file_upload"] = {"enabled": False}
     return configs
+
+
+async def _close_after_file_error(backend: BrowserCDP) -> None:
+    try:
+        await backend.close()
+    except Exception:  # noqa: BLE001, S110 - preserve the original error; never expose credentials
+        pass
 
 
 async def _upload(backend: BrowserCDP, context: Any, input: Any) -> None:
@@ -56,13 +66,13 @@ async def _upload(backend: BrowserCDP, context: Any, input: Any) -> None:
             .model_dump(exclude_none=True)
         )
         await asyncio.wait_for(backend.files.upload(context, data), 45)
-    except asyncio.CancelledError:
-        await backend.close()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        await _close_after_file_error(backend)
         raise
     except ToolError:
         raise
     except Exception:  # noqa: BLE001 - redact file paths and credentials
-        await backend.close()
+        await _close_after_file_error(backend)
         raise ToolError(FILE_ERROR) from None
 
 
@@ -158,7 +168,10 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
                 self._run(self._files().approved(allowed))
                 return allowed
             except KeyboardInterrupt:
-                self.close()
+                try:
+                    self.close()
+                except Exception:  # noqa: BLE001, S110 - preserve the interrupt; never expose credentials
+                    pass
                 raise
             except Exception:  # noqa: BLE001 - redact file paths and credentials
                 self._run(self._files().approved(False))
@@ -505,8 +518,8 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
                 if upload:
                     await self._files().approved(allowed)
                 return allowed
-            except asyncio.CancelledError:
-                await self._backend.close()
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                await _close_after_file_error(self._backend)
                 raise
             except Exception:  # noqa: BLE001 - redact file paths and credentials
                 if upload:
