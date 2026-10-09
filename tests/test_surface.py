@@ -68,6 +68,9 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
+    # OPL-5864: the account credit ledger is available through direct HTTP;
+    # this contract prerequisite does not publish a new SDK helper.
+    ("GET", "credits"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #

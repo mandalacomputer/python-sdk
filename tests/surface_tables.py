@@ -91,6 +91,7 @@ ALLOWED = {
     # reason: the figures include computers that have since been deleted, which
     # is precisely the line an unexplained invoice is about.
     ("GET", "usage"),
+    ("GET", "credits"),
     # How long the automatic snapshots a schedule takes are kept. Account-scoped
     # like `usage` and `moves`, and read-only on every surface: the plan owns
     # retention.
@@ -356,6 +357,7 @@ PARAMETERS: dict[str, set[str]] = {
     # account's current billing period. Sent as `from`/`to` — the SDK spells them
     # `since`/`until` because `from` is a keyword.
     "GET usage": {"query:from", "query:to"},
+    "GET credits": {"query:before", "query:limit"},
     "GET retention": set(),
     # The same five fields on the create and the update. The update sends only
     # the ones a caller named, so the exercise names every one of them at least
