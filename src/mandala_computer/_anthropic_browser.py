@@ -130,6 +130,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
         async def revoke(ident: str) -> None:
             await asyncio.to_thread(computer.revoke_browser_connection, ident)
 
+        self._revoke_connection = computer.revoke_browser_connection
         self._backend = BrowserCDP(create, revoke, policy)
         self._worker: _Loop | None = None
 
@@ -147,6 +148,16 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
     def close(self) -> None:
         super().close()
         if self._worker is None:
+            # A prior close already released the worker/socket. Retry only the
+            # failed HTTP revocation, without reviving that event loop.
+            if self._backend.grant is not None:
+                try:
+                    self._revoke_connection(self._backend.grant.id)
+                except Exception:  # noqa: BLE001 - never expose backend credentials
+                    raise ToolError(
+                        "Browser disconnected, but its grant could not be revoked; it expires within ten minutes."
+                    ) from None
+                self._backend.grant = None
             return
         try:
             self._run(self._backend.close())

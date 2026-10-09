@@ -462,3 +462,23 @@ async def test_navigation_fails_promptly_after_transport_loss() -> None:
     backend.evaluate = evaluate
     with pytest.raises(BrowserError, match="ended"):
         await asyncio.wait_for(backend.perform("navigate", {"url": "https://example.com"}), 1)
+
+
+def test_sync_revocation_can_retry_without_retaining_worker(chrome: str, website: Any) -> None:
+    computer, _ = remote(chrome, False)
+    calls: list[str] = []
+
+    def revoke(ident: str) -> None:
+        calls.append(ident)
+        if len(calls) == 1:
+            raise RuntimeError("temporary revoke failure")
+
+    computer.revoke_browser_connection = revoke
+    browser = MandalaBrowserToolset(computer)
+    assert_success(browser.tool_result(use("navigate", url=website[0])))
+    with pytest.raises(ToolError, match="could not be revoked"):
+        browser.close()
+    assert browser._worker is None
+    browser.close()
+    browser.close()
+    assert calls == [IDENT, IDENT]
