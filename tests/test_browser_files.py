@@ -438,6 +438,38 @@ def test_sync_ended_state_is_readable_without_reviving_a_worker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_navigation_cancel_preserves_cancellation_when_cleanup_fails() -> None:
+    computer, _ = remote("", True)
+    fail_revoke = True
+
+    async def revoke(_: str) -> None:
+        if fail_revoke:
+            raise RuntimeError("SENSITIVE_REVOKE_FAILURE_MARKER")
+
+    computer.revoke_browser_connection = revoke
+    browser = AsyncMandalaBrowserToolset(computer)
+    browser._backend.grant = SimpleNamespace(id="grant")
+    entered = asyncio.Event()
+
+    async def perform(*args: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    browser._backend.perform = perform
+    task = asyncio.create_task(browser.tool_result(use("navigate", url="https://example.test/")))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert browser._backend.closed and browser._backend.grant is not None
+    finally:
+        fail_revoke = False
+        await browser.close()
+    assert browser._backend.grant is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["local", "guest", "document"])
 async def test_staging_cancel_preserves_cancellation_when_cleanup_fails(source: str) -> None:
     computer, _ = remote("", True)

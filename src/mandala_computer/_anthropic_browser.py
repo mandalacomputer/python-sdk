@@ -49,7 +49,7 @@ def _file_configs(configs: Any, policy: BrowserFilePolicy | None) -> Any:
     return configs
 
 
-async def _close_after_file_error(backend: BrowserCDP) -> None:
+async def _close_after_error(backend: BrowserCDP) -> None:
     try:
         await backend.close()
     except Exception:  # noqa: BLE001, S110 - preserve the original error; never expose credentials
@@ -67,12 +67,12 @@ async def _upload(backend: BrowserCDP, context: Any, input: Any) -> None:
         )
         await asyncio.wait_for(backend.files.upload(context, data), 45)
     except (asyncio.CancelledError, KeyboardInterrupt):
-        await _close_after_file_error(backend)
+        await _close_after_error(backend)
         raise
     except ToolError:
         raise
     except Exception:  # noqa: BLE001 - redact file paths and credentials
-        await _close_after_file_error(backend)
+        await _close_after_error(backend)
         raise ToolError(FILE_ERROR) from None
 
 
@@ -97,13 +97,10 @@ async def _perform(backend: BrowserCDP, name: str, input: Any) -> Any:
     except BrowserError as error:
         raise ToolError(str(error)) from None
     except (asyncio.CancelledError, KeyboardInterrupt):
-        await backend.close()
+        await _close_after_error(backend)
         raise
     except Exception:  # noqa: BLE001 - never expose backend credentials in exceptions
-        try:
-            await backend.close()
-        except Exception:  # noqa: BLE001, S110 - never expose backend credentials in exceptions
-            pass
+        await _close_after_error(backend)
         raise ToolError(
             "Browser action failed and the session was closed. Create a new toolset to continue."
         ) from None
@@ -519,7 +516,7 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
                     await self._files().approved(allowed)
                 return allowed
             except (asyncio.CancelledError, KeyboardInterrupt):
-                await _close_after_file_error(self._backend)
+                await _close_after_error(self._backend)
                 raise
             except Exception:  # noqa: BLE001 - redact file paths and credentials
                 if upload:
