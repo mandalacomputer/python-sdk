@@ -233,6 +233,9 @@ def test_sync_real_browser(chrome: str, website: Any) -> None:
         refused = browser.tool_result(use("navigate", url=base + "/redirect"))
         assert refused.get("is_error") and "/blocked" not in hits
         assert base + "/blocked" in seen
+        # A refused redirect may retain the old document. Successful navigation
+        # deterministically invalidates references from that document.
+        assert_success(browser.tool_result(use("navigate", url=base + "/after-redirect")))
         assert browser.tool_result(use("left_click", target=name)).get("is_error")
     assert revoked == [IDENT]
     assert TOKEN not in str(refused)
