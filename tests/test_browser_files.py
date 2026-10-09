@@ -467,18 +467,20 @@ def test_json_content_rejects_nonstandard_or_invalid_values(content: bytes) -> N
 
 
 @pytest.mark.parametrize(
-    "destination,valid",
+    "destination,valid,count",
     [
-        ({"url": 42, "multiple": True}, False),
-        ({"url": "https://example.test/", "multiple": "yes"}, False),
-        ({"url": "https://example.test/", "multiple": 1}, False),
-        ({"url": "https://example.test/"}, False),
-        (None, False),
-        ({"url": "https://example.test/", "multiple": False}, True),
+        ({"url": 42, "multiple": True}, False, 1),
+        ({"url": "https://example.test/", "multiple": "yes"}, False, 1),
+        ({"url": "https://example.test/", "multiple": 1}, False, 1),
+        ({"url": "https://example.test/"}, False, 1),
+        (None, False, 1),
+        ({"url": "https://example.test/", "multiple": False}, True, 1),
+        ({"url": "https://example.test/", "multiple": False}, False, 2),
+        ({"url": "https://example.test/", "multiple": True}, True, 2),
     ],
 )
 async def test_upload_confirmation_requires_typed_destination(
-    destination: Any, valid: bool
+    destination: Any, valid: bool, count: int
 ) -> None:
     from mandala_computer._browser_file_session import BrowserFiles
 
@@ -509,13 +511,13 @@ async def test_upload_confirmation_requires_typed_destination(
     computer = SimpleNamespace(id="vm")
     files = BrowserFiles(computer, BrowserFilePolicy(computer, task_id="task"), backend)
     files.context = files.adapter.context = "context"
-    item = files.adapter.add("upload.txt", b"approved", "local")
+    items = [files.adapter.add(f"upload-{i}.txt", b"approved", "local") for i in range(count)]
     context = SimpleNamespace(
         tool_use=SimpleNamespace(id="call"),
         input=SimpleNamespace(
             model_dump=lambda **_: {
                 "target": {"ref": "upload"},
-                "document_ids": [item.id],
+                "document_ids": [item.id for item in items],
             }
         ),
         model_copy=lambda *, update: SimpleNamespace(**update),
