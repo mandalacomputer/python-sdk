@@ -454,3 +454,13 @@ async def test_download_approval_and_path_visibility(mode: str, monkeypatch: Any
     assert "/untrusted-browser-path" not in str(backend.changes)
     await files.close()
     assert not files.adapter.visible
+
+
+@pytest.mark.parametrize(
+    "content", [b'{"x":NaN}', b'{"x":Infinity}', b'{"x":-Infinity}', b"{oops}", b"\xff"]
+)
+def test_json_content_rejects_nonstandard_or_invalid_values(content: bytes) -> None:
+    from mandala_computer._browser_files import content_type
+
+    with pytest.raises(ValueError):
+        content_type("data.json", content, ("application/json",))

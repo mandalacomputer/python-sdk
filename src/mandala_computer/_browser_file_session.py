@@ -468,7 +468,10 @@ class BrowserFiles:
                 path = self.root + "/approved/" + guid + "-" + entry["name"]
                 if published.get("path") != path or not self.live():
                     raise ValueError()
-                self.adapter.visible.add(path)
+                with self.adapter.lock:
+                    if self.adapter.closed:
+                        raise ToolError(FILE_ERROR)
+                    self.adapter.visible.add(path)
                 entry["state"] = "complete"
                 self.backend.changes.append(
                     {

@@ -69,7 +69,11 @@ def content_type(name: str, data: bytes, allowed: tuple[str, ...]) -> str:
         text = data.decode("utf-8")
         valid = "\0" not in text
         if mime == "application/json":
-            json.loads(text)
+
+            def reject_constant(value: str) -> Any:
+                raise ValueError("JSON requires finite values")
+
+            json.loads(text, parse_constant=reject_constant)
     if not valid:
         raise ValueError("File content does not match its type")
     return mime
