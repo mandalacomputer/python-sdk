@@ -348,6 +348,15 @@ async def test_review_regressions_real_browser(chrome: str, website: Any) -> Non
         assert await js("document.getElementById('name').value") == "a"
         await call("key", text="b c Backspace")
         assert await js("document.getElementById('name').value") == "ab"
+        await js(
+            "document.body.insertAdjacentHTML('beforeend', '<textarea id=area></textarea><form id=form><input id=field><button>Submit</button></form>');document.getElementById('area').focus();window.keys=[];document.getElementById('area').addEventListener('keyup',e=>keys.push([e.key,e.shiftKey]));window.submitted=0;document.getElementById('form').onsubmit=e=>{e.preventDefault();submitted++}"
+        )
+        await call("key", text="Shift+1 Shift+a Enter")
+        assert await js("JSON.stringify(document.getElementById('area').value)") == '"!A\\n"'
+        assert await js("JSON.stringify(keys.slice(0,2))") == '[["!",true],["Shift",false]]'
+        await js("document.getElementById('field').focus()")
+        await call("key", text="Enter")
+        assert await js("window.submitted") == "1"
         point = {"type": "coordinate", "x": 20, "y": 20}
         await call("left_mouse_down", target=point)
         await call("mouse_move", target={**point, "x": 50})
@@ -380,6 +389,16 @@ async def test_review_regressions_real_browser(chrome: str, website: Any) -> Non
         await js("fetch('/logged').then(r=>r.text())")
         assert "/logged" in text(await call("read_network"))
         assert "/logged" not in text(await call("read_network"))
+        await js(
+            "window.fetchControl=new AbortController();void fetch('/slow',{signal:fetchControl.signal}).catch(()=>{})"
+        )
+        await asyncio.wait_for(pending.wait(), 2)
+        await js("fetchControl.abort()")
+        release.set()
+        await asyncio.sleep(0.1)
+        await call("get_page_text")
+        pending.clear()
+        release.clear()
         reject_reload = True
         assert (await browser.tool_result(use("navigate", url="reload"))).get("is_error")
         reject_reload = False
@@ -393,7 +412,8 @@ async def test_review_regressions_real_browser(chrome: str, website: Any) -> Non
         await call("get_page_text", tab_id=second)
         assert first not in browser._backend.ready and first not in browser._backend.sessions
         browser._backend.changes.append({"type": "navigation_refused"})
-        result = await call("list_tabs")
+        await call("list_tabs")
+        result = await call("get_page_text")
         assert "refused" in text(result).lower()
     assert revoked == [IDENT]
 

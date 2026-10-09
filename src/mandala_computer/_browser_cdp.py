@@ -19,6 +19,10 @@ class BrowserError(Exception):
     """Only driver-authored messages may be exposed to a model."""
 
 
+class _RequestGone(BrowserError):
+    """Chromium discarded a paused request before its policy check completed."""
+
+
 class _DirectConnect(connect):
     def process_redirect(self, exc: Exception) -> Exception:
         return exc  # Never forward the capability through an HTTP redirect.
@@ -127,8 +131,15 @@ class BrowserCDP:
                     future = self.pending.get(message["id"])
                     if future is not None and not future.done():
                         if "error" in message:
+                            error = message["error"]
+                            kind = (
+                                _RequestGone
+                                if error.get("code") == -32602
+                                and error.get("message") == "Invalid InterceptionId."
+                                else BrowserError
+                            )
                             future.set_exception(
-                                BrowserError("Chromium could not complete the browser action.")
+                                kind("Chromium could not complete the browser action.")
                             )
                         else:
                             future.set_result(message.get("result", {}))
@@ -256,7 +267,9 @@ class BrowserCDP:
                         self.network.setdefault(tab, deque(maxlen=100)).append(
                             f"{response['status']} {response['url'][:2000]}"
                         )
-        except Exception:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
+        except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
+            if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):
+                return  # Page-side cancellation invalidates the paused request ID.
             if session is not None and session not in self.sessions.values():
                 return  # An in-flight command raced with target destruction.
             # A failed policy installation must never leave an unguarded page.
@@ -566,6 +579,11 @@ class BrowserCDP:
                     modifiers = 0
                     for key, code in keys:
                         modifiers |= {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}.get(key, 0)
+                        if modifiers & 8 and len(key) == 1:
+                            key = dict(zip("1234567890", "!@#$%^&*()", strict=True)).get(
+                                key, key.upper()
+                            )
+                        character = "\r" if key == "Enter" else key if len(key) == 1 else ""
                         await self.send(
                             "Input.dispatchKeyEvent",
                             {
@@ -573,11 +591,7 @@ class BrowserCDP:
                                 "key": key,
                                 "windowsVirtualKeyCode": code,
                                 "modifiers": modifiers,
-                                **(
-                                    {"text": key.upper() if modifiers & 8 else key}
-                                    if len(key) == 1 and not modifiers & 7
-                                    else {}
-                                ),
+                                **({"text": character} if character and not modifiers & 7 else {}),
                             },
                             session,
                         )
@@ -586,9 +600,15 @@ class BrowserCDP:
                         await asyncio.sleep(duration)
                 finally:
                     for key, code in reversed(pressed):
+                        modifiers &= ~{"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}.get(key, 0)
                         await self.send(
                             "Input.dispatchKeyEvent",
-                            {"type": "keyUp", "key": key, "windowsVirtualKeyCode": code},
+                            {
+                                "type": "keyUp",
+                                "key": key,
+                                "windowsVirtualKeyCode": code,
+                                "modifiers": modifiers,
+                            },
                             session,
                         )
             return None
