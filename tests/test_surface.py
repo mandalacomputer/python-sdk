@@ -68,10 +68,6 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # GAP (OPL-5878): authenticated CDP transport ships on the platform first.
-    # Use direct HTTP until the browser driver adds connection lifecycle wrappers.
-    ("POST", "computers/:id/browser-connections"),
-    ("DELETE", "computers/:id/browser-connections/:connection"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -503,6 +499,16 @@ def async_client() -> mc.AsyncClient:
 def api_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     get = request.method == "GET"
+    if path.endswith("/browser-connections"):
+        return httpx.Response(
+            201,
+            json={
+                "id": "a" * 32,
+                "url": f"wss://api.test{path}/{'a' * 32}/cdp",
+                "token": "bcdp_" + "b" * 64,
+                "expires_at": "2026-10-09T01:00:00Z",
+            },
+        )
     if path.endswith("/files/list"):
         return httpx.Response(200, json=GUEST_DIRECTORY)
     if path.endswith("/signals"):
@@ -1028,6 +1034,8 @@ def exercise_everything(client: mc.Client) -> None:
     client.ssh_keys.add(SSH_KEY["public_key"])
     client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
     client.ssh_keys.remove(SSH_KEY["id"])
+    connection = c.create_browser_connection()
+    c.revoke_browser_connection(connection.id)
     c.ssh_access()
     c.set_ssh_access(True)
     c.set_ssh_access(False)
@@ -1303,6 +1311,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.ssh_keys.add(SSH_KEY["public_key"])
     await client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
     await client.ssh_keys.remove(SSH_KEY["id"])
+    connection = await c.create_browser_connection()
+    await c.revoke_browser_connection(connection.id)
     await c.ssh_access()
     await c.set_ssh_access(True)
     await c.set_ssh_access(False)

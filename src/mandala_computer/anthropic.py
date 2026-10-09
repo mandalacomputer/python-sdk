@@ -89,7 +89,14 @@ if TYPE_CHECKING:
     from ._computer import Computer
     from ._models import ScreenshotInfo
 
-__all__ = ["AsyncMandalaComputerToolset", "MandalaComputerToolset"]
+from ._anthropic_browser import AsyncMandalaBrowserToolset, MandalaBrowserToolset
+
+__all__ = [
+    "AsyncMandalaBrowserToolset",
+    "AsyncMandalaComputerToolset",
+    "MandalaBrowserToolset",
+    "MandalaComputerToolset",
+]
 
 #: The largest image the toolset's models take: 2576 pixels on the long edge
 #: and 4784 visual tokens, a token being a 28-pixel tile. The API refuses a
