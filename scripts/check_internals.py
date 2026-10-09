@@ -124,6 +124,11 @@ def scan_text(text: str, label: str, digests: set[str]) -> list[str]:
         for token in IDENTIFIER.findall(line):
             if len(token) < MIN_IDENTIFIER:
                 continue
+            # Public CDP Page.navigate response field, not a platform detail:
+            # https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-navigate
+            # Limit this collision exception to its actual protocol consumer.
+            if label == "src/mandala_computer/_browser_cdp.py" and token == "errorText":
+                continue
             if hashlib.sha256(token.encode()).hexdigest()[:12] in digests:
                 problems.append(f"{label}:{lineno}: names a platform identifier: {token}")
     return problems

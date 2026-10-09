@@ -24,6 +24,7 @@ from ._agent import (
     to_agent_event,
 )
 from ._artifacts import Artifact, decode_artifact, verify_download, verify_nomination
+from ._browser_connection import BrowserConnection, connection_id
 from ._client import (
     DEADLINE_SLACK,
     FILE_PART_SIZE,
@@ -2958,6 +2959,21 @@ class Computer(ComputerFields):
         return self._patch(
             "set_egress_proxy", _api.egress_proxy_update_body(proxy), idempotency_key
         )
+
+    def create_browser_connection(self) -> BrowserConnection:
+        """Mint a ten-minute WSS capability for managed Chromium (member role).
+
+        The guest must be running. Attach with the capability's Bearer token,
+        never the account API key. At expiry active sockets close too.
+        """
+        path = _api.computer_action(self.id, "browser-connections")
+        data = self._t.json_object("POST", path, json={})
+        return BrowserConnection.from_api(data, self._t.base_url, path)
+
+    def revoke_browser_connection(self, ident: str) -> None:
+        """Revoke a capability and close its attached socket, leaving Chromium running."""
+        path = _api.computer_action(self.id, "browser-connections")
+        self._t.json_object("DELETE", f"{path}/{connection_id(ident)}")
 
     def ssh_access(self) -> SshAccess:
         """Whether SSH is on for this computer, and whether it can work here.

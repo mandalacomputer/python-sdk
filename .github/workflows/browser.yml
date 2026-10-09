@@ -1,0 +1,19 @@
+name: Browser integration
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  chromium:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]' playwright==1.58.0
+      - run: python -m playwright install --with-deps chromium
+      - name: Exercise sync and async drivers against Chromium
+        run: |
+          export MANDALA_TEST_CHROMIUM="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          pytest -q tests/test_browser_toolset.py

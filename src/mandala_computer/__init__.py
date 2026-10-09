@@ -57,6 +57,7 @@ from ._async_resources import (
     AsyncWebhooks,
     AsyncWorkspaces,
 )
+from ._browser_connection import BrowserConnection
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
 from ._events import (
@@ -256,6 +257,7 @@ __all__ = [
     "AuthenticationError",
     "BackgroundCommand",
     "BackgroundResult",
+    "BrowserConnection",
     "BrowserProxy",
     "BrowserProxyArgs",
     "BuildProgress",

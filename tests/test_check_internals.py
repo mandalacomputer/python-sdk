@@ -142,3 +142,10 @@ def test_the_message_scan_reads_every_commit_in_the_range(tmp_path: Path) -> Non
         ci.ROOT = original
     assert len(found) == 1
     assert "server/vm.go" in found[0]
+
+
+def test_public_cdp_field_exception_is_scoped_to_its_consumer() -> None:
+    digests = digests_for("errorText", "privateBackendFunction")
+    assert not ci.scan_text('result["errorText"]', "src/mandala_computer/_browser_cdp.py", digests)
+    assert ci.scan_text('result["errorText"]', "src/another.py", digests)
+    assert ci.scan_text("privateBackendFunction", "src/mandala_computer/_browser_cdp.py", digests)

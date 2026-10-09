@@ -1795,6 +1795,105 @@ callable.
 - **A failure is an error result**, in the platform's own words, and the run
   goes on: the model reads it and adapts.
 
+### Claude's browser toolset
+
+`MandalaBrowserToolset` and `AsyncMandalaBrowserToolset` implement Anthropic's
+`browser_toolset_20260801` over the computer's authenticated WSS CDP endpoint.
+No SSH tunnel, local browser installation or Playwright dependency is needed.
+Use a running Linux computer with Chromium and member-level API access.
+
+```sh
+pip install 'mandala-computer[anthropic]'
+```
+
+```python
+import os
+from urllib.parse import urlsplit
+import anthropic
+from anthropic.tools import ToolError
+from mandala_computer import Client
+from mandala_computer.anthropic import MandalaBrowserToolset
+
+
+def allow_example(_context, url):
+    parsed = urlsplit(url if "://" in url else "https://" + url)
+    if parsed.scheme != "https" or parsed.hostname != "example.com":
+        raise ToolError("This task may only visit https://example.com.")
+
+
+with Client() as client:
+    computer = client.computers.get("vm-...")
+    with MandalaBrowserToolset(computer, url_policy=allow_example) as browser:
+        runner = anthropic.Anthropic().beta.messages.tool_runner(
+            model=os.environ["ANTHROPIC_MODEL"],
+            max_tokens=16000,
+            tools=[browser],
+            messages=[{"role": "user", "content": "Open example.com and describe it."}],
+        )
+        for message in runner:
+            print(message.content)
+```
+
+For async applications use `AsyncClient`, `AsyncMandalaBrowserToolset`,
+`async with`, and `anthropic.AsyncAnthropic().beta.messages.tool_runner`.
+Both `confirm` and `url_policy` can then be async callables. The synchronous
+browser driver runs its CDP connection on a dedicated thread; request-policy
+callbacks may run on worker threads, so do not depend on thread-local UI state.
+
+The driver creates its own **1280 × 720, nonpersistent browser context**. It
+starts on the first enabled action, has its own cookies and tabs, and never
+adopts tabs from the desktop's managed profile. Keep it in a context manager
+(or call `close`) even when the runner fails. Closing disposes its context and
+revokes its capability; it does not stop Chromium or delete the computer.
+
+- The WSS grant expires **ten minutes after creation, including active sockets**.
+  Expiry, revocation, or connection loss ends this toolset's session. Create a
+  new toolset for a fresh context; actions are never replayed automatically.
+- `javascript_exec` is disabled by default. Explicitly enabling it requires
+  `confirm`, enforced by Anthropic's base class. `confirm` can also approve or
+  refuse ordinary navigation, input, and clicks. The policy example below
+  limits destinations; it does not decide whether a form submission is safe.
+- **Uploads and downloads are unavailable.** The driver does not accept a
+  local file policy for the remote guest. It leaves `file_upload` unimplemented
+  and denies browser downloads. Do not enable it with local paths or document IDs.
+- The URL hook checks direct navigations and **intercepted HTTP(S) requests,
+  including redirects**. Background request checks have a tab ID but no tool
+  call ID. Allow by returning nothing; refuse by throwing `ToolError`.
+  Callbacks must finish promptly. This is **not network isolation**: use guest
+  egress controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and
+  browser traffic outside those intercepted requests.
+- Popups, workers and cross-process frames are unsupported and are closed.
+  If an unsupported target cannot be closed, the driver closes its session.
+  Sites depending on these features may not work with this initial driver.
+- `read_page` returns accessibility roles/names and element refs; `find`
+  performs a case-insensitive substring search over that tree. Each read/find
+  replaces that tab's refs. Navigation invalidates them. Ask for a new page
+  read after a stale-ref error. Password values and page text are page data;
+  choose which pages the model is allowed to see.
+- Limits: ten tabs, 500 entries per page read, 24,000 characters per text result,
+  16,000 characters per input/JavaScript action, a 30-second wait, a ten-second
+  held key and at most 100 key repeats. Coordinates outside the viewport and
+  invalid crop rectangles are refused. Dialogs are dismissed and reported.
+
+For other CDP integrations, the computer also exposes connection lifecycle
+methods. The returned token is a browser-control secret: keep it outside model
+context and send it only in an `Authorization: Bearer` header. Never use the
+account API key as a WebSocket credential.
+
+```python
+connection = computer.create_browser_connection()
+try:
+    # Connect your CDP client to connection.url with the header:
+    # Authorization: Bearer <connection.token>
+    print(connection.expires_at)  # expires even while connected
+finally:
+    computer.revoke_browser_connection(connection.id)
+```
+
+The async computer offers the same methods with `await`. Tokens are omitted
+from `repr(connection)`, but the `token` attribute still contains the secret.
+
+
 ### Events
 
 A computer never tells you anything unless you ask, and the only general way to
