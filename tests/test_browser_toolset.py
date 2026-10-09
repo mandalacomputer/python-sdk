@@ -567,3 +567,29 @@ async def test_async_driver_sync_url_policy_does_not_block_event_loop() -> None:
         release.set()
         result = await call
         assert result.get("is_error") and completed == [True]
+
+
+@pytest.mark.asyncio
+async def test_implicit_action_uses_remaining_tab_after_active_target_dies() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = object()
+    backend.tabs = {"active": {}, "other": {}}
+    backend.sessions = {"active": "a", "other": "b"}
+    backend.active = "active"
+    used_sessions: list[str] = []
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        used_sessions.append(session)
+        return {"result": {"value": "Remaining page"}}
+
+    backend.send = send
+    # An external target closure occurs between tool calls, without state().
+    await backend._event({"method": "Target.targetDestroyed", "params": {"targetId": "active"}})
+    assert await backend.perform("get_page_text", {}) == "Remaining page"
+    assert used_sessions == ["b"]
+    await backend._event({"method": "Target.targetDestroyed", "params": {"targetId": "other"}})
+    with pytest.raises(BrowserError, match="Tab is missing"):
+        await backend.perform("get_page_text", {})
+    assert backend.active is None
