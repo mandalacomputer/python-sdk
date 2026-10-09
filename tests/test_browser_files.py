@@ -437,6 +437,52 @@ def test_sync_ended_state_is_readable_without_reviving_a_worker() -> None:
     browser.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["local", "guest", "document"])
+async def test_staging_cancel_preserves_cancellation_when_cleanup_fails(source: str) -> None:
+    computer, _ = remote("", True)
+    computer.id = "vm"
+    fail_revoke = True
+
+    async def revoke(_: str) -> None:
+        if fail_revoke:
+            raise RuntimeError("SENSITIVE_REVOKE_FAILURE_MARKER")
+
+    computer.revoke_browser_connection = revoke
+    browser = AsyncMandalaBrowserToolset(
+        computer,
+        remote_file_policy=BrowserFilePolicy(
+            computer, task_id="task", guest_upload_roots=("/allowed",)
+        ),
+    )
+    browser._backend.grant = SimpleNamespace(id="grant")
+    entered = asyncio.Event()
+
+    async def start() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    browser._backend.start = start
+    if source == "guest":
+        staging = browser.stage_guest_file("/allowed/a.txt")
+    elif source == "document":
+        staging = browser.stage_document("document", b"a", filename="a.txt")
+    else:
+        staging = browser.stage_local_file(b"a", filename="a.txt")
+    task = asyncio.create_task(staging)
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert browser._backend.closed and browser._backend.grant is not None
+        assert not browser._files().adapter.files
+    finally:
+        fail_revoke = False
+        await browser.close()
+    assert browser._backend.grant is None
+
+
 def test_sync_close_cannot_miss_worker_under_construction(monkeypatch: Any) -> None:
     import threading
 

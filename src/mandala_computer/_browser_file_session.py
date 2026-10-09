@@ -194,7 +194,10 @@ class BrowserFiles:
                 raise ToolError(FILE_ERROR)
             return self.adapter.add(filename, snapshot, source)
         except asyncio.CancelledError:
-            await self.backend.close()
+            try:
+                await self.backend.close()
+            except Exception:  # noqa: BLE001, S110 - preserve cancellation; never expose credentials
+                pass
             raise
         except Exception:  # noqa: BLE001 - redact remote paths and credentials; fail closed
             raise ToolError(FILE_ERROR) from None
@@ -210,7 +213,10 @@ class BrowserFiles:
             )
             return await self.stage(data, path.rsplit("/", 1)[-1], "guest")
         except asyncio.CancelledError:
-            await self.backend.close()
+            try:
+                await self.backend.close()
+            except Exception:  # noqa: BLE001, S110 - preserve cancellation; never expose credentials
+                pass
             raise
         except Exception:  # noqa: BLE001 - redact remote paths and credentials; fail closed
             raise ToolError(FILE_ERROR) from None
