@@ -327,6 +327,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:system",
         "body:max_steps",
         "body:model",
+        "body:provider",
         "body:stream",
     },
     "POST chat/completions": {
@@ -334,6 +335,7 @@ PARAMETERS: dict[str, set[str]] = {
         "body:computer_id",
         "body:messages",
         "body:model",
+        "body:provider",
         "body:max_steps",
         "body:stream",
     },

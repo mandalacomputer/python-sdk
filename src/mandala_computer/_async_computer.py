@@ -2537,11 +2537,12 @@ class AsyncComputer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        provider: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Have the platform drive this computer, reporting as it goes.
 
         Screenshot, decide, click, type, repeat — inside the platform, on your
-        own Anthropic key, which it never stores and never bills you for. What
+        own Anthropic or OpenAI key, which it never stores and never bills you for. What
         it buys you is that ten clicks stop being ten images in your context.
 
         The computer must already be RUNNING. This route will not start one:
@@ -2578,7 +2579,12 @@ class AsyncComputer(ComputerFields):
                 "POST",
                 _api.computer_action(self.id, "agent"),
                 json=_api.agent_body(
-                    prompt, stream=True, system=system, max_steps=max_steps, model=model
+                    prompt,
+                    stream=True,
+                    system=system,
+                    max_steps=max_steps,
+                    model=model,
+                    provider=provider,
                 ),
                 headers={MODEL_KEY_HEADER: model_key},
             )
@@ -2599,6 +2605,7 @@ class AsyncComputer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        provider: str | None = None,
     ) -> AgentResult:
         """:meth:`agent_stream`, waited out — one call, one result.
 
@@ -2635,7 +2642,12 @@ class AsyncComputer(ComputerFields):
         steps = 0
         try:
             async for event in self.agent_stream(
-                prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
+                prompt,
+                model_key=model_key,
+                system=system,
+                max_steps=max_steps,
+                model=model,
+                provider=provider,
             ):
                 if isinstance(event, AgentDone):
                     result = event.result
@@ -2659,6 +2671,7 @@ class AsyncComputer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        provider: str | None = None,
     ) -> AgentResult:
         """The agent loop as a single non-streaming request.
 
@@ -2723,7 +2736,12 @@ class AsyncComputer(ComputerFields):
                 "POST",
                 _api.computer_action(self.id, "agent"),
                 json=_api.agent_body(
-                    prompt, stream=False, system=system, max_steps=max_steps, model=model
+                    prompt,
+                    stream=False,
+                    system=system,
+                    max_steps=max_steps,
+                    model=model,
+                    provider=provider,
                 ),
                 headers={MODEL_KEY_HEADER: model_key},
                 timeout=NO_DEADLINE,

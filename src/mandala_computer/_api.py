@@ -2324,6 +2324,7 @@ def agent_body(
     system: str | None = None,
     max_steps: int | None = None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """One agent run's request.
 
@@ -2351,8 +2352,15 @@ def agent_body(
             raise ValueError("max_steps must be at least 1")
         if max_steps > MAX_STEPS:
             raise ValueError(f"max_steps may not exceed {MAX_STEPS}")
+    if provider is not None and provider not in ("anthropic", "openai"):
+        raise ValueError("provider must be anthropic or openai")
     body: dict[str, Any] = {"prompt": prompt, "stream": stream}
-    for key, value in (("system", system), ("max_steps", max_steps), ("model", model)):
+    for key, value in (
+        ("system", system),
+        ("max_steps", max_steps),
+        ("model", model),
+        ("provider", provider),
+    ):
         if value is not None:
             body[key] = value
     return body

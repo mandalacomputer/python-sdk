@@ -1541,12 +1541,22 @@ if not result.finished:
     print(f"did not finish: {result.stop}")
 ```
 
-**It runs on your own Anthropic key**, passed as `model_key` and sent on that
+**It runs on your own Anthropic or OpenAI key**, passed as `model_key` and sent on that
 one request as `X-Model-Key`. The platform never stores one, never bills you for
 it, and will not fall back to anything — so the key is a per-call argument
 rather than something the client holds.
 
-`max_steps` bounds the loop, and bounds your Anthropic spend only loosely. A
+Select `model="gpt-6.1-sol"` with `model_key=os.environ["OPENAI_API_KEY"]`
+for the hosted OpenAI Responses driver. `provider="openai"` also selects that
+default when `model` is omitted. Provider is inferred from recognized model
+names; custom names require `provider="openai"` or `provider="anthropic"`.
+Omitting both keeps the Anthropic default. These BYOK calls use the matching
+provider key; OpenAI does not use Mandala-funded credits. OpenAI continuations
+are stored by OpenAI; the task, screenshots and tool results go to that provider.
+An OpenAI action batch must fit the remaining step and API budget before it
+starts. A partial batch failure stops the run without replaying input.
+
+`max_steps` bounds the loop, and bounds your model spend only loosely. A
 step is one **action on the desktop**, not one exchange with the model, and the
 two do not line up in either direction: one model reply may ask for several
 actions and spends a step on each, while a reply that asks for none — or a
@@ -1661,7 +1671,7 @@ Set these environment variables before running the Python example:
 | --- | --- |
 | `MANDALA_API_KEY` | Your Mandala API key, used as the bearer credential. Requires member role or stronger and access within the key's account/workspace scope. |
 | `MANDALA_COMPUTER_ID` | A computer accessible to that key and already running. This endpoint does not start it; another agent run can prevent access. |
-| `ANTHROPIC_API_KEY` | Your separate Anthropic key, sent in `X-Model-Key`. An OpenAI provider key cannot replace it. |
+| `ANTHROPIC_API_KEY` | Your separate Anthropic key, sent in `X-Model-Key`. Use the matching OpenAI key when selecting a GPT model. |
 | `ANTHROPIC_MODEL` | An Anthropic model identifier available to your key and appropriate for computer use. It is passed through unchanged. |
 
 The OpenAI library does not read Mandala's saved login profiles. Set
@@ -1690,6 +1700,11 @@ with OpenAI(
 ```
 <!-- byok-openai-example:end -->
 
+To use OpenAI inference with this same compatibility endpoint, set
+`model="gpt-6.1-sol"` and send `OPENAI_API_KEY` in `X-Model-Key`. Provider is
+inferred from the model; a custom model name additionally needs `provider` in
+`extra_body`. The matching provider bills the model usage.
+
 The printed text is the model's report, not a guarantee that the task finished.
 Inspect the JSON response's optional `agent.stop` extension: `end_turn` means
 finished. `choices[0].finish_reason == "stop"` alone is insufficient because
@@ -1708,7 +1723,7 @@ inputs, tool-call conversations, the Responses API or other OpenAI features.
 desktop task after a refusal or interrupted connection. A failed, aborted or
 limited run may already have changed the desktop; inspect it before deciding
 whether to try again. Existing Mandala computer charges and rate budgets apply,
-and Anthropic bills model usage to your key. This does not add hosted inference,
+and the selected provider bills model usage to your key. This does not add hosted inference,
 included model credits or dashboard chat persistence.
 
 Omitting `stream`, or setting `stream=False` as above, returns one JSON

@@ -999,7 +999,14 @@ def exercise_everything(client: mc.Client) -> None:
     c.set_schedule(enabled=True, hour=4, tz="UTC")
     c.clear_schedule()
     c.agent("do the thing", model_key="sk-ant-test")
-    c.agent("do the thing", model_key="sk-ant-test", system="be brief", max_steps=5, model="m")
+    c.agent(
+        "do the thing",
+        model_key="sk-ant-test",
+        system="be brief",
+        max_steps=5,
+        model="m",
+        provider="anthropic",
+    )
     c.agent_once("do the thing", model_key="sk-ant-test")
     # The streaming entry point the two calls above wait out for you. All three
     # are `POST computers/:id/agent`, so the route check sees one method here.
@@ -1292,7 +1299,12 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.clear_schedule()
     await c.agent("do the thing", model_key="sk-ant-test")
     await c.agent(
-        "do the thing", model_key="sk-ant-test", system="be brief", max_steps=5, model="m"
+        "do the thing",
+        model_key="sk-ant-test",
+        system="be brief",
+        max_steps=5,
+        model="m",
+        provider="anthropic",
     )
     await c.agent_once("do the thing", model_key="sk-ant-test")
     async with aclosing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
