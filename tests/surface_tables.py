@@ -250,6 +250,10 @@ PARAMETERS: dict[str, set[str]] = {
         "query:capture",
     },
     "POST computers/:id/input": {
+        "body:type",
+        "body:path",
+        "body:scroll_x",
+        "body:scroll_y",
         "body:action",
         "body:x",
         "body:y",
