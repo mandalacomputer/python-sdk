@@ -99,7 +99,6 @@ UNIMPLEMENTED_PARAMETERS = {
     "POST computers/:id/input  body:path",
     "POST computers/:id/input  body:scroll_x",
     "POST computers/:id/input  body:scroll_y",
-
     # OPL-5866 adds funded-agent options; this client currently sends its own model key.
     "POST computers/:id/agent  body:max_cost_usd",
     # `manage_keys: true` is refused from every API key (403): the permission
