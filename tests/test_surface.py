@@ -94,6 +94,11 @@ UNIMPLEMENTED = {
 # rule: a route nobody calls sends none of its parameters, and that route's own
 # line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
+    # OPL-4396: raw OpenAI dialect; typed helpers retain their action vocabulary.
+    "POST computers/:id/input  body:type",
+    "POST computers/:id/input  body:path",
+    "POST computers/:id/input  body:scroll_x",
+    "POST computers/:id/input  body:scroll_y",
     # OPL-5866 adds funded-agent options; this client currently sends its own model key.
     "POST computers/:id/agent  body:max_cost_usd",
     # `manage_keys: true` is refused from every API key (403): the permission
