@@ -135,13 +135,13 @@ DEFAULT_RESOLUTION = f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24"
 
 
 _NO_MODEL_KEY = (
-    "the agent needs your own Anthropic API key as model_key — "
+    "the agent needs your own Anthropic or OpenAI API key as model_key — "
     "the platform does not store one, and never bills you for it."
 )
 
 
 def _require_model_key(model_key: str) -> str:
-    """The agent routes need the caller's own Anthropic key, and only theirs.
+    """The agent routes need the caller's own provider key, and only theirs.
 
     Refused here rather than sent empty because the failure is otherwise a 401
     on a route where a 401 reads as "your Mandala key is wrong" — which is the
@@ -5249,11 +5249,12 @@ class Computer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        provider: str | None = None,
     ) -> Iterator[AgentEvent]:
         """Have the platform drive this computer, reporting as it goes.
 
         Screenshot, decide, click, type, repeat — inside the platform, on your
-        own Anthropic key, which it never stores and never bills you for. What
+        own Anthropic or OpenAI key, which it never stores and never bills you for. What
         it buys you is that ten clicks stop being ten images in your context.
 
         The computer must already be RUNNING. This route will not start one:
@@ -5290,7 +5291,12 @@ class Computer(ComputerFields):
                 "POST",
                 _api.computer_action(self.id, "agent"),
                 json=_api.agent_body(
-                    prompt, stream=True, system=system, max_steps=max_steps, model=model
+                    prompt,
+                    stream=True,
+                    system=system,
+                    max_steps=max_steps,
+                    model=model,
+                    provider=provider,
                 ),
                 headers={MODEL_KEY_HEADER: model_key},
             )
@@ -5311,6 +5317,7 @@ class Computer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        provider: str | None = None,
     ) -> AgentResult:
         """:meth:`agent_stream`, waited out — one call, one result.
 
@@ -5347,7 +5354,12 @@ class Computer(ComputerFields):
         steps = 0
         try:
             for event in self.agent_stream(
-                prompt, model_key=model_key, system=system, max_steps=max_steps, model=model
+                prompt,
+                model_key=model_key,
+                system=system,
+                max_steps=max_steps,
+                model=model,
+                provider=provider,
             ):
                 if isinstance(event, AgentDone):
                     result = event.result
@@ -5374,6 +5386,7 @@ class Computer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
+        provider: str | None = None,
     ) -> AgentResult:
         """The agent loop as a single non-streaming request.
 
@@ -5438,7 +5451,12 @@ class Computer(ComputerFields):
                 "POST",
                 _api.computer_action(self.id, "agent"),
                 json=_api.agent_body(
-                    prompt, stream=False, system=system, max_steps=max_steps, model=model
+                    prompt,
+                    stream=False,
+                    system=system,
+                    max_steps=max_steps,
+                    model=model,
+                    provider=provider,
                 ),
                 headers={MODEL_KEY_HEADER: model_key},
                 timeout=NO_DEADLINE,

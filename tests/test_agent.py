@@ -290,7 +290,7 @@ def test_what_was_not_asked_for_is_not_sent(computer: mc.Computer) -> None:
 def test_a_run_without_a_model_key_is_refused_here(computer: mc.Computer) -> None:
     """Not sent to be 401'd. On this route a 401 reads as "your Mandala key is
     wrong", which is the one thing it does not mean."""
-    with pytest.raises(mc.MandalaError, match="your own Anthropic API key"):
+    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
         computer.agent("do the thing", model_key="")
 
 
@@ -305,7 +305,7 @@ def test_a_missing_model_key_keeps_the_message_written_for_it(computer: mc.Compu
     """``None`` is the case that actually happens -- ``os.environ.get`` on an
     unset variable -- and "must be a string" is not an answer to it. It stays a
     MandalaError carrying the sentence about who is billed."""
-    with pytest.raises(mc.MandalaError, match="your own Anthropic API key"):
+    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
         computer.agent("do the thing", model_key=None)  # type: ignore[arg-type]
 
 
@@ -388,7 +388,7 @@ def test_the_stream_checks_its_arguments_when_it_starts_not_when_it_is_built(
     `agent()` and `agent_once()` raise on the call itself, because they iterate.
     """
     events = computer.agent_stream("do the thing", model_key="")
-    with pytest.raises(mc.MandalaError, match="your own Anthropic API key"):
+    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
         next(events)
 
 
@@ -417,7 +417,7 @@ def test_agent_once_asks_for_one_body_and_reads_it(computer: mc.Computer) -> Non
 
 @respx.mock
 def test_agent_once_still_needs_the_model_key(computer: mc.Computer) -> None:
-    with pytest.raises(mc.MandalaError, match="your own Anthropic API key"):
+    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
         computer.agent_once("do the thing", model_key="")
 
 
@@ -1480,3 +1480,79 @@ async def test_the_async_halves_call_a_relayed_model_429_after_steps_not_transie
     assert mc.is_transient(streamed_after.value) is False
     assert mc.is_transient(streamed_before.value) is True
     assert mc.is_transient(own.value) is True
+
+
+# Provider selection reaches every public sync and async entry point.
+@respx.mock
+@pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
+@pytest.mark.parametrize("provider", ["openai", "anthropic", None])
+def test_provider_reaches_sync_agent_wire(
+    computer: mc.Computer, method: str, provider: str | None
+) -> None:
+    route = respx.post(AGENT).mock(
+        httpx.Response(200, json=DONE) if method == "agent_once" else stream(DONE_FRAME)
+    )
+    result = getattr(computer, method)(
+        "go", model_key="fixture", model="custom-model", provider=provider
+    )
+    if method == "agent_stream":
+        list(result)
+    body = json_body(route)
+    assert isinstance(body, dict)
+    assert body["model"] == "custom-model"
+    if provider is None:
+        assert "provider" not in body
+    else:
+        assert body["provider"] == provider
+    assert route.calls.last.request.headers["X-Model-Key"] == "fixture"
+
+
+@respx.mock
+@pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
+@pytest.mark.parametrize("provider", ["openai", "anthropic", None])
+async def test_provider_reaches_async_agent_wire(method: str, provider: str | None) -> None:
+    route = respx.post(AGENT).mock(
+        httpx.Response(200, json=DONE) if method == "agent_once" else stream(DONE_FRAME)
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        computer = mc.AsyncComputer(client._t, COMPUTER)
+        result = getattr(computer, method)(
+            "go", model_key="fixture", model="custom-model", provider=provider
+        )
+        if method == "agent_stream":
+            _ = [event async for event in result]
+        else:
+            await result
+    body = json_body(route)
+    assert isinstance(body, dict)
+    assert body["model"] == "custom-model"
+    if provider is None:
+        assert "provider" not in body
+    else:
+        assert body["provider"] == provider
+
+
+@respx.mock
+@pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
+def test_invalid_provider_is_refused_before_sync_request(
+    computer: mc.Computer, method: str
+) -> None:
+    with pytest.raises(ValueError, match="provider"):
+        result = getattr(computer, method)("go", model_key="fixture", provider="typo")
+        if method == "agent_stream":
+            list(result)
+    assert not respx.calls
+
+
+@respx.mock
+@pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
+async def test_invalid_provider_is_refused_before_async_request(method: str) -> None:
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        computer = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(ValueError, match="provider"):
+            result = getattr(computer, method)("go", model_key="fixture", provider="typo")
+            if method == "agent_stream":
+                _ = [event async for event in result]
+            else:
+                await result
+    assert not respx.calls
