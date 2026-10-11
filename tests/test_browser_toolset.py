@@ -1008,7 +1008,8 @@ async def test_targets_outside_an_owned_tab_are_still_closed(message: dict[str, 
         child = message["params"]["sessionId"]
         fence = [(name, args, child) for name, args in _POPUP_FENCE]
         offline = {"offline": True, "matchedNetworkConditions": [{"urlPattern": "", **_OFFLINE}]}
-        fence.insert(3, ("Network.emulateNetworkConditionsByRule", offline, child))
+        bypass = [name for name, _ in _POPUP_FENCE].index("Network.setBypassServiceWorker")
+        fence.insert(bypass + 1, ("Network.emulateNetworkConditionsByRule", offline, child))
         assert sent == [*fence, ("Runtime.runIfWaitingForDebugger", {}, child), *close]
         assert not [m for m, _, _ in sent if m.startswith("Fetch.")]
     else:
@@ -2810,6 +2811,13 @@ POPUP_PAGES = {
         "document.title='opened'\">open</button>"
     ),
     "/script": "<title>script</title><script>window.open('/popup-url')</script>",
+    # A document the opener has cached (fresh for an hour, and allowed by the
+    # policy), then opens in a popup. Run, it marks the opener.
+    "/cache": (
+        "<title>cache</title><script>fetch('/cached').then(()=>{window.cached=true})</script>"
+        "<button style='position:absolute;left:0;top:0;width:400px;height:200px' "
+        "onclick=\"window.open('/cached')\">open</button>"
+    ),
     "/online": (
         "<title>online</title><script>window.went=[];addEventListener('offline',"
         "()=>went.push('offline'))</script><button style='position:absolute;left:0;top:0;"
@@ -2839,8 +2847,15 @@ def popups() -> Any:
         def do_GET(self) -> None:
             hits.append(self.path)
             body = POPUP_PAGES.get(self.path, "<p>popup</p><script>fetch('/popup-sub')</script>")
+            if self.path == "/cached":
+                body = (
+                    "<script>window.opener.document.title='ran';"
+                    "localStorage.setItem('ran','yes')</script>"
+                )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            if self.path == "/cached":
+                self.send_header("Cache-Control", "public, max-age=3600")
             self.end_headers()
             self.wfile.write(body.encode())
 
@@ -3081,3 +3096,80 @@ def test_many_popups_load_nothing_and_never_take_their_opener_offline(
     time.sleep(0.5)
     assert revoked == [IDENT]
     assert [path for path in hits if "popup" in path] == []
+
+
+@pytest.mark.asyncio
+async def test_a_popup_gone_before_its_refusal_starts_is_not_brought_back() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = ScriptedSocket()
+    backend.context = "context"
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        # In one read: a popup attaches and is gone.
+        socket.push(popup_attached())
+        socket.push(
+            {
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": "popup-s", "targetId": "popup-t"},
+            }
+        )
+        socket.push({"method": "Target.targetDestroyed", "params": {"targetId": "popup-t"}})
+        await asyncio.sleep(0.1)
+        assert socket.sent == [] and backend.refused == {} and not backend.failed
+    finally:
+        await socket.close()
+        await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_a_page_gone_while_a_tab_is_being_created_is_refused_quietly() -> None:
+    backend, sent = owned_backend()
+    backend.creating = asyncio.get_running_loop().create_future()
+    attach = asyncio.create_task(backend._event(popup_attached()))
+    await asyncio.sleep(0)
+    backend._settle(
+        {
+            "method": "Target.detachedFromTarget",
+            "params": {"sessionId": "popup-s", "targetId": "popup-t"},
+        }
+    )
+    backend._settle({"method": "Target.targetDestroyed", "params": {"targetId": "popup-t"}})
+    backend.creating.set_result("other")
+    await attach
+    assert sent == [] and backend.refused == {} and not backend.failed
+
+
+def test_sync_a_cached_popup_document_never_runs(chrome: str, popups: Any) -> None:
+    computer, revoked = remote(chrome, False)
+    port, hits = popups
+    with MandalaBrowserToolset(computer, url_policy=popup_policy) as browser:
+        backend = browser._backend
+        assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/cache")))
+        # Closing the popup arrives late: whatever it could load, it has time to.
+        plain = backend.send
+
+        async def late_close(method: str, params: Any = None, session: Any = None) -> Any:
+            if method == "Target.closeTarget":
+                await asyncio.sleep(0.5)
+            return await plain(method, params, session)
+
+        backend.send = late_close
+        # The opener has the document cached; the popup is opened on it.
+        for _ in range(50):
+            if browser._run(backend.evaluate(backend.active, "window.cached === true")):
+                break
+            browser._run(asyncio.sleep(0.05))
+        point = {"type": "coordinate", "x": 100, "y": 50}
+        assert_success(browser.tool_result(use("left_click", target=point)))
+        browser._run(asyncio.sleep(1))
+        ran = browser._run(
+            backend.evaluate(
+                backend.active, "JSON.stringify([document.title, localStorage.getItem('ran')])"
+            )
+        )
+        assert json.loads(ran) == ["cache", None]
+    assert revoked == [IDENT] and hits.count("/cached") == 1

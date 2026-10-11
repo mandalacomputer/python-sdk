@@ -133,6 +133,8 @@ _NO_WORKERS_INIT = (
 _POPUP_FENCE: tuple[tuple[str, dict[str, Any]], ...] = (
     ("Page.enable", {}),
     ("Network.enable", {}),
+    # Offline is below the HTTP cache: a cached document would still load.
+    ("Network.setCacheDisabled", {"cacheDisabled": True}),
     ("Network.setBypassServiceWorker", {"bypass": True}),
     _NO_WORKERS_INIT,
     ("Target.setAutoAttach", _AUTO_ATTACH),
@@ -309,7 +311,10 @@ class BrowserCDP:
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
-        # Session -> target, of popups being refused, until they detach.
+        # Session -> target, of pages attached in the context that are not (yet)
+        # tabs: popups being refused, and a new tab until it is adopted.
+        # Recorded as the attach arrives and dropped as its detach or
+        # destruction does, so a refusal never acts for a page already gone.
         self.refused: dict[str, str] = {}
         # Download ownership, as the file session keeps it, is decided here:
         # tracked frame -> the session that last reported it (a session that
@@ -1008,6 +1013,12 @@ class BrowserCDP:
         elif method == "Target.attachedToTarget":
             info, child = p["targetInfo"], p["sessionId"]
             tab = self._owner(session)
+            if (
+                session is None
+                and info.get("type") == "page"
+                and info.get("browserContextId") == self.context
+            ):
+                self.refused[child] = info["targetId"]
             if tab is not None and session is not None and info.get("type") == "iframe":
                 # A cross-site frame of an owned tab, at any depth. Closing it
                 # would close its tab; it is set up and run instead.
@@ -1095,6 +1106,9 @@ class BrowserCDP:
                 if info["type"] != "page" or target not in self.ready:
                     await self._refuse(child, info)
                     return
+                if child not in self.refused:
+                    return  # Gone before it could be set up as a tab.
+                del self.refused[child]
                 self.sessions[target] = child
                 self.tabs[target] = info
                 session = child  # Initialization can race with this target's destruction.
@@ -1187,7 +1201,8 @@ class BrowserCDP:
         popup = info.get("type") == "page"
         failed = False
         if popup:
-            self.refused[child] = target
+            if child not in self.refused:
+                return  # It went first: nothing is left to refuse.
             try:
                 for name, args in _POPUP_FENCE:
                     if child not in self.refused:
