@@ -2711,3 +2711,62 @@ async def test_a_frame_tree_reply_counts_before_the_events_read_after_it() -> No
     finally:
         await socket.close()
         await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_a_child_waiting_on_a_restored_parent_is_adopted_as_the_tree_is_read() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = ScriptedSocket()
+    backend.files = files = FrameFiles()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    files.frames = {"tab": "tab"}
+    decided: list[Any] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        decided.append(params.get("tracked"))
+
+    files.event = event  # type: ignore[method-assign]
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        socket.push(
+            {
+                "method": "Page.frameNavigated",
+                "sessionId": "page",
+                "params": {"frame": {"id": "tab"}, "type": "BackForwardCacheRestore"},
+            }
+        )
+        await settle(lambda: any(m["method"] == "Page.getFrameTree" for m in socket.sent))
+        asked = next(m for m in socket.sent if m["method"] == "Page.getFrameTree")
+        # In one read: a child of a restored frame attaches and downloads, the
+        # tree says its parent is the tab's, and the child is removed.
+        for message in [
+            {
+                "method": "Page.frameAttached",
+                "sessionId": "page",
+                "params": {"frameId": "kid", "parentFrameId": "r"},
+            },
+            {
+                "method": "Browser.downloadWillBegin",
+                "params": {"guid": "00000000-0000-0000-0000-000000000006", "frameId": "kid"},
+            },
+            {
+                "id": asked["id"],
+                "result": {
+                    "frameTree": {"frame": {"id": "tab"}, "childFrames": [{"frame": {"id": "r"}}]}
+                },
+            },
+            {
+                "method": "Page.frameDetached",
+                "sessionId": "page",
+                "params": {"frameId": "kid", "reason": "remove"},
+            },
+        ]:
+            socket.push(message)
+        await settle(lambda: decided)
+        assert decided == [True] and "kid" not in files.frames and "r" in files.frames
+    finally:
+        await socket.close()
+        await backend.reader

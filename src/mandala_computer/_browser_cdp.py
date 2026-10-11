@@ -821,7 +821,7 @@ class BrowserCDP:
             if held[1] == session:
                 del self.orphans[frame]
 
-    async def _snapshot(self, session: str, tab: str) -> None:
+    async def _snapshot(self, session: str, tab: str, *, adopt: bool = False) -> None:
         """Track the frames a session holds now.
 
         The reply is a snapshot: a frame event that arrived while it was on its
@@ -847,6 +847,10 @@ class BrowserCDP:
             try:
                 if self._owner(session) == tab:
                     self._track_tree(reply["frameTree"], tab, session, touched)
+                if adopt:
+                    # Frames reported meanwhile beneath ones this tree tracked
+                    # are tracked now too, before any later event is read.
+                    self._adopt()
             finally:
                 forget()
 
@@ -876,8 +880,7 @@ class BrowserCDP:
 
         async def restore() -> None:
             try:
-                await self._snapshot(session, tab)
-                self._adopt()
+                await self._snapshot(session, tab, adopt=True)
             except Exception:  # noqa: BLE001, S110 - unread frames stay untracked: fail closed
                 pass
 
