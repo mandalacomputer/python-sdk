@@ -1984,8 +1984,11 @@ revokes its capability; it does not stop Chromium or delete the computer.
   worker held paused is released, unpoliced, when its page closes or
   navigates. The page itself carries on. Shared workers, service workers,
   popups and other new top-level targets are unsupported and are closed; if
-  one cannot be closed, the driver closes its session. Sites that depend on
-  these may not work with this driver.
+  one cannot be closed, the driver closes its session. A popup is closed
+  without loading anything: before it is let go, every request it makes is
+  refused and it cannot start a worker, so the page that opened it, by script,
+  by a click or by a link, carries on. Sites that depend on these may not work
+  with this driver.
 - `read_page` returns accessibility roles/names and element refs; `find`
   performs a case-insensitive substring search over that tree. Each read/find
   replaces that tab's refs. Navigation invalidates them. Ask for a new page

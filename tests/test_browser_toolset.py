@@ -993,11 +993,23 @@ async def test_frames_under_an_owned_tab_run_and_workers_are_held_never_closed()
     ],
 )
 async def test_targets_outside_an_owned_tab_are_still_closed(message: dict[str, Any]) -> None:
+    from mandala_computer._browser_cdp import _POPUP_FENCE
+
     backend, sent = owned_backend()
     await backend._event(message)
-    assert [(m, p) for m, p, _ in sent] == [
-        ("Target.closeTarget", {"targetId": message["params"]["targetInfo"]["targetId"]})
-    ]
+    info = message["params"]["targetInfo"]
+    close = [("Target.closeTarget", {"targetId": info["targetId"]}, None)]
+    if info["type"] == "page":
+        # A popup is fenced and released before it is closed: held, it would
+        # hold the renderer it shares with the page that opened it.
+        child = message["params"]["sessionId"]
+        assert sent == [
+            *[(name, args, child) for name, args in _POPUP_FENCE],
+            ("Runtime.runIfWaitingForDebugger", None, child),
+            *close,
+        ]
+    else:
+        assert sent == close
     assert not backend.child_frames and not backend.failed
 
 
@@ -2770,3 +2782,111 @@ async def test_a_child_waiting_on_a_restored_parent_is_adopted_as_the_tree_is_re
     finally:
         await socket.close()
         await backend.reader
+
+
+#: Pages that open popups: from a click (scripting the popup's own window
+#: while it is open), from script with no click, and from links with and
+#: without an opener. Every popup URL contains "popup".
+POPUP_PAGES = {
+    "/click": (
+        "<title>click</title><button style='position:absolute;left:0;top:0;width:400px;"
+        "height:200px' onclick=\"const w=window.open('');if(!w){document.title='no popup';"
+        "return}try{w.fetch('/popup-fetch')}catch(e){};try{new w.Worker(URL.createObjectURL("
+        "new Blob(['fetch(\\'/popup-worker\\')'])))}catch(e){};setTimeout(()=>{try{w.location="
+        "'/popup-nav'}catch(e){}},50);document.title='opened'\">open</button>"
+    ),
+    "/script": "<title>script</title><script>window.open('/popup-url')</script>",
+    "/link": (
+        "<title>link</title><a href='/popup-link' target=_blank style='display:block;"
+        "width:400px;height:200px'>open</a>"
+    ),
+    "/link-opener": (
+        "<title>link</title><a href='/popup-link' target=_blank rel=opener "
+        "style='display:block;width:400px;height:200px'>open</a>"
+    ),
+}
+
+
+@pytest.fixture
+def popups() -> Any:
+    hits: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            body = POPUP_PAGES.get(self.path, "<p>popup</p><script>fetch('/popup-sub')</script>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *_: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port, hits
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def popup_policy(_context: Any, url: str) -> None:
+    if "popup" in url:
+        raise ToolError("not permitted")
+
+
+@pytest.mark.parametrize("page", list(POPUP_PAGES))
+def test_sync_a_popup_is_refused_without_holding_up_its_opener(
+    chrome: str, popups: Any, page: str
+) -> None:
+    computer, revoked = remote(chrome, False)
+    port, hits = popups
+    with MandalaBrowserToolset(computer, url_policy=popup_policy) as browser:
+        assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}{page}")))
+        if page != "/script":
+            began = time.monotonic()
+            point = {"type": "coordinate", "x": 100, "y": 50}
+            assert_success(browser.tool_result(use("left_click", target=point)))
+            assert time.monotonic() - began < 5
+        time.sleep(0.5)
+        # The opener carries on: a further action on the same tab works, and
+        # the popup is gone without having loaded anything.
+        began = time.monotonic()
+        assert_success(browser.tool_result(use("get_page_text")))
+        assert time.monotonic() - began < 5
+        assert len(tabs(assert_success(browser.tool_result(use("list_tabs"))))) == 1
+        assert not browser._backend.failed
+    assert revoked == [IDENT]
+    assert not [path for path in hits if "popup" in path]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", list(POPUP_PAGES))
+async def test_async_a_popup_is_refused_without_holding_up_its_opener(
+    chrome: str, popups: Any, page: str
+) -> None:
+    computer, revoked = remote(chrome, True)
+    port, hits = popups
+
+    async def policy(context: Any, url: str) -> None:
+        popup_policy(context, url)
+
+    async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        assert_success(
+            await browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}{page}"))
+        )
+        if page != "/script":
+            point = {"type": "coordinate", "x": 100, "y": 50}
+            assert_success(
+                await asyncio.wait_for(browser.tool_result(use("left_click", target=point)), 5)
+            )
+        await asyncio.sleep(0.5)
+        assert_success(await asyncio.wait_for(browser.tool_result(use("get_page_text")), 5))
+        assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
+        assert not browser._backend.failed
+    assert revoked == [IDENT]
+    assert not [path for path in hits if "popup" in path]

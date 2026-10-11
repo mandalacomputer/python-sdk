@@ -119,6 +119,17 @@ _NO_WORKERS_INIT = (
     "Page.addScriptToEvaluateOnNewDocument",
     {"source": _NO_WORKERS, "runImmediately": True},
 )
+# A popup is refused, but must first be released: auto-attach holds it before
+# its first line, and one opened by script shares its opener's renderer, so a
+# held popup holds its opener too (a click that opens one never returns). Before
+# release it is fenced, so that nothing it does or its opener does in it
+# reaches the network: every request it makes is refused, it cannot start a
+# worker, and anything it starts is held. Then it is closed.
+_POPUP_FENCE: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("Fetch.enable", _INTERCEPT),
+    _NO_WORKERS_INIT,
+    ("Target.setAutoAttach", _AUTO_ATTACH),
+)
 _FRAME_INIT: tuple[tuple[str, dict[str, Any]], ...] = (
     ("Page.enable", {}),
     _NO_WORKERS_INIT,
@@ -290,6 +301,8 @@ class BrowserCDP:
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
+        # Session -> target, of popups being refused: their every request fails.
+        self.refused: dict[str, str] = {}
         # Download ownership, as the file session keeps it, is decided here:
         # tracked frame -> the session that last reported it (a session that
         # goes takes the frames only it could see), and -> its parent frame.
@@ -949,10 +962,14 @@ class BrowserCDP:
             # to say the frames inside it went: the frames only it reported go
             # with it. One its parent has reported since lives on.
             self._forget_frames(current)
+        self._abandon(gone)
+
+    def _abandon(self, sessions: list[str]) -> None:
+        # Chromium need not answer a command on a session that has gone.
         for ident, owner in list(self.pending_sessions.items()):
             future = self.pending.get(ident)
-            if owner in gone and future is not None and not future.done():
-                future.set_exception(_SessionGone("Browser frame detached."))
+            if owner in sessions and future is not None and not future.done():
+                future.set_exception(_SessionGone("Browser session detached."))
 
     def _settle(self, message: dict[str, Any]) -> None:
         """The part of an event that awaits nothing, done as it arrives."""
@@ -969,10 +986,17 @@ class BrowserCDP:
                 self.tabs[info["targetId"]] = info
         elif method == "Target.detachedFromTarget":
             self._drop_frame(p.get("sessionId"))
+            if p.get("sessionId") in self.refused:
+                del self.refused[p["sessionId"]]
+                self._abandon([p["sessionId"]])
         elif method == "Target.targetDestroyed":
             for child, (_, frame, _) in list(self.child_frames.items()):
                 if frame == p.get("targetId"):
                     self._drop_frame(child)
+            gone = [child for child, target in self.refused.items() if target == p.get("targetId")]
+            for child in gone:
+                del self.refused[child]
+            self._abandon(gone)
         elif method == "Target.attachedToTarget":
             info, child = p["targetInfo"], p["sessionId"]
             tab = self._owner(session)
@@ -1061,9 +1085,7 @@ class BrowserCDP:
                 if target not in self.ready and self.creating is not None:
                     await asyncio.shield(self.creating)
                 if info["type"] != "page" or target not in self.ready:
-                    closed = await self.send("Target.closeTarget", {"targetId": target})
-                    if not closed.get("success"):
-                        raise BrowserError("Unsupported browser target could not be closed.")
+                    await self._refuse(child, info)
                     return
                 self.sessions[target] = child
                 self.tabs[target] = info
@@ -1095,6 +1117,14 @@ class BrowserCDP:
                     await asyncio.shield(self.creating)
                 self.drop_tab(target)
             elif method == "Fetch.requestPaused":
+                if session in self.refused:
+                    # A refused popup's: nothing it asks for is let through.
+                    await self.send(
+                        "Fetch.failRequest",
+                        {"requestId": p["requestId"], "errorReason": "BlockedByClient"},
+                        session,
+                    )
+                    return
                 tab = self._owner(session)
                 if tab is None:
                     return  # The target has already detached; its requests die with it.
@@ -1145,6 +1175,21 @@ class BrowserCDP:
             self.failed = True
             if self.ws is not None:
                 await self.ws.close()
+
+    async def _refuse(self, child: str, info: dict[str, Any]) -> None:
+        """Close a target this driver does not run; a popup is fenced and released first."""
+        target = info["targetId"]
+        if info.get("type") == "page":
+            self.refused[child] = target
+            try:
+                for name, args in _POPUP_FENCE:
+                    await self.send(name, args, child)
+                await self.send("Runtime.runIfWaitingForDebugger", session=child)
+            except _SessionGone:
+                return  # It went first: nothing is left to refuse.
+        closed = await self.send("Target.closeTarget", {"targetId": target})
+        if not closed.get("success") and (info.get("type") != "page" or child in self.refused):
+            raise BrowserError("Unsupported browser target could not be closed.")
 
     def drop_tab(self, target: str) -> None:
         if self.files is not None:
