@@ -1622,7 +1622,13 @@ class AsyncComputer(ComputerFields):
 
         A batch REFUSED before any action ran — a malformed one, a computer
         that is not running, the input lane busy — raises the ordinary error
-        for its status, and nothing happened. One whose answer could not be
+        for its status, and nothing happened. The exception is a 503
+        (:class:`~mandala_computer.UnavailableError`): the platform also
+        answers 503, in that same ordinary shape, when the batch was sent and
+        its answer was lost, so a 503 may mean the batch ran, in whole or in
+        part. Never resend it blindly; look at a fresh screenshot first.
+        :func:`~mandala_computer.is_transient` answers ``False`` for it. One
+        whose answer could not be
         read at all (interrupted, empty, a proxy's page) keeps its status's
         class but is not known to have run nothing, so
         :func:`~mandala_computer.is_transient` answers ``False`` for it too. A
