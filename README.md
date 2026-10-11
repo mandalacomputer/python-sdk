@@ -1959,11 +1959,13 @@ revokes its capability; it does not stop Chromium or delete the computer.
   egress controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and
   browser traffic outside those intercepted requests.
 - Cross-site frames, which site isolation runs as separate browser targets,
-  and dedicated workers run inside their tab, and their intercepted requests
-  meet the same URL hook. A frame that cannot be given that hook stays paused
-  and never runs. Popups, shared and service workers and other targets are
+  run inside their tab, and their intercepted requests meet the same URL hook.
+  A frame that cannot be given that hook stays paused and never runs.
+  Dedicated workers are held paused and never run: Chromium cannot close one,
+  and the script of a worker that a worker starts is fetched where no session
+  can intercept it. Popups, shared and service workers and other targets are
   unsupported and are closed; if one cannot be closed, the driver closes its
-  session. Sites depending on popups may not work with this driver.
+  session. Sites depending on popups or workers may not work with this driver.
 - `read_page` returns accessibility roles/names and element refs; `find`
   performs a case-insensitive substring search over that tree. Each read/find
   replaces that tab's refs. Navigation invalidates them. Ask for a new page
@@ -1974,8 +1976,8 @@ revokes its capability; it does not stop Chromium or delete the computer.
   held key and at most 100 key repeats. Coordinates outside the viewport and
   invalid crop rectangles are refused. Dialogs are dismissed and reported.
   Browser events (paused requests among them) are handled 256 at a time and
-  the rest wait their turn; a page that leaves more than 8,192 waiting ends
-  the session.
+  the rest wait their turn; a page that leaves more than 8,192 waiting, or
+  16 MiB of them, ends the session.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be

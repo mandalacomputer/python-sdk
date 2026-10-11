@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import respx
 from tests.test_browser_toolset import BASE, IDENT, PAYLOAD, TOKEN, chrome  # noqa: F401
@@ -193,7 +194,7 @@ async def test_renewal_failure_is_terminal_and_redacted():
 async def test_close_cancels_renewal_without_accepting_late_result():
     pending = asyncio.Event()
 
-    async def renew(_):
+    async def renew(_, _limit):
         pending.set()
         await asyncio.Event().wait()
 
@@ -218,8 +219,8 @@ async def test_real_browser_state_survives_renewal_during_pending_command(chrome
     first = short_lease(ttl=0.6, attach=0.5, end=5)
     grant = BrowserConnection(IDENT, chrome, TOKEN, first.attach_expires_at, first)
 
-    async def renew(ident):
-        assert ident == IDENT
+    async def renew(ident, limit):
+        assert ident == IDENT and 0 < limit <= 10
         elapsed = time.monotonic() - start
         renewed.set()
         return short_lease(ttl=5 - elapsed, server=elapsed, attach=0.5, end=5)
@@ -496,7 +497,7 @@ async def test_renewal_retries_passing_failures_until_one_succeeds(monkeypatch):
     ]
     calls = []
 
-    async def renew(ident):
+    async def renew(ident, limit):
         calls.append(time.monotonic())
         if failures:
             raise failures.pop(0)
@@ -582,3 +583,90 @@ def test_create_conflict_ends_the_toolset_session(asynchronous, reason):
                 status = browser.session_status
     assert first.get("is_error") and second.get("is_error")
     assert create.call_count == 1 and status["state"] == "ended"
+
+
+@pytest.mark.parametrize("late", ["success", "failure"])
+async def test_a_renewal_that_outlives_its_limit_is_waited_out_not_overlapped(late, monkeypatch):
+    import threading
+
+    from mandala_computer import _browser_cdp
+    from mandala_computer._exceptions import ConnectionError as MandalaConnectionError
+
+    monkeypatch.setattr(_browser_cdp, "_RENEW_ATTEMPT", 0.05)
+    running, most, limits = [], [], []
+    lock = threading.Lock()
+
+    def blocking(limit):
+        # A sync computer's renewal: a thread the driver cannot cancel.
+        with lock:
+            running.append(1)
+            most.append(len(running))
+        limits.append(limit)
+        try:
+            time.sleep(0.2 if len(limits) == 1 else 0)
+            if late == "failure" and len(limits) == 1:
+                raise MandalaConnectionError("lost")
+            return short_lease(ttl=20, server=0.5, end=30)
+        finally:
+            with lock:
+                running.pop()
+
+    async def renew(ident, limit):
+        return await asyncio.to_thread(blocking, limit)
+
+    b = retrying_backend(renew, monkeypatch, ttl=3)
+    await b._renew_lease()
+    assert max(most) == 1 and not b.failed
+    assert len(limits) == (1 if late == "success" else 2)
+    assert all(0 < limit <= 0.05 for limit in limits)
+    assert b.lease.lease_expires_at == EPOCH + timedelta(seconds=20.5)
+
+
+@respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_stalled_release_of_a_refused_grant_is_abandoned_at_its_deadline(
+    asynchronous, monkeypatch
+):
+    from mandala_computer import _async_computer, _computer
+
+    monkeypatch.setattr(_computer, "CLEANUP_REVOKE_TIMEOUT", 0.2)
+    monkeypatch.setattr(_async_computer, "CLEANUP_REVOKE_TIMEOUT", 0.2)
+    respx.get(f"{BASE}/computers/vm-1").respond(200, json={"id": "vm-1", "status": "running"})
+    respx.post(f"{BASE}/computers/vm-1/browser-connections").respond(
+        201, json={**PAYLOAD, "url": "wss://elsewhere.test/cdp"}
+    )
+    release = []
+
+    if asynchronous:
+
+        async def stall(request):
+            release.append(1)
+            await asyncio.sleep(3)
+            return httpx.Response(200, json={"ok": True})
+
+        respx.delete(f"{BASE}/computers/vm-1/browser-connections/{IDENT}").mock(side_effect=stall)
+
+        async def run():
+            async with AsyncClient("com_test", base_url=BASE) as client:
+                c = await client.computers.get("vm-1")
+                started = time.monotonic()
+                with pytest.raises(MandalaError, match="invalid browser connection"):
+                    await c.create_browser_connection()
+                return time.monotonic() - started
+
+        took = asyncio.run(run())
+    else:
+
+        def stall(request):
+            release.append(1)
+            time.sleep(1.5)
+            return httpx.Response(200, json={"ok": True})
+
+        respx.delete(f"{BASE}/computers/vm-1/browser-connections/{IDENT}").mock(side_effect=stall)
+        with Client("com_test", base_url=BASE) as client:
+            c = client.computers.get("vm-1")
+            started = time.monotonic()
+            with pytest.raises(MandalaError, match="invalid browser connection"):
+                c.create_browser_connection()
+            took = time.monotonic() - started
+    assert release and took < 1.0

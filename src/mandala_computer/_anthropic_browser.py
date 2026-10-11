@@ -135,9 +135,10 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that.
-    Cross-site frames and dedicated workers run under the same policy; popups
-    and other targets are unsupported. Uploads and downloads
-    require an explicit ``remote_file_policy``; uploads also require ``confirm``.
+    Cross-site frames run under the same policy; dedicated workers are held
+    paused and never run; popups and other targets are unsupported. Uploads and
+    downloads require an explicit ``remote_file_policy``; uploads also require
+    ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
     Closing disposes this context and revokes its grant, not the computer.
     Sync callbacks may run on a worker thread.
@@ -210,8 +211,8 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
 
         self._revoke_connection = computer.revoke_browser_connection
 
-        async def renew(ident: str) -> Any:
-            return await asyncio.to_thread(computer.renew_browser_connection, ident)
+        async def renew(ident: str, timeout: float) -> Any:
+            return await asyncio.to_thread(computer._renew_browser_connection, ident, timeout)
 
         self._backend = BrowserCDP(
             create, revoke, policy, renew=renew, session_policy=session_policy
@@ -476,9 +477,10 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that.
-    Cross-site frames and dedicated workers run under the same policy; popups
-    and other targets are unsupported. Uploads and downloads
-    require an explicit ``remote_file_policy``; uploads also require ``confirm``.
+    Cross-site frames run under the same policy; dedicated workers are held
+    paused and never run; popups and other targets are unsupported. Uploads and
+    downloads require an explicit ``remote_file_policy``; uploads also require
+    ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
     Closing disposes this context and revokes its grant, not the computer.
     """
@@ -544,8 +546,8 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
                 return await computer.create_browser_connection()
             return await computer.create_browser_connection(session_policy=session_policy)
 
-        async def renew(ident: str) -> Any:
-            return await computer.renew_browser_connection(ident)
+        async def renew(ident: str, timeout: float) -> Any:
+            return await computer._renew_browser_connection(ident, timeout)
 
         self._backend = BrowserCDP(
             create,

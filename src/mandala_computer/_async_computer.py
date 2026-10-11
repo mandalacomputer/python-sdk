@@ -645,10 +645,14 @@ class AsyncComputer(ComputerFields):
                 ident = data.get("id")
                 if not isinstance(ident, str):
                     raise TypeError("missing connection id")
-                await self._t.json_object(
-                    "DELETE",
-                    f"{path}/{connection_id(ident)}",
-                    timeout_cap=CLEANUP_REVOKE_TIMEOUT,
+                # The request's own cap bounds each phase, not the whole exchange.
+                await asyncio.wait_for(
+                    self._t.json_object(
+                        "DELETE",
+                        f"{path}/{connection_id(ident)}",
+                        timeout_cap=CLEANUP_REVOKE_TIMEOUT,
+                    ),
+                    CLEANUP_REVOKE_TIMEOUT,
                 )
             except Exception:  # noqa: BLE001, S110 - preserve parse error; never log a capability
                 pass
@@ -656,9 +660,18 @@ class AsyncComputer(ComputerFields):
 
     async def renew_browser_connection(self, ident: str) -> BrowserSessionLease:
         """Extend the same attached version 2 session using fresh account authorization."""
+        return await self._renew_browser_connection(ident)
+
+    async def _renew_browser_connection(
+        self, ident: str, timeout: float | None = None
+    ) -> BrowserSessionLease:
+        # ``timeout`` caps the request's phases: the browser toolset bounds each
+        # renewal attempt by it, so a retry never runs beside a stalled request.
         ident = connection_id(ident)
         path = _api.computer_action(self.id, "browser-connections")
-        data = await self._t.json_object("POST", f"{path}/{ident}/renew", json={})
+        data = await self._t.json_object(
+            "POST", f"{path}/{ident}/renew", json={}, timeout_cap=timeout
+        )
         return BrowserSessionLease.from_api(data, ident)
 
     async def revoke_browser_connection(self, ident: str) -> None:

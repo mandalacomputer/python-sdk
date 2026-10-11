@@ -704,8 +704,9 @@ def cross_site() -> Any:
 
     Under site isolation the frame is its own CDP target, attached beneath the
     page, and it embeds a 127.0.0.1 frame of its own, which attaches beneath it.
-    The page also starts a dedicated worker. Every one of them asks for a URL
-    the policy refuses and reports, to the page, whether it got through.
+    Each frame asks for a URL the policy refuses and reports, to the page,
+    whether it got through. The page and the frame each start a dedicated
+    worker, which would do the same if it ran.
     """
     hits: list[tuple[str, str]] = []
 
@@ -723,7 +724,7 @@ const seen=new Set();const show=v=>{{seen.add(String(v));document.getElementById
 addEventListener('message',e=>show(e.data));
 new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
 </script><iframe src="http://localhost:{port}/frame"></iframe>""",
-                "/frame": f"""<p>frame</p><script>{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
+                "/frame": f"""<p>frame</p><script>new Worker('/worker.js');{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
 <iframe src="http://127.0.0.1:{port}/nested"></iframe>""",
                 "/nested": f"<p>nested</p><script>{probe.format('/nested')}.then(r=>top.postMessage('nested:'+r,'*'))</script>",
             }
@@ -752,27 +753,29 @@ new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
         thread.join()
 
 
-CROSS_SITE_DONE = "frame:refused nested:refused worker:refused"
+CROSS_SITE_DONE = "frame:refused nested:refused"
 
 
 def assert_cross_site_policy(port: int, hits: list[tuple[str, str]], seen: list[str]) -> None:
-    # Each child ran and its requests met the policy: allowed ones reached the
+    # Each frame ran and its requests met the policy: allowed ones reached the
     # server, refused ones never did.
     for host, path in [
         ("localhost", "/frame"),
         ("localhost", "/frame-allowed"),
         ("127.0.0.1", "/nested"),
         ("127.0.0.1", "/nested-allowed"),
-        ("127.0.0.1", "/worker-allowed"),
     ]:
         assert (host, path) in hits
     assert not [path for _, path in hits if path.endswith("-blocked")]
     for url in [
         f"http://localhost:{port}/frame-blocked",
         f"http://127.0.0.1:{port}/nested-blocked",
-        f"http://127.0.0.1:{port}/worker-blocked",
     ]:
         assert url in seen
+    # Both workers' scripts were fetched under the policy, and neither ran.
+    assert ("127.0.0.1", "/worker.js") in hits and ("localhost", "/worker.js") in hits
+    assert f"http://localhost:{port}/worker.js" in seen
+    assert not [path for _, path in hits if path.startswith("/worker-")]
 
 
 def test_sync_cross_site_frame_runs_under_the_policy(chrome: str, cross_site: Any) -> None:
@@ -865,7 +868,7 @@ def attached(child: str, target: str, kind: str, parent: str | None) -> dict[str
 
 
 @pytest.mark.asyncio
-async def test_frames_and_workers_under_an_owned_tab_run_and_are_never_closed() -> None:
+async def test_frames_under_an_owned_tab_run_and_workers_are_held_never_closed() -> None:
     from mandala_computer._browser_cdp import _FRAME_INIT
 
     seen: list[tuple[Any, str]] = []
@@ -886,11 +889,13 @@ async def test_frames_and_workers_under_an_owned_tab_run_and_are_never_closed() 
     await backend._event(attached("nested-s", "nested-t", "iframe", "frame-s"))
     assert ("Runtime.runIfWaitingForDebugger", None, "nested-s") in sent
     assert backend._owner("nested-s") == "tab"
-    # A worker is released and left alone: its requests are its frame's.
+    # A worker, in the tab or in one of its frames, is held where it paused:
+    # not released (it could start workers beyond the policy), not detached
+    # (which would release it) and not closed (Chromium refuses).
     sent.clear()
     await backend._event(attached("worker-s", "worker-t", "worker", "frame-s"))
-    assert [m for m, _, _ in sent] == ["Runtime.runIfWaitingForDebugger", "Target.detachFromTarget"]
-    assert not [m for m, _, _ in sent if m == "Target.closeTarget"]
+    await backend._event(attached("worker2-s", "worker2-t", "worker", "page"))
+    assert sent == [] and backend._owner("worker-s") is None
     # The frame's requests answer to the tab's policy, on the frame's session.
     sent.clear()
     for ident, url in [("1", "https://ok.test/"), ("2", "https://ok.test/blocked")]:
@@ -1138,3 +1143,177 @@ async def test_a_slow_form_field_release_does_not_end_the_session() -> None:
     )
     assert ("Runtime.releaseObject", {"objectId": "obj"}, "page") in sent
     assert not backend.failed
+
+
+class ScriptedSocket:
+    """A CDP socket the test feeds by hand; commands wait for a scripted reply."""
+
+    def __init__(self) -> None:
+        self.inbox: asyncio.Queue[str | None] = asyncio.Queue()
+        self.sent: list[dict[str, Any]] = []
+        self.closed = False
+
+    def __aiter__(self) -> Any:
+        return self
+
+    async def __anext__(self) -> str:
+        raw = await self.inbox.get()
+        if raw is None:
+            raise StopAsyncIteration
+        return raw
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    async def close(self) -> None:
+        self.closed = True
+        await self.inbox.put(None)
+
+    def push(self, message: dict[str, Any]) -> None:
+        self.inbox.put_nowait(json.dumps(message))
+
+
+def paused(ident: str, session: str, url: str) -> dict[str, Any]:
+    return {
+        "method": "Fetch.requestPaused",
+        "sessionId": session,
+        "params": {"requestId": ident, "request": {"url": url}},
+    }
+
+
+async def settle(condition: Any) -> None:
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition not reached")
+
+
+@pytest.mark.asyncio
+async def test_a_frame_detached_while_the_queue_is_full_does_not_end_the_session() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    hold = asyncio.Event()
+
+    async def policy(_tab: Any, url: str) -> None:
+        if url.endswith("/slow"):
+            await hold.wait()
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.child_frames = {"frame-s": ("tab", "frame-t")}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        # A request in the frame is allowed and its continue is in flight...
+        socket.push(paused("f1", "frame-s", "https://ok.test/"))
+        await settle(lambda: any(m.get("sessionId") == "frame-s" for m in socket.sent))
+        command = next(m for m in socket.sent if m.get("sessionId") == "frame-s")
+        # ...when the tab fills every slot with requests waiting on the policy.
+        for i in range(300):
+            socket.push(paused(str(i), "page", "https://ok.test/slow"))
+        await settle(lambda: len(backend.tasks) >= 256 and backend.backlog)
+        # The frame goes; Chromium says so, then refuses the in-flight command.
+        socket.push(
+            {
+                "method": "Target.detachedFromTarget",
+                "sessionId": "page",
+                "params": {"sessionId": "frame-s", "targetId": "frame-t"},
+            }
+        )
+        socket.push(
+            {"id": command["id"], "error": {"code": -32001, "message": "Session not found."}}
+        )
+        await asyncio.sleep(0.05)
+        assert not backend.failed and not socket.closed
+        assert "frame-s" not in backend.child_frames
+    finally:
+        hold.set()
+        await socket.close()
+        await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_large_events_are_noted_or_trimmed_rather_than_queued_whole(
+    monkeypatch: Any,
+) -> None:
+    from mandala_computer import _browser_cdp
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    hold = asyncio.Event()
+
+    async def policy(_tab: Any, _url: str) -> None:
+        await hold.wait()
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    huge = "x" * (2 * 1024 * 1024)
+    try:
+        for i in range(256):
+            socket.push(paused(str(i), "page", "https://ok.test/"))
+        await settle(lambda: len(backend.slots) == 256)
+        # Console output is noted in place, whatever its size, and never queued.
+        for _ in range(20):
+            socket.push(
+                {
+                    "method": "Runtime.consoleAPICalled",
+                    "sessionId": "page",
+                    "params": {"args": [{"value": huge}]},
+                }
+            )
+        # A queued request keeps only what its check reads: an over-long URL
+        # stays over-long, so it is still refused.
+        socket.push(paused("long", "page", "https://ok.test/" + huge))
+        await settle(lambda: backend.backlog)
+        assert len(backend.console["tab"]) == 20
+        assert all(len(line) <= 2000 for line in backend.console["tab"])
+        queued, size = backend.backlog[0]
+        assert len(queued["params"]["request"]["url"]) == 8193 and size < 10_000
+        assert backend.backlog_bytes == size
+        # The byte budget still ends a flood of queued events.
+        monkeypatch.setattr(_browser_cdp, "_EVENT_QUEUE_BYTES", size * 3)
+        for i in range(5):
+            socket.push(paused(f"more{i}", "page", "https://ok.test/" + huge))
+        await settle(lambda: backend.failed)
+        with pytest.raises(BrowserError, match="faster than the session"):
+            await backend.start()
+    finally:
+        hold.set()
+        await socket.close()
+        await backend.reader
+        for task in list(backend.tasks):
+            task.cancel()
+        await asyncio.gather(*backend.tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unused_events_are_dropped_and_target_events_skip_the_queue() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    hold = asyncio.Event()
+
+    async def policy(_tab: Any, _url: str) -> None:
+        await hold.wait()
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.child_frames = {"frame-s": ("tab", "frame-t")}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        for i in range(300):
+            socket.push(paused(str(i), "page", "https://ok.test/"))
+        socket.push({"method": "Network.dataReceived", "sessionId": "page", "params": {}})
+        socket.push({"method": "Target.targetDestroyed", "params": {"targetId": "frame-t"}})
+        await settle(lambda: "frame-s" not in backend.child_frames)
+        assert len(backend.backlog) == 300 - 256
+        assert all(m["method"] == "Fetch.requestPaused" for m, _ in backend.backlog)
+    finally:
+        hold.set()
+        await socket.close()
+        await backend.reader

@@ -122,9 +122,11 @@ This is the summary you read to decide whether to upgrade.
   isolation a frame from another site is its own browser target, and the
   browser toolsets closed it as they close a popup, which closed the whole tab:
   `navigate` reported success and the next action found the tab gone. Such
-  frames, the frames inside them and dedicated workers now run inside their
-  tab, and their requests meet the same `url_policy`. Popups and other targets
-  are still refused (OPL-5900).
+  frames, and the frames inside them, now run inside their tab, and their
+  requests meet the same `url_policy`. A page that starts a dedicated worker
+  no longer ends the session either: the worker is held paused and never runs,
+  since a worker can fetch another worker's script beyond any policy check.
+  Popups and other targets are still refused (OPL-5900).
 
 - **Browser connections work on Python 3.10.** The platform's timestamps carry
   up to nine fractional digits, which 3.10's `datetime.fromisoformat` rejects,
@@ -135,19 +137,20 @@ This is the summary you read to decide whether to upgrade.
 - **One failed lease renewal no longer ends a browser session.** A renewal
   that fails in passing (a lost connection, a timeout, a 408, 429 or 5xx) is
   retried with backoff, honouring `Retry-After`, until shortly before the lease
-  deadline. Any other refusal, including every 409 whatever its `reason`, still
-  ends the session at once.
+  deadline, and an attempt is never started beside one still running. Any
+  other refusal, including every 409 whatever its `reason`, still ends the
+  session at once.
 
 - **A heavy page no longer ends a browser session.** More than 256 browser
   events in flight, as on a page with hundreds of images each waiting for
   `url_policy`, closed the session. The rest now wait their turn; only a page
-  that leaves more than 8,192 waiting ends it.
+  that leaves more than 8,192 waiting, or 16 MiB of them, ends it.
 
 - **`create_browser_connection()` releases any grant it refuses to hand over**,
-  not only one from a server that ignored a session policy, and gives that
-  release ten seconds rather than the client's whole timeout. A base URL with
-  an explicit default port (`https://host:443`) or an upper-case host no longer
-  makes every grant look as if it pointed somewhere else.
+  not only one from a server that ignored a session policy, and waits at most
+  ten seconds for that release rather than the client's whole timeout. A base
+  URL with an explicit default port (`https://host:443`) or an upper-case host
+  no longer makes every grant look as if it pointed somewhere else.
 
 - In the browser toolsets, `read_page` and `find` with `depth=0` ask for depth
   0 rather than 20; a slow release after `form_input` no longer ends the

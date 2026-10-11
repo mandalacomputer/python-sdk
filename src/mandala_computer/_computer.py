@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import math
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
@@ -3178,10 +3179,16 @@ class Computer(ComputerFields):
             # A grant this SDK refuses to hand over — an older server ignoring
             # the opt-in, or any answer that fails validation — is still live on
             # the server. Release it, briefly, without masking the parse error.
+            ident = data.get("id")
+            if isinstance(ident, str):
+                self._release_refused_grant(path, ident)
+            raise
+
+    def _release_refused_grant(self, path: str, ident: str) -> None:
+        # The request's own cap bounds each phase, not the whole exchange, so
+        # it runs beside the caller, who waits no longer than the deadline.
+        def release() -> None:
             try:
-                ident = data.get("id")
-                if not isinstance(ident, str):
-                    raise TypeError("missing connection id")
                 self._t.json_object(
                     "DELETE",
                     f"{path}/{connection_id(ident)}",
@@ -3189,13 +3196,23 @@ class Computer(ComputerFields):
                 )
             except Exception:  # noqa: BLE001, S110 - preserve parse error; never log a capability
                 pass
-            raise
+
+        worker = threading.Thread(target=release, name="mandala-browser-release", daemon=True)
+        worker.start()
+        worker.join(CLEANUP_REVOKE_TIMEOUT)
 
     def renew_browser_connection(self, ident: str) -> BrowserSessionLease:
         """Extend the same attached version 2 session using fresh account authorization."""
+        return self._renew_browser_connection(ident)
+
+    def _renew_browser_connection(
+        self, ident: str, timeout: float | None = None
+    ) -> BrowserSessionLease:
+        # ``timeout`` caps the request's phases: the browser toolset bounds each
+        # renewal attempt by it, so a retry never runs beside a stalled request.
         ident = connection_id(ident)
         path = _api.computer_action(self.id, "browser-connections")
-        data = self._t.json_object("POST", f"{path}/{ident}/renew", json={})
+        data = self._t.json_object("POST", f"{path}/{ident}/renew", json={}, timeout_cap=timeout)
         return BrowserSessionLease.from_api(data, ident)
 
     def revoke_browser_connection(self, ident: str) -> None:
