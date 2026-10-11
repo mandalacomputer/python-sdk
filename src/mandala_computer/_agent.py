@@ -79,13 +79,19 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _usd(value: Any) -> float | None:
+def _usd(value: Any, *, signed: bool = False) -> float | None:
     """A dollar figure off the wire, or ``None`` where there is none to read.
 
     ``None`` rather than :func:`_num`'s zero, because absence is the answer
     here: a run on your own key carries no charge figures at all, and a zero
-    would claim it cost nothing on credits it never touched. A boolean is not a
-    figure (``float(True)`` is ``1.0``), and neither is NaN or an infinity.
+    would claim it cost nothing on credits it never touched. Only a NUMBER the
+    platform sent counts — a boolean (``float(True)`` is ``1.0``), a numeric
+    string, NaN and the infinities are not coerced into one — and a charge is
+    never negative; ``signed`` is for the one figure that can be, the balance
+    left after an overrun. ``None`` rather than raised, because this runs
+    inside a caller's loop over a live run, which must not end over a figure it
+    could have done without. The TypeScript SDK's ``usd`` reads them the same
+    way.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -93,7 +99,9 @@ def _usd(value: Any) -> float | None:
         n = float(value)
     except OverflowError:
         return None
-    return n if math.isfinite(n) else None
+    if not math.isfinite(n) or (n < 0 and not signed):
+        return None
+    return n
 
 
 @dataclass(frozen=True)
@@ -143,7 +151,7 @@ class AgentStep:
             error=_text(r.get("error")),
             raw=dict(r),
             cost_usd=_usd(r.get("cost_usd")),
-            credits_remaining_usd=_usd(r.get("credits_remaining_usd")),
+            credits_remaining_usd=_usd(r.get("credits_remaining_usd"), signed=True),
         )
 
 

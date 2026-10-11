@@ -858,3 +858,71 @@ def test_the_platforms_own_404_or_413_keeps_its_class_on_a_funded_run(
     with pytest.raises((mc.NotFoundError, mc.FileTooLargeError)) as raised:
         computer.agent_once("go")
     assert not isinstance(raised.value, mc.ModelProviderError)
+
+
+# --- strictness the TypeScript SDK shares -------------------------------------
+
+
+@pytest.mark.parametrize("bad", [-0.01, -1])
+def test_a_negative_charge_is_not_a_charge(bad: float) -> None:
+    """A charge is never negative; only the balance left after an overrun is."""
+    step = mc.AgentStep.from_api({"n": 1, "cost_usd": bad, "credits_remaining_usd": bad}, 1)
+    assert step.cost_usd is None and step.credits_remaining_usd == bad
+    assert mc.AgentResult.from_api({"stop": "max_cost", "cost_usd": bad}).cost_usd is None
+    error = mc.InsufficientCreditsError("no", status=402, body={"cost_usd": bad})
+    assert error.cost_usd is None
+
+
+@pytest.mark.parametrize(
+    ("funded", "cost"), [("true", "0.4"), (1, True), (None, -0.2), ("yes", math.nan)]
+)
+def test_an_activity_summary_never_coerces_its_charge(funded: object, cost: object) -> None:
+    row = mc.Activity.from_api({"activity_id": "a", "funded": funded, "cost_usd": cost})
+    assert row.funded is None and row.cost_usd is None
+
+
+def _lot(**changes: Any) -> dict[str, Any]:
+    return {**CREDITS, "lots": [{**CREDITS["lots"][0], **changes}]}
+
+
+def _entry(**changes: Any) -> dict[str, Any]:
+    return {**CREDITS, "entries": [{**CREDITS["entries"][0], **changes}]}
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ({**CREDITS, "balance_micros": -1}, "balance_micros"),
+        ({**CREDITS, "held_micros": 2**53}, "held_micros"),
+        ({**CREDITS, "available_micros": -(2**53)}, "available_micros"),
+        (_lot(remaining_micros=-5), "remaining_micros"),
+        (_entry(id=0), "id"),
+        (_entry(step=-1), "step"),
+        ({**CREDITS, "next_before": 2**53}, "next_before"),
+        (_lot(expires_at="2026-11-01T00:00:00+00:00"), "expires_at"),
+        (_lot(created_at="2026-10-01 00:00:00Z"), "created_at"),
+        (_lot(created_at="2026-02-30T00:00:00Z"), "created_at"),
+        (_lot(created_at="2026-10-01T24:00:00Z"), "created_at"),
+        (_entry(created_at="2026-10-09"), "created_at"),
+        (_entry(created_at="\u0662026-10-09T12:00:00Z"), "created_at"),
+        ({**CREDITS, "grant": {**CREDITS["grant"], "period_end": "soon"}}, "period_end"),
+    ],
+)
+def test_the_ledger_is_read_as_strictly_as_the_typescript_sdk_reads_it(
+    body: dict[str, Any], match: str
+) -> None:
+    """Micros are safe integers, nonnegative but for ``available_micros``;
+    journal positions are positive; timestamps are RFC 3339 instants in UTC."""
+    with pytest.raises(mc.MandalaError, match=match):
+        mc.CreditReport.from_api(body)
+
+
+def test_the_ledger_takes_what_the_platform_actually_sends() -> None:
+    report = mc.CreditReport.from_api(
+        {
+            **_lot(created_at="2026-10-01T00:00:00Z", expires_at="2026-11-01T00:00:00.5Z"),
+            "available_micros": -(2**53 - 1),
+        }
+    )
+    assert report.available_micros == -(2**53 - 1)
+    assert report.lots[0].expires_at == "2026-11-01T00:00:00.5Z"

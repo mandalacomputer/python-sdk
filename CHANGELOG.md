@@ -45,8 +45,9 @@ This is the summary you read to decide whether to upgrade.
 - **`input_batch(actions, context=)`**, sync and async: run 1 to 32 OpenAI
   computer actions (`click`, `double_click`, `move`, `drag`, `scroll`,
   `keypress`, `type`, `wait`, `screenshot`) as one request, in OpenAI's own
-  vocabulary, typed as `OpenAIComputerAction`. The batch's shape is checked
-  before anything is sent. It answers an `InputBatchResult`. A batch refused
+  vocabulary, typed as `OpenAIComputerAction`; the `openai` package's own
+  action objects are taken as they are. The batch's shape is checked before
+  anything is sent, unknown fields included. It answers an `InputBatchResult`. A batch refused
   before any action ran raises the ordinary error for its status. A batch that
   stopped part-way raises `InputBatchError`, whose `result` says how many
   actions completed and which one failed. `is_transient()` answers `False` for
@@ -62,7 +63,9 @@ This is the summary you read to decide whether to upgrade.
   `"credits_exhausted"` when the credits run out part way. `AgentStep` has
   `cost_usd` (the run's total so far) and `credits_remaining_usd`;
   `AgentResult` and `AgentFailed` have `cost_usd`, and `AgentFailed` has
-  `top_up_url`. All are `None` on a run with your own key.
+  `top_up_url`. All are `None` on a run with your own key. A figure is only
+  ever a finite number the platform sent, never coerced, and only
+  `credits_remaining_usd` can be negative.
 
 - **`InsufficientCreditsError`**: the 402 a funded run gets when the account's
   credits cannot cover its first model call. Its `top_up_url` is the billing
@@ -74,7 +77,9 @@ This is the summary you read to decide whether to upgrade.
   credit ledger as `CreditReport` — balance, available, held and debt in
   micros, `frozen`, the plan's `CreditGrant`, live `CreditLot`s and a page of
   `CreditEntry` journal lines with `next_before` for the next page. Strictly
-  decoded.
+  decoded: every field is required, micros are safe integers (negative only
+  for `available_micros`), timestamps are RFC 3339 UTC, and an unknown `kind`
+  is kept as sent.
 
 - `Activity` has `funded` and `cost_usd` on an agent run's summary.
 

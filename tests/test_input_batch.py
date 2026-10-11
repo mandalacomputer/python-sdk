@@ -386,3 +386,88 @@ async def test_the_async_half_reads_an_unreadable_answer_the_same_way() -> None:
         with pytest.raises(mc.ConflictError) as raised:
             await c.input_batch([{"type": "wait"}])
     assert mc.is_transient(raised.value) is False
+
+
+# --- a success that says otherwise ---------------------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": True, "completed": 1, "results": [{"ok": False}]},
+        {**done(1), "failed_index": 0},
+        {**done(1), "error": "batch stopped at action 0"},
+    ],
+    ids=["an-action-not-ok", "a-failed-index", "an-error"],
+)
+def test_a_success_beside_evidence_of_a_failure_is_raised(
+    computer: mc.Computer, body: dict[str, Any]
+) -> None:
+    """``ok: true`` with an action that did not run, a failure index or an
+    error sentence: a caller handed back a success would carry on as if every
+    action had run."""
+    respx.post(INPUT).mock(httpx.Response(200, json=body))
+    with pytest.raises(mc.InputBatchError) as raised:
+        computer.input_batch([{"type": "wait"}])
+    assert raised.value.status == 200 and raised.value.result.ok is False
+    assert mc.is_transient(raised.value) is False
+
+
+@respx.mock
+async def test_the_async_half_raises_a_contradictory_success_too() -> None:
+    respx.post(INPUT).mock(
+        httpx.Response(200, json={"ok": True, "completed": 1, "results": [{"ok": False}]})
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.InputBatchError):
+            await c.input_batch([{"type": "wait"}])
+
+
+# --- the openai package's own action objects ----------------------------------
+
+
+class _Action:
+    """Stands in for an ``openai`` action model: fields, and pydantic's
+    ``model_dump``, unset optional fields ``None`` as the package leaves them."""
+
+    def __init__(self, **fields: Any) -> None:
+        self._fields = fields
+
+    def model_dump(self, *, exclude_none: bool = False) -> dict[str, Any]:
+        return {k: v for k, v in self._fields.items() if not (exclude_none and v is None)}
+
+
+@respx.mock
+def test_the_openai_packages_action_objects_are_taken_as_they_are(computer: mc.Computer) -> None:
+    route = respx.post(INPUT).mock(httpx.Response(200, json=done(3)))
+    computer.input_batch(
+        [
+            _Action(type="click", x=1, y=2, button="left", keys=None),
+            _Action(type="drag", path=[{"x": 1, "y": 2}, {"x": 3, "y": 4}], keys=None),
+            {"type": "wait"},
+        ]
+    )
+    assert json.loads(route.calls.last.request.content) == [
+        {"type": "click", "x": 1, "y": 2, "button": "left"},
+        {"type": "drag", "path": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]},
+        {"type": "wait"},
+    ]
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("action", "match"),
+    [
+        (_Action(type="click", x=1, y=2, button="left", pending_safety_checks=[]), "does not take"),
+        (_Action(type="drag", path=[{"x": 1, "y": 2}, {"x": 3, "y": 4, "z": 1}]), "path"),
+        (object(), "must be an object"),
+    ],
+)
+def test_an_action_object_is_checked_as_a_mapping_is(
+    computer: mc.Computer, action: object, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        computer.input_batch([action])  # type: ignore[list-item]
+    assert not respx.calls

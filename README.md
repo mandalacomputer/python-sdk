@@ -1004,8 +1004,9 @@ print(f"{done.completed} actions")
 png = c.screenshot(fresh=True)  # a `screenshot` action is only a marker
 ```
 
-From the OpenAI SDK, `[a.model_dump(exclude_none=True) for a in call.actions]`
-is such a list. Each action's shape is checked before anything is sent: an
+The `openai` package's own action objects are taken as they are, so
+`c.input_batch(call.actions)` forwards a `computer_call` unchanged. Each
+action's shape is checked before anything is sent: an
 unknown `type`, a missing field or one the action does not read raises
 `ValueError`. A batch the platform refuses before any action runs (a
 malformed one, a computer that is not running, the input lane busy) raises the

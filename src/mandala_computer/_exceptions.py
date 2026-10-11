@@ -374,7 +374,11 @@ class InsufficientCreditsError(APIError):
         value = self.body.get("cost_usd") if isinstance(self.body, dict) else None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        return float(value) if math.isfinite(value) else None
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        return number if math.isfinite(number) and number >= 0 else None
 
 
 class InputBatchError(APIError):

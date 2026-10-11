@@ -129,6 +129,7 @@ from ._models import (
     InputContext,
     Listing,
     Move,
+    OpenAIActionObject,
     OpenAIComputerAction,
     ScreenshotInfo,
     SecretBindingArgs,
@@ -1578,7 +1579,10 @@ class AsyncComputer(ComputerFields):
         return await self._acted(body, params, timeout=seconds + DEADLINE_SLACK)
 
     async def input_batch(
-        self, actions: Sequence[OpenAIComputerAction], *, context: bool = False
+        self,
+        actions: Sequence[OpenAIComputerAction | OpenAIActionObject],
+        *,
+        context: bool = False,
     ) -> InputBatchResult:
         """Run a batch of OpenAI computer actions, in order, as one request.
 
@@ -1586,10 +1590,10 @@ class AsyncComputer(ComputerFields):
         translation: 1 to 32 actions in OpenAI's own vocabulary — ``click``,
         ``double_click``, ``move``, ``drag``, ``scroll``, ``keypress``,
         ``type``, ``wait`` and ``screenshot``. Each is a mapping such as
-        ``{"type": "click", "x": 640, "y": 400, "button": "left"}``; an OpenAI
-        SDK action object's ``model_dump(exclude_none=True)`` is one::
+        ``{"type": "click", "x": 640, "y": 400, "button": "left"}``, or the
+        ``openai`` package's own action object, taken as it is::
 
-            done = await c.input_batch([a.model_dump(exclude_none=True) for a in call.actions])
+            done = await c.input_batch(call.actions)
             print(f"{done.completed} actions")
 
         The whole batch is checked first, here for shape and then by the

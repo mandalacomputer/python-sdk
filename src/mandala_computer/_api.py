@@ -1963,6 +1963,26 @@ _OPENAI_FIELDS: dict[str, tuple[str, ...]] = {
 _OPENAI_BUTTONS = ("left", "right", "wheel", "back", "forward")
 
 
+def _openai_action(item: object, at: str) -> Mapping[str, Any]:
+    """One action as a mapping: as given, or an ``openai`` package action
+    object's own fields.
+
+    The ``openai`` package hands a ``computer_call``'s actions over as model
+    objects, not dicts, and they are taken as they are: ``model_dump`` with
+    ``exclude_none``, because an unset optional field (``keys`` on a click) is
+    ``None`` there and absent on the wire. What that leaves is checked exactly
+    as a dict is, unknown fields included.
+    """
+    if isinstance(item, Mapping):
+        return item
+    dump = getattr(item, "model_dump", None)
+    if callable(dump):
+        fields = dump(exclude_none=True)
+        if isinstance(fields, Mapping):
+            return fields
+    raise ValueError(f"{at} must be an object, not {type(item).__name__}")
+
+
 def input_batch_body(actions: object) -> list[dict[str, Any]]:
     """The body of an OpenAI batch: the actions as a JSON array, each checked
     before anything is sent.
@@ -1983,10 +2003,9 @@ def input_batch_body(actions: object) -> list[dict[str, Any]]:
     if not 1 <= len(actions) <= INPUT_BATCH_MAX:
         raise ValueError(f"a batch holds 1 to {INPUT_BATCH_MAX} actions, not {len(actions)}")
     body: list[dict[str, Any]] = []
-    for i, action in enumerate(actions):
+    for i, item in enumerate(actions):
         at = f"actions[{i}]"
-        if not isinstance(action, Mapping):
-            raise ValueError(f"{at} must be an object, not {type(action).__name__}")  # noqa: TRY004
+        action = _openai_action(item, at)
         kind = action.get("type")
         reads = _OPENAI_FIELDS.get(kind) if isinstance(kind, str) else None
         if reads is None:

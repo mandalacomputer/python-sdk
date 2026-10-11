@@ -16,7 +16,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from operator import index as integer_index
-from typing import Any, Literal, NoReturn, SupportsIndex, TypedDict, TypeVar, overload
+from typing import (
+    Any,
+    Literal,
+    NoReturn,
+    Protocol,
+    SupportsIndex,
+    TypedDict,
+    TypeVar,
+    overload,
+)
 
 from ._api import SECRET_ENV, SECRET_FILE
 from ._exceptions import MandalaError
@@ -61,6 +70,7 @@ __all__ = [
     "Listing",
     "Move",
     "NoBrowserProxy",
+    "OpenAIActionObject",
     "OpenAIButton",
     "OpenAIComputerAction",
     "OpenAIPoint",
@@ -302,16 +312,17 @@ def _real(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
-def _opt_real(value: Any) -> float | None:
-    """:func:`_real` for a figure whose ABSENCE means something: ``None`` rather
-    than a zero that would claim a charge of nothing."""
-    if value is None or isinstance(value, bool):
+def _opt_charge(value: Any) -> float | None:
+    """A dollar charge the platform sent, or ``None``: a finite, nonnegative
+    NUMBER, never a coerced string or boolean, and absent rather than a zero
+    that would claim a charge of nothing."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
         number = float(value)
-    except (OverflowError, TypeError, ValueError):
+    except OverflowError:
         return None
-    return number if math.isfinite(number) else None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 class _Wire(Enum):
@@ -2644,13 +2655,22 @@ class _OpenAIMarker(TypedDict):
     type: Literal["wait", "screenshot"]
 
 
+class OpenAIActionObject(Protocol):
+    """An ``openai`` package action object (``ActionClick`` and the rest), which
+    :meth:`~mandala_computer.Computer.input_batch` takes as it is: anything
+    with pydantic's ``model_dump``."""
+
+    def model_dump(self, *, exclude_none: bool = ...) -> dict[str, Any]: ...
+
+
 #: One action out of an OpenAI ``computer_call``, as
 #: :meth:`~mandala_computer.Computer.input_batch` takes it: ``click``
 #: (``x``, ``y``, ``button``), ``double_click``, ``move`` (``x``, ``y``),
 #: ``drag`` (``path`` of 2 to 128 points), ``scroll`` (``x``, ``y``,
 #: ``scroll_x``, ``scroll_y``), ``keypress`` (``keys``), ``type`` (``text``),
 #: ``wait`` or ``screenshot``. The pointer actions also take ``keys`` to hold.
-#: An OpenAI SDK action object's ``model_dump(exclude_none=True)`` is one.
+#: The ``openai`` package's own action objects are taken too
+#: (:class:`OpenAIActionObject`).
 OpenAIComputerAction = (
     _OpenAIClick
     | _OpenAIPointer
@@ -4275,8 +4295,8 @@ class Activity:
             exit_code=_opt_whole(d.get("exit_code")),
             execution_id=_opt_text(d.get("execution_id")),
             raw=dict(d),
-            funded=_opt_flag(d, "funded"),
-            cost_usd=_opt_real(d.get("cost_usd")),
+            funded=d.get("funded") if isinstance(d.get("funded"), bool) else None,
+            cost_usd=_opt_charge(d.get("cost_usd")),
         )
 
 
@@ -4771,19 +4791,46 @@ class WorkspaceMember:
 # --- AI credits (GET credits) ------------------------------------------------
 
 
-def _ledger_int(d: Mapping[str, Any], key: str, where: str) -> int:
+#: JavaScript's safe-integer ceiling: the platform's ledger numbers are
+#: JavaScript numbers, and one past this cannot be the exact amount it holds.
+_SAFE_INTEGER = 2**53 - 1
+#: An RFC 3339 instant in UTC, as the platform writes one: a ``Z``, no offset.
+_UTC_INSTANT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z")
+
+
+def _ledger_int(d: Mapping[str, Any], key: str, where: str, *, least: int | None = 0) -> int:
     """A whole number off the credit ledger, or a refusal.
 
     Strict, unlike the usage figures: every amount here is integer micros (one
     USD is 1,000,000), and a balance this client cannot read is not one to
     report as zero — a caller deciding whether to start a funded run would read
     that as "nothing left" or, worse, an ``available_micros`` it could not parse
-    as "nothing owed".
+    as "nothing owed". A safe integer, as the TypeScript SDK reads it, and at
+    least ``least`` (``None`` for the one signed figure, ``available_micros``).
     """
     value = d.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise MandalaError(f"{where}: {key} is not a whole number")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or abs(value) > _SAFE_INTEGER
+        or (least is not None and value < least)
+    ):
+        kind = "a safe integer" if least is None else f"a safe integer of at least {least}"
+        raise MandalaError(f"{where}: {key} is not {kind}")
     return int.__index__(value)
+
+
+def _ledger_instant(d: Mapping[str, Any], key: str, where: str) -> str:
+    """An RFC 3339 UTC timestamp off the ledger, as sent, or a refusal."""
+    value = d.get(key)
+    if isinstance(value, str) and _UTC_INSTANT.fullmatch(value):
+        try:
+            datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            pass
+        else:
+            return str.__str__(value)
+    raise MandalaError(f"{where}: {key} is not an RFC 3339 UTC timestamp")
 
 
 def _ledger_present(d: Mapping[str, Any], key: str, where: str) -> None:
@@ -4798,11 +4845,13 @@ def _ledger_present(d: Mapping[str, Any], key: str, where: str) -> None:
         raise MandalaError(f"{where}: no {key}")
 
 
-def _ledger_nullable_int(d: Mapping[str, Any], key: str, where: str) -> int | None:
+def _ledger_nullable_int(
+    d: Mapping[str, Any], key: str, where: str, *, least: int = 0
+) -> int | None:
     _ledger_present(d, key, where)
     if d[key] is None:
         return None
-    return _ledger_int(d, key, where)
+    return _ledger_int(d, key, where, least=least)
 
 
 def _ledger_nullable_text(d: Mapping[str, Any], key: str, where: str) -> str | None:
@@ -4842,8 +4891,8 @@ class CreditLot:
             kind=_key_text(d, "kind", where),
             amount_micros=_ledger_int(d, "amount_micros", where),
             remaining_micros=_ledger_int(d, "remaining_micros", where),
-            expires_at=_key_text(d, "expires_at", where),
-            created_at=_key_text(d, "created_at", where),
+            expires_at=_ledger_instant(d, "expires_at", where),
+            created_at=_ledger_instant(d, "created_at", where),
         )
 
 
@@ -4865,8 +4914,8 @@ class CreditGrant:
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "credit grant") -> CreditGrant:
         return cls(
-            period_start=_key_text(d, "period_start", where),
-            period_end=_key_text(d, "period_end", where),
+            period_start=_ledger_instant(d, "period_start", where),
+            period_end=_ledger_instant(d, "period_end", where),
             granted_micros=_ledger_int(d, "granted_micros", where),
             used_micros=_ledger_int(d, "used_micros", where),
         )
@@ -4903,7 +4952,7 @@ class CreditEntry:
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "credit entry") -> CreditEntry:
         return cls(
-            id=_ledger_int(d, "id", where),
+            id=_ledger_int(d, "id", where, least=1),
             lot_id=_ledger_nullable_text(d, "lot_id", where),
             kind=_key_text(d, "kind", where),
             amount_micros=_ledger_int(d, "amount_micros", where),
@@ -4911,7 +4960,7 @@ class CreditEntry:
             model=_ledger_nullable_text(d, "model", where),
             run_id=_ledger_nullable_text(d, "run_id", where),
             step=_ledger_nullable_int(d, "step", where),
-            created_at=_key_text(d, "created_at", where),
+            created_at=_ledger_instant(d, "created_at", where),
         )
 
 
@@ -4965,12 +5014,10 @@ class CreditReport:
         grant = d["grant"]
         if grant is not None and not isinstance(grant, Mapping):
             raise MandalaError(f"{where}: grant is neither an object nor null")
-        next_before = _ledger_nullable_int(d, "next_before", where)
-        if next_before is not None and next_before < 1:
-            raise MandalaError(f"{where}: next_before is not a journal position")
+        next_before = _ledger_nullable_int(d, "next_before", where, least=1)
         return cls(
             balance_micros=_ledger_int(d, "balance_micros", where),
-            available_micros=_ledger_int(d, "available_micros", where),
+            available_micros=_ledger_int(d, "available_micros", where, least=None),
             held_micros=_ledger_int(d, "held_micros", where),
             debt_micros=_ledger_int(d, "debt_micros", where),
             frozen=frozen,

@@ -91,6 +91,7 @@ from ._models import (
     InputContext,
     Listing,
     Move,
+    OpenAIActionObject,
     OpenAIComputerAction,
     PageContext,
     ScreenshotInfo,
@@ -897,9 +898,18 @@ def _input_batch_outcome(
 
     A success status with a stopped batch contradicts the platform's own
     contract; it is reported the way a stopped batch is, so a returned result
-    always ran in full."""
+    always ran in full. So is any other sign of a failure beside ``ok: true``:
+    fewer actions than were sent, an action whose own ``ok`` is false, a
+    ``failed_index`` or an ``error``. Each is evidence that something did not
+    run, and a caller handed back a success would carry on as if it had."""
     result = InputBatchResult.from_api(data, where)
-    if not result.ok or result.completed != sent:
+    if (
+        not result.ok
+        or result.completed != sent
+        or not all(action.ok for action in result.results)
+        or result.failed_index is not None
+        or result.error is not None
+    ):
         raise InputBatchError(
             result.error or f"the batch stopped after {result.completed} of {sent} actions",
             status=200,
@@ -4280,7 +4290,10 @@ class Computer(ComputerFields):
         return self._acted(body, params, timeout=seconds + DEADLINE_SLACK)
 
     def input_batch(
-        self, actions: Sequence[OpenAIComputerAction], *, context: bool = False
+        self,
+        actions: Sequence[OpenAIComputerAction | OpenAIActionObject],
+        *,
+        context: bool = False,
     ) -> InputBatchResult:
         """Run a batch of OpenAI computer actions, in order, as one request.
 
@@ -4288,10 +4301,10 @@ class Computer(ComputerFields):
         translation: 1 to 32 actions in OpenAI's own vocabulary — ``click``,
         ``double_click``, ``move``, ``drag``, ``scroll``, ``keypress``,
         ``type``, ``wait`` and ``screenshot``. Each is a mapping such as
-        ``{"type": "click", "x": 640, "y": 400, "button": "left"}``; an OpenAI
-        SDK action object's ``model_dump(exclude_none=True)`` is one::
+        ``{"type": "click", "x": 640, "y": 400, "button": "left"}``, or the
+        ``openai`` package's own action object, taken as it is::
 
-            done = c.input_batch([a.model_dump(exclude_none=True) for a in call.actions])
+            done = c.input_batch(call.actions)
             print(f"{done.completed} actions")
 
         The whole batch is checked first, here for shape and then by the
