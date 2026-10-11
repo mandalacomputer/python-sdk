@@ -208,6 +208,12 @@ class APIError(MandalaError):
     #: proxy's page. Whether actions ran before it is unknown, so
     #: :func:`is_transient` answers ``False`` — the same reasoning as above.
     _batch_outcome_unknown: bool = False
+    #: Set only by the transport, on an error whose status arrived but whose
+    #: body was cut short — interrupted, or past its read deadline. A 409 is
+    #: where that matters: its body carried the word that says what kind of
+    #: conflict it is, or that a keyed call's outcome is unknown, and without
+    #: it :func:`is_transient` answers ``False`` and a keyed call keeps its key.
+    _body_lost: bool = False
 
     def __init__(
         self,
@@ -1280,6 +1286,11 @@ def is_transient(err: BaseException) -> bool:
         if isinstance(err.body, dict) and err.body.get("code") == "template_image_preparing":
             # Continuation requires the returned token and original create arguments.
             # The same code can also describe failed preparation; inspect its body.
+            return False
+        if err.status == 409 and err._body_lost:
+            # Whatever the lost body said — a conflict that clears, one that
+            # never will, or a keyed call never heard to end — is unknown, and
+            # only the last is safe to guess against.
             return False
         if (
             err.status == 409

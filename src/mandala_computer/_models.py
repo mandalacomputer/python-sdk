@@ -29,6 +29,7 @@ from typing import (
 
 from ._api import SECRET_ENV, SECRET_FILE
 from ._exceptions import MandalaError
+from ._timestamps import parse_rfc3339
 
 __all__ = [
     "NO_BROWSER_PROXY",
@@ -1883,10 +1884,9 @@ class AccountQuota:
         if d.get("advisory") is not True:
             refuse("advisory", "true")
         observed_at = text(d.get("observed_at"), "observed_at")
-        if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", observed_at):
-            refuse("observed_at", "a UTC timestamp")
         try:
-            datetime.fromisoformat(observed_at[:-1] + "+00:00")
+            # Any fraction, as before; Python 3.10 refused all but 3 or 6 digits.
+            parse_rfc3339(observed_at, fraction_digits=None, utc_only=True)
         except ValueError:
             refuse("observed_at", "a UTC timestamp")
         plan = record(d.get("plan"), "plan")

@@ -532,12 +532,33 @@ class _BaseTransport:
     ) -> MandalaError:
         if resp is not None and not resp.is_success:
             # An interrupted error body cannot erase a known non-retryable status.
-            return self._error(
+            error = self._error(
                 httpx.Response(
                     resp.status_code, headers=resp.headers, request=resp.request, content=b""
                 )
             )
+            if isinstance(error, APIError):
+                error._body_lost = True
+            return error
         return _request_failed(method, path, exc)
+
+    def _timeout_failed(
+        self,
+        method: str,
+        path: str,
+        resp: httpx.Response | None,
+        exc: httpx.TimeoutException,
+    ) -> MandalaError:
+        """A deadline that fired after an error status arrived keeps that status.
+
+        The status is the answer: a 403 or a 409 whose body was slow is still a
+        refusal, and calling it a request timeout made it look worth sending
+        again. Its cause stays the timeout, so the transport's own retry, which
+        never replays a timed-out exchange, still does not.
+        """
+        if resp is not None and not resp.is_success:
+            return self._response_failed(method, path, resp, exc)
+        return _timed_out(method, path, exc)
 
     @staticmethod
     def _budget(current: httpx.Timeout, seconds: float | None) -> httpx.Timeout:
@@ -1237,6 +1258,8 @@ def _with_idempotency_key(exc: MandalaError, headers: Mapping[str, str] | None) 
         and (
             exc.status >= 500
             or (isinstance(exc.body, dict) and exc.body.get("code") in _KEY_UNSETTLED)
+            # A 409 whose body was cut short may have said exactly that.
+            or (exc.status == 409 and exc._body_lost)
         )
     )
     if unknown:
@@ -1542,7 +1565,7 @@ class Transport(_BaseTransport):
                     raise MandalaError("retained response ended before its declared size")
                 return _retained_envelope(resp, bytes(body))
         except httpx.TimeoutException as exc:
-            raise _timed_out(method, path, exc) from exc
+            raise self._timeout_failed(method, path, resp, exc) from exc
         except httpx.RequestError as exc:
             raise self._response_failed(method, path, resp, exc) from exc
 
@@ -1646,7 +1669,7 @@ class Transport(_BaseTransport):
                             raise self._error(resp)
                     return resp
                 except httpx.TimeoutException as exc:
-                    raise _timed_out(method, path, exc) from exc
+                    raise self._timeout_failed(method, path, resp, exc) from exc
                 except httpx.RequestError as exc:
                     raise self._response_failed(method, path, resp, exc) from exc
             except MandalaError as exc:
@@ -1745,7 +1768,7 @@ class Transport(_BaseTransport):
                 if tail is not None:
                     yield tail
         except httpx.TimeoutException as exc:
-            raise _timed_out(method, path, exc) from exc
+            raise self._timeout_failed(method, path, resp, exc) from exc
         except httpx.RequestError as exc:
             raise self._response_failed(method, path, resp, exc) from exc
 
@@ -1997,7 +2020,7 @@ class AsyncTransport(_BaseTransport):
             await asyncio.sleep(0)
             return envelope
         except httpx.TimeoutException as exc:
-            raise _timed_out(method, path, exc) from exc
+            raise self._timeout_failed(method, path, resp, exc) from exc
         except httpx.RequestError as exc:
             raise self._response_failed(method, path, resp, exc) from exc
 
@@ -2101,7 +2124,7 @@ class AsyncTransport(_BaseTransport):
                             raise self._error(resp)
                     return resp
                 except httpx.TimeoutException as exc:
-                    raise _timed_out(method, path, exc) from exc
+                    raise self._timeout_failed(method, path, resp, exc) from exc
                 except httpx.RequestError as exc:
                     raise self._response_failed(method, path, resp, exc) from exc
             except MandalaError as exc:
@@ -2199,7 +2222,7 @@ class AsyncTransport(_BaseTransport):
                 if tail is not None:
                     yield tail
         except httpx.TimeoutException as exc:
-            raise _timed_out(method, path, exc) from exc
+            raise self._timeout_failed(method, path, resp, exc) from exc
         except httpx.RequestError as exc:
             raise self._response_failed(method, path, resp, exc) from exc
 

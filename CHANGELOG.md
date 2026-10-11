@@ -159,6 +159,22 @@ This is the summary you read to decide whether to upgrade.
   session; and an `anthropic` without the browser toolset gets the same install
   hint as the rest of `mandala_computer.anthropic`.
 
+- **`client.account.read()` reads its `observed_at` on Python 3.10.** The platform
+  writes timestamps with up to nine fractional digits, and 3.10's
+  `datetime.fromisoformat` reads only three or six, so most quota reports were
+  refused there as malformed. Every timestamp the SDK checks is now read the
+  same way on every supported Python (OPL-5910).
+
+- **An error whose body is slow to arrive keeps its status.** A 403, 404, 409,
+  503 or any other error status whose body read timed out was raised as
+  `RequestTimeoutError`, so `is_transient()` and the browser toolsets' lease
+  renewal treated a refusal as a timeout worth sending again. It now raises the
+  status's own class (`PermissionDeniedError`, `ConflictError` and so on), with
+  the timeout as its cause; the transport still never replays it on its own. A
+  409 whose body was cut short, by a timeout or an interruption, is not
+  transient, and a keyed call keeps its `idempotency_key` on it: the lost body
+  may have said the call's outcome is unknown.
+
 ## [0.11.0] — 2026-10-08
 
 ### Added

@@ -7,11 +7,11 @@ import binascii
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Literal, cast
 
 from . import _api
 from ._exceptions import MandalaError
+from ._timestamps import parse_rfc3339
 
 __all__ = ["ExecutionMetadata", "ExecutionOutput"]
 
@@ -94,10 +94,8 @@ def _time(value: object, field: str) -> str:
     if not _TIMESTAMP.fullmatch(text):
         raise _invalid(field)
     try:
-        # Python 3.10 only accepts three or six fractional digits. Normalize
-        # to six for calendar validation, keeping the original wire spelling.
-        validation = re.sub(r"\.([0-9]+)", lambda match: "." + match[1][:6].ljust(6, "0"), text)
-        datetime.fromisoformat(validation.replace("Z", "+00:00"))
+        # Calendar validation, keeping the original wire spelling.
+        parse_rfc3339(text)
     except ValueError:
         raise _invalid(field) from None
     return text

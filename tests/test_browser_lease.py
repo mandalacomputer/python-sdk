@@ -214,16 +214,20 @@ async def test_request_latency_cannot_extend_lease():
 
 
 async def test_real_browser_state_survives_renewal_during_pending_command(chrome):  # noqa: F811
+    # The first lease must outlast the browser's start: its clock runs from the
+    # grant, and a cold full Chrome takes over a second to come up. The pending
+    # command is then released only after the renewal has happened, so the test
+    # waits on the two events instead of racing a timer against Chrome.
     renewed = asyncio.Event()
     start = time.monotonic()
-    first = short_lease(ttl=0.6, attach=0.5, end=5)
+    first = short_lease(ttl=4, attach=0.5, end=20)
     grant = BrowserConnection(IDENT, chrome, TOKEN, first.attach_expires_at, first)
 
     async def renew(ident, limit):
         assert ident == IDENT and 0 < limit <= 10
         elapsed = time.monotonic() - start
         renewed.set()
-        return short_lease(ttl=5 - elapsed, server=elapsed, attach=0.5, end=5)
+        return short_lease(ttl=20 - elapsed, server=elapsed, attach=0.5, end=20)
 
     b = BrowserCDP(
         lambda: grant,
@@ -235,17 +239,25 @@ async def test_real_browser_state_survives_renewal_during_pending_command(chrome
     try:
         await b.start()
         session = b.sessions[b.active]
-        answer = await b.send(
-            "Runtime.evaluate",
-            {
-                "expression": "globalThis.leaseSentinel=5880; new Promise(r=>setTimeout(()=>r(leaseSentinel),1000))",
-                "awaitPromise": True,
-                "returnByValue": True,
-            },
-            session,
+        pending = asyncio.create_task(
+            b.send(
+                "Runtime.evaluate",
+                {
+                    "expression": "globalThis.leaseSentinel=5880;"
+                    " new Promise(r=>{globalThis.releaseSentinel=()=>r(leaseSentinel)})",
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+                session,
+            )
         )
-        assert renewed.is_set() and answer["result"]["value"] == 5880
+        await asyncio.wait_for(renewed.wait(), 10)
+        assert not pending.done()
+        await b.send("Runtime.evaluate", {"expression": "releaseSentinel()"}, session)
+        answer = await asyncio.wait_for(pending, 5)
+        assert answer["result"]["value"] == 5880
         assert b.sessions[b.active] == session and b.session_status()["state"] == "active"
+        assert b.lease.lease_expires_at == EPOCH + timedelta(seconds=20)
     finally:
         await b.close()
 
@@ -724,3 +736,55 @@ def test_stalled_releases_take_a_bounded_number_of_threads(monkeypatch):
             assert attempts == [1]
     finally:
         gate.set()
+
+
+@pytest.mark.parametrize("status", [403, 409])
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_refused_renewal_whose_body_times_out_is_still_a_refusal(
+    status, asynchronous, monkeypatch
+):
+    class Stalled(httpx.SyncByteStream, httpx.AsyncByteStream):
+        def __iter__(self):
+            yield b'{"error":'
+            raise httpx.ReadTimeout("body stalled")
+
+        async def __aiter__(self):
+            yield b'{"error":'
+            raise httpx.ReadTimeout("body stalled")
+
+    renewals = []
+
+    def handler(request):
+        if request.url.path.endswith("/renew"):
+            renewals.append(request)
+            return httpx.Response(status, stream=Stalled())
+        return httpx.Response(200, json={"id": "vm-1", "status": "running"})
+
+    transport = httpx.MockTransport(handler)
+    if asynchronous:
+        http = httpx.AsyncClient(transport=transport)
+        client = AsyncClient("com_test", base_url=BASE, http_client=http)
+        computer = await client.computers.get("vm-1")
+
+        async def renew(ident, limit):
+            return await computer._renew_browser_connection(ident, limit)
+    else:
+        http = httpx.Client(transport=transport)
+        client = Client("com_test", base_url=BASE, http_client=http)
+        computer = await asyncio.to_thread(client.computers.get, "vm-1")
+
+        async def renew(ident, limit):
+            return await asyncio.to_thread(computer._renew_browser_connection, ident, limit)
+
+    try:
+        b = retrying_backend(renew, monkeypatch)
+        await b._maintain_lease()
+        assert len(renewals) == 1
+        assert b.failed and "renewal failed" in b.session_status()["terminal_error"]
+    finally:
+        if asynchronous:
+            await client.aclose()
+            await http.aclose()
+        else:
+            client.close()
+            http.close()
