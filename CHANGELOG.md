@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-11
+
 ### Added
 
 - **Drive a browser with Claude's browser toolset.** `mandala_computer.anthropic`
@@ -48,7 +50,10 @@ This is the summary you read to decide whether to upgrade.
   vocabulary, typed as `OpenAIComputerAction`; the `openai` package's own
   action objects are taken as they are. The batch's shape is checked before
   anything is sent, unknown fields included. It answers an `InputBatchResult`. A batch refused
-  before any action ran raises the ordinary error for its status. A batch that
+  before any action ran raises the ordinary error for its status, except that
+  a 503 may mean the batch ran: the platform answers 503 in the same shape
+  when the batch was sent and its answer was lost, so never send it again
+  blindly. A batch that
   stopped part-way raises `InputBatchError`, whose `result` says how many
   actions completed and which one failed. `is_transient()` answers `False` for
   it, and for a refusal whose answer could not be read, and the SDK never sends
@@ -82,6 +87,68 @@ This is the summary you read to decide whether to upgrade.
   is kept as sent.
 
 - `Activity` has `funded` and `cost_usd` on an agent run's summary.
+
+- **Popups are refused without wedging the tab that opened them.** Chromium
+  holds a new popup before its first line, and a popup opened by script (or by
+  a link with `rel=opener`) shares its opener's renderer. The browser toolsets
+  take the popup offline (the opener stays online), stop it starting a worker,
+  release it, and close it: the opener carries on, and the popup loads
+  nothing.
+
+- **Pages in the browser toolsets cannot start dedicated workers.** In every
+  frame the driver attaches to before it runs, cross-site and `about:blank`
+  frames included, constructing a `Worker` throws a `SecurityError` before the
+  page's own scripts run, for script, `blob:` and `data:` URLs alike, and the
+  page carries on without it. A frame that starts running before the driver
+  can attach, as Chromium starts a sandboxed `srcdoc` frame, is not covered.
+  A worker could not be run under `url_policy`: Chromium fetches the script of
+  a worker started by another worker outside any interception, and a worker
+  held paused is released, unpoliced, when its page closes or navigates.
+
+- **The browser toolsets run cross-site frames.** Under site isolation a frame
+  from another site is its own browser target. Such frames, and the frames
+  inside them, run inside their tab and are never closed, since closing one
+  would close the whole tab; their requests meet the same `url_policy`. A page
+  that tries to start a dedicated worker does not end the session (see the
+  entry on workers). Popups and other targets are refused.
+
+- **Downloads follow the frame that started them.** Download ownership follows
+  each frame's parent and the session that reported it, as in the TypeScript
+  SDK: a frame's new document or removal forgets the frames below it, frames
+  are tracked only beneath tracked frames, a frame tree read never undoes a
+  newer frame event, and a document back from the back/forward cache has its
+  frames read again, its downloads waiting for that briefly. Frames left
+  behind do not fill the 256-frame table, so later downloads are not canceled
+  for want of room.
+
+- **Browser connections work on Python 3.10.** The platform's timestamps carry
+  up to nine fractional digits, which 3.10's `datetime.fromisoformat` rejects;
+  `create_browser_connection()` and `renew_browser_connection()` read them on
+  every supported version.
+
+- **A renewable browser session rides out a failed renewal.** A renewal that
+  fails in passing (a lost connection, a timeout, a 408, 429 or 5xx) is
+  retried with backoff, honouring `Retry-After`, until shortly before the lease
+  deadline, and an attempt is never started beside one still running. Any
+  other refusal, including every 409 whatever its `reason`, ends the session
+  at once.
+
+- **A heavy page keeps its browser session.** Browser events past 256 in
+  flight, as on a page with hundreds of images each waiting for `url_policy`,
+  wait their turn, without holding back the tab's own page loads, its dialogs
+  or its frames; only a page that leaves more than 8,192 waiting, or 32 MiB of
+  them, ends it.
+
+- **`create_browser_connection()` releases any grant it refuses to hand
+  over**, and waits at most ten seconds for that release rather than the
+  client's whole timeout. A base URL with an explicit default port
+  (`https://host:443`) or an upper-case host is matched as the same origin as
+  the grant's.
+
+- In the browser toolsets, `read_page` and `find` with `depth=0` ask for depth
+  0; a slow release after `form_input` does not end the session; and an
+  `anthropic` without the browser toolset gets the same install hint as the
+  rest of `mandala_computer.anthropic`.
 
 ### Changed
 
@@ -117,73 +184,6 @@ This is the summary you read to decide whether to upgrade.
   said that way is a plain `APIError` rather than `AuthenticationError`,
   `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
   `ModelProviderError`, and a 429 carries no Mandala budget fields.
-
-- **A popup no longer wedges the tab that opened it.** Chromium holds a new
-  popup before its first line, and a popup opened by script (or by a link
-  with `rel=opener`) shares its opener's renderer, so the click that opened
-  it never returned and the session ended. The browser toolsets now take the
-  popup offline (the opener stays online) and stop it starting a worker,
-  release it, and close it: the opener carries on, and the popup loads
-  nothing (OPL-5914).
-
-- **Pages in the browser toolsets cannot start dedicated workers.** In every
-  frame the driver attaches to before it runs, cross-site and `about:blank`
-  frames included, constructing a `Worker` throws a `SecurityError` before the
-  page's own scripts run, for script, `blob:` and `data:` URLs alike, and the
-  page carries on without it. A frame that starts running before the driver
-  can attach, as Chromium starts a sandboxed `srcdoc` frame, is not covered.
-  A worker could not be run under `url_policy`: Chromium fetches the script of
-  a worker started by another worker outside any interception, and a worker
-  held paused is released, unpoliced, when its page closes or navigates
-  (OPL-5909).
-
-- **Downloads keep the right frame in the browser toolsets.** Download
-  ownership follows each frame's parent and the session that reported it, as
-  in the TypeScript SDK: a frame's new document or removal forgets the frames
-  below it, frames are tracked only beneath tracked frames, a frame tree read
-  never undoes a newer frame event, and a document back from the
-  back/forward cache has its frames read again, its downloads waiting for
-  that briefly. Frames left behind no longer fill the 256-frame table, so
-  later downloads are no longer canceled for want of room.
-
-- **A cross-site frame no longer closes its browser tab.** Under site
-  isolation a frame from another site is its own browser target, and the
-  browser toolsets closed it as they close a popup, which closed the whole tab:
-  `navigate` reported success and the next action found the tab gone. Such
-  frames, and the frames inside them, now run inside their tab, and their
-  requests meet the same `url_policy`. A page that tries to start a dedicated
-  worker no longer ends the session either (see the entry on workers). Popups
-  and other targets are still refused (OPL-5900).
-
-- **Browser connections work on Python 3.10.** The platform's timestamps carry
-  up to nine fractional digits, which 3.10's `datetime.fromisoformat` rejects,
-  so every `create_browser_connection()` and `renew_browser_connection()`
-  raised there, and a renewable create revoked its own grant. Both now read
-  them on every supported version.
-
-- **One failed lease renewal no longer ends a browser session.** A renewal
-  that fails in passing (a lost connection, a timeout, a 408, 429 or 5xx) is
-  retried with backoff, honouring `Retry-After`, until shortly before the lease
-  deadline, and an attempt is never started beside one still running. Any
-  other refusal, including every 409 whatever its `reason`, still ends the
-  session at once.
-
-- **A heavy page no longer ends a browser session.** More than 256 browser
-  events in flight, as on a page with hundreds of images each waiting for
-  `url_policy`, closed the session. The rest now wait their turn, without
-  holding back the tab's own page loads, its dialogs or its frames; only a page
-  that leaves more than 8,192 waiting, or 32 MiB of them, ends it.
-
-- **`create_browser_connection()` releases any grant it refuses to hand over**,
-  not only one from a server that ignored a session policy, and waits at most
-  ten seconds for that release rather than the client's whole timeout. A base
-  URL with an explicit default port (`https://host:443`) or an upper-case host
-  no longer makes every grant look as if it pointed somewhere else.
-
-- In the browser toolsets, `read_page` and `find` with `depth=0` ask for depth
-  0 rather than 20; a slow release after `form_input` no longer ends the
-  session; and an `anthropic` without the browser toolset gets the same install
-  hint as the rest of `mandala_computer.anthropic`.
 
 - **`client.account.read()` reads its `observed_at` on Python 3.10.** The platform
   writes timestamps with up to nine fractional digits, and 3.10's
@@ -1386,6 +1386,7 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
+[0.12.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.8.0...v0.9.0
