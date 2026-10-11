@@ -27,7 +27,7 @@ from anthropic.types import beta
 from pydantic import ValidationError
 
 from ._async_computer import AsyncComputer
-from ._browser_cdp import BrowserCDP, BrowserError
+from ._browser_cdp import _NAVIGATION_CHECK, _POLICY_DEADLINE, BrowserCDP, BrowserError
 from ._browser_connection import BrowserSessionPolicy
 from ._browser_file_session import BrowserFiles
 from ._browser_files import FILE_ERROR, BrowserFilePolicy, BrowserStagedFile, _StagedFiles
@@ -134,9 +134,11 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
     """An isolated browser session; session_policy opts into bounded lease renewal.
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
-    not network isolation: configure guest egress controls for that. Popups,
-    workers and cross-process frames are unsupported. Uploads and downloads
-    require an explicit ``remote_file_policy``; uploads also require ``confirm``.
+    not network isolation: configure guest egress controls for that.
+    Cross-site frames run under the same policy; dedicated workers are held
+    paused and never run; popups and other targets are unsupported. Uploads and
+    downloads require an explicit ``remote_file_policy``; uploads also require
+    ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
     Closing disposes this context and revokes its grant, not the computer.
     Sync callbacks may run on a worker thread.
@@ -188,10 +190,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
         async def policy(tab: str | None, url: str) -> None:
             if url_policy is not None:
                 context = BetaURLContext(tab_id=tab)
-                callback: Any = url_policy
-                returned = await asyncio.to_thread(callback, context, url)
-                if inspect.isawaitable(returned):
-                    returned = await returned
+                returned = await self._backend.call_policy(url_policy, context, url)
                 if returned is not None:
                     raise BrowserError(
                         "URL policy must allow with no return value or refuse by throwing."
@@ -209,8 +208,8 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
 
         self._revoke_connection = computer.revoke_browser_connection
 
-        async def renew(ident: str) -> Any:
-            return await asyncio.to_thread(computer.renew_browser_connection, ident)
+        async def renew(ident: str, timeout: float) -> Any:
+            return await asyncio.to_thread(computer._renew_browser_connection, ident, timeout)
 
         self._backend = BrowserCDP(
             create, revoke, policy, renew=renew, session_policy=session_policy
@@ -474,9 +473,11 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
     """An isolated browser session; session_policy opts into bounded lease renewal.
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
-    not network isolation: configure guest egress controls for that. Popups,
-    workers and cross-process frames are unsupported. Uploads and downloads
-    require an explicit ``remote_file_policy``; uploads also require ``confirm``.
+    not network isolation: configure guest egress controls for that.
+    Cross-site frames run under the same policy; dedicated workers are held
+    paused and never run; popups and other targets are unsupported. Uploads and
+    downloads require an explicit ``remote_file_policy``; uploads also require
+    ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
     Closing disposes this context and revokes its grant, not the computer.
     """
@@ -494,14 +495,24 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
     ) -> None:
         async def apply_policy(context: BetaURLContext, url: str) -> None:
             if url_policy is not None:
-                callback: Any = url_policy
-                returned = await asyncio.to_thread(callback, context, url)
-                if inspect.isawaitable(returned):
-                    returned = await returned
+                returned = await self._backend.call_policy(url_policy, context, url)
                 if returned is not None:
                     raise BrowserError(
                         "URL policy must allow with no return value or refuse by throwing."
                     )
+
+        async def preflight(context: BetaURLContext, url: str) -> None:
+            # Anthropic's own check before a navigation is a navigation check:
+            # it runs on the navigation threads, under the same deadline.
+            check = _NAVIGATION_CHECK.set(True)
+            try:
+                await asyncio.wait_for(apply_policy(context, url), _POLICY_DEADLINE)
+            except asyncio.TimeoutError:
+                raise ToolError(
+                    "Navigation was refused by the URL policy or its deadline."
+                ) from None
+            finally:
+                _NAVIGATION_CHECK.reset(check)
 
         file_adapter = _StagedFiles(remote_file_policy) if remote_file_policy else None
 
@@ -531,7 +542,7 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
         if file_adapter is not None:
             options["file_policy"] = file_adapter
         if url_policy is not None:
-            options["url_policy"] = apply_policy
+            options["url_policy"] = preflight
         super().__init__(**options)
 
         async def policy(tab: str | None, url: str) -> None:
@@ -542,8 +553,8 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
                 return await computer.create_browser_connection()
             return await computer.create_browser_connection(session_policy=session_policy)
 
-        async def renew(ident: str) -> Any:
-            return await computer.renew_browser_connection(ident)
+        async def renew(ident: str, timeout: float) -> Any:
+            return await computer._renew_browser_connection(ident, timeout)
 
         self._backend = BrowserCDP(
             create,

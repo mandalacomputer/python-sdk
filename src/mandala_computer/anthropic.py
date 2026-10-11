@@ -76,6 +76,17 @@ try:
         BetaComputerWaitInput,
         BetaComputerZoomInput,
     )
+
+    # The browser toolset needs more of the same optional install (Anthropic's
+    # browser base classes, and the anyio and pydantic that come with it), so
+    # a missing or older one is refused the same way rather than as a bare
+    # ImportError from inside this package.
+    from ._anthropic_browser import AsyncMandalaBrowserToolset, MandalaBrowserToolset
+    from ._browser_files import (
+        BrowserDownload,
+        BrowserFilePolicy,
+        BrowserStagedFile,
+    )
 except ImportError as error:  # pragma: no cover - exercised by the import test
     raise ImportError(
         "mandala_computer.anthropic needs the anthropic package (1.12 or newer): "
@@ -88,13 +99,6 @@ if TYPE_CHECKING:
     from ._async_computer import AsyncComputer
     from ._computer import Computer
     from ._models import ScreenshotInfo
-
-from ._anthropic_browser import AsyncMandalaBrowserToolset, MandalaBrowserToolset
-from ._browser_files import (
-    BrowserDownload,
-    BrowserFilePolicy,
-    BrowserStagedFile,
-)
 
 __all__ = [
     "AsyncMandalaBrowserToolset",

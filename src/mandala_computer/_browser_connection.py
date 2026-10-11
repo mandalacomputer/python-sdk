@@ -47,14 +47,59 @@ class BrowserSessionPolicy:
         }
 
 
+#: How long releasing a grant this SDK refused to hand over may take. The
+#: caller is already getting an error; the server's own deadline covers the
+#: grant if this gives up.
+CLEANUP_REVOKE_TIMEOUT = 10.0
+
+# RFC 3339 with an explicit zone, as the platform writes it: a fraction of up to
+# nine digits (nanoseconds, trailing zeros trimmed) and `Z` or a numeric offset.
+_TIMESTAMP = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r"(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+def _timestamp(value: object) -> datetime:
+    """An aware datetime from a platform timestamp; ``ValueError`` otherwise.
+
+    Python 3.10's ``fromisoformat`` reads exactly three or six fractional
+    digits and no ``Z``, and the platform sends up to nine and ``Z``. So the
+    fraction is padded or truncated to microseconds and the zone spelled as an
+    offset before parsing, which keeps every supported version reading the same
+    stamps and refusing the same malformed ones.
+    """
+    match = _TIMESTAMP.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError("not an RFC 3339 timestamp")
+    whole, fraction, zone = match.groups()
+    micros = "." + (fraction + "00000")[:6] if fraction else ""
+    return datetime.fromisoformat(whole + micros + ("+00:00" if zone == "Z" else zone))
+
+
 def _date(data: Mapping[str, Any], field_name: str) -> datetime:
     try:
-        value = datetime.fromisoformat(data[field_name].replace("Z", "+00:00"))
-        if value.tzinfo is None:
-            raise ValueError()
-        return value
-    except (KeyError, TypeError, ValueError, AttributeError):
+        return _timestamp(data.get(field_name))
+    except ValueError:
         raise MandalaError("invalid browser session lease response") from None
+
+
+def _socket_origin(base_url: str) -> str:
+    """The WebSocket origin the platform names for this API base URL.
+
+    The platform serializes its origin the way a browser does: lowercase host,
+    no default port. A base URL written ``https://host:443`` is the same origin
+    and must not make every grant look as if it pointed somewhere else.
+    """
+    base = urlsplit(base_url)
+    secure = base.scheme.lower() == "https"
+    host = base.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    port = base.port
+    if port is not None and port != (443 if secure else 80):
+        host = f"{host}:{port}"
+    return urlunsplit(("wss" if secure else "ws", host, "", "", ""))
 
 
 @dataclass(frozen=True)
@@ -134,24 +179,17 @@ class BrowserConnection:
             raise MandalaError(message)
         if not isinstance(token, str) or not re.fullmatch(r"bcdp_[0-9a-f]{64}", token):
             raise MandalaError(message)
-        base = urlsplit(base_url)
-        expected = urlunsplit(
-            (
-                "wss" if base.scheme == "https" else "ws",
-                base.netloc,
-                f"{base.path.rstrip('/')}/{path}/{ident}/cdp",
-                "",
-                "",
-            )
-        )
+        try:
+            origin = _socket_origin(base_url)
+        except ValueError:
+            raise MandalaError(message) from None
+        expected = f"{origin}{urlsplit(base_url).path.rstrip('/')}/{path}/{ident}/cdp"
         # Never forward a capability to a response-selected origin or redirect.
         if data.get("url") != expected:
             raise MandalaError(message)
         try:
-            expires = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
-            if expires.tzinfo is None:
-                raise ValueError()
-        except (KeyError, TypeError, ValueError, AttributeError):
+            expires = _timestamp(data.get("expires_at"))
+        except ValueError:
             raise MandalaError(message) from None
         lease = None
         if "lifecycle_version" in data or session_policy is not None:
