@@ -83,7 +83,9 @@ VERBS = frozenset(
 #: wire. Together with :data:`VERBS`, this makes the classification exhaustive:
 #: adding a second request wrapper (or any other transport spelling) must be
 #: classified here rather than silently disappearing from the inventory.
-NON_REQUEST_TRANSPORT = frozenset({"aclose", "base_url", "close", "phase_ceiling"})
+NON_REQUEST_TRANSPORT = frozenset(
+    {"aclose", "base_url", "client_headers", "close", "phase_ceiling"}
+)
 
 
 class _Reaches(ast.NodeVisitor):

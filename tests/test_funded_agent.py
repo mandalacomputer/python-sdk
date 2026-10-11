@@ -562,6 +562,70 @@ def test_a_ledger_this_cannot_read_is_refused_not_reported_as_nothing(
         client_sync.credits.read()
 
 
+def _entry_without(key: str) -> dict[str, Any]:
+    entry = {k: v for k, v in CREDITS["entries"][0].items() if k != key}
+    return {**CREDITS, "entries": [entry]}
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("body", "missing"),
+    [
+        (_without("next_before"), "next_before"),
+        (_without("grant"), "grant"),
+        *((_entry_without(key), key) for key in ("lot_id", "model", "run_id", "step")),
+    ],
+)
+def test_a_nullable_ledger_field_that_is_missing_is_refused_not_read_as_null(
+    client_sync: mc.Client, body: dict[str, Any], missing: str
+) -> None:
+    """Every field of the ledger is required, the nullable ones included. A
+    missing ``next_before`` read as ``None`` would end the documented page walk
+    at the first page and silently drop the older journal."""
+    respx.get(CREDITS_URL).mock(httpx.Response(200, json=body))
+    with pytest.raises(mc.MandalaError, match=f"no {missing}"):
+        client_sync.credits.read()
+
+
+@respx.mock
+@pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
+def test_a_key_on_your_own_http_client_is_not_mistaken_for_a_funded_run(method: str) -> None:
+    """httpx merges a client's default headers into every request, so a funded
+    call through an http_client carrying X-Model-Key would quietly run on that
+    key instead. Ambiguous, so refused before anything is sent."""
+    with httpx.Client(headers={"x-model-key": "sk-inherited"}) as http:
+        c = mc.Computer(mc.Client("gck_test", base_url=BASE, http_client=http)._t, COMPUTER)
+        with pytest.raises(mc.MandalaError, match="http_client sends X-Model-Key"):
+            result = getattr(c, method)("go", max_cost_usd=1)
+            if method == "agent_stream":
+                list(result)
+    assert not respx.calls
+
+
+@respx.mock
+@pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
+async def test_the_async_halves_refuse_an_inherited_key_too(method: str) -> None:
+    async with httpx.AsyncClient(headers={"X-Model-Key": "sk-inherited"}) as http:
+        client = mc.AsyncClient("gck_test", base_url=BASE, http_client=http)
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.MandalaError, match="http_client sends X-Model-Key"):
+            result = getattr(c, method)("go")
+            if method == "agent_stream":
+                _ = [event async for event in result]
+            else:
+                await result
+    assert not respx.calls
+
+
+@respx.mock
+def test_an_explicit_key_still_wins_over_one_on_the_http_client() -> None:
+    route = respx.post(AGENT).mock(stream(frame("done", FUNDED_DONE)))
+    with httpx.Client(headers={"X-Model-Key": "sk-inherited"}) as http:
+        c = mc.Computer(mc.Client("gck_test", base_url=BASE, http_client=http)._t, COMPUTER)
+        c.agent("go", model_key=KEY)
+    assert route.calls.last.request.headers[MODEL_KEY_HEADER] == KEY
+
+
 @respx.mock
 def test_a_workspace_key_is_refused_the_account_ledger(client_sync: mc.Client) -> None:
     respx.get(CREDITS_URL).mock(httpx.Response(403, json={"error": "use an account-wide key"}))

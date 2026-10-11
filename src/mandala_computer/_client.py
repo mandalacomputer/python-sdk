@@ -1587,6 +1587,13 @@ class Transport(_BaseTransport):
         self._owns_client = client is None
         self._http = client or httpx.Client(timeout=timeout)
 
+    @property
+    def client_headers(self) -> Mapping[str, str]:
+        """The http_client's own default headers, which httpx merges into every
+        request this transport sends. Read, never changed: an agent run checks
+        them for an ``X-Model-Key`` the caller did not pass."""
+        return self._http.headers
+
     def request(
         self,
         method: str,
@@ -2034,6 +2041,13 @@ class AsyncTransport(_BaseTransport):
         super().__init__(api_key, base_url, retries, profile, user_agent, product)
         self._owns_client = client is None
         self._http = client or httpx.AsyncClient(timeout=timeout)
+
+    @property
+    def client_headers(self) -> Mapping[str, str]:
+        """The http_client's own default headers, which httpx merges into every
+        request this transport sends. Read, never changed: an agent run checks
+        them for an ``X-Model-Key`` the caller did not pass."""
+        return self._http.headers
 
     async def request(
         self,

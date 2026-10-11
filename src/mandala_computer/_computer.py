@@ -141,7 +141,16 @@ _BLANK_MODEL_KEY = (
 )
 
 
-def _model_key_headers(model_key: str | None) -> dict[str, str]:
+_INHERITED_MODEL_KEY = (
+    "this client's http_client sends X-Model-Key on every request, so leaving model_key "
+    "out would not start the funded run it asks for. Pass model_key= to run on that key, "
+    "or use an http_client without the header to run on the account's AI credits."
+)
+
+
+def _model_key_headers(
+    model_key: str | None, inherited: Mapping[str, str] | None = None
+) -> dict[str, str]:
     """The ``X-Model-Key`` header an agent run carries, or none at all.
 
     ``None`` is a FUNDED run: no header, and the platform runs the loop on the
@@ -153,6 +162,12 @@ def _model_key_headers(model_key: str | None) -> dict[str, str]:
     platform refuses a blank header too, and quietly dropping it instead would
     turn a ``.env`` entry with nothing after the ``=`` into a run on credits
     the caller never chose to spend.
+
+    ``inherited`` is the caller's own ``http_client``'s default headers. A
+    funded run is refused when they carry ``X-Model-Key``: httpx would merge it
+    into the request, and the platform would run on that key — ignoring
+    ``max_cost_usd`` and billing the provider account — while the caller asked
+    for a run on credits. Neither reading is safe to pick for them.
 
     Returns the canonical text, TRIMMED, and that is what is sent rather than
     what was handed in. Two reasons, and both are about the value that is sent
@@ -168,6 +183,8 @@ def _model_key_headers(model_key: str | None) -> dict[str, str]:
       TypeScript's ``requireModelKey`` returns ``trim()`` for the same reason.
     """
     if model_key is None:
+        if inherited is not None and MODEL_KEY_HEADER in inherited:
+            raise MandalaError(_INHERITED_MODEL_KEY)
         return {}
     # A non-string is a different mistake and gets ``canonical``'s ValueError,
     # like every other caller-controlled string in this SDK.
@@ -5327,7 +5344,9 @@ class Computer(ComputerFields):
         not guarantee generator cleanup on every Python implementation. The
         standard :func:`contextlib.closing` helper makes that concise.
         """
-        headers = _model_key_headers(model_key)
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
         steps = 0
         with closing(
             self._t.sse(
@@ -5513,7 +5532,9 @@ class Computer(ComputerFields):
         ten seconds, so nothing about it looks idle to the hop that would
         otherwise stop waiting.
         """
-        headers = _model_key_headers(model_key)
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
         try:
             data = self._t.json_object(
                 "POST",

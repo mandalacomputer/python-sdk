@@ -2592,7 +2592,9 @@ class AsyncComputer(ComputerFields):
         this iterator in :func:`contextlib.aclosing`; leaving that context awaits
         cleanup of the HTTP stream before continuing.
         """
-        headers = _model_key_headers(model_key)
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
         steps = 0
         async with aclosing(
             self._t.sse(
@@ -2775,7 +2777,9 @@ class AsyncComputer(ComputerFields):
         ten seconds, so nothing about it looks idle to the hop that would
         otherwise stop waiting.
         """
-        headers = _model_key_headers(model_key)
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
         try:
             data = await self._t.json_object(
                 "POST",

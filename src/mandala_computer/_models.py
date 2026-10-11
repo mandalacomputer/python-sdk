@@ -4599,10 +4599,28 @@ def _ledger_int(d: Mapping[str, Any], key: str, where: str) -> int:
     return int.__index__(value)
 
 
+def _ledger_present(d: Mapping[str, Any], key: str, where: str) -> None:
+    """Every field of the ledger is required, the nullable ones included.
+
+    A missing ``next_before`` read as ``None`` would end a caller's walk of the
+    journal at the first page with no sign that older entries were skipped, and
+    a missing ``grant`` would read as an account with none. ``null`` is the
+    platform saying so; absence is a response this client cannot vouch for.
+    """
+    if key not in d:
+        raise MandalaError(f"{where}: no {key}")
+
+
 def _ledger_nullable_int(d: Mapping[str, Any], key: str, where: str) -> int | None:
-    if d.get(key) is None:
+    _ledger_present(d, key, where)
+    if d[key] is None:
         return None
     return _ledger_int(d, key, where)
+
+
+def _ledger_nullable_text(d: Mapping[str, Any], key: str, where: str) -> str | None:
+    _ledger_present(d, key, where)
+    return _nullable_text(d, key, where)
 
 
 def _ledger_rows(d: Mapping[str, Any], key: str, where: str) -> builtins.list[Mapping[str, Any]]:
@@ -4699,12 +4717,12 @@ class CreditEntry:
     def from_api(cls, d: Mapping[str, Any], where: str = "credit entry") -> CreditEntry:
         return cls(
             id=_ledger_int(d, "id", where),
-            lot_id=_nullable_text(d, "lot_id", where),
+            lot_id=_ledger_nullable_text(d, "lot_id", where),
             kind=_key_text(d, "kind", where),
             amount_micros=_ledger_int(d, "amount_micros", where),
             debt_micros=_ledger_int(d, "debt_micros", where),
-            model=_nullable_text(d, "model", where),
-            run_id=_nullable_text(d, "run_id", where),
+            model=_ledger_nullable_text(d, "model", where),
+            run_id=_ledger_nullable_text(d, "run_id", where),
             step=_ledger_nullable_int(d, "step", where),
             created_at=_key_text(d, "created_at", where),
         )
@@ -4756,7 +4774,8 @@ class CreditReport:
         frozen = d.get("frozen")
         if not isinstance(frozen, bool):
             raise MandalaError(f"{where}: frozen is not true or false")
-        grant = d.get("grant")
+        _ledger_present(d, "grant", where)
+        grant = d["grant"]
         if grant is not None and not isinstance(grant, Mapping):
             raise MandalaError(f"{where}: grant is neither an object nor null")
         next_before = _ledger_nullable_int(d, "next_before", where)

@@ -1551,7 +1551,10 @@ credits** where the account is eligible (a plan, a supported billing country,
 funded runs enabled, and at least $0.25 available for the first model call). A
 funded run is Anthropic only, on the platform's own system prompt and tools:
 `claude-sonnet-5-5` by default, `claude-opus-5-5` the other choice. A custom
-`system`, another model or `provider="openai"` needs your own key.
+`system`, another model or `provider="openai"` needs your own key. A blank
+`model_key` is refused rather than dropped, and so is leaving it out on a client
+whose own `http_client` sends `X-Model-Key` by default — httpx would put that
+key on the request, and the run would not be the funded one asked for.
 
 ```python
 result = c.agent("Open the settings and turn on dark mode.", max_cost_usd=1.0)

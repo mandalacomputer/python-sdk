@@ -40,7 +40,8 @@ This is the summary you read to decide whether to upgrade.
 - **`model_key` is optional on the agent methods.** Leaving it out (or passing
   `None`) used to raise `MandalaError`; it now starts a funded run on the
   account's AI credits, where the account is eligible. A blank key is still
-  refused before anything is sent.
+  refused before anything is sent, and so is leaving it out when your own
+  `http_client` sends `X-Model-Key` by default.
 
 ### Fixed
 
