@@ -118,6 +118,14 @@ This is the summary you read to decide whether to upgrade.
   `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
   `ModelProviderError`, and a 429 carries no Mandala budget fields.
 
+- **A popup no longer wedges the tab that opened it.** Chromium holds a new
+  popup before its first line, and a popup opened by script (or by a link
+  with `rel=opener`) shares its opener's renderer, so the click that opened
+  it never returned and the session ended. The browser toolsets now take the
+  popup offline (the opener stays online) and stop it starting a worker,
+  release it, and close it: the opener carries on, and the popup loads
+  nothing (OPL-5914).
+
 - **Pages in the browser toolsets cannot start dedicated workers.** In every
   frame the driver attaches to before it runs, cross-site and `about:blank`
   frames included, constructing a `Worker` throws a `SecurityError` before the

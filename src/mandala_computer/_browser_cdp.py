@@ -119,6 +119,30 @@ _NO_WORKERS_INIT = (
     "Page.addScriptToEvaluateOnNewDocument",
     {"source": _NO_WORKERS, "runImmediately": True},
 )
+# A popup is refused, but must first be released: auto-attach holds it before
+# its first line, and one opened by script shares its opener's renderer, so a
+# held popup holds its opener too (a click that opens one never returns). Before
+# release it is fenced, so that it loads nothing: it is offline (see
+# BrowserCDP._offline), no frame in it can start a worker (Page enabled first,
+# so that the script reaches the frames made in it after release, not only its
+# current document), and anything it starts is held. Then it is closed.
+# Offline rather than intercepted: Chromium lets an intercepted request go on
+# when its session detaches, which closing the popup does, while an offline
+# request fails at once in the network stack. Blocked URLs do not stop a
+# navigation.
+_POPUP_FENCE: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("Page.enable", {}),
+    ("Network.enable", {}),
+    # Offline is below the HTTP cache: a cached document would still load.
+    ("Network.setCacheDisabled", {"cacheDisabled": True}),
+    ("Network.setBypassServiceWorker", {"bypass": True}),
+    _NO_WORKERS_INIT,
+    # And its documents run no script of their own: a document that needs no
+    # network at all (a blob: one) would otherwise load and run.
+    ("Emulation.setScriptExecutionDisabled", {"value": True}),
+    ("Target.setAutoAttach", _AUTO_ATTACH),
+)
+_OFFLINE = {"offline": True, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1}
 _FRAME_INIT: tuple[tuple[str, dict[str, Any]], ...] = (
     ("Page.enable", {}),
     _NO_WORKERS_INIT,
@@ -290,6 +314,11 @@ class BrowserCDP:
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
+        # Session -> target, of pages attached in the context that are not (yet)
+        # tabs: popups being refused, and a new tab until it is adopted.
+        # Recorded as the attach arrives and dropped as its detach or
+        # destruction does, so a refusal never acts for a page already gone.
+        self.refused: dict[str, str] = {}
         # Download ownership, as the file session keeps it, is decided here:
         # tracked frame -> the session that last reported it (a session that
         # goes takes the frames only it could see), and -> its parent frame.
@@ -949,10 +978,14 @@ class BrowserCDP:
             # to say the frames inside it went: the frames only it reported go
             # with it. One its parent has reported since lives on.
             self._forget_frames(current)
+        self._abandon(gone)
+
+    def _abandon(self, sessions: list[str]) -> None:
+        # Chromium need not answer a command on a session that has gone.
         for ident, owner in list(self.pending_sessions.items()):
             future = self.pending.get(ident)
-            if owner in gone and future is not None and not future.done():
-                future.set_exception(_SessionGone("Browser frame detached."))
+            if owner in sessions and future is not None and not future.done():
+                future.set_exception(_SessionGone("Browser session detached."))
 
     def _settle(self, message: dict[str, Any]) -> None:
         """The part of an event that awaits nothing, done as it arrives."""
@@ -969,13 +1002,26 @@ class BrowserCDP:
                 self.tabs[info["targetId"]] = info
         elif method == "Target.detachedFromTarget":
             self._drop_frame(p.get("sessionId"))
+            if p.get("sessionId") in self.refused:
+                del self.refused[p["sessionId"]]
+                self._abandon([p["sessionId"]])
         elif method == "Target.targetDestroyed":
             for child, (_, frame, _) in list(self.child_frames.items()):
                 if frame == p.get("targetId"):
                     self._drop_frame(child)
+            gone = [child for child, target in self.refused.items() if target == p.get("targetId")]
+            for child in gone:
+                del self.refused[child]
+            self._abandon(gone)
         elif method == "Target.attachedToTarget":
             info, child = p["targetInfo"], p["sessionId"]
             tab = self._owner(session)
+            if (
+                session is None
+                and info.get("type") == "page"
+                and info.get("browserContextId") == self.context
+            ):
+                self.refused[child] = info["targetId"]
             if tab is not None and session is not None and info.get("type") == "iframe":
                 # A cross-site frame of an owned tab, at any depth. Closing it
                 # would close its tab; it is set up and run instead.
@@ -1061,10 +1107,11 @@ class BrowserCDP:
                 if target not in self.ready and self.creating is not None:
                     await asyncio.shield(self.creating)
                 if info["type"] != "page" or target not in self.ready:
-                    closed = await self.send("Target.closeTarget", {"targetId": target})
-                    if not closed.get("success"):
-                        raise BrowserError("Unsupported browser target could not be closed.")
+                    await self._refuse(child, info)
                     return
+                if child not in self.refused:
+                    return  # Gone before it could be set up as a tab.
+                del self.refused[child]
                 self.sessions[target] = child
                 self.tabs[target] = info
                 session = child  # Initialization can race with this target's destruction.
@@ -1118,6 +1165,11 @@ class BrowserCDP:
                     session,
                 )
             elif method == "Page.javascriptDialogOpening":
+                if session in self.refused:
+                    # A refused popup's: dismissed, so it holds up nothing, and
+                    # not reported as the tab's.
+                    await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
+                    return
                 if self._owner(session) is None:
                     return
                 self.changes.append(
@@ -1145,6 +1197,58 @@ class BrowserCDP:
             self.failed = True
             if self.ws is not None:
                 await self.ws.close()
+
+    async def _refuse(self, child: str, info: dict[str, Any]) -> None:
+        """Close a target this driver does not run; a popup is fenced and released first."""
+        target = info["targetId"]
+        popup = info.get("type") == "page"
+        failed = False
+        if popup:
+            if child not in self.refused:
+                return  # It went first: nothing is left to refuse.
+            try:
+                for name, args in _POPUP_FENCE:
+                    if child not in self.refused:
+                        return  # It went first: nothing is left to refuse.
+                    await self.send(name, args, child)
+                    if name == "Network.setBypassServiceWorker":
+                        await self._offline(child)
+                if child not in self.refused:
+                    return
+                await self.send("Runtime.runIfWaitingForDebugger", {}, child)
+            except BrowserError:
+                if child not in self.refused:
+                    return
+                failed = True  # Not released: closing it is all that is left.
+        try:
+            closed = await self.send("Target.closeTarget", {"targetId": target})
+        except BrowserError:
+            if popup and child not in self.refused:
+                return  # It closed itself once released.
+            raise
+        if failed or (not closed.get("success") and (not popup or child in self.refused)):
+            raise BrowserError("Unsupported browser target could not be closed.")
+
+    async def _offline(self, session: str) -> None:
+        """Every request from a refused page fails at once in the network stack.
+
+        Per-rule emulation leaves navigator.onLine alone, which matters because
+        a popup in its opener's process shares that state with the opener. It
+        is offline per rule where Chromium has it (153 on), and for the whole
+        target where it has only the earlier form of the command (145). A
+        Chromium without the command at all gets the older one, which takes the
+        opener's renderer offline too while the popup lives.
+        """
+        try:
+            await self.send(
+                "Network.emulateNetworkConditionsByRule",
+                {"offline": True, "matchedNetworkConditions": [{"urlPattern": "", **_OFFLINE}]},
+                session,
+            )
+        except _SessionGone:
+            raise
+        except BrowserError:
+            await self.send("Network.emulateNetworkConditions", _OFFLINE, session)
 
     def drop_tab(self, target: str) -> None:
         if self.files is not None:
