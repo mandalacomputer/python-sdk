@@ -27,7 +27,7 @@ from anthropic.types import beta
 from pydantic import ValidationError
 
 from ._async_computer import AsyncComputer
-from ._browser_cdp import BrowserCDP, BrowserError
+from ._browser_cdp import _NAVIGATION_CHECK, _POLICY_DEADLINE, BrowserCDP, BrowserError
 from ._browser_connection import BrowserSessionPolicy
 from ._browser_file_session import BrowserFiles
 from ._browser_files import FILE_ERROR, BrowserFilePolicy, BrowserStagedFile, _StagedFiles
@@ -501,6 +501,19 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
                         "URL policy must allow with no return value or refuse by throwing."
                     )
 
+        async def preflight(context: BetaURLContext, url: str) -> None:
+            # Anthropic's own check before a navigation is a navigation check:
+            # it runs on the navigation threads, under the same deadline.
+            check = _NAVIGATION_CHECK.set(True)
+            try:
+                await asyncio.wait_for(apply_policy(context, url), _POLICY_DEADLINE)
+            except asyncio.TimeoutError:
+                raise ToolError(
+                    "Navigation was refused by the URL policy or its deadline."
+                ) from None
+            finally:
+                _NAVIGATION_CHECK.reset(check)
+
         file_adapter = _StagedFiles(remote_file_policy) if remote_file_policy else None
 
         async def file_confirm(context: Any) -> bool:
@@ -529,7 +542,7 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
         if file_adapter is not None:
             options["file_policy"] = file_adapter
         if url_policy is not None:
-            options["url_policy"] = apply_policy
+            options["url_policy"] = preflight
         super().__init__(**options)
 
         async def policy(tab: str | None, url: str) -> None:

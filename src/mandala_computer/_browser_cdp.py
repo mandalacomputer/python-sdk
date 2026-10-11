@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import functools
 import inspect
 import json
 import math
@@ -50,6 +49,8 @@ _TARGET_EVENT_LIMIT = 1024
 # have threads of their own, which held subresource checks cannot occupy.
 _POLICY_THREADS = 32
 _NAVIGATION_THREADS = 4
+#: How long one URL policy check may take, waiting for a thread included.
+_POLICY_DEADLINE = 5.0
 _NAVIGATION_CHECK: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mandala_navigation_check", default=False
 )
@@ -255,7 +256,7 @@ class BrowserCDP:
         # Frame -> the cross-site frame session that reported it, so that the
         # frames inside a cross-site frame go when its session does.
         self.frame_reporters: dict[str, str] = {}
-        self._pools: dict[bool, ThreadPoolExecutor] = {}
+        self._pools: dict[bool, tuple[ThreadPoolExecutor, asyncio.Semaphore]] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
         self.grant: Any = None
@@ -908,16 +909,49 @@ class BrowserCDP:
             self.active = next(iter(self.tabs), None)
 
     async def call_policy(self, callback: Callable[..., Any], *args: Any) -> Any:
-        """Run a caller's URL policy on this session's own threads; see _POLICY_THREADS."""
+        """Run a caller's URL policy on this session's own threads; see _POLICY_THREADS.
+
+        A check waits for a thread rather than queueing work on one, and holds
+        it until the callback really returns: a check that gave up cannot let
+        another in beside a callback still running, and nothing queues behind
+        blocked callbacks.
+        """
         navigation = _NAVIGATION_CHECK.get()
-        pool = self._pools.get(navigation)
-        if pool is None:
-            pool = self._pools[navigation] = ThreadPoolExecutor(
-                max_workers=_NAVIGATION_THREADS if navigation else _POLICY_THREADS,
-                thread_name_prefix="mandala-browser-" + ("navigation" if navigation else "policy"),
+        if navigation not in self._pools:
+            size = _NAVIGATION_THREADS if navigation else _POLICY_THREADS
+            self._pools[navigation] = (
+                ThreadPoolExecutor(
+                    max_workers=size,
+                    thread_name_prefix="mandala-browser-"
+                    + ("navigation" if navigation else "policy"),
+                ),
+                asyncio.Semaphore(size),
             )
-        call = functools.partial(contextvars.copy_context().run, callback, *args)
-        returned = await asyncio.get_running_loop().run_in_executor(pool, call)
+        pool, threads = self._pools[navigation]
+        await threads.acquire()
+        loop = asyncio.get_running_loop()
+
+        def free() -> None:
+            try:
+                loop.call_soon_threadsafe(threads.release)
+            except RuntimeError:
+                pass  # The session's loop has closed.
+
+        def run() -> Any:
+            try:
+                return context.run(callback, *args)
+            finally:
+                free()
+
+        context = contextvars.copy_context()
+        try:
+            work = pool.submit(run)
+        except BaseException:
+            threads.release()
+            raise
+        # Canceled before a thread took it, it never runs, and frees its thread here.
+        work.add_done_callback(lambda done: free() if done.cancelled() else None)
+        returned = await asyncio.wrap_future(work)
         return await returned if inspect.isawaitable(returned) else returned
 
     async def check_url(self, url: str, tab: str | None, *, navigation: bool = False) -> str:
@@ -936,7 +970,7 @@ class BrowserCDP:
         if self.policy:
             check = _NAVIGATION_CHECK.set(navigation)
             try:
-                await asyncio.wait_for(self._invoke(self.policy, tab, url), 5)
+                await asyncio.wait_for(self._invoke(self.policy, tab, url), _POLICY_DEADLINE)
             except ToolError as error:
                 raise BrowserError(str(error)) from None
             except Exception:  # noqa: BLE001 - withhold arbitrary callback error text
@@ -1431,7 +1465,7 @@ class BrowserCDP:
             for task in list(self.tasks):
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
-            for pool in self._pools.values():
+            for pool, _ in self._pools.values():
                 # A callback still running cannot be stopped; its answer is unused.
                 pool.shutdown(wait=False, cancel_futures=True)
             self.tabs.clear()

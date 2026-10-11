@@ -1845,7 +1845,7 @@ async def test_slow_sync_policies_for_subresources_hold_no_navigation_or_renewal
         for task in list(backend.tasks):
             task.cancel()
         await asyncio.gather(*backend.tasks, return_exceptions=True)
-        for pool in backend._pools.values():
+        for pool, _ in backend._pools.values():
             pool.shutdown(wait=False, cancel_futures=True)
 
 
@@ -1905,7 +1905,7 @@ def test_toolset_url_policies_leave_navigations_and_renewal_their_threads(
         took = time.monotonic() - began
         release.set()
         await asyncio.gather(*images, return_exceptions=True)
-        for pool in backend._pools.values():
+        for pool, _ in backend._pools.values():
             pool.shutdown(wait=False, cancel_futures=True)
         return took
 
@@ -1919,3 +1919,92 @@ def test_toolset_url_policies_leave_navigations_and_renewal_their_threads(
             if worker is not None:
                 worker.close()
     assert took < 1 and "https://ok.test/next" in started
+
+
+def test_async_navigate_preflight_does_not_wait_behind_held_policy_threads() -> None:
+    release = threading.Event()
+
+    def sync_policy(_context: Any, url: str) -> None:
+        if url.endswith(".png"):
+            release.wait(10)
+
+    async def create() -> Any:
+        raise RuntimeError("no browser here")
+
+    computer = SimpleNamespace(
+        create_browser_connection=create, revoke_browser_connection=lambda _: None
+    )
+
+    async def scenario() -> tuple[float, Any]:
+        browser = AsyncMandalaBrowserToolset(computer, url_policy=sync_policy)
+        backend = browser._backend
+        held = [
+            asyncio.create_task(backend.check_url(f"https://ok.test/{i}.png", "tab"))
+            for i in range(40)
+        ]
+        await asyncio.sleep(0.2)
+        began = time.monotonic()
+        # Anthropic's own policy check runs before the driver's; it must not
+        # queue behind the held subresource checks.
+        result = await asyncio.wait_for(
+            browser.tool_result(use("navigate", url="https://ok.test/next")), 4
+        )
+        took = time.monotonic() - began
+        release.set()
+        await asyncio.gather(*held, return_exceptions=True)
+        await browser.close()
+        return took, result
+
+    try:
+        took, result = asyncio.run(scenario())
+    finally:
+        release.set()
+    # It reached the driver (which has no browser here) instead of hanging.
+    assert took < 2 and result.get("is_error")
+
+
+@pytest.mark.asyncio
+async def test_policy_checks_that_time_out_queue_nothing_behind_blocked_callbacks(
+    monkeypatch: Any,
+) -> None:
+    from mandala_computer import _browser_cdp
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    monkeypatch.setattr(_browser_cdp, "_POLICY_THREADS", 2)
+    monkeypatch.setattr(_browser_cdp, "_POLICY_DEADLINE", 0.1)
+    release = threading.Event()
+    ran: list[str] = []
+
+    def sync_policy(_tab: Any, url: str) -> None:
+        ran.append(url)
+        release.wait(10)
+
+    async def policy(tab: Any, url: str) -> None:
+        await backend.call_policy(sync_policy, tab, url)
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    try:
+        for batch in range(3):
+            results = await asyncio.gather(
+                *(backend.check_url(f"https://ok.test/{batch}/{i}", "tab") for i in range(20)),
+                return_exceptions=True,
+            )
+            assert all(isinstance(r, BrowserError) for r in results)
+        pool, threads = backend._pools[False]
+        # Only the two callbacks that got threads ever ran or waited to run.
+        assert pool._work_queue.qsize() == 0 and len(ran) == 2
+        release.set()
+        for _ in range(100):
+            if threads._value == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert threads._value == 2
+        # With the threads free again, checks run as before.
+        release.clear()
+        release.set()
+        await backend.check_url("https://ok.test/after", "tab")
+        assert ran[-1] == "https://ok.test/after"
+    finally:
+        release.set()
+        for pool, _ in backend._pools.values():
+            pool.shutdown(wait=False, cancel_futures=True)
