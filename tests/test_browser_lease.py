@@ -670,3 +670,57 @@ def test_a_stalled_release_of_a_refused_grant_is_abandoned_at_its_deadline(
                 c.create_browser_connection()
             took = time.monotonic() - started
     assert release and took < 1.0
+
+
+async def test_an_attempt_abandoned_at_the_deadline_is_canceled(monkeypatch):
+    from mandala_computer import _browser_cdp
+
+    monkeypatch.setattr(_browser_cdp, "_RENEW_ATTEMPT", 0.05)
+    canceled = asyncio.Event()
+
+    async def renew(ident, limit):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            canceled.set()
+            raise
+
+    b = retrying_backend(renew, monkeypatch, ttl=0.4)
+    await b._maintain_lease()
+    assert b.failed and "renewal failed" in b.session_status()["terminal_error"]
+    await asyncio.wait_for(canceled.wait(), 1)
+
+
+@respx.mock
+def test_stalled_releases_take_a_bounded_number_of_threads(monkeypatch):
+    import threading
+
+    from mandala_computer import _computer
+
+    monkeypatch.setattr(_computer, "CLEANUP_REVOKE_TIMEOUT", 0.1)
+    monkeypatch.setattr(_computer, "_RELEASE_SLOTS", threading.BoundedSemaphore(1))
+    respx.get(f"{BASE}/computers/vm-1").respond(200, json={"id": "vm-1", "status": "running"})
+    respx.post(f"{BASE}/computers/vm-1/browser-connections").respond(
+        201, json={**PAYLOAD, "url": "wss://elsewhere.test/cdp"}
+    )
+    gate = threading.Event()
+    attempts = []
+
+    def stall(request):
+        attempts.append(1)
+        gate.wait(5)
+        return httpx.Response(200, json={"ok": True})
+
+    respx.delete(f"{BASE}/computers/vm-1/browser-connections/{IDENT}").mock(side_effect=stall)
+    try:
+        with Client("com_test", base_url=BASE) as client:
+            c = client.computers.get("vm-1")
+            for _ in range(3):
+                started = time.monotonic()
+                with pytest.raises(MandalaError, match="invalid browser connection"):
+                    c.create_browser_connection()
+                assert time.monotonic() - started < 1.0
+            # The first release still holds the only slot; the rest were skipped.
+            assert attempts == [1]
+    finally:
+        gate.set()

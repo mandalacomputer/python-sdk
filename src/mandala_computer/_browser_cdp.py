@@ -51,14 +51,16 @@ _TARGET_EVENTS = frozenset(
 _NOTED_EVENTS = frozenset(
     {
         "Page.frameAttached",
-        "Page.frameDetached",
         "Page.frameNavigated",
         "Runtime.consoleAPICalled",
         "Network.responseReceived",
     }
 )
+# A frame leaving is queued behind the downloads it may have started: noting it
+# in place would untrack their frame before their handlers ran.
 _QUEUED_EVENTS = frozenset(
     {
+        "Page.frameDetached",
         "Fetch.requestPaused",
         "Page.javascriptDialogOpening",
         "Browser.downloadWillBegin",
@@ -104,34 +106,46 @@ def _retrieve(future: asyncio.Future[Any]) -> None:
         future.exception()
 
 
-def _clip(value: Any, limit: int) -> str:
-    return str(value)[:limit] if value is not None else ""
+def _checked(value: Any, limit: int) -> str | None:
+    """A field a check reads, cut to one past the check's own limit.
+
+    So an over-long value stays over-long and is refused as before, and
+    anything that is not a string becomes ``None``, which every check refuses.
+    """
+    return value[: limit + 1] if isinstance(value, str) else None
+
+
+def _shown(value: Any, limit: int) -> str:
+    """A field only displayed, already cut to ``limit`` where it is shown."""
+    return value[:limit] if isinstance(value, str) else ""
 
 
 def _trimmed(message: dict[str, Any]) -> dict[str, Any]:
     """A queued event, cut down to the fields its handler reads.
 
-    Each limit is above what the handler accepts or keeps, so trimming never
-    turns a refusal into an acceptance: an over-long URL stays over-long.
+    Trimming never turns a refusal into an acceptance: see :func:`_checked`.
     """
     method, p = message.get("method"), message.get("params") or {}
     if method == "Fetch.requestPaused":
         request = p.get("request") or {}
         params: dict[str, Any] = {
             "requestId": p.get("requestId"),
-            "request": {"url": _clip(request.get("url"), 8193)},
+            "request": {"url": _checked(request.get("url"), 8192)},
         }
     elif method == "Page.javascriptDialogOpening":
-        params = {"type": _clip(p.get("type"), 32), "message": _clip(p.get("message"), 1000)}
+        params = {"type": _shown(p.get("type"), 32), "message": _shown(p.get("message"), 1000)}
+    elif method == "Page.frameDetached":
+        params = {"frameId": p.get("frameId")}
     else:
         params = {
             key: p[key]
             for key in ("guid", "frameId", "receivedBytes", "totalBytes", "state")
             if key in p
         }
-        for key, limit in (("url", 4096), ("suggestedFilename", 4096)):
-            if key in p:
-                params[key] = _clip(p[key], limit)
+        if "url" in p:
+            params["url"] = _shown(p["url"], 4096)
+        if "suggestedFilename" in p:
+            params["suggestedFilename"] = _checked(p["suggestedFilename"], 4096)
     trimmed = {"method": method, "params": params}
     if "sessionId" in message:
         trimmed["sessionId"] = message["sessionId"]
@@ -139,15 +153,19 @@ def _trimmed(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _target_info(message: dict[str, Any]) -> dict[str, Any]:
-    """A lifecycle event with its target's URL and title cut to what is shown."""
+    """A lifecycle event with its target's URL and title cut to what is used.
+
+    The URL is checked again before a reload, so it keeps one character past
+    the URL limit and an over-long one is still refused.
+    """
     p = message.get("params") or {}
     info = p.get("targetInfo")
     if not isinstance(info, dict):
         return message
     info = {
         **info,
-        "url": _clip(info.get("url"), 8192),
-        "title": _clip(info.get("title"), 1000),
+        "url": _shown(info.get("url"), 8193),
+        "title": _shown(info.get("title"), 1000),
     }
     return {**message, "params": {**p, "targetInfo": info}}
 
@@ -388,6 +406,7 @@ class BrowserCDP:
                     left = self.lease_deadline - time.monotonic() - _RENEW_MARGIN
                     await asyncio.wait({call}, timeout=max(0.0, left))
                     if not call.done():
+                        call.cancel()  # Out of time: the session ends with it.
                         raise
                     lease = call.result()
             except asyncio.CancelledError:
@@ -714,7 +733,7 @@ class BrowserCDP:
                     }
                 )
                 await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
-            elif method in _NOTED_EVENTS:
+            elif method in _NOTED_EVENTS or method == "Page.frameDetached":
                 self._note(method, p, session)
         except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):

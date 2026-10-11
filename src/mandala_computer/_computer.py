@@ -876,6 +876,12 @@ def _started_key(stamp: str) -> tuple[int, float]:
     return (1, when.timestamp())
 
 
+#: How many releases of refused browser grants may be in flight at once, across
+#: every computer: each runs on a thread of its own (see
+#: ``Computer._release_refused_grant``).
+_RELEASE_SLOTS = threading.BoundedSemaphore(4)
+
+
 #: How long a Unicode ``type`` may take: the platform gives the guest 75
 #: seconds for the whole request and its proxy 95, and this adds the slack every
 #: guest deadline gets.
@@ -3186,7 +3192,12 @@ class Computer(ComputerFields):
 
     def _release_refused_grant(self, path: str, ident: str) -> None:
         # The request's own cap bounds each phase, not the whole exchange, so
-        # it runs beside the caller, who waits no longer than the deadline.
+        # it runs beside the caller, who waits no longer than the deadline. A
+        # release that outlives it keeps its slot; with every slot taken, the
+        # grant is left to its own server deadline rather than another thread.
+        if not _RELEASE_SLOTS.acquire(blocking=False):
+            return
+
         def release() -> None:
             try:
                 self._t.json_object(
@@ -3196,9 +3207,15 @@ class Computer(ComputerFields):
                 )
             except Exception:  # noqa: BLE001, S110 - preserve parse error; never log a capability
                 pass
+            finally:
+                _RELEASE_SLOTS.release()
 
-        worker = threading.Thread(target=release, name="mandala-browser-release", daemon=True)
-        worker.start()
+        try:
+            worker = threading.Thread(target=release, name="mandala-browser-release", daemon=True)
+            worker.start()
+        except BaseException:
+            _RELEASE_SLOTS.release()
+            raise
         worker.join(CLEANUP_REVOKE_TIMEOUT)
 
     def renew_browser_connection(self, ident: str) -> BrowserSessionLease:

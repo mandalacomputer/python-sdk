@@ -1317,3 +1317,83 @@ async def test_unused_events_are_dropped_and_target_events_skip_the_queue() -> N
         hold.set()
         await socket.close()
         await backend.reader
+
+
+@pytest.mark.parametrize(
+    "message,field,reader",
+    [
+        (
+            {
+                "method": "Browser.downloadWillBegin",
+                "params": {"guid": "g", "suggestedFilename": "report.txt" + "a" * 5000},
+            },
+            "suggestedFilename",
+            "safe_filename",
+        ),
+        (
+            {"method": "Browser.downloadWillBegin", "params": {"suggestedFilename": 12345}},
+            "suggestedFilename",
+            "safe_filename",
+        ),
+        (paused("1", "page", "https://ok.test/" + "a" * 9000), "url", "check"),
+        (paused("1", "page", None), "url", "check"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_trimming_keeps_every_refusal(message: Any, field: str, reader: str) -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError, _trimmed
+    from mandala_computer._browser_files import safe_filename
+
+    params = _trimmed(message)["params"]
+    if reader == "safe_filename":
+        with pytest.raises(ValueError):
+            safe_filename(message["params"][field])
+        with pytest.raises(ValueError):
+            safe_filename(params[field])
+    else:
+        backend = BrowserCDP(lambda: None, lambda _: None, None)
+        with pytest.raises((BrowserError, TypeError)):
+            await backend.check_url(params["request"][field], "tab")
+
+
+@pytest.mark.asyncio
+async def test_a_frame_leaving_never_overtakes_its_own_download() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    class Files:
+        def __init__(self) -> None:
+            self.frames = {"frame": "tab"}
+            self.tracked: list[bool] = []
+
+        def frame(self, ident: str, tab: str) -> bool:
+            self.frames[ident] = tab
+            return True
+
+        async def event(self, method: str, params: dict[str, Any]) -> None:
+            self.tracked.append(params.get("frameId") in self.frames)
+
+        async def close(self) -> None:
+            pass
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = ScriptedSocket()
+    backend.files = files = Files()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        # Both arrive in one read, before the download's handler can run.
+        socket.push(
+            {
+                "method": "Browser.downloadWillBegin",
+                "params": {"guid": "g", "frameId": "frame", "url": "https://ok.test/f"},
+            }
+        )
+        socket.push(
+            {"method": "Page.frameDetached", "sessionId": "page", "params": {"frameId": "frame"}}
+        )
+        await settle(lambda: files.tracked and "frame" not in files.frames)
+        assert files.tracked == [True]
+    finally:
+        await socket.close()
+        await backend.reader
