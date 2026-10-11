@@ -2008,3 +2008,42 @@ async def test_policy_checks_that_time_out_queue_nothing_behind_blocked_callback
         release.set()
         for pool, _ in backend._pools.values():
             pool.shutdown(wait=False, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_a_cross_site_frame_navigating_keeps_the_tabs_refs() -> None:
+    from mandala_computer._browser_cdp import BrowserError
+
+    backend, sent = owned_backend()
+    await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
+    assert ("Page.enable", None, "frame-s") in [(m, None, s) for m, _, s in sent]
+    backend.refs = {"tab": {"e1": 7}}
+    backend._note("Page.frameNavigated", {"frame": {"id": "frame-t"}}, session="frame-s")
+    assert backend.refs == {"tab": {"e1": 7}}
+    backend._note("Page.frameNavigated", {"frame": {"id": "tab"}}, session="page")
+    assert backend.refs == {}
+    # A frame's dialog that is already answered does not end the session.
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.handleJavaScriptDialog":
+            raise BrowserError("Chromium could not complete the browser action.")
+        return await plain(method, params, session)
+
+    backend.send = send
+    dialog = {"type": "alert", "message": "hi"}
+    await backend._event(
+        {"method": "Page.javascriptDialogOpening", "sessionId": "frame-s", "params": dialog}
+    )
+    assert not backend.failed
+    # The tab's own dialog left unanswered still fails closed.
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+
+    backend.ws = SimpleNamespace(close=close)
+    await backend._event(
+        {"method": "Page.javascriptDialogOpening", "sessionId": "page", "params": dialog}
+    )
+    assert backend.failed and closed

@@ -635,7 +635,10 @@ class BrowserCDP:
                 self.files.frames.pop(p["frameId"], None)
                 self.frame_reporters.pop(p["frameId"], None)
             if method == "Page.frameNavigated":
-                self.refs.pop(tab, None)
+                if session not in self.child_frames:
+                    # The tab's own document changed. A cross-site frame's
+                    # navigation leaves the tab's element refs as they were.
+                    self.refs.pop(tab, None)
                 if self.files is not None:
                     self._track(p["frame"]["id"], tab, session)
             elif method == "Runtime.consoleAPICalled":
@@ -652,7 +655,7 @@ class BrowserCDP:
         except (KeyError, TypeError, AttributeError):
             # A malformed note is dropped. An untracked frame's downloads are
             # canceled, so dropping one fails closed.
-            if method == "Page.frameNavigated":
+            if method == "Page.frameNavigated" and session not in self.child_frames:
                 self.refs.pop(tab, None)
 
     def _track(self, frame: str, tab: str, session: str | None) -> bool:
@@ -871,7 +874,13 @@ class BrowserCDP:
                         "message": p.get("message", "")[:1000],
                     }
                 )
-                await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
+                try:
+                    await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
+                except BrowserError:
+                    if session not in self.child_frames:
+                        raise
+                    # Its tab may have answered it first; a frame's dialog
+                    # left open blocks only that frame.
         except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):
                 return  # Page-side cancellation invalidates the paused request ID.
