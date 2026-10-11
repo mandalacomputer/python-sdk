@@ -70,7 +70,13 @@ This is the summary you read to decide whether to upgrade.
   `AgentResult` and `AgentFailed` have `cost_usd`, and `AgentFailed` has
   `top_up_url`. All are `None` on a run with your own key. A figure is only
   ever a finite number the platform sent, never coerced, and only
-  `credits_remaining_usd` can be negative.
+  `credits_remaining_usd` can be negative. A funded run's model provider
+  failure, which the platform reports with the provider's status and its own
+  fixed sentence instead of the `model API: ` prefix, does not blame something
+  it is not: a 401, 402, 403, 404 or 413 said that way is a plain `APIError`
+  rather than `AuthenticationError`, `PermissionDeniedError`, `NotFoundError`,
+  `FileTooLargeError` or `ModelProviderError`, and a 429 carries no Mandala
+  budget fields.
 
 - **`InsufficientCreditsError`**: the 402 a funded run gets when the account's
   credits cannot cover its first model call. Its `top_up_url` is the billing
@@ -174,16 +180,9 @@ This is the summary you read to decide whether to upgrade.
   `top_up_url`, and never the plan.
 
 - `is_transient()` answers `False` for any 429 that ends an agent run after it
-  has taken steps, not only one carrying the `model API: ` prefix. A funded
-  run reports its model provider's failures without that prefix, so a funded
-  run that had already acted was called safe to send again.
-
-- A funded run's model provider failure, which the platform reports with the
-  provider's status and its own fixed sentence instead of the `model API: `
-  prefix, no longer blames something it is not: a 401, 402, 403, 404 or 413
-  said that way is a plain `APIError` rather than `AuthenticationError`,
-  `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
-  `ModelProviderError`, and a 429 carries no Mandala budget fields.
+  has taken steps, the platform's own included, not only one carrying the
+  `model API: ` prefix: the steps are on the desktop, and sending the prompt
+  again repeats them.
 
 - **`client.account.read()` reads its `observed_at` on Python 3.10.** The platform
   writes timestamps with up to nine fractional digits, and 3.10's
@@ -193,13 +192,13 @@ This is the summary you read to decide whether to upgrade.
 
 - **An error whose body is slow to arrive keeps its status.** A 403, 404, 409,
   503 or any other error status whose body read timed out was raised as
-  `RequestTimeoutError`, so `is_transient()` and the browser toolsets' lease
-  renewal treated a refusal as a timeout worth sending again. It now raises the
-  status's own class (`PermissionDeniedError`, `ConflictError` and so on), with
-  the timeout as its cause; the transport still never replays it on its own. A
-  409 whose body was cut short, by a timeout or an interruption, is not
-  transient, and a keyed call keeps its `idempotency_key` on it: the lost body
-  may have said the call's outcome is unknown.
+  `RequestTimeoutError`. It now raises the status's own class
+  (`PermissionDeniedError`, `ConflictError` and so on), with the timeout as its
+  cause, and `is_transient()` answers as it does for that status; the
+  transport still never replays it on its own. A 409 whose body was cut short,
+  by a timeout or an interruption, is not transient, and a keyed call keeps its
+  `idempotency_key` on it: the lost body may have said the call's outcome is
+  unknown.
 
 ## [0.11.0] — 2026-10-08
 
