@@ -93,14 +93,16 @@ _INTERCEPT = {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
 # Dedicated workers never start. Chromium can neither close one nor intercept
 # all of a running one's requests (the script of a worker that a worker starts
 # is fetched with no session's interception, and a held worker is released as
-# its page goes), so every document of an owned tab that the driver reaches
-# before it runs finds Worker a constructor that refuses. A sandboxed srcdoc
-# frame starts in its own process before the driver can reach it; that, like
-# WebSockets, is left to the guest's egress controls.
+# its page goes), so in every frame of an owned tab that the driver attaches
+# to before it runs, Worker is a constructor that refuses. A frame that starts
+# running without waiting for the driver (a sandboxed srcdoc frame) runs its
+# first scripts before its session can register this, so it can keep the
+# original constructor for later, as it makes its first requests before its
+# interception is on; that, like WebSockets, is the guest's egress controls'.
 _NO_WORKERS = """(() => {
   const refuse = function Worker() {
     throw new DOMException(
-      "Dedicated workers are not available in this browser session.",
+      "Dedicated workers are disabled in this browser session.",
       "SecurityError"
     );
   };
@@ -297,6 +299,9 @@ class BrowserCDP:
         # events are handled in arrival order, one at a time: its progress must
         # not overtake its beginning while that waits on a restore.
         self.download_events: dict[str, asyncio.Task[Any]] = {}
+        # Frame -> downloads waiting on a restore to learn whether it is the
+        # tab's. Settled as soon as it is: a later removal does not unsettle it.
+        self.awaiting_frames: dict[str, list[asyncio.Future[bool]]] = {}
         self._pools: dict[bool, tuple[ThreadPoolExecutor, asyncio.Semaphore]] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
@@ -742,6 +747,9 @@ class BrowserCDP:
         self.frame_source[frame] = session
         if isinstance(parent, str):
             self.frame_parent[frame] = parent
+        for owned in self.awaiting_frames.pop(frame, []):
+            if not owned.done():
+                owned.set_result(True)
         return True
 
     def _track_tree(
@@ -846,10 +854,33 @@ class BrowserCDP:
         task.add_done_callback(done)
 
     async def _decide(self, frame: Any) -> bool:
-        """Whether a download's frame is tracked once pending restores land."""
-        if self.restoring:
-            await asyncio.wait(set(self.restoring), timeout=_RESTORE_WAIT)
-        return isinstance(frame, str) and self.files is not None and frame in self.files.frames
+        """Whether a download's frame is the tab's, once pending restores land.
+
+        Settled the moment its frame is tracked, however the other restores
+        go; otherwise when none is left pending, or after _RESTORE_WAIT.
+        """
+        if not isinstance(frame, str) or self.files is None:
+            return False
+        if frame in self.files.frames:
+            return True
+        loop = asyncio.get_running_loop()
+        owned: asyncio.Future[bool] = loop.create_future()
+        self.awaiting_frames.setdefault(frame, []).append(owned)
+        try:
+            deadline = loop.time() + _RESTORE_WAIT
+            while self.restoring and not owned.done():
+                left = deadline - loop.time()
+                if left <= 0:
+                    break
+                pending: set[asyncio.Future[Any]] = {owned, *self.restoring}
+                await asyncio.wait(pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+            return owned.done() or frame in self.files.frames
+        finally:
+            waiting = self.awaiting_frames.get(frame)
+            if waiting is not None:
+                waiting[:] = [other for other in waiting if other is not owned]
+                if not waiting:
+                    del self.awaiting_frames[frame]
 
     def _owner(self, session: str | None) -> str | None:
         """The owned tab a session belongs to: the tab's own, or a frame inside it."""

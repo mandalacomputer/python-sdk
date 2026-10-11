@@ -118,12 +118,16 @@ This is the summary you read to decide whether to upgrade.
   `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
   `ModelProviderError`, and a 429 carries no Mandala budget fields.
 
-- **Dedicated workers cannot start in the browser toolsets.** Every document
-  the driver reaches before it runs, in the tab and its frames, finds `Worker`
-  a constructor that throws `SecurityError`. Chromium can neither close a
-  worker nor intercept the script of a worker another worker starts, and a
-  worker held paused instead is released as its page navigates away or
-  closes, its requests then meeting no URL policy at all (OPL-5909).
+- **Pages in the browser toolsets cannot start dedicated workers.** In every
+  frame the driver attaches to before it runs, cross-site and `about:blank`
+  frames included, constructing a `Worker` throws a `SecurityError` before the
+  page's own scripts run, for script, `blob:` and `data:` URLs alike, and the
+  page carries on without it. A frame that starts running before the driver
+  can attach, as Chromium starts a sandboxed `srcdoc` frame, is not covered.
+  A worker could not be run under `url_policy`: Chromium fetches the script of
+  a worker started by another worker outside any interception, and a worker
+  held paused is released, unpoliced, when its page closes or navigates
+  (OPL-5909).
 
 - **Downloads keep the right frame in the browser toolsets.** Download
   ownership follows each frame's parent and the session that reported it, as

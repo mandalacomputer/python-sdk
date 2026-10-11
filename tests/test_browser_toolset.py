@@ -2553,3 +2553,53 @@ async def test_a_downloads_progress_waits_for_its_beginning() -> None:
         "Browser.downloadProgress",
     ]
     assert order[0][1] is True and backend.download_events == {}
+
+
+@pytest.mark.asyncio
+async def test_a_download_owned_once_its_restore_lands_stays_owned() -> None:
+    backend, _, files = tracking_backend()
+    decided: list[Any] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        decided.append(params.get("tracked"))
+
+    files.event = event  # type: ignore[method-assign]
+    answers = {"page": asyncio.Event(), "x-s": asyncio.Event()}
+    trees = {
+        "page": {"frame": {"id": "tab"}, "childFrames": [{"frame": {"id": "r"}}]},
+        "x-s": {"frame": {"id": "x"}},
+    }
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree" and session in answers and backend.restoring:
+            await plain(method, params, session)
+            await answers[session].wait()
+            return {"frameTree": trees[session]}
+        return await plain(method, params, session)
+
+    await backend._event(attached("x-s", "x", "iframe", "page"))
+    backend.send = send
+    # Two restores at once: the tab's, and a cross-site frame's.
+    restore = {"type": "BackForwardCacheRestore"}
+    backend._note("Page.frameNavigated", {"frame": {"id": "tab"}, **restore}, "page")
+    backend._note(
+        "Page.frameNavigated", {"frame": {"id": "x", "parentId": "tab"}, **restore}, "x-s"
+    )
+    await asyncio.sleep(0)
+    backend._dispatch(
+        {
+            "method": "Browser.downloadWillBegin",
+            "params": {"guid": "00000000-0000-0000-0000-000000000003", "frameId": "r"},
+        }
+    )
+    await asyncio.sleep(0.01)
+    answers["page"].set()  # The tab's restore lands: "r" is the tab's...
+    await asyncio.sleep(0.05)
+    backend._note("Page.frameDetached", {"frameId": "r", "reason": "remove"}, "page")
+    answers["x-s"].set()  # ...and stays its owner after "r" is removed.
+    for _ in range(100):
+        if decided:
+            break
+        await asyncio.sleep(0.01)
+    assert decided == [True] and backend.awaiting_frames == {}

@@ -1959,24 +1959,31 @@ revokes its capability; it does not stop Chromium or delete the computer.
   network isolation**, and guest egress controls are where traffic is
   enforced: use them for DNS/IP containment, WebSockets, WebRTC, WebTransport
   and browser traffic outside those intercepted requests. That includes a
-  sandboxed `srcdoc` frame (`<iframe sandbox="allow-scripts" srcdoc=...>`):
-  Chromium starts it in its own process before the driver can attach to it, so
-  its first scripts can make requests, or start a worker, outside the hook.
+  sandboxed or other out-of-process frame that starts running before the
+  driver can attach to it (Chromium starts a sandboxed `srcdoc` frame this
+  way). Its first requests go out before the hook can see them, and its
+  scripts can keep the browser's own `Worker` constructor and start workers
+  with it at any time, whose requests can escape the hook, notably when their
+  page closes or navigates.
 - Cross-site frames (which Chromium runs in their own process) run as part of
-  their tab, and their HTTP(S) requests go through the same URL hook with that
-  tab's ID. A frame that cannot be given the hook stays paused and never runs.
+  their tab. Chromium holds one that loads a URL until the driver has attached
+  to it, so its HTTP(S) requests go through the same URL hook with that tab's
+  ID; one that starts running without waiting is the exception above. A frame
+  that cannot be given the hook stays paused and never runs.
   A cross-site frame's contents are not part of `read_page`, `find` or
   `get_page_text`; screenshots and coordinate input reach it.
-- Dedicated workers are not available. Every document the driver reaches
-  before it runs (the tab's own, and its same-process, `about:blank`,
-  `srcdoc`, `javascript:`, `document.write` and cross-site frames) finds
-  `Worker` a constructor that throws `SecurityError` and cannot be deleted or
-  replaced, so no worker starts there, from a URL, `blob:` or `data:` script
-  alike, and none can run outside the URL hook, at the page's exit included.
-  The sandboxed `srcdoc` frame above is the exception. Chromium can neither
-  close a worker nor intercept the script of a worker another worker starts.
-  Pages that fall back when a worker cannot start keep working. Popups, shared
-  and service workers and other new targets are unsupported and are closed; if
+- Pages cannot start dedicated workers. In every frame the driver attaches
+  to before it runs (the tab's own, cross-site frames that load a URL, and
+  same-process `about:blank`, `srcdoc`, `javascript:` and `document.write`
+  frames) `new Worker(...)` throws a `SecurityError` before the page's own
+  scripts run, whatever the script URL (`blob:` and `data:` included), and the
+  binding cannot be replaced. A frame that starts running before the driver
+  can attach is not covered (see the URL hook above). A worker cannot run
+  under the URL hook: Chromium fetches the script of a worker started by
+  another worker without any interception the driver could apply, and a
+  worker held paused is released, unpoliced, when its page closes or
+  navigates. The page itself carries on. Shared workers, service workers,
+  popups and other new top-level targets are unsupported and are closed; if
   one cannot be closed, the driver closes its session. Sites that depend on
   these may not work with this driver.
 - `read_page` returns accessibility roles/names and element refs; `find`
