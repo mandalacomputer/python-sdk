@@ -51,16 +51,14 @@ _TARGET_EVENTS = frozenset(
 _NOTED_EVENTS = frozenset(
     {
         "Page.frameAttached",
+        "Page.frameDetached",
         "Page.frameNavigated",
         "Runtime.consoleAPICalled",
         "Network.responseReceived",
     }
 )
-# A frame leaving is queued behind the downloads it may have started: noting it
-# in place would untrack their frame before their handlers ran.
 _QUEUED_EVENTS = frozenset(
     {
-        "Page.frameDetached",
         "Fetch.requestPaused",
         "Page.javascriptDialogOpening",
         "Browser.downloadWillBegin",
@@ -134,8 +132,6 @@ def _trimmed(message: dict[str, Any]) -> dict[str, Any]:
         }
     elif method == "Page.javascriptDialogOpening":
         params = {"type": _shown(p.get("type"), 32), "message": _shown(p.get("message"), 1000)}
-    elif method == "Page.frameDetached":
-        params = {"frameId": p.get("frameId"), "reason": p.get("reason")}
     else:
         params = {
             key: p[key]
@@ -622,7 +618,12 @@ class BrowserCDP:
         for current in gone:
             gone.extend(c for c, (_, _, parent) in self.child_frames.items() if parent == current)
         for current in gone:
-            self.child_frames.pop(current, None)
+            _, frame, _ = self.child_frames.pop(current)
+            if self.files is not None:
+                # Its parent's notes cannot be relied on to say it went: a
+                # frame inside a cross-site frame has no notes at all. One that
+                # lives on in its parent's process is noted again as it loads.
+                self.files.frames.pop(frame, None)
         for ident, owner in list(self.pending_sessions.items()):
             future = self.pending.get(ident)
             if owner in gone and future is not None and not future.done():
@@ -757,7 +758,7 @@ class BrowserCDP:
                     }
                 )
                 await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
-            elif method in _NOTED_EVENTS or method == "Page.frameDetached":
+            elif method in _NOTED_EVENTS:
                 self._note(method, p, session)
         except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):

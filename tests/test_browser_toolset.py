@@ -1400,7 +1400,7 @@ async def test_a_frame_leaving_never_overtakes_its_own_download() -> None:
             return True
 
         async def event(self, method: str, params: dict[str, Any]) -> None:
-            self.tracked.append(params.get("frameId") in self.frames)
+            self.tracked.append(params.get("tracked"))
 
         async def close(self) -> None:
             pass
@@ -1589,6 +1589,78 @@ async def test_a_download_belongs_to_its_frame_as_it_arrives() -> None:
         hold.set()
         await settle(lambda: files.seen)
         assert files.seen == [True]
+    finally:
+        hold.set()
+        await socket.close()
+        await backend.reader
+
+
+class FrameFiles:
+    """Download ownership as the file session keeps it, with its 256-frame cap."""
+
+    def __init__(self) -> None:
+        self.frames: dict[str, str] = {}
+
+    def frame(self, ident: str, tab: str) -> bool:
+        if ident not in self.frames and len(self.frames) >= 256:
+            return False
+        self.frames[ident] = tab
+        return True
+
+    async def event(self, method: str, params: dict[str, Any]) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_detached_cross_site_frames_give_up_their_download_ownership() -> None:
+    backend, _ = owned_backend()
+    backend.files = files = FrameFiles()
+    for i in range(300):
+        await backend._event(attached(f"f{i}", f"f{i}-t", "iframe", "page"))
+        await backend._event(attached(f"n{i}", f"n{i}-t", "iframe", f"f{i}"))
+        # Chromium reports only the outer frame's detach.
+        await backend._event(
+            {
+                "method": "Target.detachedFromTarget",
+                "sessionId": "page",
+                "params": {"sessionId": f"f{i}", "targetId": f"f{i}-t"},
+            }
+        )
+    assert files.frames == {} and backend.child_frames == {}
+    await backend._event(attached("fresh", "fresh-t", "iframe", "page"))
+    assert files.frames == {"fresh-t": "tab"}
+
+
+@pytest.mark.asyncio
+async def test_frames_removed_while_the_queue_is_full_are_forgotten_at_once() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    hold = asyncio.Event()
+
+    async def policy(_tab: Any, _url: str) -> None:
+        await hold.wait()
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.files = files = FrameFiles()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        for i in range(256):
+            socket.push(paused(str(i), "page", "https://ok.test/"))
+        await settle(lambda: len(backend.slots) == 256)
+        for i in range(300):
+            for method in ("Page.frameAttached", "Page.frameDetached"):
+                socket.push({"method": method, "sessionId": "page", "params": {"frameId": f"x{i}"}})
+        socket.push(
+            {"method": "Page.frameAttached", "sessionId": "page", "params": {"frameId": "live"}}
+        )
+        await settle(lambda: "live" in files.frames)
+        assert files.frames == {"live": "tab"}
     finally:
         hold.set()
         await socket.close()
