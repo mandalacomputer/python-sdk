@@ -3783,7 +3783,10 @@ A request that outran the client's timeout is one of these too:
 because a deadline that fires says nothing about whether the request went out.
 It is also a `TimeoutError`, so `except TimeoutError` written before it existed
 still catches it. A `wait_*` helper that gives up raises a plain `TimeoutError`
-instead, so `except mc.RequestTimeoutError` tells the two apart.
+instead, so `except mc.RequestTimeoutError` tells the two apart. An error
+status that arrived before its body timed out is not one: it is raised as that
+status's own error (a 403 as `PermissionDeniedError`, a 409 as
+`ConflictError`), with the timeout as its cause.
 
 `FileTooLargeError` and `RangeNotSatisfiableError` are the two size statuses,
 and each has a next move attached, which is why neither is a bare `APIError`.

@@ -15,6 +15,7 @@ from ._api import (
     BROWSER_MIN_LEASE_SECONDS,
 )
 from ._exceptions import MandalaError
+from ._timestamps import parse_rfc3339
 
 
 @dataclass(frozen=True)
@@ -52,29 +53,10 @@ class BrowserSessionPolicy:
 #: grant if this gives up.
 CLEANUP_REVOKE_TIMEOUT = 10.0
 
-# RFC 3339 with an explicit zone, as the platform writes it: a fraction of up to
-# nine digits (nanoseconds, trailing zeros trimmed) and `Z` or a numeric offset.
-_TIMESTAMP = re.compile(
-    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
-    r"(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})"
-)
-
 
 def _timestamp(value: object) -> datetime:
-    """An aware datetime from a platform timestamp; ``ValueError`` otherwise.
-
-    Python 3.10's ``fromisoformat`` reads exactly three or six fractional
-    digits and no ``Z``, and the platform sends up to nine and ``Z``. So the
-    fraction is padded or truncated to microseconds and the zone spelled as an
-    offset before parsing, which keeps every supported version reading the same
-    stamps and refusing the same malformed ones.
-    """
-    match = _TIMESTAMP.fullmatch(value) if isinstance(value, str) else None
-    if match is None:
-        raise ValueError("not an RFC 3339 timestamp")
-    whole, fraction, zone = match.groups()
-    micros = "." + (fraction + "00000")[:6] if fraction else ""
-    return datetime.fromisoformat(whole + micros + ("+00:00" if zone == "Z" else zone))
+    """A platform timestamp: up to nine fractional digits, ``Z`` or an offset."""
+    return parse_rfc3339(value)
 
 
 def _date(data: Mapping[str, Any], field_name: str) -> datetime:

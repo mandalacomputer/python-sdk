@@ -1352,10 +1352,12 @@ async def test_native_exception_family_controls_replay_before_and_after_response
         bodies.append(body)
         return httpx.Response(status, stream=body, headers={"Retry-After": "9"})
 
-    if issubclass(family, httpx.TimeoutException):
-        expected = TimeoutError
-    elif status is not None:
+    if status is not None:
+        # A status that arrived is the answer, even when its body then timed
+        # out (OPL-5910); the timeout stays the cause and still bars replay.
         expected = RateLimitError if status == 429 else APIError
+    elif issubclass(family, httpx.TimeoutException):
+        expected = TimeoutError
     elif family in (httpx.ConnectError, httpx.ProxyError, httpx.UnsupportedProtocol):
         expected = ConnectionError
     else:
@@ -1369,9 +1371,10 @@ async def test_native_exception_family_controls_replay_before_and_after_response
         else:
             await anext(t.sse("GET", "/builds/b/events"))
     assert caught.value.__cause__ is failures[-1]
-    if status is not None and not issubclass(family, httpx.TimeoutException):
+    if status is not None:
         assert caught.value.status == status
         assert caught.value.retry_after == 9
+        assert not isinstance(caught.value, TimeoutError)
     allowed = (
         retryable
         and status != 429

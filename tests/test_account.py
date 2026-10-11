@@ -372,3 +372,38 @@ async def test_async_cancellation_reaches_the_transport() -> None:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert cancelled.is_set()
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-09-16T12:34:56.123456789Z",
+        "2026-09-16T12:34:56.5Z",
+        "2026-09-16T12:34:56.12345678Z",
+        "2026-09-16T12:34:56.1234567891234Z",
+        "2026-09-16T12:34:56Z",
+    ],
+)
+def test_observed_at_reads_every_fraction_on_every_python(stamp: str) -> None:
+    # Python 3.10's fromisoformat reads only three or six fractional digits,
+    # and the platform writes up to nine with trailing zeros trimmed.
+    data = account_report()
+    data["observed_at"] = stamp
+    assert mc.AccountQuota.from_api(data).observed_at == stamp
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-09-16T12:34:56.Z",
+        "2026-09-16T12:34:56.123+00:00",
+        "2026-09-16 12:34:56Z",
+        "2026-09-16T12:34:56z",
+        "2026-02-30T12:34:56.5Z",
+    ],
+)
+def test_observed_at_still_refuses_what_it_refused(stamp: str) -> None:
+    data = account_report()
+    data["observed_at"] = stamp
+    with pytest.raises(mc.MandalaError, match="observed_at"):
+        mc.AccountQuota.from_api(data)

@@ -432,3 +432,55 @@ async def test_async_create_only_409_with_no_usable_reason_is_never_transient(bo
     assert error.__cause__ is None and error.__suppress_context__
     assert "already exists" not in "".join(traceback.format_exception(error))
     assert error.body == body
+
+
+class StalledBody(httpx.AsyncByteStream):
+    """An error body that starts, then stalls past the read deadline."""
+
+    async def __aiter__(self):
+        yield b'{"error":'
+        raise httpx.ReadTimeout("body stalled")
+
+
+@pytest.mark.parametrize(
+    "status,kind,transient",
+    [
+        (403, mc.PermissionDeniedError, False),
+        (404, mc.NotFoundError, False),
+        (409, mc.ConflictError, True),
+        (503, mc.UnavailableError, True),
+    ],
+)
+async def test_async_error_whose_body_times_out_keeps_its_status(status, kind, transient):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, stream=StalledBody())
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient(
+            "com_test", base_url=BASE, http_client=http, retries={"idempotent": 2}
+        ) as client,
+    ):
+        with pytest.raises(mc.MandalaError) as caught:
+            await client._t.json_object("GET", "/computers/vm-1")
+    error = caught.value
+    assert type(error) is kind and error.status == status
+    assert not isinstance(error, mc.RequestTimeoutError)
+    assert isinstance(error.__cause__, httpx.ReadTimeout)
+    assert mc.is_transient(error) is transient
+    assert len(calls) == 1
+
+
+async def test_async_success_whose_body_times_out_is_still_a_request_timeout():
+    def handler(request):
+        return httpx.Response(200, stream=StalledBody())
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(mc.RequestTimeoutError):
+            await client._t.json_object("GET", "/computers/vm-1")
