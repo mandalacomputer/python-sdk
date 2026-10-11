@@ -174,9 +174,9 @@ def _nonblank(value: object) -> str | None:
 class APIError(MandalaError):
     """The API returned an unsuccessful response."""
 
-    #: Set only by ``_agent_route_error`` in ``_computer``, on a 429 the model
-    #: API answered an agent run with after that run had already taken steps on
-    #: the desktop. :func:`is_transient` reads it and answers ``False``: sending
+    #: Set only by ``_agent_route_error`` in ``_computer``, on a 429 that ended
+    #: an agent run after that run had already taken steps on the desktop —
+    #: the model API's, relayed, or a funded run's provider failure. :func:`is_transient` reads it and answers ``False``: sending
     #: the prompt again would repeat those steps. Private, and a mark rather than
     #: a second copy of the rule, so the route that knows the run and the
     #: predicate that answers for it cannot come to disagree (OPL-5446).
@@ -1065,9 +1065,9 @@ def is_transient(err: BaseException) -> bool:
       minus :class:`MoveRequiredError`, which is a decision rather than a moment
       and ``template_image_preparing``, which requires an explicit continuation
     * :class:`RateLimitError` — a cadence, and the response usually says how long.
-      Minus one: a 429 the model API answered an agent run with (the platform
-      prefixes its message ``model API: ``) after the run had already taken
-      steps. Those steps are on the desktop, and sending the same prompt again
+      Minus one: a 429 that ended an agent run (the model API's, relayed with
+      the prefix ``model API: ``, or a funded run's provider failure) after the
+      run had already taken steps. Those steps are on the desktop, and sending the same prompt again
       repeats them. Read :attr:`~MandalaError.agent` before running again. The
       same relayed 429 before any step is still ``True``: nothing ran, and the
       platform's own 429 on those routes is unchanged.

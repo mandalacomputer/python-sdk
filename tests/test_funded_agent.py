@@ -654,3 +654,67 @@ async def test_async_stream_closes_cleanly_on_a_credits_refusal() -> None:
                 async with aclosing(c.agent_stream("go")) as events:
                     async for _ in events:
                         pass
+
+
+# --- a funded run's provider failure after steps ------------------------------
+
+#: How the platform reports a funded run's model provider failure: the
+#: provider's status, its own fixed sentence and no ``model API: `` prefix.
+FUNDED_429 = {
+    "error": "Mandala AI is unavailable",
+    "usage": {"input_tokens": 3},
+    "steps_taken": [{"n": 1, "tool": "computer", "cost_usd": 0.02}],
+    "cost_usd": 0.02,
+}
+
+
+@respx.mock
+def test_a_funded_429_after_steps_is_not_transient(computer: mc.Computer) -> None:
+    """Without the prefix the relayed-429 rule never saw these, so a funded run
+    that had clicked was called safe to send again — repeating the clicks and
+    spending more credits."""
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(429, json=FUNDED_429),
+            stream(
+                frame("step", FUNDED_STEP),
+                frame("error", {"error": "Mandala AI is unavailable", "status": 429, "steps": []}),
+            ),
+            httpx.Response(429, json={**FUNDED_429, "steps_taken": []}),
+            stream(frame("error", {"error": "Mandala AI is unavailable", "status": 429})),
+        ]
+    )
+    with pytest.raises(mc.RateLimitError) as once_after:
+        computer.agent_once("go")
+    with pytest.raises(mc.RateLimitError) as streamed_after:
+        computer.agent("go")
+    with pytest.raises(mc.RateLimitError) as once_before:
+        computer.agent_once("go")
+    with pytest.raises(mc.RateLimitError) as streamed_before:
+        computer.agent("go")
+    assert mc.is_transient(once_after.value) is False
+    assert mc.is_transient(streamed_after.value) is False
+    # Before any step nothing ran, and the wait is still worth honouring.
+    assert mc.is_transient(once_before.value) is True
+    assert mc.is_transient(streamed_before.value) is True
+
+
+@respx.mock
+async def test_the_async_halves_call_a_funded_429_after_steps_not_transient() -> None:
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(429, json=FUNDED_429),
+            stream(
+                frame("step", FUNDED_STEP),
+                frame("error", {"error": "Mandala AI is unavailable", "status": 429}),
+            ),
+        ]
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.RateLimitError) as once_after:
+            await c.agent_once("go")
+        with pytest.raises(mc.RateLimitError) as streamed_after:
+            await c.agent("go")
+    assert mc.is_transient(once_after.value) is False
+    assert mc.is_transient(streamed_after.value) is False

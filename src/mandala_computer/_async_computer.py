@@ -2671,8 +2671,10 @@ class AsyncComputer(ComputerFields):
         :class:`~mandala_computer.RateLimitError` whose ``limit``,
         ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
         refuse it. Once the run has taken a step,
-        :func:`~mandala_computer.is_transient` answers ``False`` for that 429:
-        running the prompt again would repeat the steps already on the desktop.
+        :func:`~mandala_computer.is_transient` answers ``False`` for any 429
+        that ends it — a funded run's provider failure included, which the
+        platform reports without the ``model API: `` prefix: running the prompt
+        again would repeat the steps already on the desktop.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -2752,7 +2754,8 @@ class AsyncComputer(ComputerFields):
         whose ``retry_after`` is the model API's own wait when it named one,
         and whose ``limit``, ``remaining`` and ``reset`` are ``None``, because
         the Mandala budget did not refuse it; :func:`~mandala_computer.is_transient`
-        answers ``False`` for it when the body lists steps already taken, since
+        answers ``False`` for it — and for any other 429 that ends a run, a
+        funded run's included — when the body lists steps already taken, since
         running the prompt again would repeat them), 504 ``timeout_error``
         (raised as a plain :class:`~mandala_computer.APIError`, not
         :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,

@@ -793,19 +793,36 @@ def test_a_relayed_model_429_after_steps_in_a_200_body_is_not_transient(
 
 
 @respx.mock
-@pytest.mark.parametrize(
-    "body",
-    [{"error": "rate limited"}, {"error": "rate limited", "steps_taken": [{"n": 1}]}],
-    ids=["bare", "with-steps"],
-)
-def test_the_platforms_own_429_on_agent_once_stays_transient(
-    computer: mc.Computer, body: dict[str, Any]
-) -> None:
-    """No prefix: the platform's own budget, whose answer is unchanged."""
-    respx.post(AGENT).mock(httpx.Response(429, json=body, headers=BUDGET_HEADERS))
+def test_the_platforms_own_429_on_agent_once_stays_transient(computer: mc.Computer) -> None:
+    """No prefix and no steps: the platform's own budget, refused before the
+    run began, whose answer is unchanged — budget fields included."""
+    respx.post(AGENT).mock(
+        httpx.Response(429, json={"error": "rate limited"}, headers=BUDGET_HEADERS)
+    )
     with pytest.raises(mc.RateLimitError) as raised:
         computer.agent_once("do the thing", model_key=KEY)
     assert mc.is_transient(raised.value) is True
+    assert raised.value.limit is not None
+
+
+@respx.mock
+def test_any_429_on_agent_once_after_steps_is_not_transient(computer: mc.Computer) -> None:
+    """Without the prefix too (OPL-5866). The platform's own budget refusal
+    comes before any step, so a 429 listing steps ended a run that had already
+    acted — a funded run's provider failure reads exactly like this — and
+    sending the prompt again would repeat those steps. Its budget fields are
+    left as they were; only the replay answer changes."""
+    respx.post(AGENT).mock(
+        httpx.Response(
+            429,
+            json={"error": "rate limited", "steps_taken": [{"n": 1}]},
+            headers=BUDGET_HEADERS,
+        )
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is False
+    assert raised.value.limit is not None
 
 
 @respx.mock
@@ -843,16 +860,17 @@ def test_a_429_mid_stream_before_any_step_stays_transient(computer: mc.Computer,
 
 
 @respx.mock
-def test_the_platforms_own_429_mid_stream_after_a_step_is_unchanged(
+def test_an_unprefixed_429_mid_stream_after_a_step_is_not_transient_either(
     computer: mc.Computer,
 ) -> None:
-    """Only the relayed 429 is marked; the platform's own keeps its answer."""
+    """A 429 on the stream after a step ended a run that had acted, whatever
+    its wording (OPL-5866: a funded run's provider failure has no prefix)."""
     respx.post(AGENT).mock(
         stream(STEP_FRAME, frame("error", '{"error": "slow down", "status": 429}'))
     )
     with pytest.raises(mc.RateLimitError) as raised:
         computer.agent("do the thing", model_key=KEY)
-    assert mc.is_transient(raised.value) is True
+    assert mc.is_transient(raised.value) is False
 
 
 @respx.mock

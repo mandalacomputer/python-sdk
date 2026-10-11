@@ -50,6 +50,11 @@ This is the summary you read to decide whether to upgrade.
   and `ModelProviderError` otherwise, the same as a 402 reported on the
   stream or by `agent_once()`.
 
+- `is_transient()` answers `False` for any 429 that ends an agent run after it
+  has taken steps, not only one carrying the `model API: ` prefix. A funded
+  run reports its model provider's failures without that prefix, so a funded
+  run that had already acted was called safe to send again.
+
 ## [0.11.0] — 2026-10-08
 
 ### Added

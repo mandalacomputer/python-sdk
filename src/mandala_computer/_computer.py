@@ -346,14 +346,17 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     The platform's own 429 on these routes carries no prefix and keeps its
     budget fields.
 
-    A relayed 429 that arrives after the run has already taken steps — listed in
-    the body, or ``steps_seen`` step events delivered by the stream before it —
-    is also marked so that :func:`~mandala_computer.is_transient` answers
-    ``False``. The wait is the model provider's, but the steps are on the
-    desktop, and sending the same prompt again would repeat them. The same 429
-    before any step keeps ``True``: nothing ran. This is the one place the mark
-    is set, and :func:`~mandala_computer.is_transient` the one place it is read
-    (OPL-5446).
+    ANY 429 on these routes that arrives after the run has already taken steps —
+    listed in the body, or ``steps_seen`` step events delivered by the stream
+    before it — is also marked so that :func:`~mandala_computer.is_transient`
+    answers ``False``. Whoever's wait it is, the steps are on the desktop, and
+    sending the same prompt again would repeat them. Not only the relayed ones:
+    a FUNDED run reports its model provider's failures with the platform's own
+    sentence rather than the ``model API: `` prefix, so the prefix cannot be
+    what decides, and the platform's own rate budget refusal comes before any
+    step, so it is never marked. The same 429 before any step keeps ``True``:
+    nothing ran. This is the one place the mark is set, and
+    :func:`~mandala_computer.is_transient` the one place it is read (OPL-5446).
 
     A 504 is the other status that needs a second look. The platform relays the
     model API's own ``timeout_error`` on a failed ``agent_once`` run as an HTTP
@@ -367,6 +370,7 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     """
     if isinstance(exc, (ModelProviderError, CreditsExhaustedError)):
         return exc
+    after_steps = exc.status == 429 and (steps_seen > 0 or _reports_steps(exc.body))
     if exc.status == 402 and _offers_top_up(exc):
         cls: type[APIError] = CreditsExhaustedError
     elif exc.status == 402 or (exc.status in (404, 413) and _relayed_from_model(exc)):
@@ -382,6 +386,8 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     ):
         cls = APIError
     else:
+        if after_steps:
+            exc._after_agent_steps = True
         return exc
     error = cls(
         str(exc),
@@ -396,7 +402,7 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     error.reason = exc.reason
     error.agent = exc.agent
     error.idempotency_key = exc.idempotency_key
-    if cls is RateLimitError and (steps_seen > 0 or _reports_steps(exc.body)):
+    if after_steps:
         error._after_agent_steps = True
     return error
 
@@ -5423,8 +5429,10 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.RateLimitError` whose ``limit``,
         ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
         refuse it. Once the run has taken a step,
-        :func:`~mandala_computer.is_transient` answers ``False`` for that 429:
-        running the prompt again would repeat the steps already on the desktop.
+        :func:`~mandala_computer.is_transient` answers ``False`` for any 429
+        that ends it — a funded run's provider failure included, which the
+        platform reports without the ``model API: `` prefix: running the prompt
+        again would repeat the steps already on the desktop.
 
         This still streams underneath, and that is deliberate: it is the same
         request either way, and the streaming one is the request a proxy between
@@ -5507,7 +5515,8 @@ class Computer(ComputerFields):
         whose ``retry_after`` is the model API's own wait when it named one,
         and whose ``limit``, ``remaining`` and ``reset`` are ``None``, because
         the Mandala budget did not refuse it; :func:`~mandala_computer.is_transient`
-        answers ``False`` for it when the body lists steps already taken, since
+        answers ``False`` for it — and for any other 429 that ends a run, a
+        funded run's included — when the body lists steps already taken, since
         running the prompt again would repeat them), 504 ``timeout_error``
         (raised as a plain :class:`~mandala_computer.APIError`, not
         :class:`~mandala_computer.GatewayTimeoutError`: the platform answered,
