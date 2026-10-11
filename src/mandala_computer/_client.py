@@ -532,11 +532,14 @@ class _BaseTransport:
     ) -> MandalaError:
         if resp is not None and not resp.is_success:
             # An interrupted error body cannot erase a known non-retryable status.
-            return self._error(
+            error = self._error(
                 httpx.Response(
                     resp.status_code, headers=resp.headers, request=resp.request, content=b""
                 )
             )
+            if isinstance(error, APIError):
+                error._body_lost = True
+            return error
         return _request_failed(method, path, exc)
 
     def _timeout_failed(
@@ -1255,6 +1258,8 @@ def _with_idempotency_key(exc: MandalaError, headers: Mapping[str, str] | None) 
         and (
             exc.status >= 500
             or (isinstance(exc.body, dict) and exc.body.get("code") in _KEY_UNSETTLED)
+            # A 409 whose body was cut short may have said exactly that.
+            or (exc.status == 409 and exc._body_lost)
         )
     )
     if unknown:

@@ -170,7 +170,10 @@ This is the summary you read to decide whether to upgrade.
   `RequestTimeoutError`, so `is_transient()` and the browser toolsets' lease
   renewal treated a refusal as a timeout worth sending again. It now raises the
   status's own class (`PermissionDeniedError`, `ConflictError` and so on), with
-  the timeout as its cause; the transport still never replays it on its own.
+  the timeout as its cause; the transport still never replays it on its own. A
+  409 whose body was cut short, by a timeout or an interruption, is not
+  transient, and a keyed call keeps its `idempotency_key` on it: the lost body
+  may have said the call's outcome is unknown.
 
 ## [0.11.0] — 2026-10-08
 

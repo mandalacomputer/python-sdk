@@ -447,7 +447,7 @@ class StalledBody(httpx.AsyncByteStream):
     [
         (403, mc.PermissionDeniedError, False),
         (404, mc.NotFoundError, False),
-        (409, mc.ConflictError, True),
+        (409, mc.ConflictError, False),
         (503, mc.UnavailableError, True),
     ],
 )
@@ -484,3 +484,27 @@ async def test_async_success_whose_body_times_out_is_still_a_request_timeout():
     ):
         with pytest.raises(mc.RequestTimeoutError):
             await client._t.json_object("GET", "/computers/vm-1")
+
+
+@pytest.mark.parametrize("cut", ["timeout", "interrupted"])
+async def test_async_keyed_409_whose_body_is_lost_keeps_its_key(cut):
+    class Cut(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"code":"idempotency_'
+            if cut == "timeout":
+                raise httpx.ReadTimeout("body stalled")
+            raise httpx.ReadError("body interrupted")
+
+    def handler(request):
+        return httpx.Response(409, stream=Cut())
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+    ):
+        with pytest.raises(mc.ConflictError) as caught:
+            await client._t.json_object(
+                "POST", "/computers", json={}, headers={"Idempotency-Key": "k-1"}
+            )
+    assert caught.value.idempotency_key == "k-1"
+    assert not mc.is_transient(caught.value)

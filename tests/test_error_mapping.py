@@ -807,7 +807,7 @@ class StalledBody(httpx.SyncByteStream):
     [
         (403, mc.PermissionDeniedError, False),
         (404, mc.NotFoundError, False),
-        (409, mc.ConflictError, True),
+        (409, mc.ConflictError, False),
         (503, mc.UnavailableError, True),
     ],
 )
@@ -829,9 +829,9 @@ def test_an_error_whose_body_times_out_keeps_its_status(status, kind, transient)
     assert type(error) is kind and error.status == status
     assert not isinstance(error, mc.RequestTimeoutError)
     assert isinstance(error.__cause__, httpx.ReadTimeout)
-    # A 503 on a read may be sent again by a caller; a 409 with its reason lost
-    # reads as any reasonless 409 does. The transport itself never replays a
-    # timed-out exchange.
+    # A 503 on a read may be sent again by a caller; a 409 whose body (and so
+    # its reason, or a keyed call's unknown outcome) was lost is not. The
+    # transport itself never replays a timed-out exchange.
     assert mc.is_transient(error) is transient
     assert len(calls) == 1
 
@@ -846,3 +846,27 @@ def test_a_success_whose_body_times_out_is_still_a_request_timeout():
         pytest.raises(mc.RequestTimeoutError),
     ):
         client._t.json_object("GET", "/computers/vm-1")
+
+
+@pytest.mark.parametrize("cut", ["timeout", "interrupted"])
+def test_a_keyed_409_whose_body_is_lost_keeps_its_key(cut):
+    """The lost body may have said the keyed call's outcome is unknown."""
+
+    class Cut(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"code":"idempotency_'
+            if cut == "timeout":
+                raise httpx.ReadTimeout("body stalled")
+            raise httpx.ReadError("body interrupted")
+
+    def handler(request):
+        return httpx.Response(409, stream=Cut())
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as http,
+        mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        pytest.raises(mc.ConflictError) as caught,
+    ):
+        client._t.json_object("POST", "/computers", json={}, headers={"Idempotency-Key": "k-1"})
+    assert caught.value.idempotency_key == "k-1"
+    assert not mc.is_transient(caught.value)
