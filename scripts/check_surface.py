@@ -75,6 +75,7 @@ LIMITS = [
     ("MAX_ENV_ENTRIES", "exec.maxEnvEntries"),
     ("MAX_ENV_ENTRY_BYTES", "exec.maxEnvEntryBytes"),
     ("MAX_EXEC_TIMEOUT_SECONDS", "exec.maxTimeoutSeconds"),
+    ("WEBHOOK_URL_MAX", "webhook.urlMaxChars"),
     ("WEBHOOK_DESCRIPTION_MAX", "webhook.descriptionMaxChars"),
     ("WEBHOOK_COMPUTERS_MAX", "webhook.computersMax"),
     ("WEBHOOK_REPLAY_WINDOW_S", "webhook.replayWindowSeconds"),

@@ -987,6 +987,35 @@ Chromium to get one:
 A password field's value is never read, and a computer made from an image built
 before page context answers `error` saying so.
 
+**An OpenAI `computer_call` runs as one request.** `input_batch()` takes 1 to 32
+actions in OpenAI's own vocabulary — `click`, `double_click`, `move`, `drag`,
+`scroll`, `keypress`, `type`, `wait` and `screenshot` — and runs them in order
+on one input lane, so no other API input interleaves:
+
+```python
+done = c.input_batch(
+    [
+        {"type": "click", "x": 640, "y": 400, "button": "left"},
+        {"type": "type", "text": "hello"},
+        {"type": "keypress", "keys": ["enter"]},
+    ]
+)
+print(f"{done.completed} actions")
+png = c.screenshot(fresh=True)  # a `screenshot` action is only a marker
+```
+
+From the OpenAI SDK, `[a.model_dump(exclude_none=True) for a in call.actions]`
+is such a list. Each action's shape is checked before anything is sent: an
+unknown `type`, a missing field or one the action does not read raises
+`ValueError`. A batch the platform refuses before any action runs (a
+malformed one, a computer that is not running, the input lane busy) raises the
+ordinary error for its status, and nothing happened. A batch that **stopped
+part-way** raises `InputBatchError`: `e.result.completed` actions ran, and the
+one at `e.result.failed_index` may have partly applied. Never send the same
+batch again automatically, because that repeats what already ran. Take a fresh
+screenshot and decide; `is_transient()` answers `False` for it. `context=True`
+works as it does on a single action.
+
 **Pass `fresh=True` whenever the image is feeding a decision.** A bare
 `screenshot()` may be answered from a frame up to 1.5 seconds old. That is the
 right trade for a thumbnail and the wrong one for a loop: a model shown the
@@ -1627,12 +1656,26 @@ all. Its result also carries `result.steps_taken`, every step the run took; a
 streamed result leaves it empty, because each step already arrived as an
 `AgentStepEvent`.
 
-**A run that ends unfinished does not raise.** `max_steps`, `rate_limited`,
-`refusal`, `max_cost` and `credits_exhausted` all leave real work on the
-desktop, and raising would throw away the
+**A run that ends unfinished does not raise.** Every stop reason but
+`end_turn` leaves real work on the desktop, and raising would throw away the
 only account of what was done to the machine. Check `result.finished`, which is
 `stop == "end_turn"` and nothing else — including for a stop reason added after
-this SDK was written. What *does* raise is a failure the platform reports
+this SDK was written. The others the platform documents:
+
+| `result.stop` | Why the run ended |
+| --- | --- |
+| `end_turn` | The model finished. The only one that means the task is done. |
+| `max_steps` | The run reached `max_steps`. |
+| `rate_limited` | The account's API rate budget ran out mid-run. |
+| `refusal` | The model declined. |
+| `pause_turn` | The model kept pausing its turn. |
+| `credits_exhausted` | A funded run's AI credits became unavailable. |
+| `max_cost` | A funded run's next model call could pass `max_cost_usd`. |
+| `incomplete` | OpenAI left its response unfinished. |
+| `safety_check` | OpenAI wants an action approved before it goes on. |
+
+The model can give a stop reason of its own too, such as `max_tokens`, which is
+why `stop` is a string and not an enum. What *does* raise is a failure the platform reports
 mid-run, as whatever class its status deserves: a bad model key comes back as an
 `AuthenticationError`, not as something your handler cannot classify. A 402 on
 these routes is never your Mandala plan and never raises `PlanLimitError`: one
@@ -2020,11 +2063,10 @@ Approval gives the selected page access to the uploaded bytes; it cannot control
 what that page does with them afterward. Apply account permissions and network
 policy separately.
 
-**Renewable sessions (requires the OPL-5880 platform deployment).** Explicitly
-opt in to a 30-minute active lease, renewed on the same socket up to a two-hour
-absolute limit from creation. Older servers reject this mode; it never silently
-falls back to a ten-minute session. Keep using the legacy examples until the
-updated platform is deployed.
+**Renewable sessions.** Explicitly opt in to a 30-minute active lease, renewed
+on the same socket up to a two-hour absolute limit from creation. A server too
+old for this mode rejects it; it never silently falls back to a ten-minute
+session.
 
 ```python
 from mandala_computer import BrowserSessionPolicy

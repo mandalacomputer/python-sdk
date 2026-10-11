@@ -54,11 +54,16 @@ __all__ = [
     "ExecStatus",
     "FilePart",
     "GuestDirectory",
+    "InputBatchActionResult",
+    "InputBatchResult",
     "InputContext",
     "LifecycleAck",
     "Listing",
     "Move",
     "NoBrowserProxy",
+    "OpenAIButton",
+    "OpenAIComputerAction",
+    "OpenAIPoint",
     "Operation",
     "OperationError",
     "OperationPage",
@@ -2562,6 +2567,188 @@ class TypeResult:
     mechanism: str | None
     #: The desktop just after the typing.
     context: InputContext
+
+
+# --- OpenAI input batches (POST computers/:id/input with an array) ------------
+
+#: A mouse button an OpenAI ``click`` names. ``wheel`` is the middle button.
+OpenAIButton = Literal["left", "right", "wheel", "back", "forward"]
+
+
+class OpenAIPoint(TypedDict):
+    """One waypoint of an OpenAI ``drag``, in screen pixels."""
+
+    x: float
+    y: float
+
+
+class _OpenAIHeldKeys(TypedDict, total=False):
+    #: Keys held around the whole pointer gesture, at most 16. ``None`` is
+    #: OpenAI's "no keys" and is left off the wire.
+    keys: Sequence[str] | None
+
+
+class _OpenAIClickFields(TypedDict):
+    type: Literal["click"]
+    x: float
+    y: float
+    button: OpenAIButton
+
+
+class _OpenAIClick(_OpenAIClickFields, _OpenAIHeldKeys):
+    pass
+
+
+class _OpenAIPointerFields(TypedDict):
+    type: Literal["double_click", "move"]
+    x: float
+    y: float
+
+
+class _OpenAIPointer(_OpenAIPointerFields, _OpenAIHeldKeys):
+    pass
+
+
+class _OpenAIDragFields(TypedDict):
+    type: Literal["drag"]
+    path: Sequence[OpenAIPoint]
+
+
+class _OpenAIDrag(_OpenAIDragFields, _OpenAIHeldKeys):
+    pass
+
+
+class _OpenAIScrollFields(TypedDict):
+    type: Literal["scroll"]
+    x: float
+    y: float
+    scroll_x: float
+    scroll_y: float
+
+
+class _OpenAIScroll(_OpenAIScrollFields, _OpenAIHeldKeys):
+    pass
+
+
+class _OpenAIKeypress(TypedDict):
+    type: Literal["keypress"]
+    keys: Sequence[str]
+
+
+class _OpenAIType(TypedDict):
+    type: Literal["type"]
+    text: str
+
+
+class _OpenAIMarker(TypedDict):
+    type: Literal["wait", "screenshot"]
+
+
+#: One action out of an OpenAI ``computer_call``, as
+#: :meth:`~mandala_computer.Computer.input_batch` takes it: ``click``
+#: (``x``, ``y``, ``button``), ``double_click``, ``move`` (``x``, ``y``),
+#: ``drag`` (``path`` of 2 to 128 points), ``scroll`` (``x``, ``y``,
+#: ``scroll_x``, ``scroll_y``), ``keypress`` (``keys``), ``type`` (``text``),
+#: ``wait`` or ``screenshot``. The pointer actions also take ``keys`` to hold.
+#: An OpenAI SDK action object's ``model_dump(exclude_none=True)`` is one.
+OpenAIComputerAction = (
+    _OpenAIClick
+    | _OpenAIPointer
+    | _OpenAIDrag
+    | _OpenAIScroll
+    | _OpenAIKeypress
+    | _OpenAIType
+    | _OpenAIMarker
+)
+
+
+@dataclass(frozen=True)
+class InputBatchActionResult:
+    """What one completed action of a batch answered."""
+
+    #: The action was carried out.
+    ok: bool
+    #: On a ``type``: ``"physical"``, ``"unicode"`` or ``"mixed"``, as
+    #: :meth:`~mandala_computer.Computer.type` reports it. ``None`` otherwise.
+    mechanism: str | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class InputBatchResult:
+    """What :meth:`~mandala_computer.Computer.input_batch` answers.
+
+    A returned result is a batch that ran in full: :attr:`ok` is ``True`` and
+    :attr:`completed` counts every action sent. A batch that stopped part-way
+    is raised as :class:`~mandala_computer.InputBatchError`, carrying this same
+    shape with ``ok`` ``False``, :attr:`failed_index` and :attr:`error`.
+    """
+
+    ok: bool
+    #: How many actions completed, from the first. Not a rollback guarantee.
+    completed: int
+    #: One per completed action, in order.
+    results: tuple[InputBatchActionResult, ...]
+    #: Zero-based index of the action that failed, on a batch that stopped.
+    #: That action may have partly applied.
+    failed_index: int | None = None
+    #: Why the batch stopped, on a batch that did.
+    error: str | None = None
+    #: The desktop after the batch, for a call made with ``context=True``.
+    context: InputContext | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: object, where: str) -> InputBatchResult:
+        """Strict: ``ok``, ``completed`` and ``results`` are required,
+        ``completed`` must count ``results``, and a stopped batch must say
+        where. ``context`` is decoded by the caller, which knows whether it
+        asked for one."""
+
+        def refuse(name: str, expected: str) -> NoReturn:
+            raise MandalaError(
+                f"expected an input batch result from {where}: {name} must be {expected}"
+            )
+
+        if not isinstance(d, Mapping):
+            refuse("the response", "an object")
+        ok = d.get("ok")
+        if not isinstance(ok, bool):
+            refuse("ok", "true or false")
+        completed = d.get("completed")
+        if isinstance(completed, bool) or not isinstance(completed, int) or completed < 0:
+            refuse("completed", "a nonnegative whole number")
+        rows = d.get("results")
+        if not isinstance(rows, builtins.list):
+            refuse("results", "an array")
+        if len(rows) != completed:
+            refuse("results", f"one result per completed action ({completed})")
+        results = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, Mapping) or not isinstance(row.get("ok"), bool):
+                refuse(f"results[{i}].ok", "true or false")
+            mechanism = row.get("mechanism")
+            if mechanism is not None and not isinstance(mechanism, str):
+                refuse(f"results[{i}].mechanism", "a string when present")
+            results.append(
+                InputBatchActionResult(ok=row["ok"], mechanism=mechanism or None, raw=dict(row))
+            )
+        at = d.get("failed_index")
+        if at is not None and (isinstance(at, bool) or not isinstance(at, int) or at < 0):
+            refuse("failed_index", "a nonnegative whole number when present")
+        error = d.get("error")
+        if error is not None and not isinstance(error, str):
+            refuse("error", "a string when present")
+        if not ok and at is None:
+            refuse("failed_index", "present on a batch that stopped")
+        return cls(
+            ok=ok,
+            completed=int.__index__(completed),
+            results=tuple(results),
+            failed_index=at,
+            error=error or None,
+            raw=dict(d),
+        )
 
 
 @dataclass(frozen=True)

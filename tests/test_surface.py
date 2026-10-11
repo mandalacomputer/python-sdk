@@ -91,11 +91,6 @@ UNIMPLEMENTED = {
 # rule: a route nobody calls sends none of its parameters, and that route's own
 # line already says why. Only a CALLED route's unsent parameter belongs here.
 UNIMPLEMENTED_PARAMETERS = {
-    # OPL-4396: raw OpenAI dialect; typed helpers retain their action vocabulary.
-    "POST computers/:id/input  body:type",
-    "POST computers/:id/input  body:path",
-    "POST computers/:id/input  body:scroll_x",
-    "POST computers/:id/input  body:scroll_y",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
@@ -103,10 +98,6 @@ UNIMPLEMENTED_PARAMETERS = {
     # `keys: ["ctrl", "c"]` is sent instead. The chord-as-one-string form cannot
     # express a key whose own name contains the separator.
     "POST computers/:id/input  body:key",
-    # `scroll_direction` is sent instead — `button` is the flat vocabulary's
-    # name for it, and on a route that also takes a real mouse button that is a
-    # word worth not overloading.
-    "POST computers/:id/input  body:button",
     # `amount` is sent instead. Same value, two names.
     "POST computers/:id/input  body:scroll_amount",
 }
@@ -464,6 +455,20 @@ BUILD_EVENTS = (
 )
 
 
+#: One of every OpenAI action an input batch carries.
+OPENAI_BATCH: list[mc.OpenAIComputerAction] = [
+    {"type": "click", "x": 10, "y": 20, "button": "left", "keys": ["shift"]},
+    {"type": "double_click", "x": 10, "y": 20},
+    {"type": "move", "x": 30, "y": 40},
+    {"type": "drag", "path": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]},
+    {"type": "scroll", "x": 5, "y": 6, "scroll_x": 0, "scroll_y": 300},
+    {"type": "keypress", "keys": ["ctrl", "c"]},
+    {"type": "type", "text": "hello"},
+    {"type": "wait"},
+    {"type": "screenshot"},
+]
+
+
 #: Every public callable in this SDK that can put a request on the wire, by the
 #: class that defines it — read out of the source rather than listed here. See
 #: ``surface_inventory``: the completeness check below it counts ROUTES, and a
@@ -691,6 +696,23 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"text": "on the clipboard"} if get else {"ok": True})
     if path.endswith("/windows"):
         return httpx.Response(200, json={"windows": [WINDOW]})
+    # An OpenAI batch (a JSON array) answers the batch: every action completed,
+    # one result each, and the desktop after it when asked.
+    if path.endswith("/input") and isinstance(json.loads(request.content), list):
+        sent = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "completed": len(sent),
+                "results": [{"ok": True} for _ in sent],
+                **(
+                    {"context": {"windows": [WINDOW], "focused": WINDOW}}
+                    if request.url.params.get("context") == "1"
+                    else {}
+                ),
+            },
+        )
     # An input call that asked for the desktop afterwards (OPL-5472) gets it, in
     # the platform's shape; one that did not falls through to the plain ack.
     if path.endswith("/input") and request.url.params.get("context") == "1":
@@ -814,6 +836,12 @@ def sent_parameters(calls: object) -> dict[str, set[str]]:
             body = json.loads(request.content or b"null")
             if isinstance(body, dict):
                 names.update(f"body:{key}" for key in body)
+            # An array body (an OpenAI input batch): each object's fields are
+            # the route's body parameters as much as a lone object's are.
+            if isinstance(body, list):
+                names.update(
+                    f"body:{key}" for item in body if isinstance(item, dict) for key in item
+                )
     return found
 
 
@@ -943,6 +971,9 @@ def exercise_everything(client: mc.Client) -> None:
     c.type("hi")
     c.paste("Café")
     c.paste("ls", shift=True)
+    # An OpenAI batch, every action type in one, and again asking for context.
+    c.input_batch(OPENAI_BATCH)
+    c.input_batch([{"type": "wait"}], context=True)
     c.key("ctrl", "c")
     c.hold_key("shift", seconds=1)
     c.wait(1)
@@ -1257,6 +1288,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.type("hi")
     await c.paste("Café")
     await c.paste("ls", shift=True)
+    await c.input_batch(OPENAI_BATCH)
+    await c.input_batch([{"type": "wait"}], context=True)
     await c.key("ctrl", "c")
     await c.hold_key("shift", seconds=1)
     await c.wait(1)
@@ -1511,6 +1544,22 @@ def test_every_documented_parameter_is_sent_or_pinned_as_unsent(client: mc.Clien
         f"documented parameters this SDK never sends: {sorted(unsent)}. "
         "Send them, or pin them in UNIMPLEMENTED_PARAMETERS with the reason."
     )
+
+
+@respx.mock
+def test_no_parameter_pinned_as_unsent_is_sent(client: mc.Client) -> None:
+    """A pin that says a parameter is never sent, beside a call that sends it,
+    is a reason that stopped being true. The OpenAI batch is what made four of
+    them false at once."""
+    route = respx.route(host="api.test").mock(side_effect=api_handler)
+    exercise_everything(client)
+    sent = sent_parameters(route.calls)
+    stale = {
+        pin
+        for pin in UNIMPLEMENTED_PARAMETERS
+        if pin.split("  ")[1] in sent.get(pin.split("  ")[0], set())
+    }
+    assert not stale, f"pinned as unsent, and sent: {sorted(stale)}"
 
 
 def test_every_unsent_parameter_pin_is_a_documented_parameter_of_a_called_route() -> None:

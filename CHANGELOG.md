@@ -11,6 +11,47 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **Drive a browser with Claude's browser toolset.** `mandala_computer.anthropic`
+  has `MandalaBrowserToolset` and `AsyncMandalaBrowserToolset`, drivers for
+  Anthropic's browser tool runner: an isolated Chromium context on a running
+  computer, reached over an authenticated WSS DevTools connection. Navigation
+  and every HTTP(S) request, redirects included, are checked against the URL
+  policy you give; JavaScript is opt-in and asks for confirmation; nothing is
+  replayed after expiry or a disconnect; and closing the toolset disposes the
+  context and revokes its grant. Install with
+  `pip install 'mandala-computer[anthropic]'`.
+
+- **Files in the browser toolset, opt-in.** `BrowserFilePolicy` allows uploads
+  only of files you stage first (`stage_local_file`, `stage_guest_file`,
+  `stage_document`), each an immutable `BrowserStagedFile` bound to one
+  browser context. It also allows downloads into a bounded Linux guest
+  quarantine, each a sealed `BrowserDownload` that gets a readable guest path
+  only when your `approve_download` returns `True`. Raw paths and document
+  retrieval are refused by default.
+
+- **Browser connections on `Computer`**, sync and async:
+  `create_browser_connection()`, `renew_browser_connection()` and
+  `revoke_browser_connection()`, with `BrowserConnection` (a revocable DevTools
+  capability whose token is a secret). Without a policy a connection keeps the
+  ten-minute lease. Pass a `BrowserSessionPolicy` to opt into a renewable
+  session: 30-minute leases, renewed automatically by the browser toolsets up
+  to a two-hour absolute limit. Its deadlines are on `BrowserSessionLease`.
+
+- **`provider=` on `agent()`, `agent_once()` and `agent_stream()`**, sync and
+  async: `"anthropic"` or `"openai"`, typed as `AgentProvider`. Left out, the
+  platform infers it from `model`; any other value is refused before sending.
+  An OpenAI run uses your own OpenAI key as `model_key`.
+
+- **`input_batch(actions, context=)`**, sync and async: run 1 to 32 OpenAI
+  computer actions (`click`, `double_click`, `move`, `drag`, `scroll`,
+  `keypress`, `type`, `wait`, `screenshot`) as one request, in OpenAI's own
+  vocabulary, typed as `OpenAIComputerAction`. The batch's shape is checked
+  before anything is sent. It answers an `InputBatchResult`. A batch refused
+  before any action ran raises the ordinary error for its status. A batch that
+  stopped part-way raises `InputBatchError`, whose `result` says how many
+  actions completed and which one failed; `is_transient()` answers `False` for
+  it, and the SDK never sends a batch twice.
+
 - **Run the agent on your account's AI credits**, sync and async. Leave
   `model_key` out of `agent()`, `agent_once()` or `agent_stream()` and the run
   is funded: no `X-Model-Key` is sent, and an eligible account's Mandala AI
@@ -38,6 +79,14 @@ This is the summary you read to decide whether to upgrade.
 
 ### Changed
 
+- A webhook `url` longer than the platform's 2048 characters, counted as it
+  counts them, is refused before sending rather than by a 400.
+
+- `AgentResult.stop` documents every stop reason the platform sends:
+  `pause_turn`, `credits_exhausted`, `max_cost`, `incomplete` and
+  `safety_check` beside `end_turn`, `max_steps`, `rate_limited` and
+  `refusal`.
+
 - **`model_key` is optional on the agent methods.** Leaving it out (or passing
   `None`) used to raise `MandalaError`; it now starts a funded run on the
   account's AI credits, where the account is eligible. A blank key is still
@@ -47,9 +96,9 @@ This is the summary you read to decide whether to upgrade.
 ### Fixed
 
 - A 402 answered before an agent stream opened was raised as
-  `PlanLimitError`. It is `InsufficientCreditsError` when it carries `top_up_url`
-  and `ModelProviderError` otherwise, the same as a 402 reported on the
-  stream or by `agent_once()`.
+  `PlanLimitError`. It is now classified the way a 402 reported on the stream
+  or by `agent_once()` is: `InsufficientCreditsError` when it carries
+  `top_up_url`, and never the plan.
 
 - `is_transient()` answers `False` for any 429 that ends an agent run after it
   has taken steps, not only one carrying the `model API: ` prefix. A funded

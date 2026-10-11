@@ -14,7 +14,7 @@ import shlex
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -1946,6 +1946,102 @@ def input_params(context: bool) -> dict[str, str] | None:
     return {"context": "1"} if flag(context, "context") else None
 
 
+#: The most actions one OpenAI input batch carries.
+INPUT_BATCH_MAX = 32
+#: The fields each OpenAI action reads beside ``type``: the platform's own table.
+_OPENAI_FIELDS: dict[str, tuple[str, ...]] = {
+    "click": ("x", "y", "button", "keys"),
+    "double_click": ("x", "y", "keys"),
+    "move": ("x", "y", "keys"),
+    "drag": ("path", "keys"),
+    "scroll": ("x", "y", "scroll_x", "scroll_y", "keys"),
+    "keypress": ("keys",),
+    "type": ("text",),
+    "wait": (),
+    "screenshot": (),
+}
+_OPENAI_BUTTONS = ("left", "right", "wheel", "back", "forward")
+
+
+def input_batch_body(actions: object) -> list[dict[str, Any]]:
+    """The body of an OpenAI batch: the actions as a JSON array, each checked
+    before anything is sent.
+
+    Checked for SHAPE — a known ``type``, the fields that type needs with the
+    right types, and no field it does not read — rather than for the
+    platform's budgets (typed characters, wheel notches, drag points and waits
+    summed over the batch), which it refuses itself before anything runs. A
+    field the type does not read is refused rather than dropped, as the
+    platform refuses it, so no part of a model's action silently disappears on
+    the way. ``keys: None`` is OpenAI's "no keys" and is left off the wire. The
+    TypeScript SDK's ``inputBatchBody`` draws the same lines.
+    """
+    if isinstance(actions, (str, bytes, Mapping)) or not isinstance(actions, Sequence):
+        raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
+            f"actions must be a list of OpenAI actions, not {type(actions).__name__}"
+        )
+    if not 1 <= len(actions) <= INPUT_BATCH_MAX:
+        raise ValueError(f"a batch holds 1 to {INPUT_BATCH_MAX} actions, not {len(actions)}")
+    body: list[dict[str, Any]] = []
+    for i, action in enumerate(actions):
+        at = f"actions[{i}]"
+        if not isinstance(action, Mapping):
+            raise ValueError(f"{at} must be an object, not {type(action).__name__}")  # noqa: TRY004
+        kind = action.get("type")
+        reads = _OPENAI_FIELDS.get(kind) if isinstance(kind, str) else None
+        if reads is None:
+            raise ValueError(f"{at}.type must be one of {', '.join(_OPENAI_FIELDS)}, not {kind!r}")
+        for key in action:
+            if key != "type" and key not in reads:
+                raise ValueError(f"{at}: OpenAI {kind} does not take {key!r}")
+        out: dict[str, Any] = {"type": kind}
+        if "x" in reads:
+            out["x"] = real(action.get("x"), f"{at}.x")
+            out["y"] = real(action.get("y"), f"{at}.y")
+        if kind == "click":
+            button = action.get("button")
+            if button not in _OPENAI_BUTTONS:
+                raise ValueError(f"{at}.button must be one of {', '.join(_OPENAI_BUTTONS)}")
+            out["button"] = button
+        if kind == "drag":
+            path = action.get("path")
+            if isinstance(path, (str, bytes)) or not isinstance(path, Sequence) or len(path) < 2:
+                raise ValueError(f"{at}.path must be at least two {{x, y}} points")
+            points = []
+            for j, point in enumerate(path):
+                if not isinstance(point, Mapping) or set(point) != {"x", "y"}:
+                    raise ValueError(f"{at}.path[{j}] must be an {{x, y}} point")
+                points.append(
+                    {
+                        "x": real(point["x"], f"{at}.path[{j}].x"),
+                        "y": real(point["y"], f"{at}.path[{j}].y"),
+                    }
+                )
+            out["path"] = points
+        if kind == "scroll":
+            out["scroll_x"] = real(action.get("scroll_x"), f"{at}.scroll_x")
+            out["scroll_y"] = real(action.get("scroll_y"), f"{at}.scroll_y")
+        if kind == "type":
+            text = action.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"{at}.text must be a nonempty string")
+            out["text"] = canonical(text, f"{at}.text")
+        if "keys" in reads:
+            keys = action.get("keys")
+            if kind == "keypress" or keys is not None:
+                if (
+                    isinstance(keys, (str, bytes))
+                    or not isinstance(keys, Sequence)
+                    or not all(isinstance(k, str) for k in keys)
+                ):
+                    raise ValueError(f"{at}.keys must be a list of key names")
+                if kind == "keypress" and not keys:
+                    raise ValueError(f"{at}.keys must name at least one key")
+                out["keys"] = [canonical(k, f"{at}.keys") for k in keys]
+        body.append(out)
+    return body
+
+
 def drag_body(
     from_x: int | None,
     from_y: int | None,
@@ -2339,7 +2435,7 @@ def agent_body(
     system: str | None = None,
     max_steps: int | None = None,
     model: str | None = None,
-    provider: str | None = None,
+    provider: Literal["anthropic", "openai"] | None = None,
     max_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     """One agent run's request.
@@ -2434,6 +2530,10 @@ def webhook_action(webhook_id: str, action: str) -> str:
 #: the platform's own number by ``scripts/check_surface.py``, so the copy
 #: cannot drift unnoticed.
 WEBHOOK_DESCRIPTION_MAX = 200
+#: The ceiling on a subscription's ``url``, mirrored and drift-checked the same
+#: way. Counted as the platform counts it, in UTF-16 code units, so a character
+#: outside the Basic Multilingual Plane counts twice.
+WEBHOOK_URL_MAX = 2048
 #: The ceiling on ``computers``, mirrored from the platform's own the same way.
 WEBHOOK_COMPUTERS_MAX = 64
 #: The replay window, mirrored from the platform's own number. Lives in
@@ -2475,6 +2575,9 @@ def _webhook_url(url: object) -> str:
     text = canonical(url, "url")
     if not text.startswith("https://") or len(text) == len("https://"):
         raise ValueError(f"url must be https:// and name a host: {text!r}")
+    units = len(text.encode("utf-16-le", "surrogatepass")) // 2
+    if units > WEBHOOK_URL_MAX:
+        raise ValueError(f"url must be at most {WEBHOOK_URL_MAX} characters, not {units}")
     return text
 
 

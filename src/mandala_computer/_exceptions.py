@@ -9,7 +9,7 @@ from urllib.parse import urljoin, urlsplit
 
 if TYPE_CHECKING:
     from ._agent import AgentFailed
-    from ._models import Operation
+    from ._models import InputBatchResult, Operation
 
 __all__ = [
     "APIError",
@@ -22,6 +22,7 @@ __all__ = [
     "FileExistsError",
     "FileTooLargeError",
     "GatewayTimeoutError",
+    "InputBatchError",
     "InsufficientCreditsError",
     "MandalaError",
     "MethodNotAllowedError",
@@ -368,6 +369,56 @@ class InsufficientCreditsError(APIError):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         return float(value) if math.isfinite(value) else None
+
+
+class InputBatchError(APIError):
+    """An OpenAI input batch that stopped part-way.
+
+    Raised by :meth:`~mandala_computer.Computer.input_batch` when the platform
+    answers with the batch as far as it went rather than with an ordinary
+    error: :attr:`result` is that answer, ``ok`` ``False``, with
+    ``result.completed`` actions carried out and the one at
+    ``result.failed_index`` possibly partly applied. :attr:`status` is the
+    status of what stopped it — 400, 409, 502 or 503, or 200 for an answer that
+    contradicted itself — but the class is not that status's own: a
+    :class:`ConflictError` or an :class:`UnavailableError` would call sending
+    the batch again worth trying, and it is not.
+
+    **Never send the same batch again automatically.** That repeats what
+    already ran. Look at a fresh screenshot first; :func:`is_transient`
+    answers ``False``. A batch refused BEFORE any action ran — malformed, a
+    computer that is not running, the input lane busy — is the ordinary error
+    for its status instead, and nothing happened.
+    """
+
+    #: The batch as far as it went: ``ok`` ``False``, ``completed``,
+    #: ``failed_index``, ``error`` and one result per completed action.
+    result: InputBatchResult
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        result: InputBatchResult,
+        body: object = None,
+        retry_after: float | None = None,
+        request_id: str | None = None,
+        allow: str | None = None,
+        www_authenticate: str | None = None,
+        method: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            status=status,
+            body=body,
+            retry_after=retry_after,
+            request_id=request_id,
+            allow=allow,
+            www_authenticate=www_authenticate,
+            method=method,
+        )
+        self.result = result
 
 
 class ModelProviderError(APIError):
@@ -1179,6 +1230,10 @@ def is_transient(err: BaseException) -> bool:
     only ever replays a read.
     """
     if isinstance(err, MoveRequiredError):
+        return False
+    # A batch that stopped part-way: the actions before it ran, and sending it
+    # again repeats them, whatever the status of what stopped it.
+    if isinstance(err, InputBatchError):
         return False
     # A relayed model 429 on an agent run that had already acted: the wait is
     # the model provider's, but replaying the prompt repeats the steps it took.
