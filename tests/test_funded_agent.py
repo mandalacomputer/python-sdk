@@ -718,3 +718,81 @@ async def test_the_async_halves_call_a_funded_429_after_steps_not_transient() ->
             await c.agent("go")
     assert mc.is_transient(once_after.value) is False
     assert mc.is_transient(streamed_after.value) is False
+
+
+# --- a funded run's provider 404/413/429, which carry no prefix ---------------
+
+BUDGET = {"RateLimit-Limit": "100", "RateLimit-Remaining": "0", "RateLimit-Reset": "30"}
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [404, 413])
+def test_a_funded_providers_404_or_413_is_the_model_provider(
+    computer: mc.Computer, status: int
+) -> None:
+    """The platform keeps the provider's status and replaces its words with its
+    own fixed sentence. Read as the platform's own 404 or 413, a funded run's
+    provider failure would send a caller into missing-computer recovery."""
+    failure = {"error": "Mandala AI is unavailable", "usage": {}, "steps_taken": []}
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(status, json=failure),
+            stream(frame("error", {**failure, "status": status, "steps": []})),
+        ]
+    )
+    with pytest.raises(mc.ModelProviderError) as once:
+        computer.agent_once("go")
+    with pytest.raises(mc.ModelProviderError) as streamed:
+        computer.agent("go")
+    for error in (once.value, streamed.value):
+        assert error.status == status
+        assert not isinstance(error, (mc.NotFoundError, mc.FileTooLargeError))
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [404, 413])
+async def test_the_async_halves_read_a_funded_404_or_413_the_same_way(status: int) -> None:
+    failure = {"error": "Mandala AI is unavailable", "usage": {}, "steps_taken": []}
+    respx.post(AGENT).mock(
+        side_effect=[
+            httpx.Response(status, json=failure),
+            stream(frame("error", {**failure, "status": status})),
+        ]
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.ModelProviderError):
+            await c.agent_once("go")
+        with pytest.raises(mc.ModelProviderError):
+            await c.agent("go")
+
+
+@respx.mock
+def test_a_funded_providers_429_does_not_describe_the_mandala_budget(
+    computer: mc.Computer,
+) -> None:
+    respx.post(AGENT).mock(
+        httpx.Response(
+            429,
+            json={"error": "Mandala AI is unavailable", "usage": {}, "steps_taken": []},
+            headers={**BUDGET, "Retry-After": "7"},
+        )
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("go")
+    assert raised.value.limit is None and raised.value.remaining is None
+    assert raised.value.retry_after == 7
+    assert mc.is_transient(raised.value) is True
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [404, 413])
+def test_the_platforms_own_404_or_413_keeps_its_class_on_a_funded_run(
+    computer: mc.Computer, status: int
+) -> None:
+    respx.post(AGENT).mock(
+        httpx.Response(status, json={"error": "no such computer", "usage": {}, "steps_taken": []})
+    )
+    with pytest.raises((mc.NotFoundError, mc.FileTooLargeError)) as raised:
+        computer.agent_once("go")
+    assert not isinstance(raised.value, mc.ModelProviderError)

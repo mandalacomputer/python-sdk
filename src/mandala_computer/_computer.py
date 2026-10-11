@@ -268,6 +268,12 @@ def _agent_once_outcome(data: Mapping[str, Any]) -> AgentResult:
 #: none, so this is what tells a status the model API answered from the same
 #: status answered by the platform.
 _MODEL_API_PREFIX = "model API: "
+#: What the platform says IN PLACE of the model API's message when the run was
+#: FUNDED (no ``model_key``): the provider's status is kept, and its words —
+#: which on a funded run are about the platform's own provider account — are
+#: replaced by this one fixed sentence. The same sentence also refuses a funded
+#: run with 503 before it starts, a status nothing here re-classifies.
+_FUNDED_PROVIDER_FAILURE = "Mandala AI is unavailable"
 
 
 def _relayed_from_model(exc: APIError) -> bool:
@@ -276,13 +282,16 @@ def _relayed_from_model(exc: APIError) -> bool:
     Read off the body: a non-streaming answer's JSON body, or the ``error``
     frame a stream reported, which :func:`_agent_outcome` hands over as the
     body. Either way it is the platform's ``error`` text, and the platform
-    prefixes only what the model API said.
+    prefixes only what the model API said — or, on a funded run, replaces it
+    with :data:`_FUNDED_PROVIDER_FAILURE`.
     """
     body = exc.body
     if not isinstance(body, Mapping):
         return False
     message = body.get("error")
-    return isinstance(message, str) and message.startswith(_MODEL_API_PREFIX)
+    return isinstance(message, str) and (
+        message.startswith(_MODEL_API_PREFIX) or message == _FUNDED_PROVIDER_FAILURE
+    )
 
 
 def _reports_steps(body: object) -> bool:
@@ -326,7 +335,8 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     first one did.
 
     So is a 404 or a 413 the model API answered, told apart from the platform's
-    own by the ``model API: `` prefix the platform puts on everything it relays
+    own by the ``model API: `` prefix the platform puts on everything it relays,
+    or by the fixed sentence that replaces the provider's words on a funded run
     (see :func:`_relayed_from_model`). The table would call them
     :class:`~mandala_computer.NotFoundError` (no such computer) and
     :class:`~mandala_computer.FileTooLargeError` (page the transfer), and

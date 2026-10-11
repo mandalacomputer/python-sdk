@@ -55,6 +55,12 @@ This is the summary you read to decide whether to upgrade.
   run reports its model provider's failures without that prefix, so a funded
   run that had already acted was called safe to send again.
 
+- A funded run's model provider failure, which the platform reports with the
+  provider's status and its own fixed sentence instead of the `model API: `
+  prefix, is classified like the same failure on your own key: a 404 or 413
+  is `ModelProviderError` rather than `NotFoundError` or `FileTooLargeError`,
+  and a 429 carries no Mandala budget fields.
+
 ## [0.11.0] — 2026-10-08
 
 ### Added
