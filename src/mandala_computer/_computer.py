@@ -19,6 +19,7 @@ from ._agent import (
     AgentDone,
     AgentEvent,
     AgentFailed,
+    AgentProvider,
     AgentResult,
     AgentStepEvent,
     to_agent_event,
@@ -61,6 +62,7 @@ from ._exceptions import (
     CreateOnlyConflictError,
     FileExistsError,
     GatewayTimeoutError,
+    InputBatchError,
     InsufficientCreditsError,
     MandalaError,
     ModelProviderError,
@@ -85,9 +87,12 @@ from ._models import (
     ExecStatus,
     FilePart,
     GuestDirectory,
+    InputBatchResult,
     InputContext,
     Listing,
     Move,
+    OpenAIActionObject,
+    OpenAIComputerAction,
     PageContext,
     ScreenshotInfo,
     SecretBinding,
@@ -873,6 +878,97 @@ def _started_key(stamp: str) -> tuple[int, float]:
 #: seconds for the whole request and its proxy 95, and this adds the slack every
 #: guest deadline gets.
 UNICODE_TYPE_TIMEOUT = 95.0 + DEADLINE_SLACK
+#: How long an OpenAI input batch may take: the platform's proxy allows 93
+#: seconds for the batch, its context read and transport together, and this
+#: adds the same slack.
+INPUT_BATCH_TIMEOUT = 93.0 + DEADLINE_SLACK
+
+
+def _batch_answer(body: object) -> bool:
+    """Whether a refusal's body is a batch's own result rather than an ordinary
+    error: the platform tells the two apart by ``completed``, which an ordinary
+    error never carries."""
+    return isinstance(body, Mapping) and "completed" in body
+
+
+def _input_batch_outcome(
+    data: Mapping[str, Any], sent: int, where: str, asked: bool
+) -> InputBatchResult:
+    """A 200's batch answer, raised as :class:`InputBatchError` if it stopped.
+
+    A success status with a stopped batch contradicts the platform's own
+    contract; it is reported the way a stopped batch is, so a returned result
+    always ran in full. So is any other sign of a failure beside ``ok: true``:
+    fewer actions than were sent, an action whose own ``ok`` is false, a
+    ``failed_index`` or an ``error``. Each is evidence that something did not
+    run, and a caller handed back a success would carry on as if it had."""
+    result = InputBatchResult.from_api(data, where)
+    if (
+        not result.ok
+        or result.completed != sent
+        or not all(action.ok for action in result.results)
+        or result.failed_index is not None
+        or result.error is not None
+    ):
+        raise InputBatchError(
+            result.error or f"the batch stopped after {result.completed} of {sent} actions",
+            status=200,
+            result=replace(result, ok=False),
+            body=data,
+            method="POST",
+        )
+    return replace(result, context=_input_context(data)) if asked else result
+
+
+#: The statuses a batch that stopped part-way is answered with: the platform's
+#: reference lists a batch result beside the ordinary error on exactly these.
+_BATCH_FAILURE_STATUSES = frozenset({400, 409, 502, 503})
+
+
+#: Fields only a batch's own result carries. Any of them in a refusal's body is
+#: evidence the batch began, whether or not the rest of the result is there.
+_BATCH_RESULT_FIELDS = ("completed", "results", "failed_index")
+
+
+def _ordinary_refusal(body: object) -> bool:
+    """Whether a refusal's body reads as the platform's ordinary error: an
+    object with an ``error`` sentence and nothing of a batch result in it."""
+    if not isinstance(body, Mapping) or any(f in body for f in _BATCH_RESULT_FIELDS):
+        return False
+    error = body.get("error")
+    return isinstance(error, str) and bool(error.strip())
+
+
+def _input_batch_refusal(exc: APIError, where: str) -> APIError:
+    """A refusal answered with the batch as far as it went, as
+    :class:`InputBatchError`; any other refusal as it was.
+
+    The platform tells a refusal before any action ran (its ordinary error) from
+    a batch that stopped part-way (the batch's own result) by ``completed``. A
+    body that is neither — interrupted in flight, empty, a proxy's page —
+    cannot say which one this was, at a status that can carry either. Such an
+    error keeps its class, and is marked so that
+    :func:`~mandala_computer.is_transient` answers ``False``: a 409's class
+    would otherwise call sending the batch again worth trying, and actions may
+    already have run.
+    """
+    if not _batch_answer(exc.body):
+        if exc.status in _BATCH_FAILURE_STATUSES and not _ordinary_refusal(exc.body):
+            exc._batch_outcome_unknown = True
+        return exc
+    error = InputBatchError(
+        str(exc),
+        status=exc.status,
+        result=InputBatchResult.from_api(exc.body, where),
+        body=exc.body,
+        retry_after=exc.retry_after,
+        request_id=exc.request_id,
+        allow=exc.allow,
+        www_authenticate=exc.www_authenticate,
+        method=exc.method,
+    )
+    error.reason = exc.reason
+    return error
 
 
 def _mechanism(res: Mapping[str, Any]) -> str | None:
@@ -4198,6 +4294,62 @@ class Computer(ComputerFields):
         body = _api.wait_body(seconds)
         return self._acted(body, params, timeout=seconds + DEADLINE_SLACK)
 
+    def input_batch(
+        self,
+        actions: Sequence[OpenAIComputerAction | OpenAIActionObject],
+        *,
+        context: bool = False,
+    ) -> InputBatchResult:
+        """Run a batch of OpenAI computer actions, in order, as one request.
+
+        What an OpenAI ``computer_call`` hands you, forwarded without
+        translation: 1 to 32 actions in OpenAI's own vocabulary — ``click``,
+        ``double_click``, ``move``, ``drag``, ``scroll``, ``keypress``,
+        ``type``, ``wait`` and ``screenshot``. Each is a mapping such as
+        ``{"type": "click", "x": 640, "y": 400, "button": "left"}``, or the
+        ``openai`` package's own action object, taken as it is::
+
+            done = c.input_batch(call.actions)
+            print(f"{done.completed} actions")
+
+        The whole batch is checked first, here for shape and then by the
+        platform for its budgets, before a suspended computer is woken or
+        anything is sent, and it runs on one input lane so no other API input
+        interleaves. ``screenshot`` is a marker answered with ``ok``: read the
+        picture with :meth:`screenshot` afterwards. ``context=True`` adds the
+        desktop after the batch, as :meth:`click` does.
+
+        A batch REFUSED before any action ran — a malformed one, a computer
+        that is not running, the input lane busy — raises the ordinary error
+        for its status, and nothing happened. One whose answer could not be
+        read at all (interrupted, empty, a proxy's page) keeps its status's
+        class but is not known to have run nothing, so
+        :func:`~mandala_computer.is_transient` answers ``False`` for it too. A
+        batch that STOPPED PART-WAY
+        raises :class:`~mandala_computer.InputBatchError`: ``result.completed``
+        actions ran, and the one at ``result.failed_index`` may have partly
+        applied. **Never send the same batch again automatically** — that
+        repeats what already ran. Look at a fresh screenshot first;
+        :func:`~mandala_computer.is_transient` answers ``False`` for it.
+
+        Sent with a deadline of at least 108 seconds, whatever the client's
+        default: the platform's proxy allows the batch 93.
+        """
+        params = _api.input_params(context)
+        body = _api.input_batch_body(actions)
+        path = _api.computer_action(self.id, "input")
+        where = f"POST {path}"
+        try:
+            data = self._t.json_object(
+                "POST", path, json=body, params=params, timeout=INPUT_BATCH_TIMEOUT
+            )
+        except APIError as exc:
+            error = _input_batch_refusal(exc, where)
+            if error is exc:
+                raise
+            raise error from None
+        return _input_batch_outcome(data, len(body), where, bool(params))
+
     def cursor_position(self) -> tuple[int, int] | None:
         """Where the pointer is, or ``None`` if nothing has placed it yet.
 
@@ -5345,7 +5497,7 @@ class Computer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
-        provider: str | None = None,
+        provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
     ) -> Iterator[AgentEvent]:
         """Have the platform drive this computer, reporting as it goes.
@@ -5373,6 +5525,12 @@ class Computer(ComputerFields):
         unsupported billing country, or funded runs not enabled) gets a 400 or
         a 403 saying to send a key. A custom ``system`` prompt, another model or
         ``provider="openai"`` need your own key.
+
+        ``provider`` is ``"anthropic"`` or ``"openai"``, inferred from
+        ``model`` when omitted (``claude-*`` is Anthropic, ``gpt-*`` and the
+        o-series OpenAI) and Anthropic when neither is given; OpenAI defaults
+        to ``gpt-6.1-sol``. A model name the platform does not recognise needs
+        it. Anything else is refused before the request is sent.
 
         The computer must already be RUNNING. This route will not start one:
         starting is billable, and it is not a decision to make on somebody's
@@ -5449,7 +5607,7 @@ class Computer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
-        provider: str | None = None,
+        provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
     ) -> AgentResult:
         """:meth:`agent_stream`, waited out — one call, one result.
@@ -5538,7 +5696,7 @@ class Computer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
-        provider: str | None = None,
+        provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
     ) -> AgentResult:
         """The agent loop as a single non-streaming request.

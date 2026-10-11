@@ -359,6 +359,24 @@ def test_the_computer_cap_is_the_platforms() -> None:
         _api.webhook_body(create=False, computers=[f"vm-{i}" for i in range(65)])
 
 
+def test_the_url_cap_is_the_platforms_and_counted_its_way() -> None:
+    """``webhook.urlMaxChars``, refused here rather than by a 400 — and counted
+    as the platform counts a string, in UTF-16 code units, so a character
+    outside the Basic Multilingual Plane is two of them."""
+    assert _api.WEBHOOK_URL_MAX == 2048
+    head = "https://h.example/"
+    exact = head + "a" * (2048 - len(head))
+    assert _api.webhook_body(create=True, url=exact)["url"] == exact
+    with pytest.raises(ValueError, match="at most 2048"):
+        _api.webhook_body(create=True, url=exact + "a")
+    # 2047 code points, 2048 code units: at the cap, not past it.
+    astral = head + "a" * (2048 - len(head) - 2) + "\U0001f600"
+    assert len(astral) == 2047
+    assert _api.webhook_body(create=False, url=astral)["url"] == astral
+    with pytest.raises(ValueError, match="not 2049"):
+        _api.webhook_body(create=False, url=astral + "a")
+
+
 def test_the_description_cap_is_the_platforms() -> None:
     assert _api.WEBHOOK_DESCRIPTION_MAX == 200
     assert _api.webhook_body(create=False, description="x" * 200)["description"] == "x" * 200

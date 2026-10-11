@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ._exceptions import top_up_link
 
@@ -34,12 +34,23 @@ __all__ = [
     "AgentDone",
     "AgentEvent",
     "AgentFailed",
+    "AgentProvider",
     "AgentResult",
     "AgentStep",
     "AgentStepEvent",
     "AgentText",
     "AgentUsage",
 ]
+
+
+#: Which model provider runs an agent loop: the ``provider=`` of
+#: :meth:`~mandala_computer.Computer.agent` and its siblings. Inferred from
+#: ``model`` when omitted — ``claude-*`` is Anthropic, ``gpt-*`` and the
+#: o-series OpenAI — and Anthropic when neither is given; OpenAI defaults to
+#: ``gpt-6.1-sol``. A model name the platform does not recognise needs it, and a
+#: recognised model with the other provider is refused. OpenAI needs your own
+#: ``model_key``.
+AgentProvider = Literal["anthropic", "openai"]
 
 
 def _num(value: Any) -> int:
@@ -68,13 +79,19 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _usd(value: Any) -> float | None:
+def _usd(value: Any, *, signed: bool = False) -> float | None:
     """A dollar figure off the wire, or ``None`` where there is none to read.
 
     ``None`` rather than :func:`_num`'s zero, because absence is the answer
     here: a run on your own key carries no charge figures at all, and a zero
-    would claim it cost nothing on credits it never touched. A boolean is not a
-    figure (``float(True)`` is ``1.0``), and neither is NaN or an infinity.
+    would claim it cost nothing on credits it never touched. Only a NUMBER the
+    platform sent counts — a boolean (``float(True)`` is ``1.0``), a numeric
+    string, NaN and the infinities are not coerced into one — and a charge is
+    never negative; ``signed`` is for the one figure that can be, the balance
+    left after an overrun. ``None`` rather than raised, because this runs
+    inside a caller's loop over a live run, which must not end over a figure it
+    could have done without. The TypeScript SDK's ``usd`` reads them the same
+    way.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -82,7 +99,9 @@ def _usd(value: Any) -> float | None:
         n = float(value)
     except OverflowError:
         return None
-    return n if math.isfinite(n) else None
+    if not math.isfinite(n) or (n < 0 and not signed):
+        return None
+    return n
 
 
 @dataclass(frozen=True)
@@ -132,7 +151,7 @@ class AgentStep:
             error=_text(r.get("error")),
             raw=dict(r),
             cost_usd=_usd(r.get("cost_usd")),
-            credits_remaining_usd=_usd(r.get("credits_remaining_usd")),
+            credits_remaining_usd=_usd(r.get("credits_remaining_usd"), signed=True),
         )
 
 
@@ -171,9 +190,23 @@ class AgentResult:
 
     #: How many steps it took.
     steps: int = 0
-    #: Why it ended: ``end_turn``, ``max_steps``, ``rate_limited``, ``refusal``
-    #: — or something added since, which is why this is a string and not an
-    #: enum.
+    #: Why it ended. ``end_turn`` is the model finishing, and the only one that
+    #: means the task is done (:attr:`finished`). The others the platform
+    #: documents:
+    #:
+    #: - ``max_steps`` — the run reached ``max_steps``.
+    #: - ``rate_limited`` — the account's API rate budget ran out mid-run.
+    #: - ``refusal`` — the model declined.
+    #: - ``pause_turn`` — the model kept pausing its turn.
+    #: - ``credits_exhausted`` — a funded run's AI credits became unavailable.
+    #: - ``max_cost`` — a funded run's next model call could pass ``max_cost_usd``.
+    #: - ``incomplete`` — OpenAI left its response unfinished.
+    #: - ``safety_check`` — OpenAI wants an action approved before it goes on.
+    #:
+    #: Or another stop reason the model itself gave, such as ``max_tokens`` —
+    #: which is why this is a string and not an enum. None of them is a failure,
+    #: and none is raised as one: the steps already taken are real, and what
+    #: they did to the desktop stands.
     stop: str = ""
     #: The model's closing text — its answer, or why it could not get there.
     text: str = ""
@@ -246,8 +279,9 @@ class AgentDone:
 class AgentFailed:
     """The run went wrong, mid-stream.
 
-    Distinct from a run that ended unfinished: ``max_steps`` and
-    ``rate_limited`` arrive as an :class:`AgentDone` carrying a result, because
+    Distinct from a run that ended unfinished: ``max_steps``, ``rate_limited``
+    and every other stop reason on :attr:`AgentResult.stop` arrive as an
+    :class:`AgentDone` carrying a result, because
     the steps already taken are real and what they did to the desktop stands.
     This is the platform saying the run itself could not continue.
     """

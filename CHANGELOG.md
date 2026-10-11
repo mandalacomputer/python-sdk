@@ -11,6 +11,49 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- **Drive a browser with Claude's browser toolset.** `mandala_computer.anthropic`
+  has `MandalaBrowserToolset` and `AsyncMandalaBrowserToolset`, drivers for
+  Anthropic's browser tool runner: an isolated Chromium context on a running
+  computer, reached over an authenticated WSS DevTools connection. Navigation
+  and every HTTP(S) request, redirects included, are checked against the URL
+  policy you give; JavaScript is opt-in and asks for confirmation; nothing is
+  replayed after expiry or a disconnect; and closing the toolset disposes the
+  context and revokes its grant. Install with
+  `pip install 'mandala-computer[anthropic]'`.
+
+- **Files in the browser toolset, opt-in.** `BrowserFilePolicy` allows uploads
+  only of files you stage first (`stage_local_file`, `stage_guest_file`,
+  `stage_document`), each an immutable `BrowserStagedFile` bound to one
+  browser context. It also allows downloads into a bounded Linux guest
+  quarantine, each a sealed `BrowserDownload` that gets a readable guest path
+  only when your `approve_download` returns `True`. Raw paths and document
+  retrieval are refused by default.
+
+- **Browser connections on `Computer`**, sync and async:
+  `create_browser_connection()`, `renew_browser_connection()` and
+  `revoke_browser_connection()`, with `BrowserConnection` (a revocable DevTools
+  capability whose token is a secret). Without a policy a connection keeps the
+  ten-minute lease. Pass a `BrowserSessionPolicy` to opt into a renewable
+  session: 30-minute leases, renewed automatically by the browser toolsets up
+  to a two-hour absolute limit. Its deadlines are on `BrowserSessionLease`.
+
+- **`provider=` on `agent()`, `agent_once()` and `agent_stream()`**, sync and
+  async: `"anthropic"` or `"openai"`, typed as `AgentProvider`. Left out, the
+  platform infers it from `model`; any other value is refused before sending.
+  An OpenAI run uses your own OpenAI key as `model_key`.
+
+- **`input_batch(actions, context=)`**, sync and async: run 1 to 32 OpenAI
+  computer actions (`click`, `double_click`, `move`, `drag`, `scroll`,
+  `keypress`, `type`, `wait`, `screenshot`) as one request, in OpenAI's own
+  vocabulary, typed as `OpenAIComputerAction`; the `openai` package's own
+  action objects are taken as they are. The batch's shape is checked before
+  anything is sent, unknown fields included. It answers an `InputBatchResult`. A batch refused
+  before any action ran raises the ordinary error for its status. A batch that
+  stopped part-way raises `InputBatchError`, whose `result` says how many
+  actions completed and which one failed. `is_transient()` answers `False` for
+  it, and for a refusal whose answer could not be read, and the SDK never sends
+  a batch twice.
+
 - **Run the agent on your account's AI credits**, sync and async. Leave
   `model_key` out of `agent()`, `agent_once()` or `agent_stream()` and the run
   is funded: no `X-Model-Key` is sent, and an eligible account's Mandala AI
@@ -20,7 +63,9 @@ This is the summary you read to decide whether to upgrade.
   `"credits_exhausted"` when the credits run out part way. `AgentStep` has
   `cost_usd` (the run's total so far) and `credits_remaining_usd`;
   `AgentResult` and `AgentFailed` have `cost_usd`, and `AgentFailed` has
-  `top_up_url`. All are `None` on a run with your own key.
+  `top_up_url`. All are `None` on a run with your own key. A figure is only
+  ever a finite number the platform sent, never coerced, and only
+  `credits_remaining_usd` can be negative.
 
 - **`InsufficientCreditsError`**: the 402 a funded run gets when the account's
   credits cannot cover its first model call. Its `top_up_url` is the billing
@@ -32,11 +77,21 @@ This is the summary you read to decide whether to upgrade.
   credit ledger as `CreditReport` — balance, available, held and debt in
   micros, `frozen`, the plan's `CreditGrant`, live `CreditLot`s and a page of
   `CreditEntry` journal lines with `next_before` for the next page. Strictly
-  decoded.
+  decoded: every field is required, micros are safe integers (negative only
+  for `available_micros`), timestamps are RFC 3339 UTC, and an unknown `kind`
+  is kept as sent.
 
 - `Activity` has `funded` and `cost_usd` on an agent run's summary.
 
 ### Changed
+
+- A webhook `url` longer than the platform's 2048 characters, counted as it
+  counts them, is refused before sending rather than by a 400.
+
+- `AgentResult.stop` documents every stop reason the platform sends:
+  `pause_turn`, `credits_exhausted`, `max_cost`, `incomplete` and
+  `safety_check` beside `end_turn`, `max_steps`, `rate_limited` and
+  `refusal`.
 
 - **`model_key` is optional on the agent methods.** Leaving it out (or passing
   `None`) used to raise `MandalaError`; it now starts a funded run on the
@@ -47,9 +102,9 @@ This is the summary you read to decide whether to upgrade.
 ### Fixed
 
 - A 402 answered before an agent stream opened was raised as
-  `PlanLimitError`. It is `InsufficientCreditsError` when it carries `top_up_url`
-  and `ModelProviderError` otherwise, the same as a 402 reported on the
-  stream or by `agent_once()`.
+  `PlanLimitError`. It is now classified the way a 402 reported on the stream
+  or by `agent_once()` is: `InsufficientCreditsError` when it carries
+  `top_up_url`, and never the plan.
 
 - `is_transient()` answers `False` for any 429 that ends an agent run after it
   has taken steps, not only one carrying the `model API: ` prefix. A funded

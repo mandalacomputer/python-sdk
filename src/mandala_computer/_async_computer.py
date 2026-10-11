@@ -21,6 +21,7 @@ from ._agent import (
     AgentDone,
     AgentEvent,
     AgentFailed,
+    AgentProvider,
     AgentResult,
     AgentStepEvent,
     to_agent_event,
@@ -46,6 +47,7 @@ from ._computer import (
     CAPTURING,
     DESKTOP_PROBE,
     GUEST_PROBE,
+    INPUT_BATCH_TIMEOUT,
     UNICODE_TYPE_TIMEOUT,
     BackgroundCommandFields,
     ComputerFields,
@@ -66,6 +68,8 @@ from ._computer import (
     _empty_guest_file,
     _file_body,
     _guest_not_running,
+    _input_batch_outcome,
+    _input_batch_refusal,
     _input_context,
     _mechanism,
     _model_key_headers,
@@ -121,9 +125,12 @@ from ._models import (
     ExecStatus,
     FilePart,
     GuestDirectory,
+    InputBatchResult,
     InputContext,
     Listing,
     Move,
+    OpenAIActionObject,
+    OpenAIComputerAction,
     ScreenshotInfo,
     SecretBindingArgs,
     SecretBindings,
@@ -1571,6 +1578,62 @@ class AsyncComputer(ComputerFields):
         body = _api.wait_body(seconds)
         return await self._acted(body, params, timeout=seconds + DEADLINE_SLACK)
 
+    async def input_batch(
+        self,
+        actions: Sequence[OpenAIComputerAction | OpenAIActionObject],
+        *,
+        context: bool = False,
+    ) -> InputBatchResult:
+        """Run a batch of OpenAI computer actions, in order, as one request.
+
+        What an OpenAI ``computer_call`` hands you, forwarded without
+        translation: 1 to 32 actions in OpenAI's own vocabulary — ``click``,
+        ``double_click``, ``move``, ``drag``, ``scroll``, ``keypress``,
+        ``type``, ``wait`` and ``screenshot``. Each is a mapping such as
+        ``{"type": "click", "x": 640, "y": 400, "button": "left"}``, or the
+        ``openai`` package's own action object, taken as it is::
+
+            done = await c.input_batch(call.actions)
+            print(f"{done.completed} actions")
+
+        The whole batch is checked first, here for shape and then by the
+        platform for its budgets, before a suspended computer is woken or
+        anything is sent, and it runs on one input lane so no other API input
+        interleaves. ``screenshot`` is a marker answered with ``ok``: read the
+        picture with :meth:`screenshot` afterwards. ``context=True`` adds the
+        desktop after the batch, as :meth:`click` does.
+
+        A batch REFUSED before any action ran — a malformed one, a computer
+        that is not running, the input lane busy — raises the ordinary error
+        for its status, and nothing happened. One whose answer could not be
+        read at all (interrupted, empty, a proxy's page) keeps its status's
+        class but is not known to have run nothing, so
+        :func:`~mandala_computer.is_transient` answers ``False`` for it too. A
+        batch that STOPPED PART-WAY
+        raises :class:`~mandala_computer.InputBatchError`: ``result.completed``
+        actions ran, and the one at ``result.failed_index`` may have partly
+        applied. **Never send the same batch again automatically** — that
+        repeats what already ran. Look at a fresh screenshot first;
+        :func:`~mandala_computer.is_transient` answers ``False`` for it.
+
+        Sent with a deadline of at least 108 seconds, whatever the client's
+        default: the platform's proxy allows the batch 93.
+        """
+        params = _api.input_params(context)
+        body = _api.input_batch_body(actions)
+        path = _api.computer_action(self.id, "input")
+        where = f"POST {path}"
+        try:
+            data = await self._t.json_object(
+                "POST", path, json=body, params=params, timeout=INPUT_BATCH_TIMEOUT
+            )
+        except APIError as exc:
+            error = _input_batch_refusal(exc, where)
+            if error is exc:
+                raise
+            raise error from None
+        return _input_batch_outcome(data, len(body), where, bool(params))
+
     async def cursor_position(self) -> tuple[int, int] | None:
         """Where the pointer is, or ``None`` if nothing has placed it yet.
 
@@ -2536,7 +2599,7 @@ class AsyncComputer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
-        provider: str | None = None,
+        provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Have the platform drive this computer, reporting as it goes.
@@ -2564,6 +2627,12 @@ class AsyncComputer(ComputerFields):
         unsupported billing country, or funded runs not enabled) gets a 400 or
         a 403 saying to send a key. A custom ``system`` prompt, another model or
         ``provider="openai"`` need your own key.
+
+        ``provider`` is ``"anthropic"`` or ``"openai"``, inferred from
+        ``model`` when omitted (``claude-*`` is Anthropic, ``gpt-*`` and the
+        o-series OpenAI) and Anthropic when neither is given; OpenAI defaults
+        to ``gpt-6.1-sol``. A model name the platform does not recognise needs
+        it. Anything else is refused before the request is sent.
 
         The computer must already be RUNNING. This route will not start one:
         starting is billable, and it is not a decision to make on somebody's
@@ -2640,7 +2709,7 @@ class AsyncComputer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
-        provider: str | None = None,
+        provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
     ) -> AgentResult:
         """:meth:`agent_stream`, waited out — one call, one result.
@@ -2726,7 +2795,7 @@ class AsyncComputer(ComputerFields):
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
-        provider: str | None = None,
+        provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
     ) -> AgentResult:
         """The agent loop as a single non-streaming request.

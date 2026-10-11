@@ -1562,6 +1562,16 @@ async def test_provider_reaches_async_agent_wire(method: str, provider: str | No
         assert body["provider"] == provider
 
 
+def test_the_provider_type_names_exactly_what_the_platform_accepts() -> None:
+    """``provider=`` is typed as the platform's two words (A4), the same set the
+    body builder refuses everything else against."""
+    from typing import get_args
+
+    assert set(get_args(mc.AgentProvider)) == {"anthropic", "openai"}
+    for method in (mc.Computer.agent, mc.AsyncComputer.agent_stream):
+        assert "AgentProvider" in str(method.__annotations__["provider"])
+
+
 @respx.mock
 @pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
 def test_invalid_provider_is_refused_before_sync_request(
