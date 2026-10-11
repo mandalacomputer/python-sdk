@@ -202,6 +202,12 @@ class APIError(MandalaError):
     #: a second copy of the rule, so the route that knows the run and the
     #: predicate that answers for it cannot come to disagree (OPL-5446).
     _after_agent_steps: bool = False
+    #: Set only by ``_input_batch_refusal`` in ``_computer``, on an OpenAI input
+    #: batch refused with a status an execution failure can arrive with, whose
+    #: body could not be read as an ordinary error: interrupted, empty, a
+    #: proxy's page. Whether actions ran before it is unknown, so
+    #: :func:`is_transient` answers ``False`` — the same reasoning as above.
+    _batch_outcome_unknown: bool = False
 
     def __init__(
         self,
@@ -1238,6 +1244,10 @@ def is_transient(err: BaseException) -> bool:
     # A relayed model 429 on an agent run that had already acted: the wait is
     # the model provider's, but replaying the prompt repeats the steps it took.
     if isinstance(err, APIError) and err._after_agent_steps:
+        return False
+    # An input batch refused with a body that could not be read: actions may
+    # have run before it, and replaying would repeat them.
+    if isinstance(err, APIError) and err._batch_outcome_unknown:
         return False
     # By class as well as by word: a create-only upload whose 409 carried no
     # usable reason has no ``reason`` at all, and would otherwise fall through to

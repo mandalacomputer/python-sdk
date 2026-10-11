@@ -910,10 +910,36 @@ def _input_batch_outcome(
     return replace(result, context=_input_context(data)) if asked else result
 
 
+#: The statuses a batch that stopped part-way is answered with: the platform's
+#: reference lists a batch result beside the ordinary error on exactly these.
+_BATCH_FAILURE_STATUSES = frozenset({400, 409, 502, 503})
+
+
+def _ordinary_refusal(body: object) -> bool:
+    """Whether a refusal's body reads as the platform's ordinary error: an
+    object with an ``error`` sentence and no batch result in it."""
+    if not isinstance(body, Mapping) or "completed" in body:
+        return False
+    error = body.get("error")
+    return isinstance(error, str) and bool(error.strip())
+
+
 def _input_batch_refusal(exc: APIError, where: str) -> APIError:
     """A refusal answered with the batch as far as it went, as
-    :class:`InputBatchError`; any other refusal as it was."""
+    :class:`InputBatchError`; any other refusal as it was.
+
+    The platform tells a refusal before any action ran (its ordinary error) from
+    a batch that stopped part-way (the batch's own result) by ``completed``. A
+    body that is neither — interrupted in flight, empty, a proxy's page —
+    cannot say which one this was, at a status that can carry either. Such an
+    error keeps its class, and is marked so that
+    :func:`~mandala_computer.is_transient` answers ``False``: a 409's class
+    would otherwise call sending the batch again worth trying, and actions may
+    already have run.
+    """
     if not _batch_answer(exc.body):
+        if exc.status in _BATCH_FAILURE_STATUSES and not _ordinary_refusal(exc.body):
+            exc._batch_outcome_unknown = True
         return exc
     error = InputBatchError(
         str(exc),
@@ -4277,7 +4303,11 @@ class Computer(ComputerFields):
 
         A batch REFUSED before any action ran — a malformed one, a computer
         that is not running, the input lane busy — raises the ordinary error
-        for its status, and nothing happened. A batch that STOPPED PART-WAY
+        for its status, and nothing happened. One whose answer could not be
+        read at all (interrupted, empty, a proxy's page) keeps its status's
+        class but is not known to have run nothing, so
+        :func:`~mandala_computer.is_transient` answers ``False`` for it too. A
+        batch that STOPPED PART-WAY
         raises :class:`~mandala_computer.InputBatchError`: ``result.completed``
         actions ran, and the one at ``result.failed_index`` may have partly
         applied. **Never send the same batch again automatically** — that

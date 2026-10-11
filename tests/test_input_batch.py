@@ -329,3 +329,60 @@ async def test_the_async_half_refuses_a_malformed_batch_before_sending() -> None
             with pytest.raises(ValueError, match="1 to 32 actions"):
                 await c.input_batch([])
         assert not respx.calls
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(
+            409, content=b'{"ok": false, "compl', headers={"Content-Type": "application/json"}
+        ),
+        httpx.Response(409, content=b""),
+        httpx.Response(
+            409, content=b"<html>conflict</html>", headers={"Content-Type": "text/html"}
+        ),
+        httpx.Response(409, json={"reason": "contention"}),
+        httpx.Response(503, content=b"upstream unavailable"),
+        httpx.Response(400, json=["not", "an", "error"]),
+    ],
+    ids=["truncated", "empty", "proxy-page", "no-sentence", "503-text", "400-array"],
+)
+def test_a_batch_answer_that_cannot_be_read_is_not_called_safe_to_send_again(
+    computer: mc.Computer, response: httpx.Response
+) -> None:
+    """At a status an execution failure arrives with, a body that is neither the
+    ordinary error nor the batch's result cannot say whether actions ran. Its
+    class is kept; the replay answer is not."""
+    respx.post(INPUT).mock(response)
+    with pytest.raises(mc.APIError) as raised:
+        computer.input_batch([{"type": "wait"}] * 2)
+    assert not isinstance(raised.value, mc.InputBatchError)
+    assert raised.value.status == response.status_code
+    assert mc.is_transient(raised.value) is False
+
+
+@respx.mock
+def test_an_unreadable_answer_at_a_status_no_batch_failure_has_keeps_its_answer(
+    computer: mc.Computer,
+) -> None:
+    """A 429 is refused before anything runs; an edge's page for it stays a
+    rate limit worth waiting out."""
+    respx.post(INPUT).mock(httpx.Response(429, content=b"<html>slow down</html>"))
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.input_batch([{"type": "wait"}])
+    assert mc.is_transient(raised.value) is True
+
+
+@respx.mock
+async def test_the_async_half_reads_an_unreadable_answer_the_same_way() -> None:
+    respx.post(INPUT).mock(
+        httpx.Response(
+            409, content=b'{"ok": false, "compl', headers={"Content-Type": "application/json"}
+        )
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.ConflictError) as raised:
+            await c.input_batch([{"type": "wait"}])
+    assert mc.is_transient(raised.value) is False

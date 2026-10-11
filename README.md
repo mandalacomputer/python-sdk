@@ -1009,7 +1009,9 @@ is such a list. Each action's shape is checked before anything is sent: an
 unknown `type`, a missing field or one the action does not read raises
 `ValueError`. A batch the platform refuses before any action runs (a
 malformed one, a computer that is not running, the input lane busy) raises the
-ordinary error for its status, and nothing happened. A batch that **stopped
+ordinary error for its status, and nothing happened. If the answer could not be
+read at all (interrupted, empty, a proxy's page), the error keeps its status's
+class, but `is_transient()` answers `False`: actions may have run. A batch that **stopped
 part-way** raises `InputBatchError`: `e.result.completed` actions ran, and the
 one at `e.result.failed_index` may have partly applied. Never send the same
 batch again automatically, because that repeats what already ran. Take a fresh

@@ -49,8 +49,9 @@ This is the summary you read to decide whether to upgrade.
   before anything is sent. It answers an `InputBatchResult`. A batch refused
   before any action ran raises the ordinary error for its status. A batch that
   stopped part-way raises `InputBatchError`, whose `result` says how many
-  actions completed and which one failed; `is_transient()` answers `False` for
-  it, and the SDK never sends a batch twice.
+  actions completed and which one failed. `is_transient()` answers `False` for
+  it, and for a refusal whose answer could not be read, and the SDK never sends
+  a batch twice.
 
 - **Run the agent on your account's AI credits**, sync and async. Leave
   `model_key` out of `agent()`, `agent_once()` or `agent_stream()` and the run

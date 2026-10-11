@@ -1601,7 +1601,11 @@ class AsyncComputer(ComputerFields):
 
         A batch REFUSED before any action ran — a malformed one, a computer
         that is not running, the input lane busy — raises the ordinary error
-        for its status, and nothing happened. A batch that STOPPED PART-WAY
+        for its status, and nothing happened. One whose answer could not be
+        read at all (interrupted, empty, a proxy's page) keeps its status's
+        class but is not known to have run nothing, so
+        :func:`~mandala_computer.is_transient` answers ``False`` for it too. A
+        batch that STOPPED PART-WAY
         raises :class:`~mandala_computer.InputBatchError`: ``result.completed``
         actions ran, and the one at ``result.failed_index`` may have partly
         applied. **Never send the same batch again automatically** — that
