@@ -707,8 +707,9 @@ def cross_site() -> Any:
     page, and it embeds a 127.0.0.1 frame of its own, which attaches beneath it.
     It also embeds a localhost frame, which runs in its own process. Each
     cross-site frame asks for a URL the policy refuses and reports, to the page,
-    whether it got through. The page and the frame each start a dedicated
-    worker, which would do the same if it ran. The frame is a button at a known
+    whether it got through. The page and the frame each try to start a
+    dedicated worker, which would do the same if it ran, and report whether it
+    was refused. The frame is a button at a known
     place, which reports a click. ``/churn``, served from localhost, adds and
     removes 127.0.0.1 frames faster than they can be set up, then says so.
     """
@@ -726,11 +727,11 @@ def cross_site() -> Any:
                 "/": f"""<title>Cross-site</title><p id=log>waiting</p><script>
 const seen=new Set();const show=v=>{{seen.add(String(v));document.getElementById('log').textContent=[...seen].sort().join(' ')}};
 addEventListener('message',e=>show(e.data));
-new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
+try{{new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);show('page-worker:made')}}catch(e){{show('page-worker:refused')}}
 </script><iframe src="http://localhost:{port}/frame"
 style="position:absolute;left:0;top:100px;width:600px;height:300px;border:0"></iframe>""",
                 "/frame": f"""<body style="margin:0"><button style="width:600px;height:200px"
-onclick="parent.postMessage('clicked','*')">inside</button><script>new Worker('/worker.js');{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
+onclick="parent.postMessage('clicked','*')">inside</button><script>try{{new Worker('/worker.js');parent.postMessage('frame-worker:made','*')}}catch(e){{parent.postMessage('frame-worker:refused','*')}};{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
 <iframe src="http://127.0.0.1:{port}/nested" style="height:60px"></iframe>
 <iframe src="http://localhost:{port}/inner" style="height:60px"></iframe></body>""",
                 "/inner": "<p>inner</p>",
@@ -771,16 +772,12 @@ setTimeout(()=>{{const last=document.createElement('iframe');last.src='http://12
         thread.join()
 
 
-CROSS_SITE_DONE = "frame:refused nested:refused"
+CROSS_SITE_DONE = "frame-worker:refused frame:refused nested:refused page-worker:refused"
 
 
-def assert_workers_held(port: int, hits: list[tuple[str, str]], seen: list[str]) -> None:
-    # Both workers' scripts were fetched under the policy, and, while their
-    # documents live, neither has run. (Chromium releases a held worker when its
-    # document goes, so this is checked before the toolset closes.)
-    assert ("127.0.0.1", "/worker.js") in hits and ("localhost", "/worker.js") in hits
-    assert f"http://localhost:{port}/worker.js" in seen
-    assert not [path for _, path in hits if path.startswith("/worker-")]
+def assert_no_workers(hits: list[tuple[str, str]]) -> None:
+    # Neither worker started: its script was never even asked for.
+    assert not [path for _, path in hits if path.startswith("/worker")]
 
 
 def assert_cross_site_policy(port: int, hits: list[tuple[str, str]], seen: list[str]) -> None:
@@ -833,9 +830,10 @@ def test_sync_cross_site_frame_runs_under_the_policy(chrome: str, cross_site: An
         # The tab the frame lives in is still there, and still answers.
         assert len(tabs(assert_success(browser.tool_result(use("list_tabs"))))) == 1
         assert_success(browser.tool_result(use("screenshot")))
-        assert_workers_held(port, hits, seen)
+        assert_no_workers(hits)
     assert revoked == [IDENT]
     assert_cross_site_policy(port, hits, seen)
+    assert_no_workers(hits)  # Not at the page's exit either.
 
 
 @pytest.mark.asyncio
@@ -864,7 +862,7 @@ async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_s
         assert CROSS_SITE_DONE in page
         assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
         assert_success(await browser.tool_result(use("screenshot")))
-        assert_workers_held(port, hits, seen)
+        assert_no_workers(hits)
         # Every frame is the tab's for downloads: the page, both cross-site
         # frames, and the same-process frame inside the localhost one, which
         # only that frame's own session reports.
@@ -872,6 +870,7 @@ async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_s
         assert len(tracking.frames) == 4 and set(tracking.frames.values()) == {tab}
     assert revoked == [IDENT]
     assert_cross_site_policy(port, hits, seen)
+    assert_no_workers(hits)  # Not at the page's exit either.
 
 
 def owned_backend(policy: Any = None) -> tuple[Any, list[tuple[str, Any, Any]]]:
@@ -889,12 +888,33 @@ def owned_backend(policy: Any = None) -> tuple[Any, list[tuple[str, Any, Any]]]:
     async def send(method: str, params: Any = None, session: Any = None) -> Any:
         sent.append((method, params, session))
         if method == "Page.getFrameTree":
-            # A cross-site frame's own frame is its target.
-            return {"frameTree": {"frame": {"id": backend.child_frames[session][1]}}}
+            # A tab's or a cross-site frame's own frame is its target.
+            if session in backend.child_frames:
+                return {"frameTree": {"frame": {"id": backend.child_frames[session][1]}}}
+            tab = next(t for t, own in backend.sessions.items() if own == session)
+            return {"frameTree": {"frame": {"id": tab}}}
         return {"success": True}
 
     backend.send = send
+    strict_page_events(backend, sent)
     return backend, sent
+
+
+def strict_page_events(backend: Any, sent: list[tuple[str, Any, Any]]) -> None:
+    """Chromium sends no Page events to a session that never enabled Page.
+
+    A test that notes one anyway would hide a missing Page.enable, so it
+    fails here instead. The tab's own session ("page") is already set up.
+    """
+    note = backend._note
+
+    def strict(method: str, p: Any, session: Any) -> None:
+        enabled = {"page"} | {s for m, _, s in sent if m == "Page.enable"}
+        if method.startswith("Page.") and session not in enabled:
+            raise AssertionError(f"{method} from {session}, which never enabled Page")
+        note(method, p, session)
+
+    backend._note = strict
 
 
 def attached(child: str, target: str, kind: str, parent: str | None) -> dict[str, Any]:
@@ -1857,7 +1877,11 @@ async def test_frames_inside_a_detached_cross_site_frame_are_forgotten_with_it()
         await backend._event(attached(f"f{i}", f"f{i}-t", "iframe", "page"))
         # Its own session reports a same-process frame inside it, and nothing
         # says that frame went when the cross-site frame did.
-        backend._note("Page.frameAttached", {"frameId": f"inner{i}"}, session=f"f{i}")
+        backend._note(
+            "Page.frameAttached",
+            {"frameId": f"inner{i}", "parentFrameId": f"f{i}-t"},
+            session=f"f{i}",
+        )
         assert files.frames[f"inner{i}"] == "tab"
         await backend._event(
             {
@@ -1866,7 +1890,7 @@ async def test_frames_inside_a_detached_cross_site_frame_are_forgotten_with_it()
                 "params": {"sessionId": f"f{i}", "targetId": f"f{i}-t"},
             }
         )
-    assert files.frames == {} and backend.frame_reporters == {}
+    assert files.frames == {} and backend.frame_source == {} and backend.frame_parent == {}
     # Frames the tab itself reports stay until the tab or a note removes them.
     backend._note("Page.frameAttached", {"frameId": "own"}, session="page")
     await backend._event(attached("late", "late-t", "iframe", "page"))
@@ -2047,3 +2071,367 @@ async def test_a_cross_site_frame_navigating_keeps_the_tabs_refs() -> None:
         {"method": "Page.javascriptDialogOpening", "sessionId": "page", "params": dialog}
     )
     assert backend.failed and closed
+
+
+#: Every way a page can reach a Worker constructor in its own tab: its own
+#: realm, about:blank and srcdoc frames (before and after they load), a
+#: same-origin child, a window taken from a frame then removed, and blob: and
+#: data: scripts. Each records "made" or "refused" in the title.
+WORKER_REALMS = r"""
+const out = [];
+const blob = URL.createObjectURL(new Blob(["fetch('/ran-blob')"], {type: 'text/javascript'}));
+function attempt(tag, make) {
+  try { make(); out.push(tag + ':made'); } catch (e) { out.push(tag + ':refused'); }
+  document.title = out.sort().join(' ');
+}
+attempt('main', () => { for (let i = 0; i < 10; i++) new Worker('/w.js?' + i); });
+attempt('main-blob', () => { for (let i = 0; i < 30; i++) new Worker(blob); });
+attempt('main-data', () => new Worker('data:text/javascript,fetch("/ran-data")'));
+const blank = document.createElement('iframe'); document.body.appendChild(blank);
+attempt('blank', () => new blank.contentWindow.Worker(blob));
+const doc = document.createElement('iframe'); doc.srcdoc = '<p>s</p>'; document.body.appendChild(doc);
+attempt('srcdoc-new', () => new doc.contentWindow.Worker(blob));
+doc.onload = () => attempt('srcdoc', () => new doc.contentWindow.Worker(blob));
+const child = document.createElement('iframe'); child.src = '/child'; document.body.appendChild(child);
+child.onload = () => attempt('child', () => new child.contentWindow.Worker(blob));
+const kept = document.createElement('iframe'); document.body.appendChild(kept);
+const window2 = kept.contentWindow; kept.remove();
+attempt('removed', () => new window2.Worker(blob));
+addEventListener('message', (e) => { out.push(String(e.data)); document.title = out.sort().join(' '); });
+"""
+
+#: Inside a cross-site frame, and a frame inside that.
+WORKER_REALMS_ELSEWHERE = r"""
+const blob = URL.createObjectURL(new Blob(["fetch('/ran-elsewhere')"]));
+function report(tag, make) {
+  try { make(); top.postMessage(tag + ':made', '*'); } catch (e) { top.postMessage(tag + ':refused', '*'); }
+}
+report('cross-site', () => new Worker(blob));
+const inner = document.createElement('iframe'); document.body.appendChild(inner);
+report('cross-site-inner', () => new inner.contentWindow.Worker(blob));
+"""
+
+WORKERS_REFUSED = (
+    "blank:refused child:refused cross-site-inner:refused cross-site:refused main-blob:refused "
+    "main-data:refused main:refused removed:refused srcdoc-new:refused srcdoc:refused"
+)
+
+
+@pytest.fixture
+def worker_realms() -> Any:
+    hits: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            port = self.server.server_port
+            if self.path == "/":
+                body = (
+                    f"<title>w</title><body><p>w</p><script>{WORKER_REALMS}</script>"
+                    f"<iframe src='http://localhost:{port}/elsewhere'></iframe></body>"
+                )
+            elif self.path == "/elsewhere":
+                body = f"<body><p>x</p><script>{WORKER_REALMS_ELSEWHERE}</script></body>"
+            elif self.path.startswith("/w.js"):
+                body = "fetch('/ran-url')"  # An allowed script, which asks for what is not.
+            else:
+                body = "<p>page</p>"
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "text/javascript" if "/w.js" in self.path else "text/html"
+            )
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *_: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port, hits
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("leave", ["navigate", "close"])
+def test_sync_dedicated_workers_never_start_so_none_escapes_at_page_exit(
+    chrome: str, worker_realms: Any, leave: str
+) -> None:
+    computer, revoked = remote(chrome, False)
+    port, hits = worker_realms
+    workers: list[str] = []
+
+    def policy(_context: Any, url: str) -> None:
+        if "/ran" in url:
+            raise ToolError("not permitted")
+
+    browser = MandalaBrowserToolset(computer, url_policy=policy)
+    try:
+        backend = browser._backend
+        settle_event = backend._settle
+
+        def counting(message: dict[str, Any]) -> None:
+            info = (message.get("params") or {}).get("targetInfo") or {}
+            if message.get("method") == "Target.attachedToTarget" and info.get("type") == "worker":
+                workers.append(info.get("url"))
+            settle_event(message)
+
+        backend._settle = counting
+        assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/")))
+        title = ""
+        for _ in range(50):
+            title = str(browser._run(backend.evaluate(backend.active, "document.title")))
+            if title.count(":") == WORKERS_REFUSED.count(":"):
+                break
+            assert_success(browser.tool_result(use("wait", duration=0.1)))
+        if leave == "navigate":
+            assert_success(
+                browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/away"))
+            )
+    finally:
+        browser.close()
+    time.sleep(1)  # Anything a worker released at the page's exit would send by now.
+    # Nothing a worker would have sent reached the server, at the page's exit
+    # included, because no worker was ever made.
+    assert not [path for path in hits if path.startswith("/ran")]
+    assert title == WORKERS_REFUSED and workers == [] and revoked == [IDENT]
+
+
+@pytest.mark.asyncio
+async def test_async_dedicated_workers_never_start(chrome: str, worker_realms: Any) -> None:
+    computer, revoked = remote(chrome, True)
+    port, hits = worker_realms
+
+    async def policy(_context: Any, url: str) -> None:
+        if "/ran" in url:
+            raise ToolError("not permitted")
+
+    async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        backend = browser._backend
+        assert_success(await browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/")))
+        title = ""
+        for _ in range(50):
+            title = str(await backend.evaluate(backend.active, "document.title"))
+            if title == WORKERS_REFUSED:
+                break
+            await asyncio.sleep(0.1)
+        assert title == WORKERS_REFUSED
+        assert_success(
+            await browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/away"))
+        )
+    await asyncio.sleep(1)
+    assert revoked == [IDENT] and not [path for path in hits if path.startswith("/ran")]
+
+
+@pytest.mark.asyncio
+async def test_tabs_and_frames_refuse_workers_before_they_run() -> None:
+    from mandala_computer._browser_cdp import _NO_WORKERS
+
+    backend, sent = owned_backend()
+    await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
+    backend.ready["tab2"] = asyncio.Event()
+    await backend._event(attached("page2", "tab2", "page", None))
+    for session in ("frame-s", "page2"):
+        calls = [(m, p) for m, p, s in sent if s == session]
+        names = [m for m, _ in calls]
+        script = names.index("Page.addScriptToEvaluateOnNewDocument")
+        assert names.index("Page.enable") < script < names.index("Runtime.runIfWaitingForDebugger")
+        assert calls[script][1] == {"source": _NO_WORKERS, "runImmediately": True}
+
+
+def tracking_backend() -> tuple[Any, list[tuple[str, Any, Any]], Any]:
+    """A tab whose own frame ("tab") is tracked, as after its first document."""
+    backend, sent = owned_backend()
+    backend.files = files = FrameFiles()
+    backend._note("Page.frameNavigated", {"frame": {"id": "tab"}}, "page")
+    return backend, sent, files
+
+
+def attach_frame(backend: Any, frame: str, parent: str, session: str = "page") -> None:
+    backend._note("Page.frameAttached", {"frameId": frame, "parentFrameId": parent}, session)
+
+
+@pytest.mark.asyncio
+async def test_frames_are_tracked_only_beneath_tracked_frames() -> None:
+    backend, _, files = tracking_backend()
+    attach_frame(backend, "a", "tab")
+    attach_frame(backend, "b", "a")
+    attach_frame(backend, "lost", "never-reported")
+    assert set(files.frames) == {"tab", "a", "b"}
+    # A frame refused at the table's limit takes its children with it, even
+    # once there is room again: nothing above them could ever prune them.
+    for i in range(253):
+        attach_frame(backend, f"filler{i}", "tab")
+    attach_frame(backend, "refused", "tab")
+    assert "refused" not in files.frames
+    backend._note("Page.frameDetached", {"frameId": "filler0"}, "page")
+    attach_frame(backend, "under-refused", "refused")
+    assert "under-refused" not in files.frames
+
+
+@pytest.mark.asyncio
+async def test_a_new_document_or_a_removal_forgets_the_frames_below() -> None:
+    backend, _, files = tracking_backend()
+    attach_frame(backend, "a", "tab")
+    attach_frame(backend, "b", "a")
+    attach_frame(backend, "c", "b")
+    backend._note("Page.frameNavigated", {"frame": {"id": "a", "parentId": "tab"}}, "page")
+    assert set(files.frames) == {"tab", "a"}
+    attach_frame(backend, "b2", "a")
+    backend._note("Page.frameDetached", {"frameId": "a", "reason": "swap"}, "page")
+    assert set(files.frames) == {"tab", "a", "b2"}
+    backend._note("Page.frameDetached", {"frameId": "a", "reason": "remove"}, "page")
+    assert set(files.frames) == {"tab"}
+    # A cross-site frame keeps its session across sites, and Chromium reports no
+    # detach for the frames of its old document.
+    await backend._event(attached("x-s", "x", "iframe", "page"))
+    attach_frame(backend, "x-child", "x", "x-s")
+    attach_frame(backend, "x-grandchild", "x-child", "x-s")
+    backend._note("Page.frameNavigated", {"frame": {"id": "x", "parentId": "tab"}}, "x-s")
+    assert set(files.frames) == {"tab", "x"}
+
+
+@pytest.mark.asyncio
+async def test_a_frame_its_parent_reported_since_outlives_the_session_that_went() -> None:
+    backend, _, files = tracking_backend()
+    await backend._event(attached("x-s", "x", "iframe", "page"))
+    attach_frame(backend, "x-child", "x", "x-s")
+    # The frame comes back to its tab's process: the tab reports it now.
+    backend._note("Page.frameNavigated", {"frame": {"id": "x", "parentId": "tab"}}, "page")
+    backend._drop_frame("x-s")
+    assert set(files.frames) == {"tab", "x"}
+    assert backend.frame_source["x"] == "page"
+
+
+@pytest.mark.asyncio
+async def test_a_frame_tree_reply_never_undoes_a_newer_frame_event() -> None:
+    backend, _, files = tracking_backend()
+    asked, answer = asyncio.Event(), asyncio.Event()
+    plain = backend.send
+    tree = {
+        "frame": {"id": "x"},
+        "childFrames": [
+            {"frame": {"id": "gone"}, "childFrames": [{"frame": {"id": "gone-child"}}]},
+            {"frame": {"id": "kept"}},
+        ],
+    }
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree" and session == "x-s":
+            await plain(method, params, session)
+            asked.set()
+            await answer.wait()
+            return {"frameTree": tree}
+        return await plain(method, params, session)
+
+    backend.send = send
+    setup = asyncio.create_task(backend._event(attached("x-s", "x", "iframe", "page")))
+    await asyncio.wait_for(asked.wait(), 1)
+    # While the tree is on its way, "gone" is removed.
+    backend._note("Page.frameDetached", {"frameId": "gone", "reason": "remove"}, "x-s")
+    answer.set()
+    await setup
+    assert set(files.frames) == {"tab", "x", "kept"}
+    # A session that goes while its tree is on its way tracks nothing.
+    asked.clear()
+    answer.clear()
+    tree = {"frame": {"id": "y"}, "childFrames": [{"frame": {"id": "y-child"}}]}
+
+    async def send_y(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree" and session == "y-s":
+            await plain(method, params, session)
+            asked.set()
+            await answer.wait()
+            return {"frameTree": tree}
+        return await plain(method, params, session)
+
+    backend.send = send_y
+    setup = asyncio.create_task(backend._event(attached("y-s", "y", "iframe", "page")))
+    await asyncio.wait_for(asked.wait(), 1)
+    backend._drop_frame("y-s")
+    answer.set()
+    await setup
+    assert "y" not in files.frames and "y-child" not in files.frames
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["lands", "fails", "never"])
+async def test_a_cache_restore_reads_its_frames_back_and_holds_downloads_briefly(
+    outcome: str, monkeypatch: Any
+) -> None:
+    from mandala_computer import _browser_cdp
+
+    monkeypatch.setattr(_browser_cdp, "_RESTORE_WAIT", 0.2)
+    backend, _, files = tracking_backend()
+    backend.ws = SimpleNamespace(close=lambda: asyncio.sleep(0))
+    decided: list[Any] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        decided.append(params.get("tracked"))
+
+    files.event = event  # type: ignore[method-assign]
+    asked, answer = asyncio.Event(), asyncio.Event()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree":
+            await plain(method, params, session)
+            asked.set()
+            if outcome == "never":
+                await asyncio.Event().wait()
+            await answer.wait()
+            if outcome == "fails":
+                raise _browser_cdp.BrowserError("Chromium could not complete the browser action.")
+            return {
+                "frameTree": {
+                    "frame": {"id": "tab"},
+                    "childFrames": [{"frame": {"id": "restored"}}],
+                }
+            }
+        return await plain(method, params, session)
+
+    backend.send = send
+    # The tab's document comes back from the cache, with frames nobody reports.
+    backend._note(
+        "Page.frameNavigated",
+        {"frame": {"id": "tab"}, "type": "BackForwardCacheRestore"},
+        "page",
+    )
+    await asyncio.wait_for(asked.wait(), 1)
+    # Meanwhile a frame is reported beneath one not read back yet, and a
+    # restored frame starts a download.
+    attach_frame(backend, "kid", "restored")
+    backend._dispatch(
+        {
+            "method": "Browser.downloadWillBegin",
+            "params": {
+                "guid": "00000000-0000-0000-0000-000000000001",
+                "frameId": "restored",
+                "url": "https://ok.test/f",
+                "suggestedFilename": "f.txt",
+            },
+        }
+    )
+    await asyncio.sleep(0.05)
+    assert decided == []  # Held until the tree lands, or briefly.
+    answer.set()
+    for _ in range(100):
+        if decided:
+            break
+        await asyncio.sleep(0.01)
+    if outcome == "lands":
+        assert decided == [True] and {"restored", "kid"} <= set(files.frames)
+    else:
+        # Failed or late: nothing restored is tracked, and the download is
+        # its frame's only if the frame was: fail closed.
+        assert decided == [False] and "restored" not in files.frames
+    if outcome != "never":
+        await asyncio.sleep(0.01)
+        assert backend.orphans == {} and not backend.restoring
+    for task in list(backend.tasks):
+        task.cancel()
+    await asyncio.gather(*backend.tasks, return_exceptions=True)

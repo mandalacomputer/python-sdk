@@ -1963,15 +1963,15 @@ revokes its capability; it does not stop Chromium or delete the computer.
   tab's ID. A frame that cannot be given the hook stays paused and never runs.
   A cross-site frame's contents are not part of `read_page`, `find` or
   `get_page_text`; screenshots and coordinate input reach it.
-- Dedicated workers are held paused and never run while their page lives:
-  Chromium cannot close one, and fetches the script of a worker started by
-  another worker without any interception the driver could apply. When a
-  worker's page navigates away or closes, Chromium releases it as it goes, and
-  it can then run briefly outside the URL hook; as with WebSockets, only guest
-  egress controls contain that. Popups, shared and service workers and other
-  new targets are unsupported and are closed; if one cannot be closed, the
-  driver closes its session. Sites that depend on these may not work with this
-  driver.
+- Dedicated workers are not available. Every document of a tab, in every
+  frame, finds `Worker` a constructor that throws `NotSupportedError`, so no
+  worker starts, from a URL, `blob:` or `data:` script alike, and none can run
+  outside the URL hook, at the page's exit included. Chromium can neither close
+  a worker nor intercept the script of a worker another worker starts. Pages
+  that fall back when a worker cannot start keep working. Popups, shared and
+  service workers and other new targets are unsupported and are closed; if one
+  cannot be closed, the driver closes its session. Sites that depend on these
+  may not work with this driver.
 - `read_page` returns accessibility roles/names and element refs; `find`
   performs a case-insensitive substring search over that tree. Each read/find
   replaces that tab's refs. Navigation invalidates them. Ask for a new page
