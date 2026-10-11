@@ -93,13 +93,15 @@ _INTERCEPT = {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
 # Dedicated workers never start. Chromium can neither close one nor intercept
 # all of a running one's requests (the script of a worker that a worker starts
 # is fetched with no session's interception, and a held worker is released as
-# its page goes), so every document of an owned tab, before any of its own
-# script runs, finds Worker a constructor that refuses.
+# its page goes), so every document of an owned tab that the driver reaches
+# before it runs finds Worker a constructor that refuses. A sandboxed srcdoc
+# frame starts in its own process before the driver can reach it; that, like
+# WebSockets, is left to the guest's egress controls.
 _NO_WORKERS = """(() => {
   const refuse = function Worker() {
     throw new DOMException(
       "Dedicated workers are not available in this browser session.",
-      "NotSupportedError"
+      "SecurityError"
     );
   };
   Object.defineProperty(globalThis, "Worker", {
@@ -291,6 +293,10 @@ class BrowserCDP:
         # meanwhile beneath a frame not tracked yet: frame -> (tab, session, parent).
         self.restoring: set[asyncio.Task[None]] = set()
         self.orphans: dict[str, tuple[str, str, str]] = {}
+        # Download GUID -> the task handling its latest event. A download's
+        # events are handled in arrival order, one at a time: its progress must
+        # not overtake its beginning while that waits on a restore.
+        self.download_events: dict[str, asyncio.Task[Any]] = {}
         self._pools: dict[bool, tuple[ThreadPoolExecutor, asyncio.Semaphore]] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
@@ -802,7 +808,8 @@ class BrowserCDP:
             if self._owner(session) == tab:
                 self._track_tree(reply["frameTree"], tab, session, touched)
         finally:
-            self.snapshots.remove(touched)
+            # By identity: two snapshots' sets can be equal.
+            self.snapshots = [other for other in self.snapshots if other is not touched]
 
     def _adopt(self) -> None:
         """Track waiting frames whose parent is tracked now, and theirs in turn."""
@@ -941,10 +948,21 @@ class BrowserCDP:
                 "Browser.downloadWillBegin",
                 "Browser.downloadProgress",
             ):
-                decision = message.get("decision")
-                if decision is not None:
-                    p["tracked"] = await decision
-                await self.files.event(method, p)
+                guid = p.get("guid")
+                current = asyncio.current_task()
+                before = self.download_events.get(guid) if isinstance(guid, str) else None
+                if isinstance(guid, str) and current is not None:
+                    self.download_events[guid] = current
+                try:
+                    if before is not None:
+                        await asyncio.gather(before, return_exceptions=True)
+                    decision = message.get("decision")
+                    if decision is not None:
+                        p["tracked"] = await decision
+                    await self.files.event(method, p)
+                finally:
+                    if isinstance(guid, str) and self.download_events.get(guid) is current:
+                        del self.download_events[guid]
                 return
             if method == "Target.attachedToTarget":
                 info, child = p["targetInfo"], p["sessionId"]

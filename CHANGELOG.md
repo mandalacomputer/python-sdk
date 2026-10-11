@@ -119,11 +119,11 @@ This is the summary you read to decide whether to upgrade.
   `ModelProviderError`, and a 429 carries no Mandala budget fields.
 
 - **Dedicated workers cannot start in the browser toolsets.** Every document
-  of a tab, in every frame, finds `Worker` a constructor that throws
-  `NotSupportedError`. Chromium can neither close a worker nor intercept the
-  script of a worker another worker starts, and a worker held paused instead
-  is released as its page navigates away or closes, its requests then meeting
-  no URL policy at all (OPL-5909).
+  the driver reaches before it runs, in the tab and its frames, finds `Worker`
+  a constructor that throws `SecurityError`. Chromium can neither close a
+  worker nor intercept the script of a worker another worker starts, and a
+  worker held paused instead is released as its page navigates away or
+  closes, its requests then meeting no URL policy at all (OPL-5909).
 
 - **Downloads keep the right frame in the browser toolsets.** Download
   ownership follows each frame's parent and the session that reported it, as

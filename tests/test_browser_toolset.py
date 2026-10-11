@@ -2073,10 +2073,11 @@ async def test_a_cross_site_frame_navigating_keeps_the_tabs_refs() -> None:
     assert backend.failed and closed
 
 
-#: Every way a page can reach a Worker constructor in its own tab: its own
-#: realm, about:blank and srcdoc frames (before and after they load), a
-#: same-origin child, a window taken from a frame then removed, and blob: and
-#: data: scripts. Each records "made" or "refused" in the title.
+#: The ways a page can reach a Worker constructor in its own tab: its own
+#: realm, about:blank, srcdoc, javascript: and document.write frames (srcdoc
+#: before and after it loads), a same-origin child, a window taken from a frame
+#: then removed, URL, blob: and data: scripts, and deleting or reassigning
+#: Worker first. Each records "made" or "refused" in the title.
 WORKER_REALMS = r"""
 const out = [];
 const blob = URL.createObjectURL(new Blob(["fetch('/ran-blob')"], {type: 'text/javascript'}));
@@ -2097,6 +2098,19 @@ child.onload = () => attempt('child', () => new child.contentWindow.Worker(blob)
 const kept = document.createElement('iframe'); document.body.appendChild(kept);
 const window2 = kept.contentWindow; kept.remove();
 attempt('removed', () => new window2.Worker(blob));
+const script = document.createElement('iframe'); script.src = "javascript:'<p>j</p>'";
+document.body.appendChild(script);
+script.onload = () => attempt('javascript', () => new script.contentWindow.Worker(blob));
+const written = document.createElement('iframe'); document.body.appendChild(written);
+written.contentDocument.open(); written.contentDocument.write('<p>w</p>');
+written.contentDocument.close();
+attempt('written', () => new written.contentWindow.Worker(blob));
+attempt('deleted', () => { delete window.Worker; return new Worker(blob); });
+attempt('reassigned', () => {
+  try { window.Worker = function () {}; } catch (e) {}
+  try { Object.defineProperty(window, 'Worker', {value: function () {}}); } catch (e) {}
+  return new Worker(blob);
+});
 addEventListener('message', (e) => { out.push(String(e.data)); document.title = out.sort().join(' '); });
 """
 
@@ -2111,9 +2125,26 @@ const inner = document.createElement('iframe'); document.body.appendChild(inner)
 report('cross-site-inner', () => new inner.contentWindow.Worker(blob));
 """
 
-WORKERS_REFUSED = (
-    "blank:refused child:refused cross-site-inner:refused cross-site:refused main-blob:refused "
-    "main-data:refused main:refused removed:refused srcdoc-new:refused srcdoc:refused"
+WORKERS_REFUSED = " ".join(
+    sorted(
+        f"{realm}:refused"
+        for realm in [
+            "blank",
+            "child",
+            "cross-site",
+            "cross-site-inner",
+            "deleted",
+            "javascript",
+            "main",
+            "main-blob",
+            "main-data",
+            "reassigned",
+            "removed",
+            "srcdoc",
+            "srcdoc-new",
+            "written",
+        ]
+    )
 )
 
 
@@ -2435,3 +2466,90 @@ async def test_a_cache_restore_reads_its_frames_back_and_holds_downloads_briefly
     for task in list(backend.tasks):
         task.cancel()
     await asyncio.gather(*backend.tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_frame_trees_each_keep_their_own_record_of_newer_events() -> None:
+    backend, _, files = tracking_backend()
+    asked = {"x-s": asyncio.Event(), "y-s": asyncio.Event()}
+    answer = {"x-s": asyncio.Event(), "y-s": asyncio.Event()}
+    trees = {
+        "x-s": {"frame": {"id": "x"}, "childFrames": [{"frame": {"id": "x-kid"}}]},
+        "y-s": {"frame": {"id": "y"}},
+    }
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree" and session in trees:
+            await plain(method, params, session)
+            asked[session].set()
+            await answer[session].wait()
+            return {"frameTree": trees[session]}
+        return await plain(method, params, session)
+
+    backend.send = send
+    first = asyncio.create_task(backend._event(attached("x-s", "x", "iframe", "page")))
+    second = asyncio.create_task(backend._event(attached("y-s", "y", "iframe", "page")))
+    await asyncio.wait_for(asyncio.gather(asked["x-s"].wait(), asked["y-s"].wait()), 1)
+    # Both records are empty, so equal; the second tree lands first.
+    answer["y-s"].set()
+    await second
+    backend._note("Page.frameDetached", {"frameId": "x-kid", "reason": "remove"}, "x-s")
+    answer["x-s"].set()
+    await first
+    assert "x-kid" not in files.frames and {"x", "y"} <= set(files.frames)
+    assert backend.snapshots == [] and not backend.failed
+
+
+@pytest.mark.asyncio
+async def test_a_downloads_progress_waits_for_its_beginning() -> None:
+    backend, _, files = tracking_backend()
+    order: list[tuple[str, Any]] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        order.append((method, params.get("tracked")))
+
+    files.event = event  # type: ignore[method-assign]
+    asked, answer = asyncio.Event(), asyncio.Event()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree":
+            await plain(method, params, session)
+            asked.set()
+            await answer.wait()
+            return {"frameTree": {"frame": {"id": "tab"}, "childFrames": [{"frame": {"id": "r"}}]}}
+        return await plain(method, params, session)
+
+    backend.send = send
+    backend._note(
+        "Page.frameNavigated", {"frame": {"id": "tab"}, "type": "BackForwardCacheRestore"}, "page"
+    )
+    await asyncio.wait_for(asked.wait(), 1)
+    guid = "00000000-0000-0000-0000-000000000002"
+    backend._dispatch(
+        {
+            "method": "Browser.downloadWillBegin",
+            "params": {"guid": guid, "frameId": "r", "url": "https://ok.test/f"},
+        }
+    )
+    for state in ("inProgress", "completed"):
+        backend._dispatch(
+            {
+                "method": "Browser.downloadProgress",
+                "params": {"guid": guid, "state": state, "receivedBytes": 1, "totalBytes": 1},
+            }
+        )
+    await asyncio.sleep(0.05)
+    assert order == []  # Nothing of the download before its beginning is decided.
+    answer.set()
+    for _ in range(100):
+        if len(order) == 3:
+            break
+        await asyncio.sleep(0.01)
+    assert [m for m, _ in order] == [
+        "Browser.downloadWillBegin",
+        "Browser.downloadProgress",
+        "Browser.downloadProgress",
+    ]
+    assert order[0][1] is True and backend.download_events == {}
