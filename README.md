@@ -1570,9 +1570,12 @@ call reserves $0.25 and settles at the platform's rate. Every step reports
 them — and `step.credits_remaining_usd`, the account's available credits after
 that call, which can go negative after an overrun. Credits running out part way
 ends the run with `stop == "credits_exhausted"`; neither of these raises. A run
-the credits cannot *start* raises `CreditsExhaustedError`, whose `top_up_url`
-says where to add more (a dashboard path, such as `/billing`). On a run with
-your own key every cost field is `None`. `client.credits.read()` is the ledger
+the credits cannot *start* raises `InsufficientCreditsError`, whose `top_up_url`
+is the billing page to add more on, as an absolute link. A funded run's model
+provider failing reaches you as a plain `APIError` saying "Mandala AI is
+unavailable", whatever the provider's status, rather than as the class that
+would blame your key or the computer. On a run with your own key every cost
+field is `None`. `client.credits.read()` is the ledger
 these runs spend; see [AI credits](#ai-credits).
 
 Select `model="gpt-6.1-sol"` with `model_key=os.environ["OPENAI_API_KEY"]`
@@ -1634,7 +1637,7 @@ mid-run, as whatever class its status deserves: a bad model key comes back as an
 `AuthenticationError`, not as something your handler cannot classify. A 402 on
 these routes is never your Mandala plan and never raises `PlanLimitError`: one
 carrying `top_up_url` is a funded run your AI credits could not start
-(`CreditsExhaustedError`), and one without is the model API's `billing_error`
+(`InsufficientCreditsError`), and one without is the model API's `billing_error`
 for the account behind `model_key` (`ModelProviderError`).
 
 That raise carries the run with it. `e.agent` holds what the loop had already
@@ -1651,7 +1654,7 @@ reason `revoked` rather than with a body — after steps that already ran on the
 desktop and already cost model tokens. The Mandala plan is not rechecked. The
 model API can end the run too, and its status is relayed as it came, about the
 account behind `model_key`: 402 `billing_error` (`ModelProviderError`; a 402
-carrying `top_up_url` is your AI credits instead, `CreditsExhaustedError`), 504
+carrying `top_up_url` is your AI credits instead, `InsufficientCreditsError`), 504
 `timeout_error` (a plain `APIError`, not `GatewayTimeoutError`: the platform
 answered, with the run's usage and steps), 529 `overloaded_error`; a 403 without reason `revoked` may be
 its `permission_error`. Where the refusal says how far the run got, `e.agent`
@@ -3556,7 +3559,7 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | `AuthenticationError` | 401 — a credential was refused |
 | `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
 | `ModelProviderError` | 402 on the agent routes — the model API's `billing_error` for the account behind `model_key`, not the plan |
-| `CreditsExhaustedError` | 402 on the agent routes carrying `top_up_url` — a funded run (no `model_key`) your Mandala AI credits could not start |
+| `InsufficientCreditsError` | 402 on the agent routes carrying `top_up_url` — a funded run (no `model_key`) your Mandala AI credits could not start |
 | `PermissionDeniedError` | 403 — the credential is valid but lacks the role, membership or permission (such as a key's permission to manage keys), or the account or person is suspended |
 | `NotFoundError` | 404 — no such computer, snapshot, guest file, or route |
 | `MethodNotAllowedError` | 405 — method unsupported; see `allow` |

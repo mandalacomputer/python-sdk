@@ -9,7 +9,7 @@ what the run has cost so far. Pinned here:
 - what comes back: the cost fields on steps, results and failures, absent (not
   zero) on a run with the caller's own key
 - the 402 that carries ``top_up_url``: the account's credits, raised as
-  :class:`~mandala_computer.CreditsExhaustedError` from every entry point,
+  :class:`~mandala_computer.InsufficientCreditsError` from every entry point,
   never a :class:`~mandala_computer.PlanLimitError` and never the model
   provider's billing refusal
 - ``GET credits``, strictly decoded
@@ -230,21 +230,24 @@ def test_a_negative_remaining_balance_is_kept() -> None:
 
 
 def test_a_failure_frame_carries_its_cost_and_top_up_link() -> None:
-    failure = to_agent_event(
-        "error",
-        {
-            "error": "Insufficient AI credits",
-            "status": 402,
-            "cost_usd": 0,
-            "top_up_url": "/billing",
-            "usage": {},
-            "steps": [],
-        },
-        0,
-    )
+    """The billing page's path, resolved against the client's base URL into a
+    link a person can open; the value as sent stays on ``raw``."""
+    frame_data = {
+        "error": "Insufficient AI credits",
+        "status": 402,
+        "cost_usd": 0,
+        "top_up_url": "/billing",
+        "usage": {},
+        "steps": [],
+    }
+    failure = to_agent_event("error", frame_data, 0, base_url=BASE)
     assert isinstance(failure, mc.AgentFailed)
     assert failure.cost_usd == 0
-    assert failure.top_up_url == "/billing"
+    assert failure.top_up_url == "https://api.test/billing"
+    assert failure.raw["top_up_url"] == "/billing"
+    # No base to resolve a path against: no link, rather than one nobody can follow.
+    unresolved = to_agent_event("error", frame_data, 0)
+    assert isinstance(unresolved, mc.AgentFailed) and unresolved.top_up_url is None
     plain = to_agent_event("error", {"error": "model API: boom", "status": 500}, 0)
     assert isinstance(plain, mc.AgentFailed)
     assert plain.cost_usd is None and plain.top_up_url is None
@@ -254,22 +257,24 @@ def test_a_failure_frame_carries_its_cost_and_top_up_link() -> None:
 
 
 def _assert_credits_refusal(error: BaseException) -> None:
-    assert isinstance(error, mc.CreditsExhaustedError)
+    assert isinstance(error, mc.InsufficientCreditsError)
     assert not isinstance(error, (mc.PlanLimitError, mc.ModelProviderError))
     assert error.status == 402
-    assert error.top_up_url == "/billing"
+    assert error.top_up_url == "https://api.test/billing"
+    assert "add credits at https://api.test/billing" in str(error)
+    assert isinstance(error.body, dict) and error.body["top_up_url"] == "/billing"
     assert mc.is_transient(error) is False
 
 
 @respx.mock
 @pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
-def test_a_funded_run_the_credits_cannot_start_is_credits_exhausted(
+def test_a_funded_run_the_credits_cannot_start_is_insufficient_credits(
     computer: mc.Computer, method: str
 ) -> None:
     """Refused before the stream opens, with a status — which the transport's
     table would otherwise call a PlanLimitError, on all three entry points."""
     respx.post(AGENT).mock(httpx.Response(402, json=INSUFFICIENT))
-    with pytest.raises(mc.CreditsExhaustedError) as error:
+    with pytest.raises(mc.InsufficientCreditsError) as error:
         result = getattr(computer, method)("go")
         if method == "agent_stream":
             list(result)
@@ -279,11 +284,11 @@ def test_a_funded_run_the_credits_cannot_start_is_credits_exhausted(
 
 @respx.mock
 @pytest.mark.parametrize("method", ["agent", "agent_once", "agent_stream"])
-async def test_the_async_halves_raise_credits_exhausted_too(method: str) -> None:
+async def test_the_async_halves_raise_insufficient_credits_too(method: str) -> None:
     respx.post(AGENT).mock(httpx.Response(402, json=INSUFFICIENT))
     async with mc.AsyncClient("gck_test", base_url=BASE) as client:
         c = mc.AsyncComputer(client._t, COMPUTER)
-        with pytest.raises(mc.CreditsExhaustedError) as error:
+        with pytest.raises(mc.InsufficientCreditsError) as error:
             result = getattr(c, method)("go")
             if method == "agent_stream":
                 _ = [event async for event in result]
@@ -293,7 +298,7 @@ async def test_the_async_halves_raise_credits_exhausted_too(method: str) -> None
 
 
 @respx.mock
-def test_a_credits_refusal_reported_on_the_stream_is_credits_exhausted(
+def test_a_credits_refusal_reported_on_the_stream_is_insufficient_credits(
     computer: mc.Computer,
 ) -> None:
     """The same refusal found after the stream opened arrives as an ``error``
@@ -314,11 +319,12 @@ def test_a_credits_refusal_reported_on_the_stream_is_credits_exhausted(
             )
         )
     )
-    with pytest.raises(mc.CreditsExhaustedError) as error:
+    with pytest.raises(mc.InsufficientCreditsError) as error:
         computer.agent("go")
     _assert_credits_refusal(error.value)
     assert error.value.cost_usd == 0
-    assert error.value.agent is not None and error.value.agent.top_up_url == "/billing"
+    assert error.value.agent is not None
+    assert error.value.agent.top_up_url == "https://api.test/billing"
 
 
 @respx.mock
@@ -331,17 +337,18 @@ def test_agent_stream_hands_the_refusal_frame_over_as_an_event(computer: mc.Comp
     with closing(computer.agent_stream("go")) as events:
         failure = next(iter(events))
     assert isinstance(failure, mc.AgentFailed)
-    assert failure.status == 402 and failure.top_up_url == "/billing"
+    assert failure.status == 402 and failure.top_up_url == "https://api.test/billing"
 
 
 @respx.mock
-def test_a_non_streaming_credits_refusal_is_credits_exhausted(computer: mc.Computer) -> None:
+def test_a_non_streaming_credits_refusal_is_insufficient_credits(computer: mc.Computer) -> None:
     body = {**INSUFFICIENT, "cost_usd": 0, "usage": {"input_tokens": 0}, "steps_taken": []}
     respx.post(AGENT).mock(httpx.Response(402, json=body))
-    with pytest.raises(mc.CreditsExhaustedError) as error:
+    with pytest.raises(mc.InsufficientCreditsError) as error:
         computer.agent_once("go")
     _assert_credits_refusal(error.value)
-    assert error.value.agent is not None and error.value.agent.top_up_url == "/billing"
+    assert error.value.agent is not None
+    assert error.value.agent.top_up_url == "https://api.test/billing"
 
 
 @respx.mock
@@ -357,7 +364,7 @@ def test_a_402_without_a_top_up_link_stays_the_model_provider(
     respx.post(AGENT).mock(httpx.Response(402, json=body))
     with pytest.raises(mc.ModelProviderError) as error:
         computer.agent_once("go", model_key=KEY)
-    assert not isinstance(error.value, mc.CreditsExhaustedError)
+    assert not isinstance(error.value, mc.InsufficientCreditsError)
 
 
 @respx.mock
@@ -381,11 +388,33 @@ def test_the_stream_open_keeps_every_other_status_as_it_was(computer: mc.Compute
     assert error.value.status == 400
 
 
-def test_the_top_up_link_on_a_hand_built_error() -> None:
-    bare = mc.CreditsExhaustedError("no", status=402)
+@pytest.mark.parametrize(
+    ("sent", "base", "link"),
+    [
+        ("/billing", BASE, "https://api.test/billing"),
+        ("/billing", "http://localhost:3000/api/v1", "http://localhost:3000/billing"),
+        ("https://pay.example.com/top-up", BASE, "https://pay.example.com/top-up"),
+        ("/billing", None, None),
+        ("javascript:alert(1)", BASE, None),
+        ("mailto:billing@example.com", BASE, None),
+        (" ", BASE, None),
+        (7, BASE, None),
+        (None, BASE, None),
+    ],
+)
+def test_the_top_up_link_is_an_http_link_or_nothing(
+    sent: object, base: str | None, link: str | None
+) -> None:
+    error = mc.InsufficientCreditsError("no", status=402, body={"top_up_url": sent}, base_url=base)
+    assert error.top_up_url == link
+
+
+def test_the_cost_on_a_hand_built_error() -> None:
+    bare = mc.InsufficientCreditsError("no", status=402)
     assert bare.top_up_url is None and bare.cost_usd is None
-    odd = mc.CreditsExhaustedError("no", status=402, body={"top_up_url": " ", "cost_usd": True})
-    assert odd.top_up_url is None and odd.cost_usd is None
+    odd = mc.InsufficientCreditsError("no", status=402, body={"cost_usd": True})
+    assert odd.cost_usd is None
+    assert mc.InsufficientCreditsError("no", status=402, body={"cost_usd": 0.5}).cost_usd == 0.5
 
 
 # --- activity rows ------------------------------------------------------------
@@ -650,7 +679,7 @@ async def test_async_stream_closes_cleanly_on_a_credits_refusal() -> None:
         respx.post(AGENT).mock(httpx.Response(402, json=INSUFFICIENT))
         async with mc.AsyncClient("gck_test", base_url=BASE) as client:
             c = mc.AsyncComputer(client._t, COMPUTER)
-            with pytest.raises(mc.CreditsExhaustedError):
+            with pytest.raises(mc.InsufficientCreditsError):
                 async with aclosing(c.agent_stream("go")) as events:
                     async for _ in events:
                         pass
@@ -726,13 +755,15 @@ BUDGET = {"RateLimit-Limit": "100", "RateLimit-Remaining": "0", "RateLimit-Reset
 
 
 @respx.mock
-@pytest.mark.parametrize("status", [404, 413])
-def test_a_funded_providers_404_or_413_is_the_model_provider(
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 413])
+def test_a_funded_providers_failure_is_a_plain_api_error(
     computer: mc.Computer, status: int
 ) -> None:
     """The platform keeps the provider's status and replaces its words with its
-    own fixed sentence. Read as the platform's own 404 or 413, a funded run's
-    provider failure would send a caller into missing-computer recovery."""
+    own fixed sentence. Read by the status table, a funded run's provider
+    failure would blame the caller's API key (401), their role (403), the
+    computer (404) or the request (413) — and the model-provider class would
+    blame a model account the caller does not have. None is the cause."""
     failure = {"error": "Mandala AI is unavailable", "usage": {}, "steps_taken": []}
     respx.post(AGENT).mock(
         side_effect=[
@@ -740,18 +771,22 @@ def test_a_funded_providers_404_or_413_is_the_model_provider(
             stream(frame("error", {**failure, "status": status, "steps": []})),
         ]
     )
-    with pytest.raises(mc.ModelProviderError) as once:
+    with pytest.raises(mc.APIError) as once:
         computer.agent_once("go")
-    with pytest.raises(mc.ModelProviderError) as streamed:
+    with pytest.raises(mc.APIError) as streamed:
         computer.agent("go")
     for error in (once.value, streamed.value):
+        assert type(error) is mc.APIError
         assert error.status == status
-        assert not isinstance(error, (mc.NotFoundError, mc.FileTooLargeError))
+        assert "Mandala AI is unavailable" in str(error)
+        assert mc.is_transient(error) is False
 
 
 @respx.mock
-@pytest.mark.parametrize("status", [404, 413])
-async def test_the_async_halves_read_a_funded_404_or_413_the_same_way(status: int) -> None:
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 413])
+async def test_the_async_halves_read_a_funded_providers_failure_the_same_way(
+    status: int,
+) -> None:
     failure = {"error": "Mandala AI is unavailable", "usage": {}, "steps_taken": []}
     respx.post(AGENT).mock(
         side_effect=[
@@ -761,10 +796,37 @@ async def test_the_async_halves_read_a_funded_404_or_413_the_same_way(status: in
     )
     async with mc.AsyncClient("gck_test", base_url=BASE) as client:
         c = mc.AsyncComputer(client._t, COMPUTER)
-        with pytest.raises(mc.ModelProviderError):
+        with pytest.raises(mc.APIError) as once:
             await c.agent_once("go")
-        with pytest.raises(mc.ModelProviderError):
+        with pytest.raises(mc.APIError) as streamed:
             await c.agent("go")
+    assert type(once.value) is mc.APIError and type(streamed.value) is mc.APIError
+
+
+@respx.mock
+def test_a_funded_402_without_a_link_is_not_the_callers_model_account(
+    computer: mc.Computer,
+) -> None:
+    """A funded run has no key of the caller's for the provider to bill, so a
+    402 without top_up_url, whatever it says, is not a ModelProviderError."""
+    respx.post(AGENT).mock(httpx.Response(402, json={"error": "payment required"}))
+    with pytest.raises(mc.APIError) as raised:
+        computer.agent("go")
+    assert type(raised.value) is mc.APIError
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [401, 403])
+def test_the_same_sentence_on_a_run_with_your_key_keeps_the_tables_class(
+    computer: mc.Computer, status: int
+) -> None:
+    """Only a funded run is read this way; with your own key a 401 or 403 is
+    about a credential and keeps its class."""
+    respx.post(AGENT).mock(
+        httpx.Response(status, json={"error": "Mandala AI is unavailable", "usage": {}})
+    )
+    with pytest.raises((mc.AuthenticationError, mc.PermissionDeniedError)):
+        computer.agent_once("go", model_key=KEY)
 
 
 @respx.mock

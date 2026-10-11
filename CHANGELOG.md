@@ -22,10 +22,11 @@ This is the summary you read to decide whether to upgrade.
   `AgentResult` and `AgentFailed` have `cost_usd`, and `AgentFailed` has
   `top_up_url`. All are `None` on a run with your own key.
 
-- **`CreditsExhaustedError`**: the 402 a funded run gets when the account's
-  credits cannot cover its first model call, with `top_up_url` saying where to
-  add more. Raised by all three agent entry points, sync and async; not a
-  `PlanLimitError`, and `is_transient()` answers `False`.
+- **`InsufficientCreditsError`**: the 402 a funded run gets when the account's
+  credits cannot cover its first model call. Its `top_up_url` is the billing
+  page as an absolute link, resolved against the client's base URL (and so is
+  `AgentFailed.top_up_url`). Raised by all three agent entry points, sync and
+  async; not a `PlanLimitError`, and `is_transient()` answers `False`.
 
 - **`client.credits.read(before=, limit=)`**, sync and async: the account's AI
   credit ledger as `CreditReport` — balance, available, held and debt in
@@ -46,7 +47,7 @@ This is the summary you read to decide whether to upgrade.
 ### Fixed
 
 - A 402 answered before an agent stream opened was raised as
-  `PlanLimitError`. It is `CreditsExhaustedError` when it carries `top_up_url`
+  `PlanLimitError`. It is `InsufficientCreditsError` when it carries `top_up_url`
   and `ModelProviderError` otherwise, the same as a 402 reported on the
   stream or by `agent_once()`.
 
@@ -57,9 +58,10 @@ This is the summary you read to decide whether to upgrade.
 
 - A funded run's model provider failure, which the platform reports with the
   provider's status and its own fixed sentence instead of the `model API: `
-  prefix, is classified like the same failure on your own key: a 404 or 413
-  is `ModelProviderError` rather than `NotFoundError` or `FileTooLargeError`,
-  and a 429 carries no Mandala budget fields.
+  prefix, no longer blames something it is not: a 401, 402, 403, 404 or 413
+  said that way is a plain `APIError` rather than `AuthenticationError`,
+  `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
+  `ModelProviderError`, and a 429 carries no Mandala budget fields.
 
 ## [0.11.0] — 2026-10-08
 

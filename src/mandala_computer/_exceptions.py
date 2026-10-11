@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import math
 from typing import TYPE_CHECKING
+from urllib.parse import urljoin, urlsplit
 
 if TYPE_CHECKING:
     from ._agent import AgentFailed
@@ -18,10 +19,10 @@ __all__ = [
     "ConnectionError",
     "ConnectionInterruptedError",
     "CreateOnlyConflictError",
-    "CreditsExhaustedError",
     "FileExistsError",
     "FileTooLargeError",
     "GatewayTimeoutError",
+    "InsufficientCreditsError",
     "MandalaError",
     "MethodNotAllowedError",
     "ModelProviderError",
@@ -171,6 +172,25 @@ def _nonblank(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def top_up_link(value: object, base_url: str | None) -> str | None:
+    """A funded run's ``top_up_url`` as a link a person can open, or ``None``.
+
+    The platform sends the billing page's path, on the same origin as the API,
+    so it is resolved against the client's base URL. Only an ``http`` or
+    ``https`` result is kept: anything else — another scheme, or a path with no
+    base to resolve it against — is ``None`` rather than a link nobody can
+    follow. The TypeScript SDK's ``topUpLink`` reads it the same way.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        url = urljoin(base_url or "", value.strip())
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    return url if parts.scheme in ("http", "https") and parts.netloc else None
+
+
 class APIError(MandalaError):
     """The API returned an unsuccessful response."""
 
@@ -278,12 +298,12 @@ class PlanLimitError(APIError):
     :meth:`~mandala_computer.Computer.agent_stream`,
     :meth:`~mandala_computer.Computer.agent_once`): a 402 there is either the
     account's AI credits running short for a funded run, which arrives as
-    :class:`CreditsExhaustedError`, or the model provider's own billing refusal
+    :class:`InsufficientCreditsError`, or the model provider's own billing refusal
     on your ``model_key``, which arrives as :class:`ModelProviderError`.
     """
 
 
-class CreditsExhaustedError(APIError):
+class InsufficientCreditsError(APIError):
     """A funded agent run was refused for want of AI credits (402).
 
     Raised by :meth:`~mandala_computer.Computer.agent`,
@@ -303,14 +323,41 @@ class CreditsExhaustedError(APIError):
     result, because the steps it took are real.
     """
 
-    @property
-    def top_up_url(self) -> str | None:
-        """Where the account's credits are replenished, as the platform sent it.
+    #: Where to add credits: the platform's ``top_up_url`` as an absolute
+    #: ``http(s)`` link. The platform sends the billing page's path
+    #: (``/billing``), which lives on the API's own origin, so the agent methods
+    #: resolve it against the client's base URL. ``None`` when what was sent
+    #: cannot be made into such a link — a path on an error built by hand, with
+    #: no base URL to resolve it against, included. The value as sent is still
+    #: on :attr:`body`.
+    top_up_url: str | None
 
-        Currently a path on the dashboard (``/billing``) rather than an absolute
-        URL, so resolve it against the dashboard's origin before opening it.
-        ``None`` only on an error built by hand without one."""
-        return _nonblank(self.body.get("top_up_url") if isinstance(self.body, dict) else None)
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        body: object = None,
+        retry_after: float | None = None,
+        request_id: str | None = None,
+        allow: str | None = None,
+        www_authenticate: str | None = None,
+        method: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            status=status,
+            body=body,
+            retry_after=retry_after,
+            request_id=request_id,
+            allow=allow,
+            www_authenticate=www_authenticate,
+            method=method,
+        )
+        self.top_up_url = top_up_link(
+            body.get("top_up_url") if isinstance(body, dict) else None, base_url
+        )
 
     @property
     def cost_usd(self) -> float | None:
@@ -332,26 +379,29 @@ class ModelProviderError(APIError):
     Mandala plan: it is the model API's own ``billing_error``, relayed as it
     came, and it means the account behind your ``model_key`` has a billing
     problem. A 402 that does carry ``top_up_url`` is the account's AI credits
-    for a funded run, and is :class:`CreditsExhaustedError` instead. Nothing
+    for a funded run, and is :class:`InsufficientCreditsError` instead. Nothing
     inside an agent run consults the plan; the platform's own mid-run recheck
     answers only 401 or 403 with reason ``revoked``.
 
     Raised as well for a 404 or a 413 the model API answered, which the platform
-    relays with its message prefixed ``model API: `` — or, on a funded run
-    (no ``model_key``), with the provider's status and the platform's own
-    sentence ``Mandala AI is unavailable`` in place of the provider's words. A
-    404 there is usually a ``model`` name the provider does not know, and a 413
-    a request the provider found too large; neither is a missing computer or a
-    transfer to page. The platform's own 404 and 413 on these routes carry
-    neither and stay :class:`NotFoundError` and :class:`FileTooLargeError`.
-    :attr:`status` says which one this is.
+    relays with its message prefixed ``model API: ``. A 404 there is usually a
+    ``model`` name the provider does not know, and a 413 a request the provider
+    found too large; neither is a missing computer or a transfer to page. The
+    platform's own 404 and 413 on these routes carry no prefix and stay
+    :class:`NotFoundError` and :class:`FileTooLargeError`. :attr:`status` says
+    which one this is.
+
+    Only on a run with your own ``model_key``. A FUNDED run's provider failure
+    arrives with the provider's status and the platform's own sentence
+    ``Mandala AI is unavailable`` in place of the provider's words, and a 401,
+    402, 403, 404 or 413 said that way is a plain :class:`APIError`: there is
+    no model account of yours to fix, and the table's class would blame your
+    API key, your role, the computer or the request.
 
     A subclass of :class:`APIError` and not of :class:`PlanLimitError`, so a
     handler written for the plan does not catch it and tell the caller to
     upgrade something that is not the problem. Fix the model account, the model
-    name or the request, then run again; on a funded run the provider account
-    is the platform's, so wait or pass your own ``model_key``.
-    :func:`is_transient` answers ``False``.
+    name or the request, then run again; :func:`is_transient` answers ``False``.
     Whatever the run had already done rides on :attr:`~MandalaError.agent`, as
     on any other mid-run failure.
     """

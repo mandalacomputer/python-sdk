@@ -28,6 +28,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._exceptions import top_up_link
+
 __all__ = [
     "AgentDone",
     "AgentEvent",
@@ -81,10 +83,6 @@ def _usd(value: Any) -> float | None:
     except OverflowError:
         return None
     return n if math.isfinite(n) else None
-
-
-def _opt_text(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
 
 
 @dataclass(frozen=True)
@@ -277,9 +275,10 @@ class AgentFailed:
     #: What a funded run had been charged when it failed, in USD. ``None`` on a
     #: run with your own ``model_key``.
     cost_usd: float | None = field(default=None, kw_only=True)
-    #: Where to replenish the account's AI credits, as the platform sent it —
-    #: present when a funded run was refused for want of them (status 402).
-    #: Currently a dashboard path such as ``/billing``.
+    #: Where to add AI credits, as an absolute ``http(s)`` link — present when
+    #: a funded run was refused for want of them (status 402). The platform
+    #: sends the billing page's path, which is resolved against the client's
+    #: base URL; the value as sent is in :attr:`raw`.
     top_up_url: str | None = field(default=None, kw_only=True)
 
 
@@ -289,8 +288,13 @@ class AgentFailed:
 AgentEvent = AgentStepEvent | AgentText | AgentDone | AgentFailed
 
 
-def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
-    """One frame as an event, or ``None`` for a frame this SDK does not model."""
+def to_agent_event(
+    event: str, data: Any, step_count: int, *, base_url: str | None = None
+) -> AgentEvent | None:
+    """One frame as an event, or ``None`` for a frame this SDK does not model.
+
+    ``base_url`` is the client's, which a failure's ``top_up_url`` path is
+    resolved against."""
     if event == "step":
         return AgentStepEvent(AgentStep.from_api(data, step_count + 1))
     if event == "text":
@@ -331,6 +335,6 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
             tuple(AgentStep.from_api(step, i + 1) for i, step in enumerate(taken)),
             raw=r,
             cost_usd=_usd(r.get("cost_usd")),
-            top_up_url=_opt_text(r.get("top_up_url")),
+            top_up_url=top_up_link(r.get("top_up_url"), base_url),
         )
     return None

@@ -2558,8 +2558,8 @@ class AsyncComputer(ComputerFields):
         end a little over it, with ``stop`` ``"max_cost"``. Credits running out
         part way ends a run with ``stop`` ``"credits_exhausted"``. A run the
         credits cannot start is refused with
-        :class:`~mandala_computer.CreditsExhaustedError`, whose
-        :attr:`~mandala_computer.CreditsExhaustedError.top_up_url` says where to
+        :class:`~mandala_computer.InsufficientCreditsError`, whose
+        :attr:`~mandala_computer.InsufficientCreditsError.top_up_url` says where to
         add more; an account that cannot run funded at all (no plan, an
         unsupported billing country, or funded runs not enabled) gets a 400 or
         a 403 saying to send a key. A custom ``system`` prompt, another model or
@@ -2614,7 +2614,9 @@ class AsyncComputer(ComputerFields):
         ) as frames:
             try:
                 async for frame in frames:
-                    event = to_agent_event(frame.event, frame.data, steps)
+                    event = to_agent_event(
+                        frame.event, frame.data, steps, base_url=self._t.base_url
+                    )
                     if event is None:
                         continue
                     if isinstance(event, AgentStepEvent):
@@ -2625,7 +2627,7 @@ class AsyncComputer(ComputerFields):
                 # the transport's table would call a 402 a PlanLimitError. On
                 # this route it is the account's AI credits (see
                 # :func:`_agent_route_error`).
-                error = _agent_route_error(exc)
+                error = _agent_route_error(exc, funded=model_key is None, base_url=self._t.base_url)
                 if error is exc:
                     raise
                 raise error from None
@@ -2663,11 +2665,14 @@ class AsyncComputer(ComputerFields):
         that ended without saying how the run came out. A 402 is never the
         Mandala plan: with ``top_up_url`` it is a funded run the account's
         credits could not start, raised as
-        :class:`~mandala_computer.CreditsExhaustedError`; without it, it is the
+        :class:`~mandala_computer.InsufficientCreditsError`; without it, it is the
         model API's ``billing_error`` for the account behind ``model_key``,
         raised as :class:`~mandala_computer.ModelProviderError`. So is a 404 or
         a 413 the model API answered (a model it does not know, a request it
-        found too large). A 429 the model API answered is a
+        found too large). A funded run's provider failing is a plain
+        :class:`~mandala_computer.APIError` saying ``Mandala AI is
+        unavailable`` instead, whatever the provider's status: there is no key
+        of yours behind it to blame. A 429 the model API answered is a
         :class:`~mandala_computer.RateLimitError` whose ``limit``,
         ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
         refuse it. Once the run has taken a step,
@@ -2705,7 +2710,13 @@ class AsyncComputer(ComputerFields):
             # not discard it.
             if result is None and failure is None:
                 raise
-        return _agent_outcome(result, failure, steps_seen=steps)
+        return _agent_outcome(
+            result,
+            failure,
+            steps_seen=steps,
+            funded=model_key is None,
+            base_url=self._t.base_url,
+        )
 
     async def agent_once(
         self,
@@ -2740,7 +2751,7 @@ class AsyncComputer(ComputerFields):
         been billed. The Mandala plan is not rechecked, and no status here is
         about it. A funded run the account's credits cannot start is a 402
         carrying ``top_up_url``, raised as
-        :class:`~mandala_computer.CreditsExhaustedError`. The model API can end
+        :class:`~mandala_computer.InsufficientCreditsError`. The model API can end
         the run as well, and its own status is relayed as it came, about the
         account behind ``model_key``: 402 ``billing_error`` (raised as
         :class:`~mandala_computer.ModelProviderError`, not
@@ -2805,12 +2816,12 @@ class AsyncComputer(ComputerFields):
             # the model provider's too (see :func:`_agent_route_error`). A
             # refusal that arrived mid-run carries what the run had already
             # done; see :func:`_attach_agent_partial`.
-            error = _agent_route_error(exc)
-            _attach_agent_partial(error)
+            error = _agent_route_error(exc, funded=model_key is None, base_url=self._t.base_url)
+            _attach_agent_partial(error, base_url=self._t.base_url)
             if error is exc:
                 raise
             raise error from None
-        return _agent_once_outcome(data)
+        return _agent_once_outcome(data, funded=model_key is None, base_url=self._t.base_url)
 
     # --- events ---------------------------------------------------------
 

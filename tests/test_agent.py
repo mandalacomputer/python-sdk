@@ -1265,6 +1265,9 @@ async def test_explicitly_closing_an_async_agent_stream_awaits_transport_cleanup
             self.closed = True
 
     class FakeTransport:
+        # What a run's failure resolves a top-up link against.
+        base_url = BASE
+
         def __init__(self) -> None:
             self.frames = Frames()
 
