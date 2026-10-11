@@ -144,7 +144,8 @@ This is the summary you read to decide whether to upgrade.
 
 - **A heavy page no longer ends a browser session.** More than 256 browser
   events in flight, as on a page with hundreds of images each waiting for
-  `url_policy`, closed the session. The rest now wait their turn; only a page
+  `url_policy`, closed the session. The rest now wait their turn, without
+  holding back the tab's own page loads, its dialogs or its frames; only a page
   that leaves more than 8,192 waiting, or 32 MiB of them, ends it.
 
 - **`create_browser_connection()` releases any grant it refuses to hand over**,

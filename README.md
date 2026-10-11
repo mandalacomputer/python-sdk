@@ -1962,8 +1962,7 @@ revokes its capability; it does not stop Chromium or delete the computer.
   their tab, and their HTTP(S) requests go through the same URL hook with that
   tab's ID. A frame that cannot be given the hook stays paused and never runs.
   A cross-site frame's contents are not part of `read_page`, `find` or
-  `get_page_text`; screenshots and coordinate input reach it. Downloads from
-  frames nested inside a cross-site frame are canceled.
+  `get_page_text`; screenshots and coordinate input reach it.
 - Dedicated workers are held paused and never run while their page lives:
   Chromium cannot close one, and fetches the script of a worker started by
   another worker without any interception the driver could apply. When a
@@ -1982,9 +1981,10 @@ revokes its capability; it does not stop Chromium or delete the computer.
   16,000 characters per input/JavaScript action, a 30-second wait, a ten-second
   held key and at most 100 key repeats. Coordinates outside the viewport and
   invalid crop rectangles are refused. Dialogs are dismissed and reported.
-  Browser events (paused requests among them) are handled 256 at a time and
-  the rest wait their turn; a page that leaves more than 8,192 waiting, or
-  32 MiB of them, ends the session.
+  Paused requests and downloads are handled 256 at a time and the rest wait
+  their turn; a tab's own page loads, its dialogs and its frames never wait
+  behind them. A page that leaves more than 8,192 waiting, or 32 MiB of them,
+  ends the session.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be

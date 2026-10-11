@@ -19,20 +19,26 @@ from websockets.asyncio.client import connect
 from ._browser_connection import BrowserSessionLease, BrowserSessionPolicy
 from ._exceptions import APIError
 
-# Events take one of three routes, chosen as each arrives:
+# Every event is routed as it arrives:
 #
-# - Target lifecycle events run at once, in arrival order, ahead of any reply
-#   that follows them: a reply about a frame that has gone must find it gone.
-# - Bookkeeping that needs no reply from Chromium (frames, console, network
-#   log) is done in place, so a page cannot queue large payloads.
-# - Paused requests, dialogs and downloads, which wait on the URL policy or on
-#   Chromium, run up to _EVENT_CONCURRENCY at once; the rest wait their turn in
-#   arrival order, trimmed to the fields the driver reads. Chromium holds a
-#   paused request for as long as it takes, so waiting costs nothing.
+# - Bookkeeping that awaits nothing is done on arrival, in arrival order: which
+#   frames and sessions are a tab's (attach, detach, destroy), target info,
+#   frame notes, console and network logs, and which frame owns a download. So
+#   a reply that follows a detach finds the frame gone, and a note that follows
+#   a removal is not undone by it.
+# - What then needs Chromium's replies runs as a task. Target setup and dialogs
+#   start at once and never wait behind caller code. Paused requests and
+#   downloads wait on caller code (the URL policy, the download decision), so
+#   they run in lanes: a tab's own top-level document requests in one, so that
+#   a navigation never waits behind the page's subresources, everything else
+#   in another. A lane runs up to its concurrency at once; the rest wait their
+#   turn in arrival order, trimmed to the fields their handler reads. Chromium
+#   holds a paused request for as long as it takes, so waiting costs nothing.
 #
 # Only a page flooding the session faster than any policy could answer reaches
 # a limit, and it ends the session rather than growing without bound.
-_EVENT_CONCURRENCY = 256
+_POLICY_CONCURRENCY = 256
+_NAVIGATION_CONCURRENCY = 32
 _EVENT_QUEUE_LIMIT = 8192
 _EVENT_QUEUE_BYTES = 32 * 1024 * 1024
 _TARGET_EVENT_LIMIT = 1024
@@ -57,20 +63,17 @@ _NOTED_EVENTS = frozenset(
         "Network.responseReceived",
     }
 )
-_QUEUED_EVENTS = frozenset(
-    {
-        "Fetch.requestPaused",
-        "Page.javascriptDialogOpening",
-        "Browser.downloadWillBegin",
-        "Browser.downloadProgress",
-    }
+_LANE_EVENTS = frozenset(
+    {"Fetch.requestPaused", "Browser.downloadWillBegin", "Browser.downloadProgress"}
 )
 _AUTO_ATTACH = {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}
 _INTERCEPT = {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
 # A site-isolated cross-site frame is its own target, attached under its page
 # and paused until released. Chromium intercepts its subresource requests on
-# the frame's own session, so it gets the page's interception before it runs.
+# the frame's own session, so it gets the page's interception before it runs,
+# and reports its own frames there, so that their downloads are tracked.
 _FRAME_INIT: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("Page.enable", {}),
     ("Network.enable", {}),
     ("Network.setBypassServiceWorker", {"bypass": True}),
     ("Fetch.enable", _INTERCEPT),
@@ -166,6 +169,15 @@ def _target_info(message: dict[str, Any]) -> dict[str, Any]:
     return {**message, "params": {**p, "targetInfo": info}}
 
 
+class _Lane:
+    """Events waiting on caller code, run up to ``limit`` at once, in order."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.running: set[asyncio.Task[None]] = set()
+        self.waiting: deque[tuple[dict[str, Any], int]] = deque()
+
+
 class BrowserError(Exception):
     """Only driver-authored messages may be exposed to a model."""
 
@@ -220,10 +232,10 @@ class BrowserCDP:
         self.ws: Any = None
         self.reader: asyncio.Task[None] | None = None
         self.tasks: set[asyncio.Task[None]] = set()
-        # The subset of tasks running queued events, and the queue behind them.
-        self.slots: set[asyncio.Task[None]] = set()
-        self.backlog: deque[tuple[dict[str, Any], int]] = deque()
-        self.backlog_bytes = 0
+        self.policy_lane = _Lane(_POLICY_CONCURRENCY)
+        self.navigation_lane = _Lane(_NAVIGATION_CONCURRENCY)
+        self.queued = 0
+        self.queued_bytes = 0
         self.pending: dict[int, asyncio.Future[Any]] = {}
         self.pending_sessions: dict[int, str] = {}
         # Child session -> (owning tab, frame target, parent session): the
@@ -477,8 +489,9 @@ class BrowserCDP:
             pass
         finally:
             self.failed = True
-            self.backlog.clear()
-            self.backlog_bytes = 0
+            for lane in (self.policy_lane, self.navigation_lane):
+                lane.waiting.clear()
+            self.queued = self.queued_bytes = 0
             if self.lease_task is not None and self.lease_task is not asyncio.current_task():
                 self.lease_task.cancel()
             for ready in self.ready.values():
@@ -513,55 +526,80 @@ class BrowserCDP:
         return BrowserError(_FLOODED)
 
     def _dispatch(self, message: dict[str, Any]) -> None:
-        """Route one event as it arrives; see the note on _EVENT_CONCURRENCY."""
+        """Route one event as it arrives; see the note on _POLICY_CONCURRENCY."""
         method = message.get("method")
         if method in _TARGET_EVENTS:
-            # Started now, so it runs before the waiter of any later reply.
-            if len(self.tasks) - len(self.slots) >= _TARGET_EVENT_LIMIT:
-                raise self._flooded()
-            self._run_event(_target_info(message), queued=False)
+            message = _target_info(message)
+            self._settle(message)
+            if method in ("Target.attachedToTarget", "Target.targetDestroyed"):
+                self._launch(message)
         elif method in _NOTED_EVENTS:
-            self._note(method, message.get("params") or {}, message.get("sessionId"))
-        elif method in _QUEUED_EVENTS:
+            self._settle(message)
+        elif method == "Page.javascriptDialogOpening":
+            self._launch(_trimmed(message))
+        elif method in _LANE_EVENTS:
+            p = message.get("params") or {}
             trimmed = _trimmed(message)
             if method == "Browser.downloadWillBegin" and self.files is not None:
-                # Whose download it is is decided as it arrives: a tab or frame
-                # that goes while it waits its turn must not orphan it.
+                # Whose download it is is decided as it arrives, in order with
+                # the frame notes: a frame that goes while it waits its turn
+                # must not orphan it.
                 frame = trimmed["params"].get("frameId")
                 trimmed["params"]["tracked"] = frame in self.files.frames
-            # Arrival order is kept: nothing overtakes an event already waiting.
-            if not self.backlog and len(self.slots) < _EVENT_CONCURRENCY:
-                self._run_event(trimmed, queued=True)
-                return
-            size = len(json.dumps(trimmed))
-            if (
-                len(self.backlog) >= _EVENT_QUEUE_LIMIT
-                or self.backlog_bytes + size > _EVENT_QUEUE_BYTES
-            ):
-                raise self._flooded()
-            self.backlog.append((trimmed, size))
-            self.backlog_bytes += size
+            session = message.get("sessionId")
+            tab = self._owner(session)
+            own_document = (
+                tab is not None
+                and self.sessions.get(tab) == session
+                and p.get("frameId") == tab
+                and p.get("resourceType") == "Document"
+            )
+            self._enqueue(self.navigation_lane if own_document else self.policy_lane, trimmed)
         # Anything else is an event this driver does not use.
 
-    def _run_event(self, message: dict[str, Any], *, queued: bool) -> None:
-        task = asyncio.create_task(self._event(message))
-        self.tasks.add(task)
-        if queued:
-            self.slots.add(task)
-        task.add_done_callback(self._event_finished)
-
-    def _event_finished(self, task: asyncio.Task[None]) -> None:
-        self.tasks.discard(task)
-        self.slots.discard(task)
-        while (
-            not self.failed
-            and not self.closed
-            and self.backlog
-            and len(self.slots) < _EVENT_CONCURRENCY
+    def _launch(self, message: dict[str, Any]) -> None:
+        """A task that waits only on Chromium, started at once."""
+        if (
+            len(self.tasks) - len(self.policy_lane.running) - len(self.navigation_lane.running)
+            >= _TARGET_EVENT_LIMIT
         ):
-            message, size = self.backlog.popleft()
-            self.backlog_bytes -= size
-            self._run_event(message, queued=True)
+            raise self._flooded()
+        task = asyncio.create_task(self._after(message))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def _enqueue(self, lane: _Lane, message: dict[str, Any]) -> None:
+        # Arrival order is kept: nothing overtakes an event already waiting.
+        if not lane.waiting and len(lane.running) < lane.limit:
+            self._run_in(lane, message)
+            return
+        size = len(json.dumps(message))
+        if self.queued >= _EVENT_QUEUE_LIMIT or self.queued_bytes + size > _EVENT_QUEUE_BYTES:
+            raise self._flooded()
+        lane.waiting.append((message, size))
+        self.queued += 1
+        self.queued_bytes += size
+
+    def _run_in(self, lane: _Lane, message: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._after(message))
+        self.tasks.add(task)
+        lane.running.add(task)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            self.tasks.discard(done)
+            lane.running.discard(done)
+            while (
+                not self.failed
+                and not self.closed
+                and lane.waiting
+                and len(lane.running) < lane.limit
+            ):
+                waiting, size = lane.waiting.popleft()
+                self.queued -= 1
+                self.queued_bytes -= size
+                self._run_in(lane, waiting)
+
+        task.add_done_callback(finished)
 
     def _note(self, method: str, p: dict[str, Any], session: str | None) -> None:
         """Bookkeeping that needs no reply from Chromium: frames and the logs."""
@@ -607,7 +645,7 @@ class BrowserCDP:
             return frame[0] if frame[0] in self.sessions else None
         return next((t for t, s in self.sessions.items() if s == session), None)
 
-    def _drop_frame(self, session: str) -> None:
+    def _drop_frame(self, session: str | None) -> None:
         """Forget a frame's session and every frame session attached beneath it.
 
         Chromium need not report the detach of a session whose parent has gone,
@@ -629,24 +667,49 @@ class BrowserCDP:
             if owner in gone and future is not None and not future.done():
                 future.set_exception(_SessionGone("Browser frame detached."))
 
-    async def _child(self, child: str, info: dict[str, Any], tab: str, parent: str) -> None:
-        """A child target of an owned tab. Closing it would close its tab."""
-        if info.get("type") == "worker":
-            # Chromium cannot close a dedicated worker, and cannot run one under
-            # the URL policy: the script of a worker that a worker starts is
-            # fetched with no session's interception. So it is held where
-            # auto-attach paused it, before its first line, and never released.
-            return
+    def _settle(self, message: dict[str, Any]) -> None:
+        """The part of an event that awaits nothing, done as it arrives."""
+        method, p, session = (
+            message.get("method"),
+            message.get("params") or {},
+            message.get("sessionId"),
+        )
+        if method in _NOTED_EVENTS:
+            self._note(method, p, session)
+        elif method == "Target.targetInfoChanged":
+            info = p.get("targetInfo") or {}
+            if info.get("targetId") in self.tabs:
+                self.tabs[info["targetId"]] = info
+        elif method == "Target.detachedFromTarget":
+            self._drop_frame(p.get("sessionId"))
+        elif method == "Target.targetDestroyed":
+            for child, (_, frame, _) in list(self.child_frames.items()):
+                if frame == p.get("targetId"):
+                    self._drop_frame(child)
+        elif method == "Target.attachedToTarget":
+            info, child = p["targetInfo"], p["sessionId"]
+            tab = self._owner(session)
+            if tab is not None and session is not None and info.get("type") == "iframe":
+                # A cross-site frame of an owned tab, at any depth. Closing it
+                # would close its tab; it is set up and run instead.
+                self.child_frames[child] = (tab, info["targetId"], session)
+                if self.files is not None:
+                    # Its ID is its target's. Its downloads are its tab's, even
+                    # after its parent reports it swapped out.
+                    self.files.frame(info["targetId"], tab)
+
+    async def _setup_frame(self, child: str) -> None:
+        tab = self.child_frames[child][0]
         try:
-            self.child_frames[child] = (tab, info["targetId"], parent)
-            if self.files is not None:
-                # A cross-site frame's ID is its target's. Its downloads are
-                # its tab's, even after its parent reports it swapped out.
-                self.files.frame(info["targetId"], tab)
             for name, args in _FRAME_INIT:
                 await self.send(name, args, child)
                 if child not in self.child_frames:
                     return  # Detached mid-setup: nothing left to set up.
+            if self.files is not None:
+                tree = await self.send("Page.getFrameTree", session=child)
+                if child not in self.child_frames:
+                    return
+                self.files.frame_tree(tree["frameTree"], tab)
             await self.send("Runtime.runIfWaitingForDebugger", session=child)
         except Exception:  # noqa: BLE001 - never expose browser-supplied errors
             # Usually the frame went away first. If not, it stays paused: a
@@ -655,6 +718,14 @@ class BrowserCDP:
             self._drop_frame(child)
 
     async def _event(self, message: dict[str, Any]) -> None:
+        """One event, whole: its bookkeeping, then whatever it awaits."""
+        if message.get("method") in _TARGET_EVENTS:
+            message = _target_info(message)
+        self._settle(message)
+        await self._after(message)
+
+    async def _after(self, message: dict[str, Any]) -> None:
+        """The part of an event that waits on Chromium or caller code."""
         method, p, session = (
             message.get("method"),
             message.get("params", {}),
@@ -669,14 +740,22 @@ class BrowserCDP:
                 return
             if method == "Target.attachedToTarget":
                 info, child = p["targetInfo"], p["sessionId"]
+                if child in self.child_frames:
+                    await self._setup_frame(child)
+                    return
                 parent = self._owner(session)
+                if info.get("type") == "iframe" and parent is not None:
+                    return  # Detached before its setup began.
                 if info.get("browserContextId") != self.context and parent is None:
                     await self.send("Runtime.runIfWaitingForDebugger", session=child)
                     await self.send("Target.detachFromTarget", {"sessionId": child})
                     return
-                if parent is not None and info.get("type") in ("iframe", "worker"):
-                    assert session is not None
-                    await self._child(child, info, parent, session)
+                if parent is not None and info.get("type") == "worker":
+                    # Chromium cannot close a dedicated worker, and cannot run
+                    # one under the URL policy: the script of a worker that a
+                    # worker starts is fetched with no session's interception.
+                    # So it is held where auto-attach paused it, before its
+                    # first line, and never released.
                     return
                 # Popups and other targets cannot outlive the request policy.
                 # This driver runs only explicitly-created top-level tabs and the
@@ -714,17 +793,8 @@ class BrowserCDP:
                 await self.send("Runtime.runIfWaitingForDebugger", session=child)
                 if ready := self.ready.get(target):
                     ready.set()
-            elif method == "Target.targetInfoChanged":
-                info = p["targetInfo"]
-                if info["targetId"] in self.tabs:
-                    self.tabs[info["targetId"]] = info
-            elif method == "Target.detachedFromTarget":
-                self._drop_frame(p["sessionId"])
             elif method == "Target.targetDestroyed":
                 target = p["targetId"]
-                for child, (_, frame, _) in list(self.child_frames.items()):
-                    if frame == target:
-                        self._drop_frame(child)
                 if target not in self.ready and self.creating is not None:
                     await asyncio.shield(self.creating)
                 self.drop_tab(target)
@@ -750,6 +820,8 @@ class BrowserCDP:
                     session,
                 )
             elif method == "Page.javascriptDialogOpening":
+                if self._owner(session) is None:
+                    return
                 self.changes.append(
                     {
                         "type": "dialog_dismissed",
@@ -758,8 +830,6 @@ class BrowserCDP:
                     }
                 )
                 await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
-            elif method in _NOTED_EVENTS:
-                self._note(method, p, session)
         except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):
                 return  # Page-side cancellation invalidates the paused request ID.

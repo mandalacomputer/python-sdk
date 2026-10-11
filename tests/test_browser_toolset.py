@@ -704,7 +704,8 @@ def cross_site() -> Any:
 
     Under site isolation the frame is its own CDP target, attached beneath the
     page, and it embeds a 127.0.0.1 frame of its own, which attaches beneath it.
-    Each frame asks for a URL the policy refuses and reports, to the page,
+    It also embeds a localhost frame, which runs in its own process. Each
+    cross-site frame asks for a URL the policy refuses and reports, to the page,
     whether it got through. The page and the frame each start a dedicated
     worker, which would do the same if it ran. The frame is a button at a known
     place, which reports a click. ``/churn``, served from localhost, adds and
@@ -729,12 +730,14 @@ new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
 style="position:absolute;left:0;top:100px;width:600px;height:300px;border:0"></iframe>""",
                 "/frame": f"""<body style="margin:0"><button style="width:600px;height:200px"
 onclick="parent.postMessage('clicked','*')">inside</button><script>new Worker('/worker.js');{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
-<iframe src="http://127.0.0.1:{port}/nested" style="height:60px"></iframe></body>""",
+<iframe src="http://127.0.0.1:{port}/nested" style="height:60px"></iframe>
+<iframe src="http://localhost:{port}/inner" style="height:60px"></iframe></body>""",
+                "/inner": "<p>inner</p>",
                 "/churn": f"""<title>Churn</title><p id=log>churning</p><script>
 let n=0;const t=setInterval(()=>{{const f=document.createElement('iframe');
 f.src='http://127.0.0.1:{port}/lite?'+n;document.body.appendChild(f);
 setTimeout(()=>f.remove(),n%10?n%7:500);if(++n===300){{clearInterval(t);
-setTimeout(()=>document.getElementById('log').textContent='churned '+n,300)}}}},3);
+setTimeout(()=>{{const last=document.createElement('iframe');last.src='http://127.0.0.1:{port}/lite?last';last.onload=()=>document.getElementById('log').textContent='churned '+n;document.body.appendChild(last)}},300)}}}},3);
 </script>""",
                 "/lite": f"<script>{probe.format('/lite')}</script>",
                 "/nested": f"<p>nested</p><script>{probe.format('/nested')}.then(r=>top.postMessage('nested:'+r,'*'))</script>",
@@ -846,6 +849,7 @@ async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_s
             raise ToolError("not permitted")
 
     async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        browser._backend.files = tracking = TrackingFiles()
         nav = assert_success(
             await browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/"))
         )
@@ -860,6 +864,11 @@ async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_s
         assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
         assert_success(await browser.tool_result(use("screenshot")))
         assert_workers_held(port, hits, seen)
+        # Every frame is the tab's for downloads: the page, both cross-site
+        # frames, and the same-process frame inside the localhost one, which
+        # only that frame's own session reports.
+        tab = tabs(nav)[0]["tab_id"]
+        assert len(tracking.frames) == 4 and set(tracking.frames.values()) == {tab}
     assert revoked == [IDENT]
     assert_cross_site_policy(port, hits, seen)
 
@@ -878,6 +887,9 @@ def owned_backend(policy: Any = None) -> tuple[Any, list[tuple[str, Any, Any]]]:
 
     async def send(method: str, params: Any = None, session: Any = None) -> Any:
         sent.append((method, params, session))
+        if method == "Page.getFrameTree":
+            # A cross-site frame's own frame is its target.
+            return {"frameTree": {"frame": {"id": backend.child_frames[session][1]}}}
         return {"success": True}
 
     backend.send = send
@@ -914,6 +926,7 @@ async def test_frames_under_an_owned_tab_run_and_workers_are_held_never_closed()
         *[(name, "frame-s") for name, _ in _FRAME_INIT],
         ("Runtime.runIfWaitingForDebugger", "frame-s"),
     ]
+    assert {"Page.enable", "Fetch.enable", "Target.setAutoAttach"} <= {m for m, _, _ in sent}
     # A frame inside that frame is the same tab's, however deep.
     sent.clear()
     await backend._event(attached("nested-s", "nested-t", "iframe", "frame-s"))
@@ -1092,7 +1105,7 @@ async def test_an_unbounded_event_flood_still_ends_the_session(monkeypatch: Any)
     from mandala_computer import _browser_cdp
     from mandala_computer._browser_cdp import BrowserCDP, BrowserError
 
-    monkeypatch.setattr(_browser_cdp, "_EVENT_CONCURRENCY", 2)
+    monkeypatch.setattr(_browser_cdp, "_POLICY_CONCURRENCY", 2)
     monkeypatch.setattr(_browser_cdp, "_EVENT_QUEUE_LIMIT", 10)
     stuck = asyncio.Event()
 
@@ -1243,7 +1256,7 @@ async def test_a_frame_detached_while_the_queue_is_full_does_not_end_the_session
         # ...when the tab fills every slot with requests waiting on the policy.
         for i in range(300):
             socket.push(paused(str(i), "page", "https://ok.test/slow"))
-        await settle(lambda: len(backend.tasks) >= 256 and backend.backlog)
+        await settle(lambda: len(backend.tasks) >= 256 and backend.policy_lane.waiting)
         # The frame goes; Chromium says so, then refuses the in-flight command.
         socket.push(
             {
@@ -1285,7 +1298,7 @@ async def test_large_events_are_noted_or_trimmed_rather_than_queued_whole(
     try:
         for i in range(256):
             socket.push(paused(str(i), "page", "https://ok.test/"))
-        await settle(lambda: len(backend.slots) == 256)
+        await settle(lambda: len(backend.policy_lane.running) == 256)
         # Console output is noted in place, whatever its size, and never queued.
         for _ in range(20):
             socket.push(
@@ -1298,12 +1311,12 @@ async def test_large_events_are_noted_or_trimmed_rather_than_queued_whole(
         # A queued request keeps only what its check reads: an over-long URL
         # stays over-long, so it is still refused.
         socket.push(paused("long", "page", "https://ok.test/" + huge))
-        await settle(lambda: backend.backlog)
+        await settle(lambda: backend.policy_lane.waiting)
         assert len(backend.console["tab"]) == 20
         assert all(len(line) <= 2000 for line in backend.console["tab"])
-        queued, size = backend.backlog[0]
+        queued, size = backend.policy_lane.waiting[0]
         assert len(queued["params"]["request"]["url"]) == 8193 and size < 10_000
-        assert backend.backlog_bytes == size
+        assert backend.queued_bytes == size
         # The byte budget still ends a flood of queued events.
         monkeypatch.setattr(_browser_cdp, "_EVENT_QUEUE_BYTES", size * 3)
         for i in range(5):
@@ -1341,8 +1354,8 @@ async def test_unused_events_are_dropped_and_target_events_skip_the_queue() -> N
         socket.push({"method": "Network.dataReceived", "sessionId": "page", "params": {}})
         socket.push({"method": "Target.targetDestroyed", "params": {"targetId": "frame-t"}})
         await settle(lambda: "frame-s" not in backend.child_frames)
-        assert len(backend.backlog) == 300 - 256
-        assert all(m["method"] == "Fetch.requestPaused" for m, _ in backend.backlog)
+        assert len(backend.policy_lane.waiting) == 300 - 256
+        assert all(m["method"] == "Fetch.requestPaused" for m, _ in backend.policy_lane.waiting)
     finally:
         hold.set()
         await socket.close()
@@ -1443,6 +1456,17 @@ async def test_frames_churning_faster_than_their_setup_leave_the_session_intact(
             raise ToolError("not permitted")
 
     async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        backend = browser._backend
+        frames: list[str] = []
+        settle_event = backend._settle
+
+        def counting(message: dict[str, Any]) -> None:
+            info = (message.get("params") or {}).get("targetInfo") or {}
+            if message.get("method") == "Target.attachedToTarget" and info.get("type") == "iframe":
+                frames.append(info.get("targetId"))
+            settle_event(message)
+
+        backend._settle = counting
         assert_success(
             await browser.tool_result(use("navigate", url=f"http://localhost:{port}/churn"))
         )
@@ -1457,7 +1481,8 @@ async def test_frames_churning_faster_than_their_setup_leave_the_session_intact(
         assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
         assert not browser._backend.failed
     assert revoked == [IDENT]
-    assert [path for host, path in hits if host == "127.0.0.1" and path.startswith("/lite?")]
+    # Cross-site frames came and went, as their own targets.
+    assert frames
     assert not [path for _, path in hits if path.endswith("-blocked")]
 
 
@@ -1516,23 +1541,22 @@ async def test_a_frame_detached_mid_setup_is_not_set_up_further() -> None:
 
 @pytest.mark.asyncio
 async def test_a_cross_site_frame_keeps_its_downloads_through_a_process_swap() -> None:
-    backend, _ = owned_backend()
-
-    class Files:
-        def __init__(self) -> None:
-            self.frames: dict[str, str] = {}
-
-        def frame(self, ident: str, tab: str) -> bool:
-            self.frames[ident] = tab
-            return True
-
-    backend.files = files = Files()
+    backend, sent = owned_backend()
+    backend.files = files = FrameFiles()
     # The parent reports the frame swapped out; the frame's own target arrives.
     files.frames["frame-t"] = "tab"
     backend._note("Page.frameDetached", {"frameId": "frame-t", "reason": "swap"}, session="page")
     assert files.frames == {"frame-t": "tab"}
     await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
     assert files.frames == {"frame-t": "tab"}
+    # Its own session reports its frames, and the ones it already has are
+    # tracked, before it is released.
+    calls = [m for m, _, session in sent if session == "frame-s"]
+    assert calls.index("Page.enable") < calls.index("Runtime.runIfWaitingForDebugger")
+    assert calls.index("Page.getFrameTree") < calls.index("Runtime.runIfWaitingForDebugger")
+    backend._note("Page.frameAttached", {"frameId": "same-process"}, session="frame-s")
+    assert files.frames == {"frame-t": "tab", "same-process": "tab"}
+    files.frames.pop("same-process")
     # A frame really removed is forgotten.
     backend._note("Page.frameDetached", {"frameId": "frame-t", "reason": "remove"}, session="page")
     assert files.frames == {}
@@ -1575,7 +1599,7 @@ async def test_a_download_belongs_to_its_frame_as_it_arrives() -> None:
     try:
         for i in range(256):
             socket.push(paused(str(i), "page", "https://ok.test/"))
-        await settle(lambda: len(backend.slots) == 256)
+        await settle(lambda: len(backend.policy_lane.running) == 256)
         # The download waits its turn; its tab goes at once.
         socket.push(
             {
@@ -1606,6 +1630,11 @@ class FrameFiles:
             return False
         self.frames[ident] = tab
         return True
+
+    def frame_tree(self, tree: dict[str, Any], tab: str) -> None:
+        if self.frame(tree["frame"]["id"], tab):
+            for child in tree.get("childFrames", []):
+                self.frame_tree(child, tab)
 
     async def event(self, method: str, params: dict[str, Any]) -> None:
         pass
@@ -1652,7 +1681,7 @@ async def test_frames_removed_while_the_queue_is_full_are_forgotten_at_once() ->
     try:
         for i in range(256):
             socket.push(paused(str(i), "page", "https://ok.test/"))
-        await settle(lambda: len(backend.slots) == 256)
+        await settle(lambda: len(backend.policy_lane.running) == 256)
         for i in range(300):
             for method in ("Page.frameAttached", "Page.frameDetached"):
                 socket.push({"method": method, "sessionId": "page", "params": {"frameId": f"x{i}"}})
@@ -1661,6 +1690,110 @@ async def test_frames_removed_while_the_queue_is_full_are_forgotten_at_once() ->
         )
         await settle(lambda: "live" in files.frames)
         assert files.frames == {"live": "tab"}
+    finally:
+        hold.set()
+        await socket.close()
+        await backend.reader
+
+
+class TrackingFiles(FrameFiles):
+    """A file session reduced to its frame tracking, for a real browser."""
+
+    created = False
+    cleanup_failed = False
+
+    async def setup(self, context: str) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_a_frame_noted_after_a_detach_stays_tracked() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = ScriptedSocket()
+    backend.files = files = FrameFiles()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.child_frames = {"frame-s": ("tab", "frame", "page")}
+    files.frames = {"frame": "tab"}
+    seen: list[Any] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        seen.append(params.get("tracked"))
+
+    files.event = event  # type: ignore[method-assign]
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        # The frame returns to its parent's process: its target detaches and
+        # the parent notes it navigated, in one read; then it downloads.
+        socket.push(
+            {
+                "method": "Target.detachedFromTarget",
+                "sessionId": "page",
+                "params": {"sessionId": "frame-s", "targetId": "frame"},
+            }
+        )
+        socket.push(
+            {
+                "method": "Page.frameNavigated",
+                "sessionId": "page",
+                "params": {"frame": {"id": "frame"}},
+            }
+        )
+        socket.push(
+            {
+                "method": "Browser.downloadWillBegin",
+                "params": {"guid": "g", "frameId": "frame", "url": "https://ok.test/f"},
+            }
+        )
+        await settle(lambda: seen)
+        assert files.frames == {"frame": "tab"} and seen == [True]
+    finally:
+        await socket.close()
+        await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_and_a_dialog_never_wait_behind_held_subresources() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    hold = asyncio.Event()
+    checked: list[str] = []
+
+    async def policy(_tab: Any, url: str) -> None:
+        checked.append(url)
+        if url.endswith(".png"):
+            await hold.wait()
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        for i in range(400):
+            socket.push(paused(str(i), "page", f"https://ok.test/{i}.png"))
+        await settle(lambda: len(backend.policy_lane.waiting) == 400 - 256)
+        document = paused("doc", "page", "https://ok.test/next")
+        document["params"].update(frameId="tab", resourceType="Document")
+        socket.push(document)
+        socket.push(
+            {
+                "method": "Page.javascriptDialogOpening",
+                "sessionId": "page",
+                "params": {"type": "alert", "message": "hi"},
+            }
+        )
+        await settle(
+            lambda: (
+                {"Fetch.continueRequest", "Page.handleJavaScriptDialog"}
+                <= {m["method"] for m in socket.sent}
+            )
+        )
+        answered = [m for m in socket.sent if m["method"] == "Fetch.continueRequest"]
+        assert [m["params"]["requestId"] for m in answered] == ["doc"]
+        assert len(backend.navigation_lane.running) == 1 and not backend.failed
     finally:
         hold.set()
         await socket.close()
