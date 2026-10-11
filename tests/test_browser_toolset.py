@@ -2654,3 +2654,60 @@ async def test_a_download_owned_within_the_same_read_stays_owned() -> None:
             break
         await asyncio.sleep(0.01)
     assert decided == [True] and backend.awaiting_frames == {}
+
+
+@pytest.mark.asyncio
+async def test_a_frame_tree_reply_counts_before_the_events_read_after_it() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = ScriptedSocket()
+    backend.files = files = FrameFiles()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    files.frames = {"tab": "tab"}
+    decided: list[Any] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        decided.append(params.get("tracked"))
+
+    files.event = event  # type: ignore[method-assign]
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        socket.push(
+            {
+                "method": "Page.frameNavigated",
+                "sessionId": "page",
+                "params": {"frame": {"id": "tab"}, "type": "BackForwardCacheRestore"},
+            }
+        )
+        await settle(lambda: any(m["method"] == "Page.getFrameTree" for m in socket.sent))
+        asked = next(m for m in socket.sent if m["method"] == "Page.getFrameTree")
+        # In one read: a download from a restored frame, the frame tree that
+        # says the frame is the tab's, and the frame's removal.
+        socket.push(
+            {
+                "method": "Browser.downloadWillBegin",
+                "params": {"guid": "00000000-0000-0000-0000-000000000005", "frameId": "r"},
+            }
+        )
+        socket.push(
+            {
+                "id": asked["id"],
+                "result": {
+                    "frameTree": {"frame": {"id": "tab"}, "childFrames": [{"frame": {"id": "r"}}]}
+                },
+            }
+        )
+        socket.push(
+            {
+                "method": "Page.frameDetached",
+                "sessionId": "page",
+                "params": {"frameId": "r", "reason": "remove"},
+            }
+        )
+        await settle(lambda: decided)
+        assert decided == [True] and "r" not in files.frames and backend.snapshots == []
+    finally:
+        await socket.close()
+        await backend.reader

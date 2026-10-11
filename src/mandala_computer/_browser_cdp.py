@@ -60,6 +60,11 @@ _POLICY_DEADLINE = 5.0
 _NAVIGATION_CHECK: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mandala_navigation_check", default=False
 )
+# Set around a command whose reply must be applied as it arrives, in order with
+# the events read before and after it, rather than when its caller resumes.
+_ON_REPLY: contextvars.ContextVar[Callable[[Any], None] | None] = contextvars.ContextVar(
+    "mandala_on_reply", default=None
+)
 _FLOODED = (
     "The page produced browser events faster than the session could handle them. "
     "The session ended; create a new toolset to continue."
@@ -281,6 +286,7 @@ class BrowserCDP:
         self.queued_bytes = 0
         self.pending: dict[int, asyncio.Future[Any]] = {}
         self.pending_sessions: dict[int, str] = {}
+        self.reply_hooks: dict[int, Callable[[Any], None]] = {}
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
@@ -518,12 +524,16 @@ class BrowserCDP:
         if session:
             message["sessionId"] = session
             self.pending_sessions[ident] = session
+        hook = _ON_REPLY.get()
+        if hook is not None:
+            self.reply_hooks[ident] = hook
         try:
             await self.ws.send(json.dumps(message))
             return await asyncio.wait_for(future, 15)
         finally:
             self.pending.pop(ident, None)
             self.pending_sessions.pop(ident, None)
+            self.reply_hooks.pop(ident, None)
 
     async def _read(self) -> None:
         try:
@@ -544,7 +554,14 @@ class BrowserCDP:
                                 kind("Chromium could not complete the browser action.")
                             )
                         else:
-                            future.set_result(message.get("result", {}))
+                            result = message.get("result", {})
+                            hook = self.reply_hooks.pop(message["id"], None)
+                            if hook is not None:
+                                try:
+                                    hook(result)
+                                except Exception:  # noqa: BLE001, S110 - its caller fails closed
+                                    pass
+                            future.set_result(result)
                 else:
                     self._dispatch(message)
         except Exception:  # noqa: BLE001, S110 - fail closed without exposing browser-supplied errors
@@ -815,13 +832,32 @@ class BrowserCDP:
             return
         touched: set[str] = set()
         self.snapshots.append(touched)
-        try:
-            reply = await self.send("Page.getFrameTree", session=session)
-            if self._owner(session) == tab:
-                self._track_tree(reply["frameTree"], tab, session, touched)
-        finally:
+        applied = False
+
+        def forget() -> None:
             # By identity: two snapshots' sets can be equal.
             self.snapshots = [other for other in self.snapshots if other is not touched]
+
+        def apply(reply: Any) -> None:
+            # Applied as the reply is read, before any event read after it.
+            nonlocal applied
+            if applied:
+                return
+            applied = True
+            try:
+                if self._owner(session) == tab:
+                    self._track_tree(reply["frameTree"], tab, session, touched)
+            finally:
+                forget()
+
+        hook = _ON_REPLY.set(apply)
+        try:
+            reply = await self.send("Page.getFrameTree", session=session)
+        finally:
+            _ON_REPLY.reset(hook)
+            if not applied:
+                forget()
+        apply(reply)  # When no reader applied it as it arrived.
 
     def _adopt(self) -> None:
         """Track waiting frames whose parent is tracked now, and theirs in turn."""
