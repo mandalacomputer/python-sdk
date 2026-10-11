@@ -2818,6 +2818,20 @@ POPUP_PAGES = {
         "<button style='position:absolute;left:0;top:0;width:400px;height:200px' "
         "onclick=\"window.open('/cached')\">open</button>"
     ),
+    "/written": (
+        "<title>written</title><script>window.cached=true</script>"
+        "<button style='position:absolute;left:0;top:0;width:400px;height:200px' "
+        "onclick=\"const w=window.open('');if(w){w.document.write('<script>"
+        "window.opener.document.title=&quot;ran&quot;;localStorage.setItem(&quot;ran&quot;,"
+        "&quot;yes&quot;)<\\/script>');w.document.close()}\">open</button>"
+    ),
+    "/blob": (
+        "<title>blob</title><script>window.cached=true</script>"
+        "<button style='position:absolute;left:0;top:0;width:400px;height:200px' "
+        "onclick=\"window.open(window.URL.createObjectURL(new Blob(['<script>"
+        "window.opener.document.title=&quot;ran&quot;;localStorage.setItem(&quot;ran&quot;,"
+        "&quot;yes&quot;)</script>'],{type:'text/html'})))\">open</button>"
+    ),
     "/online": (
         "<title>online</title><script>window.went=[];addEventListener('offline',"
         "()=>went.push('offline'))</script><button style='position:absolute;left:0;top:0;"
@@ -3143,12 +3157,15 @@ async def test_a_page_gone_while_a_tab_is_being_created_is_refused_quietly() -> 
     assert sent == [] and backend.refused == {} and not backend.failed
 
 
-def test_sync_a_cached_popup_document_never_runs(chrome: str, popups: Any) -> None:
+@pytest.mark.parametrize("page", ["/cache", "/written", "/blob"])
+def test_sync_a_popup_document_that_needs_no_network_never_runs(
+    chrome: str, popups: Any, page: str
+) -> None:
     computer, revoked = remote(chrome, False)
     port, hits = popups
     with MandalaBrowserToolset(computer, url_policy=popup_policy) as browser:
         backend = browser._backend
-        assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/cache")))
+        assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}{page}")))
         # Closing the popup arrives late: whatever it could load, it has time to.
         plain = backend.send
 
@@ -3158,7 +3175,8 @@ def test_sync_a_cached_popup_document_never_runs(chrome: str, popups: Any) -> No
             return await plain(method, params, session)
 
         backend.send = late_close
-        # The opener has the document cached; the popup is opened on it.
+        # A document the opener has cached, or a blob: one: neither needs the
+        # network, which is all being offline stops.
         for _ in range(50):
             if browser._run(backend.evaluate(backend.active, "window.cached === true")):
                 break
@@ -3171,5 +3189,5 @@ def test_sync_a_cached_popup_document_never_runs(chrome: str, popups: Any) -> No
                 backend.active, "JSON.stringify([document.title, localStorage.getItem('ran')])"
             )
         )
-        assert json.loads(ran) == ["cache", None]
-    assert revoked == [IDENT] and hits.count("/cached") == 1
+        assert json.loads(ran) == [page[1:], None]
+    assert revoked == [IDENT] and hits.count("/cached") == (page == "/cache")

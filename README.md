@@ -1986,9 +1986,13 @@ revokes its capability; it does not stop Chromium or delete the computer.
   popups and other new top-level targets are unsupported and are closed; if
   one cannot be closed, the driver closes its session. A popup is closed
   without loading anything: before it is let go it is taken offline (its page
-  only; the page that opened it stays online), its HTTP cache is bypassed, and
-  it cannot start a worker, so the page that opened it, by script, by a click
-  or by a link, carries on. A request the opener makes through the popup's
+  only; the page that opened it stays online), its HTTP cache is bypassed, its
+  documents run no script of their own, and it cannot start a worker, so the
+  page that opened it, by script, by a click or by a link, carries on. A popup
+  runs no script in its own process; the out-of-process frame limit above
+  applies inside a popup until it closes. (On a
+  Chromium older than 145, without per-page offline emulation, the opener too
+  reports itself offline while a popup is being refused.) A request the opener makes through the popup's
   first, empty document goes out over the opener's own connection and meets
   the URL hook as the opener's. Sites that depend on these may not work with
   this driver.

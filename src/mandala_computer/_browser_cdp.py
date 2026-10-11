@@ -137,6 +137,9 @@ _POPUP_FENCE: tuple[tuple[str, dict[str, Any]], ...] = (
     ("Network.setCacheDisabled", {"cacheDisabled": True}),
     ("Network.setBypassServiceWorker", {"bypass": True}),
     _NO_WORKERS_INIT,
+    # And its documents run no script of their own: a document that needs no
+    # network at all (a blob: one) would otherwise load and run.
+    ("Emulation.setScriptExecutionDisabled", {"value": True}),
     ("Target.setAutoAttach", _AUTO_ATTACH),
 )
 _OFFLINE = {"offline": True, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1}
