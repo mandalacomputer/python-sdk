@@ -610,8 +610,12 @@ class BrowserCDP:
                 frame = trimmed["params"].get("frameId")
                 if frame in self.files.frames:
                     trimmed["params"]["tracked"] = True
-                elif self.restoring:
-                    decision = asyncio.create_task(self._decide(frame))
+                elif self.restoring and isinstance(frame, str):
+                    # Waiting from now, before any later event is noted: its
+                    # frame may be tracked, and removed, in this same read.
+                    owned: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+                    self.awaiting_frames.setdefault(frame, []).append(owned)
+                    decision = asyncio.create_task(self._decide(frame, owned))
                     self.tasks.add(decision)
                     decision.add_done_callback(self.tasks.discard)
                     trimmed["decision"] = decision
@@ -853,20 +857,17 @@ class BrowserCDP:
 
         task.add_done_callback(done)
 
-    async def _decide(self, frame: Any) -> bool:
+    async def _decide(self, frame: str, owned: asyncio.Future[bool]) -> bool:
         """Whether a download's frame is the tab's, once pending restores land.
 
-        Settled the moment its frame is tracked, however the other restores
-        go; otherwise when none is left pending, or after _RESTORE_WAIT.
+        ``owned`` is settled the moment its frame is tracked, however the other
+        restores go; otherwise this answers when none is left pending, or after
+        _RESTORE_WAIT.
         """
-        if not isinstance(frame, str) or self.files is None:
-            return False
-        if frame in self.files.frames:
-            return True
         loop = asyncio.get_running_loop()
-        owned: asyncio.Future[bool] = loop.create_future()
-        self.awaiting_frames.setdefault(frame, []).append(owned)
         try:
+            if self.files is None:
+                return False
             deadline = loop.time() + _RESTORE_WAIT
             while self.restoring and not owned.done():
                 left = deadline - loop.time()
@@ -874,8 +875,10 @@ class BrowserCDP:
                     break
                 pending: set[asyncio.Future[Any]] = {owned, *self.restoring}
                 await asyncio.wait(pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
-            return owned.done() or frame in self.files.frames
+            return (owned.done() and not owned.cancelled()) or frame in self.files.frames
         finally:
+            if not owned.done():
+                owned.cancel()
             waiting = self.awaiting_frames.get(frame)
             if waiting is not None:
                 waiting[:] = [other for other in waiting if other is not owned]

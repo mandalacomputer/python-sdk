@@ -2603,3 +2603,54 @@ async def test_a_download_owned_once_its_restore_lands_stays_owned() -> None:
             break
         await asyncio.sleep(0.01)
     assert decided == [True] and backend.awaiting_frames == {}
+
+
+@pytest.mark.asyncio
+async def test_a_download_owned_within_the_same_read_stays_owned() -> None:
+    backend, _, files = tracking_backend()
+    decided: list[Any] = []
+
+    async def event(method: str, params: dict[str, Any]) -> None:
+        decided.append(params.get("tracked"))
+
+    files.event = event  # type: ignore[method-assign]
+    answer = asyncio.Event()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Page.getFrameTree":
+            await plain(method, params, session)
+            await answer.wait()
+            return {"frameTree": {"frame": {"id": "tab"}}}
+        return await plain(method, params, session)
+
+    backend.send = send
+    backend._note(
+        "Page.frameNavigated", {"frame": {"id": "tab"}, "type": "BackForwardCacheRestore"}, "page"
+    )
+    await asyncio.sleep(0)
+    # In one read, with no turn of the loop between them: a download begins in
+    # a frame not tracked yet, the frame is noted, and it is removed.
+    for message in [
+        {
+            "method": "Browser.downloadWillBegin",
+            "params": {"guid": "00000000-0000-0000-0000-000000000004", "frameId": "r"},
+        },
+        {
+            "method": "Page.frameNavigated",
+            "sessionId": "page",
+            "params": {"frame": {"id": "r", "parentId": "tab"}},
+        },
+        {
+            "method": "Page.frameDetached",
+            "sessionId": "page",
+            "params": {"frameId": "r", "reason": "remove"},
+        },
+    ]:
+        backend._dispatch(message)
+    answer.set()
+    for _ in range(100):
+        if decided:
+            break
+        await asyncio.sleep(0.01)
+    assert decided == [True] and backend.awaiting_frames == {}
