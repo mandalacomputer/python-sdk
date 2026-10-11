@@ -123,9 +123,12 @@ _NO_WORKERS_INIT = (
 # its first line, and one opened by script shares its opener's renderer, so a
 # held popup holds its opener too (a click that opens one never returns). Before
 # release it is fenced, so that nothing it does or its opener does in it
-# reaches the network: every request it makes is refused, it cannot start a
-# worker, and anything it starts is held. Then it is closed.
+# reaches the network: every request it makes is refused, no frame in it can
+# start a worker (Page.enable first, so that the script reaches the frames made
+# in it after release, not only its current document), and anything it starts
+# is held. Then it is closed.
 _POPUP_FENCE: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("Page.enable", {}),
     ("Fetch.enable", _INTERCEPT),
     _NO_WORKERS_INIT,
     ("Target.setAutoAttach", _AUTO_ATTACH),
@@ -1148,6 +1151,10 @@ class BrowserCDP:
                     session,
                 )
             elif method == "Page.javascriptDialogOpening":
+                if session in self.refused:
+                    # A refused popup's: dismissed, so it holds up nothing.
+                    await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
+                    return
                 if self._owner(session) is None:
                     return
                 self.changes.append(
@@ -1179,16 +1186,25 @@ class BrowserCDP:
     async def _refuse(self, child: str, info: dict[str, Any]) -> None:
         """Close a target this driver does not run; a popup is fenced and released first."""
         target = info["targetId"]
-        if info.get("type") == "page":
+        popup = info.get("type") == "page"
+        if popup:
             self.refused[child] = target
             try:
-                for name, args in _POPUP_FENCE:
+                for name, args in (*_POPUP_FENCE, ("Runtime.runIfWaitingForDebugger", {})):
+                    if child not in self.refused:
+                        return  # It went first: nothing is left to refuse.
                     await self.send(name, args, child)
-                await self.send("Runtime.runIfWaitingForDebugger", session=child)
-            except _SessionGone:
-                return  # It went first: nothing is left to refuse.
-        closed = await self.send("Target.closeTarget", {"targetId": target})
-        if not closed.get("success") and (info.get("type") != "page" or child in self.refused):
+            except BrowserError:
+                if child not in self.refused:
+                    return
+                raise
+        try:
+            closed = await self.send("Target.closeTarget", {"targetId": target})
+        except BrowserError:
+            if popup and child not in self.refused:
+                return  # It closed itself once released.
+            raise
+        if not closed.get("success") and (not popup or child in self.refused):
             raise BrowserError("Unsupported browser target could not be closed.")
 
     def drop_tab(self, target: str) -> None:

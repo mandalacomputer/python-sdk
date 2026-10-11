@@ -1005,7 +1005,7 @@ async def test_targets_outside_an_owned_tab_are_still_closed(message: dict[str, 
         child = message["params"]["sessionId"]
         assert sent == [
             *[(name, args, child) for name, args in _POPUP_FENCE],
-            ("Runtime.runIfWaitingForDebugger", None, child),
+            ("Runtime.runIfWaitingForDebugger", {}, child),
             *close,
         ]
     else:
@@ -2791,9 +2791,15 @@ POPUP_PAGES = {
     "/click": (
         "<title>click</title><button style='position:absolute;left:0;top:0;width:400px;"
         "height:200px' onclick=\"const w=window.open('');if(!w){document.title='no popup';"
-        "return}try{w.fetch('/popup-fetch')}catch(e){};try{new w.Worker(URL.createObjectURL("
-        "new Blob(['fetch(\\'/popup-worker\\')'])))}catch(e){};setTimeout(()=>{try{w.location="
-        "'/popup-nav'}catch(e){}},50);document.title='opened'\">open</button>"
+        "return}const out=['opened'];const blob=window.URL.createObjectURL(new Blob(["
+        "'fetch(\\'http://127.0.0.1:'+location.port+'/popup-worker\\')']));"
+        "try{w.fetch('/popup-fetch')}catch(e){};"
+        "try{new w.Worker(blob);out.push('worker:made')}catch(e){out.push('worker:'+e.name)};"
+        "try{const f=w.document.createElement('iframe');w.document.body.appendChild(f);"
+        "new f.contentWindow.Worker(blob);out.push('frame-worker:made')}"
+        "catch(e){out.push('frame-worker:'+e.name)};"
+        "setTimeout(()=>{try{w.location='/popup-nav'}catch(e){}},50);"
+        "document.title=out.join(' ')\">open</button>"
     ),
     "/script": "<title>script</title><script>window.open('/popup-url')</script>",
     "/link": (
@@ -2805,6 +2811,10 @@ POPUP_PAGES = {
         "style='display:block;width:400px;height:200px'>open</a>"
     ),
 }
+
+
+#: Neither the popup's window nor a frame made in it could start a worker.
+POPUP_CLICK_RESULT = "opened worker:SecurityError frame-worker:SecurityError"
 
 
 @pytest.fixture
@@ -2860,6 +2870,10 @@ def test_sync_a_popup_is_refused_without_holding_up_its_opener(
         assert time.monotonic() - began < 5
         assert len(tabs(assert_success(browser.tool_result(use("list_tabs"))))) == 1
         assert not browser._backend.failed
+        if page == "/click":
+            backend = browser._backend
+            title = browser._run(backend.evaluate(backend.active, "document.title"))
+            assert title == POPUP_CLICK_RESULT
     assert revoked == [IDENT]
     assert not [path for path in hits if "popup" in path]
 
@@ -2888,5 +2902,88 @@ async def test_async_a_popup_is_refused_without_holding_up_its_opener(
         assert_success(await asyncio.wait_for(browser.tool_result(use("get_page_text")), 5))
         assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
         assert not browser._backend.failed
+        if page == "/click":
+            backend = browser._backend
+            assert await backend.evaluate(backend.active, "document.title") == POPUP_CLICK_RESULT
     assert revoked == [IDENT]
     assert not [path for path in hits if "popup" in path]
+
+
+def popup_attached(child: str = "popup-s", target: str = "popup-t") -> dict[str, Any]:
+    return attached(child, target, "page", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "goes_after", ["Page.enable", "Fetch.enable", "Runtime.runIfWaitingForDebugger"]
+)
+async def test_a_popup_that_goes_while_refused_is_left_alone(goes_after: str) -> None:
+    from mandala_computer._browser_cdp import BrowserError
+
+    backend, sent = owned_backend()
+    plain = backend.send
+    gone = False
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        nonlocal gone
+        if gone:
+            # Chromium refuses a command for a session or target that has gone.
+            raise BrowserError("Chromium could not complete the browser action.")
+        result = await plain(method, params, session)
+        if method == goes_after:
+            gone = True
+            backend._settle(
+                {
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "popup-s", "targetId": "popup-t"},
+                }
+            )
+            backend._settle({"method": "Target.targetDestroyed", "params": {"targetId": "popup-t"}})
+        return result
+
+    backend.send = send
+    await backend._event(popup_attached())
+    assert not backend.failed and backend.refused == {}
+    assert [m for m, _, _ in sent][-1] == goes_after
+
+
+@pytest.mark.asyncio
+async def test_a_live_popup_that_cannot_be_closed_still_ends_the_session() -> None:
+    from mandala_computer._browser_cdp import BrowserError
+
+    backend, _ = owned_backend()
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+
+    backend.ws = SimpleNamespace(close=close)
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Target.closeTarget":
+            raise BrowserError("Chromium could not complete the browser action.")
+        return await plain(method, params, session)
+
+    backend.send = send
+    await backend._event(popup_attached())
+    assert backend.failed and closed
+
+
+@pytest.mark.asyncio
+async def test_a_refused_popups_requests_fail_and_its_dialogs_are_dismissed() -> None:
+    backend, sent = owned_backend()
+    backend.refused = {"popup-s": "popup-t"}
+    await backend._event(paused("r1", "popup-s", "https://ok.test/"))
+    await backend._event(
+        {
+            "method": "Page.javascriptDialogOpening",
+            "sessionId": "popup-s",
+            "params": {"type": "alert", "message": "hi"},
+        }
+    )
+    assert sent == [
+        ("Fetch.failRequest", {"requestId": "r1", "errorReason": "BlockedByClient"}, "popup-s"),
+        ("Page.handleJavaScriptDialog", {"accept": False}, "popup-s"),
+    ]
+    assert list(backend.changes) == []
