@@ -1000,14 +1000,17 @@ async def test_targets_outside_an_owned_tab_are_still_closed(message: dict[str, 
     info = message["params"]["targetInfo"]
     close = [("Target.closeTarget", {"targetId": info["targetId"]}, None)]
     if info["type"] == "page":
-        # A popup is fenced and released before it is closed: held, it would
-        # hold the renderer it shares with the page that opened it.
+        # A popup is fenced (offline, after the service-worker bypass) and
+        # released before it is closed: held, it would hold the renderer it
+        # shares with the page that opened it.
+        from mandala_computer._browser_cdp import _OFFLINE
+
         child = message["params"]["sessionId"]
-        assert sent == [
-            *[(name, args, child) for name, args in _POPUP_FENCE],
-            ("Runtime.runIfWaitingForDebugger", {}, child),
-            *close,
-        ]
+        fence = [(name, args, child) for name, args in _POPUP_FENCE]
+        offline = {"offline": True, "matchedNetworkConditions": [{"urlPattern": "", **_OFFLINE}]}
+        fence.insert(3, ("Network.emulateNetworkConditionsByRule", offline, child))
+        assert sent == [*fence, ("Runtime.runIfWaitingForDebugger", {}, child), *close]
+        assert not [m for m, _, _ in sent if m.startswith("Fetch.")]
     else:
         assert sent == close
     assert not backend.child_frames and not backend.failed
@@ -2801,7 +2804,18 @@ POPUP_PAGES = {
         "setTimeout(()=>{try{w.location='/popup-nav'}catch(e){}},50);"
         "document.title=out.join(' ')\">open</button>"
     ),
+    "/navigate": (
+        "<title>navigate</title><button style='position:absolute;left:0;top:0;width:400px;"
+        "height:200px' onclick=\"const w=window.open('');if(w){w.location='/popup-nav'}"
+        "document.title='opened'\">open</button>"
+    ),
     "/script": "<title>script</title><script>window.open('/popup-url')</script>",
+    "/online": (
+        "<title>online</title><script>window.went=[];addEventListener('offline',"
+        "()=>went.push('offline'))</script><button style='position:absolute;left:0;top:0;"
+        "width:400px;height:200px' onclick=\"const w=window.open('');if(w){w.location="
+        "'/popup-nav'}\">open</button>"
+    ),
     "/link": (
         "<title>link</title><a href='/popup-link' target=_blank style='display:block;"
         "width:400px;height:200px'>open</a>"
@@ -2915,7 +2929,8 @@ def popup_attached(child: str = "popup-s", target: str = "popup-t") -> dict[str,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "goes_after", ["Page.enable", "Fetch.enable", "Runtime.runIfWaitingForDebugger"]
+    "goes_after",
+    ["Page.enable", "Network.emulateNetworkConditionsByRule", "Runtime.runIfWaitingForDebugger"],
 )
 async def test_a_popup_that_goes_while_refused_is_left_alone(goes_after: str) -> None:
     from mandala_computer._browser_cdp import BrowserError
@@ -2971,10 +2986,9 @@ async def test_a_live_popup_that_cannot_be_closed_still_ends_the_session() -> No
 
 
 @pytest.mark.asyncio
-async def test_a_refused_popups_requests_fail_and_its_dialogs_are_dismissed() -> None:
+async def test_a_refused_popups_dialogs_are_dismissed_and_not_reported() -> None:
     backend, sent = owned_backend()
     backend.refused = {"popup-s": "popup-t"}
-    await backend._event(paused("r1", "popup-s", "https://ok.test/"))
     await backend._event(
         {
             "method": "Page.javascriptDialogOpening",
@@ -2982,8 +2996,88 @@ async def test_a_refused_popups_requests_fail_and_its_dialogs_are_dismissed() ->
             "params": {"type": "alert", "message": "hi"},
         }
     )
-    assert sent == [
-        ("Fetch.failRequest", {"requestId": "r1", "errorReason": "BlockedByClient"}, "popup-s"),
-        ("Page.handleJavaScriptDialog", {"accept": False}, "popup-s"),
-    ]
+    assert sent == [("Page.handleJavaScriptDialog", {"accept": False}, "popup-s")]
     assert list(backend.changes) == []
+
+
+@pytest.mark.asyncio
+async def test_a_chromium_without_per_rule_emulation_takes_the_popup_offline_whole() -> None:
+    from mandala_computer._browser_cdp import _OFFLINE, BrowserError
+
+    backend, sent = owned_backend()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Network.emulateNetworkConditionsByRule":
+            raise BrowserError("Chromium could not complete the browser action.")
+        return await plain(method, params, session)
+
+    backend.send = send
+    await backend._event(popup_attached())
+    assert ("Network.emulateNetworkConditions", _OFFLINE, "popup-s") in sent
+    assert not backend.failed
+
+
+@pytest.mark.asyncio
+async def test_a_live_popup_that_cannot_be_fenced_is_closed_unreleased_and_ends_the_session() -> (
+    None
+):
+    from mandala_computer._browser_cdp import BrowserError
+
+    backend, sent = owned_backend()
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+
+    backend.ws = SimpleNamespace(close=close)
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Network.enable" and session == "popup-s":
+            raise BrowserError("Chromium could not complete the browser action.")
+        return await plain(method, params, session)
+
+    backend.send = send
+    await backend._event(popup_attached())
+    names = [m for m, _, _ in sent]
+    assert "Runtime.runIfWaitingForDebugger" not in names and "Target.closeTarget" in names
+    assert backend.failed and closed
+
+
+#: Popups opened per leak test, two in three navigated by their opener at once.
+#: Closing a popup detaches its session, and Chromium lets a request
+#: intercepted on a session go on when it detaches: a fence that intercepted
+#: rather than took the popup offline let 5 to 21 of 50 such navigations reach
+#: the server (Chrome 145 to 154), which 30 make all but certain to show here.
+POPUP_LEAK_RUNS = 45
+
+
+def test_many_popups_load_nothing_and_never_take_their_opener_offline(
+    chrome: str, popups: Any
+) -> None:
+    computer, revoked = remote(chrome, False)
+    port, hits = popups
+    point = {"type": "coordinate", "x": 100, "y": 50}
+    with MandalaBrowserToolset(computer, url_policy=popup_policy) as browser:
+        backend = browser._backend
+        for run in range(POPUP_LEAK_RUNS):
+            page = ("/navigate", "/navigate", "/link-opener")[run % 3]
+            assert_success(
+                browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}{page}"))
+            )
+            assert_success(browser.tool_result(use("left_click", target=point)))
+            browser._run(asyncio.sleep(0.1))
+        # The opener never goes offline, though its popups do.
+        assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/online")))
+        assert_success(browser.tool_result(use("left_click", target=point)))
+        browser._run(asyncio.sleep(0.5))
+        state = browser._run(
+            backend.evaluate(backend.active, "JSON.stringify([window.went, navigator.onLine])")
+        )
+        assert json.loads(state) == [[], True]
+        assert len(tabs(assert_success(browser.tool_result(use("list_tabs"))))) == 1
+        assert not backend.failed
+    time.sleep(0.5)
+    assert revoked == [IDENT]
+    assert [path for path in hits if "popup" in path] == []
