@@ -68,9 +68,6 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # OPL-5864: the account credit ledger is available through direct HTTP;
-    # this contract prerequisite does not publish a new SDK helper.
-    ("GET", "credits"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -99,8 +96,6 @@ UNIMPLEMENTED_PARAMETERS = {
     "POST computers/:id/input  body:path",
     "POST computers/:id/input  body:scroll_x",
     "POST computers/:id/input  body:scroll_y",
-    # OPL-5866 adds funded-agent options; this client currently sends its own model key.
-    "POST computers/:id/agent  body:max_cost_usd",
     # `manage_keys: true` is refused from every API key (403): the permission
     # is granted only from a dashboard session, and false is the default. There
     # is nothing for this SDK to send.
@@ -357,6 +352,44 @@ USAGE = {
 # so the handler below serves this to both, and `agent_once` reads it as JSON.
 AGENT_DONE = b'event: done\ndata: {"steps": 1, "stop": "end_turn", "text": "done"}\n\n'
 AGENT_RESULT = {"steps": 1, "stop": "end_turn", "text": "done"}
+# The account's AI credit ledger, one lot, one debit and a further page.
+CREDITS = {
+    "balance_micros": 4_750_000,
+    "available_micros": 4_500_000,
+    "held_micros": 250_000,
+    "debt_micros": 0,
+    "frozen": False,
+    "grant": {
+        "period_start": "2026-10-01T00:00:00.000Z",
+        "period_end": "2026-11-01T00:00:00.000Z",
+        "granted_micros": 5_000_000,
+        "used_micros": 250_000,
+    },
+    "lots": [
+        {
+            "id": "lot-1",
+            "kind": "plan_grant",
+            "amount_micros": 5_000_000,
+            "remaining_micros": 4_750_000,
+            "expires_at": "2026-11-01T00:00:00.000Z",
+            "created_at": "2026-10-01T00:00:00.000Z",
+        }
+    ],
+    "entries": [
+        {
+            "id": 7,
+            "lot_id": None,
+            "kind": "debit",
+            "amount_micros": 250_000,
+            "debt_micros": 0,
+            "model": "claude-sonnet-5-5",
+            "run_id": "run-1",
+            "step": 1,
+            "created_at": "2026-10-09T12:00:00.000Z",
+        }
+    ],
+    "next_before": 7,
+}
 
 # One published template, in the platform's own spelling (platform OPL-3789).
 #
@@ -704,6 +737,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=account_report())
     if path.endswith("/usage"):
         return httpx.Response(200, json=USAGE)
+    if path.endswith("/credits"):
+        return httpx.Response(200, json=CREDITS)
     if path.endswith("/moves"):
         return httpx.Response(200, json=MOVES)
     if path.endswith("/retention"):
@@ -965,6 +1000,9 @@ def exercise_everything(client: mc.Client) -> None:
     # sweep that this SDK can send either.
     client.usage.read()
     client.usage.read(since=datetime(2026, 8, 1, tzinfo=timezone.utc), until="2026-08-22T00:00:00Z")
+    # The newest page, and an older one of a chosen size.
+    client.credits.read()
+    client.credits.read(before=7, limit=10)
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
     c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
@@ -1008,6 +1046,8 @@ def exercise_everything(client: mc.Client) -> None:
         provider="anthropic",
     )
     c.agent_once("do the thing", model_key="sk-ant-test")
+    # A funded run: no key, so no X-Model-Key, and the cost cap it may carry.
+    c.agent("do the thing", max_cost_usd=0.5)
     # The streaming entry point the two calls above wait out for you. All three
     # are `POST computers/:id/agent`, so the route check sees one method here.
     with closing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
@@ -1267,6 +1307,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.usage.read(
         since=datetime(2026, 8, 1, tzinfo=timezone.utc), until="2026-08-22T00:00:00Z"
     )
+    await client.credits.read()
+    await client.credits.read(before=7, limit=10)
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
     await c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
@@ -1307,6 +1349,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         provider="anthropic",
     )
     await c.agent_once("do the thing", model_key="sk-ant-test")
+    await c.agent("do the thing", max_cost_usd=0.5)
     async with aclosing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
         async for _ in events:
             break

@@ -59,6 +59,7 @@ from ._exceptions import (
     ConflictError,
     ConnectionError,
     CreateOnlyConflictError,
+    CreditsExhaustedError,
     FileExistsError,
     GatewayTimeoutError,
     MandalaError,
@@ -134,23 +135,28 @@ SCREEN_HEIGHT = 800
 DEFAULT_RESOLUTION = f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24"
 
 
-_NO_MODEL_KEY = (
-    "the agent needs your own Anthropic or OpenAI API key as model_key — "
-    "the platform does not store one, and never bills you for it."
+_BLANK_MODEL_KEY = (
+    "model_key is blank: pass your own Anthropic or OpenAI API key, or leave model_key "
+    "out to run on the account's Mandala AI credits."
 )
 
 
-def _require_model_key(model_key: str) -> str:
-    """The agent routes need the caller's own provider key, and only theirs.
+def _model_key_headers(model_key: str | None) -> dict[str, str]:
+    """The ``X-Model-Key`` header an agent run carries, or none at all.
 
-    Refused here rather than sent empty because the failure is otherwise a 401
-    on a route where a 401 reads as "your Mandala key is wrong" — which is the
-    one thing it does not mean. The platform stores no model key and will not
-    fall back to one.
+    ``None`` is a FUNDED run: no header, and the platform runs the loop on the
+    account's Mandala AI credits where the account is eligible, or refuses with
+    a 400 that says to send a key where it is not. Anything else is the
+    caller's own provider key, sent on this one request and never stored.
 
-    Returns the canonical text, TRIMMED, and the caller must send THAT rather
-    than what it was handed. Two reasons, and both are about the value that is
-    sent differing from the value that was checked:
+    A key that is present but blank is refused here rather than sent. The
+    platform refuses a blank header too, and quietly dropping it instead would
+    turn a ``.env`` entry with nothing after the ``=`` into a run on credits
+    the caller never chose to spend.
+
+    Returns the canonical text, TRIMMED, and that is what is sent rather than
+    what was handed in. Two reasons, and both are about the value that is sent
+    differing from the value that was checked:
 
     * httpx serialises a header value by calling the value's own ``encode``, so
       a ``str`` subclass checked here and then sent unchanged puts a different
@@ -161,17 +167,14 @@ def _require_model_key(model_key: str) -> str:
       whose ordinary reading, on this route, is the thing it does not mean.
       TypeScript's ``requireModelKey`` returns ``trim()`` for the same reason.
     """
-    # ``None`` is the case that actually happens — ``os.environ.get`` on an
-    # unset variable — and the message below was written to answer exactly it,
-    # so it keeps both that wording and its class. A non-string is a different
-    # mistake and gets ``canonical``'s ValueError, like every other
-    # caller-controlled string in this SDK.
     if model_key is None:
-        raise MandalaError(_NO_MODEL_KEY)
+        return {}
+    # A non-string is a different mistake and gets ``canonical``'s ValueError,
+    # like every other caller-controlled string in this SDK.
     text = _api.canonical(model_key, "model_key").strip()
     if not text:
-        raise MandalaError(_NO_MODEL_KEY)
-    return text
+        raise MandalaError(_BLANK_MODEL_KEY)
+    return {MODEL_KEY_HEADER: text}
 
 
 #: The status of a computer whose deletion stopped partway (platform API
@@ -277,16 +280,33 @@ def _reports_steps(body: object) -> bool:
     return any(isinstance(body.get(n), list) and body.get(n) for n in ("steps", "steps_taken"))
 
 
+def _offers_top_up(exc: APIError) -> bool:
+    """Whether a 402 is the account's AI credits rather than the model provider.
+
+    The platform puts ``top_up_url`` on the refusal of a FUNDED run that the
+    account's credits cannot cover, and on nothing the model API relays. So its
+    presence is what tells the two 402s on these routes apart.
+    """
+    body = exc.body
+    if not isinstance(body, Mapping):
+        return False
+    url = body.get("top_up_url")
+    return isinstance(url, str) and bool(url.strip())
+
+
 def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     """The class an agent route's status deserves, where it is not the table's.
 
-    Nothing inside an agent run consults the Mandala plan. The only 402 these
-    routes answer is the model API's own ``billing_error``, relayed as it came,
-    about the account behind the caller's ``model_key``; the transport's table
-    files every 402 as :class:`~mandala_computer.PlanLimitError`, whose advice
-    (change the plan) would be wrong here. So a 402 is rebuilt as a
-    :class:`~mandala_computer.ModelProviderError` carrying everything the first
-    one did.
+    Nothing inside an agent run consults the Mandala plan, and the transport's
+    table files every 402 as :class:`~mandala_computer.PlanLimitError`, whose
+    advice (change the plan) would be wrong here. These routes answer two other
+    402s. One carries ``top_up_url``: a funded run (no ``model_key``) the
+    account's AI credits could not cover, rebuilt as
+    :class:`~mandala_computer.CreditsExhaustedError`. The other is the model
+    API's own ``billing_error``, relayed as it came, about the account behind
+    the caller's ``model_key``, rebuilt as
+    :class:`~mandala_computer.ModelProviderError`. Either carries everything the
+    first one did.
 
     So is a 404 or a 413 the model API answered, told apart from the platform's
     own by the ``model API: `` prefix the platform puts on everything it relays
@@ -328,10 +348,12 @@ def _agent_route_error(exc: APIError, *, steps_seen: int = 0) -> APIError:
     :class:`~mandala_computer.GatewayTimeoutError`: that is an edge cut, and the
     run went with the connection. Every other status is returned as it is.
     """
-    if isinstance(exc, ModelProviderError):
+    if isinstance(exc, (ModelProviderError, CreditsExhaustedError)):
         return exc
-    if exc.status == 402 or (exc.status in (404, 413) and _relayed_from_model(exc)):
-        cls: type[APIError] = ModelProviderError
+    if exc.status == 402 and _offers_top_up(exc):
+        cls: type[APIError] = CreditsExhaustedError
+    elif exc.status == 402 or (exc.status in (404, 413) and _relayed_from_model(exc)):
+        cls = ModelProviderError
     elif exc.status == 429 and _relayed_from_model(exc):
         # The constructor's defaults leave limit, remaining and reset None.
         cls = RateLimitError
@@ -5245,17 +5267,38 @@ class Computer(ComputerFields):
         self,
         prompt: str,
         *,
-        model_key: str,
+        model_key: str | None = None,
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
         provider: str | None = None,
+        max_cost_usd: float | None = None,
     ) -> Iterator[AgentEvent]:
         """Have the platform drive this computer, reporting as it goes.
 
-        Screenshot, decide, click, type, repeat — inside the platform, on your
-        own Anthropic or OpenAI key, which it never stores and never bills you for. What
-        it buys you is that ten clicks stop being ten images in your context.
+        Screenshot, decide, click, type, repeat — inside the platform. What it
+        buys you is that ten clicks stop being ten images in your context.
+
+        **Who pays for the model.** With ``model_key``, your own Anthropic or
+        OpenAI key, sent on this one request and never stored: the provider
+        bills you and no Mandala AI credits are spent. Without it, the run is
+        FUNDED where the account is eligible — Anthropic only, on the platform's
+        own system prompt and tools, with ``claude-sonnet-5-5`` by default and
+        ``claude-opus-5-5`` the other choice — and spends the account's Mandala
+        AI credits. Every step then reports the run's
+        :attr:`~mandala_computer.AgentStep.cost_usd` so far, and the result its
+        total. ``max_cost_usd`` (0.25 to 20 dollars; the platform's default is
+        2) stops the run from starting another model call once the next one
+        could exceed it; the call already made is charged in full, so a run can
+        end a little over it, with ``stop`` ``"max_cost"``. Credits running out
+        part way ends a run with ``stop`` ``"credits_exhausted"``. A run the
+        credits cannot start is refused with
+        :class:`~mandala_computer.CreditsExhaustedError`, whose
+        :attr:`~mandala_computer.CreditsExhaustedError.top_up_url` says where to
+        add more; an account that cannot run funded at all (no plan, an
+        unsupported billing country, or funded runs not enabled) gets a 400 or
+        a 403 saying to send a key. A custom ``system`` prompt, another model or
+        ``provider="openai"`` need your own key.
 
         The computer must already be RUNNING. This route will not start one:
         starting is billable, and it is not a decision to make on somebody's
@@ -5284,7 +5327,7 @@ class Computer(ComputerFields):
         not guarantee generator cleanup on every Python implementation. The
         standard :func:`contextlib.closing` helper makes that concise.
         """
-        model_key = _require_model_key(model_key)
+        headers = _model_key_headers(model_key)
         steps = 0
         with closing(
             self._t.sse(
@@ -5297,27 +5340,39 @@ class Computer(ComputerFields):
                     max_steps=max_steps,
                     model=model,
                     provider=provider,
+                    max_cost_usd=max_cost_usd,
                 ),
-                headers={MODEL_KEY_HEADER: model_key},
+                headers=headers,
             )
         ) as frames:
-            for frame in frames:
-                event = to_agent_event(frame.event, frame.data, steps)
-                if event is None:
-                    continue
-                if isinstance(event, AgentStepEvent):
-                    steps += 1
-                yield event
+            try:
+                for frame in frames:
+                    event = to_agent_event(frame.event, frame.data, steps)
+                    if event is None:
+                        continue
+                    if isinstance(event, AgentStepEvent):
+                        steps += 1
+                    yield event
+            except APIError as exc:
+                # A refusal before the stream opened answers with a status, and
+                # the transport's table would call a 402 a PlanLimitError. On
+                # this route it is the account's AI credits (see
+                # :func:`_agent_route_error`).
+                error = _agent_route_error(exc)
+                if error is exc:
+                    raise
+                raise error from None
 
     def agent(
         self,
         prompt: str,
         *,
-        model_key: str,
+        model_key: str | None = None,
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
         provider: str | None = None,
+        max_cost_usd: float | None = None,
     ) -> AgentResult:
         """:meth:`agent_stream`, waited out — one call, one result.
 
@@ -5327,18 +5382,25 @@ class Computer(ComputerFields):
             if not result.finished:
                 print(f"did not finish: {result.stop}")
 
+        Leave ``model_key`` out to run on the account's Mandala AI credits, as
+        :meth:`agent_stream` describes; :attr:`~mandala_computer.AgentResult.cost_usd`
+        is then what the run was charged.
+
         It does **not** raise when a run ends unfinished. ``max_steps``,
-        ``rate_limited`` and ``refusal`` leave real work on the desktop, and
-        raising would discard the only account of what was done to the machine —
-        check :attr:`~mandala_computer.AgentResult.finished`. What it does raise
-        is a failure the platform reported mid-run, as the class that status
+        ``rate_limited``, ``refusal``, ``max_cost`` and ``credits_exhausted``
+        leave real work on the desktop, and raising would discard the only
+        account of what was done to the machine — check
+        :attr:`~mandala_computer.AgentResult.finished`. What it does raise is a
+        failure the platform reported mid-run, as the class that status
         deserves, and a :class:`~mandala_computer.MandalaError` for a stream
-        that ended without saying how the run came out. A 402 there is the model
-        API's ``billing_error`` for the account behind ``model_key``, never the
-        Mandala plan, and is raised as
-        :class:`~mandala_computer.ModelProviderError`; so is a 404 or a 413 the
-        model API answered (a model it does not know, a request it found too
-        large). A 429 the model API answered is a
+        that ended without saying how the run came out. A 402 is never the
+        Mandala plan: with ``top_up_url`` it is a funded run the account's
+        credits could not start, raised as
+        :class:`~mandala_computer.CreditsExhaustedError`; without it, it is the
+        model API's ``billing_error`` for the account behind ``model_key``,
+        raised as :class:`~mandala_computer.ModelProviderError`. So is a 404 or
+        a 413 the model API answered (a model it does not know, a request it
+        found too large). A 429 the model API answered is a
         :class:`~mandala_computer.RateLimitError` whose ``limit``,
         ``remaining`` and ``reset`` are ``None``: the Mandala budget did not
         refuse it. Once the run has taken a step,
@@ -5360,6 +5422,7 @@ class Computer(ComputerFields):
                 max_steps=max_steps,
                 model=model,
                 provider=provider,
+                max_cost_usd=max_cost_usd,
             ):
                 if isinstance(event, AgentDone):
                     result = event.result
@@ -5382,11 +5445,12 @@ class Computer(ComputerFields):
         self,
         prompt: str,
         *,
-        model_key: str,
+        model_key: str | None = None,
         system: str | None = None,
         max_steps: int | None = None,
         model: str | None = None,
         provider: str | None = None,
+        max_cost_usd: float | None = None,
     ) -> AgentResult:
         """The agent loop as a single non-streaming request.
 
@@ -5394,7 +5458,9 @@ class Computer(ComputerFields):
         who cannot use a stream at all: nothing is reported until the whole run
         is over, and a reverse proxy between you and the platform is entitled to
         close a request held open for minutes with nothing crossing it. Prefer
-        :meth:`agent`.
+        :meth:`agent`. ``model_key`` and ``max_cost_usd`` work as
+        :meth:`agent_stream` describes: leave the key out to run on the
+        account's Mandala AI credits.
 
         A proxy that answers instead of the platform raises here rather than
         coming back as a run of no steps that ended for no reason — the same
@@ -5405,10 +5471,12 @@ class Computer(ComputerFields):
         model call and before each tool, so a key revoked, a role dropped or an
         account suspended mid-run ends the request with a 401 or a 403 carrying
         reason ``revoked``, after some steps have already run on the desktop and
-        been billed to your model key. The Mandala plan is not rechecked, and no
-        status here is about it. The model API can end the run as well, and its
-        own status is relayed as it came, about the account behind
-        ``model_key``: 402 ``billing_error`` (raised as
+        been billed. The Mandala plan is not rechecked, and no status here is
+        about it. A funded run the account's credits cannot start is a 402
+        carrying ``top_up_url``, raised as
+        :class:`~mandala_computer.CreditsExhaustedError`. The model API can end
+        the run as well, and its own status is relayed as it came, about the
+        account behind ``model_key``: 402 ``billing_error`` (raised as
         :class:`~mandala_computer.ModelProviderError`, not
         :class:`~mandala_computer.PlanLimitError`), 404 ``not_found_error``
         and 413 ``request_too_large`` (both raised as
@@ -5429,8 +5497,8 @@ class Computer(ComputerFields):
         account rides on the exception as
         :attr:`~mandala_computer.MandalaError.agent`, exactly as it does for
         :meth:`agent`. A ``revoked`` refusal or a 402 is not worth retrying
-        unchanged: the credential, the role, or the model account's billing is
-        what has to change first.
+        unchanged: the credential, the role, the credits, or the model
+        account's billing is what has to change first.
 
         **The hosted API cuts it off at about two minutes.** The edge in front of
         ``app.mandala.computer`` ends a request that is not streaming after
@@ -5445,7 +5513,7 @@ class Computer(ComputerFields):
         ten seconds, so nothing about it looks idle to the hop that would
         otherwise stop waiting.
         """
-        model_key = _require_model_key(model_key)
+        headers = _model_key_headers(model_key)
         try:
             data = self._t.json_object(
                 "POST",
@@ -5457,16 +5525,17 @@ class Computer(ComputerFields):
                     max_steps=max_steps,
                     model=model,
                     provider=provider,
+                    max_cost_usd=max_cost_usd,
                 ),
-                headers={MODEL_KEY_HEADER: model_key},
+                headers=headers,
                 timeout=NO_DEADLINE,
             )
         except APIError as exc:
-            # A 402 here is the model provider's billing refusal, not the plan's,
-            # and a relayed 404/413/429 is the model provider's too (see
-            # :func:`_agent_route_error`). A refusal that arrived mid-run
-            # carries what the run had already done; see
-            # :func:`_attach_agent_partial`.
+            # A 402 here is the account's AI credits or the model provider's
+            # billing refusal, never the plan's, and a relayed 404/413/429 is
+            # the model provider's too (see :func:`_agent_route_error`). A
+            # refusal that arrived mid-run carries what the run had already
+            # done; see :func:`_attach_agent_partial`.
             error = _agent_route_error(exc)
             _attach_agent_partial(error)
             if error is exc:

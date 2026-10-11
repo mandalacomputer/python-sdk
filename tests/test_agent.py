@@ -287,11 +287,16 @@ def test_what_was_not_asked_for_is_not_sent(computer: mc.Computer) -> None:
 # --- what is refused before it is sent ------------------------------------
 
 
-def test_a_run_without_a_model_key_is_refused_here(computer: mc.Computer) -> None:
-    """Not sent to be 401'd. On this route a 401 reads as "your Mandala key is
-    wrong", which is the one thing it does not mean."""
-    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
-        computer.agent("do the thing", model_key="")
+@respx.mock
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_model_key_is_refused_here(computer: mc.Computer, blank: str) -> None:
+    """Not sent, and not dropped either. The platform refuses a blank header,
+    and dropping it instead would turn an empty ``.env`` entry into a run on
+    the account's AI credits that nobody chose to spend."""
+    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key") as error:
+        computer.agent("do the thing", model_key=blank)
+    assert "leave model_key out" in str(error.value)
+    assert not respx.calls
 
 
 def test_a_non_string_model_key_is_a_value_error(computer: mc.Computer) -> None:
@@ -301,12 +306,16 @@ def test_a_non_string_model_key_is_a_value_error(computer: mc.Computer) -> None:
         computer.agent("do the thing", model_key=1)  # type: ignore[arg-type]
 
 
-def test_a_missing_model_key_keeps_the_message_written_for_it(computer: mc.Computer) -> None:
-    """``None`` is the case that actually happens -- ``os.environ.get`` on an
-    unset variable -- and "must be a string" is not an answer to it. It stays a
-    MandalaError carrying the sentence about who is billed."""
-    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
-        computer.agent("do the thing", model_key=None)  # type: ignore[arg-type]
+@respx.mock
+def test_a_run_without_a_model_key_is_funded_and_sends_no_header(computer: mc.Computer) -> None:
+    """``None`` — the default — is a funded run (OPL-5866): no ``X-Model-Key``
+    at all, so the platform runs it on the account's AI credits."""
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    computer.agent("do the thing")
+    computer.agent("do the thing", model_key=None)
+    for call in route.calls:
+        assert MODEL_KEY_HEADER not in call.request.headers
+    assert json_body(route) == {"prompt": "do the thing", "stream": True}
 
 
 class _OtherKey(str):

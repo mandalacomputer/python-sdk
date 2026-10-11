@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -17,6 +18,7 @@ __all__ = [
     "ConnectionError",
     "ConnectionInterruptedError",
     "CreateOnlyConflictError",
+    "CreditsExhaustedError",
     "FileExistsError",
     "FileTooLargeError",
     "GatewayTimeoutError",
@@ -274,9 +276,51 @@ class PlanLimitError(APIError):
 
     Not raised by the agent routes (:meth:`~mandala_computer.Computer.agent`,
     :meth:`~mandala_computer.Computer.agent_stream`,
-    :meth:`~mandala_computer.Computer.agent_once`): a 402 there is the model
-    provider's, and arrives as :class:`ModelProviderError`.
+    :meth:`~mandala_computer.Computer.agent_once`): a 402 there is either the
+    account's AI credits running short for a funded run, which arrives as
+    :class:`CreditsExhaustedError`, or the model provider's own billing refusal
+    on your ``model_key``, which arrives as :class:`ModelProviderError`.
     """
+
+
+class CreditsExhaustedError(APIError):
+    """A funded agent run was refused for want of AI credits (402).
+
+    Raised by :meth:`~mandala_computer.Computer.agent`,
+    :meth:`~mandala_computer.Computer.agent_stream` and
+    :meth:`~mandala_computer.Computer.agent_once` (and their async twins) when
+    the run was started without a ``model_key`` — so it would have run on the
+    account's Mandala AI credits — and the account did not have the $0.25 the
+    first model call reserves. The platform says so with a 402 carrying
+    :attr:`top_up_url`, which is what tells it apart from the model provider's
+    own 402 on a run with your key (:class:`ModelProviderError`). Nothing ran:
+    the refusal comes before the first model call.
+
+    Not a :class:`PlanLimitError`: the plan is not what to change. Top up, wait
+    for the next grant, or pass your own ``model_key``; :func:`is_transient`
+    answers ``False``. A funded run whose credits run out PART WAY THROUGH is
+    not raised at all: it ends with ``stop`` ``"credits_exhausted"`` on its
+    result, because the steps it took are real.
+    """
+
+    @property
+    def top_up_url(self) -> str | None:
+        """Where the account's credits are replenished, as the platform sent it.
+
+        Currently a path on the dashboard (``/billing``) rather than an absolute
+        URL, so resolve it against the dashboard's origin before opening it.
+        ``None`` only on an error built by hand without one."""
+        return _nonblank(self.body.get("top_up_url") if isinstance(self.body, dict) else None)
+
+    @property
+    def cost_usd(self) -> float | None:
+        """What the funded run had been charged when it was refused, in USD —
+        ``0`` for the refusal before its first model call. ``None`` when the
+        body did not say."""
+        value = self.body.get("cost_usd") if isinstance(self.body, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) else None
 
 
 class ModelProviderError(APIError):
@@ -284,11 +328,13 @@ class ModelProviderError(APIError):
 
     Raised by :meth:`~mandala_computer.Computer.agent` and
     :meth:`~mandala_computer.Computer.agent_once` (and their async twins) for a
-    402, which on the agent routes is never the Mandala plan: it is the model
-    API's own ``billing_error``, relayed as it came, and it means the account
-    behind your ``model_key`` has a billing problem. Nothing inside an agent run
-    consults the plan; the platform's own mid-run recheck answers only 401 or
-    403 with reason ``revoked``.
+    402 that carries no ``top_up_url``, which on the agent routes is never the
+    Mandala plan: it is the model API's own ``billing_error``, relayed as it
+    came, and it means the account behind your ``model_key`` has a billing
+    problem. A 402 that does carry ``top_up_url`` is the account's AI credits
+    for a funded run, and is :class:`CreditsExhaustedError` instead. Nothing
+    inside an agent run consults the plan; the platform's own mid-run recheck
+    answers only 401 or 403 with reason ``revoked``.
 
     Raised as well for a 404 or a 413 the model API answered, which the platform
     relays with its message prefixed ``model API: ``. A 404 there is usually a

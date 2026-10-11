@@ -21,6 +21,7 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
+    CreditReport,
     EgressProxy,
     EgressProxyArgs,
     LifecycleAck,
@@ -121,6 +122,7 @@ __all__ = [
     "AsyncApiKeys",
     "AsyncBuilds",
     "AsyncComputers",
+    "AsyncCredits",
     "AsyncMoves",
     "AsyncOperations",
     "AsyncSecrets",
@@ -1138,6 +1140,40 @@ class AsyncAccount:
         return Whoami.from_api(await self._t.json_object("GET", _api.WHOAMI))
 
     whoami.__doc__ = Account.whoami.__doc__
+
+
+class AsyncCredits:
+    """The account's Mandala AI credits: what funded agent runs spend.
+
+    An agent run started without a ``model_key`` runs on these (see
+    :meth:`~mandala_computer.Computer.agent_stream`). Its own collection because
+    ``GET /credits`` is its own route, account-wide like ``GET /usage``: a key
+    confined to a workspace is refused with
+    :class:`~mandala_computer.PermissionDeniedError`, because the ledger belongs
+    to the whole account. Every role can read it, and so can an account with no
+    plan or a suspended one.
+    """
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def read(self, *, before: int | None = None, limit: int | None = None) -> CreditReport:
+        """The balance, the live lots, this period's plan grant, and one page of
+        the journal, newest first.
+
+        Follow :attr:`~mandala_computer.CreditReport.next_before` as ``before=``
+        until it is ``None`` to walk older entries; entries recorded after the
+        first page do not shift the pages behind it. ``limit`` is entries per
+        page, 1 to 100 (the platform's default is 50). The balances and lots
+        are current on every page, not pinned to the first. Reading never
+        issues or expires credits.
+
+        Amounts are integer micros (1,000,000 = $1), markup included.
+        """
+        data = await self._t.json_object(
+            "GET", _api.CREDITS, params=_api.credits_params(before, limit)
+        )
+        return CreditReport.from_api(data)
 
 
 class AsyncUsage:
