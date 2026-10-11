@@ -10,6 +10,7 @@ import re
 import selectors
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -1798,3 +1799,123 @@ async def test_a_navigation_and_a_dialog_never_wait_behind_held_subresources() -
         hold.set()
         await socket.close()
         await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_slow_sync_policies_for_subresources_hold_no_navigation_or_renewal() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    release = threading.Event()
+    checked: list[str] = []
+
+    def sync_policy(_context: Any, url: str) -> None:
+        # A caller's synchronous policy: images take as long as they take.
+        checked.append(url)
+        if url.endswith(".png"):
+            release.wait(10)
+
+    async def policy(tab: Any, url: str) -> None:
+        await backend.call_policy(sync_policy, tab, url)
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        for i in range(300):
+            socket.push(paused(str(i), "page", f"https://ok.test/{i}.png"))
+        await settle(lambda: len(checked) >= 32)
+        document = paused("doc", "page", "https://ok.test/next")
+        document["params"].update(frameId="tab", resourceType="Document")
+        socket.push(document)
+        await settle(lambda: any(m["method"] == "Fetch.continueRequest" for m in socket.sent))
+        answered = [m for m in socket.sent if m["method"] == "Fetch.continueRequest"]
+        assert [m["params"]["requestId"] for m in answered] == ["doc"]
+        # Nor do they occupy the default executor that renewal runs on.
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "renewed"), 1) == "renewed"
+        # The model's own navigation check is a navigation too.
+        assert await asyncio.wait_for(
+            backend.check_url("https://ok.test/elsewhere", "tab", navigation=True), 1
+        )
+    finally:
+        release.set()
+        await socket.close()
+        await backend.reader
+        for task in list(backend.tasks):
+            task.cancel()
+        await asyncio.gather(*backend.tasks, return_exceptions=True)
+        for pool in backend._pools.values():
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_frames_inside_a_detached_cross_site_frame_are_forgotten_with_it() -> None:
+    backend, _ = owned_backend()
+    backend.files = files = FrameFiles()
+    for i in range(300):
+        await backend._event(attached(f"f{i}", f"f{i}-t", "iframe", "page"))
+        # Its own session reports a same-process frame inside it, and nothing
+        # says that frame went when the cross-site frame did.
+        backend._note("Page.frameAttached", {"frameId": f"inner{i}"}, session=f"f{i}")
+        assert files.frames[f"inner{i}"] == "tab"
+        await backend._event(
+            {
+                "method": "Target.detachedFromTarget",
+                "sessionId": "page",
+                "params": {"sessionId": f"f{i}", "targetId": f"f{i}-t"},
+            }
+        )
+    assert files.frames == {} and backend.frame_reporters == {}
+    # Frames the tab itself reports stay until the tab or a note removes them.
+    backend._note("Page.frameAttached", {"frameId": "own"}, session="page")
+    await backend._event(attached("late", "late-t", "iframe", "page"))
+    assert files.frames == {"own": "tab", "late-t": "tab"}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_toolset_url_policies_leave_navigations_and_renewal_their_threads(
+    asynchronous: bool,
+) -> None:
+    release = threading.Event()
+    started: list[str] = []
+
+    def sync_policy(_context: Any, url: str) -> None:
+        started.append(url)
+        if url.endswith(".png"):
+            release.wait(10)
+
+    computer = SimpleNamespace(
+        create_browser_connection=lambda: None, revoke_browser_connection=lambda _: None
+    )
+    toolset: Any = (AsyncMandalaBrowserToolset if asynchronous else MandalaBrowserToolset)(
+        computer, url_policy=sync_policy
+    )
+    backend = toolset._backend
+
+    async def scenario() -> float:
+        images = [
+            asyncio.create_task(backend.check_url(f"https://ok.test/{i}.png", "tab"))
+            for i in range(64)
+        ]
+        await asyncio.sleep(0.2)
+        began = time.monotonic()
+        await backend.check_url("https://ok.test/next", "tab", navigation=True)
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "renewed"), 1) == "renewed"
+        took = time.monotonic() - began
+        release.set()
+        await asyncio.gather(*images, return_exceptions=True)
+        for pool in backend._pools.values():
+            pool.shutdown(wait=False, cancel_futures=True)
+        return took
+
+    try:
+        took = asyncio.run(scenario()) if asynchronous else toolset._run(scenario())
+    finally:
+        release.set()
+        if not asynchronous:
+            with toolset._worker_lock:
+                worker, toolset._worker = toolset._worker, None
+            if worker is not None:
+                worker.close()
+    assert took < 1 and "https://ok.test/next" in started

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import inspect
 import json
 import math
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -42,6 +45,14 @@ _NAVIGATION_CONCURRENCY = 32
 _EVENT_QUEUE_LIMIT = 8192
 _EVENT_QUEUE_BYTES = 32 * 1024 * 1024
 _TARGET_EVENT_LIMIT = 1024
+# A caller's URL policy runs on threads of the session's own, never the default
+# executor that renewal and the sync computer's calls use. Navigation checks
+# have threads of their own, which held subresource checks cannot occupy.
+_POLICY_THREADS = 32
+_NAVIGATION_THREADS = 4
+_NAVIGATION_CHECK: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mandala_navigation_check", default=False
+)
 _FLOODED = (
     "The page produced browser events faster than the session could handle them. "
     "The session ended; create a new toolset to continue."
@@ -241,6 +252,10 @@ class BrowserCDP:
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
+        # Frame -> the cross-site frame session that reported it, so that the
+        # frames inside a cross-site frame go when its session does.
+        self.frame_reporters: dict[str, str] = {}
+        self._pools: dict[bool, ThreadPoolExecutor] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
         self.grant: Any = None
@@ -554,6 +569,8 @@ class BrowserCDP:
                 and p.get("frameId") == tab
                 and p.get("resourceType") == "Document"
             )
+            if own_document:
+                trimmed["navigation"] = True
             self._enqueue(self.navigation_lane if own_document else self.policy_lane, trimmed)
         # Anything else is an event this driver does not use.
 
@@ -608,17 +625,18 @@ class BrowserCDP:
             return
         try:
             if self.files is not None and method == "Page.frameAttached":
-                self.files.frame(p["frameId"], tab)
+                self._track(p["frameId"], tab, session)
             if (
                 self.files is not None
                 and method == "Page.frameDetached"
                 and p.get("reason") != "swap"  # It lives on in another process.
             ):
                 self.files.frames.pop(p["frameId"], None)
+                self.frame_reporters.pop(p["frameId"], None)
             if method == "Page.frameNavigated":
                 self.refs.pop(tab, None)
                 if self.files is not None:
-                    self.files.frame(p["frame"]["id"], tab)
+                    self._track(p["frame"]["id"], tab, session)
             elif method == "Runtime.consoleAPICalled":
                 text = " ".join(
                     str(a.get("value", a.get("description", "")))[:1000]
@@ -635,6 +653,22 @@ class BrowserCDP:
             # canceled, so dropping one fails closed.
             if method == "Page.frameNavigated":
                 self.refs.pop(tab, None)
+
+    def _track(self, frame: str, tab: str, session: str | None) -> bool:
+        """Make a frame's downloads its tab's, remembering who reported it."""
+        assert self.files is not None
+        if not self.files.frame(frame, tab):
+            return False
+        if session in self.child_frames:
+            self.frame_reporters[frame] = session
+        else:
+            self.frame_reporters.pop(frame, None)
+        return True
+
+    def _track_tree(self, tree: dict[str, Any], tab: str, session: str) -> None:
+        if self._track(tree["frame"]["id"], tab, session):
+            for child in tree.get("childFrames", []):
+                self._track_tree(child, tab, session)
 
     def _owner(self, session: str | None) -> str | None:
         """The owned tab a session belongs to: the tab's own, or a frame inside it."""
@@ -658,10 +692,15 @@ class BrowserCDP:
         for current in gone:
             _, frame, _ = self.child_frames.pop(current)
             if self.files is not None:
-                # Its parent's notes cannot be relied on to say it went: a
-                # frame inside a cross-site frame has no notes at all. One that
-                # lives on in its parent's process is noted again as it loads.
+                # Its parent's notes cannot be relied on to say it went, nor
+                # its own to say the frames inside it went. One that lives on
+                # in its parent's process is noted again as it loads.
                 self.files.frames.pop(frame, None)
+        if self.files is not None:
+            for frame, reporter in list(self.frame_reporters.items()):
+                if reporter in gone:
+                    self.files.frames.pop(frame, None)
+                    del self.frame_reporters[frame]
         for ident, owner in list(self.pending_sessions.items()):
             future = self.pending.get(ident)
             if owner in gone and future is not None and not future.done():
@@ -696,7 +735,7 @@ class BrowserCDP:
                 if self.files is not None:
                     # Its ID is its target's. Its downloads are its tab's, even
                     # after its parent reports it swapped out.
-                    self.files.frame(info["targetId"], tab)
+                    self._track(info["targetId"], tab, child)
 
     async def _setup_frame(self, child: str) -> None:
         tab = self.child_frames[child][0]
@@ -709,7 +748,7 @@ class BrowserCDP:
                 tree = await self.send("Page.getFrameTree", session=child)
                 if child not in self.child_frames:
                     return
-                self.files.frame_tree(tree["frameTree"], tab)
+                self._track_tree(tree["frameTree"], tab, child)
             await self.send("Runtime.runIfWaitingForDebugger", session=child)
         except Exception:  # noqa: BLE001 - never expose browser-supplied errors
             # Usually the frame went away first. If not, it stays paused: a
@@ -804,7 +843,9 @@ class BrowserCDP:
                     return  # The target has already detached; its requests die with it.
                 allowed = True
                 try:
-                    await self.check_url(p["request"]["url"], tab)
+                    await self.check_url(
+                        p["request"]["url"], tab, navigation=message.get("navigation") is True
+                    )
                 except Exception:  # noqa: BLE001 - fail closed without exposing callback errors
                     allowed = False
                 if self._owner(session) != tab:
@@ -845,6 +886,9 @@ class BrowserCDP:
     def drop_tab(self, target: str) -> None:
         if self.files is not None:
             self.files.frames = {f: t for f, t in self.files.frames.items() if t != target}
+            self.frame_reporters = {
+                f: s for f, s in self.frame_reporters.items() if f in self.files.frames
+            }
         for child, (tab, _, _) in list(self.child_frames.items()):
             if tab == target:
                 self._drop_frame(child)
@@ -863,7 +907,20 @@ class BrowserCDP:
         if self.active == target:
             self.active = next(iter(self.tabs), None)
 
-    async def check_url(self, url: str, tab: str | None) -> str:
+    async def call_policy(self, callback: Callable[..., Any], *args: Any) -> Any:
+        """Run a caller's URL policy on this session's own threads; see _POLICY_THREADS."""
+        navigation = _NAVIGATION_CHECK.get()
+        pool = self._pools.get(navigation)
+        if pool is None:
+            pool = self._pools[navigation] = ThreadPoolExecutor(
+                max_workers=_NAVIGATION_THREADS if navigation else _POLICY_THREADS,
+                thread_name_prefix="mandala-browser-" + ("navigation" if navigation else "policy"),
+            )
+        call = functools.partial(contextvars.copy_context().run, callback, *args)
+        returned = await asyncio.get_running_loop().run_in_executor(pool, call)
+        return await returned if inspect.isawaitable(returned) else returned
+
+    async def check_url(self, url: str, tab: str | None, *, navigation: bool = False) -> str:
         parsed = urlsplit(url)
         if (
             parsed.scheme not in ("http", "https")
@@ -877,6 +934,7 @@ class BrowserCDP:
         if len(url) > 8192:
             raise BrowserError("URL exceeds 8192 characters.")
         if self.policy:
+            check = _NAVIGATION_CHECK.set(navigation)
             try:
                 await asyncio.wait_for(self._invoke(self.policy, tab, url), 5)
             except ToolError as error:
@@ -885,6 +943,8 @@ class BrowserCDP:
                 raise BrowserError(
                     "Navigation was refused by the URL policy or its deadline."
                 ) from None
+            finally:
+                _NAVIGATION_CHECK.reset(check)
         return url
 
     async def new_tab(self) -> dict[str, Any]:
@@ -978,15 +1038,15 @@ class BrowserCDP:
                 if not 0 <= index < len(history["entries"]):
                     raise BrowserError("No history entry in that direction.")
                 entry = history["entries"][index]
-                await self.check_url(entry["url"], tab)
+                await self.check_url(entry["url"], tab, navigation=True)
                 await self.send("Page.navigateToHistoryEntry", {"entryId": entry["id"]}, session)
             elif url == "reload":
-                await self.check_url(self.tabs[tab].get("url", ""), tab)
+                await self.check_url(self.tabs[tab].get("url", ""), tab, navigation=True)
                 await self.send("Page.reload", session=session)
             else:
                 if ":" not in url.split("/")[0]:
                     url = "https://" + url
-                await self.check_url(url, tab)
+                await self.check_url(url, tab, navigation=True)
                 result = await self.send("Page.navigate", {"url": url}, session)
                 if "errorText" in result:
                     raise BrowserError("Navigation failed or was refused by the URL policy.")
@@ -1371,6 +1431,9 @@ class BrowserCDP:
             for task in list(self.tasks):
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
+            for pool in self._pools.values():
+                # A callback still running cannot be stopped; its answer is unused.
+                pool.shutdown(wait=False, cancel_futures=True)
             self.tabs.clear()
             if self.grant:
                 await asyncio.wait_for(self._invoke(self.revoke, self.grant.id), 10)

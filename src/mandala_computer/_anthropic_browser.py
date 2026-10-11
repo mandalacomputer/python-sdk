@@ -190,10 +190,7 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
         async def policy(tab: str | None, url: str) -> None:
             if url_policy is not None:
                 context = BetaURLContext(tab_id=tab)
-                callback: Any = url_policy
-                returned = await asyncio.to_thread(callback, context, url)
-                if inspect.isawaitable(returned):
-                    returned = await returned
+                returned = await self._backend.call_policy(url_policy, context, url)
                 if returned is not None:
                     raise BrowserError(
                         "URL policy must allow with no return value or refuse by throwing."
@@ -498,10 +495,7 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
     ) -> None:
         async def apply_policy(context: BetaURLContext, url: str) -> None:
             if url_policy is not None:
-                callback: Any = url_policy
-                returned = await asyncio.to_thread(callback, context, url)
-                if inspect.isawaitable(returned):
-                    returned = await returned
+                returned = await self._backend.call_policy(url_policy, context, url)
                 if returned is not None:
                     raise BrowserError(
                         "URL policy must allow with no return value or refuse by throwing."
