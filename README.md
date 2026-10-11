@@ -1958,9 +1958,12 @@ revokes its capability; it does not stop Chromium or delete the computer.
   Callbacks must finish promptly. This is **not network isolation**: use guest
   egress controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and
   browser traffic outside those intercepted requests.
-- Popups, workers and cross-process frames are unsupported and are closed.
-  If an unsupported target cannot be closed, the driver closes its session.
-  Sites depending on these features may not work with this initial driver.
+- Cross-site frames, which site isolation runs as separate browser targets,
+  and dedicated workers run inside their tab, and their intercepted requests
+  meet the same URL hook. A frame that cannot be given that hook stays paused
+  and never runs. Popups, shared and service workers and other targets are
+  unsupported and are closed; if one cannot be closed, the driver closes its
+  session. Sites depending on popups may not work with this driver.
 - `read_page` returns accessibility roles/names and element refs; `find`
   performs a case-insensitive substring search over that tree. Each read/find
   replaces that tab's refs. Navigation invalidates them. Ask for a new page
@@ -1970,6 +1973,9 @@ revokes its capability; it does not stop Chromium or delete the computer.
   16,000 characters per input/JavaScript action, a 30-second wait, a ten-second
   held key and at most 100 key repeats. Coordinates outside the viewport and
   invalid crop rectangles are refused. Dialogs are dismissed and reported.
+  Browser events (paused requests among them) are handled 256 at a time and
+  the rest wait their turn; a page that leaves more than 8,192 waiting ends
+  the session.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be
@@ -2099,8 +2105,12 @@ valid and always close the toolset.
 `absolute_expires_at`, and a redacted `terminal_error`. Set `auto_renew=False`
 on the policy to stop at the initial lease.
 Remaining time is advisory and conservative, based on server time and monotonic
-elapsed time; client wall-clock skew does not lengthen a lease. Renewal failure
-closes the socket immediately. Status reads are local and do not call the API.
+elapsed time; client wall-clock skew does not lengthen a lease. A renewal that
+fails in passing (a lost connection, a timeout, a 408, 429 or 5xx) is retried
+with backoff, honouring `Retry-After`, until shortly before the lease deadline.
+Any other refusal, including every 409 whatever its `reason`, or running out of
+time ends the session and closes the socket at once. Status reads are local and
+do not call the API.
 
 `create_browser_connection(session_policy=BrowserSessionPolicy())` opts a raw
 CDP client in; call `renew_browser_connection(connection.id)` before each lease

@@ -28,6 +28,7 @@ from ._agent import (
 )
 from ._artifacts import Artifact, decode_artifact, verify_download, verify_nomination
 from ._browser_connection import (
+    CLEANUP_REVOKE_TIMEOUT,
     BrowserConnection,
     BrowserSessionLease,
     BrowserSessionPolicy,
@@ -637,17 +638,20 @@ class AsyncComputer(ComputerFields):
         try:
             return BrowserConnection.from_api(data, self._t.base_url, path, session_policy)
         except MandalaError:
-            # An older server can silently ignore the opt-in. Withhold the
-            # capability and release its grant without masking the parse error.
-            if session_policy is not None:
-                try:
-                    ident = data.get("id")
-                    if not isinstance(ident, str):
-                        raise TypeError("missing connection id")
-                    ident = connection_id(ident)
-                    await self.revoke_browser_connection(ident)
-                except Exception:  # noqa: BLE001, S110 - preserve parse error; never log a capability
-                    pass
+            # A grant this SDK refuses to hand over — an older server ignoring
+            # the opt-in, or any answer that fails validation — is still live on
+            # the server. Release it, briefly, without masking the parse error.
+            try:
+                ident = data.get("id")
+                if not isinstance(ident, str):
+                    raise TypeError("missing connection id")
+                await self._t.json_object(
+                    "DELETE",
+                    f"{path}/{connection_id(ident)}",
+                    timeout_cap=CLEANUP_REVOKE_TIMEOUT,
+                )
+            except Exception:  # noqa: BLE001, S110 - preserve parse error; never log a capability
+                pass
             raise
 
     async def renew_browser_connection(self, ident: str) -> BrowserSessionLease:

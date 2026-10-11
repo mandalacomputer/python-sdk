@@ -121,6 +121,9 @@ def chrome(tmp_path: Any) -> Any:
             "--headless",
             "--no-sandbox",
             "--no-first-run",
+            # The guest's Chromium isolates sites; say so rather than rely on
+            # this build's default, so cross-site frames are their own targets.
+            "--site-per-process",
             "--remote-debugging-port=0",
             f"--user-data-dir={tmp_path}",
         ],
@@ -690,3 +693,448 @@ async def test_implicit_action_uses_remaining_tab_after_active_target_dies() -> 
     with pytest.raises(BrowserError, match="Tab is missing"):
         await backend.perform("get_page_text", {})
     assert backend.active is None
+
+
+# --- cross-site frames, workers and other targets ------------------------------
+
+
+@pytest.fixture
+def cross_site() -> Any:
+    """One server, two sites: the page on 127.0.0.1 embeds a frame from localhost.
+
+    Under site isolation the frame is its own CDP target, attached beneath the
+    page, and it embeds a 127.0.0.1 frame of its own, which attaches beneath it.
+    The page also starts a dedicated worker. Every one of them asks for a URL
+    the policy refuses and reports, to the page, whether it got through.
+    """
+    hits: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append((self.headers.get("Host", "").split(":")[0], self.path))
+            port = self.server.server_port
+            probe = (
+                "fetch('{0}-allowed').then(()=>fetch('{0}-blocked'))"
+                ".then(()=>'fetched',()=>'refused')"
+            )
+            pages = {
+                "/": f"""<title>Cross-site</title><p id=log>waiting</p><script>
+const seen=new Set();const show=v=>{{seen.add(String(v));document.getElementById('log').textContent=[...seen].sort().join(' ')}};
+addEventListener('message',e=>show(e.data));
+new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
+</script><iframe src="http://localhost:{port}/frame"></iframe>""",
+                "/frame": f"""<p>frame</p><script>{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
+<iframe src="http://127.0.0.1:{port}/nested"></iframe>""",
+                "/nested": f"<p>nested</p><script>{probe.format('/nested')}.then(r=>top.postMessage('nested:'+r,'*'))</script>",
+            }
+            if self.path == "/worker.js":
+                body = (probe.format("/worker") + ".then(r=>postMessage(r))").encode()
+                kind = "text/javascript"
+            else:
+                body = pages.get(self.path, "ok").encode()
+                kind = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port, hits
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+CROSS_SITE_DONE = "frame:refused nested:refused worker:refused"
+
+
+def assert_cross_site_policy(port: int, hits: list[tuple[str, str]], seen: list[str]) -> None:
+    # Each child ran and its requests met the policy: allowed ones reached the
+    # server, refused ones never did.
+    for host, path in [
+        ("localhost", "/frame"),
+        ("localhost", "/frame-allowed"),
+        ("127.0.0.1", "/nested"),
+        ("127.0.0.1", "/nested-allowed"),
+        ("127.0.0.1", "/worker-allowed"),
+    ]:
+        assert (host, path) in hits
+    assert not [path for _, path in hits if path.endswith("-blocked")]
+    for url in [
+        f"http://localhost:{port}/frame-blocked",
+        f"http://127.0.0.1:{port}/nested-blocked",
+        f"http://127.0.0.1:{port}/worker-blocked",
+    ]:
+        assert url in seen
+
+
+def test_sync_cross_site_frame_runs_under_the_policy(chrome: str, cross_site: Any) -> None:
+    computer, revoked = remote(chrome, False)
+    port, hits = cross_site
+    seen: list[str] = []
+
+    def policy(_context: Any, url: str) -> None:
+        seen.append(url)
+        if url.endswith("-blocked"):
+            raise ToolError("not permitted")
+
+    with MandalaBrowserToolset(computer, url_policy=policy) as browser:
+        nav = assert_success(browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/")))
+        assert len(tabs(nav)) == 1
+        page = ""
+        for _ in range(50):
+            page = text(assert_success(browser.tool_result(use("get_page_text"))))
+            if CROSS_SITE_DONE in page:
+                break
+            assert_success(browser.tool_result(use("wait", duration=0.1)))
+        assert CROSS_SITE_DONE in page
+        # The tab the frame lives in is still there, and still answers.
+        assert len(tabs(assert_success(browser.tool_result(use("list_tabs"))))) == 1
+        assert_success(browser.tool_result(use("screenshot")))
+    assert revoked == [IDENT]
+    assert_cross_site_policy(port, hits, seen)
+
+
+@pytest.mark.asyncio
+async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_site: Any) -> None:
+    computer, revoked = remote(chrome, True)
+    port, hits = cross_site
+    seen: list[str] = []
+
+    async def policy(_context: Any, url: str) -> None:
+        seen.append(url)
+        if url.endswith("-blocked"):
+            raise ToolError("not permitted")
+
+    async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        nav = assert_success(
+            await browser.tool_result(use("navigate", url=f"http://127.0.0.1:{port}/"))
+        )
+        assert len(tabs(nav)) == 1
+        page = ""
+        for _ in range(50):
+            page = text(assert_success(await browser.tool_result(use("get_page_text"))))
+            if CROSS_SITE_DONE in page:
+                break
+            await asyncio.sleep(0.1)
+        assert CROSS_SITE_DONE in page
+        assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
+        assert_success(await browser.tool_result(use("screenshot")))
+    assert revoked == [IDENT]
+    assert_cross_site_policy(port, hits, seen)
+
+
+def owned_backend(policy: Any = None) -> tuple[Any, list[tuple[str, Any, Any]]]:
+    """A backend with one ready tab, recording every command it sends."""
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = object()
+    backend.context = "context"
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.active = "tab"
+    sent: list[tuple[str, Any, Any]] = []
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        sent.append((method, params, session))
+        return {"success": True}
+
+    backend.send = send
+    return backend, sent
+
+
+def attached(child: str, target: str, kind: str, parent: str | None) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "method": "Target.attachedToTarget",
+        "params": {
+            "sessionId": child,
+            "targetInfo": {"targetId": target, "type": kind, "browserContextId": "context"},
+        },
+    }
+    if parent is not None:
+        message["sessionId"] = parent
+    return message
+
+
+@pytest.mark.asyncio
+async def test_frames_and_workers_under_an_owned_tab_run_and_are_never_closed() -> None:
+    from mandala_computer._browser_cdp import _FRAME_INIT
+
+    seen: list[tuple[Any, str]] = []
+
+    async def policy(tab: Any, url: str) -> None:
+        seen.append((tab, url))
+        if url.endswith("/blocked"):
+            raise ToolError("no")
+
+    backend, sent = owned_backend(policy)
+    await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
+    assert [(m, s) for m, _, s in sent] == [
+        *[(name, "frame-s") for name, _ in _FRAME_INIT],
+        ("Runtime.runIfWaitingForDebugger", "frame-s"),
+    ]
+    # A frame inside that frame is the same tab's, however deep.
+    sent.clear()
+    await backend._event(attached("nested-s", "nested-t", "iframe", "frame-s"))
+    assert ("Runtime.runIfWaitingForDebugger", None, "nested-s") in sent
+    assert backend._owner("nested-s") == "tab"
+    # A worker is released and left alone: its requests are its frame's.
+    sent.clear()
+    await backend._event(attached("worker-s", "worker-t", "worker", "frame-s"))
+    assert [m for m, _, _ in sent] == ["Runtime.runIfWaitingForDebugger", "Target.detachFromTarget"]
+    assert not [m for m, _, _ in sent if m == "Target.closeTarget"]
+    # The frame's requests answer to the tab's policy, on the frame's session.
+    sent.clear()
+    for ident, url in [("1", "https://ok.test/"), ("2", "https://ok.test/blocked")]:
+        await backend._event(
+            {
+                "method": "Fetch.requestPaused",
+                "sessionId": "nested-s",
+                "params": {"requestId": ident, "request": {"url": url}},
+            }
+        )
+    assert seen == [("tab", "https://ok.test/"), ("tab", "https://ok.test/blocked")]
+    assert [(m, p["requestId"], s) for m, p, s in sent] == [
+        ("Fetch.continueRequest", "1", "nested-s"),
+        ("Fetch.failRequest", "2", "nested-s"),
+    ]
+    assert not backend.failed
+    # Closing the tab forgets its frames, and their requests die with them.
+    backend.drop_tab("tab")
+    assert not backend.child_frames and backend._owner("frame-s") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        attached("popup-s", "popup-t", "page", None),
+        attached("sw-s", "sw-t", "service_worker", None),
+        attached("frame-s", "frame-t", "iframe", None),
+        attached("frame-s", "frame-t", "iframe", "someone-elses-session"),
+        attached("shared-s", "shared-t", "shared_worker", "page"),
+    ],
+)
+async def test_targets_outside_an_owned_tab_are_still_closed(message: dict[str, Any]) -> None:
+    backend, sent = owned_backend()
+    await backend._event(message)
+    assert [(m, p) for m, p, _ in sent] == [
+        ("Target.closeTarget", {"targetId": message["params"]["targetInfo"]["targetId"]})
+    ]
+    assert not backend.child_frames and not backend.failed
+
+
+@pytest.mark.asyncio
+async def test_a_frame_that_cannot_take_the_policy_stays_paused_without_ending_the_tab() -> None:
+    from mandala_computer._browser_cdp import BrowserError
+
+    backend, sent = owned_backend()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        if method == "Fetch.enable" and session == "frame-s":
+            raise BrowserError("Chromium could not complete the browser action.")
+        return await plain(method, params, session)
+
+    backend.send = send
+    await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
+    assert ("Runtime.runIfWaitingForDebugger", None, "frame-s") not in sent
+    assert not [m for m, _, _ in sent if m == "Target.closeTarget"]
+    assert not backend.failed and "frame-s" not in backend.child_frames
+    assert backend.tabs == {"tab": {}}
+
+
+@pytest.mark.asyncio
+async def test_a_detached_frame_fails_its_pending_command_promptly() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, _SessionGone
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+
+        async def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = Socket()
+    backend.context = "context"
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.child_frames = {"frame-s": ("tab", "frame-t")}
+    command = asyncio.create_task(backend.send("Runtime.enable", session="frame-s"))
+    other = asyncio.create_task(backend.send("Runtime.enable", session="page"))
+    await asyncio.sleep(0)
+    await backend._event(
+        {
+            "method": "Target.detachedFromTarget",
+            "sessionId": "page",
+            "params": {"sessionId": "frame-s", "targetId": "frame-t"},
+        }
+    )
+    with pytest.raises(_SessionGone):
+        await asyncio.wait_for(command, 1)
+    assert not other.done() and not backend.failed
+    other.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_paused_requests_waits_its_turn_instead_of_ending_the_session() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    release = asyncio.Event()
+    checked: list[str] = []
+
+    async def policy(_tab: Any, url: str) -> None:
+        checked.append(url)
+        await release.wait()
+
+    class Socket:
+        def __init__(self) -> None:
+            self.inbox: asyncio.Queue[str | None] = asyncio.Queue()
+            self.answered: list[str] = []
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> str:
+            raw = await self.inbox.get()
+            if raw is None:
+                raise StopAsyncIteration
+            return raw
+
+        async def send(self, raw: str) -> None:
+            message = json.loads(raw)
+            self.answered.append(message["params"]["requestId"])
+            await self.inbox.put(json.dumps({"id": message["id"], "result": {}}))
+
+        async def close(self) -> None:
+            await self.inbox.put(None)
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = Socket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.reader = asyncio.create_task(backend._read())
+    total = 600
+    for i in range(total):
+        socket.inbox.put_nowait(
+            json.dumps(
+                {
+                    "method": "Fetch.requestPaused",
+                    "sessionId": "page",
+                    "params": {"requestId": str(i), "request": {"url": f"https://a.test/{i}"}},
+                }
+            )
+        )
+    try:
+        for _ in range(100):
+            if len(checked) >= 256:
+                break
+            await asyncio.sleep(0.01)
+        assert len(checked) == 256 and len(backend.tasks) == 256 and not backend.failed
+        release.set()
+        for _ in range(300):
+            if len(socket.answered) == total:
+                break
+            await asyncio.sleep(0.01)
+        # Every request was answered, in arrival order, with the session intact.
+        assert socket.answered == [str(i) for i in range(total)] and not backend.failed
+    finally:
+        await socket.close()
+        await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_an_unbounded_event_flood_still_ends_the_session(monkeypatch: Any) -> None:
+    from mandala_computer import _browser_cdp
+    from mandala_computer._browser_cdp import BrowserCDP, BrowserError
+
+    monkeypatch.setattr(_browser_cdp, "_EVENT_CONCURRENCY", 2)
+    monkeypatch.setattr(_browser_cdp, "_EVENT_QUEUE_LIMIT", 10)
+    stuck = asyncio.Event()
+
+    async def policy(_tab: Any, _url: str) -> None:
+        await stuck.wait()
+
+    class Socket:
+        closed = False
+
+        def __init__(self) -> None:
+            self.events = [
+                json.dumps(
+                    {
+                        "method": "Fetch.requestPaused",
+                        "sessionId": "page",
+                        "params": {"requestId": str(i), "request": {"url": "https://a.test/"}},
+                    }
+                )
+                for i in range(20)
+            ]
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> str:
+            if not self.events:
+                await asyncio.Event().wait()
+            return self.events.pop(0)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = Socket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    await asyncio.wait_for(backend._read(), 1)
+    assert backend.failed and socket.closed
+    with pytest.raises(BrowserError, match="faster than the session"):
+        await backend.start()
+    for task in list(backend.tasks):
+        task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_read_page_depth_zero_is_sent_as_zero() -> None:
+    backend, sent = owned_backend()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        await plain(method, params, session)
+        return {"nodes": []}
+
+    backend.send = send
+    await backend.perform("read_page", {"depth": 0})
+    await backend.perform("read_page", {})
+    assert [p["depth"] for m, p, _ in sent if m == "Accessibility.getFullAXTree"] == [0, 20]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_form_field_release_does_not_end_the_session() -> None:
+    backend, sent = owned_backend()
+    backend.refs = {"tab": {"e1": 7}}
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        await plain(method, params, session)
+        if method == "DOM.resolveNode":
+            return {"object": {"objectId": "obj"}}
+        if method == "Runtime.releaseObject":
+            raise asyncio.TimeoutError()
+        return {"result": {}}
+
+    backend.send = send
+    assert (
+        await backend.perform("form_input", {"target": {"type": "ref", "ref": "e1"}, "value": "x"})
+        is None
+    )
+    assert ("Runtime.releaseObject", {"objectId": "obj"}, "page") in sent
+    assert not backend.failed

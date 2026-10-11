@@ -17,6 +17,51 @@ from anthropic.tools import ToolError
 from websockets.asyncio.client import connect
 
 from ._browser_connection import BrowserSessionLease, BrowserSessionPolicy
+from ._exceptions import APIError
+
+# Events are handled concurrently up to this many at once and the rest wait
+# their turn in arrival order. A heavy page pauses hundreds of requests at once,
+# and each one waits for the URL policy and a reply from Chromium; Chromium
+# holds a paused request for as long as it takes, so queueing costs nothing.
+_EVENT_CONCURRENCY = 256
+# Only a page flooding the session faster than any policy could answer reaches
+# this, and it ends the session rather than growing without bound.
+_EVENT_QUEUE_LIMIT = 8192
+_FLOODED = (
+    "The page produced browser events faster than the session could handle them. "
+    "The session ended; create a new toolset to continue."
+)
+_AUTO_ATTACH = {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}
+_INTERCEPT = {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
+# A site-isolated cross-site frame is its own target, attached under its page
+# and paused until released. Chromium intercepts its subresource requests on
+# the frame's own session, so it gets the page's interception before it runs.
+_FRAME_INIT: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("Network.enable", {}),
+    ("Network.setBypassServiceWorker", {"bypass": True}),
+    ("Fetch.enable", _INTERCEPT),
+    ("Runtime.enable", {}),
+    ("Target.setAutoAttach", _AUTO_ATTACH),
+)
+# Renewal keeps retrying until this long before the lease deadline, so that the
+# last attempt can still arrive while the lease is active.
+_RENEW_MARGIN = 2.0
+_RENEW_ATTEMPT = 10.0
+_RENEW_BACKOFF = 0.5
+_RENEW_BACKOFF_MAX = 8.0
+
+
+def _renewable(error: BaseException) -> bool:
+    """Whether a failed renewal attempt is worth another try before the deadline."""
+    # A refusal is an answer about this session: 401/403 is the credential, 404
+    # the connection, and 409 a session that is no longer active (expired,
+    # revoked, disconnected). None of them changes by asking again, whatever
+    # reason the body gives.
+    if isinstance(error, APIError):
+        return error.status in (408, 429) or error.status >= 500
+    # Renewal changes nothing but the deadline, so a lost answer is safe to ask
+    # again; so is an attempt that hit its own timeout.
+    return isinstance(error, (ConnectionError, TimeoutError, asyncio.TimeoutError))
 
 
 class BrowserError(Exception):
@@ -25,6 +70,10 @@ class BrowserError(Exception):
 
 class _RequestGone(BrowserError):
     """Chromium discarded a paused request before its policy check completed."""
+
+
+class _SessionGone(BrowserError):
+    """A frame's session detached while a command on it was in flight."""
 
 
 class _DirectConnect(connect):
@@ -69,7 +118,11 @@ class BrowserCDP:
         self.ws: Any = None
         self.reader: asyncio.Task[None] | None = None
         self.tasks: set[asyncio.Task[None]] = set()
+        self.backlog: deque[dict[str, Any]] = deque()
         self.pending: dict[int, asyncio.Future[Any]] = {}
+        self.pending_sessions: dict[int, str] = {}
+        # Child session -> (owning tab, frame target): cross-site frames of a tab.
+        self.child_frames: dict[str, tuple[str, str]] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
         self.grant: Any = None
@@ -138,10 +191,7 @@ class BrowserCDP:
             if self.files is not None:
                 await self.files.setup(self.context)
             await self.send("Target.setDiscoverTargets", {"discover": True})
-            await self.send(
-                "Target.setAutoAttach",
-                {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True},
-            )
+            await self.send("Target.setAutoAttach", _AUTO_ATTACH)
             await self.new_tab()
             if self.lease is not None:
                 self.lease_task = asyncio.create_task(self._maintain_lease())
@@ -206,20 +256,56 @@ class BrowserCDP:
                 if not can_renew or time.monotonic() >= self.lease_deadline:
                     self.terminal_reason = "Browser session lease expired or its absolute limit was reached. Create a new toolset to continue."
                     break
-                assert self.renew is not None
-                requested = time.monotonic()
-                lease = await asyncio.wait_for(
-                    self._invoke(self.renew, self.grant.id),
-                    min(10.0, self.lease_deadline - requested),
-                )
-                self._accept_lease(lease, time.monotonic() - requested)
+                await self._renew_lease()
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001 - never expose credentials or account error bodies
+            if self.closed or self.failed:
+                return
             self.terminal_reason = "Browser session renewal failed. The session ended; create a new toolset to continue."
         self.failed = True
         if self.ws is not None:
             await self.ws.close()  # Version 2 disconnect revokes the grant on the server.
+
+    async def _renew_lease(self) -> None:
+        """Renew once, retrying passing failures until shortly before the deadline.
+
+        One failed attempt is not a failed renewal. A connection failure, a
+        timeout, a 408, a 429 or a 5xx is tried again with backoff, honouring
+        ``Retry-After``; a refusal (any other status, including every 409)
+        ends the session at once, as does running out of time.
+        """
+        assert self.renew is not None
+        attempt = 0
+        while True:
+            requested = time.monotonic()
+            # The first attempt is scheduled well inside the lease; a retry must
+            # also leave the margin for its own answer to arrive in time.
+            budget = self.lease_deadline - requested - (_RENEW_MARGIN if attempt else 0.0)
+            if budget <= 0:
+                raise BrowserError("Browser session renewal ran out of time.")
+            try:
+                lease = await asyncio.wait_for(
+                    self._invoke(self.renew, self.grant.id), min(_RENEW_ATTEMPT, budget)
+                )
+            except Exception as error:
+                if self.closed or self.failed or not _renewable(error):
+                    raise
+                wait = min(_RENEW_BACKOFF * 2**attempt, _RENEW_BACKOFF_MAX)
+                hinted = error.retry_after if isinstance(error, APIError) else None
+                if hinted is not None:
+                    wait = max(wait, hinted)
+                if time.monotonic() + wait >= self.lease_deadline - _RENEW_MARGIN:
+                    raise
+                await asyncio.sleep(wait)
+                if self.closed or self.failed:
+                    return
+                attempt += 1
+                continue
+            if self.closed or self.failed:
+                return
+            self._accept_lease(lease, time.monotonic() - requested)
+            return
 
     async def send(
         self, method: str, params: dict[str, Any] | None = None, session: str | None = None
@@ -236,11 +322,13 @@ class BrowserCDP:
         message: dict[str, Any] = {"id": ident, "method": method, "params": params or {}}
         if session:
             message["sessionId"] = session
+            self.pending_sessions[ident] = session
         try:
             await self.ws.send(json.dumps(message))
             return await asyncio.wait_for(future, 15)
         finally:
             self.pending.pop(ident, None)
+            self.pending_sessions.pop(ident, None)
 
     async def _read(self) -> None:
         try:
@@ -263,15 +351,12 @@ class BrowserCDP:
                         else:
                             future.set_result(message.get("result", {}))
                 else:
-                    if len(self.tasks) >= 256:
-                        raise BrowserError("Browser exceeded the pending event limit.")
-                    task = asyncio.create_task(self._event(message))
-                    self.tasks.add(task)
-                    task.add_done_callback(self.tasks.discard)
+                    self._dispatch(message)
         except Exception:  # noqa: BLE001, S110 - fail closed without exposing browser-supplied errors
             pass
         finally:
             self.failed = True
+            self.backlog.clear()
             if self.lease_task is not None and self.lease_task is not asyncio.current_task():
                 self.lease_task.cancel()
             for ready in self.ready.values():
@@ -279,6 +364,7 @@ class BrowserCDP:
             for mapping in (
                 self.tabs,
                 self.sessions,
+                self.child_frames,
                 self.ready,
                 self.refs,
                 self.console,
@@ -300,6 +386,69 @@ class BrowserCDP:
             if self.files is not None:
                 await self.files.close()
 
+    def _dispatch(self, message: dict[str, Any]) -> None:
+        # Arrival order is kept: nothing overtakes an event already waiting.
+        if self.backlog or len(self.tasks) >= _EVENT_CONCURRENCY:
+            if len(self.backlog) >= _EVENT_QUEUE_LIMIT:
+                self.terminal_reason = _FLOODED
+                raise BrowserError(_FLOODED)
+            self.backlog.append(message)
+            return
+        self._run_event(message)
+
+    def _run_event(self, message: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._event(message))
+        self.tasks.add(task)
+        task.add_done_callback(self._event_finished)
+
+    def _event_finished(self, task: asyncio.Task[None]) -> None:
+        self.tasks.discard(task)
+        while (
+            not self.failed
+            and not self.closed
+            and self.backlog
+            and len(self.tasks) < _EVENT_CONCURRENCY
+        ):
+            self._run_event(self.backlog.popleft())
+
+    def _owner(self, session: str | None) -> str | None:
+        """The owned tab a session belongs to: the tab's own, or a frame inside it."""
+        if session is None:
+            return None
+        frame = self.child_frames.get(session)
+        if frame is not None:
+            return frame[0] if frame[0] in self.sessions else None
+        return next((t for t, s in self.sessions.items() if s == session), None)
+
+    def _drop_frame(self, session: str) -> None:
+        if self.child_frames.pop(session, None) is None:
+            return
+        # Chromium need not answer a command on a session that has gone away.
+        for ident, owner in list(self.pending_sessions.items()):
+            future = self.pending.get(ident)
+            if owner == session and future is not None and not future.done():
+                future.set_exception(_SessionGone("Browser frame detached."))
+
+    async def _child(self, child: str, info: dict[str, Any], tab: str) -> None:
+        """A child target of an owned tab. It runs; closing it would close its tab."""
+        try:
+            if info.get("type") == "worker":
+                # A dedicated worker's requests are intercepted on its frame's
+                # session, under the policy that frame already has, and a worker
+                # cannot be closed: release it and stop listening to it.
+                await self.send("Runtime.runIfWaitingForDebugger", session=child)
+                await self.send("Target.detachFromTarget", {"sessionId": child})
+                return
+            self.child_frames[child] = (tab, info["targetId"])
+            for name, args in _FRAME_INIT:
+                await self.send(name, args, child)
+            await self.send("Runtime.runIfWaitingForDebugger", session=child)
+        except Exception:  # noqa: BLE001 - never expose browser-supplied errors
+            # Usually the frame or worker went away first. If not, it stays
+            # paused: a child that could not be given the request policy never
+            # runs, and its tab carries on without it.
+            self._drop_frame(child)
+
     async def _event(self, message: dict[str, Any]) -> None:
         method, p, session = (
             message.get("method"),
@@ -315,15 +464,17 @@ class BrowserCDP:
                 return
             if method == "Target.attachedToTarget":
                 info, child = p["targetInfo"], p["sessionId"]
-                if (
-                    info.get("browserContextId") != self.context
-                    and session not in self.sessions.values()
-                ):
+                parent = self._owner(session)
+                if info.get("browserContextId") != self.context and parent is None:
                     await self.send("Runtime.runIfWaitingForDebugger", session=child)
                     await self.send("Target.detachFromTarget", {"sessionId": child})
                     return
-                # Workers and popups cannot outlive the request policy. This
-                # first driver permits only explicitly-created top-level tabs.
+                if parent is not None and info.get("type") in ("iframe", "worker"):
+                    await self._child(child, info, parent)
+                    return
+                # Popups and other targets cannot outlive the request policy.
+                # This driver permits only explicitly-created top-level tabs and
+                # the frames and workers that run inside them.
                 target = info["targetId"]
                 if target not in self.ready and self.creating is not None:
                     await asyncio.shield(self.creating)
@@ -346,14 +497,8 @@ class BrowserCDP:
                         "Emulation.setDeviceMetricsOverride",
                         {"width": 1280, "height": 720, "deviceScaleFactor": 1, "mobile": False},
                     ),
-                    (
-                        "Fetch.enable",
-                        {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
-                    ),
-                    (
-                        "Target.setAutoAttach",
-                        {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True},
-                    ),
+                    ("Fetch.enable", _INTERCEPT),
+                    ("Target.setAutoAttach", _AUTO_ATTACH),
                 ]
                 for name, args in initializers:
                     await self.send(name, args, child)
@@ -367,13 +512,18 @@ class BrowserCDP:
                 info = p["targetInfo"]
                 if info["targetId"] in self.tabs:
                     self.tabs[info["targetId"]] = info
+            elif method == "Target.detachedFromTarget":
+                self._drop_frame(p["sessionId"])
             elif method == "Target.targetDestroyed":
                 target = p["targetId"]
+                for child, (_, frame) in list(self.child_frames.items()):
+                    if frame == target:
+                        self._drop_frame(child)
                 if target not in self.ready and self.creating is not None:
                     await asyncio.shield(self.creating)
                 self.drop_tab(target)
             elif method == "Fetch.requestPaused":
-                tab = next((t for t, s in self.sessions.items() if s == session), None)
+                tab = self._owner(session)
                 if tab is None:
                     return  # The target has already detached; its requests die with it.
                 allowed = True
@@ -381,7 +531,7 @@ class BrowserCDP:
                     await self.check_url(p["request"]["url"], tab)
                 except Exception:  # noqa: BLE001 - fail closed without exposing callback errors
                     allowed = False
-                if self.sessions.get(tab) != session:
+                if self._owner(session) != tab:
                     return
                 if not allowed:
                     self.changes.append({"type": "navigation_refused"})
@@ -403,7 +553,7 @@ class BrowserCDP:
                 )
                 await self.send("Page.handleJavaScriptDialog", {"accept": False}, session)
             else:
-                tab = next((t for t, s in self.sessions.items() if s == session), None)
+                tab = self._owner(session)
                 if tab:
                     if self.files is not None and method == "Page.frameAttached":
                         self.files.frame(p["frameId"], tab)
@@ -427,7 +577,9 @@ class BrowserCDP:
         except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):
                 return  # Page-side cancellation invalidates the paused request ID.
-            if session is not None and session not in self.sessions.values():
+            if isinstance(error, _SessionGone):
+                return  # Its frame went away mid-command.
+            if session is not None and self._owner(session) is None:
                 return  # An in-flight command raced with target destruction.
             # A failed policy installation must never leave an unguarded page.
             self.failed = True
@@ -437,6 +589,9 @@ class BrowserCDP:
     def drop_tab(self, target: str) -> None:
         if self.files is not None:
             self.files.frames = {f: t for f, t in self.files.frames.items() if t != target}
+        for child, (tab, _) in list(self.child_frames.items()):
+            if tab == target:
+                self._drop_frame(child)
         if ready := self.ready.get(target):
             ready.set()
         for mapping in (
@@ -622,10 +777,15 @@ class BrowserCDP:
             image = await self.send("Page.captureScreenshot", args, session)
             return {"data": image["data"], "media_type": "image/png"}
         if name in ("read_page", "find"):
+            depth = data.get("depth")
             nodes = (
                 await self.send(
                     "Accessibility.getFullAXTree",
-                    {"depth": int(number(data.get("depth") or 20, "depth", 50, integer=True))},
+                    {
+                        "depth": int(
+                            number(20 if depth is None else depth, "depth", 50, integer=True)
+                        )
+                    },
                     session,
                 )
             )["nodes"]
@@ -732,8 +892,10 @@ class BrowserCDP:
             finally:
                 try:
                     await self.send("Runtime.releaseObject", {"objectId": obj}, session)
-                except BrowserError:
-                    pass  # Detach/navigation may have already released the object.
+                except (BrowserError, asyncio.TimeoutError):
+                    # Detach/navigation may have already released the object, and
+                    # a slow release must not end the session or hide the result.
+                    pass
             return None
         if name in ("key", "hold_key"):
             pieces = data["text"].split()

@@ -134,8 +134,9 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
     """An isolated browser session; session_policy opts into bounded lease renewal.
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
-    not network isolation: configure guest egress controls for that. Popups,
-    workers and cross-process frames are unsupported. Uploads and downloads
+    not network isolation: configure guest egress controls for that.
+    Cross-site frames and dedicated workers run under the same policy; popups
+    and other targets are unsupported. Uploads and downloads
     require an explicit ``remote_file_policy``; uploads also require ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
     Closing disposes this context and revokes its grant, not the computer.
@@ -474,8 +475,9 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
     """An isolated browser session; session_policy opts into bounded lease renewal.
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
-    not network isolation: configure guest egress controls for that. Popups,
-    workers and cross-process frames are unsupported. Uploads and downloads
+    not network isolation: configure guest egress controls for that.
+    Cross-site frames and dedicated workers run under the same policy; popups
+    and other targets are unsupported. Uploads and downloads
     require an explicit ``remote_file_policy``; uploads also require ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
     Closing disposes this context and revokes its grant, not the computer.

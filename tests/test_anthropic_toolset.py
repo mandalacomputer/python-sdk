@@ -835,6 +835,28 @@ def test_the_package_imports_without_anthropic() -> None:
     assert "pip install 'mandala-computer[anthropic]'" in out
 
 
+def test_an_anthropic_without_the_browser_toolset_gets_the_same_refusal() -> None:
+    # An older anthropic that has the computer toolset but not the browser one
+    # is refused with the install hint, not a bare error from inside this package.
+    probe = (
+        "import sys, builtins\n"
+        "real = builtins.__import__\n"
+        "def guard(name, *a, **k):\n"
+        "    if name == 'anthropic.tools.browser':\n"
+        "        raise ModuleNotFoundError('blocked', name=name)\n"
+        "    return real(name, *a, **k)\n"
+        "builtins.__import__ = guard\n"
+        "try:\n"
+        "    import mandala_computer.anthropic\n"
+        "except ImportError as e:\n"
+        "    print('refused:', e)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    ).stdout
+    assert "refused: mandala_computer.anthropic needs the anthropic package" in out
+
+
 def test_the_readme_example_compiles_and_names_what_exists() -> None:
     from pathlib import Path
 
