@@ -46,6 +46,7 @@ from ._async_resources import (
     AsyncApiKeys,
     AsyncBuilds,
     AsyncComputers,
+    AsyncCredits,
     AsyncMoves,
     AsyncOperations,
     AsyncSecrets,
@@ -83,6 +84,7 @@ from ._exceptions import (
     FileExistsError,
     FileTooLargeError,
     GatewayTimeoutError,
+    InsufficientCreditsError,
     MandalaError,
     MethodNotAllowedError,
     ModelProviderError,
@@ -124,6 +126,10 @@ from ._models import (
     BuildStep,
     ComputerDeletion,
     ComputerUsage,
+    CreditEntry,
+    CreditGrant,
+    CreditLot,
+    CreditReport,
     DirectoryEntry,
     EgressProxy,
     EgressProxyArgs,
@@ -185,6 +191,7 @@ from ._resources import (
     ApiKeys,
     Builds,
     Computers,
+    Credits,
     Moves,
     Operations,
     Secrets,
@@ -253,6 +260,7 @@ __all__ = [
     "AsyncBackgroundCommand",
     "AsyncClient",
     "AsyncComputer",
+    "AsyncCredits",
     "AsyncEventStream",
     "AuthenticationError",
     "BackgroundCommand",
@@ -274,6 +282,11 @@ __all__ = [
     "ConnectionError",
     "ConnectionInterruptedError",
     "CreateOnlyConflictError",
+    "CreditEntry",
+    "CreditGrant",
+    "CreditLot",
+    "CreditReport",
+    "Credits",
     "DirectoryEntry",
     "EgressProxy",
     "EgressProxyArgs",
@@ -289,6 +302,7 @@ __all__ = [
     "GuestDirectory",
     "Hello",
     "InputContext",
+    "InsufficientCreditsError",
     "LifecycleAck",
     "Listing",
     "MandalaError",
@@ -405,6 +419,7 @@ class Client:
         self.account = Account(self._t)
         self.builds = Builds(self._t)
         self.computers = Computers(self._t)
+        self.credits = Credits(self._t)
         self.moves = Moves(self._t)
         self.operations = Operations(self._t)
         self.snapshots = Snapshots(self._t)
@@ -468,6 +483,7 @@ class AsyncClient:
         self.account = AsyncAccount(self._t)
         self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
+        self.credits = AsyncCredits(self._t)
         self.moves = AsyncMoves(self._t)
         self.operations = AsyncOperations(self._t)
         self.snapshots = AsyncSnapshots(self._t)

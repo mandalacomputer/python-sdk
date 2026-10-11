@@ -64,6 +64,7 @@ PAIRS = [
     (_resources.Builds, _async_resources.AsyncBuilds),
     (_resources.Sizes, _async_resources.AsyncSizes),
     (_resources.Usage, _async_resources.AsyncUsage),
+    (_resources.Credits, _async_resources.AsyncCredits),
     (_resources.Webhooks, _async_resources.AsyncWebhooks),
     (_resources.SshKeys, _async_resources.AsyncSshKeys),
     (_resources.Secrets, _async_resources.AsyncSecrets),

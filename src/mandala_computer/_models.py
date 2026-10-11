@@ -43,6 +43,10 @@ __all__ = [
     "BuildStep",
     "ComputerDeletion",
     "ComputerUsage",
+    "CreditEntry",
+    "CreditGrant",
+    "CreditLot",
+    "CreditReport",
     "DirectoryEntry",
     "EgressProxy",
     "EgressProxyArgs",
@@ -291,6 +295,18 @@ def _real(value: Any) -> float:
     except (OverflowError, TypeError, ValueError):
         return 0.0
     return number if math.isfinite(number) else 0.0
+
+
+def _opt_real(value: Any) -> float | None:
+    """:func:`_real` for a figure whose ABSENCE means something: ``None`` rather
+    than a zero that would claim a charge of nothing."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 class _Wire(Enum):
@@ -4040,6 +4056,14 @@ class Activity:
     #: The execution id the original request returned.
     execution_id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: On an agent run's summary: whether the run spent the account's Mandala
+    #: AI credits (``True``) or ran on the caller's own model key (``False``).
+    #: ``None`` on every other row.
+    funded: bool | None = field(default=None, kw_only=True)
+    #: On an agent run's summary: what it charged the account's AI credits, in
+    #: USD. ``0`` for a run on the caller's own key, whose model bill is the
+    #: provider's. ``None`` on every other row.
+    cost_usd: float | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Activity:
@@ -4064,6 +4088,8 @@ class Activity:
             exit_code=_opt_whole(d.get("exit_code")),
             execution_id=_opt_text(d.get("execution_id")),
             raw=dict(d),
+            funded=_opt_flag(d, "funded"),
+            cost_usd=_opt_real(d.get("cost_usd")),
         )
 
 
@@ -4551,6 +4577,222 @@ class WorkspaceMember:
             role=_text(d.get("role")),
             accepted_at=_text(d.get("accepted_at")),
             suspended=suspended,
+            raw=dict(d),
+        )
+
+
+# --- AI credits (GET credits) ------------------------------------------------
+
+
+def _ledger_int(d: Mapping[str, Any], key: str, where: str) -> int:
+    """A whole number off the credit ledger, or a refusal.
+
+    Strict, unlike the usage figures: every amount here is integer micros (one
+    USD is 1,000,000), and a balance this client cannot read is not one to
+    report as zero — a caller deciding whether to start a funded run would read
+    that as "nothing left" or, worse, an ``available_micros`` it could not parse
+    as "nothing owed".
+    """
+    value = d.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MandalaError(f"{where}: {key} is not a whole number")
+    return int.__index__(value)
+
+
+def _ledger_present(d: Mapping[str, Any], key: str, where: str) -> None:
+    """Every field of the ledger is required, the nullable ones included.
+
+    A missing ``next_before`` read as ``None`` would end a caller's walk of the
+    journal at the first page with no sign that older entries were skipped, and
+    a missing ``grant`` would read as an account with none. ``null`` is the
+    platform saying so; absence is a response this client cannot vouch for.
+    """
+    if key not in d:
+        raise MandalaError(f"{where}: no {key}")
+
+
+def _ledger_nullable_int(d: Mapping[str, Any], key: str, where: str) -> int | None:
+    _ledger_present(d, key, where)
+    if d[key] is None:
+        return None
+    return _ledger_int(d, key, where)
+
+
+def _ledger_nullable_text(d: Mapping[str, Any], key: str, where: str) -> str | None:
+    _ledger_present(d, key, where)
+    return _nullable_text(d, key, where)
+
+
+def _ledger_rows(d: Mapping[str, Any], key: str, where: str) -> builtins.list[Mapping[str, Any]]:
+    rows = d.get(key)
+    if not isinstance(rows, builtins.list) or not all(isinstance(r, Mapping) for r in rows):
+        raise MandalaError(f"{where}: {key} is not a list of objects")
+    return rows
+
+
+@dataclass(frozen=True)
+class CreditLot:
+    """One unexpired lot of AI credits with something left in it."""
+
+    #: Immutable lot id.
+    id: str
+    #: ``plan_grant``, ``admin_grant``, ``topup`` or ``adjust``. An open set:
+    #: show one this client does not know.
+    kind: str
+    #: What the lot was issued with, in micros (1,000,000 = $1).
+    amount_micros: int
+    #: What is left of it, before account debt and active reservations.
+    remaining_micros: int
+    #: When it expires (exclusive), RFC 3339 UTC.
+    expires_at: str
+    #: When it was issued, RFC 3339 UTC.
+    created_at: str
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "credit lot") -> CreditLot:
+        return cls(
+            id=_key_text(d, "id", where),
+            kind=_key_text(d, "kind", where),
+            amount_micros=_ledger_int(d, "amount_micros", where),
+            remaining_micros=_ledger_int(d, "remaining_micros", where),
+            expires_at=_key_text(d, "expires_at", where),
+            created_at=_key_text(d, "created_at", where),
+        )
+
+
+@dataclass(frozen=True)
+class CreditGrant:
+    """The plan's AI credit grant for the current period."""
+
+    #: The confirmed plan period's start, RFC 3339 UTC.
+    period_start: str
+    #: The exclusive end of the current grant period, RFC 3339 UTC.
+    period_end: str
+    #: What was actually issued this period, upgrade differences included. A
+    #: downgrade does not lower it.
+    granted_micros: int
+    #: Issued minus remaining: spending, debt settlement and removed credits —
+    #: not model usage alone.
+    used_micros: int
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "credit grant") -> CreditGrant:
+        return cls(
+            period_start=_key_text(d, "period_start", where),
+            period_end=_key_text(d, "period_end", where),
+            granted_micros=_ledger_int(d, "granted_micros", where),
+            used_micros=_ledger_int(d, "used_micros", where),
+        )
+
+
+@dataclass(frozen=True)
+class CreditEntry:
+    """One line of the AI credit journal, newest first."""
+
+    #: The journal sequence number. Pass the page's
+    #: :attr:`CreditReport.next_before`, not this, to read older entries.
+    id: int
+    #: The lot credited or expired; ``None`` for a debit that spans lots.
+    lot_id: str | None
+    #: ``credit``, ``debit``, ``expire``, ``clawback`` or ``debt_settle``. An
+    #: open set. The amount's DIRECTION depends on it, so do not sum entries
+    #: without reading this.
+    kind: str
+    #: Never negative: a ``credit`` adds a lot, a ``debit`` or ``clawback``
+    #: consumes credits (and may create debt), an ``expire`` removes a
+    #: remainder, and a ``debt_settle`` applies a new credit to existing debt.
+    amount_micros: int
+    #: The debt THIS entry created — not the account's running debt.
+    debt_micros: int
+    #: The billed model, on a debit.
+    model: str | None
+    #: The funded run that was charged, on a debit.
+    run_id: str | None
+    #: Which model call within that run, on a debit.
+    step: int | None
+    #: When it was recorded, RFC 3339 UTC.
+    created_at: str
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "credit entry") -> CreditEntry:
+        return cls(
+            id=_ledger_int(d, "id", where),
+            lot_id=_ledger_nullable_text(d, "lot_id", where),
+            kind=_key_text(d, "kind", where),
+            amount_micros=_ledger_int(d, "amount_micros", where),
+            debt_micros=_ledger_int(d, "debt_micros", where),
+            model=_ledger_nullable_text(d, "model", where),
+            run_id=_ledger_nullable_text(d, "run_id", where),
+            step=_ledger_nullable_int(d, "step", where),
+            created_at=_key_text(d, "created_at", where),
+        )
+
+
+@dataclass(frozen=True)
+class CreditReport:
+    """The account's AI credits: :meth:`mandala_computer.Credits.read`.
+
+    The balance, the lots it is made of, the plan's grant this period, and one
+    page of the journal. Every amount is integer micros — 1,000,000 is one
+    dollar — and already includes the platform's markup on model usage.
+
+    :attr:`available_micros` is the figure a funded agent run is admitted
+    against: the balance minus debt and the credits held for model calls in
+    flight. It can be negative, and is zero while :attr:`frozen`.
+    """
+
+    #: Unexpired, unspent lot remainders, summed.
+    balance_micros: int
+    #: Balance minus debt and held credits. May be negative; zero while frozen.
+    #: Not a promise that a funded run will be admitted.
+    available_micros: int
+    #: Reserved for model calls in progress.
+    held_micros: int
+    #: Outstanding debt, settled first out of future credit.
+    debt_micros: int
+    #: ``True`` when the account has no recognised plan or is suspended. Its
+    #: credits are kept, but they still expire, and none can be spent.
+    frozen: bool
+    #: The plan's grant this period, or ``None`` when there is none.
+    grant: CreditGrant | None
+    #: Unexpired lots with something left, earliest expiry first. Spent and
+    #: expired lots are only in the journal.
+    lots: builtins.list[CreditLot]
+    #: This page of the journal, newest first.
+    entries: builtins.list[CreditEntry]
+    #: Pass as ``before=`` for the next, older page; ``None`` on the last one.
+    #: The balances and lots are current on every page.
+    next_before: int | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "GET credits") -> CreditReport:
+        """Strict: an amount, a flag or a list this cannot read is refused
+        rather than reported as nothing."""
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: not an object")
+        frozen = d.get("frozen")
+        if not isinstance(frozen, bool):
+            raise MandalaError(f"{where}: frozen is not true or false")
+        _ledger_present(d, "grant", where)
+        grant = d["grant"]
+        if grant is not None and not isinstance(grant, Mapping):
+            raise MandalaError(f"{where}: grant is neither an object nor null")
+        next_before = _ledger_nullable_int(d, "next_before", where)
+        if next_before is not None and next_before < 1:
+            raise MandalaError(f"{where}: next_before is not a journal position")
+        return cls(
+            balance_micros=_ledger_int(d, "balance_micros", where),
+            available_micros=_ledger_int(d, "available_micros", where),
+            held_micros=_ledger_int(d, "held_micros", where),
+            debt_micros=_ledger_int(d, "debt_micros", where),
+            frozen=frozen,
+            grant=None if grant is None else CreditGrant.from_api(grant, f"{where} grant"),
+            lots=[CreditLot.from_api(r, f"{where} lot") for r in _ledger_rows(d, "lots", where)],
+            entries=[
+                CreditEntry.from_api(r, f"{where} entry") for r in _ledger_rows(d, "entries", where)
+            ],
+            next_before=next_before,
             raw=dict(d),
         )
 

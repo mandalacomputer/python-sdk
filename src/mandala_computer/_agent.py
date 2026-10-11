@@ -4,12 +4,15 @@
 interleaved with calls to a model API, running for minutes. So it answers with a
 stream of steps rather than a result, and this file is the shape of that stream.
 
-It runs on **your** Anthropic key, which the platform never stores: pass it as
-``model_key`` and it travels on that one request as ``X-Model-Key``. A step is
+It runs on **your** Anthropic or OpenAI key, which the platform never stores:
+pass it as ``model_key`` and it travels on that one request as ``X-Model-Key``.
+Leave ``model_key`` out and an eligible account's run is FUNDED instead: it
+spends the account's Mandala AI credits, every step reports what the run has
+cost so far, and ``max_cost_usd`` caps what it may start spending. A step is
 one ACTION on the desktop rather than one exchange with the model — several can
 come out of a single reply, a paused turn costs tokens and no step, and a
 ``bash`` call takes no screenshot — so ``max_steps`` bounds the loop and bounds
-what that key is billed only loosely.
+what it costs only loosely.
 
 Everything here is built by :func:`to_agent_event` out of whatever a frame
 carried, and never by asserting a shape. A frame this SDK does not model is
@@ -24,6 +27,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from ._exceptions import top_up_link
 
 __all__ = [
     "AgentDone",
@@ -63,6 +68,23 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _usd(value: Any) -> float | None:
+    """A dollar figure off the wire, or ``None`` where there is none to read.
+
+    ``None`` rather than :func:`_num`'s zero, because absence is the answer
+    here: a run on your own key carries no charge figures at all, and a zero
+    would claim it cost nothing on credits it never touched. A boolean is not a
+    figure (``float(True)`` is ``1.0``), and neither is NaN or an infinity.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        n = float(value)
+    except OverflowError:
+        return None
+    return n if math.isfinite(n) else None
+
+
 @dataclass(frozen=True)
 class AgentStep:
     """One action the loop took."""
@@ -79,6 +101,16 @@ class AgentStep:
     #: so this is a step that did not work rather than a run that failed.
     error: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: What the funded run has been charged so far, in USD, cumulative — NOT
+    #: this step's own cost. Several actions out of one model reply repeat the
+    #: same total, so never sum these. ``None`` on a run with your own
+    #: ``model_key``, whose bill is the provider's.
+    cost_usd: float | None = field(default=None, kw_only=True)
+    #: The account's available AI credits in USD after the model call behind
+    #: this step. May be negative after an overrun. ``None`` on a run with your
+    #: own key, and on a funded step where the platform could not read the
+    #: balance back.
+    credits_remaining_usd: float | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Any, fallback_n: int) -> AgentStep:
@@ -99,12 +131,17 @@ class AgentStep:
             detail=_text(r.get("detail")),
             error=_text(r.get("error")),
             raw=dict(r),
+            cost_usd=_usd(r.get("cost_usd")),
+            credits_remaining_usd=_usd(r.get("credits_remaining_usd")),
         )
 
 
 @dataclass(frozen=True)
 class AgentUsage:
-    """What a run cost on your key.
+    """The tokens a run used.
+
+    On your own ``model_key`` this is what the provider bills you for; a funded
+    run's charge in dollars is :attr:`AgentResult.cost_usd` instead.
 
     :attr:`input_tokens` includes the two cache halves, which are most of a long
     run — the rolling breakpoint means step ten's prompt is almost entirely
@@ -149,6 +186,12 @@ class AgentResult:
     #: carry them, because each one already arrived as an :class:`AgentStepEvent`.
     #: Keyword-only, so it changes no existing construction.
     steps_taken: tuple[AgentStep, ...] = field(default=(), kw_only=True)
+    #: What a funded run was charged in all, in USD, already including the
+    #: platform's markup. ``None`` on a run with your own ``model_key``, which
+    #: spends no Mandala AI credits. It can exceed the ``max_cost_usd`` you
+    #: set: the cap stops the run from STARTING another model call, and the
+    #: last one is charged in full.
+    cost_usd: float | None = field(default=None, kw_only=True)
 
     @property
     def finished(self) -> bool:
@@ -174,6 +217,7 @@ class AgentResult:
                 AgentStep.from_api(step, i + 1)
                 for i, step in enumerate(taken if isinstance(taken, list) else ())
             ),
+            cost_usd=_usd(r.get("cost_usd")),
         )
 
 
@@ -228,6 +272,14 @@ class AgentFailed:
     steps: tuple[AgentStep, ...] = ()
     #: The complete received error frame, including reason and request_id.
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: What a funded run had been charged when it failed, in USD. ``None`` on a
+    #: run with your own ``model_key``.
+    cost_usd: float | None = field(default=None, kw_only=True)
+    #: Where to add AI credits, as an absolute ``http(s)`` link — present when
+    #: a funded run was refused for want of them (status 402). The platform
+    #: sends the billing page's path, which is resolved against the client's
+    #: base URL; the value as sent is in :attr:`raw`.
+    top_up_url: str | None = field(default=None, kw_only=True)
 
 
 #: One event out of :meth:`~mandala_computer.Computer.agent_stream`. Match on it
@@ -236,8 +288,13 @@ class AgentFailed:
 AgentEvent = AgentStepEvent | AgentText | AgentDone | AgentFailed
 
 
-def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
-    """One frame as an event, or ``None`` for a frame this SDK does not model."""
+def to_agent_event(
+    event: str, data: Any, step_count: int, *, base_url: str | None = None
+) -> AgentEvent | None:
+    """One frame as an event, or ``None`` for a frame this SDK does not model.
+
+    ``base_url`` is the client's, which a failure's ``top_up_url`` path is
+    resolved against."""
     if event == "step":
         return AgentStepEvent(AgentStep.from_api(data, step_count + 1))
     if event == "text":
@@ -277,5 +334,7 @@ def to_agent_event(event: str, data: Any, step_count: int) -> AgentEvent | None:
             AgentUsage.from_api(r.get("usage")),
             tuple(AgentStep.from_api(step, i + 1) for i, step in enumerate(taken)),
             raw=r,
+            cost_usd=_usd(r.get("cost_usd")),
+            top_up_url=top_up_link(r.get("top_up_url"), base_url),
         )
     return None

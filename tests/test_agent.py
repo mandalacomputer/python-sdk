@@ -287,11 +287,16 @@ def test_what_was_not_asked_for_is_not_sent(computer: mc.Computer) -> None:
 # --- what is refused before it is sent ------------------------------------
 
 
-def test_a_run_without_a_model_key_is_refused_here(computer: mc.Computer) -> None:
-    """Not sent to be 401'd. On this route a 401 reads as "your Mandala key is
-    wrong", which is the one thing it does not mean."""
-    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
-        computer.agent("do the thing", model_key="")
+@respx.mock
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_model_key_is_refused_here(computer: mc.Computer, blank: str) -> None:
+    """Not sent, and not dropped either. The platform refuses a blank header,
+    and dropping it instead would turn an empty ``.env`` entry into a run on
+    the account's AI credits that nobody chose to spend."""
+    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key") as error:
+        computer.agent("do the thing", model_key=blank)
+    assert "leave model_key out" in str(error.value)
+    assert not respx.calls
 
 
 def test_a_non_string_model_key_is_a_value_error(computer: mc.Computer) -> None:
@@ -301,12 +306,16 @@ def test_a_non_string_model_key_is_a_value_error(computer: mc.Computer) -> None:
         computer.agent("do the thing", model_key=1)  # type: ignore[arg-type]
 
 
-def test_a_missing_model_key_keeps_the_message_written_for_it(computer: mc.Computer) -> None:
-    """``None`` is the case that actually happens -- ``os.environ.get`` on an
-    unset variable -- and "must be a string" is not an answer to it. It stays a
-    MandalaError carrying the sentence about who is billed."""
-    with pytest.raises(mc.MandalaError, match="your own Anthropic or OpenAI API key"):
-        computer.agent("do the thing", model_key=None)  # type: ignore[arg-type]
+@respx.mock
+def test_a_run_without_a_model_key_is_funded_and_sends_no_header(computer: mc.Computer) -> None:
+    """``None`` — the default — is a funded run (OPL-5866): no ``X-Model-Key``
+    at all, so the platform runs it on the account's AI credits."""
+    route = respx.post(AGENT).mock(stream(DONE_FRAME))
+    computer.agent("do the thing")
+    computer.agent("do the thing", model_key=None)
+    for call in route.calls:
+        assert MODEL_KEY_HEADER not in call.request.headers
+    assert json_body(route) == {"prompt": "do the thing", "stream": True}
 
 
 class _OtherKey(str):
@@ -784,19 +793,36 @@ def test_a_relayed_model_429_after_steps_in_a_200_body_is_not_transient(
 
 
 @respx.mock
-@pytest.mark.parametrize(
-    "body",
-    [{"error": "rate limited"}, {"error": "rate limited", "steps_taken": [{"n": 1}]}],
-    ids=["bare", "with-steps"],
-)
-def test_the_platforms_own_429_on_agent_once_stays_transient(
-    computer: mc.Computer, body: dict[str, Any]
-) -> None:
-    """No prefix: the platform's own budget, whose answer is unchanged."""
-    respx.post(AGENT).mock(httpx.Response(429, json=body, headers=BUDGET_HEADERS))
+def test_the_platforms_own_429_on_agent_once_stays_transient(computer: mc.Computer) -> None:
+    """No prefix and no steps: the platform's own budget, refused before the
+    run began, whose answer is unchanged — budget fields included."""
+    respx.post(AGENT).mock(
+        httpx.Response(429, json={"error": "rate limited"}, headers=BUDGET_HEADERS)
+    )
     with pytest.raises(mc.RateLimitError) as raised:
         computer.agent_once("do the thing", model_key=KEY)
     assert mc.is_transient(raised.value) is True
+    assert raised.value.limit is not None
+
+
+@respx.mock
+def test_any_429_on_agent_once_after_steps_is_not_transient(computer: mc.Computer) -> None:
+    """Without the prefix too (OPL-5866). The platform's own budget refusal
+    comes before any step, so a 429 listing steps ended a run that had already
+    acted — a funded run's provider failure reads exactly like this — and
+    sending the prompt again would repeat those steps. Its budget fields are
+    left as they were; only the replay answer changes."""
+    respx.post(AGENT).mock(
+        httpx.Response(
+            429,
+            json={"error": "rate limited", "steps_taken": [{"n": 1}]},
+            headers=BUDGET_HEADERS,
+        )
+    )
+    with pytest.raises(mc.RateLimitError) as raised:
+        computer.agent_once("do the thing", model_key=KEY)
+    assert mc.is_transient(raised.value) is False
+    assert raised.value.limit is not None
 
 
 @respx.mock
@@ -834,16 +860,17 @@ def test_a_429_mid_stream_before_any_step_stays_transient(computer: mc.Computer,
 
 
 @respx.mock
-def test_the_platforms_own_429_mid_stream_after_a_step_is_unchanged(
+def test_an_unprefixed_429_mid_stream_after_a_step_is_not_transient_either(
     computer: mc.Computer,
 ) -> None:
-    """Only the relayed 429 is marked; the platform's own keeps its answer."""
+    """A 429 on the stream after a step ended a run that had acted, whatever
+    its wording (OPL-5866: a funded run's provider failure has no prefix)."""
     respx.post(AGENT).mock(
         stream(STEP_FRAME, frame("error", '{"error": "slow down", "status": 429}'))
     )
     with pytest.raises(mc.RateLimitError) as raised:
         computer.agent("do the thing", model_key=KEY)
-    assert mc.is_transient(raised.value) is True
+    assert mc.is_transient(raised.value) is False
 
 
 @respx.mock
@@ -1238,6 +1265,9 @@ async def test_explicitly_closing_an_async_agent_stream_awaits_transport_cleanup
             self.closed = True
 
     class FakeTransport:
+        # What a run's failure resolves a top-up link against.
+        base_url = BASE
+
         def __init__(self) -> None:
             self.frames = Frames()
 

@@ -56,6 +56,17 @@ MOVES = "moves"
 USAGE = "usage"
 #: Instantaneous account-wide quota, including for workspace-scoped keys.
 ACCOUNT = "account"
+#: The account's AI credit ledger: balance, live lots, the plan's grant and a
+#: page of journal entries. Account-wide, so a key confined to a workspace is
+#: refused with 403.
+CREDITS = "credits"
+#: The most journal entries one ``GET credits`` page holds, and how many it
+#: holds when ``limit`` is left out.
+CREDIT_PAGE_MAX = 100
+CREDIT_PAGE_DEFAULT = 50
+#: The largest ``before`` the platform accepts: JavaScript's safe-integer
+#: ceiling, because the journal's ids are numbers on the other side.
+CREDIT_CURSOR_MAX = 9007199254740991
 #: How long automatic snapshots are kept — the plan's retention window.
 #:
 #: Account-scoped like :data:`USAGE` and :data:`MOVES`, and answered by the
@@ -2315,6 +2326,10 @@ def screenshot_region(region: Sequence[int]) -> str:
 #: the work and not the bill, and the README says so where a caller sizing a run
 #: will read it.
 MAX_STEPS = 100
+#: The range a funded run's ``max_cost_usd`` must fall in, in dollars. The
+#: platform's default, when it is left out, is $2.
+MIN_MAX_COST_USD = 0.25
+MAX_MAX_COST_USD = 20
 
 
 def agent_body(
@@ -2325,6 +2340,7 @@ def agent_body(
     max_steps: int | None = None,
     model: str | None = None,
     provider: str | None = None,
+    max_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     """One agent run's request.
 
@@ -2340,6 +2356,11 @@ def agent_body(
     at the near end of the range: a whole number, at least 1, and no more than
     :data:`MAX_STEPS`. A ``2.5`` or a ``10000`` that got through here would come
     back as the 400 this function exists to save the caller.
+
+    ``max_cost_usd`` is a funded run's spending cap, checked against the range
+    the platform accepts (:data:`MIN_MAX_COST_USD` to :data:`MAX_MAX_COST_USD`
+    dollars) for the same reason. It is sent whenever it is given: a run on the
+    caller's own key ignores it, which is the platform's rule to apply.
     """
     prompt = canonical(prompt, "prompt")
     if not prompt.strip():
@@ -2354,12 +2375,20 @@ def agent_body(
             raise ValueError(f"max_steps may not exceed {MAX_STEPS}")
     if provider is not None and provider not in ("anthropic", "openai"):
         raise ValueError("provider must be anthropic or openai")
+    if max_cost_usd is not None:
+        max_cost_usd = real(max_cost_usd, "max_cost_usd")
+        if not MIN_MAX_COST_USD <= max_cost_usd <= MAX_MAX_COST_USD:
+            raise ValueError(
+                f"max_cost_usd must be between {MIN_MAX_COST_USD} and {MAX_MAX_COST_USD} dollars, "
+                f"not {max_cost_usd}"
+            )
     body: dict[str, Any] = {"prompt": prompt, "stream": stream}
     for key, value in (
         ("system", system),
         ("max_steps", max_steps),
         ("model", model),
         ("provider", provider),
+        ("max_cost_usd", max_cost_usd),
     ):
         if value is not None:
             body[key] = value
@@ -2604,6 +2633,31 @@ def idempotency_headers(key: object = None) -> dict[str, str]:
     different call (the start a launch makes after its create) gets its own.
     """
     return {IDEMPOTENCY_KEY_HEADER: uuid.uuid4().hex if key is None else idempotency_key(key)}
+
+
+def credits_params(before: object, limit: object) -> dict[str, str] | None:
+    """``GET credits``: an older-entries cursor and a page size, each only when given.
+
+    Both are checked the way the platform checks them, since it refuses any
+    other value with 400: ``before`` is a whole number from 1 to
+    :data:`CREDIT_CURSOR_MAX` (a page's ``next_before``), and ``limit`` from 1
+    to :data:`CREDIT_PAGE_MAX`.
+    """
+    params: dict[str, str] = {}
+    if before is not None:
+        cursor = whole(before, "before", exc=ValueError)
+        if not 1 <= cursor <= CREDIT_CURSOR_MAX:
+            raise ValueError(
+                f"before must be the next_before of the page before, a whole number from 1 "
+                f"to {CREDIT_CURSOR_MAX}, not {cursor}"
+            )
+        params["before"] = str(cursor)
+    if limit is not None:
+        number = whole(limit, "limit", exc=ValueError)
+        if not 1 <= number <= CREDIT_PAGE_MAX:
+            raise ValueError(f"limit must be between 1 and {CREDIT_PAGE_MAX}, not {number}")
+        params["limit"] = str(number)
+    return params or None
 
 
 def operations_params(

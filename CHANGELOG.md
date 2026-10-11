@@ -9,6 +9,60 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Run the agent on your account's AI credits**, sync and async. Leave
+  `model_key` out of `agent()`, `agent_once()` or `agent_stream()` and the run
+  is funded: no `X-Model-Key` is sent, and an eligible account's Mandala AI
+  credits pay for the model (Anthropic only, `claude-sonnet-5-5` by default).
+  `max_cost_usd=` (0.25 to 20 dollars, checked before sending) caps what the
+  run may start spending; it ends with `stop == "max_cost"` at the cap and
+  `"credits_exhausted"` when the credits run out part way. `AgentStep` has
+  `cost_usd` (the run's total so far) and `credits_remaining_usd`;
+  `AgentResult` and `AgentFailed` have `cost_usd`, and `AgentFailed` has
+  `top_up_url`. All are `None` on a run with your own key.
+
+- **`InsufficientCreditsError`**: the 402 a funded run gets when the account's
+  credits cannot cover its first model call. Its `top_up_url` is the billing
+  page as an absolute link, resolved against the client's base URL (and so is
+  `AgentFailed.top_up_url`). Raised by all three agent entry points, sync and
+  async; not a `PlanLimitError`, and `is_transient()` answers `False`.
+
+- **`client.credits.read(before=, limit=)`**, sync and async: the account's AI
+  credit ledger as `CreditReport` — balance, available, held and debt in
+  micros, `frozen`, the plan's `CreditGrant`, live `CreditLot`s and a page of
+  `CreditEntry` journal lines with `next_before` for the next page. Strictly
+  decoded.
+
+- `Activity` has `funded` and `cost_usd` on an agent run's summary.
+
+### Changed
+
+- **`model_key` is optional on the agent methods.** Leaving it out (or passing
+  `None`) used to raise `MandalaError`; it now starts a funded run on the
+  account's AI credits, where the account is eligible. A blank key is still
+  refused before anything is sent, and so is leaving it out when your own
+  `http_client` sends `X-Model-Key` by default.
+
+### Fixed
+
+- A 402 answered before an agent stream opened was raised as
+  `PlanLimitError`. It is `InsufficientCreditsError` when it carries `top_up_url`
+  and `ModelProviderError` otherwise, the same as a 402 reported on the
+  stream or by `agent_once()`.
+
+- `is_transient()` answers `False` for any 429 that ends an agent run after it
+  has taken steps, not only one carrying the `model API: ` prefix. A funded
+  run reports its model provider's failures without that prefix, so a funded
+  run that had already acted was called safe to send again.
+
+- A funded run's model provider failure, which the platform reports with the
+  provider's status and its own fixed sentence instead of the `model API: `
+  prefix, no longer blames something it is not: a 401, 402, 403, 404 or 413
+  said that way is a plain `APIError` rather than `AuthenticationError`,
+  `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
+  `ModelProviderError`, and a 429 carries no Mandala budget fields.
+
 ## [0.11.0] — 2026-10-08
 
 ### Added
