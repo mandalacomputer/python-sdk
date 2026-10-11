@@ -135,8 +135,8 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that.
-    Cross-site frames run under the same policy; dedicated workers are held
-    paused and never run; popups and other targets are unsupported. Uploads and
+    Cross-site frames run under the same policy; dedicated workers cannot be
+    started; popups and other targets are unsupported. Uploads and
     downloads require an explicit ``remote_file_policy``; uploads also require
     ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.
@@ -474,8 +474,8 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that.
-    Cross-site frames run under the same policy; dedicated workers are held
-    paused and never run; popups and other targets are unsupported. Uploads and
+    Cross-site frames run under the same policy; dedicated workers cannot be
+    started; popups and other targets are unsupported. Uploads and
     downloads require an explicit ``remote_file_policy``; uploads also require
     ``confirm``.
     JavaScript execution is off by default; enabling it requires ``confirm``.

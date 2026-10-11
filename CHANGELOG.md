@@ -118,16 +118,34 @@ This is the summary you read to decide whether to upgrade.
   `PermissionDeniedError`, `NotFoundError`, `FileTooLargeError` or
   `ModelProviderError`, and a 429 carries no Mandala budget fields.
 
+- **Pages in the browser toolsets cannot start dedicated workers.** In every
+  frame the driver attaches to before it runs, cross-site and `about:blank`
+  frames included, constructing a `Worker` throws a `SecurityError` before the
+  page's own scripts run, for script, `blob:` and `data:` URLs alike, and the
+  page carries on without it. A frame that starts running before the driver
+  can attach, as Chromium starts a sandboxed `srcdoc` frame, is not covered.
+  A worker could not be run under `url_policy`: Chromium fetches the script of
+  a worker started by another worker outside any interception, and a worker
+  held paused is released, unpoliced, when its page closes or navigates
+  (OPL-5909).
+
+- **Downloads keep the right frame in the browser toolsets.** Download
+  ownership follows each frame's parent and the session that reported it, as
+  in the TypeScript SDK: a frame's new document or removal forgets the frames
+  below it, frames are tracked only beneath tracked frames, a frame tree read
+  never undoes a newer frame event, and a document back from the
+  back/forward cache has its frames read again, its downloads waiting for
+  that briefly. Frames left behind no longer fill the 256-frame table, so
+  later downloads are no longer canceled for want of room.
+
 - **A cross-site frame no longer closes its browser tab.** Under site
   isolation a frame from another site is its own browser target, and the
   browser toolsets closed it as they close a popup, which closed the whole tab:
   `navigate` reported success and the next action found the tab gone. Such
   frames, and the frames inside them, now run inside their tab, and their
-  requests meet the same `url_policy`. A page that starts a dedicated worker
-  no longer ends the session either: the worker is held paused and does not
-  run while its page lives, since a worker can fetch another worker's script
-  beyond any policy check. Popups and other targets are still refused
-  (OPL-5900).
+  requests meet the same `url_policy`. A page that tries to start a dedicated
+  worker no longer ends the session either (see the entry on workers). Popups
+  and other targets are still refused (OPL-5900).
 
 - **Browser connections work on Python 3.10.** The platform's timestamps carry
   up to nine fractional digits, which 3.10's `datetime.fromisoformat` rejects,

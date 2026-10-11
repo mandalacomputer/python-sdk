@@ -47,12 +47,23 @@ _TARGET_EVENT_LIMIT = 1024
 # A caller's URL policy runs on threads of the session's own, never the default
 # executor that renewal and the sync computer's calls use. Navigation checks
 # have threads of their own, which held subresource checks cannot occupy.
+# A document back from the back/forward cache brings its frames back without
+# reporting them; until its frame tree is read again, a download from a frame
+# not yet tracked waits at most this long, and at most this many frames
+# reported beneath a frame not yet tracked wait for it.
+_RESTORE_WAIT = 5.0
+_RESTORE_ORPHANS = 256
 _POLICY_THREADS = 32
 _NAVIGATION_THREADS = 4
 #: How long one URL policy check may take, waiting for a thread included.
 _POLICY_DEADLINE = 5.0
 _NAVIGATION_CHECK: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mandala_navigation_check", default=False
+)
+# Set around a command whose reply must be applied as it arrives, in order with
+# the events read before and after it, rather than when its caller resumes.
+_ON_REPLY: contextvars.ContextVar[Callable[[Any], None] | None] = contextvars.ContextVar(
+    "mandala_on_reply", default=None
 )
 _FLOODED = (
     "The page produced browser events faster than the session could handle them. "
@@ -84,8 +95,33 @@ _INTERCEPT = {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
 # and paused until released. Chromium intercepts its subresource requests on
 # the frame's own session, so it gets the page's interception before it runs,
 # and reports its own frames there, so that their downloads are tracked.
+# Dedicated workers never start. Chromium can neither close one nor intercept
+# all of a running one's requests (the script of a worker that a worker starts
+# is fetched with no session's interception, and a held worker is released as
+# its page goes), so in every frame of an owned tab that the driver attaches
+# to before it runs, Worker is a constructor that refuses. A frame that starts
+# running without waiting for the driver (a sandboxed srcdoc frame) runs its
+# first scripts before its session can register this, so it can keep the
+# original constructor for later, as it makes its first requests before its
+# interception is on; that, like WebSockets, is the guest's egress controls'.
+_NO_WORKERS = """(() => {
+  const refuse = function Worker() {
+    throw new DOMException(
+      "Dedicated workers are disabled in this browser session.",
+      "SecurityError"
+    );
+  };
+  Object.defineProperty(globalThis, "Worker", {
+    value: refuse, writable: false, configurable: false, enumerable: false
+  });
+})();"""
+_NO_WORKERS_INIT = (
+    "Page.addScriptToEvaluateOnNewDocument",
+    {"source": _NO_WORKERS, "runImmediately": True},
+)
 _FRAME_INIT: tuple[tuple[str, dict[str, Any]], ...] = (
     ("Page.enable", {}),
+    _NO_WORKERS_INIT,
     ("Network.enable", {}),
     ("Network.setBypassServiceWorker", {"bypass": True}),
     ("Fetch.enable", _INTERCEPT),
@@ -243,19 +279,35 @@ class BrowserCDP:
         self.terminal_reason: str | None = None
         self.ws: Any = None
         self.reader: asyncio.Task[None] | None = None
-        self.tasks: set[asyncio.Task[None]] = set()
+        self.tasks: set[asyncio.Task[Any]] = set()
         self.policy_lane = _Lane(_POLICY_CONCURRENCY)
         self.navigation_lane = _Lane(_NAVIGATION_CONCURRENCY)
         self.queued = 0
         self.queued_bytes = 0
         self.pending: dict[int, asyncio.Future[Any]] = {}
         self.pending_sessions: dict[int, str] = {}
+        self.reply_hooks: dict[int, Callable[[Any], None]] = {}
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
-        # Frame -> the cross-site frame session that reported it, so that the
-        # frames inside a cross-site frame go when its session does.
-        self.frame_reporters: dict[str, str] = {}
+        # Download ownership, as the file session keeps it, is decided here:
+        # tracked frame -> the session that last reported it (a session that
+        # goes takes the frames only it could see), and -> its parent frame.
+        self.frame_source: dict[str, str] = {}
+        self.frame_parent: dict[str, str] = {}
+        # For each frame tree on its way: the frames events have reported since.
+        self.snapshots: list[set[str]] = []
+        # Cache restores whose frame tree is on its way, and the frames reported
+        # meanwhile beneath a frame not tracked yet: frame -> (tab, session, parent).
+        self.restoring: set[asyncio.Task[None]] = set()
+        self.orphans: dict[str, tuple[str, str, str]] = {}
+        # Download GUID -> the task handling its latest event. A download's
+        # events are handled in arrival order, one at a time: its progress must
+        # not overtake its beginning while that waits on a restore.
+        self.download_events: dict[str, asyncio.Task[Any]] = {}
+        # Frame -> downloads waiting on a restore to learn whether it is the
+        # tab's. Settled as soon as it is: a later removal does not unsettle it.
+        self.awaiting_frames: dict[str, list[asyncio.Future[bool]]] = {}
         self._pools: dict[bool, tuple[ThreadPoolExecutor, asyncio.Semaphore]] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
@@ -472,12 +524,16 @@ class BrowserCDP:
         if session:
             message["sessionId"] = session
             self.pending_sessions[ident] = session
+        hook = _ON_REPLY.get()
+        if hook is not None:
+            self.reply_hooks[ident] = hook
         try:
             await self.ws.send(json.dumps(message))
             return await asyncio.wait_for(future, 15)
         finally:
             self.pending.pop(ident, None)
             self.pending_sessions.pop(ident, None)
+            self.reply_hooks.pop(ident, None)
 
     async def _read(self) -> None:
         try:
@@ -498,7 +554,14 @@ class BrowserCDP:
                                 kind("Chromium could not complete the browser action.")
                             )
                         else:
-                            future.set_result(message.get("result", {}))
+                            result = message.get("result", {})
+                            hook = self.reply_hooks.pop(message["id"], None)
+                            if hook is not None:
+                                try:
+                                    hook(result)
+                                except Exception:  # noqa: BLE001, S110 - its caller fails closed
+                                    pass
+                            future.set_result(result)
                 else:
                     self._dispatch(message)
         except Exception:  # noqa: BLE001, S110 - fail closed without exposing browser-supplied errors
@@ -559,9 +622,22 @@ class BrowserCDP:
             if method == "Browser.downloadWillBegin" and self.files is not None:
                 # Whose download it is is decided as it arrives, in order with
                 # the frame notes: a frame that goes while it waits its turn
-                # must not orphan it.
+                # must not orphan it. While a cache restore is reading its
+                # frames back, a frame not tracked yet waits for it, briefly.
                 frame = trimmed["params"].get("frameId")
-                trimmed["params"]["tracked"] = frame in self.files.frames
+                if frame in self.files.frames:
+                    trimmed["params"]["tracked"] = True
+                elif self.restoring and isinstance(frame, str):
+                    # Waiting from now, before any later event is noted: its
+                    # frame may be tracked, and removed, in this same read.
+                    owned: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+                    self.awaiting_frames.setdefault(frame, []).append(owned)
+                    decision = asyncio.create_task(self._decide(frame, owned))
+                    self.tasks.add(decision)
+                    decision.add_done_callback(self.tasks.discard)
+                    trimmed["decision"] = decision
+                else:
+                    trimmed["params"]["tracked"] = False
             session = message.get("sessionId")
             tab = self._owner(session)
             own_document = (
@@ -591,7 +667,7 @@ class BrowserCDP:
         if not lane.waiting and len(lane.running) < lane.limit:
             self._run_in(lane, message)
             return
-        size = len(json.dumps(message))
+        size = len(json.dumps(message, default=lambda _: None))
         if self.queued >= _EVENT_QUEUE_LIMIT or self.queued_bytes + size > _EVENT_QUEUE_BYTES:
             raise self._flooded()
         lane.waiting.append((message, size))
@@ -625,22 +701,36 @@ class BrowserCDP:
         if not tab:
             return
         try:
+            if self.files is not None and method.startswith("Page.frame"):
+                frame = p.get("frameId") or (p.get("frame") or {}).get("id")
+                if isinstance(frame, str):
+                    for touched in self.snapshots:
+                        touched.add(frame)  # Newer than any frame tree on its way.
             if self.files is not None and method == "Page.frameAttached":
-                self._track(p["frameId"], tab, session)
+                self._track(p["frameId"], tab, session, p.get("parentFrameId"))
             if (
                 self.files is not None
                 and method == "Page.frameDetached"
                 and p.get("reason") != "swap"  # It lives on in another process.
             ):
-                self.files.frames.pop(p["frameId"], None)
-                self.frame_reporters.pop(p["frameId"], None)
+                self._prune_below(p["frameId"])
+                self._untrack(p["frameId"])
             if method == "Page.frameNavigated":
                 if session not in self.child_frames:
                     # The tab's own document changed. A cross-site frame's
                     # navigation leaves the tab's element refs as they were.
                     self.refs.pop(tab, None)
                 if self.files is not None:
-                    self._track(p["frame"]["id"], tab, session)
+                    frame = p["frame"]
+                    # A new document: the old one's frames are gone, and
+                    # Chromium need not report each of them (a cross-site frame
+                    # keeps its session across sites, but not its children).
+                    self._prune_below(frame["id"])
+                    self._track(frame["id"], tab, session, frame.get("parentId"))
+                    # A document back from the back/forward cache brings its
+                    # frames back, and Chromium reports none of them.
+                    if p.get("type") == "BackForwardCacheRestore" and session is not None:
+                        self._restore(session, tab)
             elif method == "Runtime.consoleAPICalled":
                 text = " ".join(
                     str(a.get("value", a.get("description", "")))[:1000]
@@ -658,21 +748,181 @@ class BrowserCDP:
             if method == "Page.frameNavigated" and session not in self.child_frames:
                 self.refs.pop(tab, None)
 
-    def _track(self, frame: str, tab: str, session: str | None) -> bool:
-        """Make a frame's downloads its tab's, remembering who reported it."""
-        assert self.files is not None
-        if not self.files.frame(frame, tab):
+    def _track(self, frame: Any, tab: str, session: str | None, parent: Any = None) -> bool:
+        """Make a frame's downloads its tab's, beneath a tracked frame only.
+
+        So every tracked frame stays reachable from the frames above it when
+        they change documents. A frame reported while a cache restore is
+        reading its parent back waits for it, a bounded number of them.
+        """
+        files = self.files
+        assert files is not None
+        if not isinstance(frame, str) or session is None:
             return False
-        if session in self.child_frames:
-            self.frame_reporters[frame] = session
-        else:
-            self.frame_reporters.pop(frame, None)
+        if isinstance(parent, str) and parent not in files.frames:
+            if self.restoring and (frame in self.orphans or len(self.orphans) < _RESTORE_ORPHANS):
+                self.orphans[frame] = (tab, session, parent)
+            return False
+        if not files.frame(frame, tab):
+            return False
+        self.frame_source[frame] = session
+        if isinstance(parent, str):
+            self.frame_parent[frame] = parent
+        for owned in self.awaiting_frames.pop(frame, []):
+            if not owned.done():
+                owned.set_result(True)
         return True
 
-    def _track_tree(self, tree: dict[str, Any], tab: str, session: str) -> None:
-        if self._track(tree["frame"]["id"], tab, session):
-            for child in tree.get("childFrames", []):
-                self._track_tree(child, tab, session)
+    def _track_tree(
+        self,
+        tree: dict[str, Any],
+        tab: str,
+        session: str,
+        skip: set[str],
+        parent: str | None = None,
+    ) -> None:
+        # A frame an event has spoken for since the tree was asked for is newer
+        # than the tree, and so is everything below it.
+        frame = (tree.get("frame") or {}).get("id")
+        if frame in skip or not self._track(frame, tab, session, parent):
+            return
+        for child in tree.get("childFrames") or []:
+            self._track_tree(child, tab, session, skip, frame)
+
+    def _untrack(self, frame: str) -> None:
+        if self.files is not None:
+            self.files.frames.pop(frame, None)
+        self.frame_source.pop(frame, None)
+        self.frame_parent.pop(frame, None)
+        self.orphans.pop(frame, None)
+
+    def _prune_below(self, frame: str) -> None:
+        """Forget every tracked or waiting frame below ``frame``."""
+        below = {frame}
+        grew = True
+        while grew:
+            grew = False
+            pairs = [*self.frame_parent.items()]
+            pairs += [(orphan, held[2]) for orphan, held in self.orphans.items()]
+            for child, parent in pairs:
+                if parent in below and child not in below:
+                    below.add(child)
+                    grew = True
+        below.discard(frame)
+        for child in below:
+            self._untrack(child)
+
+    def _forget_frames(self, session: str) -> None:
+        """Forget the frames only ``session`` reported last: it has gone."""
+        for frame, source in list(self.frame_source.items()):
+            if source == session:
+                self._untrack(frame)
+        for frame, held in list(self.orphans.items()):
+            if held[1] == session:
+                del self.orphans[frame]
+
+    async def _snapshot(self, session: str, tab: str, *, adopt: bool = False) -> None:
+        """Track the frames a session holds now.
+
+        The reply is a snapshot: a frame event that arrived while it was on its
+        way is newer and stands, and a session that went meanwhile has nothing
+        left to track.
+        """
+        if self.files is None:
+            return
+        touched: set[str] = set()
+        self.snapshots.append(touched)
+        applied = False
+
+        def forget() -> None:
+            # By identity: two snapshots' sets can be equal.
+            self.snapshots = [other for other in self.snapshots if other is not touched]
+
+        def apply(reply: Any) -> None:
+            # Applied as the reply is read, before any event read after it.
+            nonlocal applied
+            if applied:
+                return
+            applied = True
+            try:
+                if self._owner(session) == tab:
+                    self._track_tree(reply["frameTree"], tab, session, touched)
+                if adopt:
+                    # Frames reported meanwhile beneath ones this tree tracked
+                    # are tracked now too, before any later event is read.
+                    self._adopt()
+            finally:
+                forget()
+
+        hook = _ON_REPLY.set(apply)
+        try:
+            reply = await self.send("Page.getFrameTree", session=session)
+        finally:
+            _ON_REPLY.reset(hook)
+            if not applied:
+                forget()
+        apply(reply)  # When no reader applied it as it arrived.
+
+    def _adopt(self) -> None:
+        """Track waiting frames whose parent is tracked now, and theirs in turn."""
+        assert self.files is not None
+        grew = True
+        while grew:
+            grew = False
+            for frame, (tab, session, parent) in list(self.orphans.items()):
+                if parent in self.files.frames:
+                    del self.orphans[frame]
+                    if self._owner(session) == tab and self._track(frame, tab, session, parent):
+                        grew = True
+
+    def _restore(self, session: str, tab: str) -> None:
+        """Read a session's frames again after a back/forward cache restore."""
+
+        async def restore() -> None:
+            try:
+                await self._snapshot(session, tab, adopt=True)
+            except Exception:  # noqa: BLE001, S110 - unread frames stay untracked: fail closed
+                pass
+
+        task = asyncio.create_task(restore())
+        self.restoring.add(task)
+        self.tasks.add(task)
+
+        def done(finished: asyncio.Task[None]) -> None:
+            self.restoring.discard(finished)
+            self.tasks.discard(finished)
+            if not self.restoring:
+                self.orphans.clear()
+
+        task.add_done_callback(done)
+
+    async def _decide(self, frame: str, owned: asyncio.Future[bool]) -> bool:
+        """Whether a download's frame is the tab's, once pending restores land.
+
+        ``owned`` is settled the moment its frame is tracked, however the other
+        restores go; otherwise this answers when none is left pending, or after
+        _RESTORE_WAIT.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            if self.files is None:
+                return False
+            deadline = loop.time() + _RESTORE_WAIT
+            while self.restoring and not owned.done():
+                left = deadline - loop.time()
+                if left <= 0:
+                    break
+                pending: set[asyncio.Future[Any]] = {owned, *self.restoring}
+                await asyncio.wait(pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+            return (owned.done() and not owned.cancelled()) or frame in self.files.frames
+        finally:
+            if not owned.done():
+                owned.cancel()
+            waiting = self.awaiting_frames.get(frame)
+            if waiting is not None:
+                waiting[:] = [other for other in waiting if other is not owned]
+                if not waiting:
+                    del self.awaiting_frames[frame]
 
     def _owner(self, session: str | None) -> str | None:
         """The owned tab a session belongs to: the tab's own, or a frame inside it."""
@@ -694,17 +944,11 @@ class BrowserCDP:
         for current in gone:
             gone.extend(c for c, (_, _, parent) in self.child_frames.items() if parent == current)
         for current in gone:
-            _, frame, _ = self.child_frames.pop(current)
-            if self.files is not None:
-                # Its parent's notes cannot be relied on to say it went, nor
-                # its own to say the frames inside it went. One that lives on
-                # in its parent's process is noted again as it loads.
-                self.files.frames.pop(frame, None)
-        if self.files is not None:
-            for frame, reporter in list(self.frame_reporters.items()):
-                if reporter in gone:
-                    self.files.frames.pop(frame, None)
-                    del self.frame_reporters[frame]
+            del self.child_frames[current]
+            # Its parent's notes cannot be relied on to say it went, nor its own
+            # to say the frames inside it went: the frames only it reported go
+            # with it. One its parent has reported since lives on.
+            self._forget_frames(current)
         for ident, owner in list(self.pending_sessions.items()):
             future = self.pending.get(ident)
             if owner in gone and future is not None and not future.done():
@@ -737,8 +981,8 @@ class BrowserCDP:
                 # would close its tab; it is set up and run instead.
                 self.child_frames[child] = (tab, info["targetId"], session)
                 if self.files is not None:
-                    # Its ID is its target's. Its downloads are its tab's, even
-                    # after its parent reports it swapped out.
+                    # Its root frame has its target's ID. Its downloads are its
+                    # tab's, even after its parent reports it swapped out.
                     self._track(info["targetId"], tab, child)
 
     async def _setup_frame(self, child: str) -> None:
@@ -748,11 +992,9 @@ class BrowserCDP:
                 await self.send(name, args, child)
                 if child not in self.child_frames:
                     return  # Detached mid-setup: nothing left to set up.
-            if self.files is not None:
-                tree = await self.send("Page.getFrameTree", session=child)
-                if child not in self.child_frames:
-                    return
-                self._track_tree(tree["frameTree"], tab, child)
+            await self._snapshot(child, tab)
+            if child not in self.child_frames:
+                return
             await self.send("Runtime.runIfWaitingForDebugger", session=child)
         except Exception:  # noqa: BLE001 - never expose browser-supplied errors
             # Usually the frame went away first. If not, it stays paused: a
@@ -779,7 +1021,21 @@ class BrowserCDP:
                 "Browser.downloadWillBegin",
                 "Browser.downloadProgress",
             ):
-                await self.files.event(method, p)
+                guid = p.get("guid")
+                current = asyncio.current_task()
+                before = self.download_events.get(guid) if isinstance(guid, str) else None
+                if isinstance(guid, str) and current is not None:
+                    self.download_events[guid] = current
+                try:
+                    if before is not None:
+                        await asyncio.gather(before, return_exceptions=True)
+                    decision = message.get("decision")
+                    if decision is not None:
+                        p["tracked"] = await decision
+                    await self.files.event(method, p)
+                finally:
+                    if isinstance(guid, str) and self.download_events.get(guid) is current:
+                        del self.download_events[guid]
                 return
             if method == "Target.attachedToTarget":
                 info, child = p["targetInfo"], p["sessionId"]
@@ -794,15 +1050,13 @@ class BrowserCDP:
                     await self.send("Target.detachFromTarget", {"sessionId": child})
                     return
                 if parent is not None and info.get("type") == "worker":
-                    # Chromium cannot close a dedicated worker, and cannot run
-                    # one under the URL policy: the script of a worker that a
-                    # worker starts is fetched with no session's interception.
-                    # So it is held where auto-attach paused it, before its
-                    # first line, and never released.
+                    # No document of an owned tab can make one (_NO_WORKERS). One
+                    # that attaches anyway is held where auto-attach paused it,
+                    # before its first line: Chromium cannot close it.
                     return
                 # Popups and other targets cannot outlive the request policy.
                 # This driver runs only explicitly-created top-level tabs and the
-                # frames inside them, and holds their workers paused.
+                # frames inside them.
                 target = info["targetId"]
                 if target not in self.ready and self.creating is not None:
                     await asyncio.shield(self.creating)
@@ -816,6 +1070,7 @@ class BrowserCDP:
                 session = child  # Initialization can race with this target's destruction.
                 initializers: list[tuple[str, dict[str, Any]]] = [
                     ("Page.enable", {}),
+                    _NO_WORKERS_INIT,
                     ("Runtime.enable", {}),
                     ("DOM.enable", {}),
                     ("Accessibility.enable", {}),
@@ -830,9 +1085,7 @@ class BrowserCDP:
                 ]
                 for name, args in initializers:
                     await self.send(name, args, child)
-                if self.files is not None:
-                    tree = await self.send("Page.getFrameTree", session=child)
-                    self.files.frame_tree(tree["frameTree"], target)
+                await self._snapshot(child, target)
                 await self.send("Runtime.runIfWaitingForDebugger", session=child)
                 if ready := self.ready.get(target):
                     ready.set()
@@ -895,10 +1148,12 @@ class BrowserCDP:
 
     def drop_tab(self, target: str) -> None:
         if self.files is not None:
-            self.files.frames = {f: t for f, t in self.files.frames.items() if t != target}
-            self.frame_reporters = {
-                f: s for f, s in self.frame_reporters.items() if f in self.files.frames
-            }
+            for frame, tab in list(self.files.frames.items()):
+                if tab == target:
+                    self._untrack(frame)
+        for frame, held in list(self.orphans.items()):
+            if held[0] == target:
+                del self.orphans[frame]
         for child, (tab, _, _) in list(self.child_frames.items()):
             if tab == target:
                 self._drop_frame(child)
