@@ -1958,14 +1958,21 @@ revokes its capability; it does not stop Chromium or delete the computer.
   Callbacks must finish promptly. This is **not network isolation**: use guest
   egress controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and
   browser traffic outside those intercepted requests.
-- Cross-site frames, which site isolation runs as separate browser targets,
-  run inside their tab, and their intercepted requests meet the same URL hook.
-  A frame that cannot be given that hook stays paused and never runs.
-  Dedicated workers are held paused and never run: Chromium cannot close one,
-  and the script of a worker that a worker starts is fetched where no session
-  can intercept it. Popups, shared and service workers and other targets are
-  unsupported and are closed; if one cannot be closed, the driver closes its
-  session. Sites depending on popups or workers may not work with this driver.
+- Cross-site frames (which Chromium runs in their own process) run as part of
+  their tab, and their HTTP(S) requests go through the same URL hook with that
+  tab's ID. A frame that cannot be given the hook stays paused and never runs.
+  A cross-site frame's contents are not part of `read_page`, `find` or
+  `get_page_text`; screenshots and coordinate input reach it. Downloads from
+  frames nested inside a cross-site frame are canceled.
+- Dedicated workers are held paused and never run while their page lives:
+  Chromium cannot close one, and fetches the script of a worker started by
+  another worker without any interception the driver could apply. When a
+  worker's page navigates away or closes, Chromium releases it as it goes, and
+  it can then run briefly outside the URL hook; as with WebSockets, only guest
+  egress controls contain that. Popups, shared and service workers and other
+  new targets are unsupported and are closed; if one cannot be closed, the
+  driver closes its session. Sites that depend on these may not work with this
+  driver.
 - `read_page` returns accessibility roles/names and element refs; `find`
   performs a case-insensitive substring search over that tree. Each read/find
   replaces that tab's refs. Navigation invalidates them. Ask for a new page
@@ -1977,7 +1984,7 @@ revokes its capability; it does not stop Chromium or delete the computer.
   invalid crop rectangles are refused. Dialogs are dismissed and reported.
   Browser events (paused requests among them) are handled 256 at a time and
   the rest wait their turn; a page that leaves more than 8,192 waiting, or
-  16 MiB of them, ends the session.
+  32 MiB of them, ends the session.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be

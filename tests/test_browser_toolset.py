@@ -706,7 +706,9 @@ def cross_site() -> Any:
     page, and it embeds a 127.0.0.1 frame of its own, which attaches beneath it.
     Each frame asks for a URL the policy refuses and reports, to the page,
     whether it got through. The page and the frame each start a dedicated
-    worker, which would do the same if it ran.
+    worker, which would do the same if it ran. The frame is a button at a known
+    place, which reports a click. ``/churn``, served from localhost, adds and
+    removes 127.0.0.1 frames faster than they can be set up, then says so.
     """
     hits: list[tuple[str, str]] = []
 
@@ -723,9 +725,18 @@ def cross_site() -> Any:
 const seen=new Set();const show=v=>{{seen.add(String(v));document.getElementById('log').textContent=[...seen].sort().join(' ')}};
 addEventListener('message',e=>show(e.data));
 new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
-</script><iframe src="http://localhost:{port}/frame"></iframe>""",
-                "/frame": f"""<p>frame</p><script>new Worker('/worker.js');{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
-<iframe src="http://127.0.0.1:{port}/nested"></iframe>""",
+</script><iframe src="http://localhost:{port}/frame"
+style="position:absolute;left:0;top:100px;width:600px;height:300px;border:0"></iframe>""",
+                "/frame": f"""<body style="margin:0"><button style="width:600px;height:200px"
+onclick="parent.postMessage('clicked','*')">inside</button><script>new Worker('/worker.js');{probe.format("/frame")}.then(r=>parent.postMessage('frame:'+r,'*'))</script>
+<iframe src="http://127.0.0.1:{port}/nested" style="height:60px"></iframe></body>""",
+                "/churn": f"""<title>Churn</title><p id=log>churning</p><script>
+let n=0;const t=setInterval(()=>{{const f=document.createElement('iframe');
+f.src='http://127.0.0.1:{port}/lite?'+n;document.body.appendChild(f);
+setTimeout(()=>f.remove(),n%10?n%7:500);if(++n===300){{clearInterval(t);
+setTimeout(()=>document.getElementById('log').textContent='churned '+n,300)}}}},3);
+</script>""",
+                "/lite": f"<script>{probe.format('/lite')}</script>",
                 "/nested": f"<p>nested</p><script>{probe.format('/nested')}.then(r=>top.postMessage('nested:'+r,'*'))</script>",
             }
             if self.path == "/worker.js":
@@ -734,10 +745,13 @@ new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
             else:
                 body = pages.get(self.path, "ok").encode()
                 kind = "text/html"
-            self.send_response(200)
-            self.send_header("Content-Type", kind)
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # A churned frame went away mid-answer.
 
         def log_message(self, *_: Any) -> None:
             pass
@@ -756,6 +770,15 @@ new Worker('/worker.js').onmessage=e=>show('worker:'+e.data);
 CROSS_SITE_DONE = "frame:refused nested:refused"
 
 
+def assert_workers_held(port: int, hits: list[tuple[str, str]], seen: list[str]) -> None:
+    # Both workers' scripts were fetched under the policy, and, while their
+    # documents live, neither has run. (Chromium releases a held worker when its
+    # document goes, so this is checked before the toolset closes.)
+    assert ("127.0.0.1", "/worker.js") in hits and ("localhost", "/worker.js") in hits
+    assert f"http://localhost:{port}/worker.js" in seen
+    assert not [path for _, path in hits if path.startswith("/worker-")]
+
+
 def assert_cross_site_policy(port: int, hits: list[tuple[str, str]], seen: list[str]) -> None:
     # Each frame ran and its requests met the policy: allowed ones reached the
     # server, refused ones never did.
@@ -766,16 +789,12 @@ def assert_cross_site_policy(port: int, hits: list[tuple[str, str]], seen: list[
         ("127.0.0.1", "/nested-allowed"),
     ]:
         assert (host, path) in hits
-    assert not [path for _, path in hits if path.endswith("-blocked")]
+    assert not [path for _, path in hits if path in ("/frame-blocked", "/nested-blocked")]
     for url in [
         f"http://localhost:{port}/frame-blocked",
         f"http://127.0.0.1:{port}/nested-blocked",
     ]:
         assert url in seen
-    # Both workers' scripts were fetched under the policy, and neither ran.
-    assert ("127.0.0.1", "/worker.js") in hits and ("localhost", "/worker.js") in hits
-    assert f"http://localhost:{port}/worker.js" in seen
-    assert not [path for _, path in hits if path.startswith("/worker-")]
 
 
 def test_sync_cross_site_frame_runs_under_the_policy(chrome: str, cross_site: Any) -> None:
@@ -798,9 +817,19 @@ def test_sync_cross_site_frame_runs_under_the_policy(chrome: str, cross_site: An
                 break
             assert_success(browser.tool_result(use("wait", duration=0.1)))
         assert CROSS_SITE_DONE in page
+        # Coordinate input reaches into the cross-site frame.
+        point = {"type": "coordinate", "x": 300, "y": 200}
+        assert_success(browser.tool_result(use("left_click", target=point)))
+        for _ in range(50):
+            page = text(assert_success(browser.tool_result(use("get_page_text"))))
+            if "clicked" in page:
+                break
+            assert_success(browser.tool_result(use("wait", duration=0.1)))
+        assert "clicked" in page
         # The tab the frame lives in is still there, and still answers.
         assert len(tabs(assert_success(browser.tool_result(use("list_tabs"))))) == 1
         assert_success(browser.tool_result(use("screenshot")))
+        assert_workers_held(port, hits, seen)
     assert revoked == [IDENT]
     assert_cross_site_policy(port, hits, seen)
 
@@ -830,6 +859,7 @@ async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_s
         assert CROSS_SITE_DONE in page
         assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
         assert_success(await browser.tool_result(use("screenshot")))
+        assert_workers_held(port, hits, seen)
     assert revoked == [IDENT]
     assert_cross_site_policy(port, hits, seen)
 
@@ -973,7 +1003,7 @@ async def test_a_detached_frame_fails_its_pending_command_promptly() -> None:
     backend.context = "context"
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
-    backend.child_frames = {"frame-s": ("tab", "frame-t")}
+    backend.child_frames = {"frame-s": ("tab", "frame-t", "page")}
     command = asyncio.create_task(backend.send("Runtime.enable", session="frame-s"))
     other = asyncio.create_task(backend.send("Runtime.enable", session="page"))
     await asyncio.sleep(0)
@@ -1203,7 +1233,7 @@ async def test_a_frame_detached_while_the_queue_is_full_does_not_end_the_session
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
-    backend.child_frames = {"frame-s": ("tab", "frame-t")}
+    backend.child_frames = {"frame-s": ("tab", "frame-t", "page")}
     backend.reader = asyncio.create_task(backend._read())
     try:
         # A request in the frame is allowed and its continue is in flight...
@@ -1303,7 +1333,7 @@ async def test_unused_events_are_dropped_and_target_events_skip_the_queue() -> N
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
-    backend.child_frames = {"frame-s": ("tab", "frame-t")}
+    backend.child_frames = {"frame-s": ("tab", "frame-t", "page")}
     backend.reader = asyncio.create_task(backend._read())
     try:
         for i in range(300):
@@ -1395,5 +1425,171 @@ async def test_a_frame_leaving_never_overtakes_its_own_download() -> None:
         await settle(lambda: files.tracked and "frame" not in files.frames)
         assert files.tracked == [True]
     finally:
+        await socket.close()
+        await backend.reader
+
+
+@pytest.mark.asyncio
+async def test_frames_churning_faster_than_their_setup_leave_the_session_intact(
+    chrome: str, cross_site: Any
+) -> None:
+    computer, revoked = remote(chrome, True)
+    port, hits = cross_site
+    seen: list[str] = []
+
+    async def policy(_context: Any, url: str) -> None:
+        seen.append(url)
+        if url.endswith("-blocked"):
+            raise ToolError("not permitted")
+
+    async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        assert_success(
+            await browser.tool_result(use("navigate", url=f"http://localhost:{port}/churn"))
+        )
+        page = ""
+        for _ in range(100):
+            page = text(assert_success(await browser.tool_result(use("get_page_text"))))
+            if "churned" in page:
+                break
+            await asyncio.sleep(0.1)
+        assert "churned 300" in page
+        assert_success(await browser.tool_result(use("screenshot")))
+        assert len(tabs(assert_success(await browser.tool_result(use("list_tabs"))))) == 1
+        assert not browser._backend.failed
+    assert revoked == [IDENT]
+    assert [path for host, path in hits if host == "127.0.0.1" and path.startswith("/lite?")]
+    assert not [path for _, path in hits if path.endswith("-blocked")]
+
+
+@pytest.mark.asyncio
+async def test_a_detach_takes_the_whole_subtree_and_its_pending_commands() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP, _SessionGone
+
+    backend = BrowserCDP(lambda: None, lambda _: None, None)
+    backend.ws = socket = ScriptedSocket()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    # page > a > b > c, and page > other.
+    backend.child_frames = {
+        "a": ("tab", "a-t", "page"),
+        "b": ("tab", "b-t", "a"),
+        "c": ("tab", "c-t", "b"),
+        "other": ("tab", "other-t", "page"),
+    }
+    waiting = [asyncio.create_task(backend.send("Runtime.enable", session=s)) for s in "bc"]
+    kept = asyncio.create_task(backend.send("Runtime.enable", session="other"))
+    await asyncio.sleep(0)
+    # Chromium reports only the top of the subtree.
+    await backend._event(
+        {
+            "method": "Target.detachedFromTarget",
+            "sessionId": "page",
+            "params": {"sessionId": "a", "targetId": "a-t"},
+        }
+    )
+    assert set(backend.child_frames) == {"other"}
+    for task in waiting:
+        with pytest.raises(_SessionGone):
+            await asyncio.wait_for(task, 1)
+    assert not kept.done() and not backend.failed and not socket.closed
+    kept.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_frame_detached_mid_setup_is_not_set_up_further() -> None:
+    from mandala_computer._browser_cdp import _FRAME_INIT
+
+    backend, sent = owned_backend()
+    plain = backend.send
+
+    async def send(method: str, params: Any = None, session: Any = None) -> Any:
+        result = await plain(method, params, session)
+        if method == _FRAME_INIT[0][0] and session == "frame-s":
+            backend._drop_frame("frame-s")  # Its detach arrives meanwhile.
+        return result
+
+    backend.send = send
+    await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
+    assert [(m, s) for m, _, s in sent] == [(_FRAME_INIT[0][0], "frame-s")]
+    assert not backend.failed
+
+
+@pytest.mark.asyncio
+async def test_a_cross_site_frame_keeps_its_downloads_through_a_process_swap() -> None:
+    backend, _ = owned_backend()
+
+    class Files:
+        def __init__(self) -> None:
+            self.frames: dict[str, str] = {}
+
+        def frame(self, ident: str, tab: str) -> bool:
+            self.frames[ident] = tab
+            return True
+
+    backend.files = files = Files()
+    # The parent reports the frame swapped out; the frame's own target arrives.
+    files.frames["frame-t"] = "tab"
+    backend._note("Page.frameDetached", {"frameId": "frame-t", "reason": "swap"}, session="page")
+    assert files.frames == {"frame-t": "tab"}
+    await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
+    assert files.frames == {"frame-t": "tab"}
+    # A frame really removed is forgotten.
+    backend._note("Page.frameDetached", {"frameId": "frame-t", "reason": "remove"}, session="page")
+    assert files.frames == {}
+    files.frames.clear()
+    await backend._event(attached("other-s", "other-t", "iframe", "page"))
+    assert files.frames == {"other-t": "tab"}
+
+
+@pytest.mark.asyncio
+async def test_a_download_belongs_to_its_frame_as_it_arrives() -> None:
+    from mandala_computer._browser_cdp import BrowserCDP
+
+    hold = asyncio.Event()
+
+    async def policy(_tab: Any, _url: str) -> None:
+        await hold.wait()
+
+    class Files:
+        def __init__(self) -> None:
+            self.frames = {"frame": "tab"}
+            self.seen: list[Any] = []
+
+        def frame(self, ident: str, tab: str) -> bool:
+            self.frames[ident] = tab
+            return True
+
+        async def event(self, method: str, params: dict[str, Any]) -> None:
+            self.seen.append(params.get("tracked"))
+
+        async def close(self) -> None:
+            pass
+
+    backend = BrowserCDP(lambda: None, lambda _: None, policy)
+    backend.ws = socket = ScriptedSocket()
+    backend.files = files = Files()
+    backend.tabs = {"tab": {}}
+    backend.sessions = {"tab": "page"}
+    backend.ready = {"tab": asyncio.Event()}
+    backend.reader = asyncio.create_task(backend._read())
+    try:
+        for i in range(256):
+            socket.push(paused(str(i), "page", "https://ok.test/"))
+        await settle(lambda: len(backend.slots) == 256)
+        # The download waits its turn; its tab goes at once.
+        socket.push(
+            {
+                "method": "Browser.downloadWillBegin",
+                "params": {"guid": "g", "frameId": "frame", "url": "https://ok.test/f"},
+            }
+        )
+        socket.push({"method": "Target.targetDestroyed", "params": {"targetId": "tab"}})
+        await settle(lambda: "tab" not in backend.tabs)
+        assert "frame" not in files.frames
+        hold.set()
+        await settle(lambda: files.seen)
+        assert files.seen == [True]
+    finally:
+        hold.set()
         await socket.close()
         await backend.reader

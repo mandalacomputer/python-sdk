@@ -34,7 +34,7 @@ from ._exceptions import APIError
 # a limit, and it ends the session rather than growing without bound.
 _EVENT_CONCURRENCY = 256
 _EVENT_QUEUE_LIMIT = 8192
-_EVENT_QUEUE_BYTES = 16 * 1024 * 1024
+_EVENT_QUEUE_BYTES = 32 * 1024 * 1024
 _TARGET_EVENT_LIMIT = 1024
 _FLOODED = (
     "The page produced browser events faster than the session could handle them. "
@@ -135,7 +135,7 @@ def _trimmed(message: dict[str, Any]) -> dict[str, Any]:
     elif method == "Page.javascriptDialogOpening":
         params = {"type": _shown(p.get("type"), 32), "message": _shown(p.get("message"), 1000)}
     elif method == "Page.frameDetached":
-        params = {"frameId": p.get("frameId")}
+        params = {"frameId": p.get("frameId"), "reason": p.get("reason")}
     else:
         params = {
             key: p[key]
@@ -230,8 +230,9 @@ class BrowserCDP:
         self.backlog_bytes = 0
         self.pending: dict[int, asyncio.Future[Any]] = {}
         self.pending_sessions: dict[int, str] = {}
-        # Child session -> (owning tab, frame target): cross-site frames of a tab.
-        self.child_frames: dict[str, tuple[str, str]] = {}
+        # Child session -> (owning tab, frame target, parent session): the
+        # cross-site frames of a tab, at any depth.
+        self.child_frames: dict[str, tuple[str, str, str]] = {}
         self.creating: asyncio.Future[str] | None = None
         self.counter = 0
         self.grant: Any = None
@@ -527,6 +528,11 @@ class BrowserCDP:
             self._note(method, message.get("params") or {}, message.get("sessionId"))
         elif method in _QUEUED_EVENTS:
             trimmed = _trimmed(message)
+            if method == "Browser.downloadWillBegin" and self.files is not None:
+                # Whose download it is is decided as it arrives: a tab or frame
+                # that goes while it waits its turn must not orphan it.
+                frame = trimmed["params"].get("frameId")
+                trimmed["params"]["tracked"] = frame in self.files.frames
             # Arrival order is kept: nothing overtakes an event already waiting.
             if not self.backlog and len(self.slots) < _EVENT_CONCURRENCY:
                 self._run_event(trimmed, queued=True)
@@ -569,7 +575,11 @@ class BrowserCDP:
         try:
             if self.files is not None and method == "Page.frameAttached":
                 self.files.frame(p["frameId"], tab)
-            if self.files is not None and method == "Page.frameDetached":
+            if (
+                self.files is not None
+                and method == "Page.frameDetached"
+                and p.get("reason") != "swap"  # It lives on in another process.
+            ):
                 self.files.frames.pop(p["frameId"], None)
             if method == "Page.frameNavigated":
                 self.refs.pop(tab, None)
@@ -602,27 +612,40 @@ class BrowserCDP:
         return next((t for t, s in self.sessions.items() if s == session), None)
 
     def _drop_frame(self, session: str) -> None:
-        if self.child_frames.pop(session, None) is None:
-            return
-        # Chromium need not answer a command on a session that has gone away.
+        """Forget a frame's session and every frame session attached beneath it.
+
+        Chromium need not report the detach of a session whose parent has gone,
+        nor answer a command on a session that has gone: the subtree goes, and
+        its pending commands are abandoned at once.
+        """
+        gone = [session] if session in self.child_frames else []
+        for current in gone:
+            gone.extend(c for c, (_, _, parent) in self.child_frames.items() if parent == current)
+        for current in gone:
+            self.child_frames.pop(current, None)
         for ident, owner in list(self.pending_sessions.items()):
             future = self.pending.get(ident)
-            if owner == session and future is not None and not future.done():
+            if owner in gone and future is not None and not future.done():
                 future.set_exception(_SessionGone("Browser frame detached."))
 
-    async def _child(self, child: str, info: dict[str, Any], tab: str) -> None:
+    async def _child(self, child: str, info: dict[str, Any], tab: str, parent: str) -> None:
         """A child target of an owned tab. Closing it would close its tab."""
         if info.get("type") == "worker":
-            # Chromium cannot close a dedicated worker, and cannot intercept it:
-            # a worker's own requests meet its frame's policy, but the script of
-            # a worker it starts is fetched beyond any session's interception.
-            # So it is held where auto-attach paused it, before its first line,
-            # and never released. Detaching would release it.
+            # Chromium cannot close a dedicated worker, and cannot run one under
+            # the URL policy: the script of a worker that a worker starts is
+            # fetched with no session's interception. So it is held where
+            # auto-attach paused it, before its first line, and never released.
             return
         try:
-            self.child_frames[child] = (tab, info["targetId"])
+            self.child_frames[child] = (tab, info["targetId"], parent)
+            if self.files is not None:
+                # A cross-site frame's ID is its target's. Its downloads are
+                # its tab's, even after its parent reports it swapped out.
+                self.files.frame(info["targetId"], tab)
             for name, args in _FRAME_INIT:
                 await self.send(name, args, child)
+                if child not in self.child_frames:
+                    return  # Detached mid-setup: nothing left to set up.
             await self.send("Runtime.runIfWaitingForDebugger", session=child)
         except Exception:  # noqa: BLE001 - never expose browser-supplied errors
             # Usually the frame went away first. If not, it stays paused: a
@@ -651,7 +674,8 @@ class BrowserCDP:
                     await self.send("Target.detachFromTarget", {"sessionId": child})
                     return
                 if parent is not None and info.get("type") in ("iframe", "worker"):
-                    await self._child(child, info, parent)
+                    assert session is not None
+                    await self._child(child, info, parent, session)
                     return
                 # Popups and other targets cannot outlive the request policy.
                 # This driver runs only explicitly-created top-level tabs and the
@@ -697,7 +721,7 @@ class BrowserCDP:
                 self._drop_frame(p["sessionId"])
             elif method == "Target.targetDestroyed":
                 target = p["targetId"]
-                for child, (_, frame) in list(self.child_frames.items()):
+                for child, (_, frame, _) in list(self.child_frames.items()):
                     if frame == target:
                         self._drop_frame(child)
                 if target not in self.ready and self.creating is not None:
@@ -750,7 +774,7 @@ class BrowserCDP:
     def drop_tab(self, target: str) -> None:
         if self.files is not None:
             self.files.frames = {f: t for f, t in self.files.frames.items() if t != target}
-        for child, (tab, _) in list(self.child_frames.items()):
+        for child, (tab, _, _) in list(self.child_frames.items()):
             if tab == target:
                 self._drop_frame(child)
         if ready := self.ready.get(target):

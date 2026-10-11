@@ -409,7 +409,10 @@ class BrowserFiles:
         if method == "Browser.downloadWillBegin":
             if guid in self.downloads:
                 return
-            if params.get("frameId") not in self.frames:
+            # The driver records whether the frame was tracked when the event
+            # arrived; a frame that has gone since still owns its download.
+            tracked = params.get("tracked")
+            if not (tracked if isinstance(tracked, bool) else params.get("frameId") in self.frames):
                 await self.cancel_untracked(guid)
                 return
             # Limit attempts, including failures, for this context's lifetime.

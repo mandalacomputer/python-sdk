@@ -124,9 +124,10 @@ This is the summary you read to decide whether to upgrade.
   `navigate` reported success and the next action found the tab gone. Such
   frames, and the frames inside them, now run inside their tab, and their
   requests meet the same `url_policy`. A page that starts a dedicated worker
-  no longer ends the session either: the worker is held paused and never runs,
-  since a worker can fetch another worker's script beyond any policy check.
-  Popups and other targets are still refused (OPL-5900).
+  no longer ends the session either: the worker is held paused and does not
+  run while its page lives, since a worker can fetch another worker's script
+  beyond any policy check. Popups and other targets are still refused
+  (OPL-5900).
 
 - **Browser connections work on Python 3.10.** The platform's timestamps carry
   up to nine fractional digits, which 3.10's `datetime.fromisoformat` rejects,
@@ -144,7 +145,7 @@ This is the summary you read to decide whether to upgrade.
 - **A heavy page no longer ends a browser session.** More than 256 browser
   events in flight, as on a page with hundreds of images each waiting for
   `url_policy`, closed the session. The rest now wait their turn; only a page
-  that leaves more than 8,192 waiting, or 16 MiB of them, ends it.
+  that leaves more than 8,192 waiting, or 32 MiB of them, ends it.
 
 - **`create_browser_connection()` releases any grant it refuses to hand over**,
   not only one from a server that ignored a session policy, and waits at most

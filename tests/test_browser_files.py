@@ -579,6 +579,10 @@ def test_sync_close_cannot_miss_worker_under_construction(monkeypatch: Any) -> N
         "unknown",
         "foreign",
         "timeout",
+        # Ownership is what the driver recorded as the event arrived: a frame
+        # gone since still owns its download, and one untracked then never does.
+        "frame-gone",
+        "untracked-on-arrival",
     ],
 )
 async def test_download_approval_and_path_visibility(mode: str, monkeypatch: Any) -> None:
@@ -596,7 +600,9 @@ async def test_download_approval_and_path_visibility(mode: str, monkeypatch: Any
             raise RuntimeError("private callback error")
         if mode == "timeout":
             await asyncio.Event().wait()
-        return True if mode == "allow" or mode == "wrongpath" else 1 if mode == "truthy" else False
+        if mode in ("allow", "wrongpath", "frame-gone"):
+            return True
+        return 1 if mode == "truthy" else False
 
     computer = SimpleNamespace(id="vm")
     backend = SimpleNamespace(
@@ -646,15 +652,18 @@ async def test_download_approval_and_path_visibility(mode: str, monkeypatch: Any
             return await original(awaitable, 0.01 if seconds == 30 else seconds)
 
         monkeypatch.setattr(asyncio, "wait_for", short_wait)
-    await files.event(
-        "Browser.downloadWillBegin",
-        {
-            "guid": guid,
-            "frameId": "unknown" if mode in ("unknown", "foreign") else "frame",
-            "url": "https://source.test/file",
-            "suggestedFilename": "evil.exe" if mode == "extension" else "../../safe.txt",
-        },
-    )
+    began: dict[str, Any] = {
+        "guid": guid,
+        "frameId": "unknown" if mode in ("unknown", "foreign") else "frame",
+        "url": "https://source.test/file",
+        "suggestedFilename": "evil.exe" if mode == "extension" else "../../safe.txt",
+    }
+    if mode == "frame-gone":
+        began["tracked"] = True
+        files.frames.clear()
+    if mode == "untracked-on-arrival":
+        began["tracked"] = False
+    await files.event("Browser.downloadWillBegin", began)
     assert not files.adapter.visible
     await files.event(
         "Browser.downloadProgress",
@@ -666,19 +675,27 @@ async def test_download_approval_and_path_visibility(mode: str, monkeypatch: Any
             "filePath": "/untrusted-browser-path",
         },
     )
-    assert len(files.adapter.visible) == int(mode == "allow")
-    if mode == "allow":
+    assert len(files.adapter.visible) == int(mode in ("allow", "frame-gone"))
+    if mode in ("allow", "frame-gone"):
         path = next(iter(files.adapter.visible))
         assert files.adapter.is_path_visible(path)
         assert backend.changes[-1]["path"] == path
         assert seen[0].sha256 == hashlib.sha256(data).hexdigest()
     else:
         assert all("path" not in event for event in backend.changes)
-    if mode in ("content", "extension", "oversize", "canceled", "unknown", "foreign"):
+    if mode in (
+        "content",
+        "extension",
+        "oversize",
+        "canceled",
+        "unknown",
+        "foreign",
+        "untracked-on-arrival",
+    ):
         assert not seen and "publish" not in operations
     if mode == "foreign":
         assert not operations
-    if mode == "unknown":
+    if mode in ("unknown", "untracked-on-arrival"):
         assert operations == ["discard"]
     assert "/untrusted-browser-path" not in str(backend.changes)
     await files.close()
