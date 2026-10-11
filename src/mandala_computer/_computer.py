@@ -925,10 +925,15 @@ def _input_batch_outcome(
 _BATCH_FAILURE_STATUSES = frozenset({400, 409, 502, 503})
 
 
+#: Fields only a batch's own result carries. Any of them in a refusal's body is
+#: evidence the batch began, whether or not the rest of the result is there.
+_BATCH_RESULT_FIELDS = ("completed", "results", "failed_index")
+
+
 def _ordinary_refusal(body: object) -> bool:
     """Whether a refusal's body reads as the platform's ordinary error: an
-    object with an ``error`` sentence and no batch result in it."""
-    if not isinstance(body, Mapping) or "completed" in body:
+    object with an ``error`` sentence and nothing of a batch result in it."""
+    if not isinstance(body, Mapping) or any(f in body for f in _BATCH_RESULT_FIELDS):
         return False
     error = body.get("error")
     return isinstance(error, str) and bool(error.strip())

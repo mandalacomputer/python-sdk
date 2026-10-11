@@ -345,8 +345,27 @@ async def test_the_async_half_refuses_a_malformed_batch_before_sending() -> None
         httpx.Response(409, json={"reason": "contention"}),
         httpx.Response(503, content=b"upstream unavailable"),
         httpx.Response(400, json=["not", "an", "error"]),
+        httpx.Response(
+            409,
+            json={
+                "ok": False,
+                "failed_index": 1,
+                "error": "batch stopped at action 1",
+                "results": [{"ok": True}],
+            },
+        ),
+        httpx.Response(409, json={"error": "stopped", "results": []}),
     ],
-    ids=["truncated", "empty", "proxy-page", "no-sentence", "503-text", "400-array"],
+    ids=[
+        "truncated",
+        "empty",
+        "proxy-page",
+        "no-sentence",
+        "503-text",
+        "400-array",
+        "result-without-completed",
+        "results-beside-an-error",
+    ],
 )
 def test_a_batch_answer_that_cannot_be_read_is_not_called_safe_to_send_again(
     computer: mc.Computer, response: httpx.Response
@@ -372,6 +391,18 @@ def test_an_unreadable_answer_at_a_status_no_batch_failure_has_keeps_its_answer(
     with pytest.raises(mc.RateLimitError) as raised:
         computer.input_batch([{"type": "wait"}])
     assert mc.is_transient(raised.value) is True
+
+
+@respx.mock
+async def test_the_async_half_reads_a_partial_result_without_completed_the_same_way() -> None:
+    respx.post(INPUT).mock(
+        httpx.Response(409, json={"ok": False, "failed_index": 0, "error": "stopped"})
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        with pytest.raises(mc.ConflictError) as raised:
+            await c.input_batch([{"type": "wait"}])
+    assert mc.is_transient(raised.value) is False
 
 
 @respx.mock
