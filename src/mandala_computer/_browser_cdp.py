@@ -1086,7 +1086,7 @@ class BrowserCDP:
                 self.request_epochs[retired] = self.request_epochs.get(retired, 0) + 1
 
     async def _foreign_tree(self, target: str) -> None:
-        """Read another page's tree without installing policy or runtime state."""
+        """Read a foreign page or iframe tree without installing runtime state."""
         self.probe_targets.add(target)
         try:
             result = await self.send("Target.attachToTarget", {"targetId": target, "flatten": True})
@@ -1124,19 +1124,24 @@ class BrowserCDP:
         for info in targets:
             if self.stopping:
                 return
-            if info.get("type") != "page":
+            if info.get("type") not in ("page", "iframe"):
                 continue
             target = info["targetId"]
             try:
                 if info.get("browserContextId") == self.context:
+                    if info["type"] != "page":
+                        continue  # Owned iframe sessions snapshot themselves during setup.
                     session = self.sessions.get(target)
                     if session is not None:
                         reply = await self.send("Page.getFrameTree", session=session)
                         self._remember_tree(reply["frameTree"], target)
-                else:
+                elif target in self.request_owners and self.request_owners[target] is None:
+                    # A page's tree can omit cross-process frames entirely.
+                    # Probe positively foreign iframe targets as well: their
+                    # same-process descendants have no Target of their own.
                     await self._foreign_tree(target)
             except (BrowserError, KeyError, TypeError):
-                # A page may have disappeared. That proves nothing about an
+                # A target may have disappeared. That proves nothing about an
                 # unresolved request; its lookup still fails closed below.
                 continue
 

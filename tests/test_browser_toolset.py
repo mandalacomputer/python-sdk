@@ -949,18 +949,69 @@ def sandboxed_srcdoc() -> Any:
         thread.join()
 
 
-def sandbox_finished(page: str) -> bool:
-    return "direct-finished" in page and (
-        ("worker-finished" in page and "nested-finished" in page) or "worker-refused" in page
+def sandbox_finished(page: str, workers: list[dict[str, Any]]) -> bool:
+    return (
+        "direct-finished" in page
+        and (("worker-finished" in page and "nested-finished" in page) or "worker-refused" in page)
+        and all(event["released"] for event in workers if event["waiting"] is True)
     )
 
 
+def release_sandbox_fixture_workers(browser: Any) -> list[dict[str, Any]]:
+    """Let this fixture exercise root Fetch even if frame autoattach wins.
+
+    The opaque frame can construct a worker before its document initializer
+    disables Worker, yet attach late enough for frame autoattach to pause that
+    worker. Production intentionally leaves it paused. This test alone resumes
+    positively owned, debugger-paused workers so completion still proves that
+    their HTTP requests (and nested workers' requests) met the URL policy. It
+    never changes interception, ownership, or the policy's refusal decision.
+    """
+    backend = browser._backend
+    original = backend._after
+    observed: list[dict[str, Any]] = []
+
+    async def after(message: dict[str, Any]) -> None:
+        params = message.get("params", {})
+        info = params.get("targetInfo", {})
+        owner = backend._owner(message.get("sessionId"))
+        worker = (
+            message.get("method") == "Target.attachedToTarget"
+            and info.get("type") == "worker"
+            and owner is not None
+        )
+        event = None
+        if worker:
+            event = {
+                "tab": owner,
+                "url": info.get("url"),
+                "waiting": params.get("waitingForDebugger"),
+                "released": False,
+            }
+            observed.append(event)
+        await original(message)
+        if event is not None and event["waiting"] is True:
+            await backend.send("Runtime.runIfWaitingForDebugger", session=params["sessionId"])
+            event["released"] = True
+
+    backend._after = after
+    return observed
+
+
 def assert_sandbox_policy(
-    base: str, hits: list[str], seen: list[tuple[Any, str]], tab: str, page: str, kind: str
+    base: str,
+    hits: list[str],
+    seen: list[tuple[Any, str]],
+    tab: str,
+    page: str,
+    kind: str,
+    workers: list[dict[str, Any]],
 ) -> None:
     assert "/allowed" in hits and "page-ran" in page and "frame-ran" in page
     assert not [path for path in hits if path.startswith("/forbidden-")]
-    assert sandbox_finished(page)
+    assert sandbox_finished(page, workers), {"page": page, "workers": workers, "seen": seen}
+    assert all(event["tab"] == tab for event in workers)
+    assert all(event["released"] for event in workers if event["waiting"] is True)
     assert (tab, f"{base}/forbidden-direct-{kind}") in seen
     if "worker-finished" in page:
         assert (tab, f"{base}/forbidden-worker-{kind}") in seen
@@ -984,15 +1035,16 @@ def test_sync_unpaused_sandboxed_srcdoc_requests_meet_the_tab_policy(
             raise ToolError("not permitted")
 
     with MandalaBrowserToolset(computer, url_policy=policy) as browser:
+        workers = release_sandbox_fixture_workers(browser)
         nav = assert_success(browser.tool_result(use("navigate", url=f"{base}/{kind}")))
         tab = tabs(nav)[0]["tab_id"]
         page = ""
         for _ in range(50):
             page = text(assert_success(browser.tool_result(use("get_page_text"))))
-            if sandbox_finished(page):
+            if sandbox_finished(page, workers):
                 break
             time.sleep(0.1)
-        assert_sandbox_policy(base, hits, seen, tab, page, kind)
+        assert_sandbox_policy(base, hits, seen, tab, page, kind, workers)
     assert revoked == [IDENT]
     assert not [path for path in hits if path.startswith("/forbidden-")]
 
@@ -1012,15 +1064,16 @@ async def test_async_unpaused_sandboxed_srcdoc_requests_meet_the_tab_policy(
             raise ToolError("not permitted")
 
     async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        workers = release_sandbox_fixture_workers(browser)
         nav = assert_success(await browser.tool_result(use("navigate", url=f"{base}/{kind}")))
         tab = tabs(nav)[0]["tab_id"]
         page = ""
         for _ in range(50):
             page = text(assert_success(await browser.tool_result(use("get_page_text"))))
-            if sandbox_finished(page):
+            if sandbox_finished(page, workers):
                 break
             await asyncio.sleep(0.1)
-        assert_sandbox_policy(base, hits, seen, tab, page, kind)
+        assert_sandbox_policy(base, hits, seen, tab, page, kind, workers)
     assert revoked == [IDENT]
     assert not [path for path in hits if path.startswith("/forbidden-")]
 

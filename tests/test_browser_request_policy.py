@@ -29,7 +29,15 @@ def policy_site() -> Any:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(b"<body>policy test</body>")
+            if self.path == "/foreign-oop-main":
+                body = f'<iframe src="http://localhost:{self.server.server_port}/foreign-oop"></iframe>'
+            elif self.path == "/foreign-oop":
+                body = '<iframe src="/foreign-oop-nested"></iframe>'
+            elif self.path == "/foreign-oop-nested":
+                body = "<script>fetch('/foreign-nested-hit')</script><p>nested</p>"
+            else:
+                body = "<body>policy test</body>"
+            self.wfile.write(body.encode())
 
         def log_message(self, *_: Any) -> None:
             pass
@@ -208,6 +216,74 @@ async def test_root_policy_composes_with_foreign_contexts_and_another_toolset(
         finally:
             await first.close()
             await second.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incognito", [False, True])
+async def test_foreign_oopif_same_process_descendants_do_not_end_owned_session(
+    chrome: str,  # noqa: F811
+    policy_site: Any,
+    incognito: bool,
+) -> None:
+    base, hits = policy_site
+    seen: list[tuple[str | None, str]] = []
+
+    async def policy(tab: str | None, url: str) -> None:
+        seen.append((tab, url))
+        if "/foreign-" in url:
+            raise BrowserError("foreign request must never reach the owned policy")
+
+    driver = backend(chrome, policy)
+    async with raw_browser(chrome) as foreign:
+        session = await foreign.page(incognito=incognito)
+        try:
+            tab = await navigate(driver, base + "/owner")
+            await foreign.send("Page.navigate", {"url": base + "/foreign-oop-main"}, session)
+            await until(lambda: "/foreign-nested-hit" in hits)
+            targets = (await foreign.send("Target.getTargets"))["targetInfos"]
+            oop = next(
+                info
+                for info in targets
+                if info["type"] == "iframe"
+                and info["url"] == base.replace("127.0.0.1", "localhost") + "/foreign-oop"
+            )
+            oop_session = (
+                await foreign.send(
+                    "Target.attachToTarget", {"targetId": oop["targetId"], "flatten": True}
+                )
+            )["sessionId"]
+            try:
+                tree = (await foreign.send("Page.getFrameTree", session=oop_session))["frameTree"]
+            finally:
+                await foreign.send("Target.detachFromTarget", {"sessionId": oop_session})
+            nested = next(
+                child["frame"]
+                for child in tree["childFrames"]
+                if child["frame"]["url"].endswith("/foreign-oop-nested")
+            )
+            assert nested["id"] not in {info["targetId"] for info in targets}
+            # The OOPIF's same-process child is absent from the page tree on
+            # Chromium 145/154, and cannot be found by Target.getTargetInfo.
+            # Only a read-only snapshot of the foreign iframe target finds it.
+            root = (await foreign.send("Page.getFrameTree", session=session))["frameTree"]
+
+            def frame_ids(node: Any) -> set[str]:
+                return {node["frame"]["id"]}.union(
+                    *(frame_ids(child) for child in node.get("childFrames", []))
+                )
+
+            assert nested["id"] not in frame_ids(root)
+            assert not driver.failed, driver.terminal_reason
+            assert not [url for _, url in seen if "/foreign-" in url]
+            assert driver.request_owners[nested["id"]] is None
+            await until(lambda: not driver.probe_sessions and not driver.probe_targets)
+            await navigate(driver, base + "/owner-after-foreign")
+            assert all(owner == tab for owner, _ in seen)
+            await foreign.send("Page.navigate", {"url": base + "/foreign-after-probe"}, session)
+            await until(lambda: "/foreign-after-probe" in hits)
+            assert not driver.failed
+        finally:
+            await driver.close()
 
 
 @pytest.mark.asyncio
@@ -419,23 +495,25 @@ def test_worker_context_is_learned_from_its_owned_parent_not_missing_metadata() 
 
 
 @pytest.mark.asyncio
-async def test_foreign_probe_attachment_before_command_reply_is_read_only_and_cleaned_up() -> None:
+@pytest.mark.parametrize("target_type", ["page", "iframe"])
+async def test_foreign_probe_attachment_before_command_reply_is_read_only_and_cleaned_up(
+    target_type: str,
+) -> None:
     driver, _ = owned_backend()
     sent: list[tuple[str, Any, Any]] = []
+    info = {"targetId": "foreign", "type": target_type, "browserContextId": "other"}
 
     async def send(method: str, params: Any = None, session: Any = None) -> Any:
         sent.append((method, params, session))
+        if method == "Target.getTargets":
+            return {"targetInfos": [info]}
         if method == "Target.attachToTarget":
             driver._dispatch(
                 {
                     "method": "Target.attachedToTarget",
                     "params": {
                         "sessionId": "probe",
-                        "targetInfo": {
-                            "targetId": "foreign",
-                            "type": "page",
-                            "browserContextId": "other",
-                        },
+                        "targetInfo": info,
                     },
                 }
             )
@@ -447,10 +525,11 @@ async def test_foreign_probe_attachment_before_command_reply_is_read_only_and_cl
         return {}
 
     driver.send = send
-    await driver._foreign_tree("foreign")
+    await driver._survey_owners()
     await asyncio.sleep(0)
     assert driver.request_owners["kid"] is None
     assert [method for method, _, _ in sent] == [
+        "Target.getTargets",
         "Target.attachToTarget",
         "Page.getFrameTree",
         "Target.detachFromTarget",

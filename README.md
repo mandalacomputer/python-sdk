@@ -1976,7 +1976,7 @@ revokes its capability; it does not stop Chromium or delete the computer.
 - Browser-level interception also briefly pauses other browser contexts' HTTP
   requests while their ownership is established. Positively identified foreign
   requests continue without invoking this toolset's policy. The driver may
-  temporarily attach to a foreign page to read its frame tree; it does not
+  temporarily attach to a foreign page or iframe to read its frame tree; it does not
   initialize that page or install a URL policy there. Ownership records are
   bounded and retained for detached frames. If ownership cannot be established,
   or those limits are exhausted, the toolset requests disposal of its own
