@@ -37,6 +37,7 @@ from tests.test_browser_toolset import (  # noqa: F401
     use,
 )
 
+from mandala_computer import _browser_cdp
 from mandala_computer.anthropic import AsyncMandalaBrowserToolset, MandalaBrowserToolset
 
 pytestmark = pytest.mark.skipif(
@@ -107,10 +108,15 @@ async def test_guardian_disposes_owned_context_before_releasing_held_http(
     chrome: str,  # noqa: F811
     guardian: Any,
     policy_site: Any,  # noqa: F811
+    monkeypatch: Any,
     asynchronous: bool,
     ending: str,
 ) -> None:
     """Cut only the SDK link; the guardian and its Chromium link stay alive."""
+    # This fixture intentionally holds a callback across disconnect cleanup.
+    # Keep the outer policy deadline longer than its ten-second release wait;
+    # pytest restores the production deadline after this individual case.
+    monkeypatch.setattr(_browser_cdp, "_POLICY_DEADLINE", 15.0)
     url, process = guardian
     base, hits = policy_site
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
