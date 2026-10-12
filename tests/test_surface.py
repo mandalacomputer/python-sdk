@@ -547,6 +547,16 @@ def async_client() -> mc.AsyncClient:
 def api_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     get = request.method == "GET"
+    if path.endswith("/workspace"):
+        return httpx.Response(
+            200,
+            json={
+                "computer": {
+                    **COMPUTER,
+                    "workspace_id": json.loads(request.content)["workspace_id"],
+                }
+            },
+        )
     browser_lease = {
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "lifecycle_version": 2,
@@ -948,6 +958,8 @@ def exercise_everything(client: mc.Client) -> None:
     c.restart()
     c.clone(name="copy")
     c.rename("renamed")
+    c.move_to_workspace(WORKSPACE["id"])
+    c.move_to_workspace(None)
     c.screenshot()
     c.screenshot(width=320)
     c.screenshot(fresh=True)
@@ -1265,6 +1277,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.restart()
     await c.clone(name="copy")
     await c.rename("renamed")
+    await c.move_to_workspace(WORKSPACE["id"])
+    await c.move_to_workspace(None)
     await c.screenshot()
     await c.screenshot(width=320)
     await c.screenshot(fresh=True)

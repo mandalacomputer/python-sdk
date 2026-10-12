@@ -93,8 +93,7 @@ API_KEYS = "api-keys"
 #: start, stop, suspend, restart, restore, resize, move and delete started, and
 #: how it ended. Read only.
 OPERATIONS = "operations"
-#: The account's workspaces (platform OPL-5057). Read only: they are created,
-#: renamed and deleted in the dashboard.
+#: The account's workspaces: list, read, create, rename and delete.
 WORKSPACES = "workspaces"
 #: The most one page of ``GET operations`` holds; the platform refuses more.
 OPERATIONS_PAGE_MAX = 100
@@ -1105,6 +1104,34 @@ def computer_record(data: Any, method: str, path: str) -> dict[str, Any]:
     if not names_a_computer(payload):
         raise MandalaError(f"expected a computer from {method} {path}")
     return payload
+
+
+def workspace_move_record(
+    response: httpx.Response, computer_id: str, workspace_id: str | None
+) -> dict[str, Any]:
+    """Validate the move's completed result before replacing a cached computer."""
+    message = (
+        f"expected the moved computer from PUT {computer_action(computer_id, 'workspace')}; "
+        "the move's outcome is unconfirmed and this handle still has its previous state"
+    )
+    if response.status_code != 200:
+        raise MandalaError(message)
+    try:
+        data = response.json()
+    except (ValueError, UnicodeError, RecursionError):
+        raise MandalaError(message) from None
+    record = data.get("computer") if isinstance(data, Mapping) else None
+    if (
+        not isinstance(record, Mapping)
+        or record.get("id") != computer_id
+        or (
+            record.get("workspace_id") not in (None, "")
+            if workspace_id is None
+            else record.get("workspace_id") != workspace_id
+        )
+    ):
+        raise MandalaError(message)
+    return dict(record)
 
 
 def computer_records(rows: Sequence[Any], method: str, path: str) -> list[dict[str, Any]]:
@@ -2701,6 +2728,17 @@ def workspace(workspace_id: str) -> str:
 
 def workspace_members(workspace_id: str) -> str:
     return f"workspaces/{seg(workspace_id)}/members"
+
+
+def workspace_move_body(workspace_id: str | None) -> dict[str, str | None]:
+    """An explicit destination; only ``None`` unassigns a computer."""
+    if workspace_id is not None:
+        workspace_id = canonical(workspace_id, "workspace_id")
+        if not re.fullmatch(r"wsp-[0-9a-f]{12}", workspace_id):
+            raise ValueError(
+                "workspace_id must be wsp- followed by 12 lowercase hex digits, or None"
+            )
+    return {"workspace_id": workspace_id}
 
 
 def workspace_name_body(name: object) -> dict[str, Any]:
