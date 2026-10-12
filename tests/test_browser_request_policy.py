@@ -344,19 +344,32 @@ async def test_abrupt_cdp_loss_ends_the_sdk_and_removes_its_context(
     """
     base, hits = policy_site
     checked, release = asyncio.Event(), asyncio.Event()
+    cancelled, returned = asyncio.Event(), asyncio.Event()
 
     async def policy(_tab: str | None, url: str) -> None:
         if "/held" in url:
             checked.set()
-            await release.wait()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            returned.set()
 
     driver = backend(chrome, policy)
     commands: list[str] = []
+    failed_after_abort: list[str] = []
+    aborted = False
     plain = driver.send
 
     async def send(method: str, params: Any = None, session: Any = None) -> Any:
         commands.append(method)
-        return await plain(method, params, session)
+        try:
+            return await plain(method, params, session)
+        except Exception:
+            if aborted:
+                failed_after_abort.append(method)
+            raise
 
     driver.send = send
     async with raw_browser(chrome) as foreign:
@@ -367,12 +380,26 @@ async def test_abrupt_cdp_loss_ends_the_sdk_and_removes_its_context(
             assert owned_context is not None
             await driver.evaluate(tab, f"void fetch('{base}/held').catch(()=>null)")
             await asyncio.wait_for(checked.wait(), 3)
+            assert not driver.failed and driver.terminal_reason is None
+            aborted = True
             driver.ws.transport.abort()
             await asyncio.wait_for(driver.reader, 3)
             after_loss = len(commands)
             assert driver.failed and driver.session_status()["state"] == "ended"
-            with pytest.raises(BrowserError, match="connection ended"):
+            assert not cancelled.is_set() and not returned.is_set()
+            with pytest.raises(BrowserError) as refused:
                 await driver.start()
+            # An in-flight command can fail as the reader closes (for example,
+            # a favicon's Fetch.continueRequest), recording the policy handler's
+            # terminal reason first. Either ordering must reject restart without
+            # replaying a command; the held callback has not timed out or returned.
+            if driver.terminal_reason is None:
+                assert "connection ended" in str(refused.value)
+            else:
+                assert driver.terminal_reason == "Browser request policy failed."
+                assert failed_after_abort, "policy failure did not follow a CDP command failure"
+                assert str(refused.value) == driver.terminal_reason
+            assert len(commands) == after_loss
 
             # A late user callback cannot send an SDK continuation. Chromium
             # itself can resume the pending request when its interceptor goes,
