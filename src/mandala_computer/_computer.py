@@ -1390,8 +1390,9 @@ def _ramp_delay(turn: int, poll: float) -> float:
     answer usually arrives within a second or two of the first read: a flat
     interval rounded every one of those up to a whole ``poll``, so a secret that
     landed just after a read made ``launch`` sleep out the rest of three
-    seconds before noticing. A poll that FAILED does not ramp; that is
-    :func:`_poll_delay`'s business, and it still honours ``Retry-After``.
+    seconds before noticing. The desktop probe's expected reasonless 409 is
+    also an ordinary "not yet". Other failures use :func:`_poll_delay`, which
+    still honours ``Retry-After``.
     """
     return min(FIRST_POLL * 2.0 ** min(turn, 30), poll)
 
