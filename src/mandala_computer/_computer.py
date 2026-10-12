@@ -1629,7 +1629,7 @@ class ComputerFields:
         """The lifecycle operation the last lifecycle call made through this
         handle started (platform OPL-5055): the create or clone that returned
         it, or the latest ``start``, ``stop``, ``suspend``, ``restart``,
-        ``rename``, ``resize``, ``set_idle_suspend``, ``set_browser_proxy`` or
+        ``rename``, ``move_to_workspace``, ``resize``, ``set_idle_suspend``, ``set_browser_proxy`` or
         ``set_egress_proxy`` since. ``client.operations.wait(id)`` polls it to
         its end.
 
@@ -2409,9 +2409,9 @@ class ComputerFields:
     def workspace_id(self) -> str:
         """The workspace this computer is in, or ``""`` when it is in none.
 
-        Not something a create can choose: the workspace comes from the API key,
-        and a key scoped to one creates in it. This is how to tell which, for a
-        key that is not.
+        An account-wide key can choose a workspace when creating a computer,
+        or change it with :meth:`Computer.move_to_workspace`. A key confined
+        to a workspace creates in that workspace.
         """
         return str(self._data.get("workspace_id") or "")
 
@@ -2905,6 +2905,28 @@ class Computer(ComputerFields):
         all that is left of it.
         """
         return self._patch("rename", _api.rename_body(name), idempotency_key)
+
+    def move_to_workspace(self, workspace_id: str | None) -> Computer:
+        """Move this computer to a workspace, or explicitly unassign it with ``None``.
+
+        Requires a member or owner's account-wide credential. The platform
+        refuses workspace-confined credentials, including a move to the same
+        workspace. The destination must belong to this account.
+
+        The computer must be stopped, with no saved session, snapshots, secret
+        bindings or proxy credentials. This method performs no cleanup: resolve
+        any refusal explicitly before trying again. An uncertain outcome should
+        be checked with :meth:`refresh` before another move is attempted.
+
+        Returns this same handle, updated only after a valid completed result.
+        """
+        body = _api.workspace_move_body(workspace_id)
+        computer_id = self.id
+        response = self._t.request("PUT", _api.computer_action(computer_id, "workspace"), json=body)
+        data = _api.workspace_move_record(response, computer_id, body["workspace_id"])
+        self._data = data
+        self._operation_id = None
+        return self
 
     def resize(
         self,

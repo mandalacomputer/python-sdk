@@ -77,6 +77,14 @@ Two subcommands address a computer by name or id:
     command has no ``computers`` group. With ``--wait`` it exits 0 only when
     the move is ``done``.
 
+``mandala-py move <computer> --workspace ID|unassigned``
+    Change a computer's workspace using a member or owner's account-wide
+    credential. The destination is required; a saved default is never used.
+    The computer must be stopped, without a saved session, snapshots, secret
+    bindings or proxy credentials. Refusals require explicit action; this
+    command performs no cleanup. Host sizing, wait and idempotency options
+    cannot be combined with this mode.
+
 ``mandala-py logout [--profile NAME]``
     Forget a profile saved in ``~/.mandala/credentials.json`` by
     ``mandala login``. The key it held stays valid until it is revoked. With no
@@ -2749,6 +2757,31 @@ def _cmd_move(args: argparse.Namespace) -> int:
     """``move COMPUTER --ram-mb N``: the second half of a resize refused with
     ``move_required``. The body is checked before any request; with ``--wait``
     the command waits for the move and exits 0 only when it is ``done``."""
+    if args.workspace is not None:
+        if (
+            args.ram_mb is not None
+            or args.cpu is not None
+            or args.disk_gb is not None
+            or args.wait
+            or args.timeout_ms is not None
+            or args.poll_ms is not None
+            or args.idempotency_key is not None
+        ):
+            _die(
+                "--workspace cannot be combined with --ram-mb, --cpu, --disk-gb, --wait, "
+                "--timeout-ms, --poll-ms or --idempotency-key",
+                "invalid_arguments",
+            )
+        destination = None if args.workspace == "unassigned" else args.workspace
+        _api.workspace_move_body(destination)
+        with _client() as client:
+            c = _resolve(client, args.target)
+            c.move_to_workspace(destination)
+        if args.json:
+            _json(_computer_record(c))
+        else:
+            print(f"{_shown(c.id)} workspace: {_shown(c.workspace_id or 'unassigned')}")
+        return 0
     _api.move_body(ram_mb=args.ram_mb, cpu=args.cpu, disk_gb=args.disk_gb)
     key = _sent_key(args)
     if not args.wait and (args.timeout_ms is not None or args.poll_ms is not None):
@@ -2805,17 +2838,21 @@ def _cmd_moves_list(args: argparse.Namespace) -> int:
 def _moves_parsers(sub: Any) -> None:
     move = sub.add_parser(
         "move",
-        help=(
-            "move a stopped computer to another host in its region that can run a size its "
-            "own host cannot (after a resize answered move_required), resizing it there"
-        ),
+        help=("change a computer's workspace, or move it to another host for a refused resize"),
     )
     move.add_argument("target", metavar="computer", help="computer name or id")
-    move.add_argument(
+    mode = move.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--ram-mb",
         type=int,
-        required=True,
         help="RAM in MiB: the size that did not fit, more than the computer has now",
+    )
+    mode.add_argument(
+        "--workspace",
+        metavar="ID|unassigned",
+        help="destination workspace ID, or unassigned; requires an account-wide member "
+        "credential and a stopped computer without saved state, snapshots or bindings; "
+        "never uses a saved default",
     )
     move.add_argument("--cpu", type=int, help="vCPU count to apply with the move")
     move.add_argument("--disk-gb", type=int, help="disk in GiB to apply with the move")
@@ -2827,7 +2864,9 @@ def _moves_parsers(sub: Any) -> None:
     move.add_argument("--timeout-ms", type=int, help="wait deadline in milliseconds (15 min)")
     move.add_argument("--poll-ms", type=int, help="poll interval in milliseconds")
     _key_option(move)
-    move.add_argument("--json", action="store_true", help="the move as JSON")
+    move.add_argument(
+        "--json", action="store_true", help="the host move or updated computer as JSON"
+    )
     move.set_defaults(fn=_cmd_move)
     moves = sub.add_parser("moves", help="the account's moves, running or finished in a day")
     verbs = moves.add_subparsers(dest="verb", required=True)
@@ -2963,7 +3002,7 @@ def _cmd_workspaces_rm(args: argparse.Namespace) -> int:
             lambda s: (
                 f"deleting workspace {s(args.workspace)} revokes every API key confined to it; "
                 "a workspace that still holds computers or active secrets cannot be deleted. "
-                "Move its computers to another workspace in the dashboard or delete them, "
+                "Move its computers with `move COMPUTER --workspace ID|unassigned` or delete them, "
                 "and explicitly delete its active secrets first. "
                 "Pass --yes to delete it"
             ),
@@ -4447,6 +4486,8 @@ def main(argv: list[str] | None = None) -> int:
         # was never going to answer in JSON.
         as_json = bool(getattr(args, "json", False))
         resendable = bool(getattr(args, "resendable", False))
+        if args.fn == _cmd_move and args.workspace is not None:
+            resendable = False
         if extra:
             # parse_args reports these against the TOP parser, whose usage says
             # nothing about the command that was typed. Reported against that

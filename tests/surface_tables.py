@@ -34,6 +34,7 @@ ALLOWED = {
     ("POST", "computers"),
     ("GET", "computers/:id"),
     ("PATCH", "computers/:id"),
+    ("PUT", "computers/:id/workspace"),
     ("DELETE", "computers/:id"),
     ("POST", "computers/:id/start"),
     ("POST", "computers/:id/stop"),
@@ -213,6 +214,7 @@ PARAMETERS: dict[str, set[str]] = {
         "header:Idempotency-Key",
     },
     "GET computers/:id": set(),
+    "PUT computers/:id/workspace": {"body:workspace_id"},
     "PATCH computers/:id": {
         "body:name",
         "body:cpu",

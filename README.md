@@ -3167,8 +3167,8 @@ confined to a workspace is refused them with `PermissionDeniedError`. Deleting
 a workspace REVOKES every API key confined to it, whoever holds it, and
 `revoked_keys` says how many. Only an empty workspace can be deleted: one that
 still holds computers or active secrets is refused with `ConflictError` (409)
-saying how many, and nothing is deleted or revoked. Move the computers to another
-workspace in the dashboard or delete them, and explicitly delete the active
+saying how many, and nothing is deleted or revoked. Move the computers with
+`computer.move_to_workspace(destination_id)` or delete them, and explicitly delete the active
 secrets before retrying. An active-secret refusal has `reason="unsupported"`
 and is not retried automatically. Deleted
 secrets do not block workspace deletion, but still count toward the account's
@@ -3208,6 +3208,31 @@ in it, and an account-wide key creates in none and lists everything. A
 workspace the key cannot reach (another account's, one that does not exist, or
 any but its own for a confined key) raises `NotFoundError`, and so does
 `"unassigned"` from a confined key. The listing filter combines with `state`.
+
+To change an existing computer's workspace, supply the destination explicitly:
+
+```python
+c = client.computers.get("vm-...")
+c.move_to_workspace("wsp-0123456789ab")  # returns this same Computer, updated
+c.move_to_workspace(None)  # explicitly unassign it
+# With AsyncClient: await c.move_to_workspace("wsp-0123456789ab")
+```
+
+This calls `PUT /computers/{id}/workspace` with `{"workspace_id": ID}` or
+`{"workspace_id": null}`. It needs a member or owner's **account-wide credential**;
+a workspace-confined credential is refused even for its own workspace or
+unassignment. The destination must belong to the same account. Unlike the listing
+filter, this SDK method takes `None` to unassign; `"unassigned"`, empty strings,
+names and malformed IDs are refused locally. Omitting the argument is an error.
+
+The computer must be stopped, without a saved session, snapshots, secret bindings
+or proxy credentials. The method performs no cleanup: it never stops a computer,
+discards a session, removes bindings or deletes snapshots. Server refusals keep
+their structured errors and leave the cached computer unchanged. Only a valid
+200 response containing this computer at the requested destination updates the
+handle. After an uncertain result, read the computer with `refresh()` before
+deciding whether to try again. This method has no idempotency-key option and does
+not use a saved workspace default.
 
 ### Usage
 
@@ -4005,6 +4030,8 @@ mandala-py workspaces list            # and get, members (a name or id), create,
 mandala-py workspaces use research    # a default workspace for this profile; current, use --clear
 mandala-py operations list            # and get ID, wait ID; --computer takes a name or id
 mandala-py move dev --ram-mb 65536 --wait   # after a resize answered move_required
+mandala-py move dev --workspace wsp-0123456789ab  # change its workspace
+mandala-py move dev --workspace unassigned      # explicitly leave its workspace
 mandala-py moves list                 # running, or finished in the last day; --computer
 mandala-py browser-proxy set dev http://proxy.example.com:3128 --bypass '<local>' --wait
 mandala-py browser-proxy get dev      # and clear
@@ -4042,7 +4069,7 @@ one line.
 
 Every command whose call is keyed takes `--idempotency-key KEY` (1 to 255
 printable ASCII characters, no space) and sends it instead of a key of its own:
-`move`, `browser-proxy set` and `clear`, and `egress-proxy set` and `clear`. So
+`move --ram-mb`, `browser-proxy set` and `clear`, and `egress-proxy set` and `clear`. So
 a command whose answer was lost, and whose error named a key, can be sent again
 with that key: the platform does not carry one key out twice. Without
 `--json`, such a failure ends with a line naming the key (and the request id),
@@ -4058,6 +4085,17 @@ A key the platform would refuse is refused before any request
 ```sh
 mandala-py move dev --ram-mb 65536 --idempotency-key 3f2a9c        # the key the failure named
 ```
+
+`move COMPUTER --workspace ID|unassigned` changes the workspace and prints the
+updated computer with `--json`, excluding `vnc` desktop credentials. The ID must
+be `wsp-` followed by twelve lowercase hexadecimal digits; `unassigned` sends an
+explicit null destination. This mode needs a member or owner's account-wide
+credential and the same stopped/no-saved-session/no-snapshots/no-bindings
+conditions as `move_to_workspace()` above. It performs no cleanup and never uses
+the saved workspace default. It cannot be combined with `--ram-mb`, `--cpu`,
+`--disk-gb`, `--wait`, `--timeout-ms`, `--poll-ms` or `--idempotency-key`; mixed
+options are refused before any request. `move --ram-mb` retains its host relocation
+and wait behavior, and `moves list` lists host moves.
 
 `terminal` opens the platform's terminal websocket: a PTY the platform keeps alive
 server-side, running as the desktop user. Disconnecting *detaches* rather than
@@ -4165,8 +4203,8 @@ refused (`ambiguous_workspace`) with their ids.
 (`confirmation_required`), because deleting a workspace revokes every API key
 confined to it; it prints how many. A workspace that still holds computers or
 active secrets cannot be deleted: the platform refuses it (`conflict`, 409)
-saying how many, and nothing is deleted or revoked. Move its computers to another
-workspace in the dashboard or delete them, and explicitly delete its active
+saying how many, and nothing is deleted or revoked. Move its computers with
+`move COMPUTER --workspace ID|unassigned` or delete them, and explicitly delete its active
 secrets first. A secret refusal preserves `reason: "unsupported"` in `--json`
 output and is not retried automatically.
 Deleted secrets do not block workspace deletion, but still count toward the
