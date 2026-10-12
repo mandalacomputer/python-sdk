@@ -2150,21 +2150,49 @@ def test_workspaces_rm_without_yes_is_refused_before_any_request(
     assert "--yes" in error["message"]
 
 
-def test_workspaces_rm_says_a_workspace_holding_computers_cannot_be_deleted(
+def test_workspaces_rm_explains_computer_and_secret_prerequisites(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # The platform deletes only an empty workspace (409 while it holds any), so
-    # neither the confirmation nor the module's help may say they are kept.
+    # The platform refuses deletion while a workspace holds computers or active secrets.
     import json
 
     with respx.mock(assert_all_called=False):
         assert _cli.main(["workspaces", "rm", "acme", "--json"]) == 1
     message = json.loads(capsys.readouterr().err)["error"]["message"]
-    assert "a workspace that still holds computers cannot be deleted" in message
+    assert "computers or active secrets cannot be deleted" in message
+    assert "Move or delete its computers and explicitly delete its secrets first" in message
     assert "kept" not in message and "not touched" not in message
     doc = _cli.__doc__ or ""
-    assert "(it must hold no computers)" in doc
+    assert "it must hold no computers or active secrets" in " ".join(doc.split())
     assert "computers are kept" not in doc
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@respx.mock
+def test_workspaces_rm_secret_conflict_is_preserved_without_retry_or_cleanup(
+    as_json: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    message = (
+        "This workspace still holds 1 secret. Delete it first: "
+        "a workspace that holds secrets cannot be deleted."
+    )
+    route = respx.delete(f"{BASE}/workspaces/wsp-0123456789ab").mock(
+        return_value=httpx.Response(409, json={"error": message, "reason": "unsupported"})
+    )
+    args = ["workspaces", "rm", "wsp-0123456789ab", "--yes"]
+    assert _cli.main(args + (["--json"] if as_json else [])) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    if as_json:
+        assert json.loads(err)["error"] == {
+            "code": "conflict",
+            "status": 409,
+            "reason": "unsupported",
+            "message": message,
+        }
+    else:
+        assert err == f"mandala-py: {message}\n"
+    assert route.call_count == 1 and len(respx.calls) == 1
 
 
 @respx.mock

@@ -56,7 +56,8 @@ Two subcommands address a computer by name or id:
     is the whole account's. ``create``, ``rename`` and
     ``rm`` need an owner's account-wide key; ``rename`` and ``rm`` take a name
     or an id. ``rm`` does nothing without ``--yes``, because deleting a
-    workspace revokes every API key confined to it (it must hold no computers).
+    workspace revokes every API key confined to it (it must hold no computers
+    or active secrets).
     ``use`` saves a default workspace for a saved profile, in
     ``~/.mandala/defaults.json``, which ``secrets`` and ``api-keys create`` use
     when ``--workspace`` is not given (``use --clear`` removes it); ``current``
@@ -2961,7 +2962,9 @@ def _cmd_workspaces_rm(args: argparse.Namespace) -> int:
         _die(
             lambda s: (
                 f"deleting workspace {s(args.workspace)} revokes every API key confined to it; "
-                "a workspace that still holds computers cannot be deleted. Pass --yes to delete it"
+                "a workspace that still holds computers or active secrets cannot be deleted. "
+                "Move or delete its computers and explicitly delete its secrets first. "
+                "Pass --yes to delete it"
             ),
             "confirmation_required",
         )
@@ -3201,7 +3204,10 @@ def _workspaces_parser(sub: Any) -> None:
     rename.set_defaults(fn=_cmd_workspaces_rename)
     rm = verbs.add_parser(
         "rm",
-        help=f"delete a workspace, by name or id, REVOKING every API key confined to it ({owner})",
+        help=(
+            "delete a workspace, by name or id, REVOKING every API key confined to it "
+            f"(it must hold no computers or active secrets; {owner})"
+        ),
     )
     rm.add_argument("workspace", metavar="WORKSPACE")
     rm.add_argument(
