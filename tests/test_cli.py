@@ -2160,7 +2160,8 @@ def test_workspaces_rm_explains_computer_and_secret_prerequisites(
         assert _cli.main(["workspaces", "rm", "acme", "--json"]) == 1
     message = json.loads(capsys.readouterr().err)["error"]["message"]
     assert "computers or active secrets cannot be deleted" in message
-    assert "Move or delete its computers and explicitly delete its secrets first" in message
+    assert "Move its computers to another workspace in the dashboard or delete them" in message
+    assert "explicitly delete its active secrets first" in message
     assert "kept" not in message and "not touched" not in message
     doc = _cli.__doc__ or ""
     assert "it must hold no computers or active secrets" in " ".join(doc.split())

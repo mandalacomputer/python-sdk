@@ -2963,7 +2963,8 @@ def _cmd_workspaces_rm(args: argparse.Namespace) -> int:
             lambda s: (
                 f"deleting workspace {s(args.workspace)} revokes every API key confined to it; "
                 "a workspace that still holds computers or active secrets cannot be deleted. "
-                "Move or delete its computers and explicitly delete its secrets first. "
+                "Move its computers to another workspace in the dashboard or delete them, "
+                "and explicitly delete its active secrets first. "
                 "Pass --yes to delete it"
             ),
             "confirmation_required",

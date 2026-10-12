@@ -3167,9 +3167,10 @@ confined to a workspace is refused them with `PermissionDeniedError`. Deleting
 a workspace REVOKES every API key confined to it, whoever holds it, and
 `revoked_keys` says how many. Only an empty workspace can be deleted: one that
 still holds computers or active secrets is refused with `ConflictError` (409)
-saying how many, and nothing is deleted or revoked. Move or delete the computers
-and explicitly delete the active secrets before retrying. An active-secret
-refusal has `reason="unsupported"` and is not retried automatically. Deleted
+saying how many, and nothing is deleted or revoked. Move the computers to another
+workspace in the dashboard or delete them, and explicitly delete the active
+secrets before retrying. An active-secret refusal has `reason="unsupported"`
+and is not retried automatically. Deleted
 secrets do not block workspace deletion, but still count toward the account's
 lifetime limit of 1000 secrets. If the platform cannot confirm the workspace is
 empty, the answer is
@@ -4164,9 +4165,10 @@ refused (`ambiguous_workspace`) with their ids.
 (`confirmation_required`), because deleting a workspace revokes every API key
 confined to it; it prints how many. A workspace that still holds computers or
 active secrets cannot be deleted: the platform refuses it (`conflict`, 409)
-saying how many, and nothing is deleted or revoked. Move or delete its computers
-and explicitly delete its active secrets first. A secret refusal preserves
-`reason: "unsupported"` in `--json` output and is not retried automatically.
+saying how many, and nothing is deleted or revoked. Move its computers to another
+workspace in the dashboard or delete them, and explicitly delete its active
+secrets first. A secret refusal preserves `reason: "unsupported"` in `--json`
+output and is not retried automatically.
 Deleted secrets do not block workspace deletion, but still count toward the
 account's lifetime limit of 1000 secrets.
 
