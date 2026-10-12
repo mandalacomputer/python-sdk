@@ -1953,49 +1953,60 @@ revokes its capability; it does not stop Chromium or delete the computer.
 - Uploads and downloads default to denied. Opt in with the remote file policy
   described below. A local Anthropic file policy does not authorize guest reads.
 - The URL hook checks direct navigations and **intercepted HTTP(S) requests,
-  including redirects**. Background request checks have a tab ID but no tool
-  call ID. Allow by returning nothing; refuse by throwing `ToolError`.
-  Callbacks must finish promptly. The hook steers the agent; it is **not
-  network isolation**, and guest egress controls are where traffic is
-  enforced: use them for DNS/IP containment, WebSockets, WebRTC, WebTransport
-  and browser traffic outside those intercepted requests. That includes a
-  sandboxed or other out-of-process frame that starts running before the
-  driver can attach to it (Chromium starts a sandboxed `srcdoc` frame this
-  way). Its first requests go out before the hook can see them, and its
-  scripts can keep the browser's own `Worker` constructor and start workers
-  with it at any time, whose requests can escape the hook, notably when their
-  page closes or navigates.
-- Cross-site frames (which Chromium runs in their own process) run as part of
-  their tab. Chromium holds one that loads a URL until the driver has attached
-  to it, so its HTTP(S) requests go through the same URL hook with that tab's
-  ID; one that starts running without waiting is the exception above. A frame
-  that cannot be given the hook stays paused and never runs.
-  A cross-site frame's contents are not part of `read_page`, `find` or
-  `get_page_text`; screenshots and coordinate input reach it.
-- Pages cannot start dedicated workers. In every frame the driver attaches
-  to before it runs (the tab's own, cross-site frames that load a URL, and
-  same-process `about:blank`, `srcdoc`, `javascript:` and `document.write`
-  frames) `new Worker(...)` throws a `SecurityError` before the page's own
-  scripts run, whatever the script URL (`blob:` and `data:` included), and the
-  binding cannot be replaced. A frame that starts running before the driver
-  can attach is not covered (see the URL hook above). A worker cannot run
-  under the URL hook: Chromium fetches the script of a worker started by
-  another worker without any interception the driver could apply, and a
-  worker held paused is released, unpoliced, when its page closes or
-  navigates. The page itself carries on. Shared workers, service workers,
-  popups and other new top-level targets are unsupported and are closed; if
-  one cannot be closed, the driver closes its session. A popup is closed
-  without loading anything: before it is let go it is taken offline (its page
-  only; the page that opened it stays online), its HTTP cache is bypassed, its
-  documents run no script of their own, and it cannot start a worker, so the
-  page that opened it, by script, by a click or by a link, carries on. A popup
-  runs no script in its own process; the out-of-process frame limit above
-  applies inside a popup until it closes. (On a
-  Chromium older than 145, without per-page offline emulation, the opener too
-  reports itself offline while a popup is being refused.) A request the opener makes through the popup's
-  first, empty document goes out over the opener's own connection and meets
-  the URL hook as the opener's. Sites that depend on these may not work with
-  this driver.
+  including redirects**, while its CDP connection is active. Browser-level
+  interception is installed before the toolset opens a page. Requests from
+  its frames and workers are checked even
+  when Chromium starts a sandboxed `srcdoc` frame before attaching the driver.
+  Background checks identify the owning tab and have no tool call ID. Each
+  intercepted request has one background check; an explicit navigation also
+  has its existing preflight check. Allow by returning nothing; refuse by
+  throwing `ToolError`. Callbacks must finish promptly.
+- The hook steers the agent; it is **not network isolation**. Use guest egress
+  controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and browser
+  traffic outside intercepted HTTP(S) requests. The policy does not decide
+  whether a form submission to an allowed destination is safe.
+- **Abrupt control-connection loss is also an HTTP policy limit (OPL-5952).**
+  If the CDP connection breaks, or context disposal cannot be confirmed,
+  Chromium can remove interception before destroying the context and resume
+  a paused HTTP request without policy approval. The SDK ends its session and
+  ignores late policy results, but cannot prevent that browser-side delivery.
+  `disposeOnDetach` provides eventual cleanup, not a network-enforcement
+  guarantee. Use independent guest egress controls when network containment
+  must survive control-connection loss.
+- Browser-level interception also briefly pauses other browser contexts' HTTP
+  requests while their ownership is established. Positively identified foreign
+  requests continue without invoking this toolset's policy. The driver may
+  temporarily attach to a foreign page or iframe to read its frame tree; it does not
+  initialize that page or install a URL policy there. Ownership records are
+  bounded and retained for detached frames. If ownership cannot be established,
+  or those limits are exhausted, the toolset requests disposal of its own
+  context and awaits confirmation before explicitly disabling interception.
+  This can end an otherwise healthy toolset when another
+  controller closes a previously unobserved frame with a request still pending.
+  Other browser contexts remain available. Normal close and lease termination
+  use the same confirmed-disposal ordering; if confirmation fails, the
+  control-connection-loss limitation above applies.
+- Cross-site frames run as part of their tab. Their HTTP(S) requests meet the
+  same URL hook with that tab's ID. Frame initialization still occurs before
+  releasing a frame that Chromium has paused. A cross-site frame's contents
+  are not part of `read_page`, `find` or `get_page_text`; screenshots and
+  coordinate input reach it.
+- In documents whose scripts the driver can initialize before execution,
+  `new Worker(...)` throws a `SecurityError`. This includes the tab's own
+  document, ordinary cross-site URL frames, and same-process `about:blank`,
+  `srcdoc`, `javascript:` and `document.write` frames. An already-running
+  sandboxed frame may retain the original constructor and create workers;
+  their intercepted HTTP(S) requests still meet the owning tab's URL hook.
+  Shared workers, service workers, popups and other new top-level targets are
+  unsupported and are closed; if one cannot be closed, the driver ends its
+  session. Before releasing a popup, the driver takes its page offline,
+  bypasses its HTTP cache and disables script execution, then closes it.
+  Browser-level interception also refuses requests attributed to an unadopted
+  popup. The opener continues normally. On Chromium older than 145, without
+  per-page offline emulation, the opener also reports itself offline while
+  a popup is being refused. A request the opener makes through a popup's
+  first empty document uses the opener's connection and meets the hook as
+  the opener's. Sites depending on these unsupported features may not work.
 - `read_page` returns accessibility roles/names and element refs; `find`
   performs a case-insensitive substring search over that tree. Each read/find
   replaces that tab's refs. Navigation invalidates them. Ask for a new page
@@ -2008,7 +2019,24 @@ revokes its capability; it does not stop Chromium or delete the computer.
   Paused requests and downloads are handled 256 at a time and the rest wait
   their turn; a tab's own page loads, its dialogs and its frames never wait
   behind them. A page that leaves more than 8,192 waiting, or 32 MiB of them,
-  ends the session.
+  ends the session. Request ownership retains at most 8,192 frame/target
+  identities per session, with at most 128 unresolved lookups and 128 targets
+  in one ownership survey. Exceeding those bounds also ends the session.
+
+The abrupt-loss limitation has been reproduced in Linux Chromium CI. To run
+the retained strict no-delivery characterization for OPL-5952:
+
+```sh
+MANDALA_TEST_CHROMIUM=/path/to/chromium MANDALA_TEST_STRICT_CDP_LOSS=1 \
+  python -m pytest -q tests/test_browser_request_policy.py -k abrupt_cdp_loss
+```
+
+This opt-in assertion can fail when Chromium resumes the pending request;
+passing on a particular build does not establish a transport-loss guarantee.
+The default abrupt-loss test checks that the SDK ends, its context is eventually
+removed, unrelated contexts work, and a late callback cannot send an SDK
+continuation. Active-connection policy tests and successful close, expiry and
+renewal-failure disposal tests always retain their strict no-delivery assertions.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be

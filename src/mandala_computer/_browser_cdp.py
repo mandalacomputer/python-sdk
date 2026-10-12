@@ -44,6 +44,14 @@ _NAVIGATION_CONCURRENCY = 32
 _EVENT_QUEUE_LIMIT = 8192
 _EVENT_QUEUE_BYTES = 32 * 1024 * 1024
 _TARGET_EVENT_LIMIT = 1024
+_OWNERSHIP_LIMIT = 8192
+_OWNERSHIP_LOOKUPS = 128
+_OWNERSHIP_TARGETS = 128
+_OWNERSHIP_DEADLINE = 5.0
+_OWNERSHIP_ERROR = (
+    "Browser request ownership could not be established. "
+    "The session ended; create a new toolset to continue."
+)
 # A caller's URL policy runs on threads of the session's own, never the default
 # executor that renewal and the sync computer's calls use. Navigation checks
 # have threads of their own, which held subresource checks cannot occupy.
@@ -75,6 +83,7 @@ _TARGET_EVENTS = frozenset(
         "Target.detachedFromTarget",
         "Target.targetDestroyed",
         "Target.targetInfoChanged",
+        "Target.targetCreated",
     }
 )
 _NOTED_EVENTS = frozenset(
@@ -91,19 +100,18 @@ _LANE_EVENTS = frozenset(
 )
 _AUTO_ATTACH = {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}
 _INTERCEPT = {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}
-# A site-isolated cross-site frame is its own target, attached under its page
-# and paused until released. Chromium intercepts its subresource requests on
-# the frame's own session, so it gets the page's interception before it runs,
-# and reports its own frames there, so that their downloads are tracked.
-# Dedicated workers never start. Chromium can neither close one nor intercept
-# all of a running one's requests (the script of a worker that a worker starts
-# is fetched with no session's interception, and a held worker is released as
-# its page goes), so in every frame of an owned tab that the driver attaches
-# to before it runs, Worker is a constructor that refuses. A frame that starts
+# Browser-root Fetch interception is installed before any owned page runs.
+# It covers frame requests even when Chromium does not pause a sandboxed
+# srcdoc target before its first script. Frame sessions still provide DOM,
+# runtime and download bookkeeping, but never install a second interceptor.
+# Dedicated workers remain unsupported. In every frame of an owned tab that
+# the driver initializes before it runs, Worker is a constructor that refuses.
+# Chromium cannot close a held dedicated worker without closing its page, and
+# releases it when that page goes. A frame that starts
 # running without waiting for the driver (a sandboxed srcdoc frame) runs its
 # first scripts before its session can register this, so it can keep the
-# original constructor for later, as it makes its first requests before its
-# interception is on; that, like WebSockets, is the guest's egress controls'.
+# original constructor for later. The browser-root interceptor still checks
+# its HTTP(S) requests and its workers', including before frame attachment.
 _NO_WORKERS = """(() => {
   const refuse = function Worker() {
     throw new DOMException(
@@ -148,7 +156,6 @@ _FRAME_INIT: tuple[tuple[str, dict[str, Any]], ...] = (
     _NO_WORKERS_INIT,
     ("Network.enable", {}),
     ("Network.setBypassServiceWorker", {"bypass": True}),
-    ("Fetch.enable", _INTERCEPT),
     ("Runtime.enable", {}),
     ("Target.setAutoAttach", _AUTO_ATTACH),
 )
@@ -204,6 +211,8 @@ def _trimmed(message: dict[str, Any]) -> dict[str, Any]:
         params: dict[str, Any] = {
             "requestId": p.get("requestId"),
             "request": {"url": _checked(request.get("url"), 8192)},
+            "frameId": _checked(p.get("frameId"), 128),
+            "resourceType": _shown(p.get("resourceType"), 32),
         }
     elif method == "Page.javascriptDialogOpening":
         params = {"type": _shown(p.get("type"), 32), "message": _shown(p.get("message"), 1000)}
@@ -311,6 +320,21 @@ class BrowserCDP:
         self.pending: dict[int, asyncio.Future[Any]] = {}
         self.pending_sessions: dict[int, str] = {}
         self.reply_hooks: dict[int, Callable[[Any], None]] = {}
+        # Immutable provenance, separate from the live file/frame maps. None
+        # means positively foreign, never merely absent. Retain detached frame
+        # owners so their pending requests cannot become foreign after removal.
+        self.request_owners: dict[str, str | None] = {}
+        self.request_parents: dict[str, str] = {}
+        self.dead_frames: set[str] = set()
+        self.request_epochs: dict[str, int] = {}
+        self.owner_lookups: dict[str, asyncio.Task[None]] = {}
+        self.owner_survey: asyncio.Task[None] | None = None
+        # A temporary foreign attachment can be reported before attach's reply.
+        self.probe_targets: set[str] = set()
+        self.probe_sessions: dict[str, str] = {}
+        self.stopping = False
+        self.ending: asyncio.Task[None] | None = None
+        self.intercepting = False
         # Child session -> (owning tab, frame target, parent session): the
         # cross-site frames of a tab, at any depth.
         self.child_frames: dict[str, tuple[str, str, str]] = {}
@@ -361,7 +385,7 @@ class BrowserCDP:
         return await result if inspect.isawaitable(result) else result
 
     async def start(self) -> None:
-        if self.closed or self.failed:
+        if self.closed or self.failed or self.stopping:
             raise BrowserError(
                 self.terminal_reason
                 or "Browser connection ended. Create a new toolset for a fresh session."
@@ -406,6 +430,8 @@ class BrowserCDP:
             if self.files is not None:
                 await self.files.setup(self.context)
             await self.send("Target.setDiscoverTargets", {"discover": True})
+            await self.send("Fetch.enable", _INTERCEPT)
+            self.intercepting = True
             await self.send("Target.setAutoAttach", _AUTO_ATTACH)
             await self.new_tab()
             if self.lease is not None:
@@ -439,7 +465,7 @@ class BrowserCDP:
 
     def session_status(self) -> dict[str, Any]:
         lease, deadline = self.lease, self.lease_deadline
-        ended = self.failed or self.closed
+        ended = self.failed or self.closed or self.stopping
         return {
             "state": "ended" if ended else "active" if self.ws is not None else "not_started",
             "lease_expires_at": lease.lease_expires_at if lease else None,
@@ -478,9 +504,7 @@ class BrowserCDP:
             if self.closed or self.failed:
                 return
             self.terminal_reason = "Browser session renewal failed. The session ended; create a new toolset to continue."
-        self.failed = True
-        if self.ws is not None:
-            await self.ws.close()  # Version 2 disconnect revokes the grant on the server.
+        await self._terminate(self.terminal_reason or "Browser session ended.")
 
     async def _renew_lease(self) -> None:
         """Renew once, retrying passing failures until shortly before the deadline.
@@ -592,10 +616,23 @@ class BrowserCDP:
                                     pass
                             future.set_result(result)
                 else:
-                    self._dispatch(message)
-        except Exception:  # noqa: BLE001, S110 - fail closed without exposing browser-supplied errors
+                    try:
+                        self._dispatch(message)
+                    except Exception:  # noqa: BLE001 - malformed browser events fail closed
+                        # Keep reading replies while disposal runs. Awaiting it
+                        # here would deadlock its command on this same reader.
+                        self.stopping = True
+                        task = asyncio.create_task(
+                            self._terminate(self.terminal_reason or _OWNERSHIP_ERROR)
+                        )
+                        self.tasks.add(task)
+                        task.add_done_callback(self.tasks.discard)
+        except Exception:  # noqa: BLE001, S110 - end SDK use without exposing browser-supplied errors
             pass
         finally:
+            # Once this transport is gone the SDK cannot order Chromium's
+            # Fetch teardown against disposeOnDetach. Chromium may resume a
+            # paused HTTP request before destroying the context (OPL-5952).
             self.failed = True
             for lane in (self.policy_lane, self.navigation_lane):
                 lane.waiting.clear()
@@ -635,12 +672,16 @@ class BrowserCDP:
 
     def _dispatch(self, message: dict[str, Any]) -> None:
         """Route one event as it arrives; see the note on _POLICY_CONCURRENCY."""
+        if self.stopping:
+            return  # Replies still drain; no new policy work during disposal.
         method = message.get("method")
         if method in _TARGET_EVENTS:
             message = _target_info(message)
             self._settle(message)
             if method in ("Target.attachedToTarget", "Target.targetDestroyed"):
-                self._launch(message)
+                child = (message.get("params") or {}).get("sessionId")
+                if method != "Target.attachedToTarget" or child not in self.probe_sessions:
+                    self._launch(message)
         elif method in _NOTED_EVENTS:
             self._settle(message)
         elif method == "Page.javascriptDialogOpening":
@@ -668,12 +709,14 @@ class BrowserCDP:
                 else:
                     trimmed["params"]["tracked"] = False
             session = message.get("sessionId")
-            tab = self._owner(session)
+            frame_id = p.get("frameId")
+            tab = (
+                self.request_owners.get(frame_id)
+                if session is None and isinstance(frame_id, str)
+                else None
+            )
             own_document = (
-                tab is not None
-                and self.sessions.get(tab) == session
-                and p.get("frameId") == tab
-                and p.get("resourceType") == "Document"
+                tab is not None and p.get("frameId") == tab and p.get("resourceType") == "Document"
             )
             if own_document:
                 trimmed["navigation"] = True
@@ -730,7 +773,20 @@ class BrowserCDP:
         if not tab:
             return
         try:
-            if self.files is not None and method.startswith("Page.frame"):
+            if method == "Page.frameAttached":
+                self._remember_owner(p["frameId"], tab, p.get("parentFrameId"))
+            elif method == "Page.frameDetached" and p.get("reason") != "swap":
+                self._retire_frames(p["frameId"])
+            elif method == "Page.frameNavigated":
+                frame = p["frame"]
+                # A navigation can finish (including an error document) while
+                # the next navigation's policy callback is pending. The root
+                # frame itself still exists; only its old children retire.
+                # Actual detach/revival keeps its separate epoch below.
+                self._retire_frames(frame["id"], include=False)
+                self._remember_owner(frame["id"], tab, frame.get("parentId"))
+                self.dead_frames.discard(frame["id"])
+            if method.startswith("Page.frame"):
                 frame = p.get("frameId") or (p.get("frame") or {}).get("id")
                 if isinstance(frame, str):
                     for touched in self.snapshots:
@@ -758,8 +814,8 @@ class BrowserCDP:
                     self._track(frame["id"], tab, session, frame.get("parentId"))
                     # A document back from the back/forward cache brings its
                     # frames back, and Chromium reports none of them.
-                    if p.get("type") == "BackForwardCacheRestore" and session is not None:
-                        self._restore(session, tab)
+                if p.get("type") == "BackForwardCacheRestore" and session is not None:
+                    self._restore(session, tab)
             elif method == "Runtime.consoleAPICalled":
                 text = " ".join(
                     str(a.get("value", a.get("description", "")))[:1000]
@@ -857,8 +913,6 @@ class BrowserCDP:
         way is newer and stands, and a session that went meanwhile has nothing
         left to track.
         """
-        if self.files is None:
-            return
         touched: set[str] = set()
         self.snapshots.append(touched)
         applied = False
@@ -875,8 +929,10 @@ class BrowserCDP:
             applied = True
             try:
                 if self._owner(session) == tab:
-                    self._track_tree(reply["frameTree"], tab, session, touched)
-                if adopt:
+                    self._remember_tree(reply["frameTree"], tab, skip=touched, revive=True)
+                    if self.files is not None:
+                        self._track_tree(reply["frameTree"], tab, session, touched)
+                if adopt and self.files is not None:
                     # Frames reported meanwhile beneath ones this tree tracked
                     # are tracked now too, before any later event is read.
                     self._adopt()
@@ -953,6 +1009,185 @@ class BrowserCDP:
                 if not waiting:
                     del self.awaiting_frames[frame]
 
+    def _remember_owner(self, frame: Any, tab: str | None, parent: Any = None) -> None:
+        if not isinstance(frame, str) or not frame or len(frame) > 128:
+            raise BrowserError(_OWNERSHIP_ERROR)
+        if frame in self.request_owners:
+            if self.request_owners[frame] != tab:
+                raise BrowserError(_OWNERSHIP_ERROR)
+        elif len(self.request_owners) >= _OWNERSHIP_LIMIT:
+            raise BrowserError(_OWNERSHIP_ERROR)
+        else:
+            self.request_owners[frame] = tab
+        if isinstance(parent, str) and parent != frame:
+            self.request_parents[frame] = parent
+
+    def _target_owner(self, info: Any, parent: str | None = None) -> None:
+        """Learn only positive browser metadata, never ownership from a URL."""
+        if not isinstance(info, dict) or not isinstance(info.get("type"), str):
+            raise BrowserError(_OWNERSHIP_ERROR)
+        target, context = info.get("targetId"), info.get("browserContextId")
+        if context is not None and not isinstance(context, str):
+            raise BrowserError(_OWNERSHIP_ERROR)
+        if self.context is None:
+            return
+        if parent is not None:
+            if context is not None and context != self.context:
+                raise BrowserError(_OWNERSHIP_ERROR)
+            self._remember_owner(target, parent)
+        elif context is not None and context != self.context:
+            self._remember_owner(target, None)
+        elif context is None and info["type"] in ("page", "iframe"):
+            # Page/frame targets without a browserContextId belong to the
+            # default profile. Worker metadata may omit it even when owned.
+            self._remember_owner(target, None)
+        elif context == self.context and info["type"] == "page":
+            self._remember_owner(target, target)
+        else:
+            ancestor = info.get("parentFrameId") or info.get("parentId")
+            if ancestor in self.request_owners and self.request_owners[ancestor] is not None:
+                self._remember_owner(target, self.request_owners[ancestor], ancestor)
+
+    def _remember_tree(
+        self,
+        tree: Any,
+        tab: str | None,
+        parent: str | None = None,
+        *,
+        skip: set[str] | None = None,
+        revive: bool = False,
+    ) -> None:
+        if not isinstance(tree, dict) or not isinstance(tree.get("frame"), dict):
+            raise BrowserError(_OWNERSHIP_ERROR)
+        frame = tree["frame"].get("id")
+        if skip is not None and frame in skip:
+            return  # An event since the query supersedes this entire subtree.
+        self._remember_owner(frame, tab, parent)
+        if revive:
+            self.dead_frames.discard(frame)
+        children = tree.get("childFrames", [])
+        if not isinstance(children, list):
+            raise BrowserError(_OWNERSHIP_ERROR)
+        for child in children:
+            self._remember_tree(child, tab, frame, skip=skip, revive=revive)
+
+    def _retire_frames(self, frame: str, *, include: bool = True) -> None:
+        below = {frame}
+        while True:
+            extra = {child for child, parent in self.request_parents.items() if parent in below}
+            if extra <= below:
+                break
+            below.update(extra)
+        if not include:
+            below.discard(frame)
+        for retired in below:
+            if retired in self.request_owners:
+                self.dead_frames.add(retired)
+                self.request_epochs[retired] = self.request_epochs.get(retired, 0) + 1
+
+    async def _foreign_tree(self, target: str) -> None:
+        """Read a foreign page or iframe tree without installing runtime state."""
+        self.probe_targets.add(target)
+        try:
+            result = await self.send("Target.attachToTarget", {"targetId": target, "flatten": True})
+            session = result["sessionId"]
+            if not isinstance(session, str):
+                raise BrowserError(_OWNERSHIP_ERROR)
+            self.probe_sessions[session] = target
+            reply = await self.send("Page.getFrameTree", session=session)
+            tree = reply["frameTree"]
+            if tree.get("frame", {}).get("id") != target:
+                raise BrowserError(_OWNERSHIP_ERROR)
+            self._remember_tree(tree, None)
+        finally:
+            self.probe_targets.discard(target)
+            # Include an autoattachment that arrived while the probe was in
+            # progress, as well as attachToTarget's explicit session.
+            sessions = [s for s, t in self.probe_sessions.items() if t == target]
+            for session in sessions:
+                try:
+                    await self.send("Target.detachFromTarget", {"sessionId": session})
+                except BrowserError:
+                    pass  # A disappeared target/session has nothing to detach.
+                finally:
+                    self.probe_sessions.pop(session, None)
+
+    async def _survey_owners(self) -> None:
+        response = await self.send("Target.getTargets")
+        targets = response.get("targetInfos")
+        if not isinstance(targets, list) or len(targets) > _OWNERSHIP_TARGETS:
+            raise BrowserError(_OWNERSHIP_ERROR)
+        for info in targets:
+            self._target_owner(info)
+        # A single coalesced survey bounds temporary attachments. No URL policy
+        # callback is awaited here, so a held request cannot block discovery.
+        for info in targets:
+            if self.stopping:
+                return
+            if info.get("type") not in ("page", "iframe"):
+                continue
+            target = info["targetId"]
+            try:
+                if info.get("browserContextId") == self.context:
+                    if info["type"] != "page":
+                        continue  # Owned iframe sessions snapshot themselves during setup.
+                    session = self.sessions.get(target)
+                    if session is not None:
+                        reply = await self.send("Page.getFrameTree", session=session)
+                        self._remember_tree(reply["frameTree"], target)
+                elif target in self.request_owners and self.request_owners[target] is None:
+                    # A page's tree can omit cross-process frames entirely.
+                    # Probe positively foreign iframe targets as well: their
+                    # same-process descendants have no Target of their own.
+                    await self._foreign_tree(target)
+            except (BrowserError, KeyError, TypeError):
+                # A target may have disappeared. That proves nothing about an
+                # unresolved request; its lookup still fails closed below.
+                continue
+
+    async def _lookup_owner(self, frame: str) -> None:
+        try:
+            info = (await self.send("Target.getTargetInfo", {"targetId": frame}))["targetInfo"]
+            if info.get("targetId") != frame:
+                raise BrowserError(_OWNERSHIP_ERROR)
+            self._target_owner(info)
+        except (BrowserError, KeyError, TypeError):
+            pass  # Same-process frames have no Target; inspect their trees.
+        if frame in self.request_owners or self.stopping:
+            return
+        # A survey already in flight may predate this frame. At most one fresh
+        # survey follows it; both run within this lookup's overall deadline.
+        previous = self.owner_survey
+        for _ in range(2 if previous is not None and not previous.done() else 1):
+            if self.owner_survey is None or self.owner_survey.done():
+                self.owner_survey = asyncio.create_task(self._survey_owners())
+                self.tasks.add(self.owner_survey)
+                self.owner_survey.add_done_callback(self.tasks.discard)
+                self.owner_survey.add_done_callback(_retrieve)
+            await asyncio.shield(self.owner_survey)
+            if frame in self.request_owners or self.stopping:
+                return
+        raise BrowserError(_OWNERSHIP_ERROR)
+
+    async def _request_owner(self, frame: Any) -> str | None:
+        if not isinstance(frame, str) or not frame or len(frame) > 128:
+            raise BrowserError(_OWNERSHIP_ERROR)
+        if frame not in self.request_owners:
+            lookup = self.owner_lookups.get(frame)
+            if lookup is None:
+                if len(self.owner_lookups) >= _OWNERSHIP_LOOKUPS:
+                    raise BrowserError(_OWNERSHIP_ERROR)
+                lookup = asyncio.create_task(self._lookup_owner(frame))
+                self.owner_lookups[frame] = lookup
+                self.tasks.add(lookup)
+                lookup.add_done_callback(self.tasks.discard)
+                lookup.add_done_callback(_retrieve)
+                lookup.add_done_callback(lambda done: self.owner_lookups.pop(frame, None))
+            await asyncio.wait_for(asyncio.shield(lookup), _OWNERSHIP_DEADLINE)
+        if frame not in self.request_owners:
+            raise BrowserError(_OWNERSHIP_ERROR)
+        return self.request_owners[frame]
+
     def _owner(self, session: str | None) -> str | None:
         """The owned tab a session belongs to: the tab's own, or a frame inside it."""
         if session is None:
@@ -973,6 +1208,7 @@ class BrowserCDP:
         for current in gone:
             gone.extend(c for c, (_, _, parent) in self.child_frames.items() if parent == current)
         for current in gone:
+            self._retire_frames(self.child_frames[current][1])
             del self.child_frames[current]
             # Its parent's notes cannot be relied on to say it went, nor its own
             # to say the frames inside it went: the frames only it reported go
@@ -996,16 +1232,21 @@ class BrowserCDP:
         )
         if method in _NOTED_EVENTS:
             self._note(method, p, session)
-        elif method == "Target.targetInfoChanged":
+        elif method in ("Target.targetCreated", "Target.targetInfoChanged"):
             info = p.get("targetInfo") or {}
+            self._target_owner(info)
             if info.get("targetId") in self.tabs:
                 self.tabs[info["targetId"]] = info
         elif method == "Target.detachedFromTarget":
+            if isinstance(p.get("sessionId"), str):
+                self.probe_sessions.pop(p["sessionId"], None)
             self._drop_frame(p.get("sessionId"))
             if p.get("sessionId") in self.refused:
                 del self.refused[p["sessionId"]]
                 self._abandon([p["sessionId"]])
         elif method == "Target.targetDestroyed":
+            if isinstance(p.get("targetId"), str):
+                self._retire_frames(p["targetId"])
             for child, (_, frame, _) in list(self.child_frames.items()):
                 if frame == p.get("targetId"):
                     self._drop_frame(child)
@@ -1016,6 +1257,13 @@ class BrowserCDP:
         elif method == "Target.attachedToTarget":
             info, child = p["targetInfo"], p["sessionId"]
             tab = self._owner(session)
+            self._target_owner(info, tab)
+            if tab is not None:
+                ancestor = self.child_frames[session][1] if session in self.child_frames else tab
+                self._remember_owner(info["targetId"], tab, ancestor)
+            if session is None and info["targetId"] in self.probe_targets:
+                self.probe_sessions[child] = info["targetId"]
+                return
             if (
                 session is None
                 and info.get("type") == "page"
@@ -1043,9 +1291,10 @@ class BrowserCDP:
                 return
             await self.send("Runtime.runIfWaitingForDebugger", session=child)
         except Exception:  # noqa: BLE001 - never expose browser-supplied errors
-            # Usually the frame went away first. If not, it stays paused: a
-            # frame that could not be given the request policy never runs, and
-            # its tab carries on without it.
+            # Usually the frame went away first. A paused frame is never
+            # released after incomplete setup. An already-running frame is
+            # still behind the browser-root interceptor; retiring its tracked
+            # session makes its later requests fail closed.
             self._drop_frame(child)
 
     async def _event(self, message: dict[str, Any]) -> None:
@@ -1085,6 +1334,8 @@ class BrowserCDP:
                 return
             if method == "Target.attachedToTarget":
                 info, child = p["targetInfo"], p["sessionId"]
+                if child in self.probe_sessions:
+                    return
                 if child in self.child_frames:
                     await self._setup_frame(child)
                     return
@@ -1127,7 +1378,6 @@ class BrowserCDP:
                         "Emulation.setDeviceMetricsOverride",
                         {"width": 1280, "height": 720, "deviceScaleFactor": 1, "mobile": False},
                     ),
-                    ("Fetch.enable", _INTERCEPT),
                     ("Target.setAutoAttach", _AUTO_ATTACH),
                 ]
                 for name, args in initializers:
@@ -1142,17 +1392,45 @@ class BrowserCDP:
                     await asyncio.shield(self.creating)
                 self.drop_tab(target)
             elif method == "Fetch.requestPaused":
-                tab = self._owner(session)
-                if tab is None:
-                    return  # The target has already detached; its requests die with it.
-                allowed = True
+                if session is not None:
+                    raise BrowserError(_OWNERSHIP_ERROR)
+                frame = p.get("frameId")
                 try:
-                    await self.check_url(
-                        p["request"]["url"], tab, navigation=message.get("navigation") is True
+                    tab = await self._request_owner(frame)
+                    if tab is not None and frame in self.dead_frames and self.restoring:
+                        # BFCache restores descendants without attach events.
+                        # Wait for the already-running bounded snapshot before
+                        # deciding whether a previously retired frame is live.
+                        await asyncio.wait_for(
+                            asyncio.shield(asyncio.gather(*self.restoring)),
+                            _OWNERSHIP_DEADLINE,
+                        )
+                except Exception:  # noqa: BLE001 - uncertainty never permits a request
+                    await self._terminate(_OWNERSHIP_ERROR)
+                    return
+                if self.stopping or self.closed or self.failed:
+                    return
+                epoch = self.request_epochs.get(frame, 0)
+                allowed = True
+                if tab is not None:
+                    if tab not in self.sessions or frame in self.dead_frames:
+                        allowed = False
+                    else:
+                        try:
+                            await self.check_url(
+                                p["request"]["url"],
+                                tab,
+                                navigation=message.get("navigation") is True,
+                            )
+                        except Exception:  # noqa: BLE001 - withhold callback errors
+                            allowed = False
+                    allowed = (
+                        allowed
+                        and tab in self.sessions
+                        and frame not in self.dead_frames
+                        and self.request_epochs.get(frame, 0) == epoch
                     )
-                except Exception:  # noqa: BLE001 - fail closed without exposing callback errors
-                    allowed = False
-                if self._owner(session) != tab:
+                if self.stopping or self.closed or self.failed:
                     return
                 if not allowed:
                     self.changes.append({"type": "navigation_refused"})
@@ -1186,7 +1464,7 @@ class BrowserCDP:
                         raise
                     # Its tab may have answered it first; a frame's dialog
                     # left open blocks only that frame.
-        except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
+        except Exception as error:  # noqa: BLE001 - end the session without exposing browser errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):
                 return  # Page-side cancellation invalidates the paused request ID.
             if isinstance(error, _SessionGone):
@@ -1194,9 +1472,7 @@ class BrowserCDP:
             if session is not None and self._owner(session) is None:
                 return  # An in-flight command raced with target destruction.
             # A failed policy installation must never leave an unguarded page.
-            self.failed = True
-            if self.ws is not None:
-                await self.ws.close()
+            await self._terminate(self.terminal_reason or "Browser request policy failed.")
 
     async def _refuse(self, child: str, info: dict[str, Any]) -> None:
         """Close a target this driver does not run; a popup is fenced and released first."""
@@ -1251,6 +1527,7 @@ class BrowserCDP:
             await self.send("Network.emulateNetworkConditions", _OFFLINE, session)
 
     def drop_tab(self, target: str) -> None:
+        self._retire_frames(target)
         if self.files is not None:
             for frame, tab in list(self.files.frames.items()):
                 if tab == target:
@@ -1811,24 +2088,55 @@ class BrowserCDP:
                 self.cleanup = None  # Explicit close may retry a failed revocation.
                 raise
 
+    async def _terminate(self, reason: str) -> None:
+        self.terminal_reason = reason
+        self.stopping = True
+        if self.ending is None:
+            self.ending = asyncio.create_task(self._end_socket())
+        await asyncio.shield(self.ending)
+
+    async def _end_socket(self) -> None:
+        """Remove our context before removing a browser-wide interceptor.
+
+        No policy/ownership queue is awaited. Explicit Fetch.disable follows
+        confirmed disposal only. If disposal cannot be confirmed, disconnect
+        with disposeOnDetach still set as best-effort cleanup. That disconnect
+        can resume paused HTTP before Chromium removes the context; it is not
+        a network-enforcement fallback (OPL-5952).
+        """
+        if self.ws is None:
+            self.failed = True
+            return
+        disposed = self.context is None
+        if self.context is not None and not self.failed:
+            try:
+                await self.send("Target.disposeBrowserContext", {"browserContextId": self.context})
+                disposed = True
+                self.context = None
+            except Exception:  # noqa: BLE001, S110 - disconnect provides best-effort cleanup only
+                pass
+        if disposed and self.intercepting and not self.failed:
+            try:
+                await self.send("Fetch.disable")
+            except Exception:  # noqa: BLE001, S110 - disposal already removed the owned context
+                pass
+            self.intercepting = False
+        self.failed = True
+        await self.ws.close()
+
     async def _close(self) -> None:
-        if self.files is not None:
-            await self.files.close()
         if self.lease_task is not None and self.lease_task is not asyncio.current_task():
             self.lease_task.cancel()
             await asyncio.gather(self.lease_task, return_exceptions=True)
         try:
-            if self.ws is not None:
-                if self.context and not self.failed:
-                    try:
-                        await self.send(
-                            "Target.disposeBrowserContext", {"browserContextId": self.context}
-                        )
-                    except Exception:  # noqa: BLE001, S110 - fail closed without exposing browser-supplied errors
-                        pass
-                await self.ws.close()
+            self.stopping = True
+            if self.ending is None:
+                self.ending = asyncio.create_task(self._end_socket())
+            await asyncio.shield(self.ending)
             if self.reader and self.reader is not asyncio.current_task():
                 await self.reader
+            if self.files is not None:
+                await self.files.close()
         finally:
             for task in list(self.tasks):
                 task.cancel()
