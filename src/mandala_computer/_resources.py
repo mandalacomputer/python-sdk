@@ -2296,10 +2296,15 @@ class Workspaces:
 
     def delete(self, workspace_id: str) -> WorkspaceDeleted:
         """Delete a workspace. Only an empty workspace can be deleted: one that
-        still holds computers is refused with a
+        still holds computers or active secrets is refused with a
         :class:`~mandala_computer.ConflictError` (409) saying how many, and
-        nothing is deleted or revoked; delete those computers first. If the
-        platform cannot confirm the workspace is empty, the answer is an
+        nothing is deleted or revoked. Move the computers to another workspace
+        in the dashboard or delete them, and explicitly delete the active
+        secrets before retrying. An active-secret refusal has
+        ``reason="unsupported"`` and is not retried automatically.
+        Deleted secrets do not block workspace deletion, but still count toward
+        the account's lifetime limit of 1000 secrets. If the platform cannot
+        confirm the workspace is empty, the answer is an
         :class:`~mandala_computer.UnavailableError` (503), also with nothing
         deleted; try again shortly. On success every API key confined to the
         workspace is REVOKED in the same step, whoever holds it, and

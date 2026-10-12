@@ -4724,7 +4724,7 @@ class WorkspaceDeleted:
 
     Every API key confined to the workspace was revoked with it, whoever held
     it; ``revoked_keys`` says how many. Only an empty workspace is deleted, so
-    there is no answer for one that holds computers.
+    there is no answer for one that holds computers or active secrets.
     """
 
     #: The API keys confined to the workspace, revoked in the same step.

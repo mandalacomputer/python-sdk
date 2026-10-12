@@ -3166,9 +3166,14 @@ Creating, renaming and deleting need an owner's account-wide key; a key
 confined to a workspace is refused them with `PermissionDeniedError`. Deleting
 a workspace REVOKES every API key confined to it, whoever holds it, and
 `revoked_keys` says how many. Only an empty workspace can be deleted: one that
-still holds computers is refused with `ConflictError` (409) saying how many,
-and nothing is deleted or revoked; delete those computers first. If the
-platform cannot confirm the workspace is empty, the answer is
+still holds computers or active secrets is refused with `ConflictError` (409)
+saying how many, and nothing is deleted or revoked. Move the computers to another
+workspace in the dashboard or delete them, and explicitly delete the active
+secrets before retrying. An active-secret refusal has `reason="unsupported"`
+and is not retried automatically. Deleted
+secrets do not block workspace deletion, but still count toward the account's
+lifetime limit of 1000 secrets. If the platform cannot confirm the workspace is
+empty, the answer is
 `UnavailableError` (503), also with nothing deleted; try again shortly.
 
 A key confined to a workspace lists that one workspace and no other, and `get`
@@ -4158,9 +4163,14 @@ refused (`ambiguous_workspace`) with their ids.
 `workspaces rm WORKSPACE --yes` need an owner's account-wide key; `rename` and
 `rm` take a name or an id. `rm` does nothing without `--yes`
 (`confirmation_required`), because deleting a workspace revokes every API key
-confined to it; it prints how many. A workspace that still holds computers
-cannot be deleted: the platform refuses it (`conflict`, 409) saying how many,
-and nothing is deleted or revoked.
+confined to it; it prints how many. A workspace that still holds computers or
+active secrets cannot be deleted: the platform refuses it (`conflict`, 409)
+saying how many, and nothing is deleted or revoked. Move its computers to another
+workspace in the dashboard or delete them, and explicitly delete its active
+secrets first. A secret refusal preserves `reason: "unsupported"` in `--json`
+output and is not retried automatically.
+Deleted secrets do not block workspace deletion, but still count toward the
+account's lifetime limit of 1000 secrets.
 
 `workspaces use WORKSPACE [--profile NAME]` saves a default workspace, by name
 or id, for a saved profile (`--profile`, else `MANDALA_PROFILE`, else the

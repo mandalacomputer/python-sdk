@@ -289,6 +289,32 @@ def test_a_delete_answer_that_cannot_count_its_keys_is_refused(answer: dict[str,
 
 
 @respx.mock
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_secret_conflict_preserves_error_without_retry_or_cleanup(asynchronous: bool) -> None:
+    message = (
+        "This workspace still holds 1 secret. Delete it first: "
+        "a workspace that holds secrets cannot be deleted."
+    )
+    body = {"error": message, "reason": "unsupported"}
+    route = respx.delete(f"{BASE}/workspaces/{WORKSPACE['id']}").mock(
+        return_value=httpx.Response(409, json=body)
+    )
+    with pytest.raises(mc.ConflictError) as caught:
+        if asynchronous:
+            async with mc.AsyncClient("com_test", base_url=BASE, retries={"idempotent": 2}) as c:
+                await c.workspaces.delete(WORKSPACE["id"])
+        else:
+            with mc.Client("com_test", base_url=BASE, retries={"idempotent": 2}) as sync_client:
+                sync_client.workspaces.delete(WORKSPACE["id"])
+    assert caught.value.status == 409
+    assert caught.value.reason == "unsupported"
+    assert str(caught.value) == message
+    assert caught.value.body == body
+    assert route.call_count == 1 and len(respx.calls) == 1
+    assert route.calls.last.request.content == b""
+
+
+@respx.mock
 def test_a_scoped_key_is_permission_denied_and_a_foreign_id_not_found() -> None:
     sentence = "Workspaces cannot be created, renamed or deleted with a workspace-scoped API key."
     respx.post(f"{BASE}/workspaces").mock(
