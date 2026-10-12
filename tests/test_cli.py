@@ -1875,6 +1875,7 @@ WSP_MEMBERS = [
         "role": "owner",
         "accepted_at": "2026-09-02T00:00:00.000Z",
         "suspended": False,
+        "seat_suspended": False,
     },
     {
         "user_id": "usr-fedcba9876543210",
@@ -1883,6 +1884,7 @@ WSP_MEMBERS = [
         "role": "viewer",
         "accepted_at": "2026-09-03T00:00:00.000Z",
         "suspended": True,
+        "seat_suspended": True,
     },
 ]
 
@@ -1957,13 +1959,25 @@ def test_workspaces_members_prints_each_person(capsys: pytest.CaptureFixture[str
     assert _raw_controls(out) == []
     lines = out.splitlines()
     assert len(lines) == 3  # the header and two people: a newline forges no row
-    assert lines[0].split() == ["USER", "ID", "EMAIL", "NAME", "ROLE", "ACCEPTED", "SUSPENDED"]
+    assert lines[0].split() == [
+        "USER",
+        "ID",
+        "EMAIL",
+        "NAME",
+        "ROLE",
+        "ACCEPTED",
+        "SUSPENDED",
+        "WAITING",
+        "FOR",
+        "SEAT",
+    ]
     assert lines[1].split() == [
         "usr-0123456789abcdef",
         "dana@example.com",
         "Dana\\u001b[2J\\u000aforged",
         "owner",
         "2026-09-02T00:00:00.000Z",
+        "no",
         "no",
     ]
     assert lines[2].split() == [
@@ -1972,6 +1986,7 @@ def test_workspaces_members_prints_each_person(capsys: pytest.CaptureFixture[str
         "-",
         "viewer",
         "2026-09-03T00:00:00.000Z",
+        "yes",
         "yes",
     ]
 
@@ -1987,6 +2002,64 @@ def test_workspaces_members_json_is_the_platforms_rows(
     )
     assert _cli.main(["workspaces", "members", "wsp-0123456789ab", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == WSP_MEMBERS
+
+
+@pytest.mark.parametrize("suspended", [False, True])
+@pytest.mark.parametrize("seat_suspended", [False, True, None])
+@pytest.mark.parametrize("as_json", [False, True])
+@respx.mock
+def test_workspaces_members_report_seat_state_separately(
+    suspended: bool,
+    seat_suspended: bool | None,
+    as_json: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    row = {**WSP_MEMBERS[0], "suspended": suspended, "future": "kept"}
+    if seat_suspended is None:
+        del row["seat_suspended"]  # An older server has not supplied this field.
+    else:
+        row["seat_suspended"] = seat_suspended
+    respx.get(f"{BASE}/workspaces/wsp-0123456789ab/members").mock(
+        return_value=httpx.Response(200, json=[row])
+    )
+    args = ["workspaces", "members", "wsp-0123456789ab"] + (["--json"] if as_json else [])
+    assert _cli.main(args) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    if as_json:
+        assert json.loads(out) == [row]
+    else:
+        lines = out.splitlines()
+        assert len(lines) == 2
+        assert "WAITING FOR SEAT" in lines[0]
+        assert lines[1].split()[-2:] == [
+            "yes" if suspended else "no",
+            "-" if seat_suspended is None else "yes" if seat_suspended else "no",
+        ]
+
+
+@pytest.mark.parametrize("bad", [None, 0, 1, "false", [], {}])
+@pytest.mark.parametrize("as_json", [False, True])
+@respx.mock
+def test_workspaces_members_refuse_invalid_seat_state(
+    bad: object, as_json: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    respx.get(f"{BASE}/workspaces/wsp-0123456789ab/members").mock(
+        return_value=httpx.Response(200, json=[{**WSP_MEMBERS[0], "seat_suspended": bad}])
+    )
+    args = ["workspaces", "members", "wsp-0123456789ab"] + (["--json"] if as_json else [])
+    assert _cli.main(args) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    message = "workspace member 0: seat_suspended is not true or false"
+    if as_json:
+        assert json.loads(err)["error"]["message"] == message
+    else:
+        assert err == f"mandala-py: {message}\n"
 
 
 @respx.mock

@@ -49,7 +49,8 @@ Two subcommands address a computer by name or id:
 
 ``mandala-py workspaces <list|get|members|create|rename|rm|use|current>``
     The account's workspaces: their ids (what ``secrets --workspace`` and
-    ``api-keys create --workspace`` take) and the people who reach one.
+    ``api-keys create --workspace`` take) and the account's accepted members,
+    including their sign-in suspension and waiting-for-seat states.
     ``get`` and ``members`` take a name or an id. ``members`` needs an
     account-wide key; a key confined to a workspace is refused, since the list
     is the whole account's. ``create``, ``rename`` and
@@ -2854,10 +2855,13 @@ def _member_rows(members: Sequence[WorkspaceMember]) -> str:
             _printable(m.role),
             m.accepted_at,
             "yes" if m.suspended else "no",
+            "-" if m.seat_suspended is None else "yes" if m.seat_suspended else "no",
         )
         for m in members
     ]
-    return _table(("USER ID", "EMAIL", "NAME", "ROLE", "ACCEPTED", "SUSPENDED"), rows)
+    return _table(
+        ("USER ID", "EMAIL", "NAME", "ROLE", "ACCEPTED", "SUSPENDED", "WAITING FOR SEAT"), rows
+    )
 
 
 def _cmd_workspaces_list(args: argparse.Namespace) -> int:
@@ -3177,7 +3181,7 @@ def _workspaces_parser(sub: Any) -> None:
     get.add_argument("--json", action="store_true", help="the workspace as JSON")
     get.set_defaults(fn=_cmd_workspaces_get)
     members = verbs.add_parser(
-        "members", help="who reaches a workspace, by name or id (needs an account-wide key)"
+        "members", help="the account's accepted members, by workspace (needs an account-wide key)"
     )
     members.add_argument("workspace", metavar="WORKSPACE")
     members.add_argument("--json", action="store_true", help="the rows as JSON")

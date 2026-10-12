@@ -3155,7 +3155,7 @@ for ws in client.workspaces.list():  # oldest first
     print(ws.id, ws.name)
 ws = client.workspaces.get("wsp-0123456789ab")
 for m in client.workspaces.members(ws.id):  # the account's accepted members
-    print(m.email, m.role, "suspended" if m.suspended else "")
+    print(m.email, m.role, "sign-in suspended:", m.suspended, "waiting for seat:", m.seat_suspended)
 
 acme = client.workspaces.create("customer-acme")
 client.workspaces.rename(acme.id, "customer-acme-prod")
@@ -3174,9 +3174,17 @@ platform cannot confirm the workspace is empty, the answer is
 A key confined to a workspace lists that one workspace and no other, and `get`
 of any other id raises `NotFoundError`, the same as one that does not exist (so
 does a deleted workspace a computer's `workspace_id` still names). `members()`
-is the whole account's roster, since everybody on the account reaches every
-workspace at their account role, so a key confined to a workspace cannot list
-it: `PermissionDeniedError` (403). `AsyncClient` has the same methods, awaited.
+is the whole account's accepted-member roster: each member's account role
+applies to every workspace. A key confined to a workspace cannot list it:
+`PermissionDeniedError` (403). `AsyncClient` has the same methods, awaited.
+
+The roster includes members who cannot currently use the account.
+`WorkspaceMember.suspended` means a global sign-in suspension;
+`seat_suspended` means the accepted member is waiting for a plan seat. These
+flags are independent, and appearing in the roster does not guarantee access.
+`seat_suspended` is `True` or `False` when supplied by the server, or `None`
+(unknown) when an older server omits it. A supplied non-boolean value, including
+`null`, raises `MandalaError`. The original response remains in `raw`.
 
 An account-wide key can create a computer in a workspace, and list one
 workspace's computers, without a key confined to it:
@@ -4133,10 +4141,13 @@ It is shown once.
 `workspaces list` prints the workspaces the key reaches, with the ids that
 `secrets --workspace` and `api-keys create --workspace` take; `workspaces get
 WORKSPACE` prints one, by name or id, and one the key cannot see is
-`not_found`. `workspaces members WORKSPACE` lists the people who reach it (the account's accepted members, with their
-role and whether they are suspended) and needs an account-wide key: a key
-confined to a workspace gets the platform's 403 (`--json`: `code`
-`permission_denied`). Each takes `--json` for the platform's rows.
+`not_found`. `workspaces members WORKSPACE` lists the account's accepted members
+with their roles, `SUSPENDED` for global sign-in suspension, and `WAITING FOR
+SEAT` for members awaiting a plan seat. The two states are independent. The
+seat column prints `yes`, `no`, or `-` when an older server leaves it unknown;
+the roster does not guarantee access. Listing members needs an account-wide
+key: a key confined to a workspace gets the platform's 403 (`--json`: `code`
+`permission_denied`). Each takes `--json` for the unchanged platform rows.
 
 `get` and `members` resolve a name as `rename` and `rm` do: a value shaped
 like a workspace id is sent as that id, a name that fits exactly one workspace
