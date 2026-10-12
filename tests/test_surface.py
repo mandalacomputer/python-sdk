@@ -78,6 +78,12 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # Public URLs (platform OPL-3753), behind a flag on the platform until its
+    # edge exists. Wrapped in the release that follows it there.
+    ("GET", "computers/:id/public-urls"),
+    ("POST", "computers/:id/public-urls"),
+    ("PATCH", "computers/:id/public-urls/:urlId"),
+    ("DELETE", "computers/:id/public-urls/:urlId"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -520,6 +526,9 @@ def pattern_for(path: str) -> str:
             return ":resultId"
         if i == 3 and parts[0] == "computers" and parts[2] == "artifacts":
             return ":artifactId"
+        # A public URL's id (platform OPL-3753), pinned to the same position.
+        if i == 3 and parts[0] == "computers" and parts[2] == "public-urls":
+            return ":urlId"
         return seg
 
     # A template ref's two halves, pinned to a THREE-segment path under
@@ -1879,6 +1888,13 @@ def test_retained_path_placeholders_do_not_hide_literal_segments() -> None:
     )
     assert pattern_for("/computers/results/start") == "computers/:id/start"
     assert pattern_for("/computers/artifacts/start") == "computers/:id/start"
+    # A public URL's id is an id at its own position only (platform OPL-3753).
+    assert pattern_for("/computers/vm-1/public-urls") == "computers/:id/public-urls"
+    assert (
+        pattern_for("/computers/vm-1/public-urls/pu-0123456789abcdef")
+        == "computers/:id/public-urls/:urlId"
+    )
+    assert pattern_for("/computers/public-urls/start") == "computers/:id/start"
     # An activity id is an id now that the SDK reaches the route (OPL-5026),
     # and `results` after it stays the literal the platform's pattern has.
     assert (

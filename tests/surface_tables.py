@@ -35,6 +35,11 @@ ALLOWED = {
     ("GET", "computers/:id"),
     ("PATCH", "computers/:id"),
     ("PUT", "computers/:id/workspace"),
+    # Public URLs (platform OPL-3753).
+    ("GET", "computers/:id/public-urls"),
+    ("POST", "computers/:id/public-urls"),
+    ("PATCH", "computers/:id/public-urls/:urlId"),
+    ("DELETE", "computers/:id/public-urls/:urlId"),
     ("DELETE", "computers/:id"),
     ("POST", "computers/:id/start"),
     ("POST", "computers/:id/stop"),
@@ -215,6 +220,11 @@ PARAMETERS: dict[str, set[str]] = {
     },
     "GET computers/:id": set(),
     "PUT computers/:id/workspace": {"body:workspace_id"},
+    # Public URLs (platform OPL-3753).
+    "GET computers/:id/public-urls": set(),
+    "POST computers/:id/public-urls": {"body:port", "body:label", "body:access"},
+    "PATCH computers/:id/public-urls/:urlId": {"body:port", "body:access"},
+    "DELETE computers/:id/public-urls/:urlId": set(),
     "PATCH computers/:id": {
         "body:name",
         "body:cpu",
