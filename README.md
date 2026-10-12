@@ -1953,8 +1953,9 @@ revokes its capability; it does not stop Chromium or delete the computer.
 - Uploads and downloads default to denied. Opt in with the remote file policy
   described below. A local Anthropic file policy does not authorize guest reads.
 - The URL hook checks direct navigations and **intercepted HTTP(S) requests,
-  including redirects**. Browser-level interception is installed before the
-  toolset opens a page. Requests from its frames and workers are checked even
+  including redirects**, while its CDP connection is active. Browser-level
+  interception is installed before the toolset opens a page. Requests from
+  its frames and workers are checked even
   when Chromium starts a sandboxed `srcdoc` frame before attaching the driver.
   Background checks identify the owning tab and have no tool call ID. Each
   intercepted request has one background check; an explicit navigation also
@@ -1964,17 +1965,27 @@ revokes its capability; it does not stop Chromium or delete the computer.
   controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and browser
   traffic outside intercepted HTTP(S) requests. The policy does not decide
   whether a form submission to an allowed destination is safe.
+- **Abrupt control-connection loss is also an HTTP policy limit (OPL-5952).**
+  If the CDP connection breaks, or context disposal cannot be confirmed,
+  Chromium can remove interception before destroying the context and resume
+  a paused HTTP request without policy approval. The SDK ends its session and
+  ignores late policy results, but cannot prevent that browser-side delivery.
+  `disposeOnDetach` provides eventual cleanup, not a network-enforcement
+  guarantee. Use independent guest egress controls when network containment
+  must survive control-connection loss.
 - Browser-level interception also briefly pauses other browser contexts' HTTP
   requests while their ownership is established. Positively identified foreign
   requests continue without invoking this toolset's policy. The driver may
   temporarily attach to a foreign page to read its frame tree; it does not
   initialize that page or install a URL policy there. Ownership records are
   bounded and retained for detached frames. If ownership cannot be established,
-  or those limits are exhausted, the toolset disposes its own context before
-  removing interception. This can end an otherwise healthy toolset when another
+  or those limits are exhausted, the toolset requests disposal of its own
+  context and awaits confirmation before explicitly disabling interception.
+  This can end an otherwise healthy toolset when another
   controller closes a previously unobserved frame with a request still pending.
   Other browser contexts remain available. Normal close and lease termination
-  likewise dispose this context before removing interception.
+  use the same confirmed-disposal ordering; if confirmation fails, the
+  control-connection-loss limitation above applies.
 - Cross-site frames run as part of their tab. Their HTTP(S) requests meet the
   same URL hook with that tab's ID. Frame initialization still occurs before
   releasing a frame that Chromium has paused. A cross-site frame's contents
@@ -2011,6 +2022,21 @@ revokes its capability; it does not stop Chromium or delete the computer.
   ends the session. Request ownership retains at most 8,192 frame/target
   identities per session, with at most 128 unresolved lookups and 128 targets
   in one ownership survey. Exceeding those bounds also ends the session.
+
+The abrupt-loss limitation has been reproduced in Linux Chromium CI. To run
+the retained strict no-delivery characterization for OPL-5952:
+
+```sh
+MANDALA_TEST_CHROMIUM=/path/to/chromium MANDALA_TEST_STRICT_CDP_LOSS=1 \
+  python -m pytest -q tests/test_browser_request_policy.py -k abrupt_cdp_loss
+```
+
+This opt-in assertion can fail when Chromium resumes the pending request;
+passing on a particular build does not establish a transport-loss guarantee.
+The default abrupt-loss test checks that the SDK ends, its context is eventually
+removed, unrelated contexts work, and a late callback cannot send an SDK
+continuation. Active-connection policy tests and successful close, expiry and
+renewal-failure disposal tests always retain their strict no-delivery assertions.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be

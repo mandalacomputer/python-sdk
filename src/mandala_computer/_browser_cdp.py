@@ -627,9 +627,12 @@ class BrowserCDP:
                         )
                         self.tasks.add(task)
                         task.add_done_callback(self.tasks.discard)
-        except Exception:  # noqa: BLE001, S110 - fail closed without exposing browser-supplied errors
+        except Exception:  # noqa: BLE001, S110 - end SDK use without exposing browser-supplied errors
             pass
         finally:
+            # Once this transport is gone the SDK cannot order Chromium's
+            # Fetch teardown against disposeOnDetach. Chromium may resume a
+            # paused HTTP request before destroying the context (OPL-5952).
             self.failed = True
             for lane in (self.policy_lane, self.navigation_lane):
                 lane.waiting.clear()
@@ -1456,7 +1459,7 @@ class BrowserCDP:
                         raise
                     # Its tab may have answered it first; a frame's dialog
                     # left open blocks only that frame.
-        except Exception as error:  # noqa: BLE001 - fail closed without exposing browser-supplied errors
+        except Exception as error:  # noqa: BLE001 - end the session without exposing browser errors
             if method == "Fetch.requestPaused" and isinstance(error, _RequestGone):
                 return  # Page-side cancellation invalidates the paused request ID.
             if isinstance(error, _SessionGone):
@@ -2090,9 +2093,11 @@ class BrowserCDP:
     async def _end_socket(self) -> None:
         """Remove our context before removing a browser-wide interceptor.
 
-        No policy/ownership queue is awaited. If disposal cannot be confirmed,
-        disconnect with disposeOnDetach still set; never explicitly disable
-        interception while the owned context may still be present.
+        No policy/ownership queue is awaited. Explicit Fetch.disable follows
+        confirmed disposal only. If disposal cannot be confirmed, disconnect
+        with disposeOnDetach still set as best-effort cleanup. That disconnect
+        can resume paused HTTP before Chromium removes the context; it is not
+        a network-enforcement fallback (OPL-5952).
         """
         if self.ws is None:
             self.failed = True
@@ -2103,7 +2108,7 @@ class BrowserCDP:
                 await self.send("Target.disposeBrowserContext", {"browserContextId": self.context})
                 disposed = True
                 self.context = None
-            except Exception:  # noqa: BLE001, S110 - disconnect remains the fail-closed fallback
+            except Exception:  # noqa: BLE001, S110 - disconnect provides best-effort cleanup only
                 pass
         if disposed and self.intercepting and not self.failed:
             try:

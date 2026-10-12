@@ -135,6 +135,8 @@ class MandalaBrowserToolset(BetaAbstractBrowserToolset20260801):
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that.
+    Abrupt CDP loss or unconfirmed disposal can let pending HTTP proceed
+    before Chromium removes this context, without policy approval (OPL-5952).
     Cross-site frames and intercepted worker requests use the same policy.
     Worker constructors are disabled where initialization precedes page scripts.
     Popups and other targets are unsupported. Uploads and
@@ -475,6 +477,8 @@ class AsyncMandalaBrowserToolset(BetaAsyncAbstractBrowserToolset20260801):
 
     HTTP(S) navigations and intercepted requests use ``url_policy``. It is
     not network isolation: configure guest egress controls for that.
+    Abrupt CDP loss or unconfirmed disposal can let pending HTTP proceed
+    before Chromium removes this context, without policy approval (OPL-5952).
     Cross-site frames and intercepted worker requests use the same policy.
     Worker constructors are disabled where initialization precedes page scripts.
     Popups and other targets are unsupported. Uploads and
