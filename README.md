@@ -1965,14 +1965,28 @@ revokes its capability; it does not stop Chromium or delete the computer.
   controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and browser
   traffic outside intercepted HTTP(S) requests. The policy does not decide
   whether a form submission to an allowed destination is safe.
-- **Abrupt control-connection loss is also an HTTP policy limit (OPL-5952).**
-  If the CDP connection breaks, or context disposal cannot be confirmed,
-  Chromium can remove interception before destroying the context and resume
-  a paused HTTP request without policy approval. The SDK ends its session and
-  ignores late policy results, but cannot prevent that browser-side delivery.
-  `disposeOnDetach` provides eventual cleanup, not a network-enforcement
+- **Disconnect protection depends on the deployed backend.** A backend with
+  the connection guardian advertises `context_guard_version: 1` and
+  `protected_disconnects: ["downstream", "host_link"]` through the root CDP
+  method `Mandala.getConnectionCapabilities`. While the guardian and its
+  Chromium connection remain alive, it retains interception after the SDK's
+  connection or the host relay link is lost, disposes the contexts created
+  with `disposeOnDetach: true` on that root connection, and only then detaches.
+  The SDK already creates its context with that flag; no new SDK option is
+  required. Contexts belonging to other root connections are not disposed.
+  If disposal cannot be confirmed, the guardian retains the connection and
+  interception in quarantine. Because interception spans the browser, pending
+  HTTP requests in other contexts can also remain paused until cleanup or
+  recovery. Quarantine favors retaining interception over availability.
+- **Guardian death and loss of its Chromium connection remain HTTP policy
+  limits (OPL-5954).** Legacy backends and direct Chromium connections also
+  lack the guardian's disconnect protection. In these cases Chromium can
+  remove interception before destroying the context and resume a paused HTTP
+  request without policy approval. The SDK ends its session and ignores late
+  policy results, but cannot prevent that browser-side delivery.
+  `disposeOnDetach` alone provides eventual cleanup, not a network-enforcement
   guarantee. Use independent guest egress controls when network containment
-  must survive control-connection loss.
+  must survive loss of the guardian or its Chromium connection.
 - Browser-level interception also briefly pauses other browser contexts' HTTP
   requests while their ownership is established. Positively identified foreign
   requests continue without invoking this toolset's policy. The driver may
@@ -1985,7 +1999,7 @@ revokes its capability; it does not stop Chromium or delete the computer.
   controller closes a previously unobserved frame with a request still pending.
   Other browser contexts remain available. Normal close and lease termination
   use the same confirmed-disposal ordering; if confirmation fails, the
-  control-connection-loss limitation above applies.
+  deployed guardian's protection and the limits above apply.
 - Cross-site frames run as part of their tab. Their HTTP(S) requests meet the
   same URL hook with that tab's ID. Frame initialization still occurs before
   releasing a frame that Chromium has paused. A cross-site frame's contents
@@ -2023,8 +2037,9 @@ revokes its capability; it does not stop Chromium or delete the computer.
   identities per session, with at most 128 unresolved lookups and 128 targets
   in one ownership survey. Exceeding those bounds also ends the session.
 
-The abrupt-loss limitation has been reproduced in Linux Chromium CI. To run
-the retained strict no-delivery characterization for OPL-5952:
+The direct-Chromium abrupt-loss limitation has been reproduced in Linux
+Chromium CI. To run the retained strict no-delivery characterization for
+OPL-5952 against Chromium without a guardian:
 
 ```sh
 MANDALA_TEST_CHROMIUM=/path/to/chromium MANDALA_TEST_STRICT_CDP_LOSS=1 \
@@ -2037,6 +2052,31 @@ The default abrupt-loss test checks that the SDK ends, its context is eventually
 removed, unrelated contexts work, and a late callback cannot send an SDK
 continuation. Active-connection policy tests and successful close, expiry and
 renewal-failure disposal tests always retain their strict no-delivery assertions.
+
+A separate opt-in suite tests the real guardian with both sync and async
+toolsets, for an abrupt SDK socket abort and an orderly WebSocket close:
+
+```sh
+MANDALA_TEST_CHROMIUM=/path/to/chromium \
+  MANDALA_TEST_CDP_PROXY=/path/to/guardian-test-launcher.py \
+  python -m pytest -q tests/test_browser_guardian.py
+```
+
+The launcher is supplied by the backend integration environment; the public
+SDK does not bundle or download it. The test runs it with the current Python
+interpreter and Chromium's root WebSocket URL as its argument. Its first stdout
+line must be JSON containing `url`, a loopback WebSocket URL with the same
+browser path; diagnostics go to stderr. It must proxy through the real
+guardian and keep that guardian alive when the SDK disconnects. The test
+terminates and waits for the launcher during cleanup.
+
+When configured, these tests require the advertised guardian capability and
+always assert no delivery of the held HTTP request, removal of the owned
+context, continued operation of a foreign context, and no SDK continuation
+from a late policy result. A direct observer enables no second interceptor.
+They cut the SDK connection, not the guardian's connection to Chromium, and
+do not replace the unprotected-loss characterization above. Without
+`MANDALA_TEST_CDP_PROXY`, only this separate guardian suite is skipped.
 
 **Explicit browser files.** `BrowserFilePolicy` binds one exact Computer client
 (and its account authority), task ID, browser context and toolset. It cannot be
