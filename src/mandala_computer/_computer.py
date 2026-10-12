@@ -1390,8 +1390,9 @@ def _ramp_delay(turn: int, poll: float) -> float:
     answer usually arrives within a second or two of the first read: a flat
     interval rounded every one of those up to a whole ``poll``, so a secret that
     landed just after a read made ``launch`` sleep out the rest of three
-    seconds before noticing. A poll that FAILED does not ramp; that is
-    :func:`_poll_delay`'s business, and it still honours ``Retry-After``.
+    seconds before noticing. The desktop probe's expected reasonless 409 is
+    also an ordinary "not yet". Other failures use :func:`_poll_delay`, which
+    still honours ``Retry-After``.
     """
     return min(FIRST_POLL * 2.0 ** min(turn, 30), poll)
 
@@ -1439,6 +1440,15 @@ def _desktop_wait_fatal(err: MandalaError) -> bool:
     if isinstance(err, APIError) and err.reason == "unavailable":
         return True
     return not _is_transient_for_poll(err)
+
+
+def _desktop_not_yet(err: MandalaError) -> bool:
+    """The desktop probe's expected no-session response, rather than contention.
+
+    Only this probe treats a reasonless 409 as an ordinary readiness observation.
+    Classified conflicts keep their conservative polling delay.
+    """
+    return isinstance(err, APIError) and err.status == 409 and err.reason is None
 
 
 def _desktop_timeout(computer_id: str, timeout: float) -> str:
@@ -3669,15 +3679,15 @@ class Computer(ComputerFields):
 
         Probes again 0.25s after the first probe, then doubling up to ``poll``,
         so a session that appears a moment after a probe is not a whole
-        interval late; a refusal polled through waits ``poll`` (or its
-        ``Retry-After``).
+        interval late. The reasonless no-session 409 uses this ramp too;
+        other transient failures wait ``poll`` (or their ``Retry-After``).
         """
         check_wait_args(timeout, poll)
         if _desktop_wait_skipped(self._data):
             return self
         deadline = time.monotonic() + timeout
         # Ordinary "not yet" answers so far, which ramp the sleep (see
-        # _ramp_delay); a refusal polled through sets its own delay instead.
+        # _ramp_delay); other transient failures set their own delay instead.
         not_yet = 0
         while True:
             delay: float | None = None
@@ -3700,7 +3710,8 @@ class Computer(ComputerFields):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(_desktop_timeout(self.id, timeout)) from err
-                delay = _poll_delay(err, poll)
+                if not _desktop_not_yet(err):
+                    delay = _poll_delay(err, poll)
             if delay is None:
                 delay = _ramp_delay(not_yet, poll)
                 not_yet += 1
