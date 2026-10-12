@@ -2260,9 +2260,12 @@ class Workspaces:
         return Workspace.from_api(self._t.json_object("GET", _api.workspace(workspace_id)))
 
     def members(self, workspace_id: str) -> builtins.list[WorkspaceMember]:
-        """The people who reach this workspace, oldest member first — the
-        account's accepted members, since everybody on the account reaches every
-        workspace at their account role.
+        """The account's accepted members, oldest member first. Their account
+        roles apply to every workspace; inclusion in the roster does not
+        guarantee access. ``suspended`` means a global sign-in suspension,
+        while ``seat_suspended`` means the member is waiting for a plan seat
+        and cannot use the account. The flags are independent; an older server
+        that omits ``seat_suspended`` leaves it ``None`` (unknown).
 
         A key confined to a workspace cannot list them: it raises
         :class:`~mandala_computer.PermissionDeniedError` (403), because the list

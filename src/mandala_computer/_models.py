@@ -4745,11 +4745,12 @@ class WorkspaceDeleted:
 
 @dataclass(frozen=True)
 class WorkspaceMember:
-    """Somebody who reaches a workspace: an accepted member of the account.
+    """An accepted member of the account, included in its workspace rosters.
 
-    Workspaces do not divide people — everybody on the account reaches every
-    workspace at their account role — so a workspace's members are the
-    account's. Invitations not yet accepted are left out.
+    Workspaces do not divide people: a member's account role applies to every
+    workspace. The roster includes people waiting for a plan seat or suspended
+    from signing in, so inclusion does not guarantee access. Invitations not
+    yet accepted are left out.
     """
 
     #: ``usr-`` and sixteen hex characters.
@@ -4763,20 +4764,27 @@ class WorkspaceMember:
     role: str
     #: When they joined the account.
     accepted_at: str
-    #: ``True`` when this person cannot sign in at the moment. They are still
-    #: on the account.
+    #: ``True`` when this person is globally suspended from signing in. They
+    #: are still on the account; this is independent of ``seat_suspended``.
     suspended: bool
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: ``True`` when this accepted member is waiting for a plan seat and cannot
+    #: use the account. ``None`` means an older server omitted the field;
+    #: it does not confirm that they have a seat.
+    seat_suspended: bool | None = None
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "workspace member") -> WorkspaceMember:
-        """Refuses a row that cannot say whether its person is suspended, rather
-        than reporting them as able to sign in."""
+        """Require ``suspended`` and any supplied ``seat_suspended`` to be
+        boolean. Only an omitted seat state is unknown for older servers."""
         if not isinstance(d, Mapping):
             raise MandalaError(f"{where}: not an object")
         suspended = d.get("suspended")
         if not isinstance(suspended, bool):
             raise MandalaError(f"{where}: suspended is not true or false")
+        seat_suspended = d.get("seat_suspended")
+        if "seat_suspended" in d and not isinstance(seat_suspended, bool):
+            raise MandalaError(f"{where}: seat_suspended is not true or false")
         return cls(
             user_id=_key_text(d, "user_id", where),
             email=_text(d.get("email")),
@@ -4785,6 +4793,7 @@ class WorkspaceMember:
             accepted_at=_text(d.get("accepted_at")),
             suspended=suspended,
             raw=dict(d),
+            seat_suspended=seat_suspended,
         )
 
 

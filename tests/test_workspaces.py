@@ -82,6 +82,85 @@ async def test_async_list_get_and_members() -> None:
         )
 
 
+@pytest.mark.parametrize("suspended", [False, True])
+@pytest.mark.parametrize("seat_suspended", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_member_suspension_flags_are_independent(
+    suspended: bool, seat_suspended: bool, asynchronous: bool
+) -> None:
+    row = {**MEMBER, "suspended": suspended, "seat_suspended": seat_suspended, "future": "kept"}
+    respx.get(f"{BASE}/workspaces/{WORKSPACE['id']}/members").mock(
+        return_value=httpx.Response(200, json=[row])
+    )
+    if asynchronous:
+        async with mc.AsyncClient("com_test", base_url=BASE) as c:
+            members = await c.workspaces.members(WORKSPACE["id"])
+    else:
+        with client() as sync_client:
+            members = sync_client.workspaces.members(WORKSPACE["id"])
+    assert len(members) == 1
+    assert members[0].suspended is suspended
+    assert members[0].seat_suspended is seat_suspended
+    assert members[0].raw == row
+
+
+@pytest.mark.parametrize("suspended", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_older_server_member_seat_state_is_unknown(
+    suspended: bool, asynchronous: bool
+) -> None:
+    row = {**MEMBER, "suspended": suspended}
+    respx.get(f"{BASE}/workspaces/{WORKSPACE['id']}/members").mock(
+        return_value=httpx.Response(200, json=[row])
+    )
+    if asynchronous:
+        async with mc.AsyncClient("com_test", base_url=BASE) as c:
+            members = await c.workspaces.members(WORKSPACE["id"])
+    else:
+        with client() as sync_client:
+            members = sync_client.workspaces.members(WORKSPACE["id"])
+    assert members[0].suspended is suspended
+    assert members[0].seat_suspended is None
+    assert members[0].raw == row
+    assert "seat_suspended" not in members[0].raw
+
+
+@pytest.mark.parametrize("bad", [None, 0, 1, "false", "true", [], {}])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_supplied_non_boolean_member_seat_state_is_refused(
+    bad: object, asynchronous: bool
+) -> None:
+    respx.get(f"{BASE}/workspaces/{WORKSPACE['id']}/members").mock(
+        return_value=httpx.Response(200, json=[{**MEMBER, "seat_suspended": bad}])
+    )
+    with pytest.raises(
+        mc.MandalaError, match="workspace member 0: seat_suspended is not true or false"
+    ):
+        if asynchronous:
+            async with mc.AsyncClient("com_test", base_url=BASE) as c:
+                await c.workspaces.members(WORKSPACE["id"])
+        else:
+            with client() as sync_client:
+                sync_client.workspaces.members(WORKSPACE["id"])
+
+
+def test_member_existing_positional_constructor_keeps_raw_and_unknown_seat_state() -> None:
+    raw = {**MEMBER, "future": "kept"}
+    member = mc.WorkspaceMember(
+        MEMBER["user_id"], MEMBER["email"], None, MEMBER["role"], MEMBER["accepted_at"], False, raw
+    )
+    assert member.raw is raw
+    assert member.seat_suspended is None
+    without_raw = mc.WorkspaceMember(
+        MEMBER["user_id"], MEMBER["email"], None, MEMBER["role"], MEMBER["accepted_at"], False
+    )
+    assert without_raw.raw == {}
+    assert without_raw.seat_suspended is None
+
+
 @respx.mock
 def test_an_id_is_one_path_segment() -> None:
     route = respx.get(f"{BASE}/workspaces/a%2F..%2Fb").mock(
