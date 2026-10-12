@@ -5,6 +5,10 @@ MANDALA_TEST_CDP_PROXY to a local Python launcher that accepts Chromium's root
 WebSocket URL and prints {"url": "ws://127.0.0.1:port/<same browser path>"} on
 its first stdout line. The launcher must keep the production guardian alive
 when its downstream WebSocket closes; diagnostics belong on stderr.
+
+These cases cut the SDK's downstream connection only. Advertising host-link
+protection is checked for compatibility, but exercising that separate failure
+mode belongs to the backend integration suite.
 """
 
 from __future__ import annotations
@@ -111,12 +115,13 @@ async def test_guardian_disposes_owned_context_before_releasing_held_http(
     base, hits = policy_site
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     seen: list[tuple[str | None, str]] = []
+    callback_timeout = 10.0
 
     def sync_policy(context: Any, destination: str) -> None:
         seen.append((context.tab_id, destination))
         if destination == base + "/held":
             entered.set()
-            if not release.wait(10):
+            if not release.wait(callback_timeout):
                 raise ToolError("test callback was not released")
             returned.set()
 
@@ -124,7 +129,12 @@ async def test_guardian_disposes_owned_context_before_releasing_held_http(
         seen.append((context.tab_id, destination))
         if destination == base + "/held":
             entered.set()
-            await until(release.is_set)
+            deadline = asyncio.get_running_loop().time() + callback_timeout
+            while not release.is_set():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise ToolError("test callback was not released")
+                await asyncio.sleep(min(0.02, remaining))
             returned.set()
 
     computer, revoked = remote(url, asynchronous)
@@ -203,7 +213,7 @@ async def test_guardian_disposes_owned_context_before_releasing_held_http(
             assert foreign_context in contexts
             await foreign.send("Page.navigate", {"url": base + "/foreign-after-loss"}, session)
             await until(lambda: "/foreign-after-loss" in hits)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1)
             assert not [destination for _, destination in seen if "/foreign-" in destination]
             assert "/held" not in hits, "the protected disconnect released a pending HTTP request"
             assert (await tool("list_tabs")).get("is_error")
