@@ -873,6 +873,158 @@ async def test_async_cross_site_frame_runs_under_the_policy(chrome: str, cross_s
     assert_no_workers(hits)  # Not at the page's exit either.
 
 
+@pytest.fixture
+def sandboxed_srcdoc() -> Any:
+    """An opaque-origin OOPIF makes requests in its very first script.
+
+    Unlike a cross-site URL navigation, Chromium does not pause this frame
+    before it runs. Its original Worker constructor is available before the
+    driver's new-document script can be installed on the frame session.
+    """
+    hits: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            base = f"http://127.0.0.1:{self.server.server_port}"
+            kind = self.path.removeprefix("/")
+            if kind in ("blob", "data"):
+                nested = (
+                    f"fetch({json.dumps(base + '/forbidden-nested-' + kind)},"
+                    "{mode:'no-cors'}).then(()=>postMessage('nested-finished'),"
+                    "()=>postMessage('nested-finished'));"
+                )
+                worker = (
+                    f"fetch({json.dumps(base + '/forbidden-worker-' + kind)},"
+                    "{mode:'no-cors'}).then(()=>postMessage('worker-finished'),"
+                    "()=>postMessage('worker-finished'));"
+                    f"const source={json.dumps(nested)};"
+                    "const nested=new Worker('data:text/javascript,'+encodeURIComponent(source));"
+                    "nested.onmessage=e=>postMessage(e.data);"
+                )
+                frame = (
+                    "<script>parent.postMessage('frame-ran','*');"
+                    f"fetch({json.dumps(base + '/forbidden-direct-' + kind)},"
+                    "{mode:'no-cors'}).then(()=>parent.postMessage('direct-finished','*'),"
+                    "()=>parent.postMessage('direct-finished','*'));"
+                    f"const source={json.dumps(worker)};"
+                    "try { const worker=new Worker("
+                    + (
+                        "URL.createObjectURL(new Blob([source],{type:'text/javascript'}))"
+                        if kind == "blob"
+                        else "'data:text/javascript,'+encodeURIComponent(source)"
+                    )
+                    + ");worker.onmessage=e=>parent.postMessage(e.data,'*');"
+                    "} catch(e) { parent.postMessage('worker-refused','*'); }</script>"
+                )
+                # Avoid an HTML end-tag in the outer script's string literal.
+                encoded = json.dumps(frame).replace("</script", "<\\/script")
+                body = (
+                    "<body><p id=log>page-ran</p><script>"
+                    "addEventListener('message',e=>{document.getElementById('log')"
+                    ".textContent+=' '+e.data});fetch('/allowed');"
+                    "const frame=document.createElement('iframe');"
+                    "frame.sandbox='allow-scripts';"
+                    f"frame.srcdoc={encoded};document.body.appendChild(frame);"
+                    "</script></body>"
+                )
+            else:
+                body = "ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *_: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", hits
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def sandbox_finished(page: str) -> bool:
+    return "direct-finished" in page and (
+        ("worker-finished" in page and "nested-finished" in page) or "worker-refused" in page
+    )
+
+
+def assert_sandbox_policy(
+    base: str, hits: list[str], seen: list[tuple[Any, str]], tab: str, page: str, kind: str
+) -> None:
+    assert "/allowed" in hits and "page-ran" in page and "frame-ran" in page
+    assert not [path for path in hits if path.startswith("/forbidden-")]
+    assert sandbox_finished(page)
+    assert (tab, f"{base}/forbidden-direct-{kind}") in seen
+    if "worker-finished" in page:
+        assert (tab, f"{base}/forbidden-worker-{kind}") in seen
+        assert (tab, f"{base}/forbidden-nested-{kind}") in seen
+    # The preflight navigation may have no tab, but background requests must
+    # identify the owning tab, including the frame's and worker's requests.
+    assert all(owner == tab for owner, url in seen if "/forbidden-" in url)
+
+
+@pytest.mark.parametrize("kind", ["blob", "data"])
+def test_sync_unpaused_sandboxed_srcdoc_requests_meet_the_tab_policy(
+    chrome: str, sandboxed_srcdoc: Any, kind: str
+) -> None:
+    computer, revoked = remote(chrome, False)
+    base, hits = sandboxed_srcdoc
+    seen: list[tuple[Any, str]] = []
+
+    def policy(context: Any, url: str) -> None:
+        seen.append((context.tab_id, url))
+        if "/forbidden-" in url:
+            raise ToolError("not permitted")
+
+    with MandalaBrowserToolset(computer, url_policy=policy) as browser:
+        nav = assert_success(browser.tool_result(use("navigate", url=f"{base}/{kind}")))
+        tab = tabs(nav)[0]["tab_id"]
+        page = ""
+        for _ in range(50):
+            page = text(assert_success(browser.tool_result(use("get_page_text"))))
+            if sandbox_finished(page):
+                break
+            time.sleep(0.1)
+        assert_sandbox_policy(base, hits, seen, tab, page, kind)
+    assert revoked == [IDENT]
+    assert not [path for path in hits if path.startswith("/forbidden-")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["blob", "data"])
+async def test_async_unpaused_sandboxed_srcdoc_requests_meet_the_tab_policy(
+    chrome: str, sandboxed_srcdoc: Any, kind: str
+) -> None:
+    computer, revoked = remote(chrome, True)
+    base, hits = sandboxed_srcdoc
+    seen: list[tuple[Any, str]] = []
+
+    async def policy(context: Any, url: str) -> None:
+        seen.append((context.tab_id, url))
+        if "/forbidden-" in url:
+            raise ToolError("not permitted")
+
+    async with AsyncMandalaBrowserToolset(computer, url_policy=policy) as browser:
+        nav = assert_success(await browser.tool_result(use("navigate", url=f"{base}/{kind}")))
+        tab = tabs(nav)[0]["tab_id"]
+        page = ""
+        for _ in range(50):
+            page = text(assert_success(await browser.tool_result(use("get_page_text"))))
+            if sandbox_finished(page):
+                break
+            await asyncio.sleep(0.1)
+        assert_sandbox_policy(base, hits, seen, tab, page, kind)
+    assert revoked == [IDENT]
+    assert not [path for path in hits if path.startswith("/forbidden-")]
+
+
 def owned_backend(policy: Any = None) -> tuple[Any, list[tuple[str, Any, Any]]]:
     """A backend with one ready tab, recording every command it sends."""
     from mandala_computer._browser_cdp import BrowserCDP
@@ -882,6 +1034,7 @@ def owned_backend(policy: Any = None) -> tuple[Any, list[tuple[str, Any, Any]]]:
     backend.context = "context"
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.active = "tab"
     sent: list[tuple[str, Any, Any]] = []
 
@@ -945,9 +1098,10 @@ async def test_frames_under_an_owned_tab_run_and_workers_are_held_never_closed()
     await backend._event(attached("frame-s", "frame-t", "iframe", "page"))
     assert [(m, s) for m, _, s in sent] == [
         *[(name, "frame-s") for name, _ in _FRAME_INIT],
+        ("Page.getFrameTree", "frame-s"),
         ("Runtime.runIfWaitingForDebugger", "frame-s"),
     ]
-    assert {"Page.enable", "Fetch.enable", "Target.setAutoAttach"} <= {m for m, _, _ in sent}
+    assert {"Page.enable", "Target.setAutoAttach"} <= {m for m, _, _ in sent}
     # A frame inside that frame is the same tab's, however deep.
     sent.clear()
     await backend._event(attached("nested-s", "nested-t", "iframe", "frame-s"))
@@ -960,20 +1114,19 @@ async def test_frames_under_an_owned_tab_run_and_workers_are_held_never_closed()
     await backend._event(attached("worker-s", "worker-t", "worker", "frame-s"))
     await backend._event(attached("worker2-s", "worker2-t", "worker", "page"))
     assert sent == [] and backend._owner("worker-s") is None
-    # The frame's requests answer to the tab's policy, on the frame's session.
+    # The frame's requests answer to its tab's policy through the browser session.
     sent.clear()
     for ident, url in [("1", "https://ok.test/"), ("2", "https://ok.test/blocked")]:
         await backend._event(
             {
                 "method": "Fetch.requestPaused",
-                "sessionId": "nested-s",
-                "params": {"requestId": ident, "request": {"url": url}},
+                "params": {"requestId": ident, "frameId": "nested-t", "request": {"url": url}},
             }
         )
     assert seen == [("tab", "https://ok.test/"), ("tab", "https://ok.test/blocked")]
     assert [(m, p["requestId"], s) for m, p, s in sent] == [
-        ("Fetch.continueRequest", "1", "nested-s"),
-        ("Fetch.failRequest", "2", "nested-s"),
+        ("Fetch.continueRequest", "1", None),
+        ("Fetch.failRequest", "2", None),
     ]
     assert not backend.failed
     # Closing the tab forgets its frames, and their requests die with them.
@@ -1018,14 +1171,14 @@ async def test_targets_outside_an_owned_tab_are_still_closed(message: dict[str, 
 
 
 @pytest.mark.asyncio
-async def test_a_frame_that_cannot_take_the_policy_stays_paused_without_ending_the_tab() -> None:
+async def test_a_frame_whose_runtime_setup_fails_stays_paused_without_ending_the_tab() -> None:
     from mandala_computer._browser_cdp import BrowserError
 
     backend, sent = owned_backend()
     plain = backend.send
 
     async def send(method: str, params: Any = None, session: Any = None) -> Any:
-        if method == "Fetch.enable" and session == "frame-s":
+        if method == "Runtime.enable" and session == "frame-s":
             raise BrowserError("Chromium could not complete the browser action.")
         return await plain(method, params, session)
 
@@ -1053,7 +1206,9 @@ async def test_a_detached_frame_fails_its_pending_command_promptly() -> None:
     backend.context = "context"
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.child_frames = {"frame-s": ("tab", "frame-t", "page")}
+    backend.request_owners["frame-t"] = "tab"
     command = asyncio.create_task(backend.send("Runtime.enable", session="frame-s"))
     other = asyncio.create_task(backend.send("Runtime.enable", session="page"))
     await asyncio.sleep(0)
@@ -1107,6 +1262,7 @@ async def test_a_burst_of_paused_requests_waits_its_turn_instead_of_ending_the_s
     backend.ws = socket = Socket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     total = 600
     for i in range(total):
@@ -1114,8 +1270,11 @@ async def test_a_burst_of_paused_requests_waits_its_turn_instead_of_ending_the_s
             json.dumps(
                 {
                     "method": "Fetch.requestPaused",
-                    "sessionId": "page",
-                    "params": {"requestId": str(i), "request": {"url": f"https://a.test/{i}"}},
+                    "params": {
+                        "requestId": str(i),
+                        "frameId": "tab",
+                        "request": {"url": f"https://a.test/{i}"},
+                    },
                 }
             )
         )
@@ -1157,8 +1316,11 @@ async def test_an_unbounded_event_flood_still_ends_the_session(monkeypatch: Any)
                 json.dumps(
                     {
                         "method": "Fetch.requestPaused",
-                        "sessionId": "page",
-                        "params": {"requestId": str(i), "request": {"url": "https://a.test/"}},
+                        "params": {
+                            "requestId": str(i),
+                            "frameId": "tab",
+                            "request": {"url": "https://a.test/"},
+                        },
                     }
                 )
                 for i in range(20)
@@ -1168,8 +1330,10 @@ async def test_an_unbounded_event_flood_still_ends_the_session(monkeypatch: Any)
             return self
 
         async def __anext__(self) -> str:
-            if not self.events:
-                await asyncio.Event().wait()
+            while not self.events and not self.closed:
+                await asyncio.sleep(0)
+            if self.closed:
+                raise StopAsyncIteration
             return self.events.pop(0)
 
         async def close(self) -> None:
@@ -1179,6 +1343,7 @@ async def test_an_unbounded_event_flood_still_ends_the_session(monkeypatch: Any)
     backend.ws = socket = Socket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     await asyncio.wait_for(backend._read(), 1)
     assert backend.failed and socket.closed
     with pytest.raises(BrowserError, match="faster than the session"):
@@ -1253,11 +1418,10 @@ class ScriptedSocket:
         self.inbox.put_nowait(json.dumps(message))
 
 
-def paused(ident: str, session: str, url: str) -> dict[str, Any]:
+def paused(ident: str, frame: str, url: str) -> dict[str, Any]:
     return {
         "method": "Fetch.requestPaused",
-        "sessionId": session,
-        "params": {"requestId": ident, "request": {"url": url}},
+        "params": {"requestId": ident, "frameId": frame, "request": {"url": url}},
     }
 
 
@@ -1283,16 +1447,18 @@ async def test_a_frame_detached_while_the_queue_is_full_does_not_end_the_session
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.child_frames = {"frame-s": ("tab", "frame-t", "page")}
+    backend.request_owners["frame-t"] = "tab"
     backend.reader = asyncio.create_task(backend._read())
     try:
         # A request in the frame is allowed and its continue is in flight...
-        socket.push(paused("f1", "frame-s", "https://ok.test/"))
-        await settle(lambda: any(m.get("sessionId") == "frame-s" for m in socket.sent))
-        command = next(m for m in socket.sent if m.get("sessionId") == "frame-s")
+        socket.push(paused("f1", "frame-t", "https://ok.test/"))
+        await settle(lambda: any(m["method"] == "Fetch.continueRequest" for m in socket.sent))
+        command = next(m for m in socket.sent if m["method"] == "Fetch.continueRequest")
         # ...when the tab fills every slot with requests waiting on the policy.
         for i in range(300):
-            socket.push(paused(str(i), "page", "https://ok.test/slow"))
+            socket.push(paused(str(i), "tab", "https://ok.test/slow"))
         await settle(lambda: len(backend.tasks) >= 256 and backend.policy_lane.waiting)
         # The frame goes; Chromium says so, then refuses the in-flight command.
         socket.push(
@@ -1303,7 +1469,7 @@ async def test_a_frame_detached_while_the_queue_is_full_does_not_end_the_session
             }
         )
         socket.push(
-            {"id": command["id"], "error": {"code": -32001, "message": "Session not found."}}
+            {"id": command["id"], "error": {"code": -32602, "message": "Invalid InterceptionId."}}
         )
         await asyncio.sleep(0.05)
         assert not backend.failed and not socket.closed
@@ -1330,11 +1496,12 @@ async def test_large_events_are_noted_or_trimmed_rather_than_queued_whole(
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     huge = "x" * (2 * 1024 * 1024)
     try:
         for i in range(256):
-            socket.push(paused(str(i), "page", "https://ok.test/"))
+            socket.push(paused(str(i), "tab", "https://ok.test/"))
         await settle(lambda: len(backend.policy_lane.running) == 256)
         # Console output is noted in place, whatever its size, and never queued.
         for _ in range(20):
@@ -1347,7 +1514,7 @@ async def test_large_events_are_noted_or_trimmed_rather_than_queued_whole(
             )
         # A queued request keeps only what its check reads: an over-long URL
         # stays over-long, so it is still refused.
-        socket.push(paused("long", "page", "https://ok.test/" + huge))
+        socket.push(paused("long", "tab", "https://ok.test/" + huge))
         await settle(lambda: backend.policy_lane.waiting)
         assert len(backend.console["tab"]) == 20
         assert all(len(line) <= 2000 for line in backend.console["tab"])
@@ -1357,7 +1524,7 @@ async def test_large_events_are_noted_or_trimmed_rather_than_queued_whole(
         # The byte budget still ends a flood of queued events.
         monkeypatch.setattr(_browser_cdp, "_EVENT_QUEUE_BYTES", size * 3)
         for i in range(5):
-            socket.push(paused(f"more{i}", "page", "https://ok.test/" + huge))
+            socket.push(paused(f"more{i}", "tab", "https://ok.test/" + huge))
         await settle(lambda: backend.failed)
         with pytest.raises(BrowserError, match="faster than the session"):
             await backend.start()
@@ -1383,11 +1550,13 @@ async def test_unused_events_are_dropped_and_target_events_skip_the_queue() -> N
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.child_frames = {"frame-s": ("tab", "frame-t", "page")}
+    backend.request_owners["frame-t"] = "tab"
     backend.reader = asyncio.create_task(backend._read())
     try:
         for i in range(300):
-            socket.push(paused(str(i), "page", "https://ok.test/"))
+            socket.push(paused(str(i), "tab", "https://ok.test/"))
         socket.push({"method": "Network.dataReceived", "sessionId": "page", "params": {}})
         socket.push({"method": "Target.targetDestroyed", "params": {"targetId": "frame-t"}})
         await settle(lambda: "frame-s" not in backend.child_frames)
@@ -1415,8 +1584,8 @@ async def test_unused_events_are_dropped_and_target_events_skip_the_queue() -> N
             "suggestedFilename",
             "safe_filename",
         ),
-        (paused("1", "page", "https://ok.test/" + "a" * 9000), "url", "check"),
-        (paused("1", "page", None), "url", "check"),
+        (paused("1", "tab", "https://ok.test/" + "a" * 9000), "url", "check"),
+        (paused("1", "tab", None), "url", "check"),
     ],
 )
 @pytest.mark.asyncio
@@ -1460,6 +1629,7 @@ async def test_a_frame_leaving_never_overtakes_its_own_download() -> None:
     backend.files = files = Files()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     try:
         # Both arrive in one read, before the download's handler can run.
@@ -1531,6 +1701,7 @@ async def test_a_detach_takes_the_whole_subtree_and_its_pending_commands() -> No
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     # page > a > b > c, and page > other.
     backend.child_frames = {
         "a": ("tab", "a-t", "page"),
@@ -1631,11 +1802,12 @@ async def test_a_download_belongs_to_its_frame_as_it_arrives() -> None:
     backend.files = files = Files()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.ready = {"tab": asyncio.Event()}
     backend.reader = asyncio.create_task(backend._read())
     try:
         for i in range(256):
-            socket.push(paused(str(i), "page", "https://ok.test/"))
+            socket.push(paused(str(i), "tab", "https://ok.test/"))
         await settle(lambda: len(backend.policy_lane.running) == 256)
         # The download waits its turn; its tab goes at once.
         socket.push(
@@ -1648,6 +1820,18 @@ async def test_a_download_belongs_to_its_frame_as_it_arrives() -> None:
         await settle(lambda: "tab" not in backend.tabs)
         assert "frame" not in files.frames
         hold.set()
+        # Root interception remains attached when a tab goes. Chromium answers
+        # failures of its now-discarded requests with Invalid InterceptionId;
+        # model those replies so they no longer occupy the policy lane.
+        await settle(lambda: len(socket.sent) == 256)
+        for command in socket.sent:
+            assert command["method"] == "Fetch.failRequest"
+            socket.push(
+                {
+                    "id": command["id"],
+                    "error": {"code": -32602, "message": "Invalid InterceptionId."},
+                }
+            )
         await settle(lambda: files.seen)
         assert files.seen == [True]
     finally:
@@ -1714,10 +1898,11 @@ async def test_frames_removed_while_the_queue_is_full_are_forgotten_at_once() ->
     backend.files = files = FrameFiles()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     try:
         for i in range(256):
-            socket.push(paused(str(i), "page", "https://ok.test/"))
+            socket.push(paused(str(i), "tab", "https://ok.test/"))
         await settle(lambda: len(backend.policy_lane.running) == 256)
         for i in range(300):
             for method in ("Page.frameAttached", "Page.frameDetached"):
@@ -1752,6 +1937,7 @@ async def test_a_frame_noted_after_a_detach_stays_tracked() -> None:
     backend.files = files = FrameFiles()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.child_frames = {"frame-s": ("tab", "frame", "page")}
     files.frames = {"frame": "tab"}
     seen: list[Any] = []
@@ -1807,12 +1993,13 @@ async def test_a_navigation_and_a_dialog_never_wait_behind_held_subresources() -
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     try:
         for i in range(400):
-            socket.push(paused(str(i), "page", f"https://ok.test/{i}.png"))
+            socket.push(paused(str(i), "tab", f"https://ok.test/{i}.png"))
         await settle(lambda: len(backend.policy_lane.waiting) == 400 - 256)
-        document = paused("doc", "page", "https://ok.test/next")
+        document = paused("doc", "tab", "https://ok.test/next")
         document["params"].update(frameId="tab", resourceType="Document")
         socket.push(document)
         socket.push(
@@ -1857,12 +2044,13 @@ async def test_slow_sync_policies_for_subresources_hold_no_navigation_or_renewal
     backend.ws = socket = ScriptedSocket()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     try:
         for i in range(300):
-            socket.push(paused(str(i), "page", f"https://ok.test/{i}.png"))
+            socket.push(paused(str(i), "tab", f"https://ok.test/{i}.png"))
         await settle(lambda: len(checked) >= 32)
-        document = paused("doc", "page", "https://ok.test/next")
+        document = paused("doc", "tab", "https://ok.test/next")
         document["params"].update(frameId="tab", resourceType="Document")
         socket.push(document)
         await settle(lambda: any(m["method"] == "Fetch.continueRequest" for m in socket.sent))
@@ -2681,6 +2869,7 @@ async def test_a_frame_tree_reply_counts_before_the_events_read_after_it() -> No
     backend.files = files = FrameFiles()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     files.frames = {"tab": "tab"}
     decided: list[Any] = []
 
@@ -2738,6 +2927,7 @@ async def test_a_child_waiting_on_a_restored_parent_is_adopted_as_the_tree_is_re
     backend.files = files = FrameFiles()
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     files.frames = {"tab": "tab"}
     decided: list[Any] = []
 
@@ -3121,6 +3311,7 @@ async def test_a_popup_gone_before_its_refusal_starts_is_not_brought_back() -> N
     backend.context = "context"
     backend.tabs = {"tab": {}}
     backend.sessions = {"tab": "page"}
+    backend.request_owners = {"tab": "tab"}
     backend.reader = asyncio.create_task(backend._read())
     try:
         # In one read: a popup attaches and is gone.
