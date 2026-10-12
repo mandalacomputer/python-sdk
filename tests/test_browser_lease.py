@@ -426,6 +426,145 @@ def test_non_default_port_is_part_of_the_origin():
         )
 
 
+def request_browser_grant(asynchronous, base, response, methods, policy=None):
+    def handler(request):
+        methods.append(request.method)
+        assert request.headers["Authorization"] == "Bearer com_test"
+        path = "/api/v1/computers/vm-1"
+        if request.method == "GET":
+            assert request.url.path == path
+            return httpx.Response(200, json={"id": "vm-1", "status": "running"})
+        if request.method == "POST":
+            assert request.url.path == path + "/browser-connections"
+            return httpx.Response(201, json=response)
+        assert request.method == "DELETE"
+        assert request.url.path == path + f"/browser-connections/{IDENT}"
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    if asynchronous:
+
+        async def run():
+            async with (
+                httpx.AsyncClient(transport=transport) as http,
+                AsyncClient("com_test", base_url=base, http_client=http) as client,
+            ):
+                computer = await client.computers.get("vm-1")
+                return await computer.create_browser_connection(session_policy=policy)
+
+        return asyncio.run(run())
+    with (
+        httpx.Client(transport=transport) as http,
+        Client("com_test", base_url=base, http_client=http) as client,
+    ):
+        return client.computers.get("vm-1").create_browser_connection(session_policy=policy)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("policy", [None, BrowserSessionPolicy()])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "base,canonical,previous",
+    [
+        (
+            "https://[2001:db8:0:0:0:0:0:1]/api/v1",
+            "wss://[2001:db8::1]",
+            "wss://[2001:db8:0:0:0:0:0:1]",
+        ),
+        (
+            "https://[2001:0DB8::1]:443/api/v1/",
+            "wss://[2001:db8::1]",
+            "wss://[2001:0db8::1]",
+        ),
+        ("https://[2001:db8::1]/api/v1", "wss://[2001:db8::1]", "wss://[2001:db8::1]"),
+        ("http://[0:0:0:0:0:0:0:1]:80/api/v1", "ws://[::1]", "ws://[0:0:0:0:0:0:0:1]"),
+        (
+            "https://[2001:db8:0:0:0:0:0:1]:8443/api/v1",
+            "wss://[2001:db8::1]:8443",
+            "wss://[2001:db8:0:0:0:0:0:1]:8443",
+        ),
+        (
+            "http://[2001:0db8::1]:8080/api/v1",
+            "ws://[2001:db8::1]:8080",
+            "ws://[2001:0db8::1]:8080",
+        ),
+        (
+            "https://[::FFFF:192.0.2.128]/api/v1",
+            "wss://[::ffff:c000:280]",
+            "wss://[::ffff:192.0.2.128]",
+        ),
+        (
+            "https://[0:0:0:0:0:ffff:c000:0280]/api/v1",
+            "wss://[::ffff:c000:280]",
+            "wss://[0:0:0:0:0:ffff:c000:0280]",
+        ),
+        (
+            "https://[::ffff:c000:280]/api/v1",
+            "wss://[::ffff:c000:280]",
+            "wss://[::ffff:c000:280]",
+        ),
+        ("http://[0:0:0:0:0:0:0:0]/api/v1", "ws://[::]", "ws://[0:0:0:0:0:0:0:0]"),
+    ],
+)
+def test_ipv6_grants_accept_canonical_and_previous_server_spelling(
+    asynchronous, policy, legacy, base, canonical, previous
+):
+    suffix = f"/api/v1/computers/vm-1/browser-connections/{IDENT}/cdp"
+    wire = payload() if policy else dict(PAYLOAD)
+    wire["url"] = (previous if legacy else canonical) + suffix
+    methods = []
+    grant = request_browser_grant(asynchronous, base, wire, methods, policy)
+    assert grant.url == canonical + suffix
+    assert grant.token == TOKEN and TOKEN not in repr(grant)
+    assert grant.expires_at == datetime.fromisoformat(wire["expires_at"].replace("Z", "+00:00"))
+    assert grant.lease == (BrowserSessionLease.from_api(wire, IDENT) if policy else None)
+    assert methods == ["GET", "POST"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "origin,suffix",
+    [
+        ("wss://[2001:db8::2]:8443", ""),
+        ("wss://elsewhere.test:8443", ""),
+        ("wss://[2001:db8::1]:9443", ""),
+        ("wss://[2001:db8::1]", ""),
+        ("ws://[2001:db8::1]:8443", ""),
+        ("wss://user@[2001:db8::1]:8443", ""),
+        ("wss://[2001:0db8::1]:8443", ""),
+        ("wss://[2001:db8::1]:8443", "?token=secret"),
+        ("wss://[2001:db8::1]:8443", "?"),
+        ("wss://[2001:db8::1]:8443", "#fragment"),
+        ("wss://[2001:db8::1]:8443", "#"),
+        ("wss://[2001:db8::1]:8443", "/other"),
+        ("wss://[2001:db8::1]:8443/other", ""),
+    ],
+)
+def test_ipv6_refused_response_urls_still_revoke_the_grant(asynchronous, origin, suffix):
+    base = "https://[2001:db8:0:0:0:0:0:1]:8443/api/v1"
+    url = origin + f"/api/v1/computers/vm-1/browser-connections/{IDENT}/cdp" + suffix
+    methods = []
+    with pytest.raises(MandalaError, match="invalid browser connection response"):
+        request_browser_grant(asynchronous, base, {**PAYLOAD, "url": url}, methods)
+    assert methods == ["GET", "POST", "DELETE"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_scoped_ipv6_keeps_its_existing_exact_spelling(asynchronous):
+    base = "http://[fe80:0:0:0:0:0:0:1%25eth0]:8080/api/v1"
+    suffix = f"/api/v1/computers/vm-1/browser-connections/{IDENT}/cdp"
+    url = "ws://[fe80:0:0:0:0:0:0:1%25eth0]:8080" + suffix
+    methods = []
+    grant = request_browser_grant(asynchronous, base, {**PAYLOAD, "url": url}, methods)
+    assert grant.url == url and methods == ["GET", "POST"]
+    methods.clear()
+    with pytest.raises(MandalaError, match="invalid browser connection response"):
+        request_browser_grant(
+            asynchronous, base, {**PAYLOAD, "url": url.replace("eth0", "eth1")}, methods
+        )
+    assert methods == ["GET", "POST", "DELETE"]
+
+
 @respx.mock
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("policy", [None, BrowserSessionPolicy()])
