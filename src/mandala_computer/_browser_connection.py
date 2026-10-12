@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from ipaddress import IPv6Address
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -66,17 +67,29 @@ def _date(data: Mapping[str, Any], field_name: str) -> datetime:
         raise MandalaError("invalid browser session lease response") from None
 
 
-def _socket_origin(base_url: str) -> str:
+def _socket_origin(base_url: str, *, canonical_ipv6: bool = True) -> str:
     """The WebSocket origin the platform names for this API base URL.
 
     The platform serializes its origin the way a browser does: lowercase host,
-    no default port. A base URL written ``https://host:443`` is the same origin
-    and must not make every grant look as if it pointed somewhere else.
+    no default port, compressed IPv6. A differently spelled base URL must not
+    make every grant look as if it pointed somewhere else. The previous IPv6
+    spelling is retained only to recognize responses from older servers.
     """
     base = urlsplit(base_url)
     secure = base.scheme.lower() == "https"
     host = base.hostname or ""
     if ":" in host:
+        # Scoped literals are not browser URL hosts; keep their existing exact
+        # spelling rather than change transport-specific scope handling here.
+        if canonical_ipv6 and "%" not in host:
+            address = IPv6Address(host)
+            mapped = address.ipv4_mapped
+            # Browser URLs use hex tails even when ipaddress spells them as IPv4.
+            host = (
+                f"::ffff:{int(mapped) >> 16:x}:{int(mapped) & 0xFFFF:x}"
+                if mapped is not None
+                else address.compressed
+            )
         host = f"[{host}]"
     port = base.port
     if port is not None and port != (443 if secure else 80):
@@ -163,11 +176,15 @@ class BrowserConnection:
             raise MandalaError(message)
         try:
             origin = _socket_origin(base_url)
+            previous_origin = _socket_origin(base_url, canonical_ipv6=False)
         except ValueError:
             raise MandalaError(message) from None
-        expected = f"{origin}{urlsplit(base_url).path.rstrip('/')}/{path}/{ident}/cdp"
+        suffix = f"{urlsplit(base_url).path.rstrip('/')}/{path}/{ident}/cdp"
+        expected = origin + suffix
         # Never forward a capability to a response-selected origin or redirect.
-        if data.get("url") != expected:
+        # Both accepted spellings come only from the caller's configured base;
+        # even an older server's response is returned as the canonical URL.
+        if data.get("url") not in (expected, previous_origin + suffix):
             raise MandalaError(message)
         try:
             expires = _timestamp(data.get("expires_at"))
