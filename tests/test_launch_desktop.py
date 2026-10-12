@@ -4,12 +4,14 @@ The guest agent answers a few seconds before the desktop user is logged in, and
 a desktop exec sent in between is refused with a 409 carrying no ``reason``.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from tests.test_launch import BASE, COMPUTER, GUEST
+from tests.test_launch_secrets import BINDING, RECEIPT, bound
 
 import mandala_computer as mc
 import mandala_computer._async_computer as async_computers
@@ -53,11 +55,14 @@ class Rig:
         self.tick = tick
         self.requests = []
         self.now = 0.0
+        self.sleeps = []
+        self.probe_times = []
 
     def handle(self, request):
         self.requests.append(request)
         self.now += self.tick
         if is_desktop_probe(request):
+            self.probe_times.append(self.now)
             return self.probe(len(self.desktop_probes()))
         if request.url.path.endswith("/exec"):
             return httpx.Response(200, json=GUEST)
@@ -68,6 +73,7 @@ class Rig:
 
     def install(self, monkeypatch):
         def sleep(delay):
+            self.sleeps.append(delay)
             self.now += delay
 
         async def async_sleep(delay):
@@ -107,6 +113,179 @@ async def launch(rig, flavour, **kwargs):
 
 
 FLAVOURS = ["sync", "async"]
+
+
+async def wait_for_desktop(rig, flavour, **kwargs):
+    if flavour == "sync":
+        with (
+            httpx.Client(transport=httpx.MockTransport(rig.handle)) as http,
+            mc.Client("com_test", base_url=BASE, http_client=http) as client,
+        ):
+            c = client.computers.get("launch-42")
+            assert c.wait_for_desktop(**kwargs) is c
+    else:
+        async with (
+            httpx.AsyncClient(transport=httpx.MockTransport(rig.handle)) as http,
+            mc.AsyncClient("com_test", base_url=BASE, http_client=http) as client,
+        ):
+            c = await client.computers.get("launch-42")
+            assert await c.wait_for_desktop(**kwargs) is c
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize(
+    ("poll", "sleeps"),
+    [
+        (3, [0.25, 0.5, 1, 2, 3, 3]),
+        (0.1, [0.1] * 6),
+        (0, [0] * 6),
+    ],
+)
+async def test_reasonless_desktop_conflicts_use_the_ramp_and_poll_cap(
+    monkeypatch, flavour, poll, sleeps
+):
+    rig = Rig(
+        linux(),
+        lambda n: (
+            httpx.Response(409, json=NO_DESKTOP) if n <= 6 else httpx.Response(200, json=GUEST)
+        ),
+    )
+    rig.install(monkeypatch)
+    await wait_for_desktop(rig, flavour, timeout=60, poll=poll)
+    assert rig.sleeps == sleeps
+    assert rig.probe_times == pytest.approx([sum(sleeps[:n]) for n in range(7)])
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_bound_launch_notices_the_desktop_within_its_remaining_budget(monkeypatch, flavour):
+    class BoundRig(Rig):
+        def handle(self, request):
+            if request.method == "GET" and self.now >= 0.25:
+                self.record = linux(**bound(False, secrets_applied=RECEIPT))
+            return super().handle(request)
+
+    rig = BoundRig(linux(**bound(True)), refused_twice)
+    rig.install(monkeypatch)
+    c = await launch(
+        rig,
+        flavour,
+        timeout=1.2,
+        secrets=[{"secret_id": BINDING["secret_id"], "env": "TOKEN"}],
+    )
+    assert c.secrets_delivering is False
+    assert rig.sleeps == [0.25, 0.25, 0.5]
+    assert rig.probe_times == [0.25, 0.5, 1.0]
+    assert len([r for r in rig.requests if r.method == "GET"]) == 3
+    assert len([r for r in rig.requests if r.url.path == "/api/v1/computers"]) == 1
+    assert [max(r.extensions["timeout"].values()) for r in rig.desktop_probes()] == pytest.approx(
+        [0.95, 0.7, 0.2]
+    )
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize(
+    ("status", "body", "headers", "delay"),
+    [
+        (409, {"error": "busy", "reason": "contention"}, {}, 3),
+        (409, {"error": "starting", "reason": "starting"}, {}, 3),
+        (409, {"error": "conflict", "reason": "future_reason"}, {}, 3),
+        (429, {"error": "rate limited"}, {}, 3),
+        (429, {"error": "rate limited"}, {"Retry-After": "5"}, 5),
+        (500, {"error": "internal error"}, {}, 3),
+        (502, {"error": "bad gateway"}, {}, 3),
+        (503, {"error": "temporarily unavailable"}, {}, 3),
+    ],
+)
+async def test_desktop_failures_keep_their_delay_without_advancing_the_ramp(
+    monkeypatch, flavour, status, body, headers, delay
+):
+    answers = [
+        httpx.Response(409, json=NO_DESKTOP),
+        httpx.Response(status, json=body, headers=headers),
+        httpx.Response(409, json=NO_DESKTOP),
+        httpx.Response(200, json=GUEST),
+    ]
+    rig = Rig(linux(), lambda n: answers[n - 1])
+    rig.install(monkeypatch)
+    await wait_for_desktop(rig, flavour, timeout=60, poll=3)
+    assert rig.sleeps == [0.25, delay, 0.5]
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_desktop_ramp_and_probe_timeouts_respect_the_deadline(monkeypatch, flavour):
+    def probe(n):
+        rig.now += 0.15
+        return httpx.Response(409, json=NO_DESKTOP)
+
+    rig = Rig(linux(), probe)
+    rig.install(monkeypatch)
+    with pytest.raises(mc.TimeoutError, match="desktop session was not active within 0.6s"):
+        await wait_for_desktop(rig, flavour, timeout=0.6, poll=3)
+    assert rig.now == pytest.approx(0.6)
+    assert rig.sleeps == pytest.approx([0.25, 0.05])
+    assert rig.probe_times == pytest.approx([0, 0.4])
+    assert [max(r.extensions["timeout"].values()) for r in rig.desktop_probes()] == pytest.approx(
+        [0.6, 0.2]
+    )
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_desktop_retry_after_cannot_extend_the_deadline(monkeypatch, flavour):
+    rig = Rig(
+        linux(),
+        lambda n: httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "5"}),
+    )
+    rig.install(monkeypatch)
+    with pytest.raises(mc.TimeoutError, match="desktop session was not active within 2s"):
+        await wait_for_desktop(rig, flavour, timeout=2)
+    assert rig.sleeps == [2]
+    assert len(rig.desktop_probes()) == 1
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize(
+    ("status", "body", "kind"),
+    [
+        (400, {"error": "invalid request"}, mc.APIError),
+        (401, {"error": "unauthorized"}, mc.AuthenticationError),
+        (403, {"error": "forbidden", "reason": "revoked"}, mc.PermissionDeniedError),
+        (404, {"error": "not found"}, mc.NotFoundError),
+        (409, {"error": "not running", "reason": "unavailable"}, mc.ConflictError),
+    ],
+)
+async def test_desktop_final_refusals_do_not_sleep(monkeypatch, flavour, status, body, kind):
+    rig = Rig(linux(), lambda n: httpx.Response(status, json=body))
+    rig.install(monkeypatch)
+    with pytest.raises(kind) as caught:
+        await wait_for_desktop(rig, flavour, timeout=1)
+    assert caught.value.status == status
+    assert caught.value.body == body
+    assert rig.sleeps == []
+    assert len(rig.desktop_probes()) == 1
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_desktop_wait_does_not_swallow_an_interrupted_ramp_sleep(monkeypatch, flavour):
+    rig = Rig(linux(), lambda n: httpx.Response(409, json=NO_DESKTOP))
+    rig.install(monkeypatch)
+    interruption = KeyboardInterrupt() if flavour == "sync" else asyncio.CancelledError()
+
+    def interrupt(delay):
+        rig.sleeps.append(delay)
+        raise interruption
+
+    async def async_interrupt(delay):
+        interrupt(delay)
+
+    if flavour == "sync":
+        monkeypatch.setattr(computers.time, "sleep", interrupt)
+    else:
+        monkeypatch.setattr(async_computers.asyncio, "sleep", async_interrupt)
+    with pytest.raises(type(interruption)) as caught:
+        await wait_for_desktop(rig, flavour)
+    assert caught.value is interruption
+    assert rig.sleeps == [0.25]
+    assert len(rig.desktop_probes()) == 1
 
 
 # The platform leaves `desktop` out for X11, which is what most Linux templates
