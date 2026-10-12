@@ -78,6 +78,12 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # Public URLs (platform OPL-3753), behind a flag on the platform until its
+    # edge exists. Wrapped in the release that follows it there.
+    ("GET", "computers/:id/public-urls"),
+    ("POST", "computers/:id/public-urls"),
+    ("PATCH", "computers/:id/public-urls/:urlId"),
+    ("DELETE", "computers/:id/public-urls/:urlId"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
