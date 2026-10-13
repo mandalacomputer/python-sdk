@@ -631,13 +631,19 @@ def test_a_text_failure_names_the_status_and_the_platforms_code(
 
 
 def test_a_status_the_message_already_names_is_not_repeated() -> None:
-    # The SDK's own wording for an edge failure already ends with its status.
+    # The SDK's own wording for an edge failure already ends with its status;
+    # a coded answer replaces that ending rather than adding a second.
     err = _cli.GatewayTimeoutError(
         "the edge gave up waiting (HTTP 524)", status=524, body="<html></html>"
     )
-    assert _cli._status_note(err, str(err)) == ""
+    assert _cli._with_status(err, str(err)) == "the edge gave up waiting (HTTP 524)"
     coded = _cli.ConflictError("taken", status=409, body={"code": "LABEL_TAKEN"})
-    assert _cli._status_note(coded, str(coded)) == " (HTTP 409, LABEL_TAKEN)"
+    assert _cli._with_status(coded, str(coded)) == "taken (HTTP 409, LABEL_TAKEN)"
+    both = _cli.ConflictError("taken (HTTP 409)", status=409, body={"code": "LABEL_TAKEN"})
+    assert _cli._with_status(both, str(both)) == "taken (HTTP 409, LABEL_TAKEN)"
+    # Another status in the message is the message's own business.
+    other = _cli.ConflictError("upstream said (HTTP 503)", status=409, body={})
+    assert _cli._with_status(other, str(other)) == "upstream said (HTTP 503) (HTTP 409)"
 
 
 @respx.mock

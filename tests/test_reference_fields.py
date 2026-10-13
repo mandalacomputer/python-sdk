@@ -373,6 +373,7 @@ BROKEN: list[tuple[str, dict[str, Any], dict[str, Any], str]] = [
     ("signals", SIGNALS, {**SIGNALS, "more": "perhaps"}, "more"),
     ("signals", SIGNALS, {k: v for k, v in SIGNALS.items() if k != "baseline"}, "baseline"),
     ("signals", SIGNALS, {**SIGNALS, "cursor": ""}, "signal page"),
+    ("signals", SIGNALS, {**SIGNALS, "gap": "expired"}, "gap"),
     ("activities", ACTIVITIES, {**ACTIVITIES, "items": [ROW, 7]}, "activity 1"),
     (
         "activities",

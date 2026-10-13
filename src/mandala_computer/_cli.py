@@ -412,21 +412,23 @@ def _error_info(err: BaseException) -> dict[str, Any]:
     return {"code": "failed", "message": str(err)}
 
 
-def _status_note(err: APIError, message: str) -> str:
-    """What a text-mode failure line adds after the message: ``(HTTP 409,
-    LABEL_TAKEN)``, or ``(HTTP 404)`` when the platform sent no ``code``.
+def _with_status(err: APIError, message: str) -> str:
+    """A text-mode failure's message with the status and the platform's code
+    after it: ``... (HTTP 409, LABEL_TAKEN)``, or ``... (HTTP 404)`` when the
+    platform sent no ``code``.
 
-    The status and the platform's code are what ``--json`` carries as
-    ``status`` and ``api_code``, so a person reading the line has what a script
-    reads (OPL-5974). Nothing is added for a status the message already ends
-    with, as this SDK's own wording for an edge failure does. The code comes
-    from the response body and is escaped like the message.
+    The status and the code are what ``--json`` carries as ``status`` and
+    ``api_code``, so a person reading the line has what a script reads
+    (OPL-5974). A message that already ends with its status, as this SDK's own
+    wording for an edge failure does, has that ending replaced rather than a
+    second one added. The code comes from the response body and is escaped like
+    the message.
     """
+    ending = f"(HTTP {err.status})"
+    base = message[: -len(ending)].rstrip() if message.endswith(ending) else message
     if err.code is not None:
-        return f" (HTTP {err.status}, {_printable(err.code)})"
-    if message.endswith(f"(HTTP {err.status})"):
-        return ""
-    return f" (HTTP {err.status})"
+        return f"{base} (HTTP {err.status}, {_printable(err.code)})"
+    return f"{base} {ending}"
 
 
 def _json_failure(info: dict[str, Any]) -> None:
@@ -4542,8 +4544,9 @@ def main(argv: list[str] | None = None) -> int:
             # The message can be the response's own text: escaped, so a
             # newline in it cannot forge a recovery line below it.
             message = _printable(str(e))
-            note = _status_note(e, message) if isinstance(e, APIError) else ""
-            print(f"{PROG}: {message}{note}", file=sys.stderr)
+            if isinstance(e, APIError):
+                message = _with_status(e, message)
+            print(f"{PROG}: {message}", file=sys.stderr)
             recovery = _recovery_line(e, resendable) if isinstance(e, MandalaError) else None
             if recovery is not None:
                 print(recovery, file=sys.stderr)

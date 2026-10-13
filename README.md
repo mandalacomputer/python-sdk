@@ -2720,8 +2720,9 @@ a row does not prove what the guest did. Both answer 503 rather than an empty
 page when they cannot be read, so keep the checkpoint you had.
 
 Both pages are read strictly, as the platform promises them: a page with a row
-that is not an object, an event without its `cursor` and `type`, an activity
-without its `activity_id`, a result without its `id`, or a `more`, `baseline`,
+that is not an object, an event without its `cursor` and `type`, a signal
+`gap` that is not an object, an activity without its `activity_id`, a result
+without its `id`, or a `more`, `baseline`,
 `gap`, `count_truncated` or `age_truncated` that is not a boolean raises
 `MandalaError`. Before 0.13.0 such a row was dropped and such a flag read as
 `False`, which is the reassuring answer and the wrong one: a replay that ends

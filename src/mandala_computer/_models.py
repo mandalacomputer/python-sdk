@@ -4431,8 +4431,9 @@ class SignalPage:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SignalPage:
         """Refuses a page without a cursor or an event list, an event that is
-        not an object or names no ``cursor`` and ``type``, and a ``more`` or
-        ``baseline`` that is not a boolean.
+        not an object or names no ``cursor`` and ``type``, a ``more`` or
+        ``baseline`` that is not a boolean, and a ``gap`` that is neither an
+        object nor absent.
 
         A failure must never read as an empty history: the platform keeps that
         promise on its side, and a decoder that filled in an empty list, dropped
@@ -4449,6 +4450,10 @@ class SignalPage:
             if not isinstance(row.get("cursor"), str) or not isinstance(row.get("type"), str):
                 raise MandalaError(f"{where}: event {i} does not carry a cursor and a type")
         gap = d.get("gap")
+        if gap is not None and not isinstance(gap, Mapping):
+            # Read as None it would say nothing was missed, which is the one
+            # thing a gap exists to deny.
+            raise MandalaError(f"{where}: gap is not an object")
         return cls(
             computer=_text(d.get("computer")),
             from_cursor=_text(d.get("from")),

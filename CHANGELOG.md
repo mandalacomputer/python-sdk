@@ -75,7 +75,7 @@ This is the summary you read to decide whether to upgrade.
   `activities()`, `activity()` and `activity_results()` raise `MandalaError`
   for a row that is not an object, an event without its `cursor` and `type`,
   an activity without its `activity_id`, a result without its `id`, a signal
-  page with an empty `cursor`, an activity page without its `changes_cursor`
+  page with an empty `cursor` or a `gap` that is not an object, an activity page without its `changes_cursor`
   or with a `next_cursor` that is neither text nor null, and a `more`,
   `baseline`, `gap`, `count_truncated`, `age_truncated` or `has_results`
   that is not a boolean. They used to drop the row and read the flag

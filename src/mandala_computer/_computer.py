@@ -5638,11 +5638,16 @@ class Computer(ComputerFields):
         current window and sends it back — so ``set_schedule(enabled=True)``
         restores it. Clearing returns the computer to never having had a
         schedule. Returns the platform's answer, a disabled 00:00 UTC
-        :class:`~mandala_computer.Schedule`; :attr:`snapshot_schedule` reads
-        ``None`` afterwards, even when that answer is malformed and raises
-        :class:`~mandala_computer.MandalaError`, because the delete succeeded.
+        :class:`~mandala_computer.Schedule`, and :attr:`snapshot_schedule` reads
+        ``None`` afterwards. An answer that is an object but not a whole
+        schedule raises :class:`~mandala_computer.MandalaError` with
+        :attr:`snapshot_schedule` already ``None``: the platform answered, so
+        the schedule is gone. One that is not a JSON object at all raises
+        before anything changes, because it may not be the platform's answer
+        (a proxy's page, say) and so does not show the schedule was removed.
         """
         path = _api.computer_action(self.id, "schedule")
+        # Raises for a body that is not an object, leaving the handle alone.
         answer = self._t.json_object("DELETE", path)
         self._data["snapshot_schedule"] = None
         return Schedule.from_api(answer, f"DELETE {path}")

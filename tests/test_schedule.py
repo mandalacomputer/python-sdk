@@ -118,3 +118,21 @@ async def test_the_async_methods_answer_a_schedule() -> None:
         stored = await c.set_schedule(enabled=True, hour=23, minute=30, tz="America/Chicago")
         assert isinstance(stored, mc.Schedule) and stored.tz == "America/Chicago"
         assert c.snapshot_schedule == CHICAGO
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b"<html>sign in</html>"])
+@respx.mock
+async def test_a_delete_answered_with_no_object_changes_nothing(body: bytes) -> None:
+    """A body that is not an object may be a proxy's rather than the platform's,
+    so it does not show the schedule was removed: the handle keeps it."""
+    respx.delete(SCHEDULE).mock(httpx.Response(200, content=body))
+    with mc.Client("gck_test", base_url=BASE) as client:
+        c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": CHICAGO})
+        with pytest.raises(mc.MandalaError):
+            c.clear_schedule()
+        assert c.snapshot_schedule == CHICAGO
+    async with mc.AsyncClient("gck_test", base_url=BASE) as aclient:
+        a = mc.AsyncComputer(aclient._t, {**COMPUTER, "snapshot_schedule": CHICAGO})
+        with pytest.raises(mc.MandalaError):
+            await a.clear_schedule()
+        assert a.snapshot_schedule == CHICAGO
