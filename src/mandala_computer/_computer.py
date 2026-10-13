@@ -96,6 +96,8 @@ from ._models import (
     OpenAIActionObject,
     OpenAIComputerAction,
     PageContext,
+    PublicUrl,
+    PublicUrls,
     ScreenshotInfo,
     SecretBinding,
     SecretBindingArgs,
@@ -3298,6 +3300,70 @@ class Computer(ComputerFields):
         body = _api.ssh_access_body(enabled)
         data = self._t.json_object("PUT", _api.computer_ssh(self.id), json=body)
         return SshAccess.from_api(data)
+
+    def public_urls(self) -> PublicUrls:
+        """This computer's public URLs, and whether they can answer here.
+
+        See :class:`~mandala_computer.PublicUrls`. Any role may read them, and
+        they are listed whether or not they can answer: ``enabled`` is
+        ``False``, with a ``reason``, where public URLs are off or the plan
+        includes none. While a change of this computer's workspace is unsettled
+        this raises :class:`~mandala_computer.ConflictError`.
+        """
+        path = _api.computer_public_urls(self.id)
+        data = self._t.json_object("GET", path)
+        return PublicUrls.from_api(data, f"GET {path}")
+
+    def create_public_url(
+        self,
+        port: int,
+        *,
+        label: str | None = None,
+        access: Literal["public", "private"] | None = None,
+    ) -> PublicUrl:
+        """Serve ``port`` inside this computer at ``https://<label>.<base_domain>``.
+
+        The app must listen on ``0.0.0.0:<port>``, not ``127.0.0.1``. Without a
+        ``label`` the platform picks one like ``brave-otter-3f2a``. ``access``
+        is ``"public"`` (the platform's default: anyone with the link) or
+        ``"private"`` (only a request carrying one of the account's API keys,
+        which never reaches the app).
+
+        A port outside 1 to 65535, port 22, an empty label or another access
+        raises :class:`ValueError` before any request. The platform's refusals
+        keep its ``code``: a label that is taken, reserved or reads as someone
+        else's address, a computer at its plan's limit, a plan with no public
+        URLs, or too many made in a day (with ``Retry-After``).
+        """
+        body = _api.public_url_body(port=port, label=label, access=access, create=True)
+        path = _api.computer_public_urls(self.id)
+        return PublicUrl.from_api(self._t.json_object("POST", path, json=body), f"POST {path}")
+
+    def update_public_url(
+        self,
+        url_id: str,
+        *,
+        port: int | None = None,
+        access: Literal["public", "private"] | None = None,
+    ) -> PublicUrl:
+        """Point a public URL at another port, change who may open it, or both.
+
+        The label is the URL and never changes: delete the URL and make another
+        for a new name. Naming neither ``port`` nor ``access`` raises
+        :class:`ValueError` before any request, as does a value
+        :meth:`create_public_url` would refuse.
+        """
+        body = _api.public_url_body(port=port, access=access, create=False)
+        path = _api.computer_public_url(self.id, url_id)
+        return PublicUrl.from_api(self._t.json_object("PATCH", path, json=body), f"PATCH {path}")
+
+    def delete_public_url(self, url_id: str) -> None:
+        """Remove a public URL. It stops answering at once; the app keeps running.
+
+        Its label is then free for anyone, unless the platform has blocked it.
+        Allowed at any time, an unsettled workspace change included.
+        """
+        self._t.json_object("DELETE", _api.computer_public_url(self.id, url_id))
 
     def secrets(self) -> SecretBindings:
         """The secrets this computer is bound to, and the ``version`` to send back.

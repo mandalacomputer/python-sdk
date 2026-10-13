@@ -2900,6 +2900,86 @@ def ssh_access_body(enabled: object) -> dict[str, Any]:
     return {"enabled": flag(enabled, "enabled")}
 
 
+# --- public URLs ------------------------------------------------------------
+
+
+def computer_public_urls(computer_id: str) -> str:
+    """A computer's public URLs: list with GET, make one with POST."""
+    return computer_action(computer_id, "public-urls")
+
+
+def computer_public_url(computer_id: str, url_id: str) -> str:
+    """One of a computer's public URLs: change it with PATCH, remove it with DELETE."""
+    return f"{computer_public_urls(computer_id)}/{seg(url_id)}"
+
+
+#: The two ways a public URL may be opened. ``public``: anyone with the link.
+#: ``private``: only a request carrying an API key of the account.
+PUBLIC_URL_ACCESS = ("public", "private")
+#: The computer's own SSH port, which a public URL may not serve.
+PUBLIC_URL_RESERVED_PORT = 22
+
+
+def _public_url_port(value: object) -> int:
+    port = whole(
+        value,
+        "port",
+        exc=ValueError,
+        message=f"port must be a whole number from 1 to 65535, not {value!r}",
+    )
+    if not 1 <= port <= 65535:
+        raise ValueError(f"port must be a whole number from 1 to 65535, not {port}")
+    if port == PUBLIC_URL_RESERVED_PORT:
+        raise ValueError("port 22 belongs to the computer's SSH server and cannot be served")
+    return port
+
+
+def _public_url_access(value: object) -> str:
+    access = canonical(value, "access")
+    if access not in PUBLIC_URL_ACCESS:
+        raise ValueError(f'access must be "public" or "private", not {access!r}')
+    return access
+
+
+def public_url_body(
+    *,
+    port: object = _OMITTED,
+    label: object = _OMITTED,
+    access: object = _OMITTED,
+    create: bool,
+) -> dict[str, Any]:
+    """The create or update payload, with only the fields the caller named.
+
+    A create needs ``port`` and may name a ``label`` and an ``access``; without
+    an ``access`` the platform makes the URL ``public``. An update may change
+    ``port`` and ``access`` but never the label, which IS the URL, and must
+    change something: an update naming nothing is a 400 upstream, refused here
+    first for :func:`webhook_body`'s reason.
+
+    The label is passed as given, past being a string: which labels are taken,
+    reserved or misleading is the platform's rule, and its 400 names the one a
+    label broke. ``None`` for any field means "not given", so a caller can pass
+    an optional through without a branch of its own.
+    """
+    body: dict[str, Any] = {}
+    if port is not _OMITTED and port is not None:
+        body["port"] = _public_url_port(port)
+    elif create:
+        raise ValueError("port is required")
+    if label is not _OMITTED and label is not None:
+        if not create:
+            raise ValueError("a public URL's label cannot change: delete it and make another")
+        text = canonical(label, "label")
+        if not text.strip():
+            raise ValueError("label must not be empty; omit it to have one picked")
+        body["label"] = text
+    if access is not _OMITTED and access is not None:
+        body["access"] = _public_url_access(access)
+    if not body:
+        raise ValueError("an update must name a port, an access, or both")
+    return body
+
+
 # --- secret bindings --------------------------------------------------------
 
 

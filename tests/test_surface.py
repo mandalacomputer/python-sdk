@@ -78,12 +78,6 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # Public URLs (platform OPL-3753), behind a flag on the platform until its
-    # edge exists. Wrapped in the release that follows it there.
-    ("GET", "computers/:id/public-urls"),
-    ("POST", "computers/:id/public-urls"),
-    ("PATCH", "computers/:id/public-urls/:urlId"),
-    ("DELETE", "computers/:id/public-urls/:urlId"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -178,6 +172,24 @@ SSH_KEY = {
     "key_type": "ssh-ed25519",
     "created_at": "2026-09-16T12:00:00Z",
     "last_used_at": None,
+}
+# A computer's public URL (platform OPL-3753), and the listing's envelope.
+PUBLIC_URL = {
+    "id": "pu-0123456789abcdef",
+    "url": "https://cool-thing.mandala.dev",
+    "hostname": "cool-thing.mandala.dev",
+    "label": "cool-thing",
+    "port": 3000,
+    "access": "public",
+    "disabled": False,
+    "created_at": "2026-10-12T00:00:00.000Z",
+    "updated_at": "2026-10-12T00:00:00.000Z",
+}
+PUBLIC_URLS = {
+    "enabled": True,
+    "base_domain": "mandala.dev",
+    "limit": 2,
+    "public_urls": [PUBLIC_URL],
 }
 SSH_ACCESS = {
     "computer": "vm-1",
@@ -828,6 +840,12 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh"):
         return httpx.Response(200, json=SSH_ACCESS)
+    # A computer's public URLs: the listing and a create on the collection, one
+    # URL on a change, an ack on a delete.
+    if path.endswith("/public-urls"):
+        return httpx.Response(200 if get else 201, json=PUBLIC_URLS if get else PUBLIC_URL)
+    if "/public-urls/" in path:
+        return httpx.Response(200, json={"ok": True} if request.method == "DELETE" else PUBLIC_URL)
     if path.endswith("/secrets"):
         return httpx.Response(200, json=SECRET_BINDINGS)
     if path.endswith("/computers"):
@@ -1166,6 +1184,10 @@ def exercise_everything(client: mc.Client) -> None:
     c.ssh_access()
     c.set_ssh_access(True)
     c.set_ssh_access(False)
+    c.public_urls()
+    served = c.create_public_url(3000, label="cool-thing", access="private")
+    c.update_public_url(served.id, port=8000, access="public")
+    c.delete_public_url(served.id)
     # A computer's secret bindings, read and replaced against the version read.
     bound = c.secrets()
     c.set_secrets(
@@ -1456,6 +1478,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.ssh_access()
     await c.set_ssh_access(True)
     await c.set_ssh_access(False)
+    await c.public_urls()
+    served = await c.create_public_url(3000, label="cool-thing", access="private")
+    await c.update_public_url(served.id, port=8000, access="public")
+    await c.delete_public_url(served.id)
     bound = await c.secrets()
     await c.set_secrets(
         [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
