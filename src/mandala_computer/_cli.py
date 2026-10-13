@@ -878,10 +878,21 @@ def _client(profile: str | None = None) -> Client:
     return Client() if profile is None else Client(profile=profile)
 
 
+#: The platform's computer id: ``vm-`` and twelve lowercase hex digits.
+_COMPUTER_ID = re.compile(r"vm-[0-9a-f]{12}")
+
+
 def _resolve(client: Client, target: str, computers: Listing[Computer] | None = None) -> Computer:
     """The computer ``target`` names — an exact id, or a unique name.
 
     *computers* is a listing the caller already holds, to save a second one.
+
+    A target shaped like a computer id IS that id, and is never matched
+    against names: one the listing does not hold is read from its own route,
+    which finds a computer the listing omits and answers 404 for one that is
+    gone. The platform lets a computer be named like another's id, so matching
+    names sent a command meant for a deleted computer to a live computer named
+    after it (OPL-5980).
     """
     # Resolution is not a fleet-wide consistency decision. One unreachable
     # hypervisor must not block terminal/scp to a computer on a healthy one, and the
@@ -891,6 +902,14 @@ def _resolve(client: Client, target: str, computers: Listing[Computer] | None = 
     for c in computers:
         if c.id == target:
             return c
+    if _COMPUTER_ID.fullmatch(target):
+        found = client.computers.get(target)
+        if found.id != target:
+            _die(
+                lambda s: f"the lookup of {s(target)} answered another computer, {s(found.id)}",
+                "unexpected_computer",
+            )
+        return found
     named = [c for c in computers if c.name == target]
     if len(named) == 1:
         return named[0]
@@ -2628,10 +2647,6 @@ def _operation_rows(operations: Sequence[Operation]) -> str:
         for o in operations
     ]
     return _table(("ID", "KIND", "STATE", "COMPUTER", "CREATED", "ERROR"), rows)
-
-
-#: The platform's computer id: ``vm-`` and twelve lowercase hex digits.
-_COMPUTER_ID = re.compile(r"vm-[0-9a-f]{12}")
 
 
 def _operations_computer(client: Client, target: str, listed: str = "operations") -> str:
