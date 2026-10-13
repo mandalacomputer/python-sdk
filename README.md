@@ -2577,11 +2577,11 @@ on port 443 with no port in the address. The app must listen on
 
 ```python
 c = client.computers.get("vm-...")
-served = c.create_public_url(3000)              # a label like brave-otter-3f2a is picked
-print(served.url)                               # https://brave-otter-3f2a.mandala.dev
+served = c.create_public_url(3000)  # a label like brave-otter-3f2a is picked
+print(served.url)  # https://brave-otter-3f2a.mandala.dev
 c.create_public_url(8000, label="my-demo", access="private")
-c.update_public_url(served.id, port=8080)       # or access="private"
-listing = c.public_urls()                       # .enabled, .reason, .limit, .public_urls
+c.update_public_url(served.id, port=8080)  # or access="private"
+listing = c.public_urls()  # .enabled, .reason, .limit, .public_urls
 c.delete_public_url(served.id)
 ```
 
