@@ -109,6 +109,25 @@ def test_list_sends_an_unknown_computer_as_typed_and_says_so(
 
 
 @respx.mock
+def test_list_takes_an_id_shaped_computer_as_that_id_never_as_a_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # OPL-5976: a deleted computer's id is not in the listing, and matching it
+    # against names found a live computer NAMED like it, whose operations came
+    # back instead.
+    deleted = "vm-0123456789ab"
+    impostor = {"id": "vm-bbbbbbbbbbbb", "name": deleted, "status": "running", "os": "linux"}
+    listing = respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[impostor]))
+    route = respx.get(f"{BASE}/operations").mock(
+        return_value=httpx.Response(200, json={"operations": [], "next_cursor": None})
+    )
+    assert _cli.main(["operations", "list", "--computer", deleted]) == 0
+    assert dict(route.calls.last.request.url.params) == {"computer_id": deleted}
+    assert not listing.called
+    assert "recorded under the id" not in capsys.readouterr().err
+
+
+@respx.mock
 def test_get_prints_the_one(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/operations/{OP['id']}").mock(return_value=httpx.Response(200, json=OP))
     assert _cli.main(["operations", "get", OP["id"]]) == 0

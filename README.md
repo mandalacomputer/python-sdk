@@ -4409,7 +4409,10 @@ the new host at its OLD size: resize it again there), `failed` (nothing
 changed) and `lost` (read the computer) exit 1 with a note on stderr. One move
 runs per account at a time. `moves list` prints the moves still running and
 those finished in the last day, one row per computer; `--computer` keeps one
-computer's, by name or id. Both take `--json` for the platform's records.
+computer's, by name or id. A value shaped like a computer id (`vm-` and twelve
+lowercase hex digits) is that id, never matched against names, here and on
+`operations list --computer`, so a deleted computer's rows are found by its id.
+Both take `--json` for the platform's records.
 `move` is a top-level verb, as `terminal` and `scp` are, since this CLI has no
 `computers` group.
 

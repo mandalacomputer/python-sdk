@@ -2630,12 +2630,26 @@ def _operation_rows(operations: Sequence[Operation]) -> str:
     return _table(("ID", "KIND", "STATE", "COMPUTER", "CREATED", "ERROR"), rows)
 
 
+#: The platform's computer id: ``vm-`` and twelve lowercase hex digits.
+_COMPUTER_ID = re.compile(r"vm-[0-9a-f]{12}")
+
+
 def _operations_computer(client: Client, target: str, listed: str = "operations") -> str:
-    """``operations list --computer``: a computer by name or id, as ``mandala``
-    takes one. A value that is neither a listed computer's id nor its name is
-    sent as typed, because an operation outlives its computer: a deleted one's
-    id is how its operations are found. Said on stderr, so the empty page a
-    mistyped name gets is not read as "no operations"."""
+    """``operations list`` and ``moves list --computer``: a computer by name or
+    id, as ``mandala`` takes one.
+
+    A target shaped like a computer id IS that id, used as given and never
+    looked up: a deleted computer's id is absent from the listing, and matching
+    it against names returned a live computer NAMED like that id, whose rows
+    were listed instead (OPL-5976).
+
+    Anything else is resolved as a name. One that is neither a listed
+    computer's id nor its name is sent as typed, because an operation outlives
+    its computer: a deleted one's id is how its operations are found. Said on
+    stderr, so the empty page a mistyped name gets is not read as "no
+    operations"."""
+    if _COMPUTER_ID.fullmatch(target):
+        return target
     computers = client.computers.list(allow_partial=True)
     if any(c.id == target for c in computers):
         return target

@@ -165,6 +165,25 @@ def test_moves_list_keeps_one_computer_by_name(capsys: pytest.CaptureFixture[str
     assert json.loads(capsys.readouterr().out) == {"moves": [DONE]}
 
 
+@respx.mock
+def test_moves_list_takes_an_id_shaped_computer_as_that_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # OPL-5976: a deleted computer's id fell through to a live computer NAMED
+    # like it, and that computer's move came back.
+    deleted = "vm-0123456789ab"
+    impostor = {"id": "vm-bbbbbbbbbbbb", "name": deleted, "status": "running", "os": "linux"}
+    theirs = {**DONE, "computer_id": impostor["id"]}
+    mine = {**DONE, "computer_id": deleted}
+    listing = respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[impostor]))
+    respx.get(f"{BASE}/moves").mock(
+        return_value=httpx.Response(200, json={"moves": [theirs, mine]})
+    )
+    assert _cli.main(["moves", "list", "--computer", deleted, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"moves": [mine]}
+    assert not listing.called
+
+
 # --- secrets get ---------------------------------------------------------------
 
 
