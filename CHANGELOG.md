@@ -134,6 +134,13 @@ This is the summary you read to decide whether to upgrade.
   way no longer makes every grant look as if it pointed elsewhere. The earlier
   spelling is still recognised from older servers.
 
+- **`moves list --computer` and `operations list --computer` take an id-shaped
+  reference as that id** (OPL-5976). A value shaped like a computer id (`vm-`
+  and twelve lowercase hex digits) is used as given, without a lookup. A
+  deleted computer's id is not in the listing, so it was matched against names,
+  and a live computer named like that id had its moves or operations listed
+  instead.
+
 ## [0.12.0] — 2026-10-11
 
 ### Added
