@@ -4143,8 +4143,11 @@ except mc.ConflictError:
 
 ## The `mandala-py` CLI
 
-Your own terminal against a computer, addressed by name or id. Authentication
-is the SDK's: `MANDALA_API_KEY` in the environment.
+Your own terminal against a computer, addressed by name or id. A value shaped
+like a computer id (`vm-` and twelve lowercase hex digits) is always that id:
+one the listing does not hold is read from its own route, and a 404 there is
+the answer, never a computer named after it. Authentication is the SDK's:
+`MANDALA_API_KEY` in the environment.
 
 `mandala-py` is the Python package's command. The npm package
 (`npm install -g mandala-computer`) installs `mandala`, which does what the

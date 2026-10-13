@@ -141,6 +141,15 @@ This is the summary you read to decide whether to upgrade.
   and a live computer named like that id had its moves or operations listed
   instead.
 
+- **A computer operand shaped like a computer id never falls back to a name**
+  (OPL-5980). A value shaped like a computer id (`vm-` and twelve lowercase hex
+  digits) that the listing does not hold is read from its own route, and a 404
+  there fails the command as `not_found`. The platform lets a computer be named
+  like another's id, so a command meant for a deleted computer, `egress-proxy
+  clear` or `move --workspace` included, went to a live computer named after
+  it. The same read finds a computer the listing omits, which used to be
+  refused. Names resolve as before.
+
 ## [0.12.0] — 2026-10-11
 
 ### Added
