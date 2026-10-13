@@ -1513,11 +1513,10 @@ an `APIError.reason`: `contention` and `starting` clear on their own, while
 the rest. A response classified as `unavailable` requires starting the computer
 or otherwise restoring access, and one classified as `running` requires stopping
 it, rather than retrying unchanged. Read the returned reason:
-being suspended alone does not determine the classification. If an older
-platform response has no recognised reason, the SDK preserves the historical
-`ConflictError` fallback of `True`, so code that must support unclassified
-responses should verify the computer state and
-keep its retry loop bounded.
+being suspended alone does not determine the classification. A response with
+no recognised reason is unclassified, and `is_transient()` answers `False` for
+it: read the computer's state before deciding to retry, and keep any retry
+loop of your own bounded.
 
 Two others worth knowing. A **400** never clears: a computer whose image lacks
 its desktop's clipboard tool (`xclip` on X11, `wl-clipboard` on Wayland) is
@@ -2571,31 +2570,51 @@ public address — a private, loopback or link-local one is a 400 at create.
 
 ### Public URLs
 
-A public URL serves a port inside a computer at `https://<label>.mandala.dev`,
-on port 443 with no port in the address. The app must listen on
-`0.0.0.0:<port>`, not `127.0.0.1`.
+A public URL serves a port inside a computer at `https://<label>.<base_domain>`,
+on port 443 with no port in the address. `base_domain` is in the listing
+(`c.public_urls().base_domain`, such as `mandala.dev`), and every `PublicUrl`
+carries its whole `url` and `hostname`, so nothing needs to build the address.
+The app must listen on `0.0.0.0:<port>`, not `127.0.0.1`.
 
 ```python
 c = client.computers.get("vm-...")
 served = c.create_public_url(3000)  # a label like brave-otter-3f2a is picked
-print(served.url)  # https://brave-otter-3f2a.mandala.dev
+print(served.url)  # https://brave-otter-3f2a.<base_domain>
 c.create_public_url(8000, label="my-demo", access="private")
 c.update_public_url(served.id, port=8080)  # or access="private"
-listing = c.public_urls()  # .enabled, .reason, .limit, .public_urls
+listing = c.public_urls()  # .enabled, .reason, .limit, .base_domain, .public_urls
 c.delete_public_url(served.id)
 ```
 
 `access` is `"public"` (the default: anyone with the link) or `"private"`: only
 a request carrying one of the account's API keys as `Authorization: Bearer`
 opens it, and the key never reaches the app. The label is the URL and never
-changes; delete the URL and make another for a new name. The platform refuses
-labels that are taken, reserved, or read as its own or another company's
-address, and the refusal keeps its `code` (`LABEL_TAKEN`, `INVALID_LABEL`,
-`PUBLIC_URL_LIMIT`, `PLAN_REQUIRED`, ...). A port outside 1 to 65535, port 22,
-an empty label or another `access` is a `ValueError` before any request. The
-listing comes back whether or not the URLs can answer: `enabled=False`, with a
-`reason`, where public URLs are off or the plan includes none. How many a
-computer may have is `limit`. The async client has the same methods.
+changes; delete the URL and make another for a new name. A deleted URL's label
+stays with the account: no other account can ever take it, and the account may
+use it again unless the platform has blocked it. A port outside 1 to 65535,
+port 22, an empty label or another `access` is a `ValueError` before any
+request. The listing comes back whether or not the URLs can answer:
+`enabled=False`, with a `reason`, where public URLs are off or the plan includes
+none. How many a computer may have is `limit`. The async client has the same
+methods.
+
+The platform's refusals keep its `code` on `APIError.code`:
+
+| Code | Status, class | What it means |
+|---|---|---|
+| `LABEL_TAKEN` | 409 `ConflictError` | the label is taken: by another URL, by the platform's block, or because another account has ever held it. Choose another |
+| `PUBLIC_URL_LIMIT` | 409 `ConflictError` | the computer has as many as its plan allows (`limit`) |
+| `WORKSPACE_MOVING` | 409 `ConflictError` | the computer's workspace change is unsettled. With `reason: "contention"` it clears once the move finishes; with `reason: "unsupported"` check the change in the dashboard |
+| `INVALID_LABEL`, `INVALID_PORT`, `INVALID_ACCESS` | 400 `APIError` | the label is reserved or reads as the platform's or another company's address, or a value the SDK did not catch first |
+| `PLAN_REQUIRED` | 402 `PlanLimitError` | the account's plan includes no public URLs |
+| `PUBLIC_URLS_BLOCKED` | 403 `PermissionDeniedError` | the platform has turned public URLs off for this computer or account |
+| `PUBLIC_URLS_DISABLED` | 404 `NotFoundError` | public URLs are not enabled on this platform. It reads like "computer not found", so check the `code` |
+| `RATE_LIMITED` | 429 `RateLimitError` | too many made by this account in the last 24 hours, deleted ones included; `retry_after` says when to try again |
+
+`is_transient()` answers `False` for `LABEL_TAKEN`, `PUBLIC_URL_LIMIT`,
+`PUBLIC_URLS_BLOCKED` and `PUBLIC_URLS_DISABLED`, and for a `WORKSPACE_MOVING`
+that says `unsupported`; `True` for `RATE_LIMITED` and a `WORKSPACE_MOVING` move
+in progress.
 
 ### Secrets
 
@@ -2699,6 +2718,14 @@ succeeded; a `gap` means some were missed and the cursor is a new head. Activity
 is safe metadata about requests: no command, output or input text is kept, and
 a row does not prove what the guest did. Both answer 503 rather than an empty
 page when they cannot be read, so keep the checkpoint you had.
+
+Both pages are read strictly, as the platform promises them: a page with a row
+that is not an object, an event without its `cursor` and `type`, an activity
+without its `activity_id`, a result without its `id`, or a `more`, `baseline`,
+`gap`, `count_truncated` or `age_truncated` that is not a boolean raises
+`MandalaError`. Before 0.13.0 such a row was dropped and such a flag read as
+`False`, which is the reassuring answer and the wrong one: a replay that ends
+early, or a truncated history that reads as whole.
 
 ### Readiness
 
@@ -2951,11 +2978,18 @@ A snapshot carries the shape it was captured at — `snap.os`, `snap.template`,
 computer's current one, so a computer resized after the snapshot was taken
 clones back to what it was. Read it before cloning if the size matters.
 
-`c.snapshot_schedule` is the same window carried on the computer itself, for a
-caller that already holds one and would rather not spend a second call on
-`c.schedule()`. It is `None` on a computer that has no schedule, which is not
-the same as one whose schedule is switched off, and `c.schedule()` does not
-change it.
+`c.schedule()`, `set_schedule()` and `clear_schedule()` answer a `Schedule`:
+`enabled`, `hour` (0 to 23, in `tz`), `minute` and `tz` (an IANA zone, `"UTC"`
+when none was set), with the platform's answer in `raw`. It is read strictly:
+an answer missing a field, with an `enabled` that is not a boolean, an hour or
+minute out of range, or no timezone raises `MandalaError`. Until 0.13.0 these
+returned the answer as a plain `dict`.
+
+`c.snapshot_schedule` is the same window carried on the computer itself, as the
+platform's mapping, for a caller that already holds one and would rather not
+spend a second call on `c.schedule()`. It is `None` on a computer that has no
+schedule, which is not the same as one whose schedule is switched off, and
+`c.schedule()` does not change it.
 
 Disabling and clearing differ. `set_schedule(enabled=False)` keeps the chosen
 time: `hour`, `minute` and `tz` left out keep the current schedule's values
@@ -4020,11 +4054,10 @@ that creates deserves a look first.
 
 `is_transient(err)` is that rule as a function, and it answers for the riskiest
 caller — code wrapping an arbitrary call, possibly a `create`. It says yes to
-`ConflictError` (except `MoveRequiredError`, `FileExistsError`,
-`CreateOnlyConflictError`, `ComputerNotRunningError` and
-`template_image_preparing`), `RateLimitError`, `UnavailableError` **on a read**
-and `ConnectionError` (except `ConnectionInterruptedError`), and no to
-everything above whose outcome is unknown, 502 and 504 included.
+a `ConflictError` the platform says will clear (see below), `RateLimitError`,
+`UnavailableError` **on a read** and `ConnectionError` (except
+`ConnectionInterruptedError`), and no to everything above whose outcome is
+unknown, 502 and 504 included.
 
 A 503 on a change is one of those. The platform documents that a change answered
 503 may or may not have happened — a failure after the request was sent is
@@ -4065,11 +4098,25 @@ running — start it), `running` (the computer IS running and the request needs
 it stopped, such as a resize — stop it; waiting never helps), `unsupported`,
 `exists`, `revoked`, `name_taken` (a secret name the account already uses —
 pick another) and `stale_revision` (a secret write naming a `revision_id` that
-has moved — read it again) make it answer `False`. The set is open: an absent or unknown word is treated as unclassified
-and falls back to the exception type, so a `ConflictError` without one still
-answers `True`. Not every 409 has a word yet — a seventeenth background command
-on one computer is refused without one, and waiting does not necessarily help —
-so keep a retry loop bounded.
+has moved — read it again) make it answer `False`. The set is open: an absent
+or unknown word is treated as unclassified, and an unclassified `ConflictError`
+answers `False`, because the platform says absent means no classification and
+that treating every 409 as transient loops forever. The exceptions are two
+`code`s documented as passing, which answer `True` on a body with no `reason`:
+`idempotency_in_progress` (the keyed call is still running; send it again with
+the same key for its answer) and `WORKSPACE_MOVING` (the computer is being moved
+to another workspace; a `WORKSPACE_MOVING` that says `reason: "unsupported"` is
+a change that needs the dashboard, and stays `False`). Until 0.13.0 an
+unclassified 409 answered `True`.
+
+So these never answer `True`, whatever the loop: a public URL's `LABEL_TAKEN`
+or `PUBLIC_URL_LIMIT`, a webhook past the account's subscription cap or a test
+of a disabled one, an SSH key already registered or past the key limit, a
+seventeenth background command on one computer, `MoveRequiredError`,
+`FileExistsError`, `CreateOnlyConflictError`, `ComputerNotRunningError` and
+`template_image_preparing`. Some unclassified 409s do clear (a disk still being
+copied, another move running on the account): retry one of those yourself, in a
+bounded loop, once the message says that is what it is.
 
 A retry loop on it terminates because it has a deadline, not because of any
 status: a guest agent that stays silent past its boot window does stop being a
@@ -4108,8 +4155,8 @@ and [the clipboard](#the-clipboard); [execution records](#stable-execution-reads
 [retained output and results](#retained-results-and-artifacts),
 [activities and signals](#activity-and-signals); and the computer
 [event stream](#events). Background commands, deleting a computer with its
-snapshots, snapshot holdings, the usage window and waiting for a computer have
-`mandala` commands but no `mandala-py` one; see
+snapshots, snapshot holdings, the usage window, waiting for a computer and
+[public URLs](#public-urls) have `mandala` commands but no `mandala-py` one; see
 [Relationship to the other clients](#relationship-to-the-other-clients).
 
 ```sh
@@ -4159,9 +4206,14 @@ the npm `mandala` CLI reports — `not_found`, `unauthenticated`,
 `invalid_arguments`, `ambiguous_computer`, `unsupported_mode`,
 `missing_credentials` (and the other local credential stages), `exists`,
 `timeout`, `io_error` (with `details.errno`) and the rest listed in that
-package's README — never a class name. `status` and the platform's `reason` word
-ride beside it when there are any. A mistyped command prints its whole help, not
-one line.
+package's README — never a class name. `status`, the platform's `reason` word
+and the platform's own `code` (as `api_code`, such as `LABEL_TAKEN` or
+`PUBLIC_URL_LIMIT`, which are both a `conflict`) ride beside it when there are
+any, and so do the `request_id`, `idempotency_key` and `operation_id` a failure
+carries. Without `--json`, a refusal from the platform ends its line with the
+same two facts: `mandala-py: The label "demo" is taken; choose another. (HTTP
+409, LABEL_TAKEN)`, or `(HTTP 404)` when the platform sent no code. A mistyped
+command prints its whole help, not one line.
 
 Every command whose call is keyed takes `--idempotency-key KEY` (1 to 255
 printable ASCII characters, no space) and sends it instead of a key of its own:
@@ -4556,6 +4608,7 @@ several names. Where a client has no way to do it, the cell says so with —.
 | Change a computer (`PATCH`) | `update({ … })` | `rename()`, `resize()`, `set_idle_suspend()`, `set_browser_proxy()`, `set_egress_proxy()` | `update_computer` | `computers rename`, `resize`, `idle-suspend`, `browser-proxy set`/`clear`, `egress-proxy set`/`clear` | `browser-proxy set`/`clear`, `egress-proxy set`/`clear` |
 | Wait until the computer is ready | `waitForGuest()`, `waitForDesktop()` | `wait_for_guest()`, `wait_for_desktop()` | `wait_for_computer` with `until: "guest"`, which on Linux also waits for the desktop session | `computers wait --until guest` or `--until desktop` | — |
 | The windows after an input action | `{ context: true }` on an input method, e.g. `click(x, y, [], { context: true })` | `context=True` on an input method, e.g. `click(x, y, context=True)` | `context: true` on an input tool | — | — |
+| Public URLs | `publicUrls()`, `createPublicUrl({ port, label, access })`, `updatePublicUrl(urlId, { port, access })`, `deletePublicUrl(urlId)` | `public_urls()`, `create_public_url(port, label=…, access=…)`, `update_public_url(url_id, port=…, access=…)`, `delete_public_url(url_id)` | `list_public_urls`, `create_public_url`, `update_public_url`, `delete_public_url` | `computers urls list`, `create`, `update`, `rm` | — |
 
 ## Design notes
 

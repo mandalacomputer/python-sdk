@@ -1180,11 +1180,11 @@ async def test_schedule_toggle_keeps_the_window(client: mc.AsyncClient) -> None:
 
     server = ScheduleServer(dict(CHICAGO))
     c = mc.AsyncComputer(client._t, COMPUTER)
-    assert await c.set_schedule(enabled=False) == {**CHICAGO, "enabled": False}
-    assert await c.set_schedule(enabled=True) == CHICAGO
+    assert (await c.set_schedule(enabled=False)).raw == {**CHICAGO, "enabled": False}
+    assert (await c.set_schedule(enabled=True)).raw == CHICAGO
     assert server.stored == CHICAGO
     assert (server.get_computer.call_count, server.put.call_count) == (2, 2)
-    assert await c.set_schedule(enabled=True, minute=5) == {**CHICAGO, "minute": 5}
+    assert (await c.set_schedule(enabled=True, minute=5)).raw == {**CHICAGO, "minute": 5}
     await client.aclose()
 
 
@@ -1195,15 +1195,15 @@ async def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.AsyncCl
 
     server = ScheduleServer(None)
     c = mc.AsyncComputer(client._t, COMPUTER)
-    assert await c.schedule() == NO_SCHEDULE_GET
-    assert await c.set_schedule(enabled=True) == {
+    assert (await c.schedule()).raw == NO_SCHEDULE_GET
+    assert (await c.set_schedule(enabled=True)).raw == {
         "enabled": True,
         "hour": 4,
         "minute": 0,
         "tz": "UTC",
     }
     server.stored = None
-    assert await c.set_schedule(enabled=True, tz="Europe/Paris") == {
+    assert (await c.set_schedule(enabled=True, tz="Europe/Paris")).raw == {
         "enabled": True,
         "hour": 4,
         "minute": 0,
@@ -1249,7 +1249,7 @@ async def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.AsyncCli
 
     server = ScheduleServer(dict(NO_SCHEDULE_GET))
     c = mc.AsyncComputer(client._t, COMPUTER)
-    assert await c.set_schedule(enabled=True) == {
+    assert (await c.set_schedule(enabled=True)).raw == {
         "enabled": True,
         "hour": 0,
         "minute": 0,
@@ -1270,7 +1270,7 @@ async def test_set_schedule_reads_its_own_answer(client: mc.AsyncClient) -> None
 
     c = mc.AsyncComputer(client._t, COMPUTER)
     # The whole window given: nothing to read first (see test_schedule_toggle).
-    assert await c.set_schedule(enabled=True, hour=4, minute=0, tz="UTC") == stored
+    assert (await c.set_schedule(enabled=True, hour=4, minute=0, tz="UTC")).raw == stored
     assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
     await client.aclose()
@@ -1284,7 +1284,7 @@ async def test_schedule_leaves_no_schedule_as_none(client: mc.AsyncClient) -> No
     respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=NO_SCHEDULE_GET))
     c = mc.AsyncComputer(client._t, COMPUTER)
     assert "snapshot_schedule" not in COMPUTER
-    assert await c.schedule() == NO_SCHEDULE_GET
+    assert (await c.schedule()).raw == NO_SCHEDULE_GET
     assert c.snapshot_schedule is None
     await client.aclose()
 
@@ -1297,10 +1297,10 @@ async def test_schedule_does_not_change_the_cached_property(client: mc.AsyncClie
     respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=NO_SCHEDULE_GET))
     chicago = {"enabled": True, "hour": 23, "minute": 30, "tz": "America/Chicago"}
     c = mc.AsyncComputer(client._t, {**COMPUTER, "snapshot_schedule": chicago})
-    assert await c.schedule() == NO_SCHEDULE_GET
+    assert (await c.schedule()).raw == NO_SCHEDULE_GET
     assert c.snapshot_schedule == chicago
     bare = mc.AsyncComputer(client._t, {**COMPUTER, "snapshot_schedule": None})
-    assert await bare.schedule() == NO_SCHEDULE_GET
+    assert (await bare.schedule()).raw == NO_SCHEDULE_GET
     assert bare.snapshot_schedule is None
     await client.aclose()
 

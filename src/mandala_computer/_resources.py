@@ -1061,8 +1061,9 @@ def _publish_refusal(err: ConflictError) -> ConflictError:
     The platform's four publish refusals — a different document under a
     published ref, a retired ref, and the two per-account ceilings — do not
     clear by waiting, and they have been sent with no ``reason``, which
-    :func:`~mandala_computer.is_transient` reads as a conflict worth sending
-    again. The request's own context decides here what the body did not: a
+    :func:`~mandala_computer.is_transient` read as a conflict worth sending
+    again before OPL-5974. The request's own context decides here what the body
+    did not: a
     reason this version knows as permanent is kept, a clearing word is kept as
     the platform's explicit advice, and anything else — none, blank, or a word
     this version does not know — becomes ``"exists"``.
@@ -2299,8 +2300,8 @@ class Workspaces:
         still holds computers or active secrets is refused with a
         :class:`~mandala_computer.ConflictError` (409) saying how many, and
         nothing is deleted or revoked. Move the computers to another workspace
-        in the dashboard or delete them, and explicitly delete the active
-        secrets before retrying. An active-secret refusal has
+        with :meth:`~mandala_computer.Computer.move_to_workspace` or delete
+        them, and explicitly delete the active secrets before retrying. An active-secret refusal has
         ``reason="unsupported"`` and is not retried automatically.
         Deleted secrets do not block workspace deletion, but still count toward
         the account's lifetime limit of 1000 secrets. If the platform cannot

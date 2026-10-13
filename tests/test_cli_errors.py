@@ -581,6 +581,66 @@ def test_an_api_refusal_is_named_by_what_went_wrong(
 
 
 @respx.mock
+def test_a_json_failure_carries_the_platforms_own_code(capsys: pytest.CaptureFixture[str]) -> None:
+    # Two refusals of one kind can want different fixes: a label that is taken
+    # wants another label, a computer at its limit wants room. Both are a
+    # `conflict`, so the platform's code rides beside it as `api_code`, as the
+    # npm CLI reports it (OPL-5974).
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(
+            409, json={"error": "The label is taken; choose another.", "code": "LABEL_TAKEN"}
+        )
+    )
+    assert _cli.main(["secrets", "list", "--json"]) == 1
+    assert failure(capsys) == {
+        "code": "conflict",
+        "api_code": "LABEL_TAKEN",
+        "message": "The label is taken; choose another.",
+        "status": 409,
+    }
+    # No code from the platform, no api_code.
+    respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(404, json={"error": "gone"}))
+    assert _cli.main(["secrets", "list", "--json"]) == 1
+    assert "api_code" not in failure(capsys)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("status", "body", "line"),
+    [
+        (
+            409,
+            {"error": "The label is taken; choose another.", "code": "LABEL_TAKEN"},
+            "mandala-py: The label is taken; choose another. (HTTP 409, LABEL_TAKEN)",
+        ),
+        (404, {"error": "gone"}, "mandala-py: gone (HTTP 404)"),
+        # A code is the response's own text, escaped as the message is.
+        (
+            409,
+            {"error": "taken", "code": "LABEL\x1b[2J\nmandala-py: forged"},
+            "mandala-py: taken (HTTP 409, LABEL\\u001b[2J\\u000amandala-py: forged)",
+        ),
+    ],
+)
+def test_a_text_failure_names_the_status_and_the_platforms_code(
+    capsys: pytest.CaptureFixture[str], status: int, body: dict[str, str], line: str
+) -> None:
+    respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(status, json=body))
+    assert _cli.main(["secrets", "list"]) == 1
+    assert text_failure(capsys) == [line]
+
+
+def test_a_status_the_message_already_names_is_not_repeated() -> None:
+    # The SDK's own wording for an edge failure already ends with its status.
+    err = _cli.GatewayTimeoutError(
+        "the edge gave up waiting (HTTP 524)", status=524, body="<html></html>"
+    )
+    assert _cli._status_note(err, str(err)) == ""
+    coded = _cli.ConflictError("taken", status=409, body={"code": "LABEL_TAKEN"})
+    assert _cli._status_note(coded, str(coded)) == " (HTTP 409, LABEL_TAKEN)"
+
+
+@respx.mock
 def test_a_refusal_of_the_clis_own_carries_its_word(capsys: pytest.CaptureFixture[str]) -> None:
     respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[]))
     assert _cli.main(["ssh-access", "nope", "--json"]) == 1
@@ -606,7 +666,7 @@ def test_without_json_a_failure_is_still_one_line_of_text(
     assert _cli.main(["secrets", "list"]) == 1
     out, err = capsys.readouterr()
     assert out == ""
-    assert err == "mandala-py: gone\n"
+    assert err == "mandala-py: gone (HTTP 404)\n"
 
 
 def test_a_local_file_error_keeps_its_errno_as_a_detail(
@@ -698,7 +758,7 @@ def test_a_text_failure_names_the_key_it_was_sent_with(
     key = route.calls.last.request.headers["Idempotency-Key"]
     assert key
     assert text_failure(capsys) == [
-        "mandala-py: gone quiet",
+        "mandala-py: gone quiet (HTTP 503)",
         f"mandala-py: idempotency key {key}; request id req-42" + resend(key),
     ]
 
@@ -764,7 +824,9 @@ def test_a_text_failure_message_cannot_forge_the_recovery_line(
     key = route.calls.last.request.headers["Idempotency-Key"]
     lines = text_failure(capsys)
     assert len(lines) == 2
-    assert lines[0] == "mandala-py: down\\u000amandala-py: idempotency key forged\\u001b[2J"
+    assert lines[0] == (
+        "mandala-py: down\\u000amandala-py: idempotency key forged\\u001b[2J (HTTP 503)"
+    )
     assert all("\x1b" not in line for line in lines)
     assert lines[1] == f"mandala-py: idempotency key {key}; request id r1" + resend(key)
 

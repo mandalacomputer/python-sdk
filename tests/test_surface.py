@@ -118,6 +118,8 @@ DOCUMENTED_HEADERS = {
 COMPUTER = {"id": "vm-1", "name": "d", "status": "running", "os": "linux", "cpu": 1}
 SNAPSHOT = {"id": "snap-1", "computer_id": "vm-1", "name": "s", "kind": "disk", "state": "durable"}
 HOLDINGS = {"count": 1, "size_bytes": 2, "fingerprint": "fp-abc"}
+# The schedule routes answer the whole window (OPL-5974), not the computer record.
+SCHEDULE = {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
 RETENTION = {"daily": 7, "weekly": 4, "monthly": 12}
 # One subscription (platform OPL-4300), and the same one as a create answers
 # it: the secret is on exactly that shape and on no read, so the handler below
@@ -796,6 +798,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=MOVES)
     if path.endswith("/retention"):
         return httpx.Response(200, json=RETENTION)
+    if path.endswith("/schedule"):
+        return httpx.Response(200, json=SCHEDULE)
     # Eight routes, four shapes: the collection lists on GET and answers the
     # created subscription WITH its secret on POST; a rotate is the other route
     # carrying the secret; a test answers the one delivery it queued and the

@@ -85,6 +85,7 @@ __all__ = [
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
+    "Schedule",
     "ScreenshotInfo",
     "Secret",
     "SecretBinding",
@@ -1710,6 +1711,55 @@ class SnapshotHoldings:
             computer_present=_opt_flag(d, "computer_present"),
             capturing=_num(d.get("capturing")),
             deleting=_num(d.get("deleting")),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """A computer's automatic daily snapshot window.
+
+    From :meth:`~mandala_computer.Computer.schedule`,
+    :meth:`~mandala_computer.Computer.set_schedule` and
+    :meth:`~mandala_computer.Computer.clear_schedule`. It says when snapshots are
+    TAKEN; how long they are kept is :class:`Retention`. There is deliberately no
+    "last run": snapshots carry their real capture times.
+
+    Read strictly (OPL-5974): an answer without all four fields, with an
+    ``enabled`` that is not a boolean, an ``hour`` or ``minute`` out of range, or
+    an empty ``tz`` raises :class:`~mandala_computer.MandalaError` rather than
+    being read as a disabled midnight window nobody chose.
+    """
+
+    #: Whether a capture is taken in this window.
+    enabled: bool
+    #: 0 to 23, in :attr:`tz`.
+    hour: int
+    #: 0 to 59.
+    minute: int
+    #: An IANA zone name. ``"UTC"`` when none was set.
+    tz: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "schedule") -> Schedule:
+        enabled = _wire(d, "enabled")
+        if enabled not in (_Wire.TRUE, _Wire.FALSE):
+            raise MandalaError(f"{where}: the schedule does not say whether it is enabled")
+        hour = d.get("hour")
+        if isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
+            raise MandalaError(f"{where}: the schedule's hour is not a whole number from 0 to 23")
+        minute = d.get("minute")
+        if isinstance(minute, bool) or not isinstance(minute, int) or not 0 <= minute <= 59:
+            raise MandalaError(f"{where}: the schedule's minute is not a whole number from 0 to 59")
+        tz = d.get("tz")
+        if not isinstance(tz, str) or not tz:
+            raise MandalaError(f"{where}: the schedule names no timezone")
+        return cls(
+            enabled=enabled is _Wire.TRUE,
+            hour=int.__index__(hour),
+            minute=int.__index__(minute),
+            tz=str.__str__(tz),
             raw=dict(d),
         )
 
@@ -4300,6 +4350,52 @@ class GuestDirectory:
 # --- passive signals and API activity ---------------------------------------
 
 
+def _page_flag(d: Mapping[str, Any], key: str, where: str) -> bool:
+    """A boolean a page cannot be read without, or :class:`MandalaError`.
+
+    Strict, where most of this module degrades: these flags are what a paging
+    loop runs on. ``more`` read as false ends a replay that had events owed,
+    ``gap`` read as false continues from a cursor that expired, and a
+    ``count_truncated`` read as false reports a history as whole when it is
+    not, so an answer that cannot say plainly is refused rather than read as
+    the reassuring half (OPL-5974).
+    """
+    said = _wire(d, key)
+    if said is _Wire.TRUE:
+        return True
+    if said is _Wire.FALSE:
+        return False
+    raise MandalaError(f"{where}: {key} is missing or not a boolean")
+
+
+def _row_flag(d: Mapping[str, Any], key: str, where: str) -> bool | None:
+    """An optional boolean on a row: ``None`` when absent or ``null``, and
+    :class:`MandalaError` when present as anything else (OPL-5974)."""
+    said = _wire(d, key)
+    if said is _Wire.MALFORMED:
+        raise MandalaError(f"{where}: {key} is not a boolean")
+    return True if said is _Wire.TRUE else False if said is _Wire.FALSE else None
+
+
+def _page_rows(rows: builtins.list[Any], where: str, what: str) -> builtins.list[Mapping[str, Any]]:
+    """Every row of a page as a mapping, or :class:`MandalaError` naming the
+    first that is not one. A row that cannot be read is never dropped: a page
+    one row short reads exactly like a history where it never happened."""
+    out: builtins.list[Mapping[str, Any]] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise MandalaError(f"{where}: {what} {i} is not an object")
+        out.append(row)
+    return out
+
+
+def _row_id(row: Mapping[str, Any], key: str, where: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value:
+        raise MandalaError(f"{where}: a row has no usable {key}")
+    return str.__str__(value)
+
+
 @dataclass(frozen=True)
 class SignalPage:
     """One read of a computer's passive platform signals.
@@ -4334,24 +4430,32 @@ class SignalPage:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> SignalPage:
-        """Refuses a page without a cursor or an event list.
+        """Refuses a page without a cursor or an event list, an event that is
+        not an object or names no ``cursor`` and ``type``, and a ``more`` or
+        ``baseline`` that is not a boolean.
 
         A failure must never read as an empty history: the platform keeps that
-        promise on its side, and a decoder that filled in an empty list would
-        break it on this one.
+        promise on its side, and a decoder that filled in an empty list, dropped
+        an event it could not read, or read an unreadable ``more`` as false
+        would break it on this one.
         """
+        where = "GET computers/:id/signals"
         cursor = d.get("cursor")
         events = d.get("events")
-        if not isinstance(cursor, str) or not isinstance(events, builtins.list):
-            raise MandalaError("expected a signal page from GET computers/:id/signals")
+        if not isinstance(cursor, str) or not cursor or not isinstance(events, builtins.list):
+            raise MandalaError(f"expected a signal page from {where}")
+        rows = _page_rows(events, where, "event")
+        for i, row in enumerate(rows):
+            if not isinstance(row.get("cursor"), str) or not isinstance(row.get("type"), str):
+                raise MandalaError(f"{where}: event {i} does not carry a cursor and a type")
         gap = d.get("gap")
         return cls(
             computer=_text(d.get("computer")),
             from_cursor=_text(d.get("from")),
             cursor=str.__str__(cursor),
-            events=[dict(e) for e in events if isinstance(e, Mapping)],
-            more=_wire(d, "more") is _Wire.TRUE,
-            baseline=_wire(d, "baseline") is _Wire.TRUE,
+            events=[dict(e) for e in rows],
+            more=_page_flag(d, "more", where),
+            baseline=_page_flag(d, "baseline", where),
             gap=dict(gap) if isinstance(gap, Mapping) else None,
             supported=_texts(d.get("supported")),
             retention=_text(d.get("retention")),
@@ -4416,10 +4520,15 @@ class Activity:
     cost_usd: float | None = field(default=None, kw_only=True)
 
     @classmethod
-    def from_api(cls, d: Mapping[str, Any]) -> Activity:
+    def from_api(cls, d: Mapping[str, Any], where: str = "activity") -> Activity:
+        """Refuses a row without its ``activity_id``, and a ``has_results`` sent
+        as something other than a boolean, which would otherwise read as
+        ``False`` (OPL-5974)."""
+        if not isinstance(d, Mapping):
+            raise MandalaError(f"{where}: an activity is not an object")
         workspace = d.get("workspace_id")
         return cls(
-            activity_id=_text(d.get("activity_id")),
+            activity_id=_row_id(d, "activity_id", where),
             account_id=_text(d.get("account_id")),
             computer_id=_text(d.get("computer_id")),
             workspace_id=str(workspace) if isinstance(workspace, str) and workspace else None,
@@ -4430,7 +4539,7 @@ class Activity:
             received_at=_text(d.get("received_at")),
             observed_at=_text(d.get("observed_at")),
             revision=_opt_whole(d.get("revision")),
-            has_results=_wire(d, "has_results") is _Wire.TRUE,
+            has_results=_row_flag(d, "has_results", where) is True,
             dispatched_at=_opt_text(d.get("dispatched_at")),
             elapsed_ms=_opt_whole(d.get("elapsed_ms")),
             reason=_opt_text(d.get("reason")),
@@ -4438,6 +4547,9 @@ class Activity:
             exit_code=_opt_whole(d.get("exit_code")),
             execution_id=_opt_text(d.get("execution_id")),
             raw=dict(d),
+            # Never coerced, as the TypeScript SDK reads it: a real boolean or
+            # nothing. Unknown is None here rather than False, so a malformed
+            # value cannot read as "ran on the caller's own key".
             funded=d.get("funded") if isinstance(d.get("funded"), bool) else None,
             cost_usd=_opt_charge(d.get("cost_usd")),
         )
@@ -4465,14 +4577,20 @@ class ActivityHealth:
     recovered_at: str | None
 
     @classmethod
-    def from_api(cls, value: object) -> ActivityHealth | None:
-        if not isinstance(value, Mapping):
+    def from_api(cls, value: object, where: str = "activity health") -> ActivityHealth | None:
+        """``None`` for an answer without health (absent or ``null``); refuses
+        one that is not an object, or whose truncation flags are not booleans,
+        since a history read as untruncated when it was is the misreading that
+        matters (OPL-5974)."""
+        if value is None:
             return None
+        if not isinstance(value, Mapping):
+            raise MandalaError(f"{where}: health is not an object")
         return cls(
             recording_started_at=_text(value.get("recording_started_at")),
             earliest_retained_at=_opt_text(value.get("earliest_retained_at")),
-            count_truncated=_wire(value, "count_truncated") is _Wire.TRUE,
-            age_truncated=_wire(value, "age_truncated") is _Wire.TRUE,
+            count_truncated=_page_flag(value, "count_truncated", where),
+            age_truncated=_page_flag(value, "age_truncated", where),
             capture=_text(value.get("capture")),
             completeness=_text(value.get("completeness")),
             gap_at=_opt_text(value.get("gap_at")),
@@ -4500,17 +4618,29 @@ class ActivityPage:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ActivityPage:
-        """Refuses a page without its rows, which would read as no activity."""
+        """Refuses a page without its rows, which would read as no activity, and
+        one that is not whole: a row that is not an object or has no
+        ``activity_id``, a ``gap`` that is not a boolean, a ``next_cursor`` that
+        is neither text nor ``null``, or no ``changes_cursor`` (OPL-5974)."""
+        where = "GET computers/:id/activities"
         rows = d.get("items")
         if not isinstance(rows, builtins.list):
-            raise MandalaError("expected an activity page from GET computers/:id/activities")
+            raise MandalaError(f"expected an activity page from {where}")
         next_cursor = d.get("next_cursor")
+        if next_cursor is not None and not isinstance(next_cursor, str):
+            raise MandalaError(f"{where}: next_cursor is neither text nor null")
+        changes_cursor = d.get("changes_cursor")
+        if not isinstance(changes_cursor, str):
+            raise MandalaError(f"{where}: the page carries no changes_cursor")
         return cls(
-            items=[Activity.from_api(r) for r in rows if isinstance(r, Mapping)],
-            next_cursor=next_cursor if isinstance(next_cursor, str) and next_cursor else None,
-            changes_cursor=_text(d.get("changes_cursor")),
-            gap=_wire(d, "gap") is _Wire.TRUE,
-            health=ActivityHealth.from_api(d.get("health")),
+            items=[
+                Activity.from_api(r, f"{where}: activity {i}")
+                for i, r in enumerate(_page_rows(rows, where, "activity"))
+            ],
+            next_cursor=str.__str__(next_cursor) if next_cursor else None,
+            changes_cursor=str.__str__(changes_cursor),
+            gap=_page_flag(d, "gap", where),
+            health=ActivityHealth.from_api(d.get("health"), f"{where}: health"),
             raw=dict(d),
         )
 
@@ -4536,16 +4666,21 @@ class ActivityResults:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> ActivityResults:
+        """Refuses an answer without its item list, an item that is not an
+        object or has no ``id``, and a ``more`` that is not a boolean
+        (OPL-5974)."""
+        where = "GET computers/:id/activities/:activity/results"
         rows = d.get("items")
         if not isinstance(rows, builtins.list):
-            raise MandalaError(
-                "expected activity results from GET computers/:id/activities/:activity/results"
-            )
+            raise MandalaError(f"expected activity results from {where}")
+        items = _page_rows(rows, where, "result")
+        for row in items:
+            _row_id(row, "id", where)
         return cls(
             activity_id=_text(d.get("activity_id")),
             revision=_opt_whole(d.get("revision")),
-            more=_wire(d, "more") is _Wire.TRUE,
-            items=[dict(r) for r in rows if isinstance(r, Mapping)],
+            more=_page_flag(d, "more", where),
+            items=[dict(r) for r in items],
             raw=dict(d),
         )
 

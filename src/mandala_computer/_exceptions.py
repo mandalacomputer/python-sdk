@@ -96,6 +96,25 @@ class MandalaError(Exception):
 #: one status, so a subclass of one of them could not carry it. See
 #: :func:`is_transient`.
 _REASON_CLEARS = frozenset({"contention", "starting"})
+#: The 409 ``code`` values that clear on their own where the body carries no
+#: ``reason`` (OPL-5974). The platform's reference says a 409 without a
+#: ``reason`` is unclassified and that treating 409 as uniformly transient
+#: loops forever, so a ``code`` is the only other thing that can make one worth
+#: sending again, and only these two are documented as passing:
+#:
+#: * ``idempotency_in_progress`` — the keyed call is still being carried out;
+#:   sending it again with the same key returns its answer. The platform sends
+#:   ``reason: "contention"`` beside it as well, so this is belt and
+#:   braces.
+#: * ``WORKSPACE_MOVING`` — the computer is being moved to another workspace,
+#:   and the same request works once that move has finished. The platform puts
+#:   ``contention`` on the move in progress and ``unsupported`` on a change that
+#:   is not settled and needs the dashboard, and that word, when sent, is read
+#:   first: ``unsupported`` stays permanent.
+#:
+#: Every other 409 code without a clearing ``reason`` is final: ``LABEL_TAKEN``
+#: and ``PUBLIC_URL_LIMIT`` among them.
+_CODE_CLEARS = frozenset({"idempotency_in_progress", "WORKSPACE_MOVING"})
 #: ``revoked`` is the first of these about the CALLER rather than about a computer:
 #: the authority the request arrived with no longer holds — suspended, demoted,
 #: removed, or a session the platform has retired (OPL-4801). Permanent, and named
@@ -134,6 +153,12 @@ _REASON_CLEARS = frozenset({"contention", "starting"})
 #: again, however long it waits, because the pixels it named are gone — so it
 #: is permanent, where an ordinary :class:`ConflictError` would read as worth
 #: sending again. A new screenshot, and the capture it names, is the fix.
+#:
+#: The "ordinary :class:`ConflictError`" each paragraph above warns about is
+#: the one from before OPL-5974: an unclassified 409 now answers ``False`` as
+#: well. The words still matter, because they are read before a ``code`` in
+#: :data:`_CODE_CLEARS` — ``WORKSPACE_MOVING`` with ``unsupported`` is a change
+#: that will not settle by waiting — and on the 400s that carry them.
 _REASON_PERMANENT = frozenset(
     {
         "unavailable",
@@ -848,9 +873,19 @@ class ConflictError(APIError):
       ``reason``. The sixteen already running may be long-lived servers, so
       waiting does not necessarily help: stop one of the handles you hold.
 
-    :func:`is_transient` still answers ``True`` for a 409 with no word, as it
-    always has, because most of them clear; a loop built on it should be bounded
-    in attempts or by a deadline.
+    - Public URL refusals: ``LABEL_TAKEN`` (the label is taken, blocked, or
+      was ever another account's) and ``PUBLIC_URL_LIMIT`` (the computer has as
+      many as its plan allows). Webhooks at the account's subscription cap, a
+      test of a disabled webhook, an SSH key already registered and the SSH key
+      limit are the same kind: none carries a ``reason``.
+
+    :func:`is_transient` answers ``False`` for a 409 with no word, unless its
+    ``code`` is ``idempotency_in_progress`` or ``WORKSPACE_MOVING``, which the
+    platform documents as passing (OPL-5974). It answered ``True`` before, on
+    the theory that most clear, and a retry loop built on it spun on every one
+    of the refusals above until its deadline. An unclassified 409 that does
+    clear, such as a computer whose disk is still being copied, is still worth
+    a bounded retry of your own once you have read the message.
     """
 
 
@@ -973,9 +1008,9 @@ class ComputerNotRunningError(ConflictError):
     ``read_file(..., no_wake=True)`` and its siblings ask the platform to refuse
     rather than resume a computer that is stopped or suspended, and it refuses
     with a 409. The reference documents that refusal as carrying no ``reason``,
-    so without this class it would be an ordinary :class:`ConflictError` —
-    which :func:`is_transient` calls worth sending again, while nothing but a
-    start will change the answer.
+    so without this class it would be an ordinary :class:`ConflictError`, which
+    :func:`is_transient` called worth sending again before OPL-5974, while
+    nothing but a start will change the answer.
 
     Raised for a no-wake request's 409 whose ``reason`` is missing or
     ``"unavailable"``. Final: :func:`is_transient` says ``False``. Start the
@@ -1182,9 +1217,13 @@ def is_transient(err: BaseException) -> bool:
     — possibly a ``create`` — so it names only failures that both clear on
     their own *and* are safe to replay blind:
 
-    * :class:`ConflictError` — something in flight this cannot run alongside,
-      minus :class:`MoveRequiredError`, which is a decision rather than a moment
-      and ``template_image_preparing``, which requires an explicit continuation
+    * :class:`ConflictError` WHEN THE PLATFORM SAYS IT CLEARS — a ``reason`` of
+      ``contention`` or ``starting``, or, on a body with no ``reason``, a
+      ``code`` of ``idempotency_in_progress`` or ``WORKSPACE_MOVING``. Any other
+      409 is ``False``: an absent ``reason`` means no classification, and many
+      unclassified 409s are decisions about the request (a public URL label
+      taken, a plan's limit reached, a duplicate SSH key) that answer the same
+      way forever
     * :class:`RateLimitError` — a cadence, and the response usually says how long.
       Minus one: a 429 that ended an agent run (the model API's, relayed with
       the prefix ``model API: ``, or a funded run's provider failure) after the
@@ -1214,9 +1253,11 @@ def is_transient(err: BaseException) -> bool:
     own; ``unavailable`` (start the computer), ``unsupported``, ``exists`` and
     ``revoked`` never do — and it is consulted BEFORE the types below, because
     it is the more specific answer. Where it is absent, or is a word this
-    version does not know, the type answer stands unchanged; the platform is
-    explicit that an unrecognised value means no answer given, which is what
-    makes a new word safe to add later.
+    version does not know, the platform is explicit that it means no answer
+    given, which is what makes a new word safe to add later. On a 409 that is
+    ``False`` unless the body's ``code`` is one of the two above: until
+    OPL-5974 an unclassified 409 answered ``True``, which looped a caller's
+    retry on a refusal that never clears. Every other type keeps its answer.
 
     ``starting`` is the two minutes after a start, a restart or a reboot from
     inside the guest, while its agent has not answered yet. A guest agent that
@@ -1260,8 +1301,9 @@ def is_transient(err: BaseException) -> bool:
     if isinstance(err, APIError) and err._batch_outcome_unknown:
         return False
     # By class as well as by word: a create-only upload whose 409 carried no
-    # usable reason has no ``reason`` at all, and would otherwise fall through to
-    # the ConflictError branch below and be called worth sending again.
+    # usable reason has no ``reason`` at all, and is final whatever ``code`` its
+    # body names, including one the ConflictError branch below would call
+    # worth sending again.
     if isinstance(err, (FileExistsError, CreateOnlyConflictError, ComputerNotRunningError)):
         return False
     # A lost RESPONSE is not a request that never left, and only one of the two
@@ -1274,9 +1316,9 @@ def is_transient(err: BaseException) -> bool:
     # that never clears from the two that do. Both memberships are tested
     # rather than one being inferred from the other, so a FIFTH word this
     # version has never heard of falls through to the type answer instead of
-    # being read as permanent. That fallback is the contract, not an oversight:
-    # the platform states that a client must treat an unrecognised value as no
-    # answer given.
+    # being read as permanent (on a 409, that is the code check at the end).
+    # That fallback is the contract, not an oversight: the platform states that
+    # a client must treat an unrecognised value as no answer given.
     # Only APIError owns the platform's shape-checked refusal classification.
     # Arbitrary exceptions may also happen to expose ``reason`` — including an
     # unhashable value — but that is neither this protocol nor retry advice.
@@ -1328,7 +1370,15 @@ def is_transient(err: BaseException) -> bool:
         # answers a failure after the request was sent the same way. Only a
         # read can be replayed blind.
         return err.method in _READ_METHODS
-    return isinstance(err, (ConflictError, RateLimitError, ConnectionError))
+    if isinstance(err, ConflictError):
+        # A 409 with no clearing word (handled above) is unclassified, and the
+        # platform says so: absent means no classification, and treating 409 as
+        # uniformly transient loops forever on the half that describe a decision
+        # (a label taken, a plan's limit, a duplicate key). Only a code the
+        # reference documents as passing makes one worth sending again
+        # (OPL-5974).
+        return err.code in _CODE_CLEARS
+    return isinstance(err, (RateLimitError, ConnectionError))
 
 
 #: The methods whose 503 :func:`is_transient` calls worth sending again.
