@@ -81,6 +81,18 @@ This is the summary you read to decide whether to upgrade.
   that is not a boolean. They used to drop the row and read the flag
   as `False`.
 
+- **Webhook, delivery and SSH key rows are read strictly.** A webhook, a
+  webhook delivery or an SSH key without its `id`, from a listing or a single
+  read, raises `MandalaError` rather than coming back with `id == ""`, and so
+  does a webhook whose `enabled` is not a boolean. An absent `enabled` used to
+  read as `True`.
+
+- **Window geometry is checked before sending.** `window_action(..., "move")`
+  takes whole `x` and `y` from -32768 to 32767, and `"resize"` whole `width` and
+  `height` from 1 to 32767; anything else is a `ValueError`, sync and async.
+  Pointer coordinates were already refused unless they are integers
+  (`TypeError`); `input_batch()` still takes OpenAI's numbers as they are.
+
 - **The browser toolsets check requests at the browser root** (OPL-5912). The
   URL policy is installed as browser-level interception before the toolset
   opens a page, so requests from a sandboxed `srcdoc` frame that starts before

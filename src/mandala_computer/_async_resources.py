@@ -1236,7 +1236,8 @@ class AsyncWebhooks:
         self._t = transport
 
     async def list(self) -> builtins.list[Webhook]:
-        return [Webhook.from_api(w) for w in await self._t.json_array("GET", _api.WEBHOOKS)]
+        rows = await self._t.json_array("GET", _api.WEBHOOKS)
+        return [Webhook.from_api(w, f"GET webhooks: webhook {i}") for i, w in enumerate(rows)]
 
     async def create(
         self,
@@ -1293,7 +1294,10 @@ class AsyncWebhooks:
 
     async def deliveries(self, webhook_id: str) -> builtins.list[WebhookDelivery]:
         data = await self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
-        return [WebhookDelivery.from_api(d) for d in data]
+        return [
+            WebhookDelivery.from_api(d, f"GET webhooks/:id/deliveries: delivery {i}")
+            for i, d in enumerate(data)
+        ]
 
     list.__doc__ = Webhooks.list.__doc__
     create.__doc__ = Webhooks.create.__doc__
@@ -1382,7 +1386,8 @@ class AsyncSshKeys:
         self._t = transport
 
     async def list(self) -> builtins.list[SshKey]:
-        return [SshKey.from_api(k) for k in await self._t.json_array("GET", _api.SSH_KEYS)]
+        rows = await self._t.json_array("GET", _api.SSH_KEYS)
+        return [SshKey.from_api(k, f"GET ssh-keys: key {i}") for i, k in enumerate(rows)]
 
     async def add(self, public_key: str, *, name: str | None = None) -> SshKey:
         body = _api.ssh_key_body(public_key, name)

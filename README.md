@@ -893,7 +893,10 @@ Coordinates are in the computer's own screen space. That is a create-time choice
 now rather than a fixed size, so read `c.resolution` (or `c.screen` for the two
 numbers) instead of assuming — `mandala_computer.SCREEN_WIDTH` / `SCREEN_HEIGHT`
 are the 1280×800 default, which is only what a computer that asked for nothing
-else renders at.
+else renders at. Coordinates are whole pixels: a `float` (even `640.0`) is
+refused with `TypeError` before anything is sent, so round a computed position
+yourself, e.g. `c.click(round(x), round(y))`. `input_batch()` is the exception:
+it takes OpenAI's actions as they come.
 
 ```python
 x, y = 640, 480
@@ -1436,6 +1439,10 @@ c.window_action(firefox.id, "focus")
 c.window_action(firefox.id, "move", x=0, y=0)
 c.window_action(firefox.id, "resize", width=1280, height=760)
 ```
+
+A move takes whole `x` and `y` from -32768 to 32767, and a resize whole `width`
+and `height` from 1 to 32767 (the signed 16-bit range X11 holds); anything else
+is a `ValueError` before any request.
 
 Match on `wm_class`, not `title`: the class is the application and is stable,
 the title is whatever page it happens to be showing.

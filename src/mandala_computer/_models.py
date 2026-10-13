@@ -3425,22 +3425,26 @@ class Webhook:
         return not self.enabled and self.disabled_reason == "failing"
 
     @classmethod
-    def from_api(cls, d: Mapping[str, Any]) -> Webhook:
-        return cls(**cls._fields(d))
+    def from_api(cls, d: Mapping[str, Any], where: str = "webhook") -> Webhook:
+        """Refuses a subscription without its ``id``, which no later call could
+        name, or with an ``enabled`` that is not a boolean (OPL-5974)."""
+        return cls(**cls._fields(d, where))
 
     @classmethod
-    def _fields(cls, d: Mapping[str, Any]) -> dict[str, Any]:
+    def _fields(cls, d: Mapping[str, Any], where: str) -> dict[str, Any]:
+        enabled = _wire(d, "enabled")
+        if enabled not in (_Wire.TRUE, _Wire.FALSE):
+            # Strict both ways: read as on it reports a subscription the
+            # platform switched off as delivering, and read as off it is one a
+            # caller stops watching. The platform always says which.
+            raise MandalaError(f"{where}: the subscription does not say whether it is enabled")
         return {
-            "id": _text(d.get("id")),
+            "id": _row_id(d, "id", where),
             "url": _text(d.get("url")),
             "description": _text(d.get("description")),
             "events": _texts(d.get("events")),
             "computers": _texts(d.get("computers")),
-            # Absent decodes as ENABLED, which is the platform's default for a
-            # create that did not say — and the safe reading of a row that did
-            # not either: a subscription read as disabled by mistake is one a
-            # caller stops watching.
-            "enabled": _wire(d, "enabled") is not _Wire.FALSE,
+            "enabled": enabled is _Wire.TRUE,
             "disabled_reason": _opt_text(d.get("disabled_reason")),
             "disabled_at": _opt_text(d.get("disabled_at")),
             "last_success_at": _opt_text(d.get("last_success_at")),
@@ -3479,8 +3483,8 @@ class WebhookCreated(Webhook):
         return f"{super().__repr__()[:-1]}, secret=<redacted>)"
 
     @classmethod
-    def from_api(cls, d: Mapping[str, Any]) -> WebhookCreated:
-        return cls(secret=_text(d.get("secret")), **cls._fields(d))
+    def from_api(cls, d: Mapping[str, Any], where: str = "webhook") -> WebhookCreated:
+        return cls(secret=_text(d.get("secret")), **cls._fields(d, where))
 
 
 #: The states a delivery is finished in. Nothing more will happen to one of these.
@@ -3553,9 +3557,10 @@ class WebhookDelivery:
         return self.state in DELIVERY_FINAL_STATES
 
     @classmethod
-    def from_api(cls, d: Mapping[str, Any]) -> WebhookDelivery:
+    def from_api(cls, d: Mapping[str, Any], where: str = "webhook delivery") -> WebhookDelivery:
+        """Refuses a delivery without its ``id`` (OPL-5974)."""
         return cls(
-            id=_text(d.get("id")),
+            id=_row_id(d, "id", where),
             event_type=_text(d.get("event_type")),
             computer=_text(d.get("computer")),
             cursor=_text(d.get("cursor")),
@@ -3612,9 +3617,11 @@ class SshKey:
     reach: str | None = field(default=None, kw_only=True)
 
     @classmethod
-    def from_api(cls, d: Mapping[str, Any]) -> SshKey:
+    def from_api(cls, d: Mapping[str, Any], where: str = "an SSH key") -> SshKey:
+        """Refuses a key without its ``id``, which :meth:`~mandala_computer.SshKeys.remove`
+        needs (OPL-5974)."""
         return cls(
-            id=_text(d.get("id")),
+            id=_row_id(d, "id", where),
             name=_text(d.get("name")),
             public_key=_text(d.get("public_key")),
             fingerprint=_text(d.get("fingerprint")),

@@ -1812,7 +1812,8 @@ class Webhooks:
         No secret is ever in this list. An API key issued against a workspace
         sees the subscriptions confined to that workspace only.
         """
-        return [Webhook.from_api(w) for w in self._t.json_array("GET", _api.WEBHOOKS)]
+        rows = self._t.json_array("GET", _api.WEBHOOKS)
+        return [Webhook.from_api(w, f"GET webhooks: webhook {i}") for i, w in enumerate(rows)]
 
     def create(
         self,
@@ -1929,7 +1930,10 @@ class Webhooks:
         dropped silently.
         """
         data = self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
-        return [WebhookDelivery.from_api(d) for d in data]
+        return [
+            WebhookDelivery.from_api(d, f"GET webhooks/:id/deliveries: delivery {i}")
+            for i, d in enumerate(data)
+        ]
 
 
 class SshKeys:
@@ -1960,7 +1964,8 @@ class SshKeys:
 
     def list(self) -> builtins.list[SshKey]:
         """Your keys, oldest first."""
-        return [SshKey.from_api(k) for k in self._t.json_array("GET", _api.SSH_KEYS)]
+        rows = self._t.json_array("GET", _api.SSH_KEYS)
+        return [SshKey.from_api(k, f"GET ssh-keys: key {i}") for i, k in enumerate(rows)]
 
     def add(self, public_key: str, *, name: str | None = None) -> SshKey:
         """Register one public key: a line from a ``.pub`` file, as read. It
