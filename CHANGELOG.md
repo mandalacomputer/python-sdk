@@ -9,6 +9,16 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Public URLs.** On a computer, `public_urls()`, `create_public_url(port,
+  label=None, access=None)`, `update_public_url(url_id, port=None,
+  access=None)` and `delete_public_url(url_id)` serve a port inside it at
+  `https://<label>.mandala.dev`, public or private (opened only with one of the
+  account's API keys). They answer the new `PublicUrl` and `PublicUrls`, read
+  strictly: a malformed answer raises `MandalaError` rather than being guessed
+  at. The async client has the same methods.
+
 ## [0.12.0] — 2026-10-11
 
 ### Added

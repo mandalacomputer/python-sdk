@@ -80,6 +80,8 @@ __all__ = [
     "OperationPage",
     "PageContext",
     "PageElement",
+    "PublicUrl",
+    "PublicUrls",
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
@@ -3619,6 +3621,147 @@ class SshAccess:
             key_count=_num(d.get("key_count")),
             keys_pushed=_num(d.get("keys_pushed")),
             error=_opt_text(d.get("error")),
+            raw=dict(d),
+        )
+
+
+# --- public URLs ------------------------------------------------------------
+
+
+def _url_text(d: Mapping[str, Any], key: str, where: str) -> str:
+    value = d.get(key)
+    if not isinstance(value, str) or not value:
+        raise MandalaError(f"{where}: a public URL has no usable {key}")
+    return str.__str__(value)
+
+
+@dataclass(frozen=True)
+class PublicUrl:
+    """A port inside a computer, served at :attr:`url` (platform OPL-3753).
+
+    From :meth:`~mandala_computer.Computer.public_urls`,
+    :meth:`~mandala_computer.Computer.create_public_url` and
+    :meth:`~mandala_computer.Computer.update_public_url`. The app must listen
+    on ``0.0.0.0:<port>``, not ``127.0.0.1``.
+    """
+
+    #: ``pu-`` and sixteen hex characters.
+    id: str
+    #: The address to open: ``https://<label>.<base_domain>``, on port 443, with
+    #: no port in it.
+    url: str
+    #: ``<label>.<base_domain>``.
+    hostname: str
+    #: The name before the domain. It is the URL, so it never changes.
+    label: str
+    #: The port inside the computer this URL serves.
+    port: int
+    #: ``"public"``: anyone with the link. ``"private"``: only a request
+    #: carrying an API key of this account as ``Authorization: Bearer``, which
+    #: never reaches the app. Never anything else: an answer naming another
+    #: mode is refused, since a caller branching on :attr:`is_private` would
+    #: otherwise read an unknown policy as public.
+    access: str
+    #: ``True`` when the platform has turned this URL off, by its name, its
+    #: computer or its account: it answers 404 until the platform turns it back
+    #: on, and deleting it and making it again does not.
+    disabled: bool
+    #: RFC 3339.
+    created_at: str
+    #: RFC 3339: the last change to its port or access.
+    updated_at: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @property
+    def is_private(self) -> bool:
+        """Only a request with one of the account's API keys may open it."""
+        return self.access == "private"
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "public URL") -> PublicUrl:
+        """Refuses an answer that is not a whole public URL.
+
+        A URL read wrong is one opened wrong: a port defaulted to 0, an access
+        defaulted to public or a ``disabled`` defaulted to false would each say
+        something the platform did not.
+        """
+        port = d.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise MandalaError(f"{where}: a public URL has no usable port")
+        disabled = _wire(d, "disabled")
+        if disabled not in (_Wire.TRUE, _Wire.FALSE):
+            raise MandalaError(f"{where}: a public URL does not say whether it is disabled")
+        access = d.get("access")
+        if access not in ("public", "private") or not isinstance(access, str):
+            raise MandalaError(f'{where}: a public URL\'s access is neither "public" nor "private"')
+        return cls(
+            id=_url_text(d, "id", where),
+            url=_url_text(d, "url", where),
+            hostname=_url_text(d, "hostname", where),
+            label=_url_text(d, "label", where),
+            port=int.__index__(port),
+            access=str.__str__(access),
+            disabled=disabled is _Wire.TRUE,
+            created_at=_url_text(d, "created_at", where),
+            updated_at=_url_text(d, "updated_at", where),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class PublicUrls:
+    """A computer's public URLs, and whether they can answer.
+
+    From :meth:`~mandala_computer.Computer.public_urls`. The URLs are listed
+    whether or not they can answer, so what was made can always be seen and
+    deleted.
+    """
+
+    #: Whether this computer's URLs can answer here: ``False`` where public URLs
+    #: are off or the account's plan includes none, with :attr:`reason` saying
+    #: which.
+    enabled: bool
+    #: Why :attr:`enabled` is false. ``None`` while it is true.
+    reason: str | None
+    #: The domain every label sits under, such as ``mandala.dev``.
+    base_domain: str
+    #: How many public URLs this computer may have on the account's plan. If
+    #: the plan drops below the number it has, the oldest within the limit keep
+    #: answering and the rest answer 404 until the plan allows them again.
+    limit: int
+    #: Oldest first.
+    public_urls: builtins.list[PublicUrl]
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any], where: str = "public URLs") -> PublicUrls:
+        """Refuses an answer that is not the whole envelope with every URL readable."""
+        rows = d.get("public_urls")
+        if not isinstance(rows, list):
+            raise MandalaError(f"expected public URLs from {where}")
+        urls = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise MandalaError(f"{where}: a public URL is not an object")
+            urls.append(PublicUrl.from_api(row, where))
+        enabled = _wire(d, "enabled")
+        if enabled not in (_Wire.TRUE, _Wire.FALSE):
+            raise MandalaError(f"{where}: the answer does not say whether public URLs are enabled")
+        base_domain = d.get("base_domain")
+        if not isinstance(base_domain, str) or not base_domain:
+            raise MandalaError(f"{where}: the answer names no base domain")
+        limit = d.get("limit")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise MandalaError(f"{where}: limit must be a non-negative whole number")
+        reason = d.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise MandalaError(f"{where}: reason must be text")
+        return cls(
+            enabled=enabled is _Wire.TRUE,
+            reason=None if reason is None else str.__str__(reason),
+            base_domain=str.__str__(base_domain),
+            limit=int.__index__(limit),
+            public_urls=urls,
             raw=dict(d),
         )
 

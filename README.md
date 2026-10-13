@@ -2569,6 +2569,34 @@ Ten subscriptions per account on every paid plan, none without one; the
 eleventh is a `ConflictError` naming the cap. The endpoint must resolve to a
 public address — a private, loopback or link-local one is a 400 at create.
 
+### Public URLs
+
+A public URL serves a port inside a computer at `https://<label>.mandala.dev`,
+on port 443 with no port in the address. The app must listen on
+`0.0.0.0:<port>`, not `127.0.0.1`.
+
+```python
+c = client.computers.get("vm-...")
+served = c.create_public_url(3000)  # a label like brave-otter-3f2a is picked
+print(served.url)  # https://brave-otter-3f2a.mandala.dev
+c.create_public_url(8000, label="my-demo", access="private")
+c.update_public_url(served.id, port=8080)  # or access="private"
+listing = c.public_urls()  # .enabled, .reason, .limit, .public_urls
+c.delete_public_url(served.id)
+```
+
+`access` is `"public"` (the default: anyone with the link) or `"private"`: only
+a request carrying one of the account's API keys as `Authorization: Bearer`
+opens it, and the key never reaches the app. The label is the URL and never
+changes; delete the URL and make another for a new name. The platform refuses
+labels that are taken, reserved, or read as its own or another company's
+address, and the refusal keeps its `code` (`LABEL_TAKEN`, `INVALID_LABEL`,
+`PUBLIC_URL_LIMIT`, `PLAN_REQUIRED`, ...). A port outside 1 to 65535, port 22,
+an empty label or another `access` is a `ValueError` before any request. The
+listing comes back whether or not the URLs can answer: `enabled=False`, with a
+`reason`, where public URLs are off or the plan includes none. How many a
+computer may have is `limit`. The async client has the same methods.
+
 ### Secrets
 
 The account keeps secrets — API keys, tokens, kubeconfigs — encrypted, and
