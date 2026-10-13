@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-10-13
+
 ### Added
 
 - **Public URLs.** On a computer, `public_urls()`, `create_public_url(port,
@@ -42,56 +44,69 @@ This is the summary you read to decide whether to upgrade.
 - **`Schedule`**, what `schedule()`, `set_schedule()` and `clear_schedule()`
   now return (see Changed).
 
-- **The platform's error `code` in the CLI.** `mandala-py --json` failures
-  carry it as `api_code` beside the CLI's own `code`, as `mandala` does, so a
-  `LABEL_TAKEN` and a `PUBLIC_URL_LIMIT` can be told apart without reading the
-  sentence. Without `--json`, a refusal from the platform ends its line with
-  `(HTTP <status>, <code>)`, or `(HTTP <status>)` when there is no code.
+- **The platform's error `code` in CLI errors, as `api_code`.** `mandala-py
+  --json` failures carry it as `api_code` beside the CLI's own `code`, as
+  `mandala` does, so two refusals with one status, such as `LABEL_TAKEN` and
+  `PUBLIC_URL_LIMIT`, can be told apart without reading the sentence. Without
+  `--json`, a refusal from the platform ends its line with `(HTTP <status>,
+  <code>)`, or `(HTTP <status>)` when there is no code.
 
 ### Changed
 
-- **`is_transient()` answers `False` for a 409 the platform did not classify.**
-  The platform documents that a 409 without a `reason` is unclassified and that
-  treating 409 as uniformly transient loops forever, and many are decisions
-  that never clear: a public URL's `LABEL_TAKEN` and `PUBLIC_URL_LIMIT`, a
-  webhook past the subscription cap or a test of a disabled webhook, a
-  duplicate SSH key or the SSH key limit. A 409 is now `True` only with
-  `reason` `contention` or `starting`, or, with no `reason`, a `code` of
-  `idempotency_in_progress` or `WORKSPACE_MOVING`. A word this version does
-  not know is unclassified too. Code that relied on the old `True` to retry a
-  conflict that does clear, such as a disk still being copied, should retry it
-  itself, bounded, after reading the error. The TypeScript SDK and the MCP
-  server classify each code the same way.
+- **A 409 the platform did not classify is final: `is_transient()` answers
+  `False`.** The platform documents a 409 without a `reason` as unclassified,
+  and a client treating 409 as uniformly transient loops forever on the
+  refusals that are decisions: a public URL label that is taken
+  (`LABEL_TAKEN`), a computer at its public URL limit (`PUBLIC_URL_LIMIT`), a
+  webhook past the subscription cap, a test of a disabled webhook, an SSH key
+  already registered, the SSH key limit, the cap of sixteen background
+  commands. A 409 is now transient only with `reason` `contention` or
+  `starting`, or with `code` `idempotency_in_progress` or `WORKSPACE_MOVING`
+  and no word saying otherwise (`WORKSPACE_MOVING` with `reason:
+  "unsupported"` is final). A word this version does not know is no answer, so
+  on its own it leaves the 409 final. The TypeScript SDK, the Python SDK and
+  the MCP server classify every 409 the same way. Code that relied on the old
+  `True` to retry a conflict that does clear, such as a disk still being
+  copied, should retry it itself, bounded, after reading the error.
 
 - **`schedule()`, `set_schedule()` and `clear_schedule()` return a
   `Schedule`** (`enabled`, `hour`, `minute`, `tz`, and the answer in `raw`)
   instead of a plain `dict`, sync and async. It is read strictly: an answer
   missing a field, with an `enabled` that is not a boolean, an hour or minute out
   of range, or no timezone raises `MandalaError`. A malformed answer to
-  `set_schedule()` leaves `snapshot_schedule` as it was. `snapshot_schedule`
-  itself is still the platform's mapping.
+  `set_schedule()` leaves `snapshot_schedule` as it was. `clear_schedule()`
+  clears `snapshot_schedule` once the platform answers with a JSON object, so
+  an object that is not a whole schedule raises with it already `None`, while
+  an answer that is not a JSON object raises before anything changes.
+  `snapshot_schedule` itself is still the platform's mapping. Code that indexed
+  the old `dict` (`schedule()["hour"]`) reads the attributes, or `raw`.
 
 - **Activity and signal pages are read strictly.** `signals()`,
   `activities()`, `activity()` and `activity_results()` raise `MandalaError`
   for a row that is not an object, an event without its `cursor` and `type`,
   an activity without its `activity_id`, a result without its `id`, a signal
-  page with an empty `cursor` or a `gap` that is not an object, an activity page without its `changes_cursor`
-  or with a `next_cursor` that is neither text nor null, and a `more`,
-  `baseline`, `gap`, `count_truncated`, `age_truncated` or `has_results`
-  that is not a boolean. They used to drop the row and read the flag
-  as `False`.
+  page with an empty `cursor` or a `gap` that is not an object, an activity
+  page without its `changes_cursor` or with a `next_cursor` that is neither
+  text nor null, and a `more`, `baseline`, `gap`, `count_truncated`,
+  `age_truncated` or `has_results` that is not a boolean. They used to drop the
+  row and read the flag as `False`.
 
-- **Webhook, delivery and SSH key rows are read strictly.** A webhook, a
-  webhook delivery or an SSH key without its `id`, from a listing or a single
-  read, raises `MandalaError` rather than coming back with `id == ""`, and so
-  does a webhook whose `enabled` is not a boolean. An absent `enabled` used to
-  read as `True`.
+- **Webhook, webhook delivery and SSH key listings fail on a malformed row.**
+  `webhooks.list()`, `webhooks.deliveries()` and `ssh_keys.list()` raise
+  `MandalaError` for a row that has no `id`, which used to come back with
+  `id == ""`, and for a webhook whose `enabled` is absent or not a boolean, an
+  absent one having read as `True`; the error names the row. A single webhook,
+  delivery or key is read the same way, sync and async. A row with no usable
+  id was a subscription or a key that may be live and could not be named to
+  remove it. The TypeScript SDK and the MCP server fail on these rows too.
 
-- **Window geometry is checked before sending.** `window_action(..., "move")`
-  takes whole `x` and `y` from -32768 to 32767, and `"resize"` whole `width` and
-  `height` from 1 to 32767; anything else is a `ValueError`, sync and async.
-  Pointer coordinates were already refused unless they are integers
-  (`TypeError`); `input_batch()` still takes OpenAI's numbers as they are.
+- **Input coordinates and window geometry are whole pixels, checked before
+  sending.** Pointer coordinates were already refused unless they are integers
+  (`TypeError`). Now `window_action(..., "move")` takes whole `x` and `y` from
+  -32768 to 32767, and `"resize"` a whole `width` and `height` from 1 to 32767;
+  anything else is a `ValueError`, sync and async. `input_batch()` still takes
+  OpenAI's numbers as they are. The TypeScript SDK and the MCP server check the
+  same.
 
 - **The browser toolsets check requests at the browser root** (OPL-5912). The
   URL policy is installed as browser-level interception before the toolset
@@ -1526,7 +1541,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.9.0...v0.10.0
