@@ -1674,12 +1674,28 @@ def window_body(
         raise ValueError("width and height are only valid for resize")
     body: dict[str, Any] = {"action": action}
     if x is not None and y is not None:
-        body["x"] = _coordinate(x, "x", exc=ValueError)
-        body["y"] = _coordinate(y, "y", exc=ValueError)
+        for key, value in (("x", x), ("y", y)):
+            point = _coordinate(value, key, exc=ValueError)
+            if not WINDOW_POSITION_MIN <= point <= WINDOW_GEOMETRY_MAX:
+                raise ValueError(
+                    f"{key} must be from {WINDOW_POSITION_MIN} to {WINDOW_GEOMETRY_MAX}, "
+                    f"not {point}"
+                )
+            body[key] = point
     if width is not None and height is not None:
-        body["width"] = whole(width, "width", exc=ValueError)
-        body["height"] = whole(height, "height", exc=ValueError)
+        for key, value in (("width", width), ("height", height)):
+            size = whole(value, key, exc=ValueError)
+            if not 1 <= size <= WINDOW_GEOMETRY_MAX:
+                raise ValueError(f"{key} must be from 1 to {WINDOW_GEOMETRY_MAX}, not {size}")
+            body[key] = size
     return body
+
+
+#: The range a window's position and size take (OPL-5974). X11 coordinates are
+#: signed 16-bit, so the platform refuses a move outside -32768 to 32767 and a
+#: size outside 1 to 32767; refused here first, as the TypeScript SDK does.
+WINDOW_POSITION_MIN = -32768
+WINDOW_GEOMETRY_MAX = 32767
 
 
 #: The most text ``PUT /computers/{id}/clipboard`` carries INTO a guest, in bytes.

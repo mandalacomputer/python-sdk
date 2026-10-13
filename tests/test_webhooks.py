@@ -468,8 +468,8 @@ def test_a_webhook_never_carries_a_secret() -> None:
 
 
 def test_nulls_and_absences_decode_to_the_documented_defaults() -> None:
-    w = mc.Webhook.from_api({"id": "whk-1", "url": "https://x/h"})
-    assert w.enabled is True  # the platform's default, and the safe reading
+    w = mc.Webhook.from_api({"id": "whk-1", "url": "https://x/h", "enabled": True})
+    assert w.enabled is True
     assert w.events == [] and w.computers == []
     assert w.workspace_id == ""  # omitted on an account-wide subscription
     assert w.last_status is None

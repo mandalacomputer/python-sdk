@@ -1090,7 +1090,8 @@ def test_setup_refuses_a_key_somebody_else_owns(
     out, err = capsys.readouterr()
     assert out == ""
     assert err == (
-        "mandala-py: That key is already registered. A key can belong to one person only.\n"
+        "mandala-py: That key is already registered. A key can belong to one person only."
+        " (HTTP 409)\n"
     )
 
 
@@ -1261,7 +1262,7 @@ def test_ssh_key_rm_of_an_unknown_key_fails(capsys: pytest.CaptureFixture[str]) 
         return_value=httpx.Response(404, json={"error": "ssh key not found"})
     )
     assert _cli.main(["ssh-key", "rm", "sshk-x"]) == 1
-    assert capsys.readouterr().err == f"mandala-py: {RM_NOT_FOUND}\n"
+    assert capsys.readouterr().err == f"mandala-py: {RM_NOT_FOUND} (HTTP 404)\n"
 
 
 #: What ``ssh-key rm sshk-x`` says for a 404 (OPL-5653): the platform answers
@@ -1283,7 +1284,10 @@ def test_ssh_key_rm_of_a_404_keeps_its_code_status_and_ids(
         )
     )
     assert _cli.main(["ssh-key", "rm", "sshk-x"]) == 1
-    assert capsys.readouterr().err == f"mandala-py: {RM_NOT_FOUND}\nmandala-py: request id req-1\n"
+    assert (
+        capsys.readouterr().err
+        == f"mandala-py: {RM_NOT_FOUND} (HTTP 404)\nmandala-py: request id req-1\n"
+    )
     assert _cli.main(["ssh-key", "rm", "sshk-x", "--json"]) == 1
     out, err = capsys.readouterr()
     assert out == ""

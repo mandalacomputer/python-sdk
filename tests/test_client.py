@@ -671,7 +671,12 @@ def test_the_public_retry_predicate_is_safe_for_a_create() -> None:
     create through a 502 is how one computer becomes two, both billable, on the
     strength of an error that looked like nothing happened.
     """
-    assert mc.is_transient(mc.ConflictError("busy", status=409)) is True
+    # A 409 only when the platform says it clears (OPL-5974): a bare one is a
+    # refusal nobody classified, and many of those never clear.
+    assert mc.is_transient(mc.ConflictError("busy", status=409)) is False
+    assert (
+        mc.is_transient(mc.ConflictError("busy", status=409, body={"reason": "contention"})) is True
+    )
     assert mc.is_transient(mc.RateLimitError("slow down", status=429)) is True
     assert mc.is_transient(mc.UnavailableError("no host", status=503, method="GET")) is True
     assert mc.is_transient(mc.UnavailableError("no host", status=503, method="head")) is True
@@ -766,11 +771,20 @@ def test_a_reason_this_version_has_never_heard_of_falls_back_to_the_type() -> No
 
     Both memberships are therefore tested rather than one inferred from the
     other. `not in _REASON_CLEARS` would have been the bug.
+
+    What it falls back to on a 409 is the code (OPL-5974): an unclassified 409
+    is not worth sending again, unless its ``code`` is one the platform
+    documents as passing. So the proof that an unknown word is not read as
+    permanent is that such a code still answers ``True`` beside it.
     """
     for reason in ("quiesced", "", "CONTENTION"):
         err = mc.ConflictError("refused", status=409, body={"reason": reason})
         assert err.reason == reason
-        assert mc.is_transient(err) is True, reason
+        assert mc.is_transient(err) is False, reason
+        moving = mc.ConflictError(
+            "refused", status=409, body={"reason": reason, "code": "WORKSPACE_MOVING"}
+        )
+        assert mc.is_transient(moving) is True, reason
 
 
 def test_revoked_is_permanent_by_the_word_rather_than_by_luck() -> None:
@@ -784,8 +798,9 @@ def test_revoked_is_permanent_by_the_word_rather_than_by_luck() -> None:
     replayable.
 
     The 409 is the case that proves the WORD is answering: a
-    :class:`ConflictError` is transient by class, so without ``revoked`` named it
-    says "send it again" to a caller whose authority has gone.
+    :class:`ConflictError` was transient by class, and one whose ``code`` is on
+    the passing list still is (OPL-5974), so without ``revoked`` named it says
+    "send it again" to a caller whose authority has gone.
     """
     for status in (401, 403):
         err = mc.APIError("unauthorized", status=status, body={"reason": "revoked"})
@@ -793,14 +808,19 @@ def test_revoked_is_permanent_by_the_word_rather_than_by_luck() -> None:
         assert mc.is_transient(err) is False, status
     conflict = mc.ConflictError("unauthorized", status=409, body={"reason": "revoked"})
     assert mc.is_transient(conflict) is False
+    coded = mc.ConflictError(
+        "unauthorized", status=409, body={"reason": "revoked", "code": "WORKSPACE_MOVING"}
+    )
+    assert mc.is_transient(coded) is False
 
 
 def test_a_body_with_no_usable_reason_leaves_the_answer_where_it_was() -> None:
-    """Absent, malformed and non-dict bodies are all "no answer given"."""
+    """Absent, malformed and non-dict bodies are all "no answer given", and a 409
+    with no answer given is not worth sending again (OPL-5974)."""
     for body in (None, {}, {"error": "refused"}, {"reason": 7}, {"reason": None}, "html"):
         err = mc.ConflictError("refused", status=409, body=body)
         assert err.reason is None, body
-        assert mc.is_transient(err) is True, body
+        assert mc.is_transient(err) is False, body
 
 
 def test_the_reason_rides_on_the_base_class_not_on_the_conflict() -> None:
@@ -1289,10 +1309,10 @@ def test_schedule_is_the_window_only(client: mc.Client) -> None:
     )
     c = mc.Computer(client._t, COMPUTER)
     sched = c.schedule()
-    assert "last_run" not in sched
+    assert not hasattr(sched, "last_run") and "last_run" not in sched.raw
     # Empty string would mean "UTC" to the daemon but is rejected by every
     # timezone library, so the surface must name the zone.
-    assert sched["tz"] == "UTC"
+    assert sched.tz == "UTC"
     # That answer is also what the platform sends for a computer with no
     # schedule, so it must not land in snapshot_schedule: the record said
     # "none" and a GET cannot tell the two apart.
@@ -1311,10 +1331,10 @@ def test_schedule_does_not_change_the_cached_property(client: mc.Client) -> None
     respx.get(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json=NO_SCHEDULE_GET))
     chicago = {"enabled": True, "hour": 23, "minute": 30, "tz": "America/Chicago"}
     c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": chicago})
-    assert c.schedule() == NO_SCHEDULE_GET
+    assert c.schedule().raw == NO_SCHEDULE_GET
     assert c.snapshot_schedule == chicago
     bare = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": None})
-    assert bare.schedule() == NO_SCHEDULE_GET
+    assert bare.schedule().raw == NO_SCHEDULE_GET
     assert bare.snapshot_schedule is None
 
 
@@ -1358,7 +1378,7 @@ def test_clear_schedule_is_a_delete_not_a_disable(client: mc.Client) -> None:
     put = respx.put(f"{BASE}/computers/vm-1/schedule").mock(httpx.Response(200, json={}))
 
     c = mc.Computer(client._t, {**COMPUTER, "snapshot_schedule": {"enabled": True}})
-    assert c.clear_schedule() == cleared
+    assert c.clear_schedule().raw == cleared
     assert c.snapshot_schedule is None
     assert route.called
     assert not put.called, "clearing must not go through the set path"
@@ -1420,12 +1440,12 @@ def test_schedule_toggle_keeps_the_window(client: mc.Client) -> None:
     """
     server = ScheduleServer(dict(CHICAGO))
     c = mc.Computer(client._t, COMPUTER)
-    assert c.set_schedule(enabled=False) == {**CHICAGO, "enabled": False}
-    assert c.set_schedule(enabled=True) == CHICAGO
+    assert c.set_schedule(enabled=False).raw == {**CHICAGO, "enabled": False}
+    assert c.set_schedule(enabled=True).raw == CHICAGO
     assert server.stored == CHICAGO
     assert (server.get_computer.call_count, server.put.call_count) == (2, 2)
     # One part given: the others are kept.
-    assert c.set_schedule(enabled=True, hour=5) == {**CHICAGO, "hour": 5}
+    assert c.set_schedule(enabled=True, hour=5).raw == {**CHICAGO, "hour": 5}
 
 
 @respx.mock
@@ -1439,10 +1459,15 @@ def test_schedule_with_no_window_falls_back_to_four_utc(client: mc.Client) -> No
     server = ScheduleServer(None)
     c = mc.Computer(client._t, COMPUTER)
     # The platform's own answer for this computer, as the fallback must not read it.
-    assert c.schedule() == NO_SCHEDULE_GET
-    assert c.set_schedule(enabled=True) == {"enabled": True, "hour": 4, "minute": 0, "tz": "UTC"}
+    assert c.schedule().raw == NO_SCHEDULE_GET
+    assert c.set_schedule(enabled=True).raw == {
+        "enabled": True,
+        "hour": 4,
+        "minute": 0,
+        "tz": "UTC",
+    }
     server.stored = None
-    assert c.set_schedule(enabled=True, tz="Europe/Paris") == {
+    assert c.set_schedule(enabled=True, tz="Europe/Paris").raw == {
         "enabled": True,
         "hour": 4,
         "minute": 0,
@@ -1492,7 +1517,12 @@ def test_schedule_keeps_a_disabled_midnight_utc_window(client: mc.Client) -> Non
     """
     server = ScheduleServer(dict(NO_SCHEDULE_GET))
     c = mc.Computer(client._t, COMPUTER)
-    assert c.set_schedule(enabled=True) == {"enabled": True, "hour": 0, "minute": 0, "tz": "UTC"}
+    assert c.set_schedule(enabled=True).raw == {
+        "enabled": True,
+        "hour": 0,
+        "minute": 0,
+        "tz": "UTC",
+    }
     assert server.put_bodies == [{"enabled": True, "hour": 0, "minute": 0, "tz": "UTC"}]
 
 
@@ -5776,7 +5806,7 @@ def test_set_schedule_reads_its_own_answer(client: mc.Client) -> None:
 
     c = mc.Computer(client._t, COMPUTER)
     # The whole window given: nothing to read first (see test_schedule_toggle).
-    assert c.set_schedule(enabled=True, hour=4, minute=0, tz="UTC") == stored
+    assert c.set_schedule(enabled=True, hour=4, minute=0, tz="UTC").raw == stored
     assert c.snapshot_schedule == stored
     assert (put.call_count, get.call_count) == (1, 0)
 

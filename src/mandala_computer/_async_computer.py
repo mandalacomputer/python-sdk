@@ -135,6 +135,7 @@ from ._models import (
     OpenAIComputerAction,
     PublicUrl,
     PublicUrls,
+    Schedule,
     ScreenshotInfo,
     SecretBindingArgs,
     SecretBindings,
@@ -766,9 +767,17 @@ class AsyncComputer(ComputerFields):
 
         A port outside 1 to 65535, port 22, an empty label or another access
         raises :class:`ValueError` before any request. The platform's refusals
-        keep its ``code``: a label that is taken, reserved or reads as someone
-        else's address, a computer at its plan's limit, a plan with no public
-        URLs, or too many made in a day (with ``Retry-After``).
+        keep its ``code`` (:attr:`~mandala_computer.APIError.code`):
+        ``LABEL_TAKEN`` (taken, blocked, or once another account's) and
+        ``PUBLIC_URL_LIMIT`` (the computer is at its plan's limit) as a
+        :class:`~mandala_computer.ConflictError` that
+        :func:`~mandala_computer.is_transient` calls final, ``INVALID_LABEL``
+        (reserved, or reads as someone else's address), ``PLAN_REQUIRED``,
+        ``PUBLIC_URLS_BLOCKED`` (a 403: the platform turned them off for this
+        computer or account), ``PUBLIC_URLS_DISABLED`` (a 404 that means public
+        URLs are not enabled here, not that the computer is missing), and
+        ``RATE_LIMITED`` (too many made by the account in 24 hours, deleted
+        ones included, with ``Retry-After``).
         """
         body = _api.public_url_body(port=port, label=label, access=access, create=True)
         path = _api.computer_public_urls(self.id)
@@ -797,7 +806,8 @@ class AsyncComputer(ComputerFields):
     async def delete_public_url(self, url_id: str) -> None:
         """Remove a public URL. It stops answering at once; the app keeps running.
 
-        Its label is then free for anyone, unless the platform has blocked it.
+        Its label stays with this account: no other account can ever take it,
+        and this account may use it again unless the platform has blocked it.
         Allowed at any time, an unsettled workspace change included.
         """
         await self._t.json_object("DELETE", _api.computer_public_url(self.id, url_id))
@@ -2434,9 +2444,9 @@ class AsyncComputer(ComputerFields):
         :func:`~mandala_computer.is_transient` answers ``True`` for the first
         pair and ``False`` for the second. If ``unavailable`` is returned,
         :meth:`start` the computer instead of retrying this request. An
-        absent or unknown reason remains unclassified and falls back to the
-        historical ``ConflictError`` answer of ``True``, so code supporting
-        such responses should verify the computer state and bound its retries.
+        absent or unknown reason is unclassified, and ``is_transient`` answers
+        ``False`` for it: read the computer's state before deciding to retry,
+        and bound any retry of your own.
 
         And two 400s here never clear at all, which matters more on this method
         than on the read for exactly that reason: the guest needs its desktop's
@@ -2652,14 +2662,16 @@ class AsyncComputer(ComputerFields):
         data = await self._t.json_object("GET", _api.computer_action(self.id, "snapshots"))
         return SnapshotHoldings.from_api(data)
 
-    async def schedule(self) -> Mapping[str, Any]:
-        """The automatic daily snapshot schedule.
+    async def schedule(self) -> Schedule:
+        """The automatic daily snapshot schedule, as a :class:`~mandala_computer.Schedule`.
 
         This does not update :attr:`snapshot_schedule`, because it answers a
         computer with no schedule as a disabled 00:00 UTC window. Use
-        :meth:`refresh` to update the property.
+        :meth:`refresh` to update the property. An answer that is not a whole
+        schedule raises :class:`~mandala_computer.MandalaError`.
         """
-        return dict(await self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
+        path = _api.computer_action(self.id, "schedule")
+        return Schedule.from_api(await self._t.json_object("GET", path), f"GET {path}")
 
     async def set_schedule(
         self,
@@ -2668,13 +2680,16 @@ class AsyncComputer(ComputerFields):
         hour: int | None = None,
         minute: int | None = None,
         tz: str | None = None,
-    ) -> Mapping[str, Any]:
+    ) -> Schedule:
         """Set the automatic daily snapshot window, in the given IANA timezone.
 
         ``hour``, ``minute`` or ``tz`` left out (``None``) keeps the current
         schedule's value, read first from the computer record (without
         refreshing this handle, so a create's :attr:`start_error` survives);
-        04:00 UTC only for a computer with no schedule.
+        04:00 UTC only for a computer with no schedule. Returns the stored
+        :class:`~mandala_computer.Schedule`, and an answer that is not a whole
+        schedule raises :class:`~mandala_computer.MandalaError`, leaving
+        :attr:`snapshot_schedule` as it was.
         See :meth:`mandala_computer.Computer.set_schedule`.
         """
         if hour is None or minute is None or tz is None:
@@ -2682,29 +2697,33 @@ class AsyncComputer(ComputerFields):
             # The record, not GET .../schedule: see _schedule_window.
             record = _api.computer_payload(await self._t.json_object("GET", _api.computer(self.id)))
             hour, minute, tz = _schedule_window(record.get("snapshot_schedule"), hour, minute, tz)
-        stored = dict(
-            await self._t.json_object(
-                "PUT",
-                _api.computer_action(self.id, "schedule"),
-                json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
-            )
-        )
-        self._data["snapshot_schedule"] = stored
+        path = _api.computer_action(self.id, "schedule")
+        body = _api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz)
+        answer = await self._t.json_object("PUT", path, json=body)
+        stored = Schedule.from_api(answer, f"PUT {path}")
+        self._data["snapshot_schedule"] = dict(stored.raw)
         return stored
 
-    async def clear_schedule(self) -> Mapping[str, Any]:
+    async def clear_schedule(self) -> Schedule:
         """Remove the schedule, as distinct from disabling it.
 
         ``set_schedule(enabled=False)`` keeps the chosen time — it reads the
         current window and sends it back — so ``set_schedule(enabled=True)``
         restores it. Clearing returns the computer to never having had a
-        schedule.
+        schedule. Returns the platform's answer, a disabled 00:00 UTC
+        :class:`~mandala_computer.Schedule`, and :attr:`snapshot_schedule` reads
+        ``None`` afterwards. An answer that is an object but not a whole
+        schedule raises :class:`~mandala_computer.MandalaError` with
+        :attr:`snapshot_schedule` already ``None``: the platform answered, so
+        the schedule is gone. One that is not a JSON object at all raises
+        before anything changes, because it may not be the platform's answer
+        (a proxy's page, say) and so does not show the schedule was removed.
         """
-        cleared = dict(
-            await self._t.json_object("DELETE", _api.computer_action(self.id, "schedule"))
-        )
+        path = _api.computer_action(self.id, "schedule")
+        # Raises for a body that is not an object, leaving the handle alone.
+        answer = await self._t.json_object("DELETE", path)
         self._data["snapshot_schedule"] = None
-        return cleared
+        return Schedule.from_api(answer, f"DELETE {path}")
 
     # --- the agent loop -------------------------------------------------
 

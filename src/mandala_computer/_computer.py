@@ -98,6 +98,7 @@ from ._models import (
     PageContext,
     PublicUrl,
     PublicUrls,
+    Schedule,
     ScreenshotInfo,
     SecretBinding,
     SecretBindingArgs,
@@ -563,9 +564,10 @@ def _create_only_refusal(err: ConflictError) -> ConflictError:
     arrive without a word this SDK can read: the body interrupted in flight,
     empty, a proxy's page instead of the platform's JSON, or JSON with no
     ``reason``, a ``reason`` that is not a string, or a blank one. A bare
-    :class:`ConflictError` is what :func:`is_transient` calls worth sending
-    again — a retry of a refusal that was not said to clear, and one that could
-    create the file later if the path were cleared in between. So the request's
+    :class:`ConflictError` was what :func:`is_transient` called worth sending
+    again before OPL-5974, and its ``code`` could still make it so — a retry of
+    a refusal that was not said to clear, and one that could create the file
+    later if the path were cleared in between. So the request's
     own context, create-only, decides here what the status alone cannot: the
     refusal is a :class:`CreateOnlyConflictError`, final, with a message that
     says only that it was a conflict whose reason is unknown. A 409 that DID
@@ -958,9 +960,8 @@ def _input_batch_refusal(exc: APIError, where: str) -> APIError:
     body that is neither — interrupted in flight, empty, a proxy's page —
     cannot say which one this was, at a status that can carry either. Such an
     error keeps its class, and is marked so that
-    :func:`~mandala_computer.is_transient` answers ``False``: a 409's class
-    would otherwise call sending the batch again worth trying, and actions may
-    already have run.
+    :func:`~mandala_computer.is_transient` answers ``False`` whatever its
+    class would otherwise say: actions may already have run.
     """
     if not _batch_answer(exc.body):
         if exc.status in _BATCH_FAILURE_STATUSES and not _ordinary_refusal(exc.body):
@@ -3331,9 +3332,17 @@ class Computer(ComputerFields):
 
         A port outside 1 to 65535, port 22, an empty label or another access
         raises :class:`ValueError` before any request. The platform's refusals
-        keep its ``code``: a label that is taken, reserved or reads as someone
-        else's address, a computer at its plan's limit, a plan with no public
-        URLs, or too many made in a day (with ``Retry-After``).
+        keep its ``code`` (:attr:`~mandala_computer.APIError.code`):
+        ``LABEL_TAKEN`` (taken, blocked, or once another account's) and
+        ``PUBLIC_URL_LIMIT`` (the computer is at its plan's limit) as a
+        :class:`~mandala_computer.ConflictError` that
+        :func:`~mandala_computer.is_transient` calls final, ``INVALID_LABEL``
+        (reserved, or reads as someone else's address), ``PLAN_REQUIRED``,
+        ``PUBLIC_URLS_BLOCKED`` (a 403: the platform turned them off for this
+        computer or account), ``PUBLIC_URLS_DISABLED`` (a 404 that means public
+        URLs are not enabled here, not that the computer is missing), and
+        ``RATE_LIMITED`` (too many made by the account in 24 hours, deleted
+        ones included, with ``Retry-After``).
         """
         body = _api.public_url_body(port=port, label=label, access=access, create=True)
         path = _api.computer_public_urls(self.id)
@@ -3360,7 +3369,8 @@ class Computer(ComputerFields):
     def delete_public_url(self, url_id: str) -> None:
         """Remove a public URL. It stops answering at once; the app keeps running.
 
-        Its label is then free for anyone, unless the platform has blocked it.
+        Its label stays with this account: no other account can ever take it,
+        and this account may use it again unless the platform has blocked it.
         Allowed at any time, an unsettled workspace change included.
         """
         self._t.json_object("DELETE", _api.computer_public_url(self.id, url_id))
@@ -5329,9 +5339,9 @@ class Computer(ComputerFields):
         :func:`~mandala_computer.is_transient` answers ``True`` for the first
         pair and ``False`` for the second. If ``unavailable`` is returned,
         :meth:`start` the computer instead of retrying this request. An
-        absent or unknown reason remains unclassified and falls back to the
-        historical ``ConflictError`` answer of ``True``, so code supporting
-        such responses should verify the computer state and bound its retries.
+        absent or unknown reason is unclassified, and ``is_transient`` answers
+        ``False`` for it: read the computer's state before deciding to retry,
+        and bound any retry of your own.
 
         And two 400s here never clear at all, which matters more on this method
         than on the read for exactly that reason: the guest needs its desktop's
@@ -5567,14 +5577,16 @@ class Computer(ComputerFields):
         data = self._t.json_object("GET", _api.computer_action(self.id, "snapshots"))
         return SnapshotHoldings.from_api(data)
 
-    def schedule(self) -> Mapping[str, Any]:
-        """The automatic daily snapshot schedule.
+    def schedule(self) -> Schedule:
+        """The automatic daily snapshot schedule, as a :class:`~mandala_computer.Schedule`.
 
         This does not update :attr:`snapshot_schedule`, because it answers a
         computer with no schedule as a disabled 00:00 UTC window. Use
-        :meth:`refresh` to update the property.
+        :meth:`refresh` to update the property. An answer that is not a whole
+        schedule raises :class:`~mandala_computer.MandalaError`.
         """
-        return dict(self._t.json_object("GET", _api.computer_action(self.id, "schedule")))
+        path = _api.computer_action(self.id, "schedule")
+        return Schedule.from_api(self._t.json_object("GET", path), f"GET {path}")
 
     def set_schedule(
         self,
@@ -5583,7 +5595,7 @@ class Computer(ComputerFields):
         hour: int | None = None,
         minute: int | None = None,
         tz: str | None = None,
-    ) -> Mapping[str, Any]:
+    ) -> Schedule:
         """Set the automatic daily snapshot window, in the given IANA timezone.
 
         The platform stores the window whole, so ``hour``, ``minute`` or ``tz``
@@ -5597,38 +5609,48 @@ class Computer(ComputerFields):
         ``set_schedule(enabled=True)`` switches it back on at that time. Pass
         all three to skip the read.
 
-        Returns the schedule as stored, out of the PUT's own answer. A follow-up
+        Returns the schedule as stored, out of the PUT's own answer, as a
+        :class:`~mandala_computer.Schedule`. A follow-up
         GET would cost a second metered round trip to report a *re-read* rather
         than what this call stored — so a change that landed in between would
         come back looking like yours. :meth:`clear_schedule` reads its own
         answer for the same reason, as do :meth:`rename` and :meth:`resize`.
+        An answer that is not a whole schedule raises
+        :class:`~mandala_computer.MandalaError` and leaves
+        :attr:`snapshot_schedule` as it was; the change may have been stored,
+        so :meth:`refresh` to see it.
         """
         if hour is None or minute is None or tz is None:
             _api.check_schedule_args(enabled=enabled, hour=hour, minute=minute, tz=tz)
             # The record, not GET .../schedule: see _schedule_window.
             record = _api.computer_payload(self._t.json_object("GET", _api.computer(self.id)))
             hour, minute, tz = _schedule_window(record.get("snapshot_schedule"), hour, minute, tz)
-        stored = dict(
-            self._t.json_object(
-                "PUT",
-                _api.computer_action(self.id, "schedule"),
-                json=_api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz),
-            )
-        )
-        self._data["snapshot_schedule"] = stored
+        path = _api.computer_action(self.id, "schedule")
+        body = _api.schedule_body(enabled=enabled, hour=hour, minute=minute, tz=tz)
+        stored = Schedule.from_api(self._t.json_object("PUT", path, json=body), f"PUT {path}")
+        self._data["snapshot_schedule"] = dict(stored.raw)
         return stored
 
-    def clear_schedule(self) -> Mapping[str, Any]:
+    def clear_schedule(self) -> Schedule:
         """Remove the schedule, as distinct from disabling it.
 
         ``set_schedule(enabled=False)`` keeps the chosen time — it reads the
         current window and sends it back — so ``set_schedule(enabled=True)``
         restores it. Clearing returns the computer to never having had a
-        schedule.
+        schedule. Returns the platform's answer, a disabled 00:00 UTC
+        :class:`~mandala_computer.Schedule`, and :attr:`snapshot_schedule` reads
+        ``None`` afterwards. An answer that is an object but not a whole
+        schedule raises :class:`~mandala_computer.MandalaError` with
+        :attr:`snapshot_schedule` already ``None``: the platform answered, so
+        the schedule is gone. One that is not a JSON object at all raises
+        before anything changes, because it may not be the platform's answer
+        (a proxy's page, say) and so does not show the schedule was removed.
         """
-        cleared = dict(self._t.json_object("DELETE", _api.computer_action(self.id, "schedule")))
+        path = _api.computer_action(self.id, "schedule")
+        # Raises for a body that is not an object, leaving the handle alone.
+        answer = self._t.json_object("DELETE", path)
         self._data["snapshot_schedule"] = None
-        return cleared
+        return Schedule.from_api(answer, f"DELETE {path}")
 
     # --- the agent loop -------------------------------------------------
 

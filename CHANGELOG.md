@@ -14,10 +14,125 @@ This is the summary you read to decide whether to upgrade.
 - **Public URLs.** On a computer, `public_urls()`, `create_public_url(port,
   label=None, access=None)`, `update_public_url(url_id, port=None,
   access=None)` and `delete_public_url(url_id)` serve a port inside it at
-  `https://<label>.mandala.dev`, public or private (opened only with one of the
-  account's API keys). They answer the new `PublicUrl` and `PublicUrls`, read
-  strictly: a malformed answer raises `MandalaError` rather than being guessed
-  at. The async client has the same methods.
+  `https://<label>.<base_domain>`, where `base_domain` comes from the listing
+  (`PublicUrls.base_domain`). A URL is public, or private (opened only with one
+  of the account's API keys). They answer the new `PublicUrl` and `PublicUrls`,
+  read strictly: a malformed answer raises `MandalaError` rather than being
+  guessed at. A deleted URL's label stays with the account: no other account
+  can ever take it, and the account may use it again unless the platform has
+  blocked it. Refusals keep the platform's `code`: `LABEL_TAKEN`,
+  `PUBLIC_URL_LIMIT`, `PLAN_REQUIRED`, `PUBLIC_URLS_BLOCKED` (403),
+  `PUBLIC_URLS_DISABLED` (a 404 meaning they are not enabled here, not that
+  the computer is missing), `WORKSPACE_MOVING` and the daily `RATE_LIMITED`.
+  The async client has the same methods.
+
+- **`move_to_workspace(workspace_id)`** on a computer, sync and async (OPL-5932):
+  `PUT /computers/{id}/workspace` with a workspace id, or `None` to unassign it.
+  It needs an account-wide member or owner credential and a stopped computer
+  with no saved session, snapshots, secret bindings or proxy credentials, and
+  it does no cleanup. **`mandala-py move COMPUTER --workspace ID|unassigned`**
+  does the same from the CLI; it cannot be combined with the resize options.
+
+- **`WorkspaceMember.seat_suspended`** (OPL-5919): `True` for an accepted member
+  waiting for a plan seat, `None` when an older server leaves it out, and a
+  non-boolean value raises `MandalaError`. It is independent of `suspended`, the
+  global sign-in suspension. `mandala-py workspaces members` prints it in a new
+  `WAITING FOR SEAT` column (`yes`, `no` or `-`).
+
+- **`Schedule`**, what `schedule()`, `set_schedule()` and `clear_schedule()`
+  now return (see Changed).
+
+- **The platform's error `code` in the CLI.** `mandala-py --json` failures
+  carry it as `api_code` beside the CLI's own `code`, as `mandala` does, so a
+  `LABEL_TAKEN` and a `PUBLIC_URL_LIMIT` can be told apart without reading the
+  sentence. Without `--json`, a refusal from the platform ends its line with
+  `(HTTP <status>, <code>)`, or `(HTTP <status>)` when there is no code.
+
+### Changed
+
+- **`is_transient()` answers `False` for a 409 the platform did not classify.**
+  The platform documents that a 409 without a `reason` is unclassified and that
+  treating 409 as uniformly transient loops forever, and many are decisions
+  that never clear: a public URL's `LABEL_TAKEN` and `PUBLIC_URL_LIMIT`, a
+  webhook past the subscription cap or a test of a disabled webhook, a
+  duplicate SSH key or the SSH key limit. A 409 is now `True` only with
+  `reason` `contention` or `starting`, or, with no `reason`, a `code` of
+  `idempotency_in_progress` or `WORKSPACE_MOVING`. A word this version does
+  not know is unclassified too. Code that relied on the old `True` to retry a
+  conflict that does clear, such as a disk still being copied, should retry it
+  itself, bounded, after reading the error. The TypeScript SDK and the MCP
+  server classify each code the same way.
+
+- **`schedule()`, `set_schedule()` and `clear_schedule()` return a
+  `Schedule`** (`enabled`, `hour`, `minute`, `tz`, and the answer in `raw`)
+  instead of a plain `dict`, sync and async. It is read strictly: an answer
+  missing a field, with an `enabled` that is not a boolean, an hour or minute out
+  of range, or no timezone raises `MandalaError`. A malformed answer to
+  `set_schedule()` leaves `snapshot_schedule` as it was. `snapshot_schedule`
+  itself is still the platform's mapping.
+
+- **Activity and signal pages are read strictly.** `signals()`,
+  `activities()`, `activity()` and `activity_results()` raise `MandalaError`
+  for a row that is not an object, an event without its `cursor` and `type`,
+  an activity without its `activity_id`, a result without its `id`, a signal
+  page with an empty `cursor` or a `gap` that is not an object, an activity page without its `changes_cursor`
+  or with a `next_cursor` that is neither text nor null, and a `more`,
+  `baseline`, `gap`, `count_truncated`, `age_truncated` or `has_results`
+  that is not a boolean. They used to drop the row and read the flag
+  as `False`.
+
+- **Webhook, delivery and SSH key rows are read strictly.** A webhook, a
+  webhook delivery or an SSH key without its `id`, from a listing or a single
+  read, raises `MandalaError` rather than coming back with `id == ""`, and so
+  does a webhook whose `enabled` is not a boolean. An absent `enabled` used to
+  read as `True`.
+
+- **Window geometry is checked before sending.** `window_action(..., "move")`
+  takes whole `x` and `y` from -32768 to 32767, and `"resize"` whole `width` and
+  `height` from 1 to 32767; anything else is a `ValueError`, sync and async.
+  Pointer coordinates were already refused unless they are integers
+  (`TypeError`); `input_batch()` still takes OpenAI's numbers as they are.
+
+- **The browser toolsets check requests at the browser root** (OPL-5912). The
+  URL policy is installed as browser-level interception before the toolset
+  opens a page, so requests from a sandboxed `srcdoc` frame that starts before
+  the driver attaches, and from its workers, now meet `url_policy` too. This
+  supersedes the 0.12.0 limits that left such a frame, and the workers it
+  started, outside the hook. Other browser contexts' requests are paused briefly
+  while their ownership is established and then continue without this
+  toolset's policy. A new failure mode comes with it: when ownership cannot be
+  established, or its bounds (8,192 frame and target identities, 128 unresolved
+  lookups and 128 targets in one survey) are exhausted, the toolset disposes of
+  its own context and ends the session. Requests from another context's
+  out-of-process frames, and from the frames inside them, are recognised as
+  foreign by reading that frame's tree, rather than failing ownership and
+  ending this toolset's session.
+
+- **Abrupt loss of the browser's control connection is documented as a policy
+  limit** (OPL-5952). If the DevTools connection breaks, or context disposal
+  cannot be confirmed, Chromium can drop interception before destroying the
+  context and let a paused request through unapproved. The SDK ends its session
+  and ignores late policy results, but cannot prevent that; use guest egress
+  controls where containment must survive it.
+
+- `Workspaces.delete()` and `mandala-py workspaces rm` say that a workspace
+  still holding active secrets is refused (409, `reason: "unsupported"`) as one
+  holding computers is (OPL-5918), and point at `move_to_workspace()` and
+  `move --workspace` for the computers.
+
+### Fixed
+
+- **`wait_for_desktop()` no longer stalls on the desktop probe's "no session
+  yet" answer** (OPL-5931). That answer is a 409 with no `reason`, and the wait
+  treated it as a classified refusal, waiting a whole `poll` interval (or its
+  `Retry-After`) each time. It now uses the readiness ramp, 0.25 s doubling up
+  to `poll`; classified conflicts keep their conservative delay.
+
+- **Browser connections accept the canonical IPv6 form of the base URL**
+  (OPL-5927). The platform names a connection's WebSocket origin the way a
+  browser serializes it, with IPv6 hosts compressed; a base URL spelled another
+  way no longer makes every grant look as if it pointed elsewhere. The earlier
+  spelling is still recognised from older servers.
 
 ## [0.12.0] — 2026-10-11
 
@@ -1395,6 +1510,7 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.12.0...HEAD
 [0.12.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.9.0...v0.10.0

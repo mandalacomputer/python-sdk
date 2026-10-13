@@ -1061,8 +1061,9 @@ def _publish_refusal(err: ConflictError) -> ConflictError:
     The platform's four publish refusals — a different document under a
     published ref, a retired ref, and the two per-account ceilings — do not
     clear by waiting, and they have been sent with no ``reason``, which
-    :func:`~mandala_computer.is_transient` reads as a conflict worth sending
-    again. The request's own context decides here what the body did not: a
+    :func:`~mandala_computer.is_transient` read as a conflict worth sending
+    again before OPL-5974. The request's own context decides here what the body
+    did not: a
     reason this version knows as permanent is kept, a clearing word is kept as
     the platform's explicit advice, and anything else — none, blank, or a word
     this version does not know — becomes ``"exists"``.
@@ -1811,7 +1812,8 @@ class Webhooks:
         No secret is ever in this list. An API key issued against a workspace
         sees the subscriptions confined to that workspace only.
         """
-        return [Webhook.from_api(w) for w in self._t.json_array("GET", _api.WEBHOOKS)]
+        rows = self._t.json_array("GET", _api.WEBHOOKS)
+        return [Webhook.from_api(w, f"GET webhooks: webhook {i}") for i, w in enumerate(rows)]
 
     def create(
         self,
@@ -1928,7 +1930,10 @@ class Webhooks:
         dropped silently.
         """
         data = self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
-        return [WebhookDelivery.from_api(d) for d in data]
+        return [
+            WebhookDelivery.from_api(d, f"GET webhooks/:id/deliveries: delivery {i}")
+            for i, d in enumerate(data)
+        ]
 
 
 class SshKeys:
@@ -1959,7 +1964,8 @@ class SshKeys:
 
     def list(self) -> builtins.list[SshKey]:
         """Your keys, oldest first."""
-        return [SshKey.from_api(k) for k in self._t.json_array("GET", _api.SSH_KEYS)]
+        rows = self._t.json_array("GET", _api.SSH_KEYS)
+        return [SshKey.from_api(k, f"GET ssh-keys: key {i}") for i, k in enumerate(rows)]
 
     def add(self, public_key: str, *, name: str | None = None) -> SshKey:
         """Register one public key: a line from a ``.pub`` file, as read. It
@@ -2299,8 +2305,8 @@ class Workspaces:
         still holds computers or active secrets is refused with a
         :class:`~mandala_computer.ConflictError` (409) saying how many, and
         nothing is deleted or revoked. Move the computers to another workspace
-        in the dashboard or delete them, and explicitly delete the active
-        secrets before retrying. An active-secret refusal has
+        with :meth:`~mandala_computer.Computer.move_to_workspace` or delete
+        them, and explicitly delete the active secrets before retrying. An active-secret refusal has
         ``reason="unsupported"`` and is not retried automatically.
         Deleted secrets do not block workspace deletion, but still count toward
         the account's lifetime limit of 1000 secrets. If the platform cannot

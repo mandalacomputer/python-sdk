@@ -2076,7 +2076,7 @@ def test_workspaces_members_with_a_scoped_key_is_refused(
     )
     assert _cli.main(["workspaces", "members", "wsp-0123456789ab"]) == 1
     out, err = capsys.readouterr()
-    assert out == "" and err == f"mandala-py: {sentence}\n"
+    assert out == "" and err == f"mandala-py: {sentence} (HTTP 403)\n"
     assert _cli.main(["workspaces", "members", "wsp-0123456789ab", "--json"]) == 1
     error = json.loads(capsys.readouterr().err)["error"]
     assert (error["code"], error["status"]) == ("permission_denied", 403)
@@ -2195,7 +2195,7 @@ def test_workspaces_rm_secret_conflict_is_preserved_without_retry_or_cleanup(
             "message": message,
         }
     else:
-        assert err == f"mandala-py: {message}\n"
+        assert err == f"mandala-py: {message} (HTTP 409)\n"
     assert route.call_count == 1 and len(respx.calls) == 1
 
 

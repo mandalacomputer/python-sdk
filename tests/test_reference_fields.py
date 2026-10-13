@@ -244,7 +244,17 @@ def test_signals_baseline_then_replay(client: mc.Client) -> None:
         "computer": "vm-1",
         "from": "h-0",
         "cursor": "h-1",
-        "events": [{"type": "computer.idle", "seq": 1, "data": {"idle_seconds": 60}}],
+        "events": [
+            {
+                "type": "computer.idle",
+                "seq": 1,
+                "cursor": "h-1",
+                "at": "2026-10-01T12:00:00Z",
+                "computer": "vm-1",
+                "source": "daemon",
+                "data": {"idle_seconds": 60},
+            }
+        ],
         "more": True,
         "baseline": False,
         "supported": ["computer.idle"],
@@ -298,6 +308,167 @@ async def test_async_activities_pages_and_changes(async_client: mc.AsyncClient) 
         await c.activities(changes=True)
 
 
+# --- strict pages (OPL-5974) --------------------------------------------------
+
+EVENT = {
+    "type": "computer.idle",
+    "seq": 1,
+    "cursor": "h-1",
+    "at": "2026-10-01T12:00:00Z",
+    "computer": "vm-1",
+    "source": "daemon",
+    "data": {"idle_seconds": 60},
+}
+SIGNALS = {
+    "computer": "vm-1",
+    "from": "h-0",
+    "cursor": "h-1",
+    "events": [EVENT],
+    "more": False,
+    "baseline": False,
+    "supported": ["computer.idle"],
+    "retention": "ephemeral",
+}
+ROW = {
+    "activity_id": "act_0123456789abcdef0123456789abcdef",
+    "account_id": "acc",
+    "computer_id": "vm-1",
+    "workspace_id": None,
+    "channel": "api",
+    "route": "exec",
+    "action": "exec",
+    "state": "exited",
+    "received_at": "t0",
+    "observed_at": "t1",
+}
+HEALTH = {
+    "recording_started_at": "t0",
+    "earliest_retained_at": None,
+    "count_truncated": False,
+    "age_truncated": False,
+    "capture": "available",
+    "completeness": "best-effort",
+    "gap_at": None,
+    "recovered_at": None,
+}
+ACTIVITIES = {
+    "items": [ROW],
+    "next_cursor": None,
+    "changes_cursor": "chg-1",
+    "gap": False,
+    "health": HEALTH,
+}
+RESULTS = {
+    "activity_id": ROW["activity_id"],
+    "revision": 1,
+    "more": False,
+    "items": [{"id": "res_0123456789abcdef0123456789abcdef", "kind": "artifact"}],
+}
+
+#: (route suffix, the whole answer, a broken one, what the refusal names).
+BROKEN: list[tuple[str, dict[str, Any], dict[str, Any], str]] = [
+    ("signals", SIGNALS, {**SIGNALS, "events": [EVENT, "not a row"]}, "event 1"),
+    ("signals", SIGNALS, {**SIGNALS, "events": [{**EVENT, "cursor": None}]}, "cursor"),
+    ("signals", SIGNALS, {**SIGNALS, "events": [{"seq": 2, "data": {}}]}, "type"),
+    ("signals", SIGNALS, {**SIGNALS, "more": "perhaps"}, "more"),
+    ("signals", SIGNALS, {k: v for k, v in SIGNALS.items() if k != "baseline"}, "baseline"),
+    ("signals", SIGNALS, {**SIGNALS, "cursor": ""}, "signal page"),
+    ("signals", SIGNALS, {**SIGNALS, "gap": "expired"}, "gap"),
+    ("activities", ACTIVITIES, {**ACTIVITIES, "items": [ROW, 7]}, "activity 1"),
+    (
+        "activities",
+        ACTIVITIES,
+        {**ACTIVITIES, "items": [{k: v for k, v in ROW.items() if k != "activity_id"}]},
+        "activity_id",
+    ),
+    ("activities", ACTIVITIES, {**ACTIVITIES, "items": [{**ROW, "has_results": "y"}]}, "has_r"),
+    ("activities", ACTIVITIES, {**ACTIVITIES, "gap": None}, "gap"),
+    ("activities", ACTIVITIES, {**ACTIVITIES, "next_cursor": 5}, "next_cursor"),
+    (
+        "activities",
+        ACTIVITIES,
+        {k: v for k, v in ACTIVITIES.items() if k != "changes_cursor"},
+        "changes_cursor",
+    ),
+    (
+        "activities",
+        ACTIVITIES,
+        {**ACTIVITIES, "health": {**HEALTH, "count_truncated": "maybe"}},
+        "count_truncated",
+    ),
+    ("activities", ACTIVITIES, {**ACTIVITIES, "health": "degraded"}, "health"),
+    ("results", RESULTS, {**RESULTS, "items": [None]}, "result 0"),
+    ("results", RESULTS, {**RESULTS, "items": [{"kind": "artifact"}]}, "id"),
+    ("results", RESULTS, {**RESULTS, "more": 2}, "more"),
+]
+
+
+def _route(suffix: str) -> str:
+    if suffix == "results":
+        return f"{BASE}/computers/vm-1/activities/{ROW['activity_id']}/results"
+    return f"{BASE}/computers/vm-1/{suffix}"
+
+
+def _read(c: mc.Computer, suffix: str) -> object:
+    if suffix == "signals":
+        return c.signals()
+    if suffix == "activities":
+        return c.activities()
+    return c.activity_results(str(ROW["activity_id"]))
+
+
+async def _aread(c: mc.AsyncComputer, suffix: str) -> object:
+    if suffix == "signals":
+        return await c.signals()
+    if suffix == "activities":
+        return await c.activities()
+    return await c.activity_results(str(ROW["activity_id"]))
+
+
+@pytest.mark.parametrize(("suffix", "whole", "broken", "names"), BROKEN)
+@respx.mock
+def test_a_page_that_is_not_whole_is_refused_not_trimmed(
+    client: mc.Client, suffix: str, whole: dict[str, Any], broken: dict[str, Any], names: str
+) -> None:
+    """A row dropped reads as a history where it never happened, and a flag
+    read as false as a replay with nothing owed or a history that is whole."""
+    route = respx.get(_route(suffix)).mock(httpx.Response(200, json=whole))
+    assert _read(computer(client), suffix) is not None
+    route.mock(httpx.Response(200, json=broken))
+    with pytest.raises(mc.MandalaError, match=names):
+        _read(computer(client), suffix)
+
+
+@pytest.mark.parametrize(("suffix", "whole", "broken", "names"), BROKEN)
+@respx.mock
+async def test_the_async_client_refuses_the_same_pages(
+    async_client: mc.AsyncClient,
+    suffix: str,
+    whole: dict[str, Any],
+    broken: dict[str, Any],
+    names: str,
+) -> None:
+    route = respx.get(_route(suffix)).mock(httpx.Response(200, json=whole))
+    c = mc.AsyncComputer(async_client._t, COMPUTER)
+    assert await _aread(c, suffix) is not None
+    route.mock(httpx.Response(200, json=broken))
+    with pytest.raises(mc.MandalaError, match=names):
+        await _aread(c, suffix)
+
+
+def test_whole_pages_read_as_sent() -> None:
+    signals = mc.SignalPage.from_api(SIGNALS)
+    assert signals.events == [EVENT] and signals.more is False and signals.baseline is False
+    page = mc.ActivityPage.from_api({**ACTIVITIES, "next_cursor": "old-1", "gap": True})
+    assert page.items[0].activity_id == ROW["activity_id"] and page.items[0].has_results is False
+    assert page.next_cursor == "old-1" and page.gap is True
+    assert page.health is not None and page.health.count_truncated is False
+    # Health left out by an older platform is still None, not a refusal.
+    assert mc.ActivityPage.from_api({**ACTIVITIES, "health": None}).health is None
+    results = mc.ActivityResults.from_api({**RESULTS, "more": True})
+    assert results.more is True and results.items == RESULTS["items"]
+
+
 # --- delete ------------------------------------------------------------------
 
 
@@ -339,7 +510,8 @@ def test_a_detailed_delete_keeps_the_whole_answer(client: mc.Client) -> None:
         (409, "unsupported", False),
         (409, "exists", False),
         (409, "running", False),  # stop the computer first; waiting never clears it
-        (409, "some-new-word", True),  # unknown: the type's answer stands
+        # Unknown: no classification, and an unclassified 409 is final (OPL-5974).
+        (409, "some-new-word", False),
         (400, "some-new-word", False),
         (502, None, False),  # the guest agent silent past its boot window
     ],

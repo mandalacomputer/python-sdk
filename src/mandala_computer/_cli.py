@@ -358,10 +358,16 @@ def _sent_key(args: argparse.Namespace) -> str | None:
 
 def _error_info(err: BaseException) -> dict[str, Any]:
     """The ``error`` object ``--json`` prints for a failure: ``code`` and
-    ``message`` always; the HTTP ``status`` and the platform's ``reason`` word
-    when there are any, and the ``request_id``, ``idempotency_key`` and
-    ``operation_id`` a failure carries, which are what finding out how a call
-    ended needs."""
+    ``message`` always; the HTTP ``status``, the platform's ``reason`` word and
+    its own ``code`` (as ``api_code``) when there are any, and the
+    ``request_id``, ``idempotency_key`` and ``operation_id`` a failure carries,
+    which are what finding out how a call ended needs.
+
+    ``code`` stays this CLI's word for the kind of failure, as ``mandala``
+    keeps it; ``api_code`` is the platform's, beside it, because two refusals
+    of one kind can want different fixes — a public URL label that is taken
+    and a computer at its plan's limit are both a ``conflict`` — and a script
+    should not have to read the sentence to tell them apart (OPL-5974)."""
     if isinstance(err, _Failure):
         return {"code": err.reason, "message": err.message}
     if isinstance(err, APIError):
@@ -369,6 +375,8 @@ def _error_info(err: BaseException) -> dict[str, Any]:
         info: dict[str, Any] = {"code": code, "message": str(err), "status": err.status}
         if err.reason is not None:
             info["reason"] = err.reason
+        if err.code is not None:
+            info["api_code"] = err.code
         return _with_ids(info, err)
     if isinstance(err, ConnectionInterruptedError):
         return _with_ids({"code": "connection_interrupted", "message": str(err)}, err)
@@ -402,6 +410,25 @@ def _error_info(err: BaseException) -> dict[str, Any]:
             info["details"] = {"errno": errno.errorcode.get(err.errno, str(err.errno))}
         return info
     return {"code": "failed", "message": str(err)}
+
+
+def _with_status(err: APIError, message: str) -> str:
+    """A text-mode failure's message with the status and the platform's code
+    after it: ``... (HTTP 409, LABEL_TAKEN)``, or ``... (HTTP 404)`` when the
+    platform sent no ``code``.
+
+    The status and the code are what ``--json`` carries as ``status`` and
+    ``api_code``, so a person reading the line has what a script reads
+    (OPL-5974). A message that already ends with its status, as this SDK's own
+    wording for an edge failure does, has that ending replaced rather than a
+    second one added. The code comes from the response body and is escaped like
+    the message.
+    """
+    ending = f"(HTTP {err.status})"
+    base = message[: -len(ending)].rstrip() if message.endswith(ending) else message
+    if err.code is not None:
+        return f"{base} (HTTP {err.status}, {_printable(err.code)})"
+    return f"{base} {ending}"
 
 
 def _json_failure(info: dict[str, Any]) -> None:
@@ -4516,7 +4543,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             # The message can be the response's own text: escaped, so a
             # newline in it cannot forge a recovery line below it.
-            print(f"{PROG}: {_printable(str(e))}", file=sys.stderr)
+            message = _printable(str(e))
+            if isinstance(e, APIError):
+                message = _with_status(e, message)
+            print(f"{PROG}: {message}", file=sys.stderr)
             recovery = _recovery_line(e, resendable) if isinstance(e, MandalaError) else None
             if recovery is not None:
                 print(recovery, file=sys.stderr)
