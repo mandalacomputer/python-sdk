@@ -203,7 +203,10 @@ def test_an_id_with_a_slash_stays_one_segment() -> None:
         ({"url": ""}, "no usable url"),
         ({"hostname": 7}, "no usable hostname"),
         ({"label": None}, "no usable label"),
-        ({"access": None}, "no usable access"),
+        ({"access": None}, 'neither "public" nor "private"'),
+        ({"access": "restricted"}, 'neither "public" nor "private"'),
+        ({"access": " private"}, 'neither "public" nor "private"'),
+        ({"access": ""}, 'neither "public" nor "private"'),
         ({"disabled": None}, "whether it is disabled"),
         ({"disabled": "maybe"}, "whether it is disabled"),
         ({"created_at": None}, "no usable created_at"),
@@ -288,3 +291,23 @@ async def test_async_methods() -> None:
         assert delete.called
         with pytest.raises(ValueError, match="port 22"):
             await computer.create_public_url(22)
+
+
+@respx.mock
+async def test_an_unknown_access_mode_is_refused_not_read_as_public() -> None:
+    respx.post(f"{BASE}/computers/vm-9/public-urls").mock(
+        return_value=httpx.Response(201, json={**URL, "access": "restricted"})
+    )
+    respx.patch(f"{BASE}/computers/vm-9/public-urls/pu-0123456789abcdef").mock(
+        return_value=httpx.Response(200, json={**URL, "access": "restricted"})
+    )
+    with (
+        mc.Client() as client,
+        pytest.raises(mc.MandalaError, match="POST computers/vm-9/public-urls"),
+    ):
+        mc.Computer(client._t, {"id": "vm-9"}).create_public_url(3000)
+    async with mc.AsyncClient() as client:
+        with pytest.raises(mc.MandalaError, match="neither"):
+            await mc.AsyncComputer(client._t, {"id": "vm-9"}).update_public_url(
+                "pu-0123456789abcdef", port=8000
+            )

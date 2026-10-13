@@ -3658,7 +3658,9 @@ class PublicUrl:
     port: int
     #: ``"public"``: anyone with the link. ``"private"``: only a request
     #: carrying an API key of this account as ``Authorization: Bearer``, which
-    #: never reaches the app. A plain string, as the platform sends it.
+    #: never reaches the app. Never anything else: an answer naming another
+    #: mode is refused, since a caller branching on :attr:`is_private` would
+    #: otherwise read an unknown policy as public.
     access: str
     #: ``True`` when the platform has turned this URL off, by its name, its
     #: computer or its account: it answers 404 until the platform turns it back
@@ -3689,13 +3691,16 @@ class PublicUrl:
         disabled = _wire(d, "disabled")
         if disabled not in (_Wire.TRUE, _Wire.FALSE):
             raise MandalaError(f"{where}: a public URL does not say whether it is disabled")
+        access = d.get("access")
+        if access not in ("public", "private") or not isinstance(access, str):
+            raise MandalaError(f'{where}: a public URL\'s access is neither "public" nor "private"')
         return cls(
             id=_url_text(d, "id", where),
             url=_url_text(d, "url", where),
             hostname=_url_text(d, "hostname", where),
             label=_url_text(d, "label", where),
             port=int.__index__(port),
-            access=_url_text(d, "access", where),
+            access=str.__str__(access),
             disabled=disabled is _Wire.TRUE,
             created_at=_url_text(d, "created_at", where),
             updated_at=_url_text(d, "updated_at", where),
