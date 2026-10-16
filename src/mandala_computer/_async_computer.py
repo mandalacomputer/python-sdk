@@ -2336,7 +2336,10 @@ class AsyncComputer(ComputerFields):
 
         Supply an existing upload_id to resume; a missing receipt stays a 404.
         Typed API and validation errors keep their classes; other interruptions
-        use UploadInterruptedError. Errors carry upload_id for status/cleanup.
+        use UploadInterruptedError. The raised exception is tagged with upload_id;
+        asyncio can replace cancellation exceptions across task boundaries,
+        especially on Python 3.10. For guaranteed cancellation recovery, retain
+        an ID and stage the first chunk with write_file_chunk before resuming here.
         On success call cancel_file_upload to remove the receipt.
         Staging consumes guest disk until cancelled; there is no automatic expiry.
         """

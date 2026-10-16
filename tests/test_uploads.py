@@ -217,7 +217,16 @@ async def test_cancellation_waits_for_the_source_reader_before_returning():
     chunks = respx.put(ROUTE).mock(httpx.Response(200, json=receipt(3, 3)))
     async with computer(True) as c:
         source = BlockingSource(b"abc")
-        task = asyncio.create_task(c.upload_file(PATH, source, size=3))
+        captured = []
+
+        async def upload():
+            try:
+                await c.upload_file(PATH, source, size=3)
+            except asyncio.CancelledError as error:
+                captured.append(error)
+                raise
+
+        task = asyncio.create_task(upload())
         try:
             assert await asyncio.to_thread(started.wait, 3)
             task.cancel("first cancellation")
@@ -227,12 +236,14 @@ async def test_cancellation_waits_for_the_source_reader_before_returning():
             assert not task.done()
         finally:
             release.set()
-        # Python 3.10 may omit the cancellation message across shield/task
-        # boundaries. The contract is the exception type, recovery ID and a
-        # finished source read, not version-specific cancellation text.
-        with pytest.raises(asyncio.CancelledError) as error:
+        # Python 3.10 can replace CancelledError at the task boundary, losing
+        # both its message and custom attributes. Inspect the SDK exception
+        # inside its coroutine; cancellation still propagates to the awaiter.
+        with pytest.raises(asyncio.CancelledError):
             await task
         assert finished.is_set()
-        assert len(error.value.upload_id) == 32
+        assert len(captured) == 1
+        assert captured[0].args == ("first cancellation",)
+        assert len(captured[0].upload_id) == 32
         source.close()
     assert chunks.call_count == 0
