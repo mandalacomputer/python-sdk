@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-10-16
+
 ### Security
 
 - **Dependency floors move past published advisories.** `anyio` is now a
@@ -1552,7 +1554,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.10.0...v0.11.0
