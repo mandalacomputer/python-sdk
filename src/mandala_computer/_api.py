@@ -3434,3 +3434,38 @@ def secret_delete_params(revision_id: object, workspace_id: object) -> dict[str,
     if workspace is not None:
         params["workspace_id"] = workspace
     return params
+
+
+def file_uploads(computer_id: str) -> str:
+    return f"{files(computer_id)}/uploads"
+
+
+def file_upload_params(path: str, upload_id: str, no_wake: bool = False) -> dict[str, str]:
+    params = upload_params(path, True, no_wake)
+    if (
+        not path.startswith("/")
+        or path == "/"
+        or any(part in ("", ".", "..") for part in path.split("/")[1:])
+    ):
+        raise ValueError("Upload path must be a normalized absolute Linux file path")
+    if not isinstance(upload_id, str) or re.fullmatch(r"[a-f0-9]{32}", upload_id) is None:
+        raise ValueError("upload_id must be 32 lowercase hexadecimal characters")
+    return {**params, "upload_id": upload_id}
+
+
+def file_chunk_params(
+    path: str, upload_id: str, offset: int, size: int, data: bytes, overwrite: bool, no_wake: bool
+) -> dict[str, str]:
+    params = file_upload_params(path, upload_id, no_wake)
+    if (
+        type(size) is not int
+        or type(offset) is not int
+        or not 0 <= offset <= size <= 2147483648
+        or not isinstance(data, bytes)
+        or len(data) > 8 * 1024 * 1024
+        or len(data) > size - offset
+        or (not data and offset != size)
+        or type(overwrite) is not bool
+    ):
+        raise ValueError("Invalid upload chunk, offset or size (8 MiB per chunk, 2 GiB per file)")
+    return {**params, "offset": str(offset), "size": str(size), "overwrite": str(overwrite).lower()}

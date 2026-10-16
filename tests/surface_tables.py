@@ -92,6 +92,9 @@ ALLOWED = {
     ("PUT", "computers/:id/files"),
     ("GET", "computers/:id/files"),
     ("GET", "computers/:id/files/list"),
+    ("PUT", "computers/:id/files/uploads"),
+    ("GET", "computers/:id/files/uploads"),
+    ("DELETE", "computers/:id/files/uploads"),
     ("POST", "computers/:id/agent"),
     # What the account has used. Account-scoped like `moves`, and for a related
     # reason: the figures include computers that have since been deleted, which
@@ -357,6 +360,16 @@ PARAMETERS: dict[str, set[str]] = {
     "PUT computers/:id/files": {"query:path", "query:no_wake", "query:overwrite"},
     "GET computers/:id/files": {"query:path", "query:no_wake", "header:Range"},
     "GET computers/:id/files/list": {"query:path"},
+    "PUT computers/:id/files/uploads": {
+        "query:upload_id",
+        "query:overwrite",
+        "query:size",
+        "query:offset",
+        "query:no_wake",
+        "query:path",
+    },
+    "GET computers/:id/files/uploads": {"query:upload_id", "query:path", "query:no_wake"},
+    "DELETE computers/:id/files/uploads": {"query:upload_id", "query:path", "query:no_wake"},
     "GET snapshots": {"query:allow_partial", "query:include"},
     "GET computers/:id/snapshots": set(),
     "POST computers/:id/snapshots": {"body:name", "body:memory"},

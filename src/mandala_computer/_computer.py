@@ -7,6 +7,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import replace
@@ -68,6 +69,7 @@ from ._exceptions import (
     InsufficientCreditsError,
     MandalaError,
     ModelProviderError,
+    NotFoundError,
     RangeNotSatisfiableError,
     RateLimitError,
     TimeoutError,
@@ -130,6 +132,7 @@ from ._results import (
     decode_result,
     decode_result_output,
 )
+from ._uploads import FileUpload, UploadInterruptedError, read_chunk
 
 __all__ = ["BackgroundCommand", "Computer"]
 
@@ -5118,6 +5121,108 @@ class Computer(ComputerFields):
                 raise
             raise refusal from None
         return _bytes_written(resp)
+
+    def write_file_chunk(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        upload_id: str,
+        offset: int,
+        size: int,
+        overwrite: bool = True,
+        no_wake: bool = False,
+    ) -> FileUpload:
+        """Linux only: stage up to 8 MiB of a file up to 2 GiB. Read status after errors.
+
+        Keep path, upload_id, size, overwrite and source contents unchanged.
+        The final chunk publishes atomically. No partial destination is exposed.
+        """
+        params = _api.file_chunk_params(path, upload_id, offset, size, data, overwrite, no_wake)
+        result = self._t.json_object(
+            "PUT", _api.file_uploads(self.id), params=params, content=data, timeout=FILE_TIMEOUT
+        )
+        progress = FileUpload.from_api(result, path, upload_id)
+        if (
+            progress.size != size
+            or progress.offset != offset + len(data)
+            or progress.complete != (progress.offset == size)
+        ):
+            raise ValueError(
+                "Upload progress does not confirm this chunk; read status before retrying"
+            )
+        return progress
+
+    def file_upload(self, path: str, upload_id: str, *, no_wake: bool = False) -> FileUpload:
+        """Read staged offset and completion, including after a lost reply."""
+        result = self._t.json_object(
+            "GET",
+            _api.file_uploads(self.id),
+            params=_api.file_upload_params(path, upload_id, no_wake),
+            timeout=FILE_TIMEOUT,
+        )
+        return FileUpload.from_api(result, path, upload_id)
+
+    def cancel_file_upload(self, path: str, upload_id: str, *, no_wake: bool = False) -> None:
+        """Remove staging and its receipt; never deletes the published destination."""
+        self._t.json_object(
+            "DELETE",
+            _api.file_uploads(self.id),
+            params=_api.file_upload_params(path, upload_id, no_wake),
+            timeout=FILE_TIMEOUT,
+        )
+
+    def upload_file(
+        self,
+        path: str,
+        source: IO[bytes],
+        *,
+        size: int,
+        upload_id: str | None = None,
+        overwrite: bool = True,
+        no_wake: bool = False,
+    ) -> FileUpload:
+        """Upload a seekable binary file in bounded chunks; retain the unchanged source.
+
+        Supply upload_id to resume. UploadInterruptedError carries the ID after
+        failure. On success call cancel_file_upload to remove the receipt.
+        Staging consumes guest disk until cancelled; there is no automatic expiry.
+        """
+        identity = upload_id or uuid.uuid4().hex
+        _api.file_upload_params(path, identity, no_wake)
+        if type(size) is not int or not 0 <= size <= 2147483648:
+            raise ValueError("File size must be between 0 and 2 GiB")
+        try:
+            progress = None
+            if upload_id is not None:
+                try:
+                    progress = self.file_upload(path, identity, no_wake=no_wake)
+                except NotFoundError:
+                    pass
+            if progress is not None and progress.size != size:
+                raise ValueError(
+                    "Source size differs from the staged upload; use the unchanged source or a new ID"
+                )
+            if progress is not None and progress.complete:
+                return progress
+            offset = progress.offset if progress is not None else 0
+            while True:
+                length = min(4 * 1024 * 1024, size - offset)
+                data = read_chunk(source, offset, length)
+                progress = self.write_file_chunk(
+                    path,
+                    data,
+                    upload_id=identity,
+                    offset=offset,
+                    size=size,
+                    overwrite=overwrite,
+                    no_wake=no_wake,
+                )
+                if progress.complete:
+                    return progress
+                offset = progress.offset
+        except Exception as error:
+            raise UploadInterruptedError(identity, error) from error
 
     def list_directory(self, path: str) -> GuestDirectory:
         """List one directory inside the guest: names, types and file sizes.

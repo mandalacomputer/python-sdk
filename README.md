@@ -4694,3 +4694,16 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Large resumable uploads
+
+Linux computers with Python 3 support files up to 2 GiB using `upload_file`. It reads a seekable binary source in 4 MiB chunks. The sync and async clients have the same methods; async file reads run in a worker thread. Keep the source unchanged.
+
+```python
+with open("dataset.bin", "rb") as source:
+    done = computer.upload_file("/tmp/dataset.bin", source,
+                                size=os.fstat(source.fileno()).st_size, overwrite=False)
+computer.cancel_file_upload(done.path, done.upload_id)  # receipt only, never destination
+```
+
+Import `os` for this example. `UploadInterruptedError.upload_id` is the identity to retain after a failure; pass it as `upload_id` with the same source to resume from server status. `write_file_chunk`, `file_upload` and `cancel_file_upload` expose the protocol directly. Chunks are at most 8 MiB. Staging and completion receipts stay on the guest disk until cancelled; they do not expire automatically. Ordinary `write_file` remains capped at 64 MiB. Older hosts refuse the new endpoint without falling back to a truncating write.
