@@ -227,7 +227,10 @@ async def test_cancellation_waits_for_the_source_reader_before_returning():
             assert not task.done()
         finally:
             release.set()
-        with pytest.raises(asyncio.CancelledError, match="first cancellation") as error:
+        # Python 3.10 may omit the cancellation message across shield/task
+        # boundaries. The contract is the exception type, recovery ID and a
+        # finished source read, not version-specific cancellation text.
+        with pytest.raises(asyncio.CancelledError) as error:
             await task
         assert finished.is_set()
         assert len(error.value.upload_id) == 32
