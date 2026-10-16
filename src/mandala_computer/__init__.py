@@ -226,11 +226,11 @@ from ._results import (
     SynchronousResult,
     SynchronousResultPrefix,
 )
+from ._uploads import FileUpload, UploadInterruptedError
 from ._webhooks import REPLAY_WINDOW_S, verify
 
 __version__ = "0.13.1"
 
-from ._uploads import FileUpload, UploadInterruptedError
 
 __all__ = [
     "CHANNEL_EVENT_TYPES",

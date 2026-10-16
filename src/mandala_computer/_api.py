@@ -3442,6 +3442,7 @@ def file_uploads(computer_id: str) -> str:
 
 def file_upload_params(path: str, upload_id: str, no_wake: bool = False) -> dict[str, str]:
     params = upload_params(path, True, no_wake)
+    path = params["path"]
     if (
         not path.startswith("/")
         or path == "/"
@@ -3450,7 +3451,7 @@ def file_upload_params(path: str, upload_id: str, no_wake: bool = False) -> dict
         raise ValueError("Upload path must be a normalized absolute Linux file path")
     if not isinstance(upload_id, str) or re.fullmatch(r"[a-f0-9]{32}", upload_id) is None:
         raise ValueError("upload_id must be 32 lowercase hexadecimal characters")
-    return {**params, "upload_id": upload_id}
+    return {**params, "upload_id": str.__str__(upload_id)}
 
 
 def file_chunk_params(

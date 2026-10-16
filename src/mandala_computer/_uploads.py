@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import IO, Any
+
+from ._exceptions import MandalaError
 
 
 @dataclass(frozen=True)
@@ -27,17 +30,18 @@ class FileUpload:
             or type(complete) is not bool
             or (complete and offset != size)
         ):
-            raise ValueError(
+            raise MandalaError(
                 "Server returned invalid upload progress; read upload status before retrying"
             )
         return cls(path, upload_id, offset, size, complete)
 
 
-class UploadInterruptedError(Exception):
+class UploadInterruptedError(MandalaError):
     """Retain upload_id and the unchanged source to resume, or cancel staging."""
 
     def __init__(self, upload_id: str, cause: Exception):
         self.upload_id = upload_id
+        self.cause = cause
         super().__init__(
             f"Upload {upload_id} interrupted. Resume with this upload_id and the unchanged source, or cancel_file_upload to remove staging. {cause}"
         )
@@ -45,7 +49,18 @@ class UploadInterruptedError(Exception):
 
 def read_chunk(source: IO[bytes], offset: int, length: int) -> bytes:
     source.seek(offset)
-    data = source.read(length)
-    if not isinstance(data, bytes) or len(data) != length:
-        raise ValueError("Source returned a short or invalid chunk; keep the source unchanged")
-    return data
+    chunk = bytearray()
+    remaining = length
+    while remaining:
+        data = source.read(remaining)
+        if not isinstance(data, bytes) or not data or len(data) > remaining:
+            raise ValueError("Source returned a short or invalid chunk; keep the source unchanged")
+        chunk.extend(data)
+        remaining -= len(data)
+    return bytes(chunk)
+
+
+def attach_upload_id(error: BaseException, identity: str) -> None:
+    """Keep cancellation/validation identity, including user-defined exceptions."""
+    with suppress(AttributeError, TypeError):
+        setattr(error, "upload_id", identity)  # noqa: B010 - BaseException has no typed field
