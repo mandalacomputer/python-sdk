@@ -161,7 +161,7 @@ from ._results import (
     decode_result,
     decode_result_output,
 )
-from ._uploads import FileUpload, UploadInterruptedError, attach_upload_id, read_chunk
+from ._uploads import FileUpload, UploadInterruptedError, attach_upload_id, read_chunk_async
 
 __all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
 
@@ -2335,14 +2335,16 @@ class AsyncComputer(ComputerFields):
         """Upload a seekable binary file in bounded chunks; retain the unchanged source.
 
         Supply an existing upload_id to resume; a missing receipt stays a 404.
-        Errors retain their type and carry upload_id for status/cleanup. On success call cancel_file_upload to remove the receipt.
+        Typed API and validation errors keep their classes; other interruptions
+        use UploadInterruptedError. Errors carry upload_id for status/cleanup.
+        On success call cancel_file_upload to remove the receipt.
         Staging consumes guest disk until cancelled; there is no automatic expiry.
         """
-        identity = upload_id or uuid.uuid4().hex
-        _api.file_upload_params(path, identity, no_wake)
-        if type(size) is not int or not 0 <= size <= 2147483648:
-            raise ValueError("File size must be between 0 and 2 GiB")
+        identity = upload_id if upload_id is not None else uuid.uuid4().hex
         try:
+            _api.file_upload_params(path, identity, no_wake)
+            if type(size) is not int or not 0 <= size <= 2147483648:
+                raise ValueError("File size must be between 0 and 2 GiB")
             progress = None
             if upload_id is not None:
                 progress = await self.file_upload(path, identity, no_wake=no_wake)
@@ -2355,7 +2357,7 @@ class AsyncComputer(ComputerFields):
             offset = progress.offset if progress is not None else 0
             while True:
                 length = min(4 * 1024 * 1024, size - offset)
-                data = await asyncio.to_thread(read_chunk, source, offset, length)
+                data = await read_chunk_async(source, offset, length)
                 progress = await self.write_file_chunk(
                     path,
                     data,

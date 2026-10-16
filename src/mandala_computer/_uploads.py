@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -64,3 +65,19 @@ def attach_upload_id(error: BaseException, identity: str) -> None:
     """Keep cancellation/validation identity, including user-defined exceptions."""
     with suppress(AttributeError, TypeError):
         setattr(error, "upload_id", identity)  # noqa: B010 - BaseException has no typed field
+
+
+async def read_chunk_async(source: IO[bytes], offset: int, length: int) -> bytes:
+    """Do not return cancellation while a worker still owns the source cursor."""
+    worker = asyncio.create_task(asyncio.to_thread(read_chunk, source, offset, length))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Python cannot stop a file-reading thread. Drain it before the caller
+        # closes/reuses the source; repeated task cancellation must not detach it.
+        while not worker.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(worker)
+        if not worker.cancelled():
+            worker.exception()  # Retrieve a source failure without replacing cancellation.
+        raise

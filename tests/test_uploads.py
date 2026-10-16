@@ -188,3 +188,48 @@ async def test_async_cancellation_preserves_exception_and_generated_id():
             await c.upload_file(PATH, io.BytesIO(b"abc"), size=3)
         assert error.value is cancelled
         assert error.value.upload_id == generated
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_empty_resume_id_is_invalid_before_network(asynchronous):
+    async with computer(asynchronous) as c:
+        with pytest.raises(ValueError, match="upload_id"):
+            await result(c.upload_file(PATH, io.BytesIO(b"abc"), size=3, upload_id=""))
+
+
+@respx.mock
+async def test_cancellation_waits_for_the_source_reader_before_returning():
+    import asyncio
+    import threading
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingSource(io.BytesIO):
+        def read(self, n=-1):
+            started.set()
+            assert release.wait(5)
+            try:
+                return super().read(n)
+            finally:
+                finished.set()
+
+    chunks = respx.put(ROUTE).mock(httpx.Response(200, json=receipt(3, 3)))
+    async with computer(True) as c:
+        source = BlockingSource(b"abc")
+        task = asyncio.create_task(c.upload_file(PATH, source, size=3))
+        try:
+            assert await asyncio.to_thread(started.wait, 3)
+            task.cancel("first cancellation")
+            await asyncio.sleep(0.01)
+            task.cancel("second cancellation")
+            await asyncio.sleep(0.01)
+            assert not task.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError, match="first cancellation") as error:
+            await task
+        assert finished.is_set()
+        assert len(error.value.upload_id) == 32
+        source.close()
+    assert chunks.call_count == 0

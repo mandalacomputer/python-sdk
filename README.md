@@ -4695,7 +4695,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 An explicit `upload_id` resumes an existing receipt; 404 stays a refusal, never a restart. Typed API and validation errors keep their classes. Errors, including cancellation, carry `upload_id` when the exception permits attributes. For guaranteed recovery after cancellation, choose an ID and stage the first chunk with `write_file_chunk` before calling `upload_file` with that ID. A create-only publish still checks the destination atomically, so another writer can occupy it after staging began.
 
-Linux computers with Python 3 support files up to 2 GiB using `upload_file`. It reads a seekable binary source in 4 MiB chunks. The sync and async clients have the same methods; async file reads run in a worker thread. Keep the source unchanged.
+Linux computers with Python 3 support files up to 2 GiB using `upload_file`. It reads a seekable binary source in 4 MiB chunks. The sync and async clients have the same methods; async file reads run in a worker thread. Cancellation waits for an active source read to finish before returning, so the source can safely be closed or reused. Keep the source unchanged.
 
 ```python
 with open("dataset.bin", "rb") as source:
