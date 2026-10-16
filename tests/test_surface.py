@@ -607,6 +607,20 @@ def api_handler(request: httpx.Request) -> httpx.Response:
                 ),
             },
         )
+    if path.endswith("/files/uploads"):
+        params = request.url.params
+        return httpx.Response(
+            200,
+            json={"ok": True}
+            if request.method == "DELETE"
+            else {
+                "path": params["path"],
+                "upload_id": params["upload_id"],
+                "offset": int(params.get("size", "3")),
+                "size": int(params.get("size", "3")),
+                "complete": True,
+            },
+        )
     if path.endswith("/files/list"):
         return httpx.Response(200, json=GUEST_DIRECTORY)
     if path.endswith("/signals"):
@@ -1095,6 +1109,12 @@ def exercise_everything(client: mc.Client) -> None:
     c.read_file("/home/user/out.txt", no_wake=True)
     c.write_file("/home/user/in.txt", b"hello", no_wake=True)
     c.list_directory("/home/user")
+    c.write_file_chunk(
+        "/tmp/large", b"abc", upload_id="a" * 32, offset=0, size=3, overwrite=False, no_wake=True
+    )
+    c.file_upload("/tmp/large", "a" * 32, no_wake=True)
+    c.cancel_file_upload("/tmp/large", "a" * 32, no_wake=True)
+    c.upload_file("/tmp/large", io.BytesIO(b"abc"), size=3)
     # Passive history (OPL-5026): signals and API activity.
     c.signals()
     c.signals("c-1", limit=10)
@@ -1407,6 +1427,12 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.read_file("/home/user/out.txt", no_wake=True)
     await c.write_file("/home/user/in.txt", b"hello", no_wake=True)
     await c.list_directory("/home/user")
+    await c.write_file_chunk(
+        "/tmp/large", b"abc", upload_id="a" * 32, offset=0, size=3, overwrite=False, no_wake=True
+    )
+    await c.file_upload("/tmp/large", "a" * 32, no_wake=True)
+    await c.cancel_file_upload("/tmp/large", "a" * 32, no_wake=True)
+    await c.upload_file("/tmp/large", io.BytesIO(b"abc"), size=3)
     await c.signals()
     await c.signals("c-1", limit=10)
     await c.activities()

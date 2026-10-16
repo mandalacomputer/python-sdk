@@ -226,9 +226,11 @@ from ._results import (
     SynchronousResult,
     SynchronousResultPrefix,
 )
+from ._uploads import FileUpload, UploadInterruptedError
 from ._webhooks import REPLAY_WINDOW_S, verify
 
 __version__ = "0.13.1"
+
 
 __all__ = [
     "CHANNEL_EVENT_TYPES",
@@ -310,6 +312,7 @@ __all__ = [
     "FileExistsError",
     "FilePart",
     "FileTooLargeError",
+    "FileUpload",
     "GatewayTimeoutError",
     "GuestDirectory",
     "Hello",
@@ -381,6 +384,7 @@ __all__ = [
     "TimeoutError",
     "TypeResult",
     "UnavailableError",
+    "UploadInterruptedError",
     "UsagePeriod",
     "UsageReport",
     "UsageTotals",

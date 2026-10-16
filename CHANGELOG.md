@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+- Add bounded Linux resumable uploads up to 2 GiB, with sync/async helpers, status-based resume and explicit receipt cleanup.
+
 ## [0.13.1] — 2026-10-16
 
 ### Security

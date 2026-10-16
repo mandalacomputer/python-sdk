@@ -4691,6 +4691,22 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python scripts/check_surface.py   # the drift check on its own, with output
 ```
 
+## Large resumable uploads
+
+An explicit `upload_id` resumes an existing receipt; 404 stays a refusal, never a restart. Typed API and validation errors keep their classes. The SDK tags errors, including cancellation, with `upload_id` when the exception permits attributes. Asyncio can replace cancellation exceptions across task boundaries (notably on Python 3.10), losing that attribute; catch inside the upload coroutine to inspect it, or retain the ID before starting. For guaranteed recovery after cancellation, choose an ID and stage the first chunk with `write_file_chunk` before calling `upload_file` with that ID. A create-only publish still checks the destination atomically, so another writer can occupy it after staging began.
+
+Linux computers with Python 3 support files up to 2 GiB using `upload_file`. It reads a seekable binary source in 4 MiB chunks. The sync and async clients have the same methods; async file reads run in a worker thread. Cancellation waits for an active source read to finish before returning, so the source can safely be closed or reused. Keep the source unchanged.
+
+```python
+with open("dataset.bin", "rb") as source:
+    done = computer.upload_file(
+        "/tmp/dataset.bin", source, size=os.fstat(source.fileno()).st_size, overwrite=False
+    )
+computer.cancel_file_upload(done.path, done.upload_id)  # receipt only, never destination
+```
+
+Import `os` for this example. `MandalaError.upload_id` is the identity to retain after a failure; pass it as `upload_id` with the same source to resume from server status. `write_file_chunk`, `file_upload` and `cancel_file_upload` expose the protocol directly. Chunks are at most 8 MiB. Staging and completion receipts stay on the guest disk until cancelled; they do not expire automatically. Ordinary `write_file` remains capped at 64 MiB. Older hosts refuse the new endpoint without falling back to a truncating write.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

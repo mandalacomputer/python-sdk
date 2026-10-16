@@ -47,6 +47,9 @@ __all__ = [
 class MandalaError(Exception):
     """Base class for every error this SDK raises."""
 
+    #: Resumable upload ID on an upload failure; read status before resending.
+    upload_id: str | None = None
+
     #: The failed agent run behind this error, or ``None`` — which is every
     #: error that did not come out of one.
     #:
