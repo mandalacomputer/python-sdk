@@ -9,6 +9,17 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency floors move past published advisories.** `anyio` is now a
+  declared dependency at 4.14.2 or later (it was imported directly but arrived
+  only through `httpx`, which permits releases with a TLS host-name encoding
+  flaw that could allow certificate spoofing, and a process-pool hang), and the
+  `anthropic` extra needs `pydantic` 2.4 or later (regular expression denial of
+  service). A fresh install already resolved past both; this stops an existing
+  environment keeping the affected versions. CI now audits both the newest and
+  the minimum versions the package permits, daily.
+
 ## [0.13.0] — 2026-10-13
 
 ### Added
