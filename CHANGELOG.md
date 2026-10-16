@@ -9,6 +9,15 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Security
+
+- **The `anthropic` extra's floors move past published advisories:** `anyio`
+  4.14.2 (TLS host-name encoding that could allow certificate spoofing, and
+  process-pool workers that could block) and `pydantic` 2.4 (regular
+  expression denial of service). A fresh install already resolved past both;
+  this stops the extra admitting the affected versions. CI now audits both
+  the versions a fresh install resolves and the declared floors, daily.
+
 ## [0.13.0] — 2026-10-13
 
 ### Added
