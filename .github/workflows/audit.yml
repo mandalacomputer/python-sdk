@@ -1,13 +1,21 @@
 name: Audit
 
 # pip-audit over what this package lets a user end up with. It ships no
-# lockfile, so there are two sets of versions to check: what a fresh install
-# of the package and its `anthropic` extra resolves today, and the floors
-# pyproject.toml declares, which an existing environment may still hold. The
-# floors were where the advisories were: anyio>=3.5 and pydantic>=2 admitted
-# versions with published fixes after the MCP server's dependency audit
-# prompted a look here (OPL-6036). An advisory is published against code that
-# has not changed, so this also runs daily.
+# lockfile, so two resolutions of the package and its `anthropic` extra are
+# checked: the newest versions a fresh install picks today, and the declared
+# floors (uv's lowest-direct: every direct dependency at its minimum, the rest
+# resolved as usual). The floors were where the advisories were: anyio>=3.5
+# and pydantic>=2 admitted versions with published fixes (OPL-6036). Each is
+# resolved for the oldest and newest Python the package supports, since
+# markers can pick different versions.
+#
+# Not checked: the lowest version of every transitive dependency too. That
+# graph does not resolve at all (httpx 0.27 permits idna 0.2, which no longer
+# builds), and a transitive's advisory is that project's floor to raise.
+#
+# Resolution installs nothing, so no package's build or install code runs
+# here. An advisory is published against code that has not changed, so this
+# also runs daily.
 
 on:
   push:
@@ -31,21 +39,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The package goes into a venv of its own and pip-audit into another,
-      # so neither's dependencies are audited as the other's.
-      - name: Resolve a fresh install
+      - name: Install uv and pip-audit
         run: |
-          python -m venv "$RUNNER_TEMP/sdk"
-          "$RUNNER_TEMP/sdk/bin/pip" install --quiet ".[anthropic]"
-          "$RUNNER_TEMP/sdk/bin/pip" freeze --exclude mandala-computer > "$RUNNER_TEMP/current.txt"
-          python scripts/floor_requirements.py > "$RUNNER_TEMP/floors.txt"
-          cat "$RUNNER_TEMP/floors.txt"
-      - name: Install pip-audit
+          python -m venv "$RUNNER_TEMP/tools"
+          "$RUNNER_TEMP/tools/bin/pip" install --quiet uv==0.9.5 pip-audit==2.10.1
+      - name: Resolve
         run: |
-          python -m venv "$RUNNER_TEMP/audit"
-          "$RUNNER_TEMP/audit/bin/pip" install --quiet pip-audit==2.10.1
-      - name: Audit what a fresh install resolves
-        run: '"$RUNNER_TEMP/audit/bin/pip-audit" -r "$RUNNER_TEMP/current.txt" --no-deps --disable-pip --progress-spinner off'
-      - name: Audit the declared floors
-        if: always()
-        run: '"$RUNNER_TEMP/audit/bin/pip-audit" -r "$RUNNER_TEMP/floors.txt" --no-deps --disable-pip --progress-spinner off'
+          for python in 3.10 3.14; do
+            for resolution in highest lowest-direct; do
+              out="$RUNNER_TEMP/$resolution-$python.txt"
+              "$RUNNER_TEMP/tools/bin/uv" pip compile pyproject.toml --extra anthropic \
+                --resolution "$resolution" --python-version "$python" \
+                --quiet --no-header --no-annotate -o "$out"
+              echo "== $resolution, Python $python"; cat "$out"
+            done
+          done
+      - name: Audit
+        run: |
+          status=0
+          for file in "$RUNNER_TEMP"/highest-*.txt "$RUNNER_TEMP"/lowest-direct-*.txt; do
+            echo "== $(basename "$file" .txt)"
+            "$RUNNER_TEMP/tools/bin/pip-audit" -r "$file" --no-deps --disable-pip --progress-spinner off || status=1
+          done
+          exit "$status"
