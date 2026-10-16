@@ -9,7 +9,23 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
-- Add bounded Linux resumable uploads up to 2 GiB, with sync/async helpers, status-based resume and explicit receipt cleanup.
+## [0.14.0] — 2026-10-16
+
+### Added
+
+- **Resumable uploads.** On a Linux computer with Python 3,
+  `computer.upload_file(path, source, size=…)` uploads a file of up to 2 GiB
+  from a seekable binary source in 4 MiB chunks, and publishes it atomically
+  when the last chunk lands; `overwrite=False` refuses an occupied destination.
+  The sync and async clients have the same methods (async reads run in a worker
+  thread). A failed upload carries `upload_id` on the exception: pass it back
+  as `upload_id` with the unchanged source and the upload resumes from the
+  offset the computer reports. A supplied ID must already exist — a missing one
+  is a 404, never a silent restart. `write_file_chunk` (at most 8 MiB),
+  `file_upload` and `cancel_file_upload` expose the protocol directly. Staging
+  and completion receipts use guest disk until cancelled and do not expire. A
+  host without the endpoint refuses it rather than falling back to a truncating
+  write, and `write_file` stays capped at 64 MiB.
 
 ## [0.13.1] — 2026-10-16
 
