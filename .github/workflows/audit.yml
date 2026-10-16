@@ -13,9 +13,19 @@ name: Audit
 # graph does not resolve at all (httpx 0.27 permits idna 0.2, which no longer
 # builds), and a transitive's advisory is that project's floor to raise.
 #
-# Resolution installs nothing, so no package's build or install code runs
-# here. An advisory is published against code that has not changed, so this
-# also runs daily.
+# Resolution installs nothing, but it is not guaranteed to run no package
+# code: uv reads metadata from wheels and from an sdist's static metadata,
+# and an sdist without either would be built to get it. --no-build would rule
+# that out, but it also moves the floors it cannot honour: on Python 3.14
+# pydantic 2.4's core has no wheel, so it resolves 2.12 and the 2.4 floor goes
+# unchecked there. The job holds nothing worth taking (contents: read, no
+# credentials persisted), so the floors win.
+#
+# pip-audit runs with --strict: without it a dependency whose lookup fails is
+# skipped and the audit still passes.
+#
+# An advisory is published against code that has not changed, so this also
+# runs daily.
 
 on:
   push:
@@ -59,6 +69,6 @@ jobs:
           status=0
           for file in "$RUNNER_TEMP"/highest-*.txt "$RUNNER_TEMP"/lowest-direct-*.txt; do
             echo "== $(basename "$file" .txt)"
-            "$RUNNER_TEMP/tools/bin/pip-audit" -r "$file" --no-deps --disable-pip --progress-spinner off || status=1
+            "$RUNNER_TEMP/tools/bin/pip-audit" -r "$file" --no-deps --disable-pip --strict --progress-spinner off || status=1
           done
           exit "$status"
