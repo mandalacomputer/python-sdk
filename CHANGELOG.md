@@ -12,10 +12,11 @@ This is the summary you read to decide whether to upgrade.
 ### Changed
 
 - Clarify the browser URL policy's advertised disconnect protection for
-  temporary contexts on supported Linux computers, including guardian loss
-  and browser-connection loss for public HTTP(S) destinations. Document the
-  remaining proxy, local-network, restart and cleanup limits. This is a
-  documentation correction; protection depends on the deployed backend.
+  temporary contexts on supported remote Linux computers, including guardian
+  loss and browser-connection loss for public HTTP(S) destinations. Document
+  the remaining proxy, local-network, restart, page/session detach and cleanup
+  limits. This is a documentation correction; protection depends on the
+  deployed backend.
 
 ## [0.14.0] — 2026-10-16
 
