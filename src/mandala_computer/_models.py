@@ -3696,7 +3696,8 @@ def _url_text(d: Mapping[str, Any], key: str, where: str) -> str:
 class PublicUrl:
     """A port inside a computer, served at :attr:`url` (platform OPL-3753).
 
-    From :meth:`~mandala_computer.Computer.public_urls`,
+    From ``client.public_urls.list/create/update`` or
+    :meth:`~mandala_computer.Computer.public_urls`,
     :meth:`~mandala_computer.Computer.create_public_url` and
     :meth:`~mandala_computer.Computer.update_public_url`. The app must listen
     on ``0.0.0.0:<port>``, not ``127.0.0.1``.
@@ -3769,7 +3770,8 @@ class PublicUrl:
 class PublicUrls:
     """A computer's public URLs, and whether they can answer.
 
-    From :meth:`~mandala_computer.Computer.public_urls`. The URLs are listed
+    From ``client.public_urls.list(computer_id)`` or
+    :meth:`~mandala_computer.Computer.public_urls`. The URLs are listed
     whether or not they can answer, so what was made can always be seen and
     deleted.
     """

@@ -9,6 +9,15 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Public URLs by computer ID.** `client.public_urls.list(computer_id)`,
+  `.create(computer_id, port, label=…, access=…)`, `.update(computer_id, url_id,
+  port=…, access=…)` and `.delete(computer_id, url_id)` work without fetching a
+  computer handle or contacting its host. Both sync and async clients support
+  them; list and delete remain usable for computers marked `lost`. Existing
+  handle methods and the `PublicUrls` result model are unchanged.
+
 ### Changed
 
 - Clarify the browser URL policy's advertised disconnect protection for

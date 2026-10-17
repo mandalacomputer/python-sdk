@@ -10,7 +10,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from datetime import datetime
 from enum import Enum, auto
-from typing import Any
+from typing import Any, Literal
 
 from . import _api
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport
@@ -42,6 +42,8 @@ from ._models import (
     NoBrowserProxy,
     Operation,
     OperationPage,
+    PublicUrl,
+    PublicUrls,
     PublishedTemplate,
     Retention,
     RetiredTemplates,
@@ -75,6 +77,7 @@ __all__ = [
     "Credits",
     "Moves",
     "Operations",
+    "PublicUrlsResource",
     "Secrets",
     "Sizes",
     "Snapshots",
@@ -1934,6 +1937,72 @@ class Webhooks:
             WebhookDelivery.from_api(d, f"GET webhooks/:id/deliveries: delivery {i}")
             for i, d in enumerate(data)
         ]
+
+
+class PublicUrlsResource:
+    """Manage public URLs by computer ID, without reading the computer first.
+
+    Available as ``client.public_urls``. These calls do not need the computer's
+    host to answer. List and delete also work for a computer marked ``lost``;
+    create and update still require a computer the platform can use again.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self, computer_id: str) -> PublicUrls:
+        """List URLs and their availability, including when the host is unavailable.
+
+        Returns the same :class:`~mandala_computer.PublicUrls` as
+        :meth:`~mandala_computer.Computer.public_urls`.
+        """
+        path = _api.computer_public_urls(computer_id)
+        data = self._t.json_object("GET", path)
+        return PublicUrls.from_api(data, f"GET {path}")
+
+    def create(
+        self,
+        computer_id: str,
+        port: int,
+        *,
+        label: str | None = None,
+        access: Literal["public", "private"] | None = None,
+    ) -> PublicUrl:
+        """Serve a port at a new URL; the default access is public.
+
+        The app must listen on ``0.0.0.0:<port>``. Uses the same validation,
+        defaults and errors as :meth:`~mandala_computer.Computer.create_public_url`.
+        """
+        body = _api.public_url_body(port=port, label=label, access=access, create=True)
+        path = _api.computer_public_urls(computer_id)
+        data = self._t.json_object("POST", path, json=body)
+        return PublicUrl.from_api(data, f"POST {path}")
+
+    def update(
+        self,
+        computer_id: str,
+        url_id: str,
+        *,
+        port: int | None = None,
+        access: Literal["public", "private"] | None = None,
+    ) -> PublicUrl:
+        """Change a URL's port, access, or both; its label cannot change.
+
+        Uses the same validation and errors as
+        :meth:`~mandala_computer.Computer.update_public_url`.
+        """
+        body = _api.public_url_body(port=port, access=access, create=False)
+        path = _api.computer_public_url(computer_id, url_id)
+        data = self._t.json_object("PATCH", path, json=body)
+        return PublicUrl.from_api(data, f"PATCH {path}")
+
+    def delete(self, computer_id: str, url_id: str) -> None:
+        """Remove a URL, including from a computer marked lost.
+
+        The app is unaffected and the label stays with the account. See
+        :meth:`~mandala_computer.Computer.delete_public_url`.
+        """
+        self._t.json_object("DELETE", _api.computer_public_url(computer_id, url_id))
 
 
 class SshKeys:

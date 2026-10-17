@@ -2615,19 +2615,31 @@ public address — a private, loopback or link-local one is a 400 at create.
 
 A public URL serves a port inside a computer at `https://<label>.<base_domain>`,
 on port 443 with no port in the address. `base_domain` is in the listing
-(`c.public_urls().base_domain`, such as `mandala.dev`), and every `PublicUrl`
+(`client.public_urls.list(computer_id).base_domain`, such as `mandala.dev`), and every `PublicUrl`
 carries its whole `url` and `hostname`, so nothing needs to build the address.
 The app must listen on `0.0.0.0:<port>`, not `127.0.0.1`.
 
 ```python
-c = client.computers.get("vm-...")
-served = c.create_public_url(3000)  # a label like brave-otter-3f2a is picked
+computer_id = "vm-..."
+served = client.public_urls.create(computer_id, 3000)  # a label is picked
 print(served.url)  # https://brave-otter-3f2a.<base_domain>
-c.create_public_url(8000, label="my-demo", access="private")
-c.update_public_url(served.id, port=8080)  # or access="private"
-listing = c.public_urls()  # .enabled, .reason, .limit, .base_domain, .public_urls
-c.delete_public_url(served.id)
+client.public_urls.create(computer_id, 8000, label="my-demo", access="private")
+client.public_urls.update(computer_id, served.id, port=8080)  # or access="private"
+listing = client.public_urls.list(computer_id)
+# listing: .enabled, .reason, .limit, .base_domain, .public_urls
+client.public_urls.delete(computer_id, served.id)
 ```
+
+These ID-based calls do not fetch the computer or need its host to answer.
+List and delete also work for computers marked `lost`, so their URLs can be
+removed after a host is written off. Create and update accept an `unreachable`
+computer, but cannot make its application reachable until its host recovers.
+With `AsyncClient`, use the same calls with `await`.
+
+Existing handles still support `c.public_urls()`, `c.create_public_url(...)`,
+`c.update_public_url(...)` and `c.delete_public_url(...)`. If all you need is URL
+management, prefer `client.public_urls` over fetching a handle with
+`client.computers.get(...)`, which needs the computer's host.
 
 `access` is `"public"` (the default: anyone with the link) or `"private"`: only
 a request carrying one of the account's API keys as `Authorization: Bearer`
@@ -4658,7 +4670,7 @@ several names. Where a client has no way to do it, the cell says so with —.
 | Change a computer (`PATCH`) | `update({ … })` | `rename()`, `resize()`, `set_idle_suspend()`, `set_browser_proxy()`, `set_egress_proxy()` | `update_computer` | `computers rename`, `resize`, `idle-suspend`, `browser-proxy set`/`clear`, `egress-proxy set`/`clear` | `browser-proxy set`/`clear`, `egress-proxy set`/`clear` |
 | Wait until the computer is ready | `waitForGuest()`, `waitForDesktop()` | `wait_for_guest()`, `wait_for_desktop()` | `wait_for_computer` with `until: "guest"`, which on Linux also waits for the desktop session | `computers wait --until guest` or `--until desktop` | — |
 | The windows after an input action | `{ context: true }` on an input method, e.g. `click(x, y, [], { context: true })` | `context=True` on an input method, e.g. `click(x, y, context=True)` | `context: true` on an input tool | — | — |
-| Public URLs | `publicUrls()`, `createPublicUrl({ port, label, access })`, `updatePublicUrl(urlId, { port, access })`, `deletePublicUrl(urlId)` | `public_urls()`, `create_public_url(port, label=…, access=…)`, `update_public_url(url_id, port=…, access=…)`, `delete_public_url(url_id)` | `list_public_urls`, `create_public_url`, `update_public_url`, `delete_public_url` | `computers urls list`, `create`, `update`, `rm` | — |
+| Public URLs | `publicUrls()`, `createPublicUrl({ port, label, access })`, `updatePublicUrl(urlId, { port, access })`, `deletePublicUrl(urlId)` | `client.public_urls.list(id)`, `.create(id, port, label=…, access=…)`, `.update(id, url_id, port=…, access=…)`, `.delete(id, url_id)`; also handle methods | `list_public_urls`, `create_public_url`, `update_public_url`, `delete_public_url` | `computers urls list`, `create`, `update`, `rm` | — |
 
 ## Design notes
 
