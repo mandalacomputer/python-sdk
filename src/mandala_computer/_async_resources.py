@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from . import _api
 from ._async_computer import AsyncComputer
@@ -30,6 +30,8 @@ from ._models import (
     NoBrowserProxy,
     Operation,
     OperationPage,
+    PublicUrl,
+    PublicUrls,
     PublishedTemplate,
     Retention,
     RetiredTemplates,
@@ -93,6 +95,7 @@ from ._resources import (
     ApiKeys,
     Builds,
     Operations,
+    PublicUrlsResource,
     Secrets,
     SshKeys,
     Templates,
@@ -125,6 +128,7 @@ __all__ = [
     "AsyncCredits",
     "AsyncMoves",
     "AsyncOperations",
+    "AsyncPublicUrlsResource",
     "AsyncSecrets",
     "AsyncSizes",
     "AsyncSnapshots",
@@ -1377,6 +1381,52 @@ class AsyncSecrets:
     replace.__doc__ = Secrets.replace.__doc__
     delete.__doc__ = Secrets.delete.__doc__
     set.__doc__ = Secrets.set.__doc__
+
+
+class AsyncPublicUrlsResource:
+    __doc__ = PublicUrlsResource.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self, computer_id: str) -> PublicUrls:
+        path = _api.computer_public_urls(computer_id)
+        data = await self._t.json_object("GET", path)
+        return PublicUrls.from_api(data, f"GET {path}")
+
+    async def create(
+        self,
+        computer_id: str,
+        port: int,
+        *,
+        label: str | None = None,
+        access: Literal["public", "private"] | None = None,
+    ) -> PublicUrl:
+        body = _api.public_url_body(port=port, label=label, access=access, create=True)
+        path = _api.computer_public_urls(computer_id)
+        data = await self._t.json_object("POST", path, json=body)
+        return PublicUrl.from_api(data, f"POST {path}")
+
+    async def update(
+        self,
+        computer_id: str,
+        url_id: str,
+        *,
+        port: int | None = None,
+        access: Literal["public", "private"] | None = None,
+    ) -> PublicUrl:
+        body = _api.public_url_body(port=port, access=access, create=False)
+        path = _api.computer_public_url(computer_id, url_id)
+        data = await self._t.json_object("PATCH", path, json=body)
+        return PublicUrl.from_api(data, f"PATCH {path}")
+
+    async def delete(self, computer_id: str, url_id: str) -> None:
+        await self._t.json_object("DELETE", _api.computer_public_url(computer_id, url_id))
+
+    list.__doc__ = PublicUrlsResource.list.__doc__
+    create.__doc__ = PublicUrlsResource.create.__doc__
+    update.__doc__ = PublicUrlsResource.update.__doc__
+    delete.__doc__ = PublicUrlsResource.delete.__doc__
 
 
 class AsyncSshKeys:

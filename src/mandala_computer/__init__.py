@@ -50,6 +50,7 @@ from ._async_resources import (
     AsyncCredits,
     AsyncMoves,
     AsyncOperations,
+    AsyncPublicUrlsResource,
     AsyncSecrets,
     AsyncSizes,
     AsyncSnapshots,
@@ -205,6 +206,7 @@ from ._resources import (
     Credits,
     Moves,
     Operations,
+    PublicUrlsResource,
     Secrets,
     Sizes,
     Snapshots,
@@ -448,6 +450,7 @@ class Client:
         self.credits = Credits(self._t)
         self.moves = Moves(self._t)
         self.operations = Operations(self._t)
+        self.public_urls = PublicUrlsResource(self._t)
         self.snapshots = Snapshots(self._t)
         self.templates = Templates(self._t)
         self.sizes = Sizes(self._t)
@@ -512,6 +515,7 @@ class AsyncClient:
         self.credits = AsyncCredits(self._t)
         self.moves = AsyncMoves(self._t)
         self.operations = AsyncOperations(self._t)
+        self.public_urls = AsyncPublicUrlsResource(self._t)
         self.snapshots = AsyncSnapshots(self._t)
         self.templates = AsyncTemplates(self._t)
         self.sizes = AsyncSizes(self._t)

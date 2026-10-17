@@ -1212,6 +1212,10 @@ def exercise_everything(client: mc.Client) -> None:
     served = c.create_public_url(3000, label="cool-thing", access="private")
     c.update_public_url(served.id, port=8000, access="public")
     c.delete_public_url(served.id)
+    client.public_urls.list(c.id)
+    served_by_id = client.public_urls.create(c.id, 3000, label="cool-thing", access="private")
+    client.public_urls.update(c.id, served_by_id.id, port=8000, access="public")
+    client.public_urls.delete(c.id, served_by_id.id)
     # A computer's secret bindings, read and replaced against the version read.
     bound = c.secrets()
     c.set_secrets(
@@ -1512,6 +1516,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     served = await c.create_public_url(3000, label="cool-thing", access="private")
     await c.update_public_url(served.id, port=8000, access="public")
     await c.delete_public_url(served.id)
+    await client.public_urls.list(c.id)
+    served_by_id = await client.public_urls.create(c.id, 3000, label="cool-thing", access="private")
+    await client.public_urls.update(c.id, served_by_id.id, port=8000, access="public")
+    await client.public_urls.delete(c.id, served_by_id.id)
     bound = await c.secrets()
     await c.set_secrets(
         [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
