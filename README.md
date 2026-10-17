@@ -1971,28 +1971,64 @@ revokes its capability; it does not stop Chromium or delete the computer.
   controls for DNS/IP containment, WebSockets, WebRTC, WebTransport and browser
   traffic outside intercepted HTTP(S) requests. The policy does not decide
   whether a form submission to an allowed destination is safe.
-- **Disconnect protection depends on the deployed backend.** A backend with
-  the connection guardian advertises `context_guard_version: 1` and
-  `protected_disconnects: ["downstream", "host_link"]` through the root CDP
-  method `Mandala.getConnectionCapabilities`. While the guardian and its
-  Chromium connection remain alive, it retains interception after the SDK's
-  connection or the host relay link is lost, disposes the contexts created
-  with `disposeOnDetach: true` on that root connection, and only then detaches.
-  The SDK already creates its context with that flag; no new SDK option is
-  required. Contexts belonging to other root connections are not disposed.
-  If disposal cannot be confirmed, the guardian retains the connection and
-  interception in quarantine. Because interception spans the browser, pending
-  HTTP requests in other contexts can also remain paused until cleanup or
-  recovery. Quarantine favors retaining interception over availability.
-- **Guardian death and loss of its Chromium connection remain HTTP policy
-  limits (OPL-5954).** Legacy backends and direct Chromium connections also
-  lack the guardian's disconnect protection. In these cases Chromium can
-  remove interception before destroying the context and resume a paused HTTP
-  request without policy approval. The SDK ends its session and ignores late
-  policy results, but cannot prevent that browser-side delivery.
-  `disposeOnDetach` alone provides eventual cleanup, not a network-enforcement
-  guarantee. Use independent guest egress controls when network containment
-  must survive loss of the guardian or its Chromium connection.
+- **Disconnect protection depends on the deployed backend and this connection's
+  advertised capabilities.** A backend with the guardian capability reports
+  `context_guard_version: 1` and a `protected_disconnects` list through the root
+  CDP method `Mandala.getConnectionCapabilities`. `downstream` and `host_link`
+  cover loss of the SDK connection or the host relay link while the connection
+  guardian and its Chromium connection remain alive. Pending requests remain
+  intercepted until this connection's temporary contexts are disposed. This SDK
+  already requests temporary contexts with `disposeOnDetach: true`; no SDK opt-in
+  is needed. Contexts belonging to other connections are not disposed.
+  Backends without the guardian capability, and direct Chromium connections,
+  lack this disconnect protection: a lost connection can release a held request
+  before its context is removed.
+
+  The toolset does not query or enforce these capability flags automatically.
+  To inspect a raw CDP connection, send this command on that connection without
+  a `sessionId`, and inspect the response's `protected_disconnects` list:
+
+  ```json
+  {"id":1,"method":"Mandala.getConnectionCapabilities"}
+  ```
+
+  An unsupported-method error means the capability is unavailable. A response
+  describes only that connection, not a different toolset's connection. A
+  successful connection, SDK version, or `context_guard_version` alone does not
+  establish which failures are protected.
+- **Additional protection for public HTTP(S) destinations.** On supported remote
+  Linux computers, a connection that also lists both `guardian_exit` and
+  `browser_link` in `protected_disconnects` prevents held HTTP(S) requests to
+  public destinations from being delivered without policy approval when the
+  guardian dies or loses its Chromium connection. This includes requests sent
+  over an already-established HTTPS connection to the destination. It applies
+  to this toolset's temporary context, not persistent, default, or other
+  connections' contexts, nor a context configured with its own proxy settings.
+  A computer with a [configured browser proxy](#a-proxy-for-the-browsers) or
+  another browser proxy policy does not advertise this additional protection.
+  Where it is not advertised, guardian death or loss of its Chromium connection
+  can still release a held request. The SDK ends its session and ignores late
+  policy results, but cannot prevent delivery outside the advertised protection.
+- **Remaining limits and compatibility.** Local IP literals, localhost and
+  dotless hostnames remain reachable subject to Chromium's local-network access
+  checks, but are outside the additional disconnect protection. With this
+  additional protection, other hostnames that resolve to a non-public address
+  are refused before reaching the destination, even if the URL hook allows them;
+  using a local IP literal does not gain disconnect protection. Changing a
+  browser proxy policy does not apply it to an already-open protected context;
+  close the toolset and create a new one. A request can still escape if
+  Chromium's network service restarts and browser control is also lost before
+  the context is disposed, or if a page or child control session detaches while
+  the main connection remains healthy. Contexts with this additional protection
+  use the computer's DNS resolver and TCP rather than Chromium's secure DNS or
+  QUIC/HTTP3. WebSockets and non-HTTP(S) traffic such as WebRTC and WebTransport
+  have no URL-hook disconnect guarantee. Use independent guest egress controls
+  for network containment; this is **not network isolation**.
+- **Cleanup can remain pending.** If context disposal cannot be confirmed, the
+  connection and interception are retained while cleanup is pending, even with
+  the additional protection. This occupies a connection slot and can stall
+  intercepted HTTP requests in other browser contexts. Eventual cleanup is not
+  guaranteed; the shared browser is not forcibly stopped as a fallback.
 - Browser-level interception also briefly pauses other browser contexts' HTTP
   requests while their ownership is established. Positively identified foreign
   requests continue without invoking this toolset's policy. The driver may
