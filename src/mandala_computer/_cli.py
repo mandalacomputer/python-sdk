@@ -274,11 +274,11 @@ _API_CODES: tuple[tuple[type[APIError], str], ...] = (
 )
 
 
-def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
+def _with_ids(info: dict[str, Any], err: BaseException) -> dict[str, Any]:
     """``info`` with each id the failure carries that is not ``None``."""
     ids = {
         "request_id": getattr(err, "request_id", None),
-        "idempotency_key": err.idempotency_key,
+        "idempotency_key": getattr(err, "idempotency_key", None),
         "operation_id": getattr(err, "operation_id", None),
         # A resumable upload's id: what resuming it, or removing its staging,
         # names (``scp --upload-id``).
@@ -288,7 +288,7 @@ def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
     return info
 
 
-def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
+def _recovery_line(err: BaseException, resendable: bool = False) -> str | None:
     """The text-mode line naming the ids a failure carries, or ``None``.
 
     Read from :func:`_with_ids`, so text and ``--json`` name the same ids.
@@ -420,7 +420,9 @@ def _error_info(err: BaseException) -> dict[str, Any]:
     if isinstance(err, MandalaError):
         return _with_ids({"code": "failed", "message": str(err)}, err)
     if isinstance(err, ValueError):
-        return {"code": "invalid_arguments", "message": str(err)}
+        # A resumable upload refused part way (its source changed under it)
+        # still names the upload whose staging is on the guest.
+        return _with_ids({"code": "invalid_arguments", "message": str(err)}, err)
     if isinstance(err, OSError):
         info = {"code": "io_error", "message": str(err)}
         if err.errno is not None:
@@ -1068,13 +1070,21 @@ def _terminal_refusal(status: int, body: bytes, headers: Any) -> APIError:
     return error_for_status(status, message, data or None, keep_reason=True)
 
 
-def _terminal_retry_delay(err: APIError, attempt: int) -> float:
-    """One second, then two, then three — or the platform's Retry-After, capped at ten."""
+#: The longest ``terminal`` waits before opening a refused terminal again. A
+#: Retry-After longer than this is not shortened: the refusal is reported.
+_TERMINAL_RETRY_WAIT_MAX = 10.0
+
+
+def _terminal_retry_delay(err: APIError, attempt: int) -> float | None:
+    """One second, then two, then three, or the platform's Retry-After when it
+    asked for longer; ``None`` when it asked for more than this command waits."""
     after = err.retry_after
     base = float(attempt + 1)
     if after is not None and math.isfinite(after):
+        if after > _TERMINAL_RETRY_WAIT_MAX:
+            return None
         base = max(base, after)
-    return min(base, 10.0)
+    return base
 
 
 def _connect(url: str) -> ClientConnection:
@@ -1107,8 +1117,9 @@ def _connect(url: str) -> ClientConnection:
         clears = (err.status in (409, 503) and err.reason == "contention") or (
             err.status == 409 and err.reason == "starting"
         )
-        if clears and attempt < _TERMINAL_CONTENTION_RETRIES:
-            time.sleep(_terminal_retry_delay(err, attempt))
+        delay = _terminal_retry_delay(err, attempt) if clears else None
+        if delay is not None and attempt < _TERMINAL_CONTENTION_RETRIES:
+            time.sleep(delay)
             attempt += 1
             continue
         # Everything else is the platform's own sentence and status: the
@@ -1687,13 +1698,18 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                 )
             try:
                 if data is None:
-                    progress = computer.upload_file(
-                        remote_path,
-                        f,
-                        size=size,
-                        upload_id=args.upload_id,
-                        overwrite=not args.no_overwrite,
-                    )
+                    try:
+                        progress = computer.upload_file(
+                            remote_path,
+                            f,
+                            size=size,
+                            upload_id=args.upload_id,
+                            overwrite=not args.no_overwrite,
+                        )
+                    except KeyboardInterrupt as stopped:
+                        # Ctrl-C is still 130, but the staged chunks outlive it
+                        # and only their upload id reaches them again.
+                        return _upload_interrupted(stopped, args.json)
                     sent = size
                     stored: int | None = progress.offset
                     # The receipt outlives the file it describes and holds
@@ -1761,6 +1777,25 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     return 0
+
+
+def _upload_interrupted(stopped: KeyboardInterrupt, as_json: bool) -> int:
+    """Report a resumable upload stopped with Ctrl-C, naming its upload id; 130."""
+    upload_id = getattr(stopped, "upload_id", None)
+    message = "interrupted"
+    if isinstance(upload_id, str):
+        message = (
+            f"upload {_printable(upload_id)} interrupted; resume it by sending the same scp "
+            f"again with --upload-id {_printable(upload_id)} and the unchanged file"
+        )
+    if as_json:
+        info: dict[str, Any] = {"code": "cancelled", "message": message}
+        if isinstance(upload_id, str):
+            info["upload_id"] = upload_id
+        _json_failure(info)
+    else:
+        print(f"{PROG}: {message}", file=sys.stderr)
+    return 130
 
 
 def _staging_note(err: BaseException) -> str:
@@ -4744,7 +4779,11 @@ def main(argv: list[str] | None = None) -> int:
             wait = _wait_line(e) if isinstance(e, APIError) else None
             if wait is not None:
                 print(wait, file=sys.stderr)
-            recovery = _recovery_line(e, resendable) if isinstance(e, MandalaError) else None
+            recovery = (
+                _recovery_line(e, resendable)
+                if isinstance(e, MandalaError) or getattr(e, "upload_id", None) is not None
+                else None
+            )
             if recovery is not None:
                 print(recovery, file=sys.stderr)
         return 1

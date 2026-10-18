@@ -156,3 +156,24 @@ def test_a_refusal_without_a_body_still_names_its_status(
         _cli._connect("wss://terminal.test")
     assert caught.value.status == 502
     assert "terminal refused" in str(caught.value)
+
+
+def test_a_retry_after_longer_than_the_wait_is_not_shortened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    busy = {"error": "another terminal is still being set up", "reason": "contention"}
+    seen = connecting(monkeypatch, refused(503, busy, **{"Retry-After": "60"}), object())
+    with pytest.raises(_cli.UnavailableError) as caught:
+        _cli._connect("wss://terminal.test")
+    assert len(seen) == 1
+    assert caught.value.retry_after == 60
+
+
+def test_a_short_retry_after_is_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    busy = {"error": "another terminal is still being set up", "reason": "contention"}
+    ws = object()
+    connecting(monkeypatch, refused(503, busy, **{"Retry-After": "7"}), ws)
+    assert _cli._connect("wss://terminal.test") is ws
+    assert slept == [7.0]

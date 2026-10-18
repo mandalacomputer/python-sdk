@@ -158,3 +158,44 @@ def test_a_large_upload_to_a_windows_guest_is_refused_before_sending(tmp_path: P
 def test_upload_id_is_checked_before_anything_is_sent(argv: list[str], message: str) -> None:
     with pytest.raises(SystemExit, match=message):
         _cli.main(argv)
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@respx.mock
+def test_ctrl_c_mid_upload_still_names_the_upload_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=LINUX))
+
+    def stop(_request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    respx.put(UPLOADS).mock(side_effect=stop)
+    argv = ["scp", str(source(tmp_path)), "dev:/home/user/big.bin"]
+    assert _cli.main(argv + (["--json"] if as_json else [])) == 130
+    err = capsys.readouterr().err
+    if as_json:
+        error = json.loads(err)["error"]
+        assert error["code"] == "cancelled"
+        assert re.fullmatch(r"[a-f0-9]{32}", error["upload_id"])
+    else:
+        assert re.search(r"upload [a-f0-9]{32} interrupted; resume it .*--upload-id", err)
+
+
+@respx.mock
+def test_a_source_that_changes_mid_upload_still_names_the_upload_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=LINUX))
+    src = source(tmp_path, b"x" * (4 * 1024 * 1024 + 10))
+
+    def shrink(request: httpx.Request) -> httpx.Response:
+        answer = staged(request)
+        src.write_bytes(b"short")
+        return answer
+
+    respx.put(UPLOADS).mock(side_effect=shrink)
+    assert _cli.main(["scp", str(src), "dev:/home/user/big.bin", "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "invalid_arguments"
+    assert re.fullmatch(r"[a-f0-9]{32}", error["upload_id"])
