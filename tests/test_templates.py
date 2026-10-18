@@ -269,7 +269,7 @@ def test_a_layered_document_is_told_why_it_has_no_build_digest(client: mc.Client
     """
     needs = (
         "the contents of acme/base's image, which only a host holding it can supply. "
-        "Run `gorillad -build-template <file> -dry-run` there to see this document's "
+        "Run the host's template build with `-dry-run` there to see this document's "
         "build digest"
     )
     respx.post(f"{BASE}/templates/validate").mock(
@@ -584,6 +584,56 @@ def test_a_stream_error_says_it_is_not_the_build(client: mc.Client) -> None:
         list(client.builds.events("bld-1"))
 
 
+REVOKED_FRAME = {
+    "request_id": "req_123",
+    "error": "This API key has been revoked.",
+    "status": 401,
+    "reason": "revoked",
+}
+
+
+@respx.mock
+def test_a_refusal_frame_becomes_the_status_error(client: mc.Client) -> None:
+    """An ``error`` frame with a status is the refusal the request would have had.
+
+    Its class, ``reason`` and ``request_id`` are kept, and it does not advise
+    reading ``builds.progress``, which a revoked caller cannot do (OPL-6080).
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("error", REVOKED_FRAME)))
+    with pytest.raises(mc.AuthenticationError) as caught:
+        list(client.builds.events("bld-1"))
+    err = caught.value
+    assert err.status == 401
+    assert err.reason == "revoked"
+    assert err.request_id == "req_123"
+    assert "builds.progress" not in str(err)
+    assert "has been revoked" in str(err)
+
+
+@respx.mock
+async def test_a_refusal_frame_becomes_the_status_error_async(
+    async_client: mc.AsyncClient,
+) -> None:
+    frame = {**REVOKED_FRAME, "status": 403, "error": "Your role no longer reaches it."}
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("error", frame)))
+    with pytest.raises(mc.PermissionDeniedError) as caught:
+        async for _ in async_client.builds.events("bld-1"):
+            pass
+    assert caught.value.reason == "revoked"
+    assert caught.value.request_id == "req_123"
+    assert "builds.progress" not in str(caught.value)
+
+
+@respx.mock
+def test_a_5xx_frame_is_typed_and_still_points_at_the_poll(client: mc.Client) -> None:
+    frame = {"error": "the build host went away", "status": 503}
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("error", frame)))
+    with pytest.raises(mc.APIError) as caught:
+        list(client.builds.events("bld-1"))
+    assert caught.value.status == 503
+    assert "builds.progress('bld-1')" in str(caught.value)
+
+
 @respx.mock
 def test_wait_returns_when_the_build_is_done(client: mc.Client) -> None:
     respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=DONE))
@@ -840,7 +890,13 @@ def test_a_list_field_that_is_not_a_list_degrades_rather_than_raising(
 def test_the_other_list_fields_degrade_too() -> None:
     assert mc.RetiredTemplates.from_api({"retired": 7}).retired == []
     assert mc.TemplateCheck.from_api({"problems": 7}).problems == []
-    assert mc.BuildProgress.from_api({"steps": "nope"}).steps == []
+    # Not the steps, which are a list of what the build is doing: one that is
+    # not a list, or a step that is not an object, fails the read (OPL-6080).
+    with pytest.raises(mc.MandalaError, match="steps is not a list"):
+        mc.BuildProgress.from_api({"steps": "nope"})
+    with pytest.raises(mc.MandalaError, match="step 1 is not an object"):
+        mc.BuildProgress.from_api({"steps": [{"n": 1}, "two"]})
+    assert mc.BuildProgress.from_api({"steps": None}).steps == []
 
 
 # --- and the async half, which has the same two loops ----------------------
@@ -1028,7 +1084,14 @@ def test_a_trailing_newline_is_not_a_version() -> None:
 @pytest.mark.parametrize(
     ("err", "retried"),
     [
-        (mc.ConflictError("busy", status=409), True),
+        (mc.ConflictError("busy", status=409, body={"reason": "contention"}), True),
+        (mc.ConflictError("busy", status=409, body={"code": "idempotency_in_progress"}), True),
+        (mc.ConflictError("busy", status=409), False),
+        (mc.ConflictError("taken", status=409, body={"reason": "unsupported"}), False),
+        (
+            mc.ConflictError("unknown", status=409, body={"code": "idempotency_outcome_unknown"}),
+            False,
+        ),
         (mc.RateLimitError("slow down", status=429), True),
         (mc.UnavailableError("no host", status=503), True),
         (mc.GatewayTimeoutError("gateway", status=504), True),
@@ -1632,7 +1695,8 @@ def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
     switch, so a cautious True made the loop in ``start_exec``'s own docstring
     neither break nor sleep (/code-review, OPL-3835).
     """
-    decoded = model.from_api({field: "maybe"})
+    # A snapshot row carries its id, which every snapshot is refused without.
+    decoded = model.from_api({**({"id": "snap-1"} if model is mc.Snapshot else {}), field: "maybe"})
     assert getattr(decoded, field) is cautious, steers
     assert decoded.raw[field] == "maybe"
 

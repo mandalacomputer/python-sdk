@@ -321,8 +321,9 @@ def test_scp_remote_needs_a_path() -> None:
 def test_scp_refuses_an_oversized_local_file_before_reading_it(tmp_path) -> None:
     src = tmp_path / "large.bin"
     with src.open("wb") as f:
-        f.truncate(_cli.FILE_SIZE_LIMIT + 1)
-    with pytest.raises(SystemExit, match="64 MiB"):
+        # Sparse: past what even the resumable upload carries.
+        f.truncate(_cli.UPLOAD_SIZE_LIMIT + 1)
+    with pytest.raises(SystemExit, match="2 GiB upload limit"):
         _cli.main(["scp", str(src), "dev:/tmp/large.bin"])
 
 

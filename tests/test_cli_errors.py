@@ -630,6 +630,65 @@ def test_a_text_failure_names_the_status_and_the_platforms_code(
     assert text_failure(capsys) == [line]
 
 
+@respx.mock
+def test_a_failure_carries_the_platforms_retry_after(capsys: pytest.CaptureFixture[str]) -> None:
+    """``retry_after_ms`` under ``--json``, and a line saying it in text, as
+    ``mandala`` reports both (OPL-6080)."""
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(
+            429, json={"error": "slow down"}, headers={"Retry-After": "125"}
+        )
+    )
+    assert _cli.main(["secrets", "list", "--json"]) == 1
+    assert failure(capsys)["retry_after_ms"] == 125000
+    assert _cli.main(["secrets", "list"]) == 1
+    assert text_failure(capsys) == [
+        "mandala-py: slow down (HTTP 429)",
+        "mandala-py: the platform asked to wait 2m 5s before trying again",
+    ]
+    respx.get(f"{BASE}/secrets").mock(return_value=httpx.Response(503, json={"error": "away"}))
+    assert _cli.main(["secrets", "list", "--json"]) == 1
+    assert "retry_after_ms" not in failure(capsys)
+
+
+@pytest.mark.parametrize("as_json", [True, False])
+@respx.mock
+def test_an_enormous_retry_after_is_capped_not_a_crash(
+    capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(
+            503,
+            json={"error": "away", "request_id": "req_7"},
+            headers={"Retry-After": "9" * 306},
+        )
+    )
+    assert _cli.main(["secrets", "list", *(["--json"] if as_json else [])]) == 1
+    if as_json:
+        error = failure(capsys)
+        assert error["retry_after_ms"] == 2**31 - 1
+        assert error["request_id"] == "req_7"
+    else:
+        lines = text_failure(capsys)
+        assert "the platform asked to wait" in lines[1]
+        assert "request id req_7" in lines[2]
+
+
+@pytest.mark.parametrize(
+    ("ms", "text"),
+    [
+        (1, "1s"),
+        (59000, "59s"),
+        (60000, "1m"),
+        (61500, "1m 2s"),
+        (3600000, "1h"),
+        (5460000, "1h 31m"),
+    ],
+)
+def test_a_retry_after_reads_as_a_person_says_it(ms: int, text: str) -> None:
+    assert _cli._retry_after_text(ms) == text
+
+
 def test_a_status_the_message_already_names_is_not_repeated() -> None:
     # The SDK's own wording for an edge failure already ends with its status;
     # a coded answer replaces that ending rather than adding a second.

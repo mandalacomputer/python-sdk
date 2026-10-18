@@ -338,3 +338,32 @@ def test_a_null_name_beside_the_other_reads_as_absent(api: Any) -> None:
         mc.SecretBinding(secret_id=A, revision_id=REV_A, file="kubeconfig"),
         mc.SecretBinding(secret_id=B, revision_id=REV_B, env="API_TOKEN"),
     ]
+
+
+CREATE_WITH_REVISION = [{"secret_id": A, "revision_id": REV_A, "env": "API_TOKEN"}]
+
+
+@respx.mock
+def test_a_create_binding_naming_a_revision_is_refused_before_sending() -> None:
+    """A new computer binds each secret's latest revision; the platform refuses
+    a ``revision_id`` on create, so this does too, before any request
+    (OPL-6080). ``set_secrets`` still takes one."""
+    route = respx.post(f"{BASE}/computers")
+    with mc.Client("com_test", base_url=BASE) as client:
+        with pytest.raises(ValueError, match=r"secrets\[0\]\.revision_id is for a rebind"):
+            client.computers.create(secrets=CREATE_WITH_REVISION)
+        with pytest.raises(ValueError, match="revision_id is for a rebind"):
+            client.computers.launch(secrets=CREATE_WITH_REVISION)
+    assert not route.called
+    from mandala_computer import _api
+
+    assert _api.secret_bindings_body(CREATE_WITH_REVISION)[0]["revision_id"] == REV_A
+
+
+@respx.mock
+async def test_an_async_create_binding_naming_a_revision_is_refused() -> None:
+    route = respx.post(f"{BASE}/computers")
+    async with mc.AsyncClient("com_test", base_url=BASE) as client:
+        with pytest.raises(ValueError, match="revision_id is for a rebind"):
+            await client.computers.create(secrets=CREATE_WITH_REVISION)
+    assert not route.called

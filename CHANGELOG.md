@@ -17,8 +17,52 @@ This is the summary you read to decide whether to upgrade.
   computer handle or contacting its host. Both sync and async clients support
   them; list and delete remain usable for computers marked `lost`. Existing
   handle methods and the `PublicUrls` result model are unchanged.
+- **`mandala-py scp` uploads past 64 MiB.** A file up to 2 GiB goes to a Linux
+  guest through the resumable upload in 4 MiB chunks, as `mandala scp` does,
+  and its upload receipt is removed afterwards (`--json` names it as
+  `cleanup_upload_id` if that failed). An interrupted upload names its upload
+  id; `--upload-id ID` with the unchanged file resumes it.
+- **CLI errors carry the platform's `Retry-After`.** `--json` adds
+  `retry_after_ms`, and text mode adds a line saying how long the platform
+  asked to wait, as the npm CLI reports both. A failed resumable upload's
+  `upload_id` is reported the same way.
 
 ### Changed
+
+- **A wait ends on a 409 that does not say it clears.** Every `wait_*` helper
+  (and `launch`, `operations.wait`, `builds.wait`) used to poll through any 409.
+  A permanent `reason` (`unavailable`, `unsupported`, `revoked`, ...) or the
+  codes `idempotency_outcome_unknown` and `template_image_preparing` now end
+  the wait with that error at once; `contention`, `starting`,
+  `idempotency_in_progress` and `WORKSPACE_MOVING` keep it polling. A 409 with
+  no word (or a word this version does not know) ends the wait, except in
+  `wait_for_desktop`, whose probe answers exactly that while no desktop session
+  exists yet. `wait_for_guest` reads a probe's `unavailable` against a fresh
+  read of the computer, and ends only when it is stopped with nothing held.
+- **A retry that will not fit raises the platform's answer.** With
+  `retries={"idempotent": n}`, a `Retry-After` past the caller's budget now
+  raises the original error (an `UnavailableError` with its `retry_after`)
+  rather than a `RequestTimeoutError`, and without a budget one retry waits at
+  most 60 seconds instead of as long as the header asked.
+- **A build event stream's refusal frame is typed.** An `error` frame with a
+  status (such as a `401` with `reason: "revoked"` when the key is revoked
+  mid-stream) raises the class that status maps to, with `reason` and
+  `request_id`, and no longer tells a refused caller to read `builds.progress`.
+- **`mandala-py terminal` on a suspended computer** says to start it, not to
+  stop and start it: the terminal route does not resume a computer. A `503`
+  with `reason: "contention"` (another terminal being set up) is opened again a
+  few times, and any other refusal prints the platform's sentence with its
+  status, code and request id.
+- **Stricter decoding.** A snapshot, build or size row without an id, a
+  directory entry, usage row or build step that is not an object, and a webhook
+  `computers` filter that is not a list of ids now fail the read instead of
+  decoding to an empty id or being dropped.
+- **Create-time secret bindings refuse `revision_id`.** A new computer always
+  binds each secret's latest revision and the platform refuses one there, so
+  `create`/`launch` raise `ValueError` before sending; `set_secrets` still
+  takes it.
+- **Webhook descriptions are counted in UTF-16 units**, as the platform counts
+  them, so an emoji counts two toward the 200 limit.
 
 - Clarify the browser URL policy's advertised disconnect protection for
   temporary contexts on supported remote Linux computers, including guardian
@@ -1590,7 +1634,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.11.0...v0.12.0

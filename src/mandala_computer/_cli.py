@@ -116,6 +116,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -124,9 +125,11 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import httpx
+
 from . import _api, _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
-from ._client import FILE_SIZE_LIMIT
+from ._client import FILE_SIZE_LIMIT, _retry_after, error_for_status
 from ._computer import Computer
 from ._credentials import CredentialError
 from ._defaults import (
@@ -192,6 +195,9 @@ if TYPE_CHECKING:
 #: what to run next. ``mandala`` is the npm CLI's; see the module docstring.
 PROG = "mandala-py"
 
+#: The most one resumable upload carries: ``scp`` past 64 MiB.
+UPLOAD_SIZE_LIMIT = 2 * 1024 * 1024 * 1024
+
 # The whole guest-side scrollback is smaller than this; anything bigger in one
 # frame is not the terminal protocol.
 _MAX_FRAME = 1 << 22
@@ -212,10 +218,19 @@ class _Failure(SystemExit):
     prints to a terminal. See :func:`_die`.
     """
 
-    def __init__(self, message: str, reason: str, shown: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        reason: str,
+        shown: str | None = None,
+        ids: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(f"{PROG}: {message if shown is None else shown}")
         self.message = message
         self.reason = reason
+        #: Ids ``--json`` reports beside ``code`` and ``message``, such as the
+        #: ``upload_id`` of a refused resumable upload whose staging remains.
+        self.ids = dict(ids or {})
 
 
 #: How a message spells a value from a response: ``str`` for ``--json``'s
@@ -228,7 +243,11 @@ def _shown(value: object) -> str:
     return _printable(str(value))
 
 
-def _die(message: str | Callable[[_Spell], str], code: str = "failed") -> NoReturn:
+def _die(
+    message: str | Callable[[_Spell], str],
+    code: str = "failed",
+    ids: Mapping[str, str] | None = None,
+) -> NoReturn:
     """Refuse with ``message``, under the ``--json`` ``error.code`` ``code``.
 
     A message that quotes a value from a response (a computer's name, a
@@ -240,8 +259,8 @@ def _die(message: str | Callable[[_Spell], str], code: str = "failed") -> NoRetu
     values as they are, as it reports every other answer: JSON escapes them.
     """
     if callable(message):
-        raise _Failure(message(str), code, message(_shown))
-    raise _Failure(message, code)
+        raise _Failure(message(str), code, message(_shown), ids)
+    raise _Failure(message, code, ids=ids)
 
 
 #: The ``error.code`` an SDK failure is reported under with ``--json``: one
@@ -270,18 +289,21 @@ _API_CODES: tuple[tuple[type[APIError], str], ...] = (
 )
 
 
-def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
+def _with_ids(info: dict[str, Any], err: BaseException) -> dict[str, Any]:
     """``info`` with each id the failure carries that is not ``None``."""
     ids = {
         "request_id": getattr(err, "request_id", None),
-        "idempotency_key": err.idempotency_key,
+        "idempotency_key": getattr(err, "idempotency_key", None),
         "operation_id": getattr(err, "operation_id", None),
+        # A resumable upload's id: what resuming it, or removing its staging,
+        # names (``scp --upload-id``).
+        "upload_id": getattr(err, "upload_id", None),
     }
     info.update({key: value for key, value in ids.items() if value is not None})
     return info
 
 
-def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
+def _recovery_line(err: BaseException, resendable: bool = False) -> str | None:
     """The text-mode line naming the ids a failure carries, or ``None``.
 
     Read from :func:`_with_ids`, so text and ``--json`` name the same ids.
@@ -300,6 +322,7 @@ def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
         for key, label in (
             ("operation_id", "operation"),
             ("idempotency_key", "idempotency key"),
+            ("upload_id", "upload id"),
             ("request_id", "request id"),
         )
         if key in ids
@@ -307,6 +330,11 @@ def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
     if not parts:
         return None
     line = f"{PROG}: {'; '.join(parts)}"
+    if "upload_id" in ids:
+        line += (
+            f" (resume it by sending the same scp again with --upload-id "
+            f"{_printable(str(ids['upload_id']))} and the unchanged file)"
+        )
     if "idempotency_key" in ids and "operation_id" not in ids:
         # The two commands are for pasting into a shell, and the key may be the
         # caller's own --idempotency-key: any printable ASCII but a space. So it
@@ -369,7 +397,7 @@ def _error_info(err: BaseException) -> dict[str, Any]:
     and a computer at its plan's limit are both a ``conflict`` — and a script
     should not have to read the sentence to tell them apart (OPL-5974)."""
     if isinstance(err, _Failure):
-        return {"code": err.reason, "message": err.message}
+        return {"code": err.reason, "message": err.message, **err.ids}
     if isinstance(err, APIError):
         code = next((word for cls, word in _API_CODES if isinstance(err, cls)), "api_error")
         info: dict[str, Any] = {"code": code, "message": str(err), "status": err.status}
@@ -377,6 +405,12 @@ def _error_info(err: BaseException) -> dict[str, Any]:
             info["reason"] = err.reason
         if err.code is not None:
             info["api_code"] = err.code
+        # How long the platform asked for before another attempt, from its
+        # Retry-After, in milliseconds as ``mandala`` reports it: the one
+        # number a script retrying a 429 or a 503 needs (OPL-6080).
+        after = _retry_after_ms(err)
+        if after is not None:
+            info["retry_after_ms"] = after
         return _with_ids(info, err)
     if isinstance(err, ConnectionInterruptedError):
         return _with_ids({"code": "connection_interrupted", "message": str(err)}, err)
@@ -401,7 +435,9 @@ def _error_info(err: BaseException) -> dict[str, Any]:
     if isinstance(err, MandalaError):
         return _with_ids({"code": "failed", "message": str(err)}, err)
     if isinstance(err, ValueError):
-        return {"code": "invalid_arguments", "message": str(err)}
+        # A resumable upload refused part way (its source changed under it)
+        # still names the upload whose staging is on the guest.
+        return _with_ids({"code": "invalid_arguments", "message": str(err)}, err)
     if isinstance(err, OSError):
         info = {"code": "io_error", "message": str(err)}
         if err.errno is not None:
@@ -410,6 +446,43 @@ def _error_info(err: BaseException) -> dict[str, Any]:
             info["details"] = {"errno": errno.errorcode.get(err.errno, str(err.errno))}
         return info
     return {"code": "failed", "message": str(err)}
+
+
+#: The most ``retry_after_ms`` reports, as ``mandala`` caps it: about 24.8 days.
+_RETRY_AFTER_MS_MAX = 2**31 - 1
+
+
+def _retry_after_ms(err: APIError) -> int | None:
+    """``err.retry_after`` in whole milliseconds, or ``None`` when none was sent.
+
+    Capped, so a header of hundreds of digits (finite as seconds, infinite as
+    milliseconds) cannot overflow the conversion inside the error report."""
+    after = err.retry_after
+    if after is None or not math.isfinite(after) or after < 0:
+        return None
+    if after >= _RETRY_AFTER_MS_MAX / 1000:
+        return _RETRY_AFTER_MS_MAX
+    return min(math.ceil(after * 1000), _RETRY_AFTER_MS_MAX)
+
+
+def _retry_after_text(ms: int) -> str:
+    """A Retry-After as a person reads it: ``12s``, ``2m 5s``, ``1h 30m``."""
+    seconds = -(-ms // 1000)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m {seconds % 60}s" if seconds % 60 else f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h {minutes % 60}m" if minutes % 60 else f"{hours}h"
+
+
+def _wait_line(err: APIError) -> str | None:
+    """The text-mode line saying how long the platform asked to be left, if it did."""
+    after = _retry_after_ms(err)
+    if after is None:
+        return None
+    return f"{PROG}: the platform asked to wait {_retry_after_text(after)} before trying again"
 
 
 def _with_status(err: APIError, message: str) -> str:
@@ -966,6 +1039,10 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
         if c.status not in ("running", "suspended"):
             _die(lambda s: f"{s(c.name)} is {s(c.status or 'not running')} — start it, then retry")
         _die(lambda s: f"{s(c.name)} has no terminal endpoint (server too old?)")
+    if c.status == "suspended":
+        # Unlike the rest of the API, the terminal route does not resume a
+        # suspended computer: it refuses with ``resume_required`` (OPL-6080).
+        _die(lambda s: f"{s(c.name)} is {_SUSPENDED_TERMINAL}", "not_running")
     url = vnc.terminal_url
     params: list[tuple[str, str]] = []
     if args.session != "main":
@@ -987,31 +1064,101 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
     return _interact(url)
 
 
+#: What a suspended computer is told: the terminal does not resume it.
+_SUSPENDED_TERMINAL = "suspended, and opening a terminal does not resume it — start it, then retry"
+
+#: How many more times a terminal refused with ``contention`` is opened again.
+#: The refusal says another terminal on the computer is part way through its
+#: first-time setup, which takes a few seconds and clears by itself.
+_TERMINAL_CONTENTION_RETRIES = 3
+
+
+def _terminal_refusal(status: int, body: bytes, headers: Any) -> APIError:
+    """The refusal of a terminal upgrade, as the SDK's error for its status.
+
+    So the line printed is the platform's own sentence followed by ``(HTTP
+    409)`` or ``(HTTP 409, CODE)``, and the request id after it, as every other
+    command's failure is (OPL-6080).
+    """
+    try:
+        parsed: object = json.loads(body) if body else None
+    except ValueError:
+        parsed = None
+    data = parsed if isinstance(parsed, dict) else {}
+    text = data.get("error")
+    message = text if isinstance(text, str) and text.strip() else "terminal refused"
+    if "request_id" not in data:
+        request_id = headers.get("X-Request-ID") if headers is not None else None
+        if isinstance(request_id, str) and request_id:
+            data = {**data, "request_id": request_id}
+    return error_for_status(status, message, data or None, keep_reason=True)
+
+
+#: The longest ``terminal`` waits before opening a refused terminal again. A
+#: Retry-After longer than this is not shortened: the refusal is reported.
+_TERMINAL_RETRY_WAIT_MAX = 10.0
+
+
+def _terminal_retry_delay(after: float | None, attempt: int) -> float | None:
+    """One second, then two, then three, or the platform's Retry-After when it
+    asked for longer; ``None`` when it asked for more than this command waits."""
+    base = float(attempt + 1)
+    if after is not None:
+        if not after <= _TERMINAL_RETRY_WAIT_MAX:
+            return None
+        base = max(base, after)
+    return base
+
+
 def _connect(url: str) -> ClientConnection:
     from websockets.exceptions import InvalidStatus, WebSocketException
     from websockets.sync.client import connect
 
-    try:
-        return connect(url, max_size=_MAX_FRAME, compression=None)
-    except InvalidStatus as e:
-        status = e.response.status_code
-        if status == 409:
-            # The terminal channel is added to a computer at cold boot only —
-            # a machine running since before its host learned the feature
-            # answers 409 until it picks the device up.
-            _die(
-                "this computer predates the terminal channel — "
-                "stop it and start it again (a restart is not enough), then retry"
+    attempt = 0
+    while True:
+        try:
+            return connect(url, max_size=_MAX_FRAME, compression=None)
+        except InvalidStatus as e:
+            response = e.response
+            err = _terminal_refusal(response.status_code, bytes(response.body), response.headers)
+            # Read as every other response's Retry-After is: seconds or an
+            # HTTP date, and an overflow kept as infinity rather than lost.
+            header = response.headers.get("Retry-After") if response.headers else None
+            after = (
+                None
+                if header is None
+                else _retry_after(
+                    httpx.Response(503, headers={"retry-after": header}), for_retry=True
+                )
             )
-        _die(f"terminal refused: HTTP {status}")
-    except OSError as e:
-        unreachable = str(e)
-        _die(lambda s: f"could not reach the terminal: {s(unreachable)}")
-    except WebSocketException:
-        # Not ``str(e)``: ``InvalidURI`` includes the full URI, and
-        # ``terminal_url`` carries a credential with no expiry. The
-        # ``InvalidStatus`` branch above already prints a token-free sentence.
-        _die("could not open the terminal")
+            if after is not None and math.isfinite(after):
+                err.retry_after = after
+        except OSError as e:
+            _die(f"could not reach the terminal: {_printable(str(e))}")
+        except WebSocketException:
+            # Not ``str(e)``: ``InvalidURI`` includes the full URI, and
+            # ``terminal_url`` carries a credential with no expiry. The
+            # ``InvalidStatus`` branch above prints only the platform's
+            # sentence, which carries no token.
+            _die("could not open the terminal")
+        body = err.body if isinstance(err.body, dict) else {}
+        if err.status == 409 and body.get("resume_required") is True:
+            _die(f"this computer is {_SUSPENDED_TERMINAL}", "not_running")
+        if err.status == 409 and err.reason == "unavailable":
+            _die("this computer is not running — start it, then retry", "not_running")
+        clears = (err.status in (409, 503) and err.reason == "contention") or (
+            err.status == 409 and err.reason == "starting"
+        )
+        delay = _terminal_retry_delay(after, attempt) if clears else None
+        if delay is not None and attempt < _TERMINAL_CONTENTION_RETRIES:
+            time.sleep(delay)
+            attempt += 1
+            continue
+        # Everything else is the platform's own sentence and status: the
+        # computer that predates the terminal channel (``unsupported``, which
+        # says to stop and start it), the session or connection limits (a 409
+        # with no word), a broker that could not be reached (502).
+        raise err
 
 
 #: What ``mandala terminal`` returns when it cannot report the command's status —
@@ -1506,6 +1653,10 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     # there would replace a file the caller asked to keep.
     if src is not None and args.no_overwrite:
         _die("--no-overwrite applies to an upload, not a download", "invalid_arguments")
+    if src is not None and args.upload_id is not None:
+        _die("--upload-id applies to an upload, not a download", "invalid_arguments")
+    if args.upload_id is not None and not re.fullmatch(r"[a-f0-9]{32}", args.upload_id):
+        _die("--upload-id must be 32 lowercase hexadecimal characters", "invalid_arguments")
 
     if src is not None:
         target, remote_path = src
@@ -1553,45 +1704,88 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     ):
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
-        if os.fstat(f.fileno()).st_size > FILE_SIZE_LIMIT:
-            _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
-        # The bounded read also covers files that grow after fstat and special
-        # files whose reported size is zero.
-        data = f.read(FILE_SIZE_LIMIT + 1)
-    if len(data) > FILE_SIZE_LIMIT:
-        _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
-    with _client() as client:
-        try:
-            stored = _resolve(client, target).write_file(
-                remote_path, data, overwrite=not args.no_overwrite
-            )
-        except FileExistsError:
-            # Only THIS upload is known to have written nothing: an earlier
-            # attempt whose answer was lost may have written the file itself.
-            _die(
-                f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
-                "earlier attempt's outcome was unknown, the file may be yours: read it and "
-                "compare before choosing another path or dropping --no-overwrite to replace it.",
-                "exists",
-            )
-        except CreateOnlyConflictError:
-            # No usable reason, so nothing here says the path is taken, nor that
-            # this upload wrote nothing: without the platform's word, a 409 (JSON
-            # or not) may come from a hop that had already forwarded the write.
-            _die(
-                f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
-                "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
-                "send the same upload again blind: read "
-                "the remote path to see what is there before choosing another path or "
-                "dropping --no-overwrite.",
-                "conflict",
-            )
+        size = os.fstat(f.fileno()).st_size
+        # Past what one request carries, or resuming one that was: the
+        # resumable upload, in chunks, as ``mandala scp`` switches to it
+        # (OPL-6080). Linux guests only, up to 2 GiB.
+        resumable = size > FILE_SIZE_LIMIT or args.upload_id is not None
+        data: bytes | None = None
+        if resumable:
+            if size > UPLOAD_SIZE_LIMIT:
+                _die(f"{args.src} exceeds the 2 GiB upload limit", "too_large")
+        else:
+            # The bounded read also covers files that grow after fstat and
+            # special files whose reported size is zero.
+            data = f.read(FILE_SIZE_LIMIT + 1)
+            if len(data) > FILE_SIZE_LIMIT:
+                _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
+        cleanup_upload_id: str | None = None
+        with _client() as client:
+            computer = _resolve(client, target)
+            if resumable and (computer.os == "windows" or looks_windows_guest_path(remote_path)):
+                _die(
+                    f"{args.src} exceeds the 64 MiB file-transfer limit; larger uploads "
+                    "are Linux only",
+                    "too_large",
+                )
+            try:
+                if data is None:
+                    try:
+                        progress = computer.upload_file(
+                            remote_path,
+                            f,
+                            size=size,
+                            upload_id=args.upload_id,
+                            overwrite=not args.no_overwrite,
+                        )
+                    except KeyboardInterrupt as stopped:
+                        # Ctrl-C is still 130, but the staged chunks outlive it
+                        # and only their upload id reaches them again.
+                        return _upload_interrupted(stopped, args.json)
+                    sent = size
+                    stored: int | None = progress.offset
+                    # The receipt outlives the file it describes and holds
+                    # nothing worth keeping once the file is published.
+                    # Without waking a computer that slept since.
+                    try:
+                        computer.cancel_file_upload(remote_path, progress.upload_id, no_wake=True)
+                    except MandalaError:
+                        cleanup_upload_id = progress.upload_id
+                    except KeyboardInterrupt:
+                        return _cleanup_interrupted(progress.upload_id, args.json)
+                else:
+                    sent = len(data)
+                    stored = computer.write_file(remote_path, data, overwrite=not args.no_overwrite)
+            except FileExistsError as e:
+                # Only THIS upload is known to have written nothing: an earlier
+                # attempt whose answer was lost may have written the file itself.
+                _die(
+                    f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
+                    "earlier attempt's outcome was unknown, the file may be yours: read it and "
+                    "compare before choosing another path or dropping --no-overwrite to replace "
+                    f"it.{_staging_note(e)}",
+                    "exists",
+                    _upload_ids(e),
+                )
+            except CreateOnlyConflictError as e:
+                # No usable reason, so nothing here says the path is taken, nor that
+                # this upload wrote nothing: without the platform's word, a 409 (JSON
+                # or not) may come from a hop that had already forwarded the write.
+                _die(
+                    f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
+                    "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
+                    "send the same upload again blind: read "
+                    "the remote path to see what is there before choosing another path or "
+                    f"dropping --no-overwrite.{_staging_note(e)}",
+                    "conflict",
+                    _upload_ids(e),
+                )
     # A count that differs from what was sent means the guest holds something
     # other than this file: refused in both modes, as ``mandala scp`` refuses
     # it, so ``confirmed: true`` always means the platform counted every byte.
-    if stored is not None and stored != len(data):
+    if stored is not None and stored != sent:
         _die(
-            f"upload was incomplete: sent {len(data)} bytes but the guest reported {stored}",
+            f"upload was incomplete: sent {sent} bytes but the guest reported {stored}",
             "invalid_arguments",
         )
     if args.json:
@@ -1599,17 +1793,80 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         # reported a count of what it wrote (one that matched, as checked
         # above), as ``mandala scp --json`` says it. A platform that reports
         # none is not evidence that everything landed.
-        _json(
+        result: dict[str, Any] = {
+            "source": args.src,
+            "destination": f"{target}:{remote_path}",
+            "bytes": sent,
+            "confirmed": stored is not None,
+        }
+        # The file is published; only its upload receipt was left behind.
+        if cleanup_upload_id is not None:
+            result["cleanup_upload_id"] = cleanup_upload_id
+        _json(result)
+    else:
+        print(f"{args.src} -> {target}:{remote_path} ({sent} bytes)", file=sys.stderr)
+        if cleanup_upload_id is not None:
+            print(
+                f"{PROG}: the file is in place, but its upload receipt "
+                f"{cleanup_upload_id} could not be removed; it holds guest disk until "
+                "it is cancelled",
+                file=sys.stderr,
+            )
+    return 0
+
+
+def _upload_interrupted(stopped: KeyboardInterrupt, as_json: bool) -> int:
+    """Report a resumable upload stopped with Ctrl-C, naming its upload id; 130."""
+    upload_id = getattr(stopped, "upload_id", None)
+    message = "interrupted"
+    if isinstance(upload_id, str):
+        message = (
+            f"upload {_printable(upload_id)} interrupted; resume it by sending the same scp "
+            f"again with --upload-id {_printable(upload_id)} and the unchanged file"
+        )
+    if as_json:
+        info: dict[str, Any] = {"code": "cancelled", "message": message}
+        if isinstance(upload_id, str):
+            info["upload_id"] = upload_id
+        _json_failure(info)
+    else:
+        print(f"{PROG}: {message}", file=sys.stderr)
+    return 130
+
+
+def _cleanup_interrupted(upload_id: str, as_json: bool) -> int:
+    """Ctrl-C while removing a published upload's receipt: the file is in place,
+    and the receipt's id is reported so it can still be removed; 130."""
+    message = (
+        f"the file is in place, but removing its upload receipt {_printable(upload_id)} was "
+        "interrupted; it holds guest disk until it is cancelled"
+    )
+    if as_json:
+        _json_failure(
             {
-                "source": args.src,
-                "destination": f"{target}:{remote_path}",
-                "bytes": len(data),
-                "confirmed": stored is not None,
+                "code": "cancelled",
+                "message": message,
+                "upload_id": upload_id,
+                "upload_complete": True,
             }
         )
     else:
-        print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
-    return 0
+        print(f"{PROG}: {message}", file=sys.stderr)
+    return 130
+
+
+def _upload_ids(err: BaseException) -> dict[str, str]:
+    """``{"upload_id": ...}`` for a refused resumable upload, else nothing."""
+    upload_id = getattr(err, "upload_id", None)
+    return {"upload_id": upload_id} if isinstance(upload_id, str) else {}
+
+
+def _staging_note(err: BaseException) -> str:
+    """For a refused resumable upload: the id whose staging may need removing."""
+    upload_id = getattr(err, "upload_id", None)
+    if not isinstance(upload_id, str):
+        return ""
+    return f" Upload {_printable(upload_id)} may have staged data on the guest."
 
 
 # --- entry -----------------------------------------------------------------
@@ -4501,6 +4758,12 @@ def _parser() -> _Parser:
         help="upload only: create the guest file, refusing if something is there",
     )
     scp.add_argument(
+        "--upload-id",
+        metavar="ID",
+        help="upload only: resume the resumable upload with this 32-character lowercase hex "
+        "ID (no dashes), from the unchanged source; uploads past 64 MiB use one already",
+    )
+    scp.add_argument(
         "--json", action="store_true", help="the copy as JSON: source, destination, bytes"
     )
     scp.set_defaults(fn=_cmd_scp)
@@ -4576,7 +4839,14 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(e, APIError):
                 message = _with_status(e, message)
             print(f"{PROG}: {message}", file=sys.stderr)
-            recovery = _recovery_line(e, resendable) if isinstance(e, MandalaError) else None
+            wait = _wait_line(e) if isinstance(e, APIError) else None
+            if wait is not None:
+                print(wait, file=sys.stderr)
+            recovery = (
+                _recovery_line(e, resendable)
+                if isinstance(e, MandalaError) or getattr(e, "upload_id", None) is not None
+                else None
+            )
             if recovery is not None:
                 print(recovery, file=sys.stderr)
         return 1

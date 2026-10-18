@@ -597,22 +597,26 @@ def build_params(no_reuse: bool) -> dict[str, str]:
     return {"no_reuse": "true"} if flag(no_reuse, "no_reuse") else {}
 
 
-def build_stream_failed(build_id: str, data: Any) -> str:
+def build_stream_failed(build_id: str, data: Any, *, status: int | None = None) -> str:
     """What to say when a build's event stream ends with an ``error`` event.
 
     The stream's own failure, not the build's — named as such because a caller
     told "the build failed" would go and read a document that is fine. One
     function so the sync and async halves cannot word it differently.
+
+    A frame with a 4xx ``status`` is a refusal of the caller (a revoked key, a
+    role that no longer reaches the build), and reading ``builds.progress``
+    would be refused the same way, so that advice is left off it.
     """
     detail = ""
     if isinstance(data, Mapping):
         detail = str(data.get("error") or "")
     elif data is not None:
         detail = str(data)
-    return (
-        f"the build event stream for {build_id} ended: {detail or 'no reason given'} "
-        f"(this says nothing about the build itself — read builds.progress({build_id!r}))"
-    )
+    said = f"the build event stream for {build_id} ended: {detail or 'no reason given'}"
+    if status is not None and status < 500:
+        return f"{said} (this says nothing about the build itself)"
+    return f"{said} (this says nothing about the build itself — read builds.progress({build_id!r}))"
 
 
 def build_stream_truncated(build_id: str, *, malformed: bool) -> str:
@@ -1230,7 +1234,7 @@ def create_body(
         if count is not None:
             body[key] = whole(count, key, exc=ValueError)
     if secrets is not None:
-        body["secrets"] = secret_bindings_body(secrets)
+        body["secrets"] = secret_bindings_body(secrets, revisions=False)
     if browser_proxy is NO_BROWSER_PROXY:
         body["browser_proxy"] = None
     elif browser_proxy is not None:
@@ -2644,10 +2648,18 @@ def _webhook_url(url: object) -> str:
 
 
 def _description(value: object) -> str:
+    """A webhook description, at most 200 characters as the platform counts them.
+
+    UTF-16 code units, as :func:`_webhook_url` counts: the platform measures a
+    JavaScript string, where a character outside the Basic Multilingual Plane
+    (an emoji) is two, so 101 of them pass a code-point count and are refused
+    with a 400 (OPL-6080).
+    """
     text = canonical(value, "description")
-    if len(text) > WEBHOOK_DESCRIPTION_MAX:
+    units = len(text.encode("utf-16-le", "surrogatepass")) // 2
+    if units > WEBHOOK_DESCRIPTION_MAX:
         raise ValueError(
-            f"description must be at most {WEBHOOK_DESCRIPTION_MAX} characters, not {len(text)}"
+            f"description must be at most {WEBHOOK_DESCRIPTION_MAX} characters, not {units}"
         )
     return text
 
@@ -3046,7 +3058,9 @@ def _encodable(text: str, what: str) -> str:
     raise ValueError(f"{what} must be valid Unicode text")
 
 
-def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[str, str]]:
+def secret_bindings_body(
+    bindings: object, what: str = "secrets", *, revisions: bool = True
+) -> list[dict[str, str]]:
     """A binding list as the wire takes it, checked for what the platform would refuse.
 
     Each binding names one secret by id and publishes it under exactly one of
@@ -3058,6 +3072,11 @@ def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[s
 
     A bare mapping or string in the list position is refused rather than
     wrapped, for the reason :func:`_ids` gives.
+
+    ``revisions=False`` is a create's list: a new computer always binds each
+    secret's latest revision, and the platform refuses a ``revision_id`` there,
+    so one is refused here before anything is sent (OPL-6080). It is for a
+    rebind with ``set_secrets``.
     """
     if isinstance(bindings, (str, bytes, Mapping)) or not isinstance(bindings, (list, tuple)):
         raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
@@ -3110,6 +3129,11 @@ def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[s
             files.add(name)
             wire["file"] = name
         revision_id = binding.get("revision_id")
+        if revision_id is not None and not revisions:
+            raise ValueError(
+                f"{at}.revision_id is for a rebind (set_secrets); a create binds each "
+                "secret's latest revision, so omit it"
+            )
         if revision_id is not None:
             wire["revision_id"] = _secret_ref(revision_id, f"{at}.revision_id")
         out.append(wire)

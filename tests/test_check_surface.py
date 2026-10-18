@@ -28,8 +28,8 @@ def check_surface(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return check_surface
 
 
-#: The files that make a directory the platform to a copy git cannot vouch for.
-IDENTITY = (Path("web/lib/surface.ts"), Path("web/lib/apidoc.ts"))
+#: The directories that make a directory the platform to a copy git cannot vouch for.
+IDENTITY = (Path("server"), Path("web"), Path("gateway"))
 
 
 def _manifest_of(check_surface: ModuleType) -> dict[str, object]:
@@ -62,8 +62,7 @@ def _platform_with(
     # the marker, write a manifest for the very test that asserts there is none
     # (second review).
     for marker in IDENTITY:
-        (platform / marker).parent.mkdir(parents=True, exist_ok=True)
-        (platform / marker).write_text("// synthesized platform source\n")
+        (platform / marker).mkdir(parents=True, exist_ok=True)
     # A test may build the platform twice in one directory; whatever the earlier
     # build wrote is not this call's manifest.
     (platform / check_surface.MANIFEST).unlink(missing_ok=True)
@@ -200,8 +199,8 @@ def test_an_ambient_git_dir_does_not_answer_for_the_directory_asked_about(
     Both directions are wrong and both are reachable from a hook or a wrapper
     that runs this check: an unrelated clone answering with the platform's name,
     and a platform sibling answering with the SDK's — the second being OPL-3901
-    again, since recognition then falls back to the marker files that a missing
-    ``apidoc.ts`` defeats.
+    again, since recognition then falls back to the marker directories that a
+    missing one defeats.
     """
     platform = _clone_of(
         check_surface, f"git@github.com:{check_surface.PLATFORM_REMOTE}.git", tmp_path / "app"

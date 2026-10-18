@@ -139,7 +139,9 @@ async def test_wait_for_guest_probes_a_start_already_admitted() -> None:
     def probe(request):
         probes["n"] += 1
         if probes["n"] < 2:
-            return httpx.Response(409, json={"error": "the agent is not up yet"})
+            return httpx.Response(
+                409, json={"error": "the agent is not up yet", "reason": "starting"}
+            )
         return httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
 
     respx.post(f"{BASE}/computers/vm-1/exec").mock(side_effect=probe)

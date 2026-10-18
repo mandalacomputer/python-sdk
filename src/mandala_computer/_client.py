@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from . import _api
 from ._api import IDEMPOTENCY_KEY_HEADER
 from ._credentials import resolve_credentials
 from ._exceptions import (
@@ -58,6 +59,14 @@ DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
 #: two that do not — a foreground ``exec`` and the file transfers — say so per
 #: request; see :meth:`_BaseTransport._budget`.
 DEFAULT_TIMEOUT = 60.0
+
+#: The longest one transport retry may wait, when the call set no budget.
+#:
+#: A ``Retry-After`` longer than this raises the error it came with, carrying
+#: ``retry_after``, instead of sleeping: the caller decides whether to wait that
+#: long. The ordinary request deadline, which is where the TypeScript client
+#: stops waiting as well.
+MAX_UNBUDGETED_RETRY_WAIT = DEFAULT_TIMEOUT
 
 #: Added to a guest-side deadline to get the client's.
 #:
@@ -1108,7 +1117,9 @@ def _move_offer(body: object) -> bool | None:
     return possible
 
 
-def error_for_status(status: int, message: str, body: object = None) -> APIError:
+def error_for_status(
+    status: int, message: str, body: object = None, *, keep_reason: bool = False
+) -> APIError:
     """The exception a status deserves, for a failure that arrived in a stream.
 
     The agent loop reports its own failures as events rather than as a status —
@@ -1141,12 +1152,36 @@ def error_for_status(status: int, message: str, body: object = None) -> APIError
         cls = APIError
     # Stream failures may include completed work. Retain its correlation and
     # accounting without making flat or nested reasons into replay advice.
-    if isinstance(body, dict):
+    # ``keep_reason`` is for a stream whose failure did no work: a build's
+    # event stream ending because the caller's authority went (``revoked``).
+    if isinstance(body, dict) and not keep_reason:
         body = {key: value for key, value in body.items() if key != "reason"}
         nested = body.get("error")
         if isinstance(nested, dict):
             body["error"] = {key: value for key, value in nested.items() if key != "reason"}
     return cls(message, status=status, body=body)
+
+
+def build_stream_error(build_id: str, data: Any) -> MandalaError:
+    """The exception for a build event stream's ``error`` frame.
+
+    A frame that carries an HTTP status is the refusal the request would have
+    had as a response, sent after the 200 (the caller's key revoked, its role
+    changed): it becomes the class that status deserves, with its ``reason``
+    and ``request_id`` kept, so ``except AuthenticationError`` and a branch on
+    ``reason == "revoked"`` work here as they do on any route (OPL-6080). One
+    with no status is the stream's own failure and stays a
+    :class:`MandalaError`. The sync and async halves share this.
+    """
+    status = data.get("status") if isinstance(data, Mapping) else None
+    if isinstance(status, int) and not isinstance(status, bool) and 400 <= status <= 599:
+        return error_for_status(
+            status,
+            _api.build_stream_failed(build_id, data, status=status),
+            dict(data),
+            keep_reason=True,
+        )
+    return MandalaError(_api.build_stream_failed(build_id, data))
 
 
 def _timed_out(method: str, path: str, exc: httpx.TimeoutException) -> RequestTimeoutError:
@@ -1426,11 +1461,16 @@ class _Retry:
             if after is not None:
                 delay = max(delay, after)
         self.attempt += 1
-        left = self.remaining()
-        if left is not None and delay >= left:
-            raise _timed_out(
-                self.method, self.path, httpx.ReadTimeout("retry exceeds request budget")
-            )
+        # A wait that will not fit raises the platform's own answer — the 503
+        # and its ``retry_after`` — rather than a timeout: a timeout says the
+        # outcome is unknown, and here the platform said what it was and when
+        # to ask again (OPL-6080, as the TypeScript client does). With a
+        # budget, the wait has to end inside it; without one, it may not pass
+        # the ordinary request deadline, so a misbehaving edge asking for an
+        # hour cannot park a read for an hour behind a call that set no limit.
+        left = None if self.deadline is None else self.deadline - time.monotonic()
+        if delay >= (MAX_UNBUDGETED_RETRY_WAIT if left is None else left):
+            raise exc
         return delay
 
 

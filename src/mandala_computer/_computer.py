@@ -1419,6 +1419,19 @@ def _guest_not_running(err: BaseException) -> bool:
     return isinstance(err, APIError) and err.status == 400
 
 
+def _guest_probe_unavailable(err: BaseException) -> bool:
+    """Whether the guest probe was refused as "not running" (409 ``unavailable``).
+
+    Final to every other wait, and not to this one by itself: during an admitted
+    start the computer reads stopped while its RAM is held, a cached
+    ``running`` can be stale, and a boot can finish between the probe and the
+    re-read. So :meth:`Computer.wait_for_guest` re-reads the computer after it
+    and ends only when that read says stopped with nothing held ("call start()
+    first"); otherwise it probes again (OPL-6080, as the TypeScript client does).
+    """
+    return isinstance(err, APIError) and err.status == 409 and err.reason == "unavailable"
+
+
 def _desktop_wait_skipped(data: Mapping[str, Any]) -> bool:
     """Whether :meth:`Computer.wait_for_desktop` has nothing to ask this computer.
 
@@ -1442,9 +1455,7 @@ def _desktop_wait_fatal(err: MandalaError) -> bool:
     running (``reason: "unavailable"``) will not grow a desktop by being asked
     again, and a refusal of the request itself must not become a timeout.
     """
-    if isinstance(err, APIError) and err.reason == "unavailable":
-        return True
-    return not _is_transient_for_poll(err)
+    return not _is_transient_for_poll(err, settling_409=True)
 
 
 def _desktop_not_yet(err: MandalaError) -> bool:
@@ -3707,7 +3718,11 @@ class Computer(ComputerFields):
                 # request and a defect. The status is identical and the meaning
                 # is opposite, so the route decides — and only here, in the one
                 # method that talks to the guest agent (OPL-3724).
-                if not (_is_transient_for_poll(err) or _guest_not_running(err)):
+                if not (
+                    _is_transient_for_poll(err)
+                    or _guest_not_running(err)
+                    or _guest_probe_unavailable(err)
+                ):
                     raise
                 # A permanent refusal remains the cause even when its response
                 # arrives at the deadline. Only a transient failure can become
@@ -5572,6 +5587,9 @@ class Computer(ComputerFields):
             _api.computer_action(self.id, "snapshots"),
             json=_api.snapshot_body(memory, name),
         )
+        # Before decoding, which refuses a row with no id in its own words.
+        if not isinstance(data.get("id"), str) or not data.get("id"):
+            raise MandalaError(capture_accepted_without_id())
         snap = Snapshot.from_api(data)
         # A row that is not `capturing` is a stored snapshot, and there is
         # nothing to wait for. That is what a platform predating OPL-4562
@@ -5584,8 +5602,6 @@ class Computer(ComputerFields):
         # placeholder that looks like a handle, cannot be polled, and strands a
         # running capture with nobody holding its id — the OPL-4561 shape this
         # whole change exists to remove (Codex review, OPL-4568).
-        if snap.state == CAPTURING and not snap.id:
-            raise MandalaError(capture_accepted_without_id())
         if not wait or snap.state != CAPTURING:
             return snap
         return self._await_capture(snap.id, timeout, poll)

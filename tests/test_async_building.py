@@ -130,7 +130,7 @@ async def test_wait_for_guest_discovers_a_build_that_failed_while_waiting(
     client: mc.AsyncClient,
 ) -> None:
     respx.post(f"{BASE}/computers/vm-new/exec").mock(
-        httpx.Response(409, json={"error": "still being copied"})
+        httpx.Response(409, json={"error": "still being copied", "reason": "contention"})
     )
     refresh = respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=FAILED))
     with pytest.raises(mc.MandalaError, match="no space left on device"):
@@ -144,7 +144,9 @@ async def test_starting_a_computer_that_is_still_building_raises_conflict(
     client: mc.AsyncClient,
 ) -> None:
     respx.post(f"{BASE}/computers/vm-new/start").mock(
-        return_value=httpx.Response(409, json={"error": "still being copied"})
+        return_value=httpx.Response(
+            409, json={"error": "still being copied", "reason": "contention"}
+        )
     )
     with pytest.raises(mc.ConflictError):
         await mc.AsyncComputer(client._t, BUILDING).start()

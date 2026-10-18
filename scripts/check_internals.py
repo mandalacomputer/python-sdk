@@ -31,7 +31,9 @@ WHAT IS FORBIDDEN, and it is deliberately narrow — this is not a secret scanne
   client: it has no Go, so any ``<something>.go`` in it names somebody else's
   file. Likewise ``lib/<module>`` and ``web/lib/<module>``, with or without the
   extension — the first cut required the ``web/`` prefix and the ``.ts``, and
-  all four surviving references were spelled the other way.
+  all four surviving references were spelled the other way — and ``web/lib``
+  on its own.
+* the platform daemon's binary name.
 * identifiers declared in the platform and not in this library.
 * nothing else. Prose about what the platform DOES is the point of this client's
   comments and must stay.
@@ -90,6 +92,10 @@ PATH_PATTERNS = [
     (re.compile(r"\b[A-Za-z_][A-Za-z0-9_/]*\.go\b"), "names a platform source file"),
     # `lib/x`, `web/lib/x`, `server/x`, with or without an extension.
     (re.compile(r"\b(?:web/)?lib/[A-Za-z][A-Za-z0-9_]*(?:\.ts)?\b"), "names a platform module"),
+    # And `web/lib` itself, with no module after it (OPL-6080).
+    (re.compile(r"\bweb/lib\b"), "names a platform directory"),
+    # The platform's daemon, by its binary name.
+    (re.compile(r"\bgorillad\b"), "names the platform daemon"),
     (re.compile(r"\bserver/[A-Za-z][A-Za-z0-9_/]*\b"), "names a platform module"),
 ]
 

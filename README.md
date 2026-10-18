@@ -467,7 +467,11 @@ for p in client.builds.events(build.id):
 Each event is news — the platform sends one only when something moved — and the
 last one is the `done`, **including for a build that failed**. An `error` event
 means the *stream* could not go on and says nothing about the build; it raises,
-and says so. An account may hold eight streams open at once. To stop reading
+and says so. One that carries a status, such as the `401` with
+`reason: "revoked"` sent when the caller's key is revoked mid-stream, raises the
+class that status has on any route (`AuthenticationError`,
+`PermissionDeniedError`, ...) with its `reason` and `request_id`. An account may
+hold eight streams open at once. To stop reading
 early, close the iterator — `contextlib.closing()` — rather than `break` out of
 it.
 
@@ -2727,6 +2731,10 @@ bound = c.secrets()
 c.set_secrets([{"secret_id": key.id, "env": "OPENAI_API_KEY"}], version=bound.version)
 ```
 
+A create always binds each secret's latest revision, so a create or launch
+binding naming a `revision_id` raises `ValueError` before anything is sent, as
+the platform would refuse it. `revision_id` is for a rebind with `set_secrets`.
+
 A replaced value is sent to a running computer asynchronously and on a
 best-effort basis — to a file binding always, and to an environment binding for
 new shells on images that support it — and the answer does not say whether it
@@ -3844,7 +3852,11 @@ A valid `Retry-After` is a lower bound on that delay, including HTTP dates and
 zero. Very large valid delays never fall back to a shorter wait. Cancellation
 and timeout failures end the operation. An explicit caller
 `timeout_cap`, such as a wait helper's remaining budget, shrinks by monotonic
-elapsed time across attempts and backoff; a retry that cannot fit is refused.
+elapsed time across attempts and backoff; a retry that cannot fit is not made.
+Without a budget, one retry waits at most 60 seconds (the default request
+timeout). Either way, a wait that will not fit raises the platform's own error,
+such as the `UnavailableError` with its `retry_after`, rather than a timeout:
+the platform did answer, and said when to ask again.
 Ordinary httpx connect/read/write/pool timeouts remain phase-specific and do
 **not** impose a total wall-clock deadline on a read or its retries.
 
@@ -4268,11 +4280,13 @@ the npm `mandala` CLI reports — `not_found`, `unauthenticated`,
 package's README — never a class name. `status`, the platform's `reason` word
 and the platform's own `code` (as `api_code`, such as `LABEL_TAKEN` or
 `PUBLIC_URL_LIMIT`, which are both a `conflict`) ride beside it when there are
-any, and so do the `request_id`, `idempotency_key` and `operation_id` a failure
+any, and so do `retry_after_ms` (the platform's `Retry-After`, in milliseconds)
+and the `request_id`, `idempotency_key` and `operation_id` a failure
 carries. Without `--json`, a refusal from the platform ends its line with the
 same two facts: `mandala-py: The label "demo" is taken; choose another. (HTTP
-409, LABEL_TAKEN)`, or `(HTTP 404)` when the platform sent no code. A mistyped
-command prints its whole help, not one line.
+409, LABEL_TAKEN)`, or `(HTTP 404)` when the platform sent no code, followed by
+`mandala-py: the platform asked to wait 30s before trying again` when it sent a
+`Retry-After`. A mistyped command prints its whole help, not one line.
 
 Every command whose call is keyed takes `--idempotency-key KEY` (1 to 255
 printable ASCII characters, no space) and sends it instead of a key of its own:
@@ -4330,15 +4344,25 @@ The interactive `terminal` command currently requires a Unix-like local terminal
 the guest. It rides the files API rather than the terminal, so it works
 without any shell in the guest at all. A download is paged, so a file larger
 than the 64 MiB one request moves copies like any other, and a copy that is
-refused leaves the local file alone. An upload is one request, and one larger
-than the limit is refused before it is read.
+refused leaves the local file alone. An upload up to 64 MiB is one request; a
+larger one, up to 2 GiB and to a Linux guest only, goes up through the resumable
+upload in 4 MiB chunks, as `mandala scp` does, and its upload receipt is removed
+once the file is in place (`--json` names it as `cleanup_upload_id` if that
+removal failed). An interrupted one names its upload id: send the same `scp`
+again with `--upload-id ID` and the unchanged file to carry on from what the
+guest holds. A file over 2 GiB is refused before it is read.
 `--no-overwrite` makes an upload create-only: a guest path that is already
 taken is refused, and that upload writes nothing. It is refused on a download.
 
-Two answers worth recognizing: a computer that predates the terminal feature
-answers 409 until it is stopped and started again (a restart is not enough,
-deliberately — a resumed session must match its saved device topology), and
-Windows guests have no terminal yet.
+A few answers worth recognizing. A suspended computer is not resumed by
+`terminal`, unlike the rest of the API: it is refused, and the fix is to start
+it, then retry. A computer that predates the terminal feature answers 409 until
+it is stopped and started again (a restart is not enough, deliberately — a
+resumed session must match its saved device topology). A `503` with
+`reason: "contention"` means another terminal on the computer is part way
+through its first-time setup; `terminal` opens it again a few times before
+giving up. Any other refusal prints the platform's sentence with its status and
+code, as every other command does. Windows guests have no terminal yet.
 
 `webhooks` is the CRUD from the section above, and only that — the CLI does not
 receive webhooks; a receiver is a server, and `verify` is what it calls.
