@@ -1746,6 +1746,96 @@ portable across Python implementations. To stop a run early, wrap the iterator
 in `contextlib.closing()` (sync) or `contextlib.aclosing()` (async); leaving that
 context closes the HTTP stream and stops the run.
 
+#### Threads: carrying on a conversation
+
+A run is kept. Unless you send `store=False`, a run that acted on the desktop,
+or finished with an answer, is kept as one exchange — the prompt, and how the
+run answered it — in a **thread** on that computer, and `result.thread_id`
+names it. Send it with the next prompt and the model is given the thread's
+earlier turns, told they are done, and acts only on the new one:
+
+```python
+first = c.agent("Open the settings.", model_key=key)
+then = c.agent("Now turn on dark mode.", model_key=key, thread_id=first.thread_id)
+```
+
+A failed run that had acted, or that was continuing a thread, names it too, as
+`e.thread_id` on the exception (and `thread_id` on the `AgentFailed` event), so
+the conversation can go on from the failure. A run refused before it did
+anything keeps nothing.
+
+- `thread_id` is `thr_` and 24 lowercase hex characters; anything else is
+  refused before the request is sent. A thread of another computer, or a full
+  one (100 turns), is a `ConflictError`, and one this key cannot see a
+  `NotFoundError`.
+- `messages=[{"role": "user" | "assistant", "content": "..."}, ...]` is the
+  conversation so far for a caller that keeps its own — oldest first, without
+  this prompt (`mc.AgentMessage` is its type). A new thread starts with it. It
+  cannot be sent with `thread_id`: a thread already holds its conversation.
+- `store=False` keeps nothing, and cannot be sent with `thread_id`.
+
+All three work on `agent()`, `agent_stream()` and `agent_once()`, sync and
+async. `client.agent_threads` reads them back:
+
+```python
+page = client.agent_threads.list(computer_id=c.id)  # most recently used first
+for t in page.threads:
+    print(t.id, t.turns, t.title)
+thread = client.agent_threads.get(page.threads[0].id)
+for turn in thread.messages:
+    print(turn.role, turn.stop or "", turn.text)
+client.agent_threads.delete(thread.id)
+```
+
+`list` takes `computer_id`, `limit` (1 to 100; 20 by default) and `before`;
+for the next page pass `page.next_before`, which is `None` on the last one. An
+assistant turn's `stop` is how its run ended — any `result.stop`, or `error`,
+`aborted` (stopped part way), `running` (still going) or `interrupted` (the
+platform restarted under it); the last three are runs that may have done more
+than they reported. An account keeps its 1000 most recently used threads, a
+computer's threads are deleted with it, and a key confined to a workspace sees
+only that workspace's. Viewers cannot read them: a prompt is where private
+text ends up.
+
+#### Background runs
+
+`c.start_agent_run(prompt, ...)` gives the computer a job and walks away. It
+takes `agent()`'s arguments (all but `store`: a background run is always kept,
+so it can be read back) and returns an `AgentRun` once the run holds the
+computer; the run goes on without the request, and is not cut off at the edge
+the way `agent_once()` is. `client.agent_runs.start(computer_id, prompt, ...)`
+does the same by id.
+
+```python
+run = c.start_agent_run("Rename every screenshot on the desktop by date.")
+run = client.agent_runs.wait(run)  # polls to completed/failed/cancelled/interrupted
+if run.finished:  # completed, and the model ended its turn
+    print(run.result.text)
+else:
+    print(run.status, run.error, len(run.steps_taken), "steps")
+```
+
+`wait(run, timeout=1800, poll=3)` returns the run however it ended and does not
+raise for any ending — every one leaves real work on the desktop, and the run
+is the account of it. A `TimeoutError` means the run is still going, not that it
+stopped; `client.agent_runs.cancel(run.id)` stops it where it is, and answers
+the run (unchanged, if it had already ended). `get(run_id)` reads it as it
+stands — status, `steps_taken`, `cost_usd` on a funded run, and once it has
+ended its `result` (`completed`) or `error` (`failed`, `interrupted`), whose
+`top_up_url` is an absolute link when a funded run ran out of credits.
+`list(computer_id=..., status=..., limit=..., before=...)` pages newest first,
+each run without its steps.
+
+What refuses a run before it holds the computer is raised by the start, as
+`agent()` raises it: `NotFoundError` for an unknown computer or thread,
+`ConflictError` for a computer that is not running, is already driven or is
+changing workspace, `InsufficientCreditsError` for a funded run the credits
+cannot start. Everything after that ends the run as `failed`. A run the platform
+was executing when it restarted is `interrupted` and is not resumed, and
+`run.thread_id` names the thread the run is kept in once it has something in
+it. The start is not retried: a start whose answer was lost may have started a
+run, so list the computer's runs before sending it again.
+
 #### OpenAI-compatible computer agent
 
 An existing OpenAI client can drive the same computer agent through

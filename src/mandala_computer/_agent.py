@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from ._exceptions import top_up_link
 
@@ -34,6 +34,7 @@ __all__ = [
     "AgentDone",
     "AgentEvent",
     "AgentFailed",
+    "AgentMessage",
     "AgentProvider",
     "AgentResult",
     "AgentStep",
@@ -51,6 +52,20 @@ __all__ = [
 #: recognised model with the other provider is refused. OpenAI needs your own
 #: ``model_key``.
 AgentProvider = Literal["anthropic", "openai"]
+
+
+class AgentMessage(TypedDict):
+    """One earlier turn of a conversation the caller keeps itself: the
+    ``messages=`` of :meth:`~mandala_computer.Computer.agent` and its siblings.
+
+    ``role`` is ``"user"`` for a prompt and ``"assistant"`` for what the run
+    answered, and ``content`` is its text. The list is oldest first and leaves
+    out the prompt being sent now. The model is given these as earlier turns,
+    told they are done, and acts only on the new prompt.
+    """
+
+    role: Literal["user", "assistant"]
+    content: str
 
 
 def _num(value: Any) -> int:
@@ -77,6 +92,17 @@ def _num(value: Any) -> int:
 
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+def _thread_id(value: Any) -> str | None:
+    """A ``thread_id`` off the wire, or ``None`` where there is none to read.
+
+    Absent is ordinary: a run sent with ``store=False`` keeps nothing, and one
+    refused before it acted starts no thread. Anything that is not a non-empty
+    string reads as absent too, by this module's rule that a malformed field
+    never costs the run's result.
+    """
+    return str.__str__(value) if isinstance(value, str) and value else None
 
 
 def _usd(value: Any, *, signed: bool = False) -> float | None:
@@ -225,6 +251,13 @@ class AgentResult:
     #: set: the cap stops the run from STARTING another model call, and the
     #: last one is charged in full.
     cost_usd: float | None = field(default=None, kw_only=True)
+    #: The thread this run's exchange was kept in: pass it as ``thread_id=`` on
+    #: the next run on this computer to continue the conversation, or read it
+    #: with ``client.agent_threads.get``. ``None`` when nothing was kept — a run
+    #: sent with ``store=False``, an account with no thread it could replace.
+    #: On a background run's :attr:`~mandala_computer.AgentRun.result` it is
+    #: the run's own :attr:`~mandala_computer.AgentRun.thread_id`.
+    thread_id: str | None = field(default=None, kw_only=True)
 
     @property
     def finished(self) -> bool:
@@ -251,6 +284,7 @@ class AgentResult:
                 for i, step in enumerate(taken if isinstance(taken, list) else ())
             ),
             cost_usd=_usd(r.get("cost_usd")),
+            thread_id=_thread_id(r.get("thread_id")),
         )
 
 
@@ -314,6 +348,11 @@ class AgentFailed:
     #: sends the billing page's path, which is resolved against the client's
     #: base URL; the value as sent is in :attr:`raw`.
     top_up_url: str | None = field(default=None, kw_only=True)
+    #: The thread the failed run was kept in: present when it had acted on the
+    #: desktop before it failed, or when it was continuing a thread you named.
+    #: Its assistant turn records the failure, so the conversation can go on
+    #: from there. ``None`` for a run refused before it did anything.
+    thread_id: str | None = field(default=None, kw_only=True)
 
 
 #: One event out of :meth:`~mandala_computer.Computer.agent_stream`. Match on it
@@ -370,5 +409,6 @@ def to_agent_event(
             raw=r,
             cost_usd=_usd(r.get("cost_usd")),
             top_up_url=top_up_link(r.get("top_up_url"), base_url),
+            thread_id=_thread_id(r.get("thread_id")),
         )
     return None

@@ -9,6 +9,25 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Agent threads.** `agent()`, `agent_stream()` and `agent_once()` take
+  `thread_id=` to continue a kept conversation, `store=False` to keep nothing,
+  and `messages=` for a conversation the caller keeps itself (`AgentMessage`),
+  checked against the platform's rules before the request is sent.
+  `AgentResult.thread_id`, `AgentFailed.thread_id` and `MandalaError.thread_id`
+  name the thread a run was kept in. `client.agent_threads.list(computer_id=…,
+  limit=…, before=…)`, `.get(thread_id)` and `.delete(thread_id)` read and
+  remove them (`AgentThreadPage`, `AgentThreadSummary`, `AgentThread`,
+  `AgentThreadTurn`).
+- **Background agent runs.** `Computer.start_agent_run(prompt, …)` and
+  `client.agent_runs.start(computer_id, prompt, …)` start the agent loop and
+  return an `AgentRun` without waiting for it; `client.agent_runs.get`,
+  `.list(computer_id=…, status=…, limit=…, before=…)`, `.cancel` and
+  `.wait(run, timeout=…, poll=…)` read it back, page through runs, stop one,
+  and poll one to `completed`, `failed`, `cancelled` or `interrupted`. Sync and
+  async clients both.
+
 ## [0.15.0] — 2026-10-18
 
 ### Added

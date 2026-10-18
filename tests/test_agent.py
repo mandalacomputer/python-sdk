@@ -1177,12 +1177,16 @@ def test_the_module_declares_everything_the_package_re_exports() -> None:
     which is exactly why it drifts, and why the package's own export list is the
     thing to check it against.
     """
-    from mandala_computer import _agent
+    from mandala_computer import _agent, _agent_records
 
     exported = {n for n in mc.__all__ if n.startswith("Agent")}
-    assert exported == set(_agent.__all__)
-    for name in _agent.__all__:
-        assert hasattr(_agent, name), name
+    # The loop's stream in one module, the threads and background runs it keeps
+    # in the other (OPL-6084): between them, every Agent name the package has.
+    assert not set(_agent.__all__) & set(_agent_records.__all__)
+    assert exported == set(_agent.__all__) | set(_agent_records.__all__)
+    for module in (_agent, _agent_records):
+        for name in module.__all__:
+            assert hasattr(module, name), name
 
 
 # --- the async half --------------------------------------------------------

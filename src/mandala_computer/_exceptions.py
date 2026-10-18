@@ -86,6 +86,19 @@ class MandalaError(Exception):
     #: any ``5xx``: it is either carried out once or answered ``409``.
     idempotency_key: str | None = None
 
+    @property
+    def thread_id(self) -> str | None:
+        """The thread a failed agent run was kept in, or ``None``.
+
+        :attr:`agent`'s :attr:`~mandala_computer.AgentFailed.thread_id`, read
+        through: present when the run acted on the desktop before it failed, or
+        when it was continuing a thread you named, so the next prompt can go on
+        from the failure with ``thread_id=e.thread_id``. ``None`` on every
+        error that did not come out of a run, and on a run refused before it
+        did anything.
+        """
+        return self.agent.thread_id if self.agent is not None else None
+
 
 #: The words the platform will put in a refusal's ``reason`` (OPL-3898, and
 #: OPL-4801 for the fifth), split by what a retry loop should do about each. ``error`` beside it stays a

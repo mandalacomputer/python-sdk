@@ -13,11 +13,21 @@ from enum import Enum, auto
 from typing import Any, Literal
 
 from . import _api
+from ._agent import AgentMessage, AgentProvider
+from ._agent_records import AgentRun, AgentRunPage, AgentRunStatus, AgentThread, AgentThreadPage
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport, build_stream_error
-from ._computer import Computer, _poll_delay, _ride_out, check_wait_args
+from ._computer import (
+    Computer,
+    _agent_route_error,
+    _model_key_headers,
+    _poll_delay,
+    _ride_out,
+    check_wait_args,
+)
 from ._exceptions import (
     _REASON_CLEARS,
     _REASON_PERMANENT,
+    APIError,
     ConflictError,
     FileExistsError,
     MandalaError,
@@ -71,6 +81,8 @@ from ._sse import SSEEvent
 
 __all__ = [
     "Account",
+    "AgentRuns",
+    "AgentThreads",
     "ApiKeys",
     "Builds",
     "Computers",
@@ -2554,4 +2566,239 @@ class Operations:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(_operation_timed_out(op_id, timeout, last, answered))
+            time.sleep(min(delay, remaining))
+
+
+# --- agent threads and background runs ----------------------------------------
+
+
+class AgentThreads:
+    """The conversations agent runs have kept (``client.agent_threads``).
+
+    A run on :meth:`~mandala_computer.Computer.agent` (or its siblings, or a
+    background run) is kept as one exchange in a thread on its computer unless
+    it was sent with ``store=False``, and its
+    :attr:`~mandala_computer.AgentResult.thread_id` continues it. Threads are
+    deleted with their computer, follow it to another workspace, and an account
+    keeps its 1000 most recently used: a new one takes the place of the one
+    used longest ago.
+
+    Members and owners may read and delete them; a viewer is refused with
+    :class:`~mandala_computer.PermissionDeniedError`, since a prompt is where
+    private text ends up. A key confined to a workspace sees that workspace's
+    threads only, and any other id is a
+    :class:`~mandala_computer.NotFoundError`.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(
+        self,
+        *,
+        computer_id: str | None = None,
+        limit: int | None = None,
+        before: str | None = None,
+    ) -> AgentThreadPage:
+        """One page of threads, most recently used first.
+
+        ``computer_id`` keeps one computer's; ``limit`` is 1 to 100, and the
+        platform's default is 20. For the next page pass the page's
+        :attr:`~mandala_computer.AgentThreadPage.next_before` as ``before`` —
+        the last thread's id — until it is ``None``. A ``before`` this key
+        cannot see is an :class:`~mandala_computer.APIError` with status 400.
+        """
+        params = _api.agent_page_params(computer_id, limit, before)
+        data = self._t.json_object("GET", _api.AGENT_THREADS, params=params)
+        return AgentThreadPage.from_api(data)
+
+    def get(self, thread_id: str) -> AgentThread:
+        """One thread and every turn in it, oldest first: each ``user`` turn a
+        prompt, each ``assistant`` turn how the run answered it."""
+        path = _api.agent_thread(thread_id)
+        return AgentThread.from_api(self._t.json_object("GET", path), f"GET {path}")
+
+    def delete(self, thread_id: str) -> None:
+        """Delete a thread and its turns. Its id can no longer be continued;
+        what its runs did to the desktop stands."""
+        self._t.json_object("DELETE", _api.agent_thread(thread_id))
+
+
+#: How long :meth:`AgentRuns.wait` waits by default: a long run of 100 steps.
+AGENT_RUN_WAIT_TIMEOUT = 1800.0
+#: Seconds between its polls by default. A step takes at least that long.
+AGENT_RUN_WAIT_POLL = 3.0
+
+
+def _agent_run_id_arg(run: AgentRun | str) -> str:
+    """The id to wait on, refused with a sentence when there is none."""
+    run_id = run.id if isinstance(run, AgentRun) else run
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run must be an AgentRun or a run id (run_...), not empty")
+    _api.agent_run(run_id)
+    return run_id
+
+
+def _agent_run_timed_out(run_id: str, timeout: float, last: AgentRun | None, answered: bool) -> str:
+    if last is not None and answered:
+        return (
+            f"agent run {run_id} was still {last.status} after {timeout}s, at step "
+            f"{last.steps}; the run has not stopped, only this wait has"
+        )
+    if last is not None:
+        return (
+            f"agent run {run_id} could not be read for the last part of {timeout}s; when it "
+            f"last answered it was {last.status}. Read agent_runs.get for where it got to."
+        )
+    return f"agent run {run_id} could not be read within {timeout}s"
+
+
+class AgentRuns:
+    """Background agent runs (``client.agent_runs``): give a computer a job and
+    walk away.
+
+    :meth:`start` answers once the run holds the computer, and the run goes on
+    without the request. :meth:`get` reads it as it stands, :meth:`wait` polls
+    it to its end, and :meth:`cancel` stops it. An account keeps its 1000 newest
+    runs that have ended, and every run still going.
+
+    Members and owners may start and read them; a viewer is refused with
+    :class:`~mandala_computer.PermissionDeniedError`. A key confined to a
+    workspace sees that workspace's runs only, and any other id is a
+    :class:`~mandala_computer.NotFoundError`. A run the platform was executing
+    when it restarted is marked ``interrupted`` and is not resumed.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def start(
+        self,
+        computer_id: str,
+        prompt: str,
+        *,
+        model_key: str | None = None,
+        system: str | None = None,
+        max_steps: int | None = None,
+        model: str | None = None,
+        provider: AgentProvider | None = None,
+        max_cost_usd: float | None = None,
+        thread_id: str | None = None,
+        messages: Sequence[AgentMessage] | None = None,
+    ) -> AgentRun:
+        """Start a background run on a computer by its id.
+
+        :meth:`~mandala_computer.Computer.start_agent_run`, without a handle:
+        the same arguments, the same refusals, the same answer.
+        """
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
+        path = _api.computer_agent_runs(computer_id)
+        body = _api.agent_body(
+            prompt,
+            stream=None,
+            system=system,
+            max_steps=max_steps,
+            model=model,
+            provider=provider,
+            max_cost_usd=max_cost_usd,
+            thread_id=thread_id,
+            messages=messages,
+        )
+        try:
+            data = self._t.json_object("POST", path, json=body, headers=headers)
+        except APIError as exc:
+            error = _agent_route_error(exc, funded=model_key is None, base_url=self._t.base_url)
+            if error is exc:
+                raise
+            raise error from None
+        return AgentRun.from_api(data, f"POST {path}", base_url=self._t.base_url)
+
+    def get(self, run_id: str) -> AgentRun:
+        """The run as it stands: its status, every step so far, its cost on a
+        funded run, and once it has ended its
+        :attr:`~mandala_computer.AgentRun.result` (``completed``) or
+        :attr:`~mandala_computer.AgentRun.error` (``failed``,
+        ``interrupted``)."""
+        return self._read(run_id, None)
+
+    def _read(self, run_id: str, timeout_cap: float | None) -> AgentRun:
+        path = _api.agent_run(run_id)
+        data = self._t.json_object("GET", path, timeout_cap=timeout_cap)
+        return AgentRun.from_api(data, f"GET {path}", base_url=self._t.base_url)
+
+    def list(
+        self,
+        *,
+        computer_id: str | None = None,
+        status: AgentRunStatus | None = None,
+        limit: int | None = None,
+        before: str | None = None,
+    ) -> AgentRunPage:
+        """One page of runs, newest first, each without its
+        :attr:`~mandala_computer.AgentRun.steps_taken` (read one for them).
+
+        ``computer_id`` keeps one computer's and ``status`` the runs in one
+        status; ``limit`` is 1 to 100, and the platform's default is 20. For
+        the next page pass the page's
+        :attr:`~mandala_computer.AgentRunPage.next_before` as ``before`` until
+        it is ``None``.
+        """
+        params = _api.agent_page_params(computer_id, limit, before, status)
+        data = self._t.json_object("GET", _api.AGENT_RUNS, params=params)
+        return AgentRunPage.from_api(data, base_url=self._t.base_url)
+
+    def cancel(self, run_id: str) -> AgentRun:
+        """Stop a running run where it is: the model call in flight is abandoned
+        and no further action is taken. What it already did to the desktop
+        stands, and so does what it cost. Answers the run, ``cancelled``; a run
+        that had already ended is answered as it is, unchanged."""
+        path = _api.agent_run_cancel(run_id)
+        data = self._t.json_object("POST", path)
+        return AgentRun.from_api(data, f"POST {path}", base_url=self._t.base_url)
+
+    def wait(
+        self,
+        run: AgentRun | str,
+        timeout: float = AGENT_RUN_WAIT_TIMEOUT,
+        poll: float = AGENT_RUN_WAIT_POLL,
+    ) -> AgentRun:
+        """Poll a run until it has ended, and answer it.
+
+        Returns the run in whichever status it ended — ``completed``,
+        ``failed``, ``cancelled`` or ``interrupted`` (or one added after this
+        version, on a run the platform says has ended) — and does not raise for
+        any of them: every ending leaves real work on the desktop, and the run
+        is the account of it. Check :attr:`~mandala_computer.AgentRun.finished`,
+        which only a ``completed`` run that ended ``end_turn`` is.
+
+        Raises :class:`~mandala_computer.TimeoutError` if it is still running
+        when ``timeout`` (seconds; default 30 minutes) runs out; the run is not
+        stopped by that, only the waiting is — :meth:`cancel` stops it. A
+        transient failure of a poll is ridden out, as every wait in this
+        package does; an id this key cannot see is a
+        :class:`~mandala_computer.NotFoundError` at once.
+        """
+        check_wait_args(timeout, poll)
+        run_id = _agent_run_id_arg(run)
+        deadline = time.monotonic() + timeout
+        last: AgentRun | None = None
+        answered = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_agent_run_timed_out(run_id, timeout, last, answered))
+            delay = poll
+            try:
+                last = self._read(run_id, remaining)
+                answered = True
+            except MandalaError as err:
+                answered = False
+                delay = _ride_out(err, deadline, poll)
+            if answered and last is not None and last.ended:
+                return last
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_agent_run_timed_out(run_id, timeout, last, answered))
             time.sleep(min(delay, remaining))
