@@ -152,6 +152,14 @@ ALLOWED = {
     ("GET", "operations/:id"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
+    # Agent threads and background runs; not reached yet — see UNIMPLEMENTED.
+    ("GET", "agent/threads"),
+    ("GET", "agent/threads/:thread"),
+    ("DELETE", "agent/threads/:thread"),
+    ("POST", "computers/:id/agent/runs"),
+    ("GET", "agent/runs"),
+    ("GET", "agent/runs/:run"),
+    ("POST", "agent/runs/:run/cancel"),
 }
 
 # Every query, header and body field the platform documents, by route —
@@ -344,6 +352,9 @@ PARAMETERS: dict[str, set[str]] = {
         "body:model",
         "body:provider",
         "body:stream",
+        "body:thread_id",
+        "body:store",
+        "body:messages",
     },
     "POST chat/completions": {
         "header:X-Model-Key",
@@ -353,7 +364,27 @@ PARAMETERS: dict[str, set[str]] = {
         "body:provider",
         "body:max_steps",
         "body:stream",
+        "body:thread_id",
+        "body:store",
     },
+    "GET agent/threads": {"query:computer_id", "query:limit", "query:before"},
+    "GET agent/threads/:thread": set(),
+    "DELETE agent/threads/:thread": set(),
+    "POST computers/:id/agent/runs": {
+        "header:X-Model-Key",
+        "body:prompt",
+        "body:system",
+        "body:max_cost_usd",
+        "body:max_steps",
+        "body:model",
+        "body:provider",
+        "body:thread_id",
+        "body:store",
+        "body:messages",
+    },
+    "GET agent/runs": {"query:computer_id", "query:status", "query:limit", "query:before"},
+    "GET agent/runs/:run": set(),
+    "POST agent/runs/:run/cancel": set(),
     # An upload's body is the file itself, raw — there are no named fields to
     # mirror. A download's `Range` is the one header a *caller* sets that
     # reaches the daemon; see `Computer.read_file_part`.
