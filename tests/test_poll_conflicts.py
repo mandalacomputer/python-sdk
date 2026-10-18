@@ -75,8 +75,8 @@ def aclient() -> mc.AsyncClient:
     "body",
     [
         {"error": "refused"},
-        {"error": "not running", "reason": "unavailable"},
         {"error": "no", "code": "idempotency_outcome_unknown"},
+        {"error": "no", "reason": "unsupported"},
     ],
 )
 @respx.mock
@@ -117,6 +117,43 @@ def test_wait_for_guest_still_polls_a_contention_409() -> None:
     with client() as c:
         computer = c.computers.get("vm-1")
         assert computer.wait_for_guest(timeout=30, poll=0.01) is computer
+    assert len(probe.calls) == 2
+
+
+@respx.mock
+def test_wait_for_guest_ends_on_unavailable_only_when_the_computer_reads_stopped() -> None:
+    """The probe's ``unavailable`` is checked against a fresh read of the computer."""
+    reads = iter(
+        [httpx.Response(200, json=COMPUTER)]
+        + [
+            httpx.Response(200, json={**COMPUTER, "status": "stopped", "running_ram_mb": 0})
+            for _ in range(5)
+        ]
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(side_effect=lambda _request: next(reads))
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        return_value=httpx.Response(409, json={"error": "not running", "reason": "unavailable"})
+    )
+    with client() as c:
+        computer = c.computers.get("vm-1")
+        with pytest.raises(mc.MandalaError, match=r"call start\(\) first"):
+            computer.wait_for_guest(timeout=30, poll=0.01)
+    assert len(probe.calls) == 1
+
+
+@respx.mock
+async def test_wait_for_guest_probes_again_when_unavailable_meets_a_running_read() -> None:
+    """A boot that finished between the probe and the re-read, or a stale cache."""
+    respx.get(f"{BASE}/computers/vm-1").mock(return_value=httpx.Response(200, json=COMPUTER))
+    probe = respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        side_effect=[
+            httpx.Response(409, json={"error": "not running", "reason": "unavailable"}),
+            httpx.Response(200, json=OK),
+        ]
+    )
+    async with aclient() as c:
+        computer = await c.computers.get("vm-1")
+        assert await computer.wait_for_guest(timeout=30, poll=0.01) is computer
     assert len(probe.calls) == 2
 
 

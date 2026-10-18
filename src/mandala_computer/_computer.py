@@ -1419,6 +1419,19 @@ def _guest_not_running(err: BaseException) -> bool:
     return isinstance(err, APIError) and err.status == 400
 
 
+def _guest_probe_unavailable(err: BaseException) -> bool:
+    """Whether the guest probe was refused as "not running" (409 ``unavailable``).
+
+    Final to every other wait, and not to this one by itself: during an admitted
+    start the computer reads stopped while its RAM is held, a cached
+    ``running`` can be stale, and a boot can finish between the probe and the
+    re-read. So :meth:`Computer.wait_for_guest` re-reads the computer after it
+    and ends only when that read says stopped with nothing held ("call start()
+    first"); otherwise it probes again (OPL-6080, as the TypeScript client does).
+    """
+    return isinstance(err, APIError) and err.status == 409 and err.reason == "unavailable"
+
+
 def _desktop_wait_skipped(data: Mapping[str, Any]) -> bool:
     """Whether :meth:`Computer.wait_for_desktop` has nothing to ask this computer.
 
@@ -3705,7 +3718,11 @@ class Computer(ComputerFields):
                 # request and a defect. The status is identical and the meaning
                 # is opposite, so the route decides — and only here, in the one
                 # method that talks to the guest agent (OPL-3724).
-                if not (_is_transient_for_poll(err) or _guest_not_running(err)):
+                if not (
+                    _is_transient_for_poll(err)
+                    or _guest_not_running(err)
+                    or _guest_probe_unavailable(err)
+                ):
                     raise
                 # A permanent refusal remains the cause even when its response
                 # arrives at the deadline. Only a transient failure can become

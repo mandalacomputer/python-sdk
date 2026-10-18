@@ -1,9 +1,8 @@
 """Rows and fields that used to decode to a quiet default now fail the read.
 
-A row without its id, a flag that is neither true nor false, and a list entry
-that is not an object were read as ``""``, ``False`` and "not there". Each is a
-wrong answer a caller acts on — a delete sent to an empty id, a snapshot read as
-not orphaned, a directory listing one entry short — so each is refused, as the
+A row without its id and a list entry that is not an object were read as ``""``
+and "not there". Each is a wrong answer a caller acts on — a delete sent to an
+empty id, a directory listing one entry short — so each is refused, as the
 other listings already refuse them (OPL-6080).
 """
 
@@ -26,12 +25,10 @@ def test_a_snapshot_row_without_an_id_is_refused() -> None:
 
 
 @pytest.mark.parametrize("flag", ["incremental", "auto", "orphaned", "computer_unreachable"])
-def test_a_garbled_snapshot_flag_is_refused(flag: str) -> None:
-    with pytest.raises(mc.MandalaError, match=f"{flag} is not a boolean"):
-        mc.Snapshot.from_api({**SNAPSHOT, flag: "maybe"})
+def test_a_snapshot_flag_is_true_only_when_it_says_so(flag: str) -> None:
+    """Left lenient, as the TypeScript client reads them: only a plain true is true."""
+    assert getattr(mc.Snapshot.from_api({**SNAPSHOT, flag: "maybe"}), flag) is False
     assert getattr(mc.Snapshot.from_api({**SNAPSHOT, flag: True}), flag) is True
-    assert getattr(mc.Snapshot.from_api({**SNAPSHOT, flag: None}), flag) is False
-    assert getattr(mc.Snapshot.from_api(SNAPSHOT), flag) is False
 
 
 def test_a_build_row_without_an_id_is_refused() -> None:
@@ -40,11 +37,9 @@ def test_a_build_row_without_an_id_is_refused() -> None:
     assert mc.TemplateBuild.from_api({"id": "bld-1"}).id == "bld-1"
 
 
-def test_a_size_without_an_id_or_with_a_garbled_allowed_is_refused() -> None:
+def test_a_size_without_an_id_is_refused() -> None:
     with pytest.raises(mc.MandalaError, match="size: a row has no usable id"):
         mc.Size.from_api({"label": "Small"})
-    with pytest.raises(mc.MandalaError, match="allowed is not a boolean"):
-        mc.Size.from_api({"id": "small", "allowed": "yes please"})
     assert mc.Size.from_api({"id": "small", "allowed": True}).allowed is True
 
 

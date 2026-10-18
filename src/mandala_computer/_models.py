@@ -1479,7 +1479,7 @@ class Size:
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=_row_flag(d, "allowed", "size") is True,
+            allowed=_wire(d, "allowed") is _Wire.TRUE,
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -1642,11 +1642,11 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=_row_flag(d, "incremental", "snapshot") is True,
-            auto=_row_flag(d, "auto", "snapshot") is True,
+            incremental=_wire(d, "incremental") is _Wire.TRUE,
+            auto=_wire(d, "auto") is _Wire.TRUE,
             computer_name=_text(d.get("computer_name")),
-            orphaned=_row_flag(d, "orphaned", "snapshot") is True,
-            computer_unreachable=_row_flag(d, "computer_unreachable", "snapshot") is True,
+            orphaned=_wire(d, "orphaned") is _Wire.TRUE,
+            computer_unreachable=_wire(d, "computer_unreachable") is _Wire.TRUE,
             restore_available=_opt_flag(d, "restore_available"),
             # The same reading `is_unreachable_stub` uses, and it did not match:
             # the filter kept a row whose flag was null or unreadable and then

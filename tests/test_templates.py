@@ -1673,6 +1673,12 @@ def test_force_stop_still_takes_real_bools() -> None:
         (mc.UsageReport, "unmetered", True, "the other half of the same caveat, named with it"),
         (mc.Snapshot, "unreachable", True, "a bare row with no computer_id can only be a stub"),
         (
+            mc.Snapshot,
+            "orphaned",
+            False,
+            "True steers a restore into a clone, which bills a computer",
+        ),
+        (
             mc.Window,
             "visible",
             False,

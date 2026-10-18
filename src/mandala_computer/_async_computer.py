@@ -71,6 +71,7 @@ from ._computer import (
     _empty_guest_file,
     _file_body,
     _guest_not_running,
+    _guest_probe_unavailable,
     _input_batch_outcome,
     _input_batch_refusal,
     _input_context,
@@ -1123,7 +1124,11 @@ class AsyncComputer(ComputerFields):
                 # 400 for a moment where the control plane answers 400 for a
                 # defect, so this one method names it and the shared predicate
                 # does not (OPL-3724).
-                if not (_is_transient_for_poll(err) or _guest_not_running(err)):
+                if not (
+                    _is_transient_for_poll(err)
+                    or _guest_not_running(err)
+                    or _guest_probe_unavailable(err)
+                ):
                     raise
                 # Preserve permanent refusals even at the deadline, as the
                 # sync loop does; only transient failures become timeouts.
