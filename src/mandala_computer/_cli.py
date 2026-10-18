@@ -377,6 +377,12 @@ def _error_info(err: BaseException) -> dict[str, Any]:
             info["reason"] = err.reason
         if err.code is not None:
             info["api_code"] = err.code
+        # How long the platform asked for before another attempt, from its
+        # Retry-After, in milliseconds as ``mandala`` reports it: the one
+        # number a script retrying a 429 or a 503 needs (OPL-6080).
+        after = _retry_after_ms(err)
+        if after is not None:
+            info["retry_after_ms"] = after
         return _with_ids(info, err)
     if isinstance(err, ConnectionInterruptedError):
         return _with_ids({"code": "connection_interrupted", "message": str(err)}, err)
@@ -410,6 +416,34 @@ def _error_info(err: BaseException) -> dict[str, Any]:
             info["details"] = {"errno": errno.errorcode.get(err.errno, str(err.errno))}
         return info
     return {"code": "failed", "message": str(err)}
+
+
+def _retry_after_ms(err: APIError) -> int | None:
+    """``err.retry_after`` in whole milliseconds, or ``None`` when none was sent."""
+    after = err.retry_after
+    if after is None or not math.isfinite(after) or after < 0:
+        return None
+    return math.ceil(after * 1000)
+
+
+def _retry_after_text(ms: int) -> str:
+    """A Retry-After as a person reads it: ``12s``, ``2m 5s``, ``1h 30m``."""
+    seconds = -(-ms // 1000)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m {seconds % 60}s" if seconds % 60 else f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h {minutes % 60}m" if minutes % 60 else f"{hours}h"
+
+
+def _wait_line(err: APIError) -> str | None:
+    """The text-mode line saying how long the platform asked to be left, if it did."""
+    after = _retry_after_ms(err)
+    if after is None:
+        return None
+    return f"{PROG}: the platform asked to wait {_retry_after_text(after)} before trying again"
 
 
 def _with_status(err: APIError, message: str) -> str:
@@ -4576,6 +4610,9 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(e, APIError):
                 message = _with_status(e, message)
             print(f"{PROG}: {message}", file=sys.stderr)
+            wait = _wait_line(e) if isinstance(e, APIError) else None
+            if wait is not None:
+                print(wait, file=sys.stderr)
             recovery = _recovery_line(e, resendable) if isinstance(e, MandalaError) else None
             if recovery is not None:
                 print(recovery, file=sys.stderr)

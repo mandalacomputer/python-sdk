@@ -4280,11 +4280,13 @@ the npm `mandala` CLI reports — `not_found`, `unauthenticated`,
 package's README — never a class name. `status`, the platform's `reason` word
 and the platform's own `code` (as `api_code`, such as `LABEL_TAKEN` or
 `PUBLIC_URL_LIMIT`, which are both a `conflict`) ride beside it when there are
-any, and so do the `request_id`, `idempotency_key` and `operation_id` a failure
+any, and so do `retry_after_ms` (the platform's `Retry-After`, in milliseconds)
+and the `request_id`, `idempotency_key` and `operation_id` a failure
 carries. Without `--json`, a refusal from the platform ends its line with the
 same two facts: `mandala-py: The label "demo" is taken; choose another. (HTTP
-409, LABEL_TAKEN)`, or `(HTTP 404)` when the platform sent no code. A mistyped
-command prints its whole help, not one line.
+409, LABEL_TAKEN)`, or `(HTTP 404)` when the platform sent no code, followed by
+`mandala-py: the platform asked to wait 30s before trying again` when it sent a
+`Retry-After`. A mistyped command prints its whole help, not one line.
 
 Every command whose call is keyed takes `--idempotency-key KEY` (1 to 255
 printable ASCII characters, no space) and sends it instead of a key of its own:
