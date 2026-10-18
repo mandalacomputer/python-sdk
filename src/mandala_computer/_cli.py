@@ -125,9 +125,11 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import httpx
+
 from . import _api, _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
-from ._client import FILE_SIZE_LIMIT, error_for_status
+from ._client import FILE_SIZE_LIMIT, _retry_after, error_for_status
 from ._computer import Computer
 from ._credentials import CredentialError
 from ._defaults import (
@@ -1075,13 +1077,12 @@ def _terminal_refusal(status: int, body: bytes, headers: Any) -> APIError:
 _TERMINAL_RETRY_WAIT_MAX = 10.0
 
 
-def _terminal_retry_delay(err: APIError, attempt: int) -> float | None:
+def _terminal_retry_delay(after: float | None, attempt: int) -> float | None:
     """One second, then two, then three, or the platform's Retry-After when it
     asked for longer; ``None`` when it asked for more than this command waits."""
-    after = err.retry_after
     base = float(attempt + 1)
-    if after is not None and math.isfinite(after):
-        if after > _TERMINAL_RETRY_WAIT_MAX:
+    if after is not None:
+        if not after <= _TERMINAL_RETRY_WAIT_MAX:
             return None
         base = max(base, after)
     return base
@@ -1098,9 +1099,18 @@ def _connect(url: str) -> ClientConnection:
         except InvalidStatus as e:
             response = e.response
             err = _terminal_refusal(response.status_code, bytes(response.body), response.headers)
-            retry_after = response.headers.get("Retry-After") if response.headers else None
-            if retry_after is not None and retry_after.strip().isdigit():
-                err.retry_after = float(retry_after.strip())
+            # Read as every other response's Retry-After is: seconds or an
+            # HTTP date, and an overflow kept as infinity rather than lost.
+            header = response.headers.get("Retry-After") if response.headers else None
+            after = (
+                None
+                if header is None
+                else _retry_after(
+                    httpx.Response(503, headers={"retry-after": header}), for_retry=True
+                )
+            )
+            if after is not None and math.isfinite(after):
+                err.retry_after = after
         except OSError as e:
             _die(f"could not reach the terminal: {_printable(str(e))}")
         except WebSocketException:
@@ -1117,7 +1127,7 @@ def _connect(url: str) -> ClientConnection:
         clears = (err.status in (409, 503) and err.reason == "contention") or (
             err.status == 409 and err.reason == "starting"
         )
-        delay = _terminal_retry_delay(err, attempt) if clears else None
+        delay = _terminal_retry_delay(after, attempt) if clears else None
         if delay is not None and attempt < _TERMINAL_CONTENTION_RETRIES:
             time.sleep(delay)
             attempt += 1
@@ -1719,6 +1729,8 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                         computer.cancel_file_upload(remote_path, progress.upload_id, no_wake=True)
                     except MandalaError:
                         cleanup_upload_id = progress.upload_id
+                    except KeyboardInterrupt:
+                        return _cleanup_interrupted(progress.upload_id, args.json)
                 else:
                     sent = len(data)
                     stored = computer.write_file(remote_path, data, overwrite=not args.no_overwrite)
@@ -1793,6 +1805,27 @@ def _upload_interrupted(stopped: KeyboardInterrupt, as_json: bool) -> int:
         if isinstance(upload_id, str):
             info["upload_id"] = upload_id
         _json_failure(info)
+    else:
+        print(f"{PROG}: {message}", file=sys.stderr)
+    return 130
+
+
+def _cleanup_interrupted(upload_id: str, as_json: bool) -> int:
+    """Ctrl-C while removing a published upload's receipt: the file is in place,
+    and the receipt's id is reported so it can still be removed; 130."""
+    message = (
+        f"the file is in place, but removing its upload receipt {_printable(upload_id)} was "
+        "interrupted; it holds guest disk until it is cancelled"
+    )
+    if as_json:
+        _json_failure(
+            {
+                "code": "cancelled",
+                "message": message,
+                "upload_id": upload_id,
+                "upload_complete": True,
+            }
+        )
     else:
         print(f"{PROG}: {message}", file=sys.stderr)
     return 130

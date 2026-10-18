@@ -1408,7 +1408,9 @@ def _poll_409_clears(err: APIError, settles: bool) -> bool:
     a refusal that may never clear (OPL-6080).
     """
     body = err.body if isinstance(err.body, dict) else {}
-    code = body.get("code")
+    # The shape-checked code: a body's ``code`` that is not a string (``{}``)
+    # is no code, rather than a TypeError out of the membership tests.
+    code = err.code
     if code in _CODE_FINAL_TO_A_WAIT:
         return False
     if err.reason in _REASON_PERMANENT:

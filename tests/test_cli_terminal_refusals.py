@@ -177,3 +177,17 @@ def test_a_short_retry_after_is_honoured(monkeypatch: pytest.MonkeyPatch) -> Non
     connecting(monkeypatch, refused(503, busy, **{"Retry-After": "7"}), ws)
     assert _cli._connect("wss://terminal.test") is ws
     assert slept == [7.0]
+
+
+def test_an_http_date_retry_after_is_read_and_not_shortened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from email.utils import formatdate
+
+    when = formatdate(time.time() + 120, usegmt=True)
+    busy = {"error": "another terminal is still being set up", "reason": "contention"}
+    seen = connecting(monkeypatch, refused(503, busy, **{"Retry-After": when}), object())
+    with pytest.raises(_cli.UnavailableError) as caught:
+        _cli._connect("wss://terminal.test")
+    assert len(seen) == 1
+    assert caught.value.retry_after is not None and caught.value.retry_after > 100

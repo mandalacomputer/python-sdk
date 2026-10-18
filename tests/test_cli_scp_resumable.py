@@ -199,3 +199,26 @@ def test_a_source_that_changes_mid_upload_still_names_the_upload_id(
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["code"] == "invalid_arguments"
     assert re.fullmatch(r"[a-f0-9]{32}", error["upload_id"])
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@respx.mock
+def test_ctrl_c_while_removing_the_receipt_names_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=LINUX))
+    respx.put(UPLOADS).mock(side_effect=staged)
+
+    def stop(_request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    respx.delete(UPLOADS).mock(side_effect=stop)
+    argv = ["scp", str(source(tmp_path)), "dev:/home/user/big.bin"]
+    assert _cli.main(argv + (["--json"] if as_json else [])) == 130
+    err = capsys.readouterr().err
+    if as_json:
+        error = json.loads(err)["error"]
+        assert error["code"] == "cancelled" and error["upload_complete"] is True
+        assert re.fullmatch(r"[a-f0-9]{32}", error["upload_id"])
+    else:
+        assert re.search(r"the file is in place, but removing its upload receipt [a-f0-9]{32}", err)

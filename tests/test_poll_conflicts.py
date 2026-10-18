@@ -57,6 +57,9 @@ def conflict(**body: Any) -> mc.ConflictError:
         (conflict(), True, True),
         (conflict(reason="a-word-from-the-future"), False, False),
         (conflict(reason="a-word-from-the-future"), True, True),
+        # A code that is not a string is no code, not a TypeError.
+        (conflict(code={}, reason="contention"), False, True),
+        (conflict(code=[]), False, False),
     ],
 )
 def test_a_poll_reads_the_409s_word(err: mc.ConflictError, settling: bool, polled: bool) -> None:
@@ -182,3 +185,22 @@ async def test_async_operations_wait_polls_through_contention() -> None:
         op = await c.operations.wait(OP_ID, timeout=30, poll=0.01)
     assert op.state == "succeeded"
     assert len(route.calls) == 2
+
+
+@respx.mock
+async def test_a_malformed_code_does_not_crash_either_wait() -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(return_value=httpx.Response(200, json=COMPUTER))
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        side_effect=[
+            httpx.Response(409, json={"error": "busy", "code": {}, "reason": "contention"}),
+            httpx.Response(200, json=OK),
+            httpx.Response(409, json={"error": "busy", "code": [], "reason": "contention"}),
+            httpx.Response(200, json=OK),
+        ]
+    )
+    with client() as c:
+        computer = c.computers.get("vm-1")
+        assert computer.wait_for_guest(timeout=30, poll=0.01) is computer
+    async with aclient() as ac:
+        acomputer = await ac.computers.get("vm-1")
+        assert await acomputer.wait_for_guest(timeout=30, poll=0.01) is acomputer
