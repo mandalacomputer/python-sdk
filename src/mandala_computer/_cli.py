@@ -116,6 +116,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -126,7 +127,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import _api, _openssh
 from ._api import _JS_TRIM, looks_windows_guest_path
-from ._client import FILE_SIZE_LIMIT
+from ._client import FILE_SIZE_LIMIT, error_for_status
 from ._computer import Computer
 from ._credentials import CredentialError
 from ._defaults import (
@@ -1012,6 +1013,10 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
         if c.status not in ("running", "suspended"):
             _die(lambda s: f"{s(c.name)} is {s(c.status or 'not running')} — start it, then retry")
         _die(lambda s: f"{s(c.name)} has no terminal endpoint (server too old?)")
+    if c.status == "suspended":
+        # Unlike the rest of the API, the terminal route does not resume a
+        # suspended computer: it refuses with ``resume_required`` (OPL-6080).
+        _die(lambda s: f"{s(c.name)} is {_SUSPENDED_TERMINAL}", "not_running")
     url = vnc.terminal_url
     params: list[tuple[str, str]] = []
     if args.session != "main":
@@ -1033,31 +1038,84 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
     return _interact(url)
 
 
+#: What a suspended computer is told: the terminal does not resume it.
+_SUSPENDED_TERMINAL = "suspended, and opening a terminal does not resume it — start it, then retry"
+
+#: How many more times a terminal refused with ``contention`` is opened again.
+#: The refusal says another terminal on the computer is part way through its
+#: first-time setup, which takes a few seconds and clears by itself.
+_TERMINAL_CONTENTION_RETRIES = 3
+
+
+def _terminal_refusal(status: int, body: bytes, headers: Any) -> APIError:
+    """The refusal of a terminal upgrade, as the SDK's error for its status.
+
+    So the line printed is the platform's own sentence followed by ``(HTTP
+    409)`` or ``(HTTP 409, CODE)``, and the request id after it, as every other
+    command's failure is (OPL-6080).
+    """
+    try:
+        parsed: object = json.loads(body) if body else None
+    except ValueError:
+        parsed = None
+    data = parsed if isinstance(parsed, dict) else {}
+    text = data.get("error")
+    message = text if isinstance(text, str) and text.strip() else "terminal refused"
+    if "request_id" not in data:
+        request_id = headers.get("X-Request-ID") if headers is not None else None
+        if isinstance(request_id, str) and request_id:
+            data = {**data, "request_id": request_id}
+    return error_for_status(status, message, data or None, keep_reason=True)
+
+
+def _terminal_retry_delay(err: APIError, attempt: int) -> float:
+    """One second, then two, then three — or the platform's Retry-After, capped at ten."""
+    after = err.retry_after
+    base = float(attempt + 1)
+    if after is not None and math.isfinite(after):
+        base = max(base, after)
+    return min(base, 10.0)
+
+
 def _connect(url: str) -> ClientConnection:
     from websockets.exceptions import InvalidStatus, WebSocketException
     from websockets.sync.client import connect
 
-    try:
-        return connect(url, max_size=_MAX_FRAME, compression=None)
-    except InvalidStatus as e:
-        status = e.response.status_code
-        if status == 409:
-            # The terminal channel is added to a computer at cold boot only —
-            # a machine running since before its host learned the feature
-            # answers 409 until it picks the device up.
-            _die(
-                "this computer predates the terminal channel — "
-                "stop it and start it again (a restart is not enough), then retry"
-            )
-        _die(f"terminal refused: HTTP {status}")
-    except OSError as e:
-        unreachable = str(e)
-        _die(lambda s: f"could not reach the terminal: {s(unreachable)}")
-    except WebSocketException:
-        # Not ``str(e)``: ``InvalidURI`` includes the full URI, and
-        # ``terminal_url`` carries a credential with no expiry. The
-        # ``InvalidStatus`` branch above already prints a token-free sentence.
-        _die("could not open the terminal")
+    attempt = 0
+    while True:
+        try:
+            return connect(url, max_size=_MAX_FRAME, compression=None)
+        except InvalidStatus as e:
+            response = e.response
+            err = _terminal_refusal(response.status_code, bytes(response.body), response.headers)
+            retry_after = response.headers.get("Retry-After") if response.headers else None
+            if retry_after is not None and retry_after.strip().isdigit():
+                err.retry_after = float(retry_after.strip())
+        except OSError as e:
+            _die(f"could not reach the terminal: {_printable(str(e))}")
+        except WebSocketException:
+            # Not ``str(e)``: ``InvalidURI`` includes the full URI, and
+            # ``terminal_url`` carries a credential with no expiry. The
+            # ``InvalidStatus`` branch above prints only the platform's
+            # sentence, which carries no token.
+            _die("could not open the terminal")
+        body = err.body if isinstance(err.body, dict) else {}
+        if err.status == 409 and body.get("resume_required") is True:
+            _die(f"this computer is {_SUSPENDED_TERMINAL}", "not_running")
+        if err.status == 409 and err.reason == "unavailable":
+            _die("this computer is not running — start it, then retry", "not_running")
+        clears = (err.status in (409, 503) and err.reason == "contention") or (
+            err.status == 409 and err.reason == "starting"
+        )
+        if clears and attempt < _TERMINAL_CONTENTION_RETRIES:
+            time.sleep(_terminal_retry_delay(err, attempt))
+            attempt += 1
+            continue
+        # Everything else is the platform's own sentence and status: the
+        # computer that predates the terminal channel (``unsupported``, which
+        # says to stop and start it), the session or connection limits (a 409
+        # with no word), a broker that could not be reached (502).
+        raise err
 
 
 #: What ``mandala terminal`` returns when it cannot report the command's status —

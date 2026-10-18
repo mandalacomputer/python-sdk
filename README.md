@@ -4354,10 +4354,15 @@ guest holds. A file over 2 GiB is refused before it is read.
 `--no-overwrite` makes an upload create-only: a guest path that is already
 taken is refused, and that upload writes nothing. It is refused on a download.
 
-Two answers worth recognizing: a computer that predates the terminal feature
-answers 409 until it is stopped and started again (a restart is not enough,
-deliberately — a resumed session must match its saved device topology), and
-Windows guests have no terminal yet.
+A few answers worth recognizing. A suspended computer is not resumed by
+`terminal`, unlike the rest of the API: it is refused, and the fix is to start
+it, then retry. A computer that predates the terminal feature answers 409 until
+it is stopped and started again (a restart is not enough, deliberately — a
+resumed session must match its saved device topology). A `503` with
+`reason: "contention"` means another terminal on the computer is part way
+through its first-time setup; `terminal` opens it again a few times before
+giving up. Any other refusal prints the platform's sentence with its status and
+code, as every other command does. Windows guests have no terminal yet.
 
 `webhooks` is the CRUD from the section above, and only that — the CLI does not
 receive webhooks; a receiver is a server, and `verify` is what it calls.
