@@ -14,6 +14,7 @@ from mandala_computer import (
     ConnectionInterruptedError,
     RateLimitError,
     TimeoutError,
+    UnavailableError,
     _client,
 )
 from mandala_computer._client import AsyncTransport
@@ -344,7 +345,7 @@ async def test_timeout_cap_deducts_monotonic_elapsed_time(delays, monkeypatch):
         now[0] += 0.6
         return httpx.Response(503, json={})
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(UnavailableError):
         await make(handler, {"idempotent": 5}).json("GET", "/computers", timeout_cap=1.6)
     assert caps == pytest.approx([1.6, 0.75])
 
@@ -356,7 +357,7 @@ async def test_huge_retry_after_cannot_exceed_explicit_budget(delays):
         calls.append(request)
         return httpx.Response(503, headers={"Retry-After": "9999999999999999999999999"})
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(UnavailableError):
         await make(handler, {"idempotent": 2}).json("GET", "/computers", timeout_cap=1)
     assert len(calls) == 1
     assert delays == []
@@ -729,14 +730,14 @@ async def test_overflowing_numeric_retry_after_cannot_bypass_budget(digits, dela
         calls.append(request)
         return httpx.Response(503, headers={"Retry-After": "9" * digits})
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(UnavailableError):
         await make(handler, {"idempotent": 2}).json("GET", "/computers", timeout_cap=1)
     assert len(calls) == 1
     assert delays == []
 
 
 @pytest.mark.parametrize("kind", ["json", "bounded", "sse"])
-async def test_overflowing_header_uses_interruptible_long_wait_without_cap(kind, monkeypatch):
+async def test_overflowing_header_without_a_budget_raises_the_answer(kind, monkeypatch):
     import asyncio
 
     calls, waits = [], []
@@ -754,14 +755,14 @@ async def test_overflowing_header_uses_interruptible_long_wait_without_cap(kind,
         return httpx.Response(503, headers={"Retry-After": "9" * 309})
 
     t = make(handler, {"idempotent": 2})
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(UnavailableError):
         if kind == "sse":
             await anext(t.sse("GET", "/builds/b/events"))
         elif kind == "bounded":
             await t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
         else:
             await t.json("GET", "/computers")
-    assert waits == [86400.0]
+    assert waits == []
     assert len(calls) == 1
 
 
@@ -1781,7 +1782,31 @@ async def test_native_http2_goaway_keeps_huge_retry_after_and_status(status, del
         t = AsyncTransport(
             "test", base_url="https://example.test", client=http, retries={"idempotent": 2}
         )
-        with pytest.raises(RateLimitError if status == 429 else TimeoutError):
+        with pytest.raises(RateLimitError if status == 429 else UnavailableError):
             await t.json("GET", "/computers", timeout_cap=1)
         assert wire.calls == 1 and delays == []
         assert wire.streams[0].response_sent and wire.streams[0].closed
+
+
+async def test_a_retry_after_past_the_unbudgeted_cap_raises_the_answer(delays):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503, headers={"Retry-After": "3600"})
+
+    with pytest.raises(UnavailableError) as caught:
+        await make(handler, {"idempotent": 3}).json("GET", "/computers")
+    assert caught.value.retry_after == 3600
+    assert not isinstance(caught.value, TimeoutError)
+    assert len(calls) == 1 and delays == []
+
+
+async def test_a_retry_past_the_budget_raises_the_503_not_a_timeout(delays):
+    def handler(request):
+        return httpx.Response(503, headers={"Retry-After": "20"})
+
+    with pytest.raises(UnavailableError) as caught:
+        await make(handler, {"idempotent": 3}).json("GET", "/computers", timeout_cap=10)
+    assert caught.value.retry_after == 20
+    assert delays == []

@@ -14,6 +14,7 @@ from mandala_computer import (
     ConnectionInterruptedError,
     RateLimitError,
     TimeoutError,
+    UnavailableError,
     _client,
 )
 from mandala_computer._client import Transport
@@ -342,7 +343,7 @@ def test_timeout_cap_deducts_monotonic_elapsed_time(delays, monkeypatch):
         now[0] += 0.6
         return httpx.Response(503, json={})
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(UnavailableError):
         make(handler, {"idempotent": 5}).json("GET", "/computers", timeout_cap=1.6)
     assert caps == pytest.approx([1.6, 0.75])
 
@@ -354,7 +355,7 @@ def test_huge_retry_after_cannot_exceed_explicit_budget(delays):
         calls.append(request)
         return httpx.Response(503, headers={"Retry-After": "9999999999999999999999999"})
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(UnavailableError):
         make(handler, {"idempotent": 2}).json("GET", "/computers", timeout_cap=1)
     assert len(calls) == 1
     assert delays == []
@@ -651,14 +652,14 @@ def test_overflowing_numeric_retry_after_cannot_bypass_budget(digits, delays):
         calls.append(request)
         return httpx.Response(503, headers={"Retry-After": "9" * digits})
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(UnavailableError):
         make(handler, {"idempotent": 2}).json("GET", "/computers", timeout_cap=1)
     assert len(calls) == 1
     assert delays == []
 
 
 @pytest.mark.parametrize("kind", ["json", "bounded", "sse"])
-def test_overflowing_header_uses_interruptible_long_wait_without_cap(kind, monkeypatch):
+def test_overflowing_header_without_a_budget_raises_the_answer(kind, monkeypatch):
 
     calls, waits = [], []
 
@@ -675,14 +676,14 @@ def test_overflowing_header_uses_interruptible_long_wait_without_cap(kind, monke
         return httpx.Response(503, headers={"Retry-After": "9" * 309})
 
     t = make(handler, {"idempotent": 2})
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(UnavailableError):
         if kind == "sse":
             next(t.sse("GET", "/builds/b/events"))
         elif kind == "bounded":
             t.bounded_binary("GET", "/computers/vm/results/r/output", max_bytes=10)
         else:
             t.json("GET", "/computers")
-    assert waits == [86400.0]
+    assert waits == []
     assert len(calls) == 1
 
 
@@ -1686,7 +1687,50 @@ def test_native_http2_goaway_keeps_huge_retry_after_and_status(status, delays):
         t = Transport(
             "test", base_url="https://example.test", client=http, retries={"idempotent": 2}
         )
-        with pytest.raises(RateLimitError if status == 429 else TimeoutError):
+        with pytest.raises(RateLimitError if status == 429 else UnavailableError):
             t.json("GET", "/computers", timeout_cap=1)
         assert wire.calls == 1 and delays == []
         assert wire.streams[0].response_sent and wire.streams[0].closed
+
+
+def test_a_retry_after_past_the_unbudgeted_cap_raises_the_answer(delays):
+    """With no budget, a wait longer than the request deadline is not slept.
+
+    The 503 itself is raised, with the interval the platform asked for, so the
+    caller decides whether to wait an hour (OPL-6080).
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503, headers={"Retry-After": "3600"})
+
+    with pytest.raises(UnavailableError) as caught:
+        make(handler, {"idempotent": 3}).json("GET", "/computers")
+    assert caught.value.retry_after == 3600
+    assert not isinstance(caught.value, TimeoutError)
+    assert len(calls) == 1 and delays == []
+
+
+def test_a_retry_after_inside_the_unbudgeted_cap_is_waited(delays):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, headers={"Retry-After": "45"})
+        return httpx.Response(200, json={})
+
+    assert make(handler, {"idempotent": 1}).json("GET", "/computers") == {}
+    assert delays == [45]
+
+
+def test_a_retry_past_the_budget_raises_the_503_not_a_timeout(delays):
+    def handler(request):
+        return httpx.Response(503, headers={"Retry-After": "20"})
+
+    with pytest.raises(UnavailableError) as caught:
+        make(handler, {"idempotent": 3}).json("GET", "/computers", timeout_cap=10)
+    assert caught.value.retry_after == 20
+    assert not isinstance(caught.value, TimeoutError)
+    assert delays == []

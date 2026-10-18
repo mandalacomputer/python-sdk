@@ -59,6 +59,14 @@ DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
 #: request; see :meth:`_BaseTransport._budget`.
 DEFAULT_TIMEOUT = 60.0
 
+#: The longest one transport retry may wait, when the call set no budget.
+#:
+#: A ``Retry-After`` longer than this raises the error it came with, carrying
+#: ``retry_after``, instead of sleeping: the caller decides whether to wait that
+#: long. The ordinary request deadline, which is where the TypeScript client
+#: stops waiting as well.
+MAX_UNBUDGETED_RETRY_WAIT = DEFAULT_TIMEOUT
+
 #: Added to a guest-side deadline to get the client's.
 #:
 #: The platform holds an ``exec`` open for ``timeout_s + 5s`` before giving up
@@ -1426,11 +1434,16 @@ class _Retry:
             if after is not None:
                 delay = max(delay, after)
         self.attempt += 1
-        left = self.remaining()
-        if left is not None and delay >= left:
-            raise _timed_out(
-                self.method, self.path, httpx.ReadTimeout("retry exceeds request budget")
-            )
+        # A wait that will not fit raises the platform's own answer — the 503
+        # and its ``retry_after`` — rather than a timeout: a timeout says the
+        # outcome is unknown, and here the platform said what it was and when
+        # to ask again (OPL-6080, as the TypeScript client does). With a
+        # budget, the wait has to end inside it; without one, it may not pass
+        # the ordinary request deadline, so a misbehaving edge asking for an
+        # hour cannot park a read for an hour behind a call that set no limit.
+        left = None if self.deadline is None else self.deadline - time.monotonic()
+        if delay >= (MAX_UNBUDGETED_RETRY_WAIT if left is None else left):
+            raise exc
         return delay
 
 

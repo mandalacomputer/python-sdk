@@ -3844,7 +3844,11 @@ A valid `Retry-After` is a lower bound on that delay, including HTTP dates and
 zero. Very large valid delays never fall back to a shorter wait. Cancellation
 and timeout failures end the operation. An explicit caller
 `timeout_cap`, such as a wait helper's remaining budget, shrinks by monotonic
-elapsed time across attempts and backoff; a retry that cannot fit is refused.
+elapsed time across attempts and backoff; a retry that cannot fit is not made.
+Without a budget, one retry waits at most 60 seconds (the default request
+timeout). Either way, a wait that will not fit raises the platform's own error,
+such as the `UnavailableError` with its `retry_after`, rather than a timeout:
+the platform did answer, and said when to ask again.
 Ordinary httpx connect/read/write/pool timeouts remain phase-specific and do
 **not** impose a total wall-clock deadline on a read or its retries.
 
