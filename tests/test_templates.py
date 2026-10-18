@@ -890,7 +890,13 @@ def test_a_list_field_that_is_not_a_list_degrades_rather_than_raising(
 def test_the_other_list_fields_degrade_too() -> None:
     assert mc.RetiredTemplates.from_api({"retired": 7}).retired == []
     assert mc.TemplateCheck.from_api({"problems": 7}).problems == []
-    assert mc.BuildProgress.from_api({"steps": "nope"}).steps == []
+    # Not the steps, which are a list of what the build is doing: one that is
+    # not a list, or a step that is not an object, fails the read (OPL-6080).
+    with pytest.raises(mc.MandalaError, match="steps is not a list"):
+        mc.BuildProgress.from_api({"steps": "nope"})
+    with pytest.raises(mc.MandalaError, match="step 1 is not an object"):
+        mc.BuildProgress.from_api({"steps": [{"n": 1}, "two"]})
+    assert mc.BuildProgress.from_api({"steps": None}).steps == []
 
 
 # --- and the async half, which has the same two loops ----------------------
@@ -1082,7 +1088,10 @@ def test_a_trailing_newline_is_not_a_version() -> None:
         (mc.ConflictError("busy", status=409, body={"code": "idempotency_in_progress"}), True),
         (mc.ConflictError("busy", status=409), False),
         (mc.ConflictError("taken", status=409, body={"reason": "unsupported"}), False),
-        (mc.ConflictError("unknown", status=409, body={"code": "idempotency_outcome_unknown"}), False),
+        (
+            mc.ConflictError("unknown", status=409, body={"code": "idempotency_outcome_unknown"}),
+            False,
+        ),
         (mc.RateLimitError("slow down", status=429), True),
         (mc.UnavailableError("no host", status=503), True),
         (mc.GatewayTimeoutError("gateway", status=504), True),
@@ -1664,12 +1673,6 @@ def test_force_stop_still_takes_real_bools() -> None:
         (mc.UsageReport, "unmetered", True, "the other half of the same caveat, named with it"),
         (mc.Snapshot, "unreachable", True, "a bare row with no computer_id can only be a stub"),
         (
-            mc.Snapshot,
-            "orphaned",
-            False,
-            "True steers a restore into a clone, which bills a computer",
-        ),
-        (
             mc.Window,
             "visible",
             False,
@@ -1686,7 +1689,8 @@ def test_every_wire_boolean_fails_the_safe_way_for_its_own_field(
     switch, so a cautious True made the loop in ``start_exec``'s own docstring
     neither break nor sleep (/code-review, OPL-3835).
     """
-    decoded = model.from_api({field: "maybe"})
+    # A snapshot row carries its id, which every snapshot is refused without.
+    decoded = model.from_api({**({"id": "snap-1"} if model is mc.Snapshot else {}), field: "maybe"})
     assert getattr(decoded, field) is cautious, steers
     assert decoded.raw[field] == "maybe"
 

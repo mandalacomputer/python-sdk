@@ -144,7 +144,9 @@ async def test_starting_a_computer_that_is_still_building_raises_conflict(
     client: mc.AsyncClient,
 ) -> None:
     respx.post(f"{BASE}/computers/vm-new/start").mock(
-        return_value=httpx.Response(409, json={"error": "still being copied", "reason": "contention"})
+        return_value=httpx.Response(
+            409, json={"error": "still being copied", "reason": "contention"}
+        )
     )
     with pytest.raises(mc.ConflictError):
         await mc.AsyncComputer(client._t, BUILDING).start()

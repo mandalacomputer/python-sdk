@@ -1252,7 +1252,7 @@ class TemplateBuild:
     def from_api(cls, d: Mapping[str, Any]) -> TemplateBuild:
         finished = d.get("finished_at")
         return cls(
-            id=_text(d.get("id")),
+            id=_row_id(d, "id", "build"),
             ref=_text(d.get("ref")),
             status=_text(d.get("status")),
             error=_text(d.get("error")),
@@ -1427,8 +1427,7 @@ class BuildProgress:
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> BuildProgress:
-        rows = d.get("steps")
-        rows = rows if isinstance(rows, builtins.list) else []
+        rows = _present_list(d.get("steps"), "build progress", "steps")
         return cls(
             id=_text(d.get("id")),
             status=_text(d.get("status")),
@@ -1436,7 +1435,7 @@ class BuildProgress:
             phase=_text(d.get("phase")),
             step=_num(d.get("step")),
             of=_num(d.get("of")),
-            steps=[BuildStep.from_api(r) for r in rows if isinstance(r, Mapping)],
+            steps=[BuildStep.from_api(r) for r in _page_rows(rows, "build progress", "step")],
             note=_text(d.get("note")),
             error=_text(d.get("error")),
             updated_at=_text(d.get("updated_at")),
@@ -1473,13 +1472,14 @@ class Size:
     def from_api(cls, d: Mapping[str, Any]) -> Size:
         cheapest_plan = d.get("cheapest_plan")
         return cls(
-            id=_text(d.get("id")),
+            # The id is what a create names; "" would be sent as a size.
+            id=_row_id(d, "id", "size"),
             label=_text(d.get("label")),
             template=_text(d.get("template")),
             cpu=_num(d.get("cpu")),
             ram_mb=_num(d.get("ram_mb")),
             disk_gb=_num(d.get("disk_gb")),
-            allowed=_wire(d, "allowed") is _Wire.TRUE,
+            allowed=_row_flag(d, "allowed", "size") is True,
             cheapest_plan=None if cheapest_plan is None else _text(cheapest_plan),
             raw=dict(d),
         )
@@ -1626,7 +1626,10 @@ class Snapshot:
     @classmethod
     def from_api(cls, d: Mapping[str, Any]) -> Snapshot:
         return cls(
-            id=_text(d.get("id")),
+            # Required, stub or not: the documented stub is an id and its flag,
+            # and a row with no id decoded as "" sent the next delete or
+            # restore to a path that names nothing (OPL-6080).
+            id=_row_id(d, "id", "snapshot"),
             computer_id=_text(d.get("computer_id")),
             name=_text(d.get("name")),
             # `or "disk"` rather than a `dict.get` default, which answers a
@@ -1639,11 +1642,11 @@ class Snapshot:
             state=_text(d.get("state")),
             size_bytes=_num(d.get("size_bytes")),
             created_at=_text(d.get("created_at")),
-            incremental=_wire(d, "incremental") is _Wire.TRUE,
-            auto=_wire(d, "auto") is _Wire.TRUE,
+            incremental=_row_flag(d, "incremental", "snapshot") is True,
+            auto=_row_flag(d, "auto", "snapshot") is True,
             computer_name=_text(d.get("computer_name")),
-            orphaned=_wire(d, "orphaned") is _Wire.TRUE,
-            computer_unreachable=_wire(d, "computer_unreachable") is _Wire.TRUE,
+            orphaned=_row_flag(d, "orphaned", "snapshot") is True,
+            computer_unreachable=_row_flag(d, "computer_unreachable", "snapshot") is True,
             restore_available=_opt_flag(d, "restore_available"),
             # The same reading `is_unreachable_stub` uses, and it did not match:
             # the filter kept a row whose flag was null or unreadable and then
@@ -2125,10 +2128,11 @@ class UsageTotals:
             snapshot_gb_months=_real(d.get("snapshot_gb_months")),
             disk_gb_hours=_real(d.get("disk_gb_hours")),
             disk_gb_months=_real(d.get("disk_gb_months")),
+            # A row that cannot be read fails the read rather than leaving a
+            # breakdown that no longer adds up to its totals (OPL-6080).
             computers=tuple(
                 ComputerUsage.from_api(c)
-                for c in (rows if isinstance(rows, list) else [])
-                if isinstance(c, Mapping)
+                for c in _page_rows(_present_list(rows, "usage", "computers"), "usage", "row")
             ),
         )
 
@@ -3443,7 +3447,7 @@ class Webhook:
             "url": _text(d.get("url")),
             "description": _text(d.get("description")),
             "events": _texts(d.get("events")),
-            "computers": _texts(d.get("computers")),
+            "computers": _row_ids(d.get("computers"), where, "computers"),
             "enabled": enabled is _Wire.TRUE,
             "disabled_reason": _opt_text(d.get("disabled_reason")),
             "disabled_at": _opt_text(d.get("disabled_at")),
@@ -4342,8 +4346,9 @@ class GuestDirectory:
                 type=_text(row.get("type")),
                 size_bytes=_opt_whole(row.get("size_bytes")),
             )
-            for row in rows
-            if isinstance(row, Mapping)
+            # Refused rather than skipped: a listing one entry short reads as
+            # a complete one (OPL-6080).
+            for row in _page_rows(rows, "GET computers/:id/files/list", "entry")
         ]
         # A partial listing read as complete is the one misreading that matters,
         # so anything but a plain "false" leaves the flag set.
@@ -4395,6 +4400,28 @@ def _page_rows(rows: builtins.list[Any], where: str, what: str) -> builtins.list
         if not isinstance(row, Mapping):
             raise MandalaError(f"{where}: {what} {i} is not an object")
         out.append(row)
+    return out
+
+
+def _present_list(value: Any, where: str, key: str) -> builtins.list[Any]:
+    """A list field the platform may leave out (or send ``null``), read as empty,
+    and :class:`MandalaError` when it is present as anything but a list."""
+    if value is None:
+        return []
+    if not isinstance(value, builtins.list):
+        raise MandalaError(f"{where}: {key} is not a list")
+    return value
+
+
+def _row_ids(value: Any, where: str, key: str) -> builtins.list[str]:
+    """A list of ids: empty when absent or ``null``, and :class:`MandalaError`
+    for anything else that is not a list of non-empty strings. A webhook's
+    ``computers`` read as empty is a filter read as "every computer"."""
+    out: builtins.list[str] = []
+    for item in _present_list(value, where, key):
+        if not isinstance(item, str) or not item:
+            raise MandalaError(f"{where}: {key} holds an entry that is not an id")
+        out.append(str.__str__(item))
     return out
 
 

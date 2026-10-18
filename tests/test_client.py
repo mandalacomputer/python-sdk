@@ -4004,11 +4004,11 @@ def test_null_model_fields_are_normalized_without_losing_the_row() -> None:
         {"name": None, "label": None, "os": None, "cpu": None, "ram_mb": None, "disk_gb": None}
     )
     size = mc.Size.from_api(
-        {"id": None, "label": None, "template": None, "cpu": None, "ram_mb": None, "disk_gb": None}
+        {"id": "s-1", "label": None, "template": None, "cpu": None, "ram_mb": None, "disk_gb": None}
     )
     snapshot = mc.Snapshot.from_api(
         {
-            "id": None,
+            "id": "snap-1",
             "computer_id": None,
             "name": None,
             "state": None,
@@ -4030,8 +4030,13 @@ def test_null_model_fields_are_normalized_without_losing_the_row() -> None:
     )
 
     assert (template.name, template.cpu, template.ram_mb, template.disk_gb) == ("", 0, 0, 0)
-    assert (size.id, size.label, size.cpu, size.ram_mb, size.disk_gb) == ("", "", 0, 0, 0)
-    assert (snapshot.id, snapshot.state, snapshot.size_bytes, snapshot.cpu) == ("", "", 0, 0)
+    assert (size.id, size.label, size.cpu, size.ram_mb, size.disk_gb) == ("s-1", "", 0, 0, 0)
+    assert (snapshot.id, snapshot.state, snapshot.size_bytes, snapshot.cpu) == ("snap-1", "", 0, 0)
+    # The one field that is not normalised: an id is what the next call names,
+    # and "" would name nothing (OPL-6080).
+    for model in (mc.Size, mc.Snapshot):
+        with pytest.raises(mc.MandalaError, match="no usable id"):
+            model.from_api({"id": None})
     assert (holdings.count, holdings.size_bytes, holdings.fingerprint) == (0, 0, "")
     # The window is the exception on this list, and OPL-4200 is why: a null
     # `cpu` or `size_bytes` normalises to a zero that reads as "nothing
@@ -4054,7 +4059,7 @@ def test_a_boolean_where_a_number_belongs_is_unusable_rather_than_one() -> None:
     """
     template = mc.Template.from_api({"cpu": True, "ram_mb": True, "disk_gb": True})
     assert (template.cpu, template.ram_mb, template.disk_gb) == (0, 0, 0)
-    assert mc.Snapshot.from_api({"size_bytes": True}).size_bytes == 0
+    assert mc.Snapshot.from_api({"id": "snap-1", "size_bytes": True}).size_bytes == 0
     usage = mc.ComputerUsage.from_api({"id": "vm-1", "run_hours": True, "vcpu_hours": True})
     assert (usage.run_hours, usage.vcpu_hours) == (0.0, 0.0)
 
@@ -4068,11 +4073,11 @@ def test_a_null_snapshot_kind_is_still_a_disk_snapshot() -> None:
     `kind ==` comparison reading an unclassified snapshot (adversarial review,
     OPL-4479).
     """
-    for body in ({}, {"kind": None}):
+    for body in ({"id": "snap-1"}, {"id": "snap-1", "kind": None}):
         snapshot = mc.Snapshot.from_api(body)
         assert snapshot.kind == "disk", body
         assert snapshot.is_memory is False, body
-    assert mc.Snapshot.from_api({"kind": "memory"}).is_memory is True
+    assert mc.Snapshot.from_api({"id": "snap-1", "kind": "memory"}).is_memory is True
 
 
 def test_null_computer_string_fields_are_empty() -> None:
