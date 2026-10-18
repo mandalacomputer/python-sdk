@@ -222,3 +222,29 @@ def test_ctrl_c_while_removing_the_receipt_names_it(
         assert re.fullmatch(r"[a-f0-9]{32}", error["upload_id"])
     else:
         assert re.search(r"the file is in place, but removing its upload receipt [a-f0-9]{32}", err)
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ({"error": "a file is there", "reason": "exists"}, "exists"),
+        ({"error": "conflict"}, "conflict"),
+    ],
+)
+@respx.mock
+def test_a_create_only_refusal_after_a_staged_chunk_keeps_the_upload_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], body: dict[str, str], code: str
+) -> None:
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=LINUX))
+    respx.put(UPLOADS).mock(
+        side_effect=[
+            lambda request: staged(request),
+            httpx.Response(409, json=body),
+        ]
+    )
+    src = source(tmp_path, b"x" * (4 * 1024 * 1024 + 10))
+    argv = ["scp", "--no-overwrite", str(src), "dev:/home/user/big.bin", "--json"]
+    assert _cli.main(argv) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == code
+    assert re.fullmatch(r"[a-f0-9]{32}", error["upload_id"])

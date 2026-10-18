@@ -218,10 +218,19 @@ class _Failure(SystemExit):
     prints to a terminal. See :func:`_die`.
     """
 
-    def __init__(self, message: str, reason: str, shown: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        reason: str,
+        shown: str | None = None,
+        ids: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(f"{PROG}: {message if shown is None else shown}")
         self.message = message
         self.reason = reason
+        #: Ids ``--json`` reports beside ``code`` and ``message``, such as the
+        #: ``upload_id`` of a refused resumable upload whose staging remains.
+        self.ids = dict(ids or {})
 
 
 #: How a message spells a value from a response: ``str`` for ``--json``'s
@@ -234,7 +243,11 @@ def _shown(value: object) -> str:
     return _printable(str(value))
 
 
-def _die(message: str | Callable[[_Spell], str], code: str = "failed") -> NoReturn:
+def _die(
+    message: str | Callable[[_Spell], str],
+    code: str = "failed",
+    ids: Mapping[str, str] | None = None,
+) -> NoReturn:
     """Refuse with ``message``, under the ``--json`` ``error.code`` ``code``.
 
     A message that quotes a value from a response (a computer's name, a
@@ -246,8 +259,8 @@ def _die(message: str | Callable[[_Spell], str], code: str = "failed") -> NoRetu
     values as they are, as it reports every other answer: JSON escapes them.
     """
     if callable(message):
-        raise _Failure(message(str), code, message(_shown))
-    raise _Failure(message, code)
+        raise _Failure(message(str), code, message(_shown), ids)
+    raise _Failure(message, code, ids=ids)
 
 
 #: The ``error.code`` an SDK failure is reported under with ``--json``: one
@@ -384,7 +397,7 @@ def _error_info(err: BaseException) -> dict[str, Any]:
     and a computer at its plan's limit are both a ``conflict`` — and a script
     should not have to read the sentence to tell them apart (OPL-5974)."""
     if isinstance(err, _Failure):
-        return {"code": err.reason, "message": err.message}
+        return {"code": err.reason, "message": err.message, **err.ids}
     if isinstance(err, APIError):
         code = next((word for cls, word in _API_CODES if isinstance(err, cls)), "api_error")
         info: dict[str, Any] = {"code": code, "message": str(err), "status": err.status}
@@ -1752,6 +1765,7 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                     "compare before choosing another path or dropping --no-overwrite to replace "
                     f"it.{_staging_note(e)}",
                     "exists",
+                    _upload_ids(e),
                 )
             except CreateOnlyConflictError as e:
                 # No usable reason, so nothing here says the path is taken, nor that
@@ -1764,6 +1778,7 @@ def _cmd_scp(args: argparse.Namespace) -> int:
                     "the remote path to see what is there before choosing another path or "
                     f"dropping --no-overwrite.{_staging_note(e)}",
                     "conflict",
+                    _upload_ids(e),
                 )
     # A count that differs from what was sent means the guest holds something
     # other than this file: refused in both modes, as ``mandala scp`` refuses
@@ -1838,6 +1853,12 @@ def _cleanup_interrupted(upload_id: str, as_json: bool) -> int:
     else:
         print(f"{PROG}: {message}", file=sys.stderr)
     return 130
+
+
+def _upload_ids(err: BaseException) -> dict[str, str]:
+    """``{"upload_id": ...}`` for a refused resumable upload, else nothing."""
+    upload_id = getattr(err, "upload_id", None)
+    return {"upload_id": upload_id} if isinstance(upload_id, str) else {}
 
 
 def _staging_note(err: BaseException) -> str:
