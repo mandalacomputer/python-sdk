@@ -2648,10 +2648,18 @@ def _webhook_url(url: object) -> str:
 
 
 def _description(value: object) -> str:
+    """A webhook description, at most 200 characters as the platform counts them.
+
+    UTF-16 code units, as :func:`_webhook_url` counts: the platform measures a
+    JavaScript string, where a character outside the Basic Multilingual Plane
+    (an emoji) is two, so 101 of them pass a code-point count and are refused
+    with a 400 (OPL-6080).
+    """
     text = canonical(value, "description")
-    if len(text) > WEBHOOK_DESCRIPTION_MAX:
+    units = len(text.encode("utf-16-le", "surrogatepass")) // 2
+    if units > WEBHOOK_DESCRIPTION_MAX:
         raise ValueError(
-            f"description must be at most {WEBHOOK_DESCRIPTION_MAX} characters, not {len(text)}"
+            f"description must be at most {WEBHOOK_DESCRIPTION_MAX} characters, not {units}"
         )
     return text
 

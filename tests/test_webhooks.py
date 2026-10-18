@@ -384,6 +384,14 @@ def test_the_description_cap_is_the_platforms() -> None:
         _api.webhook_body(create=False, description="x" * 201)
 
 
+def test_the_description_cap_counts_utf16_units_as_the_platform_does() -> None:
+    """An emoji is two units to the platform's JavaScript ``.length`` (OPL-6080)."""
+    emoji = "\U0001f600"
+    assert _api.webhook_body(create=False, description=emoji * 100)["description"] == emoji * 100
+    with pytest.raises(ValueError, match="not 202"):
+        _api.webhook_body(create=False, description=emoji * 101)
+
+
 def test_enabled_is_a_real_bool() -> None:
     """``"false"`` arms deliveries; the flag guard every other arming flag has."""
     with pytest.raises(ValueError, match="True or False"):
