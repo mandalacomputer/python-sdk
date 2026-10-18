@@ -2494,17 +2494,85 @@ MIN_MAX_COST_USD = 0.25
 MAX_MAX_COST_USD = 20
 
 
+#: An agent thread's id: ``thr_`` and twenty-four lower-case hex characters, as
+#: the platform mints them and the only shape it will find.
+THREAD_ID = re.compile(r"thr_[0-9a-f]{24}")
+#: The roles a turn of a caller's own ``messages`` may have.
+AGENT_MESSAGE_ROLES = ("user", "assistant")
+
+
+def agent_thread_id(value: object) -> str:
+    """A ``thread_id`` to continue, checked against the platform's own shape.
+
+    Refused here rather than sent, because a run that names a thread the
+    platform cannot find is answered only after it has been admitted, and its
+    rate cost is spent by then. The likeliest way to get one wrong is to hand
+    over a background run's own ``id`` (``run_…``) where its ``thread_id`` was
+    meant, and that deserves a sentence rather than a 404.
+    """
+    text = canonical(value, "thread_id")
+    if not THREAD_ID.fullmatch(text):
+        raise ValueError(
+            "thread_id must be thr_ followed by 24 lowercase hex characters, the "
+            f"thread_id of an earlier run, not {text!r}"
+        )
+    return text
+
+
+def agent_messages(messages: object) -> list[dict[str, str]]:
+    """A caller's own conversation so far, as the platform reads it.
+
+    A list of ``{"role": "user" | "assistant", "content": str}``, oldest first —
+    exactly what the platform accepts, and anything else is the 400 it would
+    answer, refused here instead. Only ``role`` and ``content`` are sent: they
+    are what the platform reads, and a copy built from them is a copy that
+    cannot change after it was checked.
+
+    A ``str`` is refused rather than iterated, for the reason :func:`_ids`
+    gives; so is anything else that is not a list or a tuple, since a
+    conversation is an order of turns.
+    """
+    if not isinstance(messages, (list, tuple)):
+        raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
+            "messages must be a list of {'role': 'user' | 'assistant', 'content': str}, "
+            f"not {type(messages).__name__}"
+        )
+    out: list[dict[str, str]] = []
+    for i, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise ValueError(  # noqa: TRY004
+                f"messages[{i}] must be a {{'role', 'content'}} mapping, "
+                f"not {type(message).__name__}"
+            )
+        role = message.get("role")
+        if not isinstance(role, str) or str.__str__(role) not in AGENT_MESSAGE_ROLES:
+            raise ValueError(f"messages[{i}] role must be 'user' or 'assistant', not {role!r}")
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError(  # noqa: TRY004
+                f"messages[{i}] content must be a string, not {type(content).__name__}"
+            )
+        out.append({"role": str.__str__(role), "content": str.__str__(content)})
+    return out
+
+
 def agent_body(
     prompt: str,
     *,
-    stream: bool,
+    stream: bool | None,
     system: str | None = None,
     max_steps: int | None = None,
     model: str | None = None,
     provider: Literal["anthropic", "openai"] | None = None,
     max_cost_usd: float | None = None,
+    thread_id: str | None = None,
+    store: bool | None = None,
+    messages: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One agent run's request.
+
+    ``stream`` is ``True`` or ``False`` for ``POST computers/:id/agent``, and
+    ``None`` for a background run, whose route refuses the field outright.
 
     An empty prompt is refused here rather than sent. The platform would answer
     400, but a run is the one call on this surface where a round trip is not the
@@ -2523,6 +2591,12 @@ def agent_body(
     the platform accepts (:data:`MIN_MAX_COST_USD` to :data:`MAX_MAX_COST_USD`
     dollars) for the same reason. It is sent whenever it is given: a run on the
     caller's own key ignores it, which is the platform's rule to apply.
+
+    The conversation is checked on the platform's rules too: ``thread_id`` has
+    the shape :func:`agent_thread_id` checks, ``store`` is a real ``bool``,
+    ``messages`` is what :func:`agent_messages` accepts, ``store=False`` cannot
+    continue a thread, and a non-empty ``messages`` cannot be sent with one — a
+    thread already holds its conversation. Each is sent only when given.
     """
     prompt = canonical(prompt, "prompt")
     if not prompt.strip():
@@ -2544,17 +2618,99 @@ def agent_body(
                 f"max_cost_usd must be between {MIN_MAX_COST_USD} and {MAX_MAX_COST_USD} dollars, "
                 f"not {max_cost_usd}"
             )
-    body: dict[str, Any] = {"prompt": prompt, "stream": stream}
+    history = None if messages is None else agent_messages(messages)
+    if thread_id is not None:
+        thread_id = agent_thread_id(thread_id)
+    if store is not None:
+        store = flag(store, "store")
+    if store is False and thread_id is not None:
+        raise ValueError("store=False cannot continue a thread; leave out thread_id or store")
+    if history and thread_id is not None:
+        raise ValueError(
+            "send messages or thread_id, not both: a thread already holds its conversation"
+        )
+    body: dict[str, Any] = {"prompt": prompt}
+    if stream is not None:
+        body["stream"] = flag(stream, "stream")
     for key, value in (
         ("system", system),
         ("max_steps", max_steps),
         ("model", model),
         ("provider", provider),
         ("max_cost_usd", max_cost_usd),
+        ("thread_id", thread_id),
+        ("store", store),
+        ("messages", history),
     ):
         if value is not None:
             body[key] = value
     return body
+
+
+# --- agent threads and background runs --------------------------------------
+
+#: The account's agent threads: list, read, delete.
+AGENT_THREADS = "agent/threads"
+#: The account's background agent runs: list, read, cancel.
+AGENT_RUNS = "agent/runs"
+#: The most one page of threads or runs holds; the platform refuses more.
+AGENT_PAGE_MAX = 100
+#: Every status a background run can be in, the filter
+#: ``GET agent/runs?status=`` accepts.
+AGENT_RUN_STATUSES = ("running", "completed", "failed", "cancelled", "interrupted")
+
+
+def agent_thread(thread_id: str) -> str:
+    return f"agent/threads/{seg(thread_id)}"
+
+
+def agent_run(run_id: str) -> str:
+    return f"agent/runs/{seg(run_id)}"
+
+
+def agent_run_cancel(run_id: str) -> str:
+    return f"agent/runs/{seg(run_id)}/cancel"
+
+
+def computer_agent_runs(computer_id: str) -> str:
+    return f"computers/{seg(computer_id)}/agent/runs"
+
+
+def agent_page_params(
+    computer_id: object, limit: object, before: object, status: object = None
+) -> dict[str, str] | None:
+    """``GET agent/threads`` and ``GET agent/runs``: a computer, a status, a
+    page size and a cursor, each only when given.
+
+    Checked the way the platform checks them, since it answers anything else
+    with 400. An empty ``computer_id`` is refused rather than dropped, for the
+    reason :func:`operations_params` gives: dropped, it would list the whole
+    account to a caller who believes they asked about one computer. ``before``
+    is the id of the last row of the page before; ``status`` is one of
+    :data:`AGENT_RUN_STATUSES`.
+    """
+    params: dict[str, str] = {}
+    if computer_id is not None:
+        cid = canonical(computer_id, "computer_id")
+        if not cid or cid != cid.strip():
+            raise ValueError("computer_id must be a computer id, with no spaces around it")
+        params["computer_id"] = cid
+    if status is not None:
+        word = canonical(status, "status")
+        if word not in AGENT_RUN_STATUSES:
+            raise ValueError(f"status must be one of {', '.join(AGENT_RUN_STATUSES)}, not {word!r}")
+        params["status"] = word
+    if limit is not None:
+        number = whole(limit, "limit", exc=ValueError)
+        if not 1 <= number <= AGENT_PAGE_MAX:
+            raise ValueError(f"limit must be between 1 and {AGENT_PAGE_MAX}, not {number}")
+        params["limit"] = str(number)
+    if before is not None:
+        cursor = canonical(before, "before")
+        if not cursor or cursor != cursor.strip():
+            raise ValueError("before must be the id of the last row of the page before")
+        params["before"] = cursor
+    return params or None
 
 
 def start_params(resume_only: bool) -> dict[str, Any] | None:

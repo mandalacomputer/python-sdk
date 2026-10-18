@@ -152,7 +152,7 @@ ALLOWED = {
     ("GET", "operations/:id"),
     # Reachable, and not reached from here — see UNIMPLEMENTED.
     ("POST", "chat/completions"),
-    # Agent threads and background runs; not reached yet — see UNIMPLEMENTED.
+    # Agent threads and background runs (OPL-6084).
     ("GET", "agent/threads"),
     ("GET", "agent/threads/:thread"),
     ("DELETE", "agent/threads/:thread"),

@@ -72,6 +72,8 @@ PAIRS = [
     (_resources.Operations, _async_resources.AsyncOperations),
     (_resources.PublicUrlsResource, _async_resources.AsyncPublicUrlsResource),
     (_resources.Workspaces, _async_resources.AsyncWorkspaces),
+    (_resources.AgentThreads, _async_resources.AsyncAgentThreads),
+    (_resources.AgentRuns, _async_resources.AsyncAgentRuns),
 ]
 
 

@@ -78,15 +78,6 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # Agent threads and background runs. Not wrapped yet; until they are, call
-    # them over HTTP.
-    ("GET", "agent/threads"),
-    ("GET", "agent/threads/:thread"),
-    ("DELETE", "agent/threads/:thread"),
-    ("POST", "computers/:id/agent/runs"),
-    ("GET", "agent/runs"),
-    ("GET", "agent/runs/:run"),
-    ("POST", "agent/runs/:run/cancel"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -109,11 +100,10 @@ UNIMPLEMENTED_PARAMETERS = {
     "POST computers/:id/input  body:key",
     # `amount` is sent instead. Same value, two names.
     "POST computers/:id/input  body:scroll_amount",
-    # Continuing a thread, opting out of keeping one, and a history the caller
-    # keeps itself. Not sent by agent() yet.
-    "POST computers/:id/agent  body:thread_id",
-    "POST computers/:id/agent  body:store",
-    "POST computers/:id/agent  body:messages",
+    # A background run is kept so it can be read back: the platform refuses
+    # `store: false` there, and `true` is its default, so there is nothing for
+    # this SDK to send (OPL-6084).
+    "POST computers/:id/agent/runs  body:store",
 }
 
 #: UNIMPLEMENTED in the spelling PARAMETERS is keyed by.
@@ -377,6 +367,47 @@ USAGE = {
 # so the handler below serves this to both, and `agent_once` reads it as JSON.
 AGENT_DONE = b'event: done\ndata: {"steps": 1, "stop": "end_turn", "text": "done"}\n\n'
 AGENT_RESULT = {"steps": 1, "stop": "end_turn", "text": "done"}
+# An agent thread and a background run (OPL-6084), and the pages that list
+# them. The run is `completed`, so a wait on it answers at once, and the page
+# says there is more so that a walk's `before` is a real id.
+THREAD_ID = "thr_0123456789abcdef01234567"
+RUN_ID = "run_0123456789abcdef01234567"
+AGENT_THREAD_SUMMARY = {
+    "id": THREAD_ID,
+    "computer_id": "vm-1",
+    "title": "do the thing",
+    "turns": 2,
+    "created_at": "2026-10-18T12:00:00.000Z",
+    "updated_at": "2026-10-18T12:01:00.000Z",
+}
+AGENT_THREAD = {
+    **AGENT_THREAD_SUMMARY,
+    "messages": [
+        {"role": "user", "text": "do the thing", "created_at": "2026-10-18T12:00:00.000Z"},
+        {
+            "role": "assistant",
+            "text": "done",
+            "stop": "end_turn",
+            "steps": 1,
+            "created_at": "2026-10-18T12:01:00.000Z",
+        },
+    ],
+}
+AGENT_RUN = {
+    "id": RUN_ID,
+    "computer_id": "vm-1",
+    "thread_id": THREAD_ID,
+    "status": "completed",
+    "prompt": "do the thing",
+    "model": "claude-sonnet-5-5",
+    "max_steps": 20,
+    "steps": 1,
+    "result": AGENT_RESULT,
+    "steps_taken": [{"n": 1, "tool": "computer", "action": "left_click"}],
+    "created_at": "2026-10-18T12:00:00.000Z",
+    "updated_at": "2026-10-18T12:01:00.000Z",
+    "ended_at": "2026-10-18T12:01:00.000Z",
+}
 # The account's AI credit ledger, one lot, one debit and a further page.
 CREDITS = {
     "balance_micros": 4_750_000,
@@ -662,6 +693,20 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"png")
     if path.endswith("/files"):
         return httpx.Response(200, content=b"bytes")
+    # Agent threads and background runs (OPL-6084). A run's start is a 202 and
+    # its cancel answers the run, as a read does; a thread's delete is an ack.
+    if path.endswith("/agent/runs"):
+        if get:
+            return httpx.Response(200, json={"runs": [AGENT_RUN], "has_more": True})
+        return httpx.Response(202, json={**AGENT_RUN, "status": "running", "ended_at": None})
+    if "/agent/runs/" in path:
+        return httpx.Response(200, json=AGENT_RUN)
+    if path.endswith("/agent/threads"):
+        return httpx.Response(200, json={"threads": [AGENT_THREAD_SUMMARY], "has_more": True})
+    if "/agent/threads/" in path:
+        return httpx.Response(
+            200, json={"ok": True} if request.method == "DELETE" else AGENT_THREAD
+        )
     if path.endswith("/agent"):
         # The streaming and non-streaming forms are one route and one handler
         # here, told apart by what the caller asked for — which is the same
@@ -1167,6 +1212,39 @@ def exercise_everything(client: mc.Client) -> None:
     with closing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
         for _ in events:
             break
+    # Threads (OPL-6084): continuing one, keeping none, and a conversation the
+    # caller keeps itself — which cannot be sent with a thread.
+    c.agent("do the thing", model_key="sk-ant-test", thread_id=THREAD_ID, store=True)
+    c.agent_once(
+        "do the thing",
+        model_key="sk-ant-test",
+        store=False,
+        messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+    )
+    # A background run from the handle and by id, every field on one of them,
+    # and the conversation on the other.
+    c.start_agent_run(
+        "do the thing",
+        model_key="sk-ant-test",
+        system="be brief",
+        max_steps=5,
+        model="m",
+        provider="anthropic",
+        max_cost_usd=0.5,
+        thread_id=THREAD_ID,
+    )
+    run = client.agent_runs.start(
+        c.id, "do the thing", messages=[{"role": "user", "content": "hi"}]
+    )
+    client.agent_runs.get(run.id)
+    client.agent_runs.list()
+    client.agent_runs.list(computer_id=c.id, status="completed", limit=5, before=RUN_ID)
+    client.agent_runs.wait(run)
+    client.agent_runs.cancel(run.id)
+    client.agent_threads.list()
+    client.agent_threads.list(computer_id=c.id, limit=5, before=THREAD_ID)
+    client.agent_threads.get(THREAD_ID)
+    client.agent_threads.delete(THREAD_ID)
     client.computers.list(allow_partial=True)
     # The listing narrowed to one lifecycle state, and narrowed to a TERMINAL
     # one: `deleted` and `lost` are answered from the platform's record alone
@@ -1485,6 +1563,35 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     async with aclosing(c.agent_stream("do the thing", model_key="sk-ant-test")) as events:
         async for _ in events:
             break
+    await c.agent("do the thing", model_key="sk-ant-test", thread_id=THREAD_ID, store=True)
+    await c.agent_once(
+        "do the thing",
+        model_key="sk-ant-test",
+        store=False,
+        messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+    )
+    await c.start_agent_run(
+        "do the thing",
+        model_key="sk-ant-test",
+        system="be brief",
+        max_steps=5,
+        model="m",
+        provider="anthropic",
+        max_cost_usd=0.5,
+        thread_id=THREAD_ID,
+    )
+    run = await client.agent_runs.start(
+        c.id, "do the thing", messages=[{"role": "user", "content": "hi"}]
+    )
+    await client.agent_runs.get(run.id)
+    await client.agent_runs.list()
+    await client.agent_runs.list(computer_id=c.id, status="completed", limit=5, before=RUN_ID)
+    await client.agent_runs.wait(run)
+    await client.agent_runs.cancel(run.id)
+    await client.agent_threads.list()
+    await client.agent_threads.list(computer_id=c.id, limit=5, before=THREAD_ID)
+    await client.agent_threads.get(THREAD_ID)
+    await client.agent_threads.delete(THREAD_ID)
     await client.computers.list(allow_partial=True)
     await client.computers.list(state="deleted")
     await client.computers.list(workspace_id="wsp-0123456789ab")
@@ -1989,3 +2096,15 @@ def test_retained_path_placeholders_do_not_hide_literal_segments() -> None:
     # a literal `secrets` at position 2 and must not become an id.
     assert pattern_for("/secrets/csec-1") == "secrets/:id"
     assert pattern_for("/computers/vm-1/secrets") == "computers/:id/secrets"
+
+
+def test_agent_ids_are_ids_at_their_own_position_only() -> None:
+    """A thread's and a run's id are the second segment under `agent` (OPL-6084),
+    and `cancel` after a run's id stays the literal the platform's pattern has.
+    The two collections themselves, and a computer's `agent/runs`, are not ids."""
+    assert pattern_for("/agent/threads") == "agent/threads"
+    assert pattern_for(f"/agent/threads/{THREAD_ID}") == "agent/threads/:thread"
+    assert pattern_for("/agent/runs") == "agent/runs"
+    assert pattern_for(f"/agent/runs/{RUN_ID}") == "agent/runs/:run"
+    assert pattern_for(f"/agent/runs/{RUN_ID}/cancel") == "agent/runs/:run/cancel"
+    assert pattern_for("/computers/vm-1/agent/runs") == "computers/:id/agent/runs"

@@ -11,9 +11,11 @@ from datetime import datetime
 from typing import Any, Literal
 
 from . import _api
+from ._agent import AgentMessage, AgentProvider
+from ._agent_records import AgentRun, AgentRunPage, AgentRunStatus, AgentThread, AgentThreadPage
 from ._async_computer import AsyncComputer
 from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport, build_stream_error
-from ._exceptions import ConflictError, MandalaError, NotFoundError, TimeoutError
+from ._exceptions import APIError, ConflictError, MandalaError, NotFoundError, TimeoutError
 from ._models import (
     AccountQuota,
     ApiKey,
@@ -84,14 +86,24 @@ def _reworded(doc: str | None, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
-from ._computer import _poll_delay, _ride_out, check_wait_args
+from ._computer import (
+    _agent_route_error,
+    _model_key_headers,
+    _poll_delay,
+    _ride_out,
+    check_wait_args,
+)
 from ._exceptions import _is_transient_for_poll
 from ._resources import (
+    AGENT_RUN_WAIT_POLL,
+    AGENT_RUN_WAIT_TIMEOUT,
     EPHEMERAL_DOC,
     OPERATION_WAIT_POLL,
     OPERATION_WAIT_TIMEOUT,
     SECRET_SET_RETRIES,
     Account,
+    AgentRuns,
+    AgentThreads,
     ApiKeys,
     Builds,
     Operations,
@@ -101,6 +113,8 @@ from ._resources import (
     Templates,
     Webhooks,
     Workspaces,
+    _agent_run_id_arg,
+    _agent_run_timed_out,
     _LastPoll,
     _launch_start_admitted,
     _named,
@@ -122,6 +136,8 @@ from ._sse import SSEEvent
 
 __all__ = [
     "AsyncAccount",
+    "AsyncAgentRuns",
+    "AsyncAgentThreads",
     "AsyncApiKeys",
     "AsyncBuilds",
     "AsyncComputers",
@@ -1570,3 +1586,137 @@ class AsyncOperations:
     get.__doc__ = Operations.get.__doc__
     list.__doc__ = Operations.list.__doc__
     wait.__doc__ = Operations.wait.__doc__
+
+
+class AsyncAgentThreads:
+    __doc__ = AgentThreads.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(
+        self,
+        *,
+        computer_id: str | None = None,
+        limit: int | None = None,
+        before: str | None = None,
+    ) -> AgentThreadPage:
+        params = _api.agent_page_params(computer_id, limit, before)
+        data = await self._t.json_object("GET", _api.AGENT_THREADS, params=params)
+        return AgentThreadPage.from_api(data)
+
+    async def get(self, thread_id: str) -> AgentThread:
+        path = _api.agent_thread(thread_id)
+        return AgentThread.from_api(await self._t.json_object("GET", path), f"GET {path}")
+
+    async def delete(self, thread_id: str) -> None:
+        await self._t.json_object("DELETE", _api.agent_thread(thread_id))
+
+    list.__doc__ = AgentThreads.list.__doc__
+    get.__doc__ = AgentThreads.get.__doc__
+    delete.__doc__ = AgentThreads.delete.__doc__
+
+
+class AsyncAgentRuns:
+    __doc__ = AgentRuns.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def start(
+        self,
+        computer_id: str,
+        prompt: str,
+        *,
+        model_key: str | None = None,
+        system: str | None = None,
+        max_steps: int | None = None,
+        model: str | None = None,
+        provider: AgentProvider | None = None,
+        max_cost_usd: float | None = None,
+        thread_id: str | None = None,
+        messages: Sequence[AgentMessage] | None = None,
+    ) -> AgentRun:
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
+        path = _api.computer_agent_runs(computer_id)
+        body = _api.agent_body(
+            prompt,
+            stream=None,
+            system=system,
+            max_steps=max_steps,
+            model=model,
+            provider=provider,
+            max_cost_usd=max_cost_usd,
+            thread_id=thread_id,
+            messages=messages,
+        )
+        try:
+            data = await self._t.json_object("POST", path, json=body, headers=headers)
+        except APIError as exc:
+            error = _agent_route_error(exc, funded=model_key is None, base_url=self._t.base_url)
+            if error is exc:
+                raise
+            raise error from None
+        return AgentRun.from_api(data, f"POST {path}", base_url=self._t.base_url)
+
+    async def get(self, run_id: str) -> AgentRun:
+        return await self._read(run_id, None)
+
+    async def _read(self, run_id: str, timeout_cap: float | None) -> AgentRun:
+        path = _api.agent_run(run_id)
+        data = await self._t.json_object("GET", path, timeout_cap=timeout_cap)
+        return AgentRun.from_api(data, f"GET {path}", base_url=self._t.base_url)
+
+    async def list(
+        self,
+        *,
+        computer_id: str | None = None,
+        status: AgentRunStatus | None = None,
+        limit: int | None = None,
+        before: str | None = None,
+    ) -> AgentRunPage:
+        params = _api.agent_page_params(computer_id, limit, before, status)
+        data = await self._t.json_object("GET", _api.AGENT_RUNS, params=params)
+        return AgentRunPage.from_api(data, base_url=self._t.base_url)
+
+    async def cancel(self, run_id: str) -> AgentRun:
+        path = _api.agent_run_cancel(run_id)
+        data = await self._t.json_object("POST", path)
+        return AgentRun.from_api(data, f"POST {path}", base_url=self._t.base_url)
+
+    async def wait(
+        self,
+        run: AgentRun | str,
+        timeout: float = AGENT_RUN_WAIT_TIMEOUT,
+        poll: float = AGENT_RUN_WAIT_POLL,
+    ) -> AgentRun:
+        check_wait_args(timeout, poll)
+        run_id = _agent_run_id_arg(run)
+        deadline = time.monotonic() + timeout
+        last: AgentRun | None = None
+        answered = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_agent_run_timed_out(run_id, timeout, last, answered))
+            delay = poll
+            try:
+                last = await self._read(run_id, remaining)
+                answered = True
+            except MandalaError as err:
+                answered = False
+                delay = _ride_out(err, deadline, poll)
+            if answered and last is not None and last.ended:
+                return last
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(_agent_run_timed_out(run_id, timeout, last, answered))
+            await asyncio.sleep(min(delay, remaining))
+
+    start.__doc__ = AgentRuns.start.__doc__
+    get.__doc__ = AgentRuns.get.__doc__
+    list.__doc__ = AgentRuns.list.__doc__
+    cancel.__doc__ = AgentRuns.cancel.__doc__
+    wait.__doc__ = AgentRuns.wait.__doc__

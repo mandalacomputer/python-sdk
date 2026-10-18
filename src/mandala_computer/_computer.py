@@ -21,11 +21,13 @@ from ._agent import (
     AgentDone,
     AgentEvent,
     AgentFailed,
+    AgentMessage,
     AgentProvider,
     AgentResult,
     AgentStepEvent,
     to_agent_event,
 )
+from ._agent_records import AgentRun
 from ._artifacts import Artifact, decode_artifact, verify_download, verify_nomination
 from ._browser_connection import (
     CLEANUP_REVOKE_TIMEOUT,
@@ -5803,6 +5805,9 @@ class Computer(ComputerFields):
         model: str | None = None,
         provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
+        thread_id: str | None = None,
+        store: bool | None = None,
+        messages: Sequence[AgentMessage] | None = None,
     ) -> Iterator[AgentEvent]:
         """Have the platform drive this computer, reporting as it goes.
 
@@ -5835,6 +5840,23 @@ class Computer(ComputerFields):
         o-series OpenAI) and Anthropic when neither is given; OpenAI defaults
         to ``gpt-6.1-sol``. A model name the platform does not recognise needs
         it. Anything else is refused before the request is sent.
+
+        **A run is kept in a thread.** Unless ``store=False``, a run that acted
+        on the desktop, or finished with an answer, is kept as one exchange in a
+        thread on this computer, and the thread's id comes back as
+        :attr:`~mandala_computer.AgentResult.thread_id` (on a failure,
+        :attr:`~mandala_computer.MandalaError.thread_id`). Pass it as
+        ``thread_id`` to continue the conversation: the model is given the
+        thread's earlier turns, told they are done, and acts only on the new
+        prompt. A thread of another computer, or a full one (100 turns), is a
+        :class:`~mandala_computer.ConflictError`, and one this key cannot see a
+        :class:`~mandala_computer.NotFoundError`. ``messages`` is the
+        conversation so far for a caller that keeps its own — a list of
+        :class:`~mandala_computer.AgentMessage`, oldest first, without this
+        prompt — and a new thread starts with it. ``store=False`` keeps nothing.
+        Neither can be sent with ``thread_id``, and a malformed one is refused
+        before the request is sent. ``client.agent_threads`` lists, reads and
+        deletes the threads.
 
         The computer must already be RUNNING. This route will not start one:
         starting is billable, and it is not a decision to make on somebody's
@@ -5879,6 +5901,9 @@ class Computer(ComputerFields):
                     model=model,
                     provider=provider,
                     max_cost_usd=max_cost_usd,
+                    thread_id=thread_id,
+                    store=store,
+                    messages=messages,
                 ),
                 headers=headers,
             )
@@ -5913,6 +5938,9 @@ class Computer(ComputerFields):
         model: str | None = None,
         provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
+        thread_id: str | None = None,
+        store: bool | None = None,
+        messages: Sequence[AgentMessage] | None = None,
     ) -> AgentResult:
         """:meth:`agent_stream`, waited out — one call, one result.
 
@@ -5924,7 +5952,10 @@ class Computer(ComputerFields):
 
         Leave ``model_key`` out to run on the account's Mandala AI credits, as
         :meth:`agent_stream` describes; :attr:`~mandala_computer.AgentResult.cost_usd`
-        is then what the run was charged.
+        is then what the run was charged. ``thread_id``, ``store`` and
+        ``messages`` work as it describes too: the result's
+        :attr:`~mandala_computer.AgentResult.thread_id` is the thread to
+        continue.
 
         It does **not** raise when a run ends unfinished. ``max_steps``,
         ``rate_limited``, ``refusal``, ``max_cost`` and ``credits_exhausted``
@@ -5968,6 +5999,9 @@ class Computer(ComputerFields):
                 model=model,
                 provider=provider,
                 max_cost_usd=max_cost_usd,
+                thread_id=thread_id,
+                store=store,
+                messages=messages,
             ):
                 if isinstance(event, AgentDone):
                     result = event.result
@@ -6002,6 +6036,9 @@ class Computer(ComputerFields):
         model: str | None = None,
         provider: AgentProvider | None = None,
         max_cost_usd: float | None = None,
+        thread_id: str | None = None,
+        store: bool | None = None,
+        messages: Sequence[AgentMessage] | None = None,
     ) -> AgentResult:
         """The agent loop as a single non-streaming request.
 
@@ -6009,9 +6046,9 @@ class Computer(ComputerFields):
         who cannot use a stream at all: nothing is reported until the whole run
         is over, and a reverse proxy between you and the platform is entitled to
         close a request held open for minutes with nothing crossing it. Prefer
-        :meth:`agent`. ``model_key`` and ``max_cost_usd`` work as
-        :meth:`agent_stream` describes: leave the key out to run on the
-        account's Mandala AI credits.
+        :meth:`agent`. ``model_key``, ``max_cost_usd``, ``thread_id``,
+        ``store`` and ``messages`` work as :meth:`agent_stream` describes: leave
+        the key out to run on the account's Mandala AI credits.
 
         A proxy that answers instead of the platform raises here rather than
         coming back as a run of no steps that ended for no reason — the same
@@ -6080,6 +6117,9 @@ class Computer(ComputerFields):
                     model=model,
                     provider=provider,
                     max_cost_usd=max_cost_usd,
+                    thread_id=thread_id,
+                    store=store,
+                    messages=messages,
                 ),
                 headers=headers,
                 timeout=NO_DEADLINE,
@@ -6096,6 +6136,82 @@ class Computer(ComputerFields):
                 raise
             raise error from None
         return _agent_once_outcome(data, funded=model_key is None, base_url=self._t.base_url)
+
+    def start_agent_run(
+        self,
+        prompt: str,
+        *,
+        model_key: str | None = None,
+        system: str | None = None,
+        max_steps: int | None = None,
+        model: str | None = None,
+        provider: AgentProvider | None = None,
+        max_cost_usd: float | None = None,
+        thread_id: str | None = None,
+        messages: Sequence[AgentMessage] | None = None,
+    ) -> AgentRun:
+        """Start the agent loop on this computer and walk away: a background run.
+
+        The same loop as :meth:`agent`, with the same arguments, except that
+        nothing streams. This returns once the run holds the computer, with the
+        :class:`~mandala_computer.AgentRun` as it stands (``status``
+        ``"running"``), and the run goes on without the request: read it back
+        with ``client.agent_runs.get``, wait for its end with
+        ``client.agent_runs.wait``, or stop it with ``client.agent_runs.cancel``.
+        Unlike :meth:`agent_once`, it is not cut off at the edge after two
+        minutes::
+
+            run = c.start_agent_run("Rename every screenshot on the desktop.")
+            run = client.agent_runs.wait(run)
+            if not run.finished:
+                print(run.status, run.error or run.result)
+
+        What refuses a run before it holds the computer is raised here, as
+        :meth:`agent` raises it: :class:`~mandala_computer.NotFoundError` for an
+        unknown computer or thread, :class:`~mandala_computer.ConflictError` for
+        a computer that is not running, is already driven or is changing
+        workspace (the last two with ``reason`` ``"contention"``), and
+        :class:`~mandala_computer.InsufficientCreditsError` for a funded run the
+        credits cannot start. Everything after that, the model API's errors
+        included, ends the run as ``failed`` with its
+        :attr:`~mandala_computer.AgentRun.error`.
+
+        A background run is always kept in a thread, so there is no ``store``:
+        :attr:`~mandala_computer.AgentRun.thread_id` names the thread once it
+        has something in it. ``model_key`` is held in memory for the run's life
+        and never stored. The run uses the API key that started it, and deleting
+        that key stops it at its next step.
+
+        Not retried: a start whose answer was lost may have started a run, so
+        list this computer's runs (``client.agent_runs.list(computer_id=...)``)
+        before sending it again.
+        """
+        headers = _model_key_headers(
+            model_key, self._t.client_headers if model_key is None else None
+        )
+        path = _api.computer_agent_runs(self.id)
+        body = _api.agent_body(
+            prompt,
+            stream=None,
+            system=system,
+            max_steps=max_steps,
+            model=model,
+            provider=provider,
+            max_cost_usd=max_cost_usd,
+            thread_id=thread_id,
+            messages=messages,
+        )
+        try:
+            data = self._t.json_object("POST", path, json=body, headers=headers)
+        except APIError as exc:
+            # The same refusals the agent route answers before it streams, and
+            # the same reading of them: a 402 is the account's AI credits, never
+            # the plan (see :func:`_agent_route_error`).
+            error = _agent_route_error(exc, funded=model_key is None, base_url=self._t.base_url)
+            if error is exc:
+                raise
+            raise error from None
+        return AgentRun.from_api(data, f"POST {path}", base_url=self._t.base_url)
 
     # --- events ---------------------------------------------------------
 

@@ -33,6 +33,7 @@ from ._agent import (
     AgentDone,
     AgentEvent,
     AgentFailed,
+    AgentMessage,
     AgentProvider,
     AgentResult,
     AgentStep,
@@ -40,10 +41,22 @@ from ._agent import (
     AgentText,
     AgentUsage,
 )
+from ._agent_records import (
+    AgentRun,
+    AgentRunError,
+    AgentRunPage,
+    AgentRunStatus,
+    AgentThread,
+    AgentThreadPage,
+    AgentThreadSummary,
+    AgentThreadTurn,
+)
 from ._artifacts import Artifact, ArtifactAssociation
 from ._async_computer import AsyncBackgroundCommand, AsyncComputer
 from ._async_resources import (
     AsyncAccount,
+    AsyncAgentRuns,
+    AsyncAgentThreads,
     AsyncApiKeys,
     AsyncBuilds,
     AsyncComputers,
@@ -200,6 +213,8 @@ from ._models import (
 )
 from ._resources import (
     Account,
+    AgentRuns,
+    AgentThreads,
     ApiKeys,
     Builds,
     Computers,
@@ -262,11 +277,20 @@ __all__ = [
     "AgentDone",
     "AgentEvent",
     "AgentFailed",
+    "AgentMessage",
     "AgentProvider",
     "AgentResult",
+    "AgentRun",
+    "AgentRunError",
+    "AgentRunPage",
+    "AgentRunStatus",
     "AgentStep",
     "AgentStepEvent",
     "AgentText",
+    "AgentThread",
+    "AgentThreadPage",
+    "AgentThreadSummary",
+    "AgentThreadTurn",
     "AgentUsage",
     "ApiKey",
     "ApiKeyCreated",
@@ -445,6 +469,8 @@ class Client:
             product=f"mandala-computer-py/{__version__}",
         )
         self.account = Account(self._t)
+        self.agent_runs = AgentRuns(self._t)
+        self.agent_threads = AgentThreads(self._t)
         self.builds = Builds(self._t)
         self.computers = Computers(self._t)
         self.credits = Credits(self._t)
@@ -510,6 +536,8 @@ class AsyncClient:
             product=f"mandala-computer-py/{__version__}",
         )
         self.account = AsyncAccount(self._t)
+        self.agent_runs = AsyncAgentRuns(self._t)
+        self.agent_threads = AsyncAgentThreads(self._t)
         self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
         self.credits = AsyncCredits(self._t)
