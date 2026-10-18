@@ -1388,7 +1388,40 @@ def is_transient(err: BaseException) -> bool:
 _READ_METHODS = frozenset({"GET", "HEAD"})
 
 
-def _is_transient_for_poll(err: BaseException) -> bool:
+#: The 409 ``code`` values a wait gives up on at once, whatever else the body
+#: says: a keyed call the platform never heard end (the computer, not another
+#: poll, says whether it happened), and a template image still being prepared
+#: (continuing needs the token and the create's own arguments).
+_CODE_FINAL_TO_A_WAIT = frozenset({"idempotency_outcome_unknown", "template_image_preparing"})
+
+
+def _poll_409_clears(err: APIError, settles: bool) -> bool:
+    """Whether a 409 met by a poll is worth polling through.
+
+    The platform's word decides where it sent one: a permanent word, or a code
+    that is always final, ends the wait with that error; ``contention`` and
+    ``starting`` (top-level only, as :func:`is_transient` reads them), or a
+    code documented as passing, keep it polling. A 409 with neither is
+    unclassified, and only a wait whose polled route documents a reasonless 409
+    as the state it is waiting out (``settles``) keeps polling through one;
+    every other wait ends on it, rather than spending the caller's deadline on
+    a refusal that may never clear (OPL-6080).
+    """
+    body = err.body if isinstance(err.body, dict) else {}
+    code = body.get("code")
+    if code in _CODE_FINAL_TO_A_WAIT:
+        return False
+    if err.reason in _REASON_PERMANENT:
+        return False
+    top = body.get("reason")
+    if isinstance(top, str) and top in _REASON_CLEARS:
+        return True
+    if code in _CODE_CLEARS:
+        return True
+    return settles
+
+
+def _is_transient_for_poll(err: BaseException, *, settling_409: bool = False) -> bool:
     """The same words, a different question: whether a poll is worth making again.
 
     Asked only by the ``wait_*`` helpers, and deliberately private. They replay
@@ -1441,7 +1474,10 @@ def _is_transient_for_poll(err: BaseException) -> bool:
       change the answer. Three are named because they describe the moment
       instead: 409 (something in flight), 429 (a cadence) and 408, which RFC 9110
       defines as a request the client may repeat unchanged and which the edge in
-      front of this surface does emit.
+      front of this surface does emit. A 409 polls through only when it says so
+      — see :func:`_poll_409_clears`: a permanent word or an always-final code
+      ends the wait, and a 409 with no word ends it unless ``settling_409`` says
+      the polled route documents that 409 as the state being waited out.
 
       A 3xx goes with the 4xx, which is why the rule is ``>= 500`` rather than
       "not a 4xx": httpx is left on its default of not following redirects and
@@ -1486,7 +1522,9 @@ def _is_transient_for_poll(err: BaseException) -> bool:
     if isinstance(err, APIError):
         if err.status == 524:
             return False
-        if err.status in (408, 409, 429):
+        if err.status == 409:
+            return _poll_409_clears(err, settling_409)
+        if err.status in (408, 429):
             return True
         return 500 <= err.status < 600
     return True

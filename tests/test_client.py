@@ -1024,7 +1024,9 @@ def test_a_rate_limit_on_the_nested_guest_refresh_is_honoured(
     """
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
         side_effect=[
-            httpx.Response(409, json={"error": "the guest agent is not answering yet"}),
+            httpx.Response(
+                409, json={"error": "the guest agent is not answering yet", "reason": "starting"}
+            ),
             httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}),
         ]
     )
@@ -4246,7 +4248,7 @@ def test_wait_for_guest_still_waits_through_a_booting_agent(client: mc.Client) -
     """409 is what the agent answers with in the first seconds of a start."""
     route = respx.post(f"{BASE}/computers/vm-1/exec")
     route.side_effect = [
-        httpx.Response(409, json={"error": "guest agent not ready"}),
+        httpx.Response(409, json={"error": "guest agent not ready", "reason": "starting"}),
         httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}),
     ]
     c = _computer(client)

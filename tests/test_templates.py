@@ -1028,7 +1028,11 @@ def test_a_trailing_newline_is_not_a_version() -> None:
 @pytest.mark.parametrize(
     ("err", "retried"),
     [
-        (mc.ConflictError("busy", status=409), True),
+        (mc.ConflictError("busy", status=409, body={"reason": "contention"}), True),
+        (mc.ConflictError("busy", status=409, body={"code": "idempotency_in_progress"}), True),
+        (mc.ConflictError("busy", status=409), False),
+        (mc.ConflictError("taken", status=409, body={"reason": "unsupported"}), False),
+        (mc.ConflictError("unknown", status=409, body={"code": "idempotency_outcome_unknown"}), False),
         (mc.RateLimitError("slow down", status=429), True),
         (mc.UnavailableError("no host", status=503), True),
         (mc.GatewayTimeoutError("gateway", status=504), True),

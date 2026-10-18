@@ -204,7 +204,7 @@ def test_wait_for_guest_discovers_a_build_that_failed_while_waiting(
     client: mc.Client,
 ) -> None:
     respx.post(f"{BASE}/computers/vm-new/exec").mock(
-        httpx.Response(409, json={"error": "still being copied"})
+        httpx.Response(409, json={"error": "still being copied", "reason": "contention"})
     )
     refresh = respx.get(f"{BASE}/computers/vm-new").mock(httpx.Response(200, json=FAILED))
     with pytest.raises(mc.MandalaError, match="no space left on device"):

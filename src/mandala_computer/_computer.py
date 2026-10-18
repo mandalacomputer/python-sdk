@@ -1442,9 +1442,7 @@ def _desktop_wait_fatal(err: MandalaError) -> bool:
     running (``reason: "unavailable"``) will not grow a desktop by being asked
     again, and a refusal of the request itself must not become a timeout.
     """
-    if isinstance(err, APIError) and err.reason == "unavailable":
-        return True
-    return not _is_transient_for_poll(err)
+    return not _is_transient_for_poll(err, settling_409=True)
 
 
 def _desktop_not_yet(err: MandalaError) -> bool:
