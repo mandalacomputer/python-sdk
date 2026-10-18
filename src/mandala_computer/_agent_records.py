@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from ._agent import AgentResult, AgentStep, _usd
@@ -353,8 +353,8 @@ class AgentRun:
     #: ``model_key``.
     cost_usd: float | None = None
     #: How a ``completed`` run ended; ``None`` before then and on any other
-    #: ending. Its ``thread_id`` is always ``None``: the run's own
-    #: :attr:`thread_id` is the one to use.
+    #: ending. Its ``thread_id`` is the run's own :attr:`thread_id`, whatever
+    #: the platform put inside it, so the two can never name different threads.
     result: AgentResult | None = None
     #: Why a ``failed`` or ``interrupted`` run stopped; ``None`` otherwise.
     error: AgentRunError | None = None
@@ -393,6 +393,7 @@ class AgentRun:
         if result is not None and not isinstance(result, Mapping):
             raise MandalaError(f"{where}: result is neither null nor an object")
         error = d.get("error")
+        thread_id = _thread_ref(d, where)
         return cls(
             id=_id(d, "id", where),
             computer_id=_text(d.get("computer_id")),
@@ -403,10 +404,15 @@ class AgentRun:
             steps=_count(d.get("steps")),
             created_at=_text(d.get("created_at")),
             updated_at=_text(d.get("updated_at")),
-            thread_id=_thread_ref(d, where),
+            thread_id=thread_id,
             ended_at=_opt_text(d.get("ended_at")),
             cost_usd=_usd(d.get("cost_usd")),
-            result=None if result is None else AgentResult.from_api(result),
+            # The run's thread is the run's, not whatever the result carried:
+            # the platform documents none there, and a caller reading either
+            # field must be handed the same thread to continue.
+            result=None
+            if result is None
+            else replace(AgentResult.from_api(result), thread_id=thread_id),
             error=None
             if error is None
             else AgentRunError.from_api(error, f"{where}: error", base_url=base_url),

@@ -254,10 +254,9 @@ class AgentResult:
     #: The thread this run's exchange was kept in: pass it as ``thread_id=`` on
     #: the next run on this computer to continue the conversation, or read it
     #: with ``client.agent_threads.get``. ``None`` when nothing was kept — a run
-    #: sent with ``store=False``, an account with no thread it could replace —
-    #: and on a background run's :attr:`~mandala_computer.AgentRun.result`,
-    #: whose thread is the run's own
-    #: :attr:`~mandala_computer.AgentRun.thread_id`.
+    #: sent with ``store=False``, an account with no thread it could replace.
+    #: On a background run's :attr:`~mandala_computer.AgentRun.result` it is
+    #: the run's own :attr:`~mandala_computer.AgentRun.thread_id`.
     thread_id: str | None = field(default=None, kw_only=True)
 
     @property

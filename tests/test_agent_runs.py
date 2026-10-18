@@ -234,7 +234,7 @@ def test_get_reads_a_completed_run_whole() -> None:
     assert run.status == "completed" and run.ended and run.finished
     assert run.thread_id == THREAD_ID and run.cost_usd == 0.11
     assert run.result is not None and run.result.text == "renamed 4 files"
-    assert run.result.usage.input_tokens == 900 and run.result.thread_id is None
+    assert run.result.usage.input_tokens == 900 and run.result.thread_id == THREAD_ID
     assert [s.tool for s in run.steps_taken] == ["computer", "bash"]
     assert run.ended_at == COMPLETED["ended_at"] and run.raw == COMPLETED
 
@@ -254,6 +254,19 @@ def test_a_failure_and_an_interruption_carry_their_error() -> None:
     interrupted = client().agent_runs.get(RUN_ID)
     assert interrupted.ended and interrupted.error is not None
     assert interrupted.error.status == 503 and interrupted.error.reason is None
+
+
+@pytest.mark.parametrize("nested", [None, "", "thr_aaaaaaaaaaaaaaaaaaaaaaaa"])
+def test_the_result_names_the_runs_own_thread_whatever_it_carried(nested: object) -> None:
+    """The run's ``thread_id`` and its result's cannot disagree: a caller
+    reading ``run.result.thread_id`` to continue the conversation gets the
+    thread the run says it is kept in, not one the result happened to carry."""
+    body = {**COMPLETED, "result": {**COMPLETED["result"], "thread_id": nested}}
+    run = mc.AgentRun.from_api(body)
+    assert run.thread_id == THREAD_ID
+    assert run.result is not None and run.result.thread_id == THREAD_ID
+    unkept = mc.AgentRun.from_api({**body, "thread_id": None})
+    assert unkept.result is not None and unkept.result.thread_id is None
 
 
 def test_completed_is_not_finished_unless_the_model_ended_its_turn() -> None:

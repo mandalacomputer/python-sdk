@@ -6152,7 +6152,7 @@ class Computer(ComputerFields):
     ) -> AgentRun:
         """Start the agent loop on this computer and walk away: a background run.
 
-        The same loop as :meth:`agent`, with the same arguments, except that
+        The same loop as :meth:`agent`, with its arguments but ``store``, and
         nothing streams. This returns once the run holds the computer, with the
         :class:`~mandala_computer.AgentRun` as it stands (``status``
         ``"running"``), and the run goes on without the request: read it back
