@@ -13,7 +13,7 @@ from enum import Enum, auto
 from typing import Any, Literal
 
 from . import _api
-from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport
+from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, Transport, build_stream_error
 from ._computer import Computer, _poll_delay, _ride_out, check_wait_args
 from ._exceptions import (
     _REASON_CLEARS,
@@ -1483,7 +1483,7 @@ class Builds:
     def _events(self, build_id: str, stream: Iterator[SSEEvent]) -> Iterator[BuildProgress]:
         for event in stream:
             if event.event == "error":
-                raise MandalaError(_api.build_stream_failed(build_id, event.data))
+                raise build_stream_error(build_id, event.data)
             if event.event not in ("progress", "done"):
                 continue
             if not isinstance(event.data, Mapping):

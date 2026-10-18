@@ -584,6 +584,56 @@ def test_a_stream_error_says_it_is_not_the_build(client: mc.Client) -> None:
         list(client.builds.events("bld-1"))
 
 
+REVOKED_FRAME = {
+    "request_id": "req_123",
+    "error": "This API key has been revoked.",
+    "status": 401,
+    "reason": "revoked",
+}
+
+
+@respx.mock
+def test_a_refusal_frame_becomes_the_status_error(client: mc.Client) -> None:
+    """An ``error`` frame with a status is the refusal the request would have had.
+
+    Its class, ``reason`` and ``request_id`` are kept, and it does not advise
+    reading ``builds.progress``, which a revoked caller cannot do (OPL-6080).
+    """
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("error", REVOKED_FRAME)))
+    with pytest.raises(mc.AuthenticationError) as caught:
+        list(client.builds.events("bld-1"))
+    err = caught.value
+    assert err.status == 401
+    assert err.reason == "revoked"
+    assert err.request_id == "req_123"
+    assert "builds.progress" not in str(err)
+    assert "has been revoked" in str(err)
+
+
+@respx.mock
+async def test_a_refusal_frame_becomes_the_status_error_async(
+    async_client: mc.AsyncClient,
+) -> None:
+    frame = {**REVOKED_FRAME, "status": 403, "error": "Your role no longer reaches it."}
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("error", frame)))
+    with pytest.raises(mc.PermissionDeniedError) as caught:
+        async for _ in async_client.builds.events("bld-1"):
+            pass
+    assert caught.value.reason == "revoked"
+    assert caught.value.request_id == "req_123"
+    assert "builds.progress" not in str(caught.value)
+
+
+@respx.mock
+def test_a_5xx_frame_is_typed_and_still_points_at_the_poll(client: mc.Client) -> None:
+    frame = {"error": "the build host went away", "status": 503}
+    respx.get(f"{BASE}/builds/bld-1/events").mock(return_value=sse(("error", frame)))
+    with pytest.raises(mc.APIError) as caught:
+        list(client.builds.events("bld-1"))
+    assert caught.value.status == 503
+    assert "builds.progress('bld-1')" in str(caught.value)
+
+
 @respx.mock
 def test_wait_returns_when_the_build_is_done(client: mc.Client) -> None:
     respx.get(f"{BASE}/builds/bld-1/progress").mock(return_value=httpx.Response(200, json=DONE))

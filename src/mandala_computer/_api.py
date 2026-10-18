@@ -597,22 +597,26 @@ def build_params(no_reuse: bool) -> dict[str, str]:
     return {"no_reuse": "true"} if flag(no_reuse, "no_reuse") else {}
 
 
-def build_stream_failed(build_id: str, data: Any) -> str:
+def build_stream_failed(build_id: str, data: Any, *, status: int | None = None) -> str:
     """What to say when a build's event stream ends with an ``error`` event.
 
     The stream's own failure, not the build's — named as such because a caller
     told "the build failed" would go and read a document that is fine. One
     function so the sync and async halves cannot word it differently.
+
+    A frame with a 4xx ``status`` is a refusal of the caller (a revoked key, a
+    role that no longer reaches the build), and reading ``builds.progress``
+    would be refused the same way, so that advice is left off it.
     """
     detail = ""
     if isinstance(data, Mapping):
         detail = str(data.get("error") or "")
     elif data is not None:
         detail = str(data)
-    return (
-        f"the build event stream for {build_id} ended: {detail or 'no reason given'} "
-        f"(this says nothing about the build itself — read builds.progress({build_id!r}))"
-    )
+    said = f"the build event stream for {build_id} ended: {detail or 'no reason given'}"
+    if status is not None and status < 500:
+        return f"{said} (this says nothing about the build itself)"
+    return f"{said} (this says nothing about the build itself — read builds.progress({build_id!r}))"
 
 
 def build_stream_truncated(build_id: str, *, malformed: bool) -> str:

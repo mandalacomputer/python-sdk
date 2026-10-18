@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from . import _api
 from ._async_computer import AsyncComputer
-from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport
+from ._client import SNAPSHOT_DELETE_TIMEOUT, SNAPSHOT_POLL, AsyncTransport, build_stream_error
 from ._exceptions import ConflictError, MandalaError, NotFoundError, TimeoutError
 from ._models import (
     AccountQuota,
@@ -1000,7 +1000,7 @@ class AsyncBuilds:
     ) -> AsyncIterator[BuildProgress]:
         async for event in stream:
             if event.event == "error":
-                raise MandalaError(_api.build_stream_failed(build_id, event.data))
+                raise build_stream_error(build_id, event.data)
             if event.event not in ("progress", "done"):
                 continue
             if not isinstance(event.data, Mapping):

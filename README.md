@@ -467,7 +467,11 @@ for p in client.builds.events(build.id):
 Each event is news — the platform sends one only when something moved — and the
 last one is the `done`, **including for a build that failed**. An `error` event
 means the *stream* could not go on and says nothing about the build; it raises,
-and says so. An account may hold eight streams open at once. To stop reading
+and says so. One that carries a status, such as the `401` with
+`reason: "revoked"` sent when the caller's key is revoked mid-stream, raises the
+class that status has on any route (`AuthenticationError`,
+`PermissionDeniedError`, ...) with its `reason` and `request_id`. An account may
+hold eight streams open at once. To stop reading
 early, close the iterator — `contextlib.closing()` — rather than `break` out of
 it.
 
