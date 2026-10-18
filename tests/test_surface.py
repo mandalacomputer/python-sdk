@@ -5,7 +5,7 @@ there, but a client that calls a route the server does not expose fails at
 runtime in a user's hands rather than here. This asserts every request the SDK
 can issue lands on an allowlisted route.
 
-Keep ALLOWED in step with V1_ROUTES in `web/lib/surface.ts` in the platform repo.
+Keep ALLOWED in step with the v1 route table in the platform repo.
 It mirrors that table in full, including the routes this SDK does not call —
 those are named in UNIMPLEMENTED, which is what keeps the distance between the
 two visible rather than letting it grow quietly. The tables themselves live in
@@ -20,7 +20,7 @@ mirror that never learned the route exists. That script is run from this file,
 rather than left as a command in the README, because a check somebody has to
 remember is the same hole one step further back.
 
-PARAMETERS mirrors `web/lib/apidoc.ts` the same way, and exists because the
+PARAMETERS mirrors the platform's API reference the same way, and exists because the
 route table was not enough. `Range` on `GET computers/:id/files` is what lets a
 file larger than one request moves come off a computer at all, and it arrived on
 a route ALLOWED already listed — so every check here stayed green through a
@@ -1856,7 +1856,7 @@ def test_the_mirror_is_in_step_with_the_platform() -> None:
     """The drift check, run by the suite rather than only by hand.
 
     `scripts/check_surface.py` is what compares ALLOWED against the platform's
-    own V1_ROUTES, and until this test existed nothing ran it — it was a line in
+    own route table, and until this test existed nothing ran it — it was a line in
     the README, which is a thing somebody has to remember. That is the exact
     failure it was written for: the routes it would have caught went missing
     because no one thought to look.

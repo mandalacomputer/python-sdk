@@ -37,10 +37,10 @@ def test_the_repo_itself_is_clean() -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        "# see server/vm.go for the ordering",
-        "# the switch in fileevents.go decides",  # no `server/` prefix
+        "# see server/widget.go for the ordering",
+        "# the switch in gadgets.go decides",  # no `server/` prefix
         "# server/pkg/nested/thing.go",  # nested
-        "# webhookSign.go",  # capitals
+        "# frobnicateThing.go",  # capitals
         "# api_v2.go",  # digits and underscores
     ],
 )
@@ -56,14 +56,32 @@ def test_a_go_file_is_caught_however_it_is_spelled(line: str) -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        "# lib/apidoc says otherwise",
-        "# web/lib/projection.ts sets it",
-        "# lib/hvproxy forwards the header",
-        "# server/api.go",
+        "# lib/manual says otherwise",
+        "# web/lib/frobnicate.ts sets it",
+        "# lib/relay forwards the header",
+        "# server/handler.go",
     ],
 )
 def test_a_platform_module_is_caught_with_or_without_its_extension(line: str) -> None:
     assert ci.scan_text(line, "f.py", set())
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "# run `gorillad -dry-run` there",
+        "# the daemon (gorillad) answers",
+        "# everything under web/lib is generated",
+        "# see web/lib for the table",
+    ],
+)
+def test_the_daemon_and_the_bare_module_directory_are_caught(line: str) -> None:
+    """The daemon's binary name and ``web/lib`` with no module after it (OPL-6080)."""
+    assert ci.scan_text(line, "f.py", set())
+
+
+def test_web_lib_with_a_module_is_reported_once() -> None:
+    assert len(ci.scan_text("# web/lib/routes.ts", "f.py", set())) == 1
 
 
 def test_an_identifier_is_caught_by_its_hash_and_reported_by_its_name() -> None:
@@ -94,7 +112,7 @@ def test_ordinary_prose_about_the_platform_survives() -> None:
 def test_an_allowlisted_file_is_the_only_way_past_it() -> None:
     assert "scripts/check_surface.py" in ci.ALLOWED_FILES
     # And the allowlist is by FILE: the same text elsewhere still fails.
-    assert ci.scan_text("# web/lib/surface.ts", "src/mandala_computer/_api.py", set())
+    assert ci.scan_text("# web/lib/routes.ts", "src/mandala_computer/_api.py", set())
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -132,7 +150,7 @@ def test_the_message_scan_reads_every_commit_in_the_range(tmp_path: Path) -> Non
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "first, and clean"], cwd=repo, check=True)
     (repo / "a").write_text("2")
-    subprocess.run(["git", "commit", "-qam", "second: see server/vm.go"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qam", "second: see server/widget.go"], cwd=repo, check=True)
 
     original = ci.ROOT
     try:
@@ -141,7 +159,7 @@ def test_the_message_scan_reads_every_commit_in_the_range(tmp_path: Path) -> Non
     finally:
         ci.ROOT = original
     assert len(found) == 1
-    assert "server/vm.go" in found[0]
+    assert "server/widget.go" in found[0]
 
 
 def test_public_cdp_field_exception_is_scoped_to_its_consumer() -> None:

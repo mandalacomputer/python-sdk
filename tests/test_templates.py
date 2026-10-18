@@ -269,7 +269,7 @@ def test_a_layered_document_is_told_why_it_has_no_build_digest(client: mc.Client
     """
     needs = (
         "the contents of acme/base's image, which only a host holding it can supply. "
-        "Run `gorillad -build-template <file> -dry-run` there to see this document's "
+        "Run the host's template build with `-dry-run` there to see this document's "
         "build digest"
     )
     respx.post(f"{BASE}/templates/validate").mock(

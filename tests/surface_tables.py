@@ -9,7 +9,7 @@ exercise; this module is just the tables.
 
 from __future__ import annotations
 
-# (method, pattern) with ids replaced by ":id" — mirrors surface.ts V1_ROUTES.
+# (method, pattern) with ids replaced by ":id" — mirrors the platform's v1 route table.
 ALLOWED = {
     ("GET", "templates"),
     # The template document format (platform OPL-3568): the published JSON
@@ -155,8 +155,8 @@ ALLOWED = {
 }
 
 # Every query, header and body field the platform documents, by route —
-# mirroring the `DOCS` table in `web/lib/apidoc.ts` as ALLOWED mirrors
-# V1_ROUTES.
+# mirroring the platform's API reference as ALLOWED mirrors its route
+# table.
 #
 # Its own table because the route table could not see the thing that made it
 # necessary. `Range` on `GET computers/:id/files` is what lets a file larger

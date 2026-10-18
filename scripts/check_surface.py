@@ -131,7 +131,8 @@ def git_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name not in GIT_ELSEWHERE}
 
 
-#: The files that identify a platform checkout git cannot vouch for — an export,
+#: The top-level directories that identify a platform checkout git cannot vouch
+#: for — an export,
 #: a vendored copy, a clone whose remote was removed. A fallback rather than the
 #: primary test: they are contents, and contents are what goes missing when the
 #: mirror drifts. Named for identity only and never read: the MANIFEST is
@@ -140,7 +141,7 @@ def git_environment() -> dict[str, str]:
 #: is missing — an export that predates or lost the manifest then skipped at
 #: exit 0 instead of failing (review of OPL-4837). :func:`read_manifest`
 #: separately says whether a recognized checkout holds one.
-PLATFORM_MARKERS = (Path("web/lib/surface.ts"), Path("web/lib/apidoc.ts"))
+PLATFORM_MARKERS = (Path("server"), Path("web"), Path("gateway"))
 
 
 #: Directory names the platform repo answers to when checked out beside this one.
@@ -207,7 +208,7 @@ def is_platform_checkout(directory: Path) -> bool:
     cannot speak for.
     """
     return PLATFORM_REMOTE in remotes(directory) or all(
-        (directory / marker).is_file() for marker in PLATFORM_MARKERS
+        (directory / marker).is_dir() for marker in PLATFORM_MARKERS
     )
 
 
