@@ -4344,8 +4344,13 @@ The interactive `terminal` command currently requires a Unix-like local terminal
 the guest. It rides the files API rather than the terminal, so it works
 without any shell in the guest at all. A download is paged, so a file larger
 than the 64 MiB one request moves copies like any other, and a copy that is
-refused leaves the local file alone. An upload is one request, and one larger
-than the limit is refused before it is read.
+refused leaves the local file alone. An upload up to 64 MiB is one request; a
+larger one, up to 2 GiB and to a Linux guest only, goes up through the resumable
+upload in 4 MiB chunks, as `mandala scp` does, and its upload receipt is removed
+once the file is in place (`--json` names it as `cleanup_upload_id` if that
+removal failed). An interrupted one names its upload id: send the same `scp`
+again with `--upload-id ID` and the unchanged file to carry on from what the
+guest holds. A file over 2 GiB is refused before it is read.
 `--no-overwrite` makes an upload create-only: a guest path that is already
 taken is refused, and that upload writes nothing. It is refused on a download.
 

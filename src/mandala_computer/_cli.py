@@ -192,6 +192,9 @@ if TYPE_CHECKING:
 #: what to run next. ``mandala`` is the npm CLI's; see the module docstring.
 PROG = "mandala-py"
 
+#: The most one resumable upload carries: ``scp`` past 64 MiB.
+UPLOAD_SIZE_LIMIT = 2 * 1024 * 1024 * 1024
+
 # The whole guest-side scrollback is smaller than this; anything bigger in one
 # frame is not the terminal protocol.
 _MAX_FRAME = 1 << 22
@@ -276,6 +279,9 @@ def _with_ids(info: dict[str, Any], err: MandalaError) -> dict[str, Any]:
         "request_id": getattr(err, "request_id", None),
         "idempotency_key": err.idempotency_key,
         "operation_id": getattr(err, "operation_id", None),
+        # A resumable upload's id: what resuming it, or removing its staging,
+        # names (``scp --upload-id``).
+        "upload_id": getattr(err, "upload_id", None),
     }
     info.update({key: value for key, value in ids.items() if value is not None})
     return info
@@ -300,6 +306,7 @@ def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
         for key, label in (
             ("operation_id", "operation"),
             ("idempotency_key", "idempotency key"),
+            ("upload_id", "upload id"),
             ("request_id", "request id"),
         )
         if key in ids
@@ -307,6 +314,11 @@ def _recovery_line(err: MandalaError, resendable: bool = False) -> str | None:
     if not parts:
         return None
     line = f"{PROG}: {'; '.join(parts)}"
+    if "upload_id" in ids:
+        line += (
+            f" (resume it by sending the same scp again with --upload-id "
+            f"{_printable(str(ids['upload_id']))} and the unchanged file)"
+        )
     if "idempotency_key" in ids and "operation_id" not in ids:
         # The two commands are for pasting into a shell, and the key may be the
         # caller's own --idempotency-key: any printable ASCII but a space. So it
@@ -1540,6 +1552,10 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     # there would replace a file the caller asked to keep.
     if src is not None and args.no_overwrite:
         _die("--no-overwrite applies to an upload, not a download", "invalid_arguments")
+    if src is not None and args.upload_id is not None:
+        _die("--upload-id applies to an upload, not a download", "invalid_arguments")
+    if args.upload_id is not None and not re.fullmatch(r"[a-f0-9]{32}", args.upload_id):
+        _die("--upload-id must be 32 lowercase hexadecimal characters", "invalid_arguments")
 
     if src is not None:
         target, remote_path = src
@@ -1587,45 +1603,79 @@ def _cmd_scp(args: argparse.Namespace) -> int:
     ):
         remote_path += os.path.basename(args.src)
     with open(args.src, "rb") as f:
-        if os.fstat(f.fileno()).st_size > FILE_SIZE_LIMIT:
-            _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
-        # The bounded read also covers files that grow after fstat and special
-        # files whose reported size is zero.
-        data = f.read(FILE_SIZE_LIMIT + 1)
-    if len(data) > FILE_SIZE_LIMIT:
-        _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
-    with _client() as client:
-        try:
-            stored = _resolve(client, target).write_file(
-                remote_path, data, overwrite=not args.no_overwrite
-            )
-        except FileExistsError:
-            # Only THIS upload is known to have written nothing: an earlier
-            # attempt whose answer was lost may have written the file itself.
-            _die(
-                f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
-                "earlier attempt's outcome was unknown, the file may be yours: read it and "
-                "compare before choosing another path or dropping --no-overwrite to replace it.",
-                "exists",
-            )
-        except CreateOnlyConflictError:
-            # No usable reason, so nothing here says the path is taken, nor that
-            # this upload wrote nothing: without the platform's word, a 409 (JSON
-            # or not) may come from a hop that had already forwarded the write.
-            _die(
-                f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
-                "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
-                "send the same upload again blind: read "
-                "the remote path to see what is there before choosing another path or "
-                "dropping --no-overwrite.",
-                "conflict",
-            )
+        size = os.fstat(f.fileno()).st_size
+        # Past what one request carries, or resuming one that was: the
+        # resumable upload, in chunks, as ``mandala scp`` switches to it
+        # (OPL-6080). Linux guests only, up to 2 GiB.
+        resumable = size > FILE_SIZE_LIMIT or args.upload_id is not None
+        data: bytes | None = None
+        if resumable:
+            if size > UPLOAD_SIZE_LIMIT:
+                _die(f"{args.src} exceeds the 2 GiB upload limit", "too_large")
+        else:
+            # The bounded read also covers files that grow after fstat and
+            # special files whose reported size is zero.
+            data = f.read(FILE_SIZE_LIMIT + 1)
+            if len(data) > FILE_SIZE_LIMIT:
+                _die(f"{args.src} exceeds the 64 MiB file-transfer limit", "too_large")
+        cleanup_upload_id: str | None = None
+        with _client() as client:
+            computer = _resolve(client, target)
+            if resumable and (computer.os == "windows" or looks_windows_guest_path(remote_path)):
+                _die(
+                    f"{args.src} exceeds the 64 MiB file-transfer limit; larger uploads "
+                    "are Linux only",
+                    "too_large",
+                )
+            try:
+                if data is None:
+                    progress = computer.upload_file(
+                        remote_path,
+                        f,
+                        size=size,
+                        upload_id=args.upload_id,
+                        overwrite=not args.no_overwrite,
+                    )
+                    sent = size
+                    stored: int | None = progress.offset
+                    # The receipt outlives the file it describes and holds
+                    # nothing worth keeping once the file is published.
+                    # Without waking a computer that slept since.
+                    try:
+                        computer.cancel_file_upload(remote_path, progress.upload_id, no_wake=True)
+                    except MandalaError:
+                        cleanup_upload_id = progress.upload_id
+                else:
+                    sent = len(data)
+                    stored = computer.write_file(remote_path, data, overwrite=not args.no_overwrite)
+            except FileExistsError as e:
+                # Only THIS upload is known to have written nothing: an earlier
+                # attempt whose answer was lost may have written the file itself.
+                _die(
+                    f"{target}:{remote_path} already exists; this upload wrote nothing. If an "
+                    "earlier attempt's outcome was unknown, the file may be yours: read it and "
+                    "compare before choosing another path or dropping --no-overwrite to replace "
+                    f"it.{_staging_note(e)}",
+                    "exists",
+                )
+            except CreateOnlyConflictError as e:
+                # No usable reason, so nothing here says the path is taken, nor that
+                # this upload wrote nothing: without the platform's word, a 409 (JSON
+                # or not) may come from a hop that had already forwarded the write.
+                _die(
+                    f"{target}:{remote_path}: the create-only upload was refused as a conflict, "
+                    "reason unknown; whether this upload wrote anything is unconfirmed. Do not "
+                    "send the same upload again blind: read "
+                    "the remote path to see what is there before choosing another path or "
+                    f"dropping --no-overwrite.{_staging_note(e)}",
+                    "conflict",
+                )
     # A count that differs from what was sent means the guest holds something
     # other than this file: refused in both modes, as ``mandala scp`` refuses
     # it, so ``confirmed: true`` always means the platform counted every byte.
-    if stored is not None and stored != len(data):
+    if stored is not None and stored != sent:
         _die(
-            f"upload was incomplete: sent {len(data)} bytes but the guest reported {stored}",
+            f"upload was incomplete: sent {sent} bytes but the guest reported {stored}",
             "invalid_arguments",
         )
     if args.json:
@@ -1633,17 +1683,34 @@ def _cmd_scp(args: argparse.Namespace) -> int:
         # reported a count of what it wrote (one that matched, as checked
         # above), as ``mandala scp --json`` says it. A platform that reports
         # none is not evidence that everything landed.
-        _json(
-            {
-                "source": args.src,
-                "destination": f"{target}:{remote_path}",
-                "bytes": len(data),
-                "confirmed": stored is not None,
-            }
-        )
+        result: dict[str, Any] = {
+            "source": args.src,
+            "destination": f"{target}:{remote_path}",
+            "bytes": sent,
+            "confirmed": stored is not None,
+        }
+        # The file is published; only its upload receipt was left behind.
+        if cleanup_upload_id is not None:
+            result["cleanup_upload_id"] = cleanup_upload_id
+        _json(result)
     else:
-        print(f"{args.src} -> {target}:{remote_path} ({len(data)} bytes)", file=sys.stderr)
+        print(f"{args.src} -> {target}:{remote_path} ({sent} bytes)", file=sys.stderr)
+        if cleanup_upload_id is not None:
+            print(
+                f"{PROG}: the file is in place, but its upload receipt "
+                f"{cleanup_upload_id} could not be removed; it holds guest disk until "
+                "it is cancelled",
+                file=sys.stderr,
+            )
     return 0
+
+
+def _staging_note(err: BaseException) -> str:
+    """For a refused resumable upload: the id whose staging may need removing."""
+    upload_id = getattr(err, "upload_id", None)
+    if not isinstance(upload_id, str):
+        return ""
+    return f" Upload {_printable(upload_id)} may have staged data on the guest."
 
 
 # --- entry -----------------------------------------------------------------
@@ -4533,6 +4600,12 @@ def _parser() -> _Parser:
         "--no-overwrite",
         action="store_true",
         help="upload only: create the guest file, refusing if something is there",
+    )
+    scp.add_argument(
+        "--upload-id",
+        metavar="ID",
+        help="upload only: resume the resumable upload with this 32-character lowercase hex "
+        "ID (no dashes), from the unchanged source; uploads past 64 MiB use one already",
     )
     scp.add_argument(
         "--json", action="store_true", help="the copy as JSON: source, destination, bytes"
