@@ -435,12 +435,21 @@ def _error_info(err: BaseException) -> dict[str, Any]:
     return {"code": "failed", "message": str(err)}
 
 
+#: The most ``retry_after_ms`` reports, as ``mandala`` caps it: about 24.8 days.
+_RETRY_AFTER_MS_MAX = 2**31 - 1
+
+
 def _retry_after_ms(err: APIError) -> int | None:
-    """``err.retry_after`` in whole milliseconds, or ``None`` when none was sent."""
+    """``err.retry_after`` in whole milliseconds, or ``None`` when none was sent.
+
+    Capped, so a header of hundreds of digits (finite as seconds, infinite as
+    milliseconds) cannot overflow the conversion inside the error report."""
     after = err.retry_after
     if after is None or not math.isfinite(after) or after < 0:
         return None
-    return math.ceil(after * 1000)
+    if after >= _RETRY_AFTER_MS_MAX / 1000:
+        return _RETRY_AFTER_MS_MAX
+    return min(math.ceil(after * 1000), _RETRY_AFTER_MS_MAX)
 
 
 def _retry_after_text(ms: int) -> str:

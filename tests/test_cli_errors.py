@@ -651,6 +651,29 @@ def test_a_failure_carries_the_platforms_retry_after(capsys: pytest.CaptureFixtu
     assert "retry_after_ms" not in failure(capsys)
 
 
+@pytest.mark.parametrize("as_json", [True, False])
+@respx.mock
+def test_an_enormous_retry_after_is_capped_not_a_crash(
+    capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    respx.get(f"{BASE}/secrets").mock(
+        return_value=httpx.Response(
+            503,
+            json={"error": "away", "request_id": "req_7"},
+            headers={"Retry-After": "9" * 306},
+        )
+    )
+    assert _cli.main(["secrets", "list", *(["--json"] if as_json else [])]) == 1
+    if as_json:
+        error = failure(capsys)
+        assert error["retry_after_ms"] == 2**31 - 1
+        assert error["request_id"] == "req_7"
+    else:
+        lines = text_failure(capsys)
+        assert "the platform asked to wait" in lines[1]
+        assert "request id req_7" in lines[2]
+
+
 @pytest.mark.parametrize(
     ("ms", "text"),
     [
