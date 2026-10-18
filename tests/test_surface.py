@@ -78,6 +78,15 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # Agent threads and background runs. Not wrapped yet; until they are, call
+    # them over HTTP.
+    ("GET", "agent/threads"),
+    ("GET", "agent/threads/:thread"),
+    ("DELETE", "agent/threads/:thread"),
+    ("POST", "computers/:id/agent/runs"),
+    ("GET", "agent/runs"),
+    ("GET", "agent/runs/:run"),
+    ("POST", "agent/runs/:run/cancel"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -100,6 +109,11 @@ UNIMPLEMENTED_PARAMETERS = {
     "POST computers/:id/input  body:key",
     # `amount` is sent instead. Same value, two names.
     "POST computers/:id/input  body:scroll_amount",
+    # Continuing a thread, opting out of keeping one, and a history the caller
+    # keeps itself. Not sent by agent() yet.
+    "POST computers/:id/agent  body:thread_id",
+    "POST computers/:id/agent  body:store",
+    "POST computers/:id/agent  body:messages",
 }
 
 #: UNIMPLEMENTED in the spelling PARAMETERS is keyed by.
@@ -543,6 +557,12 @@ def pattern_for(path: str) -> str:
         # A public URL's id (platform OPL-3753), pinned to the same position.
         if i == 3 and parts[0] == "computers" and parts[2] == "public-urls":
             return ":urlId"
+        # An agent thread's and a background run's id, second segment under
+        # `agent` only, as the platform pins them.
+        if i == 2 and parts[0] == "agent" and parts[1] == "threads":
+            return ":thread"
+        if i == 2 and parts[0] == "agent" and parts[1] == "runs":
+            return ":run"
         return seg
 
     # A template ref's two halves, pinned to a THREE-segment path under
