@@ -2731,6 +2731,10 @@ bound = c.secrets()
 c.set_secrets([{"secret_id": key.id, "env": "OPENAI_API_KEY"}], version=bound.version)
 ```
 
+A create always binds each secret's latest revision, so a create or launch
+binding naming a `revision_id` raises `ValueError` before anything is sent, as
+the platform would refuse it. `revision_id` is for a rebind with `set_secrets`.
+
 A replaced value is sent to a running computer asynchronously and on a
 best-effort basis — to a file binding always, and to an environment binding for
 new shells on images that support it — and the answer does not say whether it

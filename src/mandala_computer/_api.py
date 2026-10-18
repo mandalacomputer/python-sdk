@@ -1234,7 +1234,7 @@ def create_body(
         if count is not None:
             body[key] = whole(count, key, exc=ValueError)
     if secrets is not None:
-        body["secrets"] = secret_bindings_body(secrets)
+        body["secrets"] = secret_bindings_body(secrets, revisions=False)
     if browser_proxy is NO_BROWSER_PROXY:
         body["browser_proxy"] = None
     elif browser_proxy is not None:
@@ -3050,7 +3050,9 @@ def _encodable(text: str, what: str) -> str:
     raise ValueError(f"{what} must be valid Unicode text")
 
 
-def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[str, str]]:
+def secret_bindings_body(
+    bindings: object, what: str = "secrets", *, revisions: bool = True
+) -> list[dict[str, str]]:
     """A binding list as the wire takes it, checked for what the platform would refuse.
 
     Each binding names one secret by id and publishes it under exactly one of
@@ -3062,6 +3064,11 @@ def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[s
 
     A bare mapping or string in the list position is refused rather than
     wrapped, for the reason :func:`_ids` gives.
+
+    ``revisions=False`` is a create's list: a new computer always binds each
+    secret's latest revision, and the platform refuses a ``revision_id`` there,
+    so one is refused here before anything is sent (OPL-6080). It is for a
+    rebind with ``set_secrets``.
     """
     if isinstance(bindings, (str, bytes, Mapping)) or not isinstance(bindings, (list, tuple)):
         raise ValueError(  # noqa: TRY004 — one exception type for one class of mistake
@@ -3114,6 +3121,11 @@ def secret_bindings_body(bindings: object, what: str = "secrets") -> list[dict[s
             files.add(name)
             wire["file"] = name
         revision_id = binding.get("revision_id")
+        if revision_id is not None and not revisions:
+            raise ValueError(
+                f"{at}.revision_id is for a rebind (set_secrets); a create binds each "
+                "secret's latest revision, so omit it"
+            )
         if revision_id is not None:
             wire["revision_id"] = _secret_ref(revision_id, f"{at}.revision_id")
         out.append(wire)
