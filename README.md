@@ -1645,6 +1645,17 @@ starting is billable, and it is not a decision to make on your behalf because
 you sent a prompt. A stopped or suspended computer is a `ConflictError`, and so
 is one another run is already driving.
 
+**During a platform update, new runs are refused for a few minutes.** The
+calls that start a run — `agent()`, `agent_stream()`, `agent_once()`,
+`start_agent_run()` and `agent_runs.start()` — raise `UnavailableError` (503)
+with `reason == "draining"` and a `retry_after` (30 seconds today). The refusal
+comes before anything starts: nothing ran, nothing was charged, and runs already
+going are not affected. So `is_transient()` answers `True` for it, and a client
+constructed with `retries={"idempotent": n}` sends the same call again itself
+after the wait — up to `n` more times, with each wait capped as for a read (see
+[Optional retries for reads](#optional-retries-for-reads)). Without `retries` it
+is raised, and sending the same call again after `retry_after` is safe.
+
 A run is minutes of clicking, so `agent_stream()` reports as it goes — something
 that says nothing until it is over cannot be told from a hang:
 
@@ -1834,7 +1845,9 @@ cannot start. Everything after that ends the run as `failed`. A run the platform
 was executing when it restarted is `interrupted` and is not resumed, and
 `run.thread_id` names the thread the run is kept in once it has something in
 it. The start is not retried: a start whose answer was lost may have started a
-run, so list the computer's runs before sending it again.
+run, so list the computer's runs before sending it again. The one exception is
+the refusal during a platform update (`reason == "draining"`, above), which says
+nothing started; a client with `retries` sends that start again itself.
 
 #### OpenAI-compatible computer agent
 
@@ -1903,7 +1916,10 @@ inputs, tool-call conversations, the Responses API or other OpenAI features.
 `max_retries=0` prevents the OpenAI client from automatically replaying a
 desktop task after a refusal or interrupted connection. A failed, aborted or
 limited run may already have changed the desktop; inspect it before deciding
-whether to try again. Existing Mandala computer charges and rate budgets apply,
+whether to try again. One refusal is the exception: during a platform update
+the endpoint refuses new runs with HTTP 503, a `Retry-After` header and
+`"reason": "draining"` in the JSON body, before anything starts, and the same
+request is safe to send again once that wait is over. Existing Mandala computer charges and rate budgets apply,
 and the selected provider bills model usage to your key. This does not add hosted inference,
 included model credits or dashboard chat persistence.
 
@@ -3915,7 +3931,8 @@ client = Client(retries={"idempotent": 2})  # up to two additional attempts per 
 
 `idempotent` must be a nonnegative integer; zero keeps a single attempt. The
 client copies this setting at construction. Only GET and HEAD can retry, on
-connection failures or HTTP 502, 503 and 504. The legacy PID output poll is
+connection failures or HTTP 502, 503 and 504 — save one refusal of the calls
+that start an agent run, at the end of this section. The legacy PID output poll is
 excluded because reading it advances a shared cursor. HTTP 429 is never retried,
 including when its error body is interrupted; `RateLimitError.retry_after` still
 carries a usable server delay. Other statuses and local validation, decoding,
@@ -3962,6 +3979,17 @@ A lost answer does not prove a mutation did not happen: another create or exec
 can duplicate work. Creates, template preparation, retained publication and POST
 agent streams therefore remain single attempts. Check an uncertain mutation's
 outcome explicitly before deciding what to do next.
+
+One answer is the exception, and only on the calls that start an agent run —
+`agent()`, `agent_stream()`, `agent_once()`, `start_agent_run()` and
+`agent_runs.start()`, sync and async. During a platform update they are refused
+with HTTP 503 and `"reason": "draining"` at the top of the body, before anything
+starts, and with `retries` set that refusal is sent again after its
+`Retry-After`, counted against the same `idempotent` attempts and under the same
+cap on one wait. Nothing else they meet is: not a connection failure, not a 502
+or 504, not any other 503, and not a draining refusal reached through a
+redirect, which answers a different request than the one sent. Without
+`retries` the refusal is raised, as everything else is.
 
 ### Errors
 
@@ -4225,6 +4253,14 @@ carries the request's `method` so you can see which it was. Read the current
 state before sending a create, a command, a delete or a secret change again.
 The SDK's own `retries` never replays a change either.
 
+The one 503 on a change that answers `True` says so in its body: a call that
+starts an agent run, refused with `reason == "draining"` while the platform is
+about to restart for an update. That refusal comes before anything starts, so
+nothing ran and nothing was charged; send the same call again after
+`retry_after` (or let `retries` do it — see
+[Letting the platform drive](#letting-the-platform-drive)). Only the word at the
+top of the body counts, and not on an error carrying a run in `e.agent`.
+
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during
 a boot is what a poll loop is *for* — and give up only on a failure describing
@@ -4251,7 +4287,9 @@ original create arguments when appropriate, as shown above.
 Read `APIError.reason`, one word the platform puts beside the sentence:
 `contention` (something in flight) and `starting` (the guest agent's boot
 window, two minutes after a start, a restart or a reboot inside the guest)
-make `is_transient()` answer `True`; `unavailable` (the computer is not
+make `is_transient()` answer `True`, and so does `draining` on a 503 (a call
+that starts an agent run, refused during a platform update before anything
+started, as above); `unavailable` (the computer is not
 running — start it), `running` (the computer IS running and the request needs
 it stopped, such as a resize — stop it; waiting never helps), `unsupported`,
 `exists`, `revoked`, `name_taken` (a secret name the account already uses —
