@@ -9,6 +9,20 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **A refusal during a platform update is safe to send again.** While the
+  platform is about to restart for an update, the calls that start an agent
+  run — `agent()`, `agent_stream()`, `agent_once()`, `start_agent_run()` and
+  `agent_runs.start()` — are refused with `UnavailableError` (503),
+  `reason == "draining"` and a `retry_after`, before anything starts.
+  `is_transient()` now answers `True` for it, whatever the method (it answered
+  `False`, as for any 503 on a POST). A client constructed with
+  `retries={"idempotent": n}` sends the same call again after the
+  `Retry-After`, counted against the same `n` attempts and under the same cap
+  on one wait; nothing else these calls meet is resent. Retries stay off by
+  default. Sync and async clients both.
+
 ## [0.16.0] — 2026-10-18
 
 ### Added

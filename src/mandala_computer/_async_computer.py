@@ -2924,6 +2924,16 @@ class AsyncComputer(ComputerFields):
         before the request is sent. ``client.agent_threads`` lists, reads and
         deletes the threads.
 
+        **During a platform update** new runs are refused for a few minutes:
+        a :class:`~mandala_computer.UnavailableError` (503) with ``reason``
+        ``"draining"`` and a :attr:`~mandala_computer.APIError.retry_after`,
+        raised before the first event. Nothing ran and nothing was charged, and
+        runs already going are not affected, so
+        :func:`~mandala_computer.is_transient` answers ``True``. A client
+        constructed with ``retries`` sends the same request again itself after
+        that wait, within the same number of attempts and the same cap on one
+        wait, before anything is yielded (OPL-6094).
+
         The computer must already be RUNNING. This route will not start one:
         starting is billable, and it is not a decision to make on somebody's
         behalf because they sent a prompt. A stopped or suspended computer is a
@@ -2972,6 +2982,7 @@ class AsyncComputer(ComputerFields):
                     messages=messages,
                 ),
                 headers=headers,
+                resend_draining=True,
             )
         ) as frames:
             try:
@@ -3111,7 +3122,10 @@ class AsyncComputer(ComputerFields):
         close a request held open for minutes with nothing crossing it. Prefer
         :meth:`agent`. ``model_key``, ``max_cost_usd``, ``thread_id``,
         ``store`` and ``messages`` work as :meth:`agent_stream` describes: leave
-        the key out to run on the account's Mandala AI credits.
+        the key out to run on the account's Mandala AI credits. So does the
+        refusal during a platform update, a 503 with ``reason`` ``"draining"``:
+        nothing ran, and a client constructed with ``retries`` sends the same
+        request again itself after its ``Retry-After``.
 
         A proxy that answers instead of the platform raises here rather than
         coming back as a run of no steps that ended for no reason — the same
@@ -3186,6 +3200,7 @@ class AsyncComputer(ComputerFields):
                 ),
                 headers=headers,
                 timeout=NO_DEADLINE,
+                resend_draining=True,
             )
         except APIError as exc:
             # A 402 here is the account's AI credits or the model provider's
@@ -3247,7 +3262,15 @@ class AsyncComputer(ComputerFields):
 
         Not retried: a start whose answer was lost may have started a run, so
         list this computer's runs (``client.agent_runs.list(computer_id=...)``)
-        before sending it again.
+        before sending it again. The one exception is a refusal that says
+        nothing started: while the platform is about to restart for an update,
+        new runs are refused with :class:`~mandala_computer.UnavailableError`
+        (503), ``reason`` ``"draining"`` and a
+        :attr:`~mandala_computer.APIError.retry_after`, and
+        :func:`~mandala_computer.is_transient` answers ``True``. A client
+        constructed with ``retries`` sends the same start again itself after
+        that wait, within the same number of attempts and the same cap on one
+        wait; without ``retries`` it is raised (OPL-6094).
         """
         headers = _model_key_headers(
             model_key, self._t.client_headers if model_key is None else None
@@ -3265,7 +3288,9 @@ class AsyncComputer(ComputerFields):
             messages=messages,
         )
         try:
-            data = await self._t.json_object("POST", path, json=body, headers=headers)
+            data = await self._t.json_object(
+                "POST", path, json=body, headers=headers, resend_draining=True
+            )
         except APIError as exc:
             # The same refusals the agent route answers before it streams, and
             # the same reading of them: a 402 is the account's AI credits, never

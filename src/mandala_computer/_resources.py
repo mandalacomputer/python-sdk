@@ -2707,7 +2707,9 @@ class AgentRuns:
             messages=messages,
         )
         try:
-            data = self._t.json_object("POST", path, json=body, headers=headers)
+            data = self._t.json_object(
+                "POST", path, json=body, headers=headers, resend_draining=True
+            )
         except APIError as exc:
             error = _agent_route_error(exc, funded=model_key is None, base_url=self._t.base_url)
             if error is exc:

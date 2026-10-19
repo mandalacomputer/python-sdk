@@ -48,6 +48,7 @@ from ._exceptions import (
     TimeoutError,
     UnavailableError,
     _refusal_reason,
+    _refused_while_draining,
 )
 from ._sse import SSEDecoder, SSEEvent, feed_chunk
 
@@ -521,29 +522,41 @@ class _BaseTransport:
         *,
         client: httpx.Client | httpx.AsyncClient,
         follow_redirects: bool | None = None,
+        resend_draining: bool = False,
     ) -> _Retry:
         if self._credential_source == "file":
             follow_redirects = False
         # Legacy PID reads consume a shared output cursor, despite using GET.
         pathname = httpx.URL(self._url(path)).path
         safe = _safe_read(method, pathname)
+        # A change is sent again for one answer only: the platform refusing to
+        # start an agent run while it updates, which it says came before
+        # anything started (OPL-6094). Only the calls that start a run ask.
+        draining_only = resend_draining and not safe
         return _Retry(
-            self._retries if safe else 0,
+            self._retries if safe or draining_only else 0,
             method,
             path,
             timeout_cap,
             client,
             follow_redirects,
+            draining_only=draining_only,
         )
 
     def _response_failed(
         self, method: str, path: str, resp: httpx.Response | None, exc: httpx.RequestError
     ) -> MandalaError:
         if resp is not None and not resp.is_success:
-            # An interrupted error body cannot erase a known non-retryable status.
+            # An interrupted error body cannot erase a known non-retryable status,
+            # nor the redirect it came through: the history is what names the
+            # method the caller sent and marks the answer as another request's.
             error = self._error(
                 httpx.Response(
-                    resp.status_code, headers=resp.headers, request=resp.request, content=b""
+                    resp.status_code,
+                    headers=resp.headers,
+                    request=resp.request,
+                    content=b"",
+                    history=list(resp.history),
                 )
             )
             if isinstance(error, APIError):
@@ -923,6 +936,14 @@ class _BaseTransport:
 
     @staticmethod
     def _error(resp: httpx.Response) -> APIError:
+        """The exception a failed response deserves, marked when it answered
+        a redirected request rather than the one sent (OPL-6094)."""
+        error = _BaseTransport._classified_error(resp)
+        error._redirected = bool(resp.history)
+        return error
+
+    @staticmethod
+    def _classified_error(resp: httpx.Response) -> APIError:
         body: Any = None
         message = f"HTTP {resp.status_code}"
         # Whether the PLATFORM named this failure, as opposed to the message
@@ -1085,13 +1106,16 @@ def _rate_header(resp: httpx.Response, name: str) -> int | None:
 
 
 def _request_method(resp: httpx.Response) -> str | None:
-    """The method of the request ``resp`` answers, or ``None`` if it has none.
+    """The method of the request the caller SENT, or ``None`` if it has none.
 
     Carried onto the error because a 503 means two different things by method:
-    a read can be read again, and a change may or may not have happened.
+    a read can be read again, and a change may or may not have happened. On a
+    client that follows redirects that is the first hop's method, not the last:
+    a POST answered ``303`` arrives as a GET, and the 303 says the POST was
+    carried out, so a 503 on that GET must not read as a read (OPL-6094).
     """
     try:
-        return resp.request.method
+        return (resp.history[0] if resp.history else resp).request.method
     except RuntimeError:
         return None
 
@@ -1373,6 +1397,8 @@ class _Retry:
         cap: float | None,
         client: httpx.Client | httpx.AsyncClient,
         follow_redirects: bool | None,
+        *,
+        draining_only: bool = False,
     ) -> None:
         self.count = count
         self.attempt = 0
@@ -1382,6 +1408,11 @@ class _Retry:
         self.after: float | None = None
         self.client = client
         self.follow_redirects = follow_redirects
+        #: A change that may be sent again for one answer alone: the platform
+        #: refusing to start an agent run while it updates (OPL-6094). Nothing
+        #: else it meets — a connection failure, a 502, any other 503 — is a
+        #: refusal that came before the request did anything.
+        self.draining_only = draining_only
         self.observed_response = False
         self.hidden_response_possible = False
         # Default-off and ineligible requests retain their original phase cap,
@@ -1389,6 +1420,10 @@ class _Retry:
         self.deadline = None if cap is None or count == 0 else time.monotonic() + cap
 
     def observe(self, request: httpx.Request) -> None:
+        # A change resent for its refusal is judged on the refusal itself, in
+        # observe_response and delay; the hops of a read are judged here.
+        if self.draining_only:
+            return
         # A caller-supplied httpx client may follow redirects to a consuming read.
         if not _safe_read(request.method, request.url.path):
             self.count = 0
@@ -1410,6 +1445,10 @@ class _Retry:
 
     def observe_response(self, response: httpx.Response) -> None:
         self.observed_response = True
+        if self.draining_only and response.history:
+            # A refusal reached through a redirect answers another request than
+            # the one sent: a 303 after a POST says the POST was carried out.
+            self.count = 0
         for hop in (*response.history, response):
             self.observe(hop.request)
         after = _retry_after(response, for_retry=True)
@@ -1448,11 +1487,14 @@ class _Retry:
                 self.observe(exc.__cause__.request)
             except RuntimeError:
                 pass  # A custom transport can raise without attaching a request.
-        eligible = (
-            isinstance(exc, ConnectionError)
-            or isinstance(exc, APIError)
-            and exc.status in (502, 503, 504)
-        ) and not isinstance(exc, TimeoutError)
+        if self.draining_only:
+            eligible = _refused_while_draining(exc)
+        else:
+            eligible = (
+                isinstance(exc, ConnectionError)
+                or isinstance(exc, APIError)
+                and exc.status in (502, 503, 504)
+            ) and not isinstance(exc, TimeoutError)
         if not eligible or self.attempt >= self.count:
             raise exc
         delay: float = min(0.25 * (1 << min(self.attempt, 7)), 30.0)
@@ -1669,10 +1711,14 @@ class Transport(_BaseTransport):
         timeout_cap: float | None = None,
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool | None = None,
+        resend_draining: bool = False,
     ) -> httpx.Response:
         """One exchange; explicit timeout_cap shrinks across attempts and backoff.
 
         Ordinary httpx timeouts still apply separately to each network phase.
+        ``resend_draining`` is for the calls that start an agent run: with
+        ``retries`` set, a change is sent again for a 503 ``draining`` refusal
+        and nothing else (OPL-6094).
         """
         if self._credential_source == "file":
             follow_redirects = False
@@ -1682,6 +1728,7 @@ class Transport(_BaseTransport):
             timeout_cap,
             client=self._http,
             follow_redirects=follow_redirects,
+            resend_draining=resend_draining,
         )
         redirect_option: dict[str, Any] = (
             {} if follow_redirects is None else {"follow_redirects": follow_redirects}
@@ -1723,9 +1770,13 @@ class Transport(_BaseTransport):
         *,
         json: Any = None,
         headers: Mapping[str, str] | None = None,
+        resend_draining: bool = False,
     ) -> Generator[SSEEvent, None, None]:
-        """Retry establishment only; an exposed event makes failure terminal."""
-        retry = self._retry(method, path, client=self._http)
+        """Retry establishment only; an exposed event makes failure terminal.
+
+        ``resend_draining`` as for :meth:`request`.
+        """
+        retry = self._retry(method, path, client=self._http, resend_draining=resend_draining)
         exposed = False
         while True:
             retry.begin()
@@ -2124,10 +2175,14 @@ class AsyncTransport(_BaseTransport):
         timeout_cap: float | None = None,
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool | None = None,
+        resend_draining: bool = False,
     ) -> httpx.Response:
         """One exchange; explicit timeout_cap shrinks across attempts and backoff.
 
         Ordinary httpx timeouts still apply separately to each network phase.
+        ``resend_draining`` is for the calls that start an agent run: with
+        ``retries`` set, a change is sent again for a 503 ``draining`` refusal
+        and nothing else (OPL-6094).
         """
         if self._credential_source == "file":
             follow_redirects = False
@@ -2137,6 +2192,7 @@ class AsyncTransport(_BaseTransport):
             timeout_cap,
             client=self._http,
             follow_redirects=follow_redirects,
+            resend_draining=resend_draining,
         )
         redirect_option: dict[str, Any] = (
             {} if follow_redirects is None else {"follow_redirects": follow_redirects}
@@ -2178,9 +2234,13 @@ class AsyncTransport(_BaseTransport):
         *,
         json: Any = None,
         headers: Mapping[str, str] | None = None,
+        resend_draining: bool = False,
     ) -> AsyncGenerator[SSEEvent, None]:
-        """Retry establishment only; an exposed event makes failure terminal."""
-        retry = self._retry(method, path, client=self._http)
+        """Retry establishment only; an exposed event makes failure terminal.
+
+        ``resend_draining`` as for :meth:`request`.
+        """
+        retry = self._retry(method, path, client=self._http, resend_draining=resend_draining)
         exposed = False
         while True:
             retry.begin()

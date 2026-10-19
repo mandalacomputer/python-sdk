@@ -112,6 +112,19 @@ class MandalaError(Exception):
 #: one status, so a subclass of one of them could not carry it. See
 #: :func:`is_transient`.
 _REASON_CLEARS = frozenset({"contention", "starting"})
+#: The word on a ``503`` from a call that starts an agent run, while the
+#: platform is about to restart for an update (OPL-6094): new runs are refused
+#: for a few minutes, with a ``Retry-After``, and runs already going carry on.
+#: The refusal comes before anything starts, so nothing ran, nothing was held
+#: and nothing was charged, and the same request is safe to send again once the
+#: wait is over.
+#:
+#: Not one of :data:`_REASON_CLEARS`, on purpose. Those two clear a 400 or a
+#: 409; this one is read on a 503 alone, where every other answer to a change
+#: is an outcome nobody knows. So it is a rule of its own — see
+#: :func:`_refused_while_draining` — rather than a third word in a set whose
+#: members would then make any status worth sending again.
+_REASON_DRAINING = "draining"
 #: The 409 ``code`` values that clear on their own where the body carries no
 #: ``reason`` (OPL-5974). The platform's reference says a 409 without a
 #: ``reason`` is unclassified and that treating 409 as uniformly transient
@@ -255,6 +268,12 @@ class APIError(MandalaError):
     #: conflict it is, or that a keyed call's outcome is unknown, and without
     #: it :func:`is_transient` answers ``False`` and a keyed call keeps its key.
     _body_lost: bool = False
+    #: Set only by the transport, on an error whose response came at the end of
+    #: one or more redirects: its status answers the request the last hop made,
+    #: not the one that was sent, and a 303 after a POST says the POST was
+    #: carried out. :func:`is_transient` reads it for the one 503 it would
+    #: otherwise call safe to send again on a change (OPL-6094).
+    _redirected: bool = False
 
     def __init__(
         self,
@@ -280,10 +299,10 @@ class APIError(MandalaError):
         #: A delay alone does not mean that replaying the request is safe.
         self.retry_after = retry_after
         #: The platform's own word for what kind of refusal this is, when it
-        #: sent one: ``"contention"``, ``"starting"``, ``"unavailable"``,
-        #: ``"unsupported"`` (OPL-3898), ``"revoked"``, ``"exists"``,
-        #: ``"running"``, ``"name_taken"``, ``"stale_revision"`` or
-        #: ``"stale_capture"``. ``None``
+        #: sent one: ``"contention"``, ``"starting"``, ``"draining"``,
+        #: ``"unavailable"``, ``"unsupported"`` (OPL-3898), ``"revoked"``,
+        #: ``"exists"``, ``"running"``, ``"name_taken"``, ``"stale_revision"``
+        #: or ``"stale_capture"``. ``None``
         #: where it sent nothing, which is most errors and always will be — not
         #: every refusal has a word, and the platform is explicit that absent
         #: means unclassified rather than "none of them". An OPEN set: a word
@@ -1076,6 +1095,20 @@ class UnavailableError(APIError):
     as a create, a command or a delete. :attr:`~APIError.method` says which the
     request was, and :func:`is_transient` answers ``True`` only for a read.
     This SDK's own ``retries`` never replays a change, whatever it answered.
+
+    One exception to both, and it says so in :attr:`~APIError.reason`. The
+    calls that start an agent run —
+    :meth:`~mandala_computer.Computer.agent`,
+    :meth:`~mandala_computer.Computer.agent_stream`,
+    :meth:`~mandala_computer.Computer.agent_once`,
+    :meth:`~mandala_computer.Computer.start_agent_run` and
+    ``agent_runs.start()`` — answer a 503 with ``reason`` ``"draining"`` and a
+    :attr:`~APIError.retry_after` while the platform is about to restart for an
+    update (OPL-6094). That refusal comes before anything starts: nothing ran,
+    nothing was charged, and runs already going are not affected. So
+    :func:`is_transient` answers ``True`` for it, and a client constructed with
+    ``retries`` sends the same call again itself after the wait, within the
+    same number of attempts and the same cap on how long one wait may be.
     """
 
 
@@ -1254,6 +1287,20 @@ def is_transient(err: BaseException) -> bool:
       before sending a create, a command, a delete or any other change again.
       An error whose request method is unknown (one built by hand, with no
       ``method``) is treated as a change.
+    * :class:`UnavailableError` WITH ``reason`` ``draining``, whatever the
+      method — a call that starts an agent run, refused while the platform is
+      about to restart for an update (OPL-6094). The refusal comes before
+      anything starts, so nothing ran and nothing was charged; send the same
+      call again after :attr:`~APIError.retry_after`. Only the word at the top
+      of the body counts, and not on an error that carries a run in
+      :attr:`~MandalaError.agent` or a body that accounts for one (``usage``,
+      ``steps``, ``steps_taken``, ``cost_usd``, ``thread_id``, ``agent``) —
+      that run had started — nor on a body whose ``error`` is not a string, nor
+      on an answer reached through a redirect, which answers another request
+      than the one sent. The rule is read from the answer, not from the route:
+      the platform sends ``draining`` only on the calls that start an agent
+      run, and this relies on that, as it relies on ``contention`` and
+      ``starting`` being meant.
     * :class:`ConnectionError` — the request never left
 
     One 409 used to escape that first bullet, and this predicate could not be
@@ -1381,6 +1428,12 @@ def is_transient(err: BaseException) -> bool:
             return True
         if reason in _REASON_PERMANENT:
             return False
+    # The one 503 a change may be sent again after: a call that starts an
+    # agent run, refused during a platform update before anything started
+    # (OPL-6094). Ahead of the rule below, which would call a POST's 503 an
+    # unknown outcome — which this one, by the platform's own word, is not.
+    if _refused_while_draining(err):
+        return True
     if isinstance(err, UnavailableError):
         # A 503 on a change is an UNKNOWN outcome, not a refusal: the platform
         # answers a failure after the request was sent the same way. Only a
@@ -1399,6 +1452,61 @@ def is_transient(err: BaseException) -> bool:
 
 #: The methods whose 503 :func:`is_transient` calls worth sending again.
 _READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+#: The fields a body uses to account for an agent run: what it spent, the steps
+#: it took, the thread it was kept in. The refusal while the platform updates
+#: carries none of them, so a body that does is not that refusal — whatever
+#: value a field holds, ``null`` and ``[]`` included.
+_RUN_ACCOUNT_FIELDS = ("usage", "steps", "steps_taken", "cost_usd", "thread_id", "agent")
+
+
+def _refused_while_draining(err: BaseException) -> bool:
+    """Whether ``err`` is a call that starts an agent run, refused while the
+    platform is about to restart for an update (OPL-6094).
+
+    A ``503`` whose body says ``reason: "draining"`` at the top. The platform
+    answers it before anything starts — nothing held, run, charged or
+    recorded — so the same request is safe to send again after its
+    ``Retry-After``, whatever the method. :func:`is_transient` answers ``True``
+    for it, and the transport's ``retries`` resends it on the calls that ask.
+
+    What it is not, read narrowly on purpose, because each of these would
+    replay a request whose first sending may have done something:
+
+    * a word nested under ``error``, which :attr:`APIError.reason` also reads.
+      The top-level word is the platform refusing the request; a nested one
+      belongs to whatever the envelope wraps, as :func:`is_transient` already
+      says of ``contention`` and ``starting``. Nor a body whose ``error`` is
+      anything but a string: the refusal's is a sentence, and an object there
+      is some other envelope, which may carry a run's account inside it.
+    * an error that carries a run in :attr:`~MandalaError.agent`. The refusal
+      comes before the stream opens; a failure reported from inside a run that
+      had begun is about a run that started, whatever word it carries, and
+      sending the prompt again would start another.
+    * a body that accounts for a run — any of :data:`_RUN_ACCOUNT_FIELDS`,
+      ``agent`` among them. The refusal carries none of them, since nothing ran. A body that does is
+      about a run that started, and it is read off the body rather than off
+      :attr:`~MandalaError.agent` because the transport decides whether to
+      resend before ``agent_once`` attaches that account to the error.
+    * a response reached through a redirect (:attr:`APIError._redirected`):
+      it answers the request the last hop made, not the one that was sent.
+
+    Read from the answer alone, not from the route or the method — an error
+    does not carry the path it answered. That is safe because the platform
+    sends ``draining`` only on the calls that start an agent run, and this
+    relies on it.
+    """
+    if not isinstance(err, APIError) or err.status != 503:
+        return False
+    if err.agent is not None or err._redirected:
+        return False
+    body = err.body
+    if not isinstance(body, dict) or body.get("reason") != _REASON_DRAINING:
+        return False
+    if not isinstance(body.get("error"), str):
+        return False
+    return not any(field in body for field in _RUN_ACCOUNT_FIELDS)
 
 
 #: The 409 ``code`` values a wait gives up on at once, whatever else the body
