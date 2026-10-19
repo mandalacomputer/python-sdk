@@ -547,10 +547,16 @@ class _BaseTransport:
         self, method: str, path: str, resp: httpx.Response | None, exc: httpx.RequestError
     ) -> MandalaError:
         if resp is not None and not resp.is_success:
-            # An interrupted error body cannot erase a known non-retryable status.
+            # An interrupted error body cannot erase a known non-retryable status,
+            # nor the redirect it came through: the history is what names the
+            # method the caller sent and marks the answer as another request's.
             error = self._error(
                 httpx.Response(
-                    resp.status_code, headers=resp.headers, request=resp.request, content=b""
+                    resp.status_code,
+                    headers=resp.headers,
+                    request=resp.request,
+                    content=b"",
+                    history=list(resp.history),
                 )
             )
             if isinstance(error, APIError):

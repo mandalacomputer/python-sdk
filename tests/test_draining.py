@@ -595,6 +595,65 @@ def test_a_post_answered_303_keeps_the_method_it_was_sent_with() -> None:
     assert mc.is_transient(raised.value) is False
 
 
+class _CutShort(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """A 503 body that stops partway: the connection drops or the read times out."""
+
+    def __init__(self, error: type[httpx.TransportError]) -> None:
+        self.error = error
+
+    def __iter__(self) -> Any:
+        yield b'{"error": "busy", "reason": "dr'
+        raise self.error("body cut short")
+
+    async def __aiter__(self) -> Any:
+        yield b'{"error": "busy", "reason": "dr'
+        raise self.error("body cut short")
+
+
+def _post_303_then_cut_short(error: type[httpx.TransportError]) -> Callable[..., httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(303, headers={"Location": "/api/v1/elsewhere"})
+        return httpx.Response(503, stream=_CutShort(error))
+
+    return handler
+
+
+@pytest.mark.parametrize("error", [httpx.ReadError, httpx.ReadTimeout])
+def test_a_303_whose_503_body_is_cut_short_still_names_the_post(
+    error: type[httpx.TransportError],
+) -> None:
+    """The error rebuilt for a body that never arrived keeps the redirect, so
+    it still names the POST that was sent and no caller loop resends it."""
+    http = httpx.Client(
+        transport=httpx.MockTransport(_post_303_then_cut_short(error)), follow_redirects=True
+    )
+    with (
+        mc.Client("gck_test", base_url=BASE, http_client=http) as c,
+        pytest.raises(mc.UnavailableError) as raised,
+    ):
+        c.agent_runs.start("vm-1", "go", model_key=KEY)
+    assert raised.value.method == "POST" and raised.value._redirected
+    assert mc.is_transient(raised.value) is False
+
+
+@pytest.mark.parametrize("error", [httpx.ReadError, httpx.ReadTimeout])
+async def test_async_a_303_whose_503_body_is_cut_short_still_names_the_post(
+    error: type[httpx.TransportError],
+) -> None:
+    handler = _post_303_then_cut_short(error)
+
+    async def ahandler(request: httpx.Request) -> httpx.Response:
+        return handler(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(ahandler), follow_redirects=True)
+    async with mc.AsyncClient("gck_test", base_url=BASE, http_client=http) as c:
+        with pytest.raises(mc.UnavailableError) as raised:
+            await c.agent_runs.start("vm-1", "go", model_key=KEY)
+    assert raised.value.method == "POST" and raised.value._redirected
+    assert mc.is_transient(raised.value) is False
+
+
 def test_a_public_call_refused_through_a_redirect_is_not_resent_or_transient(
     delays: list[float],
 ) -> None:
