@@ -467,6 +467,7 @@ def _agent_route_error(
     error.reason = exc.reason
     error.agent = exc.agent
     error.idempotency_key = exc.idempotency_key
+    error._redirected = exc._redirected
     if after_steps:
         error._after_agent_steps = True
     return error

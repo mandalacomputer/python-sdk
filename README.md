@@ -1919,7 +1919,8 @@ limited run may already have changed the desktop; inspect it before deciding
 whether to try again. One refusal is the exception: during a platform update
 the endpoint refuses new runs with HTTP 503, a `Retry-After` header and
 `"reason": "draining"` in the JSON body, before anything starts, and the same
-request is safe to send again once that wait is over. Existing Mandala computer charges and rate budgets apply,
+request is safe to send again once that wait is over.
+Existing Mandala computer charges and rate budgets apply,
 and the selected provider bills model usage to your key. This does not add hosted inference,
 included model credits or dashboard chat persistence.
 
@@ -4259,7 +4260,10 @@ about to restart for an update. That refusal comes before anything starts, so
 nothing ran and nothing was charged; send the same call again after
 `retry_after` (or let `retries` do it — see
 [Letting the platform drive](#letting-the-platform-drive)). Only the word at the
-top of the body counts, and not on an error carrying a run in `e.agent`.
+top of the body counts, and not on an error carrying a run in `e.agent` or a
+body that accounts for one (`usage`, `steps`, `steps_taken`, `cost_usd`,
+`thread_id`), nor on an answer reached through a redirect, which answers
+another request than the one sent.
 
 The `wait_*` helpers do not ask it. They replay idempotent reads under a
 deadline you set, so they ride out every 5xx — a hypervisor briefly away during

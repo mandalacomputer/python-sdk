@@ -22,6 +22,7 @@ import respx
 import mandala_computer as mc
 from mandala_computer import _client
 from mandala_computer._client import MODEL_KEY_HEADER, Transport
+from mandala_computer._exceptions import _refused_while_draining
 
 BASE = "https://api.test/api/v1"
 AGENT = f"{BASE}/computers/vm-1/agent"
@@ -206,6 +207,12 @@ TABLE: list[tuple[int, str, object, bool]] = [
     # A body that did not arrive, or did not parse.
     (503, "POST", None, False),
     (503, "POST", "draining", False),
+    # A body that accounts for a run is about a run that started.
+    (503, "POST", {**DRAINING, "usage": {"input_tokens": 900}}, False),
+    (503, "POST", {**DRAINING, "steps": []}, False),
+    (503, "POST", {**DRAINING, "steps_taken": [{"n": 1, "tool": "computer"}]}, False),
+    (503, "POST", {**DRAINING, "cost_usd": 0.05}, False),
+    (503, "POST", {**DRAINING, "thread_id": None}, False),
 ]
 
 
@@ -540,6 +547,55 @@ def test_a_refusal_reached_through_a_redirect_is_not_resent(
         t.json("POST", "/computers/vm/agent/runs", json={"prompt": "once"}, resend_draining=True)
     assert raised.value.reason == "draining"
     assert len(calls) == 2 and delays == []
+    # Nor may a caller's own loop be told to send it again for the word. (After
+    # a 303 the last hop was a GET, which is_transient reads as it always has.)
+    assert raised.value._redirected and not _refused_while_draining(raised.value)
+    if status != 303:
+        assert mc.is_transient(raised.value) is False
+
+
+@pytest.mark.parametrize("status", [307, 303])
+def test_a_stream_refused_through_a_redirect_is_not_resent_or_transient(
+    status: int, delays: list[float]
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path.endswith("/agent"):
+            return httpx.Response(status, headers={"Location": "/api/v1/elsewhere"})
+        return draining()
+
+    t = transport(handler, follow_redirects=True)
+    with pytest.raises(mc.UnavailableError) as raised:
+        next(t.sse("POST", "/computers/vm/agent", json={"prompt": "once"}, resend_draining=True))
+    assert len(calls) == 2 and delays == []
+    assert not _refused_while_draining(raised.value)
+    if status != 303:
+        assert mc.is_transient(raised.value) is False
+
+
+def test_a_public_call_refused_through_a_redirect_is_not_resent_or_transient(
+    delays: list[float],
+) -> None:
+    """The same through ``agent_runs.start`` on a caller's own httpx client
+    that follows redirects: the mark survives the agent route's own reading."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path.endswith("/agent/runs"):
+            return httpx.Response(307, headers={"Location": "/api/v1/elsewhere"})
+        return draining()
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    with (
+        mc.Client("gck_test", base_url=BASE, http_client=http, retries={"idempotent": 3}) as c,
+        pytest.raises(mc.UnavailableError) as raised,
+    ):
+        c.agent_runs.start("vm-1", "go", model_key=KEY)
+    assert len(calls) == 2 and delays == []
+    assert mc.is_transient(raised.value) is False
 
 
 def test_the_same_client_resends_a_refusal_that_was_not_redirected(delays: list[float]) -> None:
@@ -571,3 +627,86 @@ def test_a_stream_is_resent_only_before_its_first_event(delays: list[float]) -> 
     )
     assert [e.event for e in events] == ["done"]
     assert len(calls) == 2 and delays == [30]
+
+
+# --- a body that accounts for a run -------------------------------------------------
+
+
+#: A 503 that says draining and also reports a run: steps taken and tokens
+#: spent. Not the refusal, which comes before anything starts.
+ACCOUNTED: dict[str, Any] = {
+    **DRAINING,
+    "usage": {"input_tokens": 900, "output_tokens": 40},
+    "steps_taken": [{"n": 1, "tool": "computer", "action": "left_click"}],
+}
+
+
+def test_agent_once_never_resends_a_refusal_that_accounts_for_a_run(delays: list[float]) -> None:
+    """The transport decides before ``agent_once`` attaches the run to the
+    error, so the account in the body is what has to stop it."""
+    with respx.mock:
+        route = respx.post(AGENT).mock(
+            side_effect=[httpx.Response(503, json=ACCOUNTED, headers={"Retry-After": "30"})]
+        )
+        with client({"idempotent": 3}) as c, pytest.raises(mc.UnavailableError) as raised:
+            mc.Computer(c._t, COMPUTER).agent_once("go", model_key=KEY)
+    assert route.call_count == 1 and delays == []
+    err = raised.value
+    assert err.agent is not None and len(err.agent.steps) == 1
+    assert err.agent.usage.input_tokens == 900
+    assert mc.is_transient(err) is False
+
+
+async def test_async_agent_once_never_resends_a_refusal_that_accounts_for_a_run(
+    delays: list[float],
+) -> None:
+    with respx.mock:
+        route = respx.post(AGENT).mock(
+            side_effect=[httpx.Response(503, json=ACCOUNTED, headers={"Retry-After": "30"})]
+        )
+        async with aclient({"idempotent": 3}) as c:
+            with pytest.raises(mc.UnavailableError) as raised:
+                await mc.AsyncComputer(c._t, COMPUTER).agent_once("go", model_key=KEY)
+    assert route.call_count == 1 and delays == []
+    assert raised.value.agent is not None and len(raised.value.agent.steps) == 1
+    assert mc.is_transient(raised.value) is False
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"steps": []}, {"thread_id": "thr_0123456789abcdef01234567"}, {"cost_usd": 0.05}],
+    ids=["steps", "thread_id", "cost_usd"],
+)
+@pytest.mark.parametrize(
+    ("name", "url", "call"), NOT_RESENT_CALLS, ids=[n for n, _, _ in NOT_RESENT_CALLS]
+)
+def test_no_call_resends_a_refusal_that_accounts_for_a_run(
+    extra: dict[str, Any], name: str, url: str, call: SyncCall, delays: list[float]
+) -> None:
+    with respx.mock:
+        route = respx.post(url).mock(
+            return_value=httpx.Response(
+                503, json={**DRAINING, **extra}, headers={"Retry-After": "30"}
+            )
+        )
+        with client({"idempotent": 3}) as c, pytest.raises(mc.UnavailableError) as raised:
+            call(c)
+    assert route.call_count == 1 and delays == []
+    assert mc.is_transient(raised.value) is False
+
+
+def test_the_agent_routes_rebuilt_error_keeps_the_redirect_mark() -> None:
+    """The agent routes rebuild some statuses as another class (a 402 as the
+    account's credits); the rebuilt error answers the same redirected request."""
+    from mandala_computer._computer import _agent_route_error
+
+    sent = mc.PlanLimitError(
+        "Insufficient AI credits",
+        status=402,
+        body={"error": "Insufficient AI credits", "top_up_url": "/billing"},
+        method="POST",
+    )
+    sent._redirected = True
+    rebuilt = _agent_route_error(sent, funded=True, base_url=BASE)
+    assert isinstance(rebuilt, mc.InsufficientCreditsError) and rebuilt is not sent
+    assert rebuilt._redirected is True

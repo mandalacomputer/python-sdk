@@ -930,6 +930,14 @@ class _BaseTransport:
 
     @staticmethod
     def _error(resp: httpx.Response) -> APIError:
+        """The exception a failed response deserves, marked when it answered
+        a redirected request rather than the one sent (OPL-6094)."""
+        error = _BaseTransport._classified_error(resp)
+        error._redirected = bool(resp.history)
+        return error
+
+    @staticmethod
+    def _classified_error(resp: httpx.Response) -> APIError:
         body: Any = None
         message = f"HTTP {resp.status_code}"
         # Whether the PLATFORM named this failure, as opposed to the message

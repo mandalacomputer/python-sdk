@@ -268,6 +268,12 @@ class APIError(MandalaError):
     #: conflict it is, or that a keyed call's outcome is unknown, and without
     #: it :func:`is_transient` answers ``False`` and a keyed call keeps its key.
     _body_lost: bool = False
+    #: Set only by the transport, on an error whose response came at the end of
+    #: one or more redirects: its status answers the request the last hop made,
+    #: not the one that was sent, and a 303 after a POST says the POST was
+    #: carried out. :func:`is_transient` reads it for the one 503 it would
+    #: otherwise call safe to send again on a change (OPL-6094).
+    _redirected: bool = False
 
     def __init__(
         self,
@@ -1287,7 +1293,10 @@ def is_transient(err: BaseException) -> bool:
       anything starts, so nothing ran and nothing was charged; send the same
       call again after :attr:`~APIError.retry_after`. Only the word at the top
       of the body counts, and not on an error that carries a run in
-      :attr:`~MandalaError.agent`: a run that streamed had started.
+      :attr:`~MandalaError.agent` or a body that accounts for one (``usage``,
+      ``steps``, ``steps_taken``, ``cost_usd``, ``thread_id``) — that run had
+      started — nor on an answer reached through a redirect, which answers
+      another request than the one sent.
     * :class:`ConnectionError` — the request never left
 
     One 409 used to escape that first bullet, and this predicate could not be
@@ -1441,6 +1450,13 @@ def is_transient(err: BaseException) -> bool:
 _READ_METHODS = frozenset({"GET", "HEAD"})
 
 
+#: The fields a body uses to account for an agent run: what it spent, the steps
+#: it took, the thread it was kept in. The refusal while the platform updates
+#: carries none of them, so a body that does is not that refusal — whatever
+#: value a field holds, ``null`` and ``[]`` included.
+_RUN_ACCOUNT_FIELDS = ("usage", "steps", "steps_taken", "cost_usd", "thread_id")
+
+
 def _refused_while_draining(err: BaseException) -> bool:
     """Whether ``err`` is a call that starts an agent run, refused while the
     platform is about to restart for an update (OPL-6094).
@@ -1451,7 +1467,8 @@ def _refused_while_draining(err: BaseException) -> bool:
     ``Retry-After``, whatever the method. :func:`is_transient` answers ``True``
     for it, and the transport's ``retries`` resends it on the calls that ask.
 
-    Two things it is not, read narrowly on purpose:
+    What it is not, read narrowly on purpose, because each of these would
+    replay a request whose first sending may have done something:
 
     * a word nested under ``error``, which :attr:`APIError.reason` also reads.
       The top-level word is the platform refusing the request; a nested one
@@ -1461,10 +1478,22 @@ def _refused_while_draining(err: BaseException) -> bool:
       comes before the stream opens; a failure reported from inside a run that
       had begun is about a run that started, whatever word it carries, and
       sending the prompt again would start another.
+    * a body that accounts for a run — any of :data:`_RUN_ACCOUNT_FIELDS`.
+      The refusal carries none of them, since nothing ran. A body that does is
+      about a run that started, and it is read off the body rather than off
+      :attr:`~MandalaError.agent` because the transport decides whether to
+      resend before ``agent_once`` attaches that account to the error.
+    * a response reached through a redirect (:attr:`APIError._redirected`):
+      it answers the request the last hop made, not the one that was sent.
     """
-    if not isinstance(err, APIError) or err.status != 503 or err.agent is not None:
+    if not isinstance(err, APIError) or err.status != 503:
         return False
-    return isinstance(err.body, dict) and err.body.get("reason") == _REASON_DRAINING
+    if err.agent is not None or err._redirected:
+        return False
+    body = err.body
+    if not isinstance(body, dict) or body.get("reason") != _REASON_DRAINING:
+        return False
+    return not any(field in body for field in _RUN_ACCOUNT_FIELDS)
 
 
 #: The 409 ``code`` values a wait gives up on at once, whatever else the body
