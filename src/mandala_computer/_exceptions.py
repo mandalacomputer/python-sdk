@@ -1294,9 +1294,10 @@ def is_transient(err: BaseException) -> bool:
       call again after :attr:`~APIError.retry_after`. Only the word at the top
       of the body counts, and not on an error that carries a run in
       :attr:`~MandalaError.agent` or a body that accounts for one (``usage``,
-      ``steps``, ``steps_taken``, ``cost_usd``, ``thread_id``) — that run had
-      started — nor on an answer reached through a redirect, which answers
-      another request than the one sent.
+      ``steps``, ``steps_taken``, ``cost_usd``, ``thread_id``, ``agent``) —
+      that run had started — nor on a body whose ``error`` is not a string, nor
+      on an answer reached through a redirect, which answers another request
+      than the one sent.
     * :class:`ConnectionError` — the request never left
 
     One 409 used to escape that first bullet, and this predicate could not be
@@ -1454,7 +1455,7 @@ _READ_METHODS = frozenset({"GET", "HEAD"})
 #: it took, the thread it was kept in. The refusal while the platform updates
 #: carries none of them, so a body that does is not that refusal — whatever
 #: value a field holds, ``null`` and ``[]`` included.
-_RUN_ACCOUNT_FIELDS = ("usage", "steps", "steps_taken", "cost_usd", "thread_id")
+_RUN_ACCOUNT_FIELDS = ("usage", "steps", "steps_taken", "cost_usd", "thread_id", "agent")
 
 
 def _refused_while_draining(err: BaseException) -> bool:
@@ -1473,13 +1474,15 @@ def _refused_while_draining(err: BaseException) -> bool:
     * a word nested under ``error``, which :attr:`APIError.reason` also reads.
       The top-level word is the platform refusing the request; a nested one
       belongs to whatever the envelope wraps, as :func:`is_transient` already
-      says of ``contention`` and ``starting``.
+      says of ``contention`` and ``starting``. Nor a body whose ``error`` is
+      anything but a string: the refusal's is a sentence, and an object there
+      is some other envelope, which may carry a run's account inside it.
     * an error that carries a run in :attr:`~MandalaError.agent`. The refusal
       comes before the stream opens; a failure reported from inside a run that
       had begun is about a run that started, whatever word it carries, and
       sending the prompt again would start another.
-    * a body that accounts for a run — any of :data:`_RUN_ACCOUNT_FIELDS`.
-      The refusal carries none of them, since nothing ran. A body that does is
+    * a body that accounts for a run — any of :data:`_RUN_ACCOUNT_FIELDS`,
+      ``agent`` among them. The refusal carries none of them, since nothing ran. A body that does is
       about a run that started, and it is read off the body rather than off
       :attr:`~MandalaError.agent` because the transport decides whether to
       resend before ``agent_once`` attaches that account to the error.
@@ -1492,6 +1495,8 @@ def _refused_while_draining(err: BaseException) -> bool:
         return False
     body = err.body
     if not isinstance(body, dict) or body.get("reason") != _REASON_DRAINING:
+        return False
+    if not isinstance(body.get("error"), str):
         return False
     return not any(field in body for field in _RUN_ACCOUNT_FIELDS)
 

@@ -751,11 +751,20 @@ async def test_async_agent_once_never_resends_a_refusal_that_accounts_for_a_run(
     assert mc.is_transient(raised.value) is False
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [{"steps": []}, {"thread_id": "thr_0123456789abcdef01234567"}, {"cost_usd": 0.05}],
-    ids=["steps", "thread_id", "cost_usd"],
-)
+#: Bodies with the top-level word that still speak for a run, or are not the
+#: refusal's envelope at all: a run under ``agent``, or an ``error`` that is an
+#: object carrying an account rather than the refusal's sentence.
+RUN_BEARING: list[dict[str, Any]] = [
+    {"steps": []},
+    {"thread_id": "thr_0123456789abcdef01234567"},
+    {"cost_usd": 0.05},
+    {"agent": {"steps": [{"n": 1, "tool": "computer", "action": "left_click"}]}},
+    {"error": {"message": "stopped", "usage": {"input_tokens": 900, "output_tokens": 40}}},
+]
+RUN_BEARING_IDS = ["steps", "thread_id", "cost_usd", "agent", "error_object"]
+
+
+@pytest.mark.parametrize("extra", RUN_BEARING, ids=RUN_BEARING_IDS)
 @pytest.mark.parametrize(
     ("name", "url", "call"), NOT_RESENT_CALLS, ids=[n for n, _, _ in NOT_RESENT_CALLS]
 )
@@ -770,6 +779,23 @@ def test_no_call_resends_a_refusal_that_accounts_for_a_run(
         )
         with client({"idempotent": 3}) as c, pytest.raises(mc.UnavailableError) as raised:
             call(c)
+    assert route.call_count == 1 and delays == []
+    assert mc.is_transient(raised.value) is False
+
+
+@pytest.mark.parametrize("extra", RUN_BEARING, ids=RUN_BEARING_IDS)
+async def test_async_agent_once_never_resends_a_run_bearing_refusal(
+    extra: dict[str, Any], delays: list[float]
+) -> None:
+    with respx.mock:
+        route = respx.post(AGENT).mock(
+            return_value=httpx.Response(
+                503, json={**DRAINING, **extra}, headers={"Retry-After": "30"}
+            )
+        )
+        async with aclient({"idempotent": 3}) as c:
+            with pytest.raises(mc.UnavailableError) as raised:
+                await mc.AsyncComputer(c._t, COMPUTER).agent_once("go", model_key=KEY)
     assert route.call_count == 1 and delays == []
     assert mc.is_transient(raised.value) is False
 
