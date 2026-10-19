@@ -1297,7 +1297,10 @@ def is_transient(err: BaseException) -> bool:
       ``steps``, ``steps_taken``, ``cost_usd``, ``thread_id``, ``agent``) —
       that run had started — nor on a body whose ``error`` is not a string, nor
       on an answer reached through a redirect, which answers another request
-      than the one sent.
+      than the one sent. The rule is read from the answer, not from the route:
+      the platform sends ``draining`` only on the calls that start an agent
+      run, and this relies on that, as it relies on ``contention`` and
+      ``starting`` being meant.
     * :class:`ConnectionError` — the request never left
 
     One 409 used to escape that first bullet, and this predicate could not be
@@ -1488,6 +1491,11 @@ def _refused_while_draining(err: BaseException) -> bool:
       resend before ``agent_once`` attaches that account to the error.
     * a response reached through a redirect (:attr:`APIError._redirected`):
       it answers the request the last hop made, not the one that was sent.
+
+    Read from the answer alone, not from the route or the method — an error
+    does not carry the path it answered. That is safe because the platform
+    sends ``draining`` only on the calls that start an agent run, and this
+    relies on it.
     """
     if not isinstance(err, APIError) or err.status != 503:
         return False
