@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-10-19
+
 ### Changed
 
 - **A refusal during a platform update is safe to send again.** While the
@@ -22,6 +24,17 @@ This is the summary you read to decide whether to upgrade.
   `Retry-After`, counted against the same `n` attempts and under the same cap
   on one wait; nothing else these calls meet is resent. Retries stay off by
   default. Sync and async clients both.
+
+### Fixed
+
+- **An error after a followed redirect names the method you sent.** On a
+  client of your own that follows redirects, a POST answered `303` arrives as
+  a GET, and a `503` on that GET used to report `method == "GET"`, so
+  `is_transient()` called it a read and safe to send again — although the
+  `303` said the POST had been carried out. The error now carries the first
+  hop's method, also when the error body was cut short. Such an error is also
+  never treated as the draining refusal: it answered another request than the
+  one sent.
 
 ## [0.16.0] — 2026-10-18
 
@@ -1671,7 +1684,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.13.1...v0.14.0
