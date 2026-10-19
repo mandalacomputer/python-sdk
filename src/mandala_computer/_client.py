@@ -1100,13 +1100,16 @@ def _rate_header(resp: httpx.Response, name: str) -> int | None:
 
 
 def _request_method(resp: httpx.Response) -> str | None:
-    """The method of the request ``resp`` answers, or ``None`` if it has none.
+    """The method of the request the caller SENT, or ``None`` if it has none.
 
     Carried onto the error because a 503 means two different things by method:
-    a read can be read again, and a change may or may not have happened.
+    a read can be read again, and a change may or may not have happened. On a
+    client that follows redirects that is the first hop's method, not the last:
+    a POST answered ``303`` arrives as a GET, and the 303 says the POST was
+    carried out, so a 503 on that GET must not read as a read (OPL-6094).
     """
     try:
-        return resp.request.method
+        return (resp.history[0] if resp.history else resp).request.method
     except RuntimeError:
         return None
 

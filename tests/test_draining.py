@@ -547,11 +547,12 @@ def test_a_refusal_reached_through_a_redirect_is_not_resent(
         t.json("POST", "/computers/vm/agent/runs", json={"prompt": "once"}, resend_draining=True)
     assert raised.value.reason == "draining"
     assert len(calls) == 2 and delays == []
-    # Nor may a caller's own loop be told to send it again for the word. (After
-    # a 303 the last hop was a GET, which is_transient reads as it always has.)
+    # Nor may a caller's own loop be told to send it again, for the word or for
+    # the method: after a 303 the last hop was a GET, but the request sent was
+    # the POST, and the 303 says it was carried out.
     assert raised.value._redirected and not _refused_while_draining(raised.value)
-    if status != 303:
-        assert mc.is_transient(raised.value) is False
+    assert raised.value.method == "POST"
+    assert mc.is_transient(raised.value) is False
 
 
 @pytest.mark.parametrize("status", [307, 303])
@@ -571,8 +572,27 @@ def test_a_stream_refused_through_a_redirect_is_not_resent_or_transient(
         next(t.sse("POST", "/computers/vm/agent", json={"prompt": "once"}, resend_draining=True))
     assert len(calls) == 2 and delays == []
     assert not _refused_while_draining(raised.value)
-    if status != 303:
-        assert mc.is_transient(raised.value) is False
+    assert raised.value.method == "POST"
+    assert mc.is_transient(raised.value) is False
+
+
+def test_a_post_answered_303_keeps_the_method_it_was_sent_with() -> None:
+    """Any 503 after a POST's 303, draining or not: the 303 says the POST was
+    carried out, so the error names the POST and no caller loop resends it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(303, headers={"Location": "/api/v1/elsewhere"})
+        return httpx.Response(503, json={"error": "busy"})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    with (
+        mc.Client("gck_test", base_url=BASE, http_client=http) as c,
+        pytest.raises(mc.UnavailableError) as raised,
+    ):
+        c.agent_runs.start("vm-1", "go", model_key=KEY)
+    assert raised.value.method == "POST" and raised.value._redirected
+    assert mc.is_transient(raised.value) is False
 
 
 def test_a_public_call_refused_through_a_redirect_is_not_resent_or_transient(
