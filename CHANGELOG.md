@@ -1694,7 +1694,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.0...v0.17.2
 [0.17.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.14.0...v0.15.0
