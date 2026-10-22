@@ -4905,7 +4905,7 @@ class Computer(ComputerFields):
         working directory behind this, so a relative path is refused before the
         request is made. Works while the computer is running or suspended
         (a transfer resumes a suspended computer, like any other use, and a
-        resume is charged). ``no_wake=True`` requires a running computer
+        resume consumes running capacity). ``no_wake=True`` requires a running computer
         instead: one that is not is refused with a
         :class:`~mandala_computer.ComputerNotRunningError` rather than resumed.
 
@@ -5466,7 +5466,7 @@ class Computer(ComputerFields):
         Pair it with ``key("ctrl", "v")`` to get it into whatever has focus.
 
         Unlike :meth:`clipboard`, this DRIVES the computer: a suspended one is
-        resumed to serve it, which is a start and is charged like one.
+        resumed to serve it, which is a start and consumes running capacity.
 
         At most 64 KiB of UTF-8 goes in — half what comes out, and the two are
         different bounds on different channels rather than one number rounded

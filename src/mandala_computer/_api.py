@@ -852,7 +852,7 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
 #: before a trailing newline, so ``"2026-08-01T00:00:00Z\n"`` — a stamp read
 #: from a config file — satisfied the anchored pattern and was sent as
 #: ``from=...%0A``. Same trap as :data:`_VERSION`, and on the one call whose
-#: output somebody checks against an invoice.
+#: output somebody uses to compare usage across periods.
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})")
 
 
@@ -863,7 +863,7 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
     accepted: a naive datetime has no zone, so rendering it would mean this SDK
     choosing between "the machine that called" and "UTC" — and being wrong about
     that shifts the window by hours on the one call whose output somebody checks
-    against an invoice. ``datetime.now(timezone.utc)`` and
+    across periods. ``datetime.now(timezone.utc)`` and
     ``datetime(2026, 8, 1, tzinfo=timezone.utc)`` are both fine; a bare
     ``datetime(2026, 8, 1)`` is refused, with the remedy in the message.
 
@@ -886,8 +886,8 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
         return value.isoformat()
     # `canonical` before the regex, and the CANONICAL string is what goes back:
     # a `str` subclass can hold a valid 2026 stamp and answer a valid 2030 one
-    # to httpx, which bills a window nobody asked about on the one call whose
-    # output is compared against an invoice.
+    # to httpx, which measures a window nobody asked about on the one call whose
+    # output is used to compare usage across periods.
     if not isinstance(value, str):
         raise ValueError(  # noqa: TRY004
             f"{what} must be an RFC 3339 timestamp with a time zone, e.g. "

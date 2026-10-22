@@ -1923,7 +1923,7 @@ whether to try again. One refusal is the exception: during a platform update
 the endpoint refuses new runs with HTTP 503, a `Retry-After` header and
 `"reason": "draining"` in the JSON body, before anything starts, and the same
 request is safe to send again once that wait is over.
-Existing Mandala computer charges and rate budgets apply,
+Existing Mandala capacity limits and rate budgets apply,
 and the selected provider bills model usage to your key. This does not add hosted inference,
 included model credits or dashboard chat persistence.
 
@@ -3544,9 +3544,10 @@ not use a saved workspace default.
 
 ### Usage
 
-What the account has spent, in the same figures the dashboard shows and the
-invoice bills on. This is the read to build a spend check around: a loop that
-launches computers is the caller that can run up a bill without noticing.
+What the account has used: running hours weighted by cores and memory, and
+storage held over time. Use this to monitor resource use across a batch of
+computers. These measurements do not add a runtime or storage usage charge to
+the monthly subscription; AI-credit usage is separate.
 
 ```python
 u = client.usage.read()
@@ -3556,10 +3557,8 @@ for c in u.usage.computers:
     print(f"  {c.name or c.id}{' (deleted)' if c.gone else ''}  {c.run_hours}h")
 ```
 
-With no arguments the window is the account's **current billing period**, which
-is what makes the numbers comparable with an invoice. Name a window for one that
-has closed — the billing period is always the current one, and by the time an
-invoice arrives the period it covers is not:
+With no arguments the window is the account's **current billing period**.
+Name both bounds to inspect a period that has closed:
 
 ```python
 from datetime import datetime, timezone
@@ -3585,7 +3584,7 @@ same two bounds under the wire's names — `client.usage.read(from_=..., to=...)
 `"2026-08-01T00:00:00"`. A naive datetime is refused rather than rendered,
 because the zone that would have to be assumed is not necessarily yours, and a
 window silently shifted by a few hours is the worst possible failure on the one
-call whose output somebody checks against a bill.
+call used to compare usage across periods.
 
 **Read `degraded` and `unmetered` before you use the numbers.** Every figure is a
 sum across the hypervisors your computers are on, so a host that did not
@@ -3596,7 +3595,7 @@ quietly too small.
 if u.degraded or u.unmetered:
     # Short, and saying so. `degraded` clears when the host comes back;
     # `unmetered` is a host running a daemon older than the meter and never does.
-    print("these totals may be low — do not reconcile them against an invoice")
+    print("these totals may be low — do not treat them as complete usage")
 ```
 
 This is why the call returns rather than raising, unlike a partial listing below:
@@ -3605,9 +3604,9 @@ row can — and one of the two shortfalls would never clear by retrying.
 
 Two more fields worth knowing:
 
-- `reported_through` — the last UTC day whose usage has settled for billing, as a
+- `reported_through` — the last UTC day whose usage has settled for metering, as a
   contiguous prefix. Not a caveat on the totals, which are live and true through
-  `to`; it is the boundary to check before comparing anything with an invoice.
+  `to`; settlement does not imply a usage charge on the subscription.
   `None` while none of the window has settled.
 - `breakdown` — `False` when the API key is scoped to a workspace. Usage is
   metered per **account**, so `usage.computers` would name computers
@@ -3809,7 +3808,7 @@ one call away.
 Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
 directory. A transfer resumes a suspended computer, like any other use, and a
-resume is charged. Pass `no_wake=True` to any transfer to require a running
+resume consumes running capacity. Pass `no_wake=True` to any transfer to require a running
 computer instead: one that is not running raises `ComputerNotRunningError`, a
 `ConflictError` that is not transient, since only a start changes it.
 

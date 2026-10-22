@@ -9,6 +9,14 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct public-URL guidance: omitted access is public on paid plans and private
+  on trials; private URLs support appropriately scoped account API keys and
+  dashboard browser sign-in. Trials cannot request public access.
+- Describe runtime, storage and exec usage as resource consumption rather than
+  extra subscription charges. AI-credit and model-provider billing is unchanged.
+
 ## [0.17.0] — 2026-10-19
 
 ### Changed

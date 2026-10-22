@@ -2563,7 +2563,7 @@ class AsyncComputer(ComputerFields):
         Pair it with ``key("ctrl", "v")`` to get it into whatever has focus.
 
         Unlike :meth:`clipboard`, this DRIVES the computer: a suspended one is
-        resumed to serve it, which is a start and is charged like one.
+        resumed to serve it, which is a start and consumes running capacity.
 
         At most 64 KiB of UTF-8 goes in — half what comes out, and the two are
         different bounds on different channels rather than one number rounded

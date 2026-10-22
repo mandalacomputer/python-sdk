@@ -301,11 +301,11 @@ def _real(value: Any) -> float:
 
     Its own helper rather than :func:`_num`, which truncates to ``int``. Every
     usage figure is fractional — 0.75 hours is a real session, and 0.13
-    GB-months is a real charge — so truncating them would round most small
+    GB-months is real usage — so truncating them would round most small
     accounts' usage to nothing.
 
     Booleans are refused for the reason :func:`_num` gives, and it lands on a
-    billing figure here: ``"run_hours": true`` billed as one hour.
+    usage figure here: ``"run_hours": true`` counted as one hour.
     """
     if isinstance(value, bool):
         return 0.0
@@ -786,7 +786,7 @@ class VncConnect:
         had to be polled for in a loop bounded in ATTEMPTS, each one an extra request,
         because being granted a selection is asynchronous.
         :meth:`Computer.set_clipboard` does all of it, confirms the selection
-        was taken before it returns, and bills once.
+        was taken before it returns, in one request.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
         browser holding this one cannot type even from a patched client. The
@@ -2072,7 +2072,7 @@ class ComputerUsage:
     vcpu_hours: float
     ram_gb_hours: float
     #: This computer is no longer on the fleet. It ran during the window and was
-    #: deleted, which is why it is billed for and absent from
+    #: deleted, which is why it appears in usage and absent from
     #: :meth:`~mandala_computer.Computers.list` — the line is not stale, the
     #: machine is gone.
     gone: bool
@@ -2109,7 +2109,7 @@ class UsageTotals:
     #: The breakdown, which is what makes a total checkable.
     #:
     #: EMPTY on a workspace-scoped API key, and empty rather than ``None`` so
-    #: that iterating it never needs a check first. Usage is metered and billed
+    #: that iterating it never needs a check first. Usage is metered
     #: per ACCOUNT, so these lines cover the whole account and would name
     #: computers outside such a key's scope; the platform withholds them and
     #: sends the account-wide totals either way.
@@ -2172,13 +2172,13 @@ class UsageReport:
     #: shape (the platform omits the field rather than sending an empty list), so
     #: an empty breakdown can be told from an invisible one.
     breakdown: bool
-    #: The last UTC day (``YYYY-MM-DD``) whose usage has settled for billing — a
+    #: The last UTC day (``YYYY-MM-DD``) whose usage has settled for metering — a
     #: contiguous prefix, so a day still being held back stops the count where it
     #: is. ``None`` when none of the window has settled yet.
     #:
     #: NOT a caveat on the totals, which are live from the ledger and true
     #: through :attr:`to`. It answers the other question, and it is the one to
-    #: check before comparing these numbers against an invoice.
+    #: check to distinguish settled metering from live usage.
     reported_through: str | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -3737,7 +3737,7 @@ class PublicUrl:
 
     @property
     def is_private(self) -> bool:
-        """Only a request with one of the account's API keys may open it."""
+        """Requires an appropriately scoped account API key or dashboard browser sign-in."""
         return self.access == "private"
 
     @classmethod
