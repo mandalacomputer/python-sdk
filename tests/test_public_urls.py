@@ -277,9 +277,8 @@ def test_trial_public_refusal_preserves_plan_error_and_code() -> None:
             },
         )
     )
-    with mc.Client() as client:
-        with pytest.raises(mc.PlanLimitError) as raised:
-            client.public_urls.create("vm-9", 3000, access="public")
+    with mc.Client() as client, pytest.raises(mc.PlanLimitError) as raised:
+        client.public_urls.create("vm-9", 3000, access="public")
     assert raised.value.code == "PUBLIC_ACCESS_REQUIRES_PLAN"
 
 
