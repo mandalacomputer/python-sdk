@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.17.2] — 2026-10-22
+
 ### Fixed
 
 - Correct public-URL guidance: omitted access is public on paid plans and private
