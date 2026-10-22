@@ -590,6 +590,6 @@ def test_a_keyless_later_stage_error_names_the_computer_and_no_key(monkeypatch):
     for cls in (mc.Computers, mc.AsyncComputers):
         doc = " ".join((cls.launch.__doc__ or "").split())
         assert "``idempotency_key`` is ``None``" in doc, cls.__name__
-        assert "the computer exists and is billable" in doc, cls.__name__
+        assert "the computer exists and consumes resources" in doc, cls.__name__
         assert "Do not launch again without a key" in doc, cls.__name__
         assert "creates a second computer" in doc, cls.__name__

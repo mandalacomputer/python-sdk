@@ -693,7 +693,7 @@ class OriginResponseError(APIError):
 
     Which makes a blind retry the thing to be careful about. Re-sending a read
     costs nothing; re-sending a create can leave two computers where one was
-    meant, both of them billable, on the strength of a failure that said the
+    meant, both consuming resources, on the strength of a failure that said the
     first one never happened. Look before retrying anything that makes something.
 
     This one was filed with :class:`OriginUnreachableError` at first, on the

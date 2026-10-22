@@ -1212,7 +1212,7 @@ def capture_accepted_without_id() -> str:
     Raised under ``wait=False`` too, and that is the case it matters most in.
     A caller who waits at least gets an exception; one who asked to hold the id
     was handed a placeholder that looks like a handle, cannot be polled, and
-    leaves a running capture with nobody holding its id — a snapshot billed for
+    leaves a running capture with nobody holding its id — a snapshot consuming storage
     and reachable only by guessing, which is the OPL-4561 failure this ticket
     exists to remove (Codex review).
     """
@@ -2141,8 +2141,8 @@ class ComputerFields:
         """Why this computer was made but would not boot, or ``""``.
 
         Only ever set on the response to a create that asked for a running
-        machine and got as far as building one. The computer exists and is
-        billable, which is why the platform answers with it rather than with an
+        machine and got as far as building one. The computer exists and
+        consumes resources, which is why the platform answers with it rather than with an
         error alone; it is simply stopped, and :meth:`Computer.start` may well
         work on a second attempt.
 
@@ -3342,9 +3342,12 @@ class Computer(ComputerFields):
 
         The app must listen on ``0.0.0.0:<port>``, not ``127.0.0.1``. Without a
         ``label`` the platform picks one like ``brave-otter-3f2a``. ``access``
-        is ``"public"`` (the platform's default: anyone with the link) or
-        ``"private"`` (only a request carrying one of the account's API keys,
-        which never reaches the app).
+        is ``"public"`` (anyone with the link) or ``"private"``. Omitted access
+        defaults to public on paid plans and private on trials; trials cannot
+        request public access. Private URLs accept an account API key (a
+        workspace-scoped key must match this computer's workspace), or a browser
+        signed in to the URL through the dashboard's Open button. The API key
+        never reaches the app.
 
         A port outside 1 to 65535, port 22, an empty label or another access
         raises :class:`ValueError` before any request. The platform's refusals
@@ -3354,6 +3357,7 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.ConflictError` that
         :func:`~mandala_computer.is_transient` calls final, ``INVALID_LABEL``
         (reserved, or reads as someone else's address), ``PLAN_REQUIRED``,
+        ``PUBLIC_ACCESS_REQUIRES_PLAN`` (a 402: trials allow only private URLs),
         ``PUBLIC_URLS_BLOCKED`` (a 403: the platform turned them off for this
         computer or account), ``PUBLIC_URLS_DISABLED`` (a 404 that means public
         URLs are not enabled here, not that the computer is missing), and
@@ -5870,7 +5874,7 @@ class Computer(ComputerFields):
         wait, before anything is yielded (OPL-6094).
 
         The computer must already be RUNNING. This route will not start one:
-        starting is billable, and it is not a decision to make on somebody's
+        starting consumes running capacity, and it is not a decision to make on somebody's
         behalf because they sent a prompt. A stopped or suspended computer is a
         :class:`~mandala_computer.ConflictError`, and so is a computer another
         run is already driving.

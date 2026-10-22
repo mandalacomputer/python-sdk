@@ -783,7 +783,7 @@ class VncConnect:
         holder had to outlive the exec under ``setsid`` and have its output
         redirected or the call hung to its full timeout; the text had to be
         base64 and quoted or an apostrophe ended the shell word; and the result
-        had to be polled for in a loop bounded in ATTEMPTS, each one billable,
+        had to be polled for in a loop bounded in ATTEMPTS, each one an extra request,
         because being granted a selection is asynchronous.
         :meth:`Computer.set_clipboard` does all of it, confirms the selection
         was taken before it returns, and bills once.
@@ -1516,7 +1516,7 @@ class Snapshot:
     #:     did not finish. ONLY LISTED WHEN ASKED FOR —
     #:     ``include_unfinished=True`` — because a half-deleted snapshot is not
     #:     one anything can be restored or cloned from; it is still holding
-    #:     objects and still billed, which is why it is askable at all. See
+    #:     objects and still counted against storage, which is why it is askable at all. See
     #:     :attr:`is_deleting`.
     state: str
     size_bytes: int
@@ -3718,9 +3718,10 @@ class PublicUrl:
     label: str
     #: The port inside the computer this URL serves.
     port: int
-    #: ``"public"``: anyone with the link. ``"private"``: only a request
-    #: carrying an API key of this account as ``Authorization: Bearer``, which
-    #: never reaches the app. Never anything else: an answer naming another
+    #: ``"public"``: anyone with the link. ``"private"``: an account API key
+    #: (workspace-scoped keys must match the computer's workspace), or browser
+    #: sign-in through the dashboard's Open button. The key never reaches the
+    #: app. Never another access mode: an answer naming another
     #: mode is refused, since a caller branching on :attr:`is_private` would
     #: otherwise read an unknown policy as public.
     access: str

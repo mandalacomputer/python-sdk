@@ -4349,7 +4349,7 @@ def test_a_failing_ephemeral_cleanup_keeps_the_original_error(client: mc.Client)
             raise ZeroDivisionError("the caller's own bug")
 
     with (
-        pytest.warns(UserWarning, match="still billable") as warning,
+        pytest.warns(UserWarning, match="still consuming resources") as warning,
         pytest.raises(ZeroDivisionError),
     ):
         caller_raises()
@@ -4386,7 +4386,10 @@ def test_a_cleanup_that_fails_at_the_transport_keeps_the_original_error(
         with client.computers.ephemeral():
             raise ZeroDivisionError("the caller's own bug")
 
-    with pytest.warns(UserWarning, match="still billable"), pytest.raises(ZeroDivisionError):
+    with (
+        pytest.warns(UserWarning, match="still consuming resources"),
+        pytest.raises(ZeroDivisionError),
+    ):
         caller_raises()
 
 

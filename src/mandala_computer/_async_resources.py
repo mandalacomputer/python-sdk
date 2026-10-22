@@ -357,7 +357,7 @@ class AsyncComputers:
         A create that builds a computer which then will not boot is *not* an
         error: it returns the computer, stopped, with
         :attr:`AsyncComputer.start_error` saying what went wrong. The machine
-        exists and is billable either way, so it comes back rather than being
+        exists and consumes resources either way, so it comes back rather than being
         thrown away with the exception — check ``start_error`` if it matters,
         and :meth:`AsyncComputer.start` may work on a second attempt.
         """
@@ -464,7 +464,7 @@ class AsyncComputers:
         Such an error whose ``idempotency_key`` is ``None`` (a readiness wait
         that ran out of time, say, or a start that succeeded but whose refresh
         failed) also came after a successful create: the computer exists and
-        is billable. Recover through the id its message names
+        consumes resources. Recover through the id its message names
         (``computers.get`` or a ``wait_*`` method), or delete it. Do not launch
         again without a key: ``idempotency_key=None`` makes a fresh key, and
         that launch creates a second computer.
@@ -637,7 +637,7 @@ class AsyncSnapshots:
 
         ``include_unfinished`` widens it to deletions that began and did not
         finish. Nothing can be restored or cloned from one, but they still hold
-        objects and are still billed, so it is the flag for a question about
+        objects and still count against storage, so it is the flag for a question about
         storage rather than about what can be used.
 
         CAPTURES IN FLIGHT ARE LISTED TOO, and they are not snapshots yet: a

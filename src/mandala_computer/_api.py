@@ -701,7 +701,7 @@ def files_params(path: str, no_wake: bool = False) -> dict[str, str]:
 
     ``no_wake`` sends ``no_wake=1``: the platform then requires a running
     computer and refuses one that is not with a 409 rather than resuming it —
-    and billing the resume. Checked with :func:`flag`, like every arming flag.
+    and consuming running capacity. Checked with :func:`flag`, like every arming flag.
     """
     # Canonical first, for the reason :func:`canonical` gives. ``startswith`` is
     # overridable, so a str subclass could satisfy the absoluteness check and
@@ -993,7 +993,7 @@ def snapshot_listing_params(*, include_unfinished: bool, allow_partial: bool) ->
 
     ``include=unfinished`` widens the listing to deletions that began and did
     not finish. They are not restorable or clonable — their state reads
-    ``deleting`` — but they still hold objects and are still billed, so this is
+    ``deleting`` — but they still hold objects and still count against storage, so this is
     the flag for a question about storage rather than about what can be used.
     """
     params = dict(partial_params(allow_partial) or {})
@@ -3098,7 +3098,7 @@ def computer_public_url(computer_id: str, url_id: str) -> str:
 
 
 #: The two ways a public URL may be opened. ``public``: anyone with the link.
-#: ``private``: only a request carrying an API key of the account.
+#: ``private``: an appropriately scoped account API key or dashboard browser sign-in.
 PUBLIC_URL_ACCESS = ("public", "private")
 #: The computer's own SSH port, which a public URL may not serve.
 PUBLIC_URL_RESERVED_PORT = 22
@@ -3135,8 +3135,9 @@ def public_url_body(
     """The create or update payload, with only the fields the caller named.
 
     A create needs ``port`` and may name a ``label`` and an ``access``; without
-    an ``access`` the platform makes the URL ``public``. An update may change
-    ``port`` and ``access`` but never the label, which IS the URL, and must
+    an ``access`` the platform chooses public on paid plans, private on trials.
+    An update may change ``port`` and ``access`` but never the label, which IS
+    the URL, and must
     change something: an update naming nothing is a 400 upstream, refused here
     first for :func:`webhook_body`'s reason.
 
