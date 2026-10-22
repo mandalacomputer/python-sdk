@@ -301,11 +301,11 @@ def _real(value: Any) -> float:
 
     Its own helper rather than :func:`_num`, which truncates to ``int``. Every
     usage figure is fractional — 0.75 hours is a real session, and 0.13
-    GB-months is a real charge — so truncating them would round most small
+    GB-months is real usage — so truncating them would round most small
     accounts' usage to nothing.
 
     Booleans are refused for the reason :func:`_num` gives, and it lands on a
-    billing figure here: ``"run_hours": true`` billed as one hour.
+    usage figure here: ``"run_hours": true`` counted as one hour.
     """
     if isinstance(value, bool):
         return 0.0
@@ -783,10 +783,10 @@ class VncConnect:
         holder had to outlive the exec under ``setsid`` and have its output
         redirected or the call hung to its full timeout; the text had to be
         base64 and quoted or an apostrophe ended the shell word; and the result
-        had to be polled for in a loop bounded in ATTEMPTS, each one billable,
+        had to be polled for in a loop bounded in ATTEMPTS, each one an extra request,
         because being granted a selection is asynchronous.
         :meth:`Computer.set_clipboard` does all of it, confirms the selection
-        was taken before it returns, and bills once.
+        was taken before it returns, in one request.
     ``view_token``
         Watch only. The daemon drops input on a socket opened with it, so a
         browser holding this one cannot type even from a patched client. The
@@ -1516,7 +1516,7 @@ class Snapshot:
     #:     did not finish. ONLY LISTED WHEN ASKED FOR —
     #:     ``include_unfinished=True`` — because a half-deleted snapshot is not
     #:     one anything can be restored or cloned from; it is still holding
-    #:     objects and still billed, which is why it is askable at all. See
+    #:     objects and still counted against storage, which is why it is askable at all. See
     #:     :attr:`is_deleting`.
     state: str
     size_bytes: int
@@ -2072,7 +2072,7 @@ class ComputerUsage:
     vcpu_hours: float
     ram_gb_hours: float
     #: This computer is no longer on the fleet. It ran during the window and was
-    #: deleted, which is why it is billed for and absent from
+    #: deleted, which is why it appears in usage and absent from
     #: :meth:`~mandala_computer.Computers.list` — the line is not stale, the
     #: machine is gone.
     gone: bool
@@ -2109,7 +2109,7 @@ class UsageTotals:
     #: The breakdown, which is what makes a total checkable.
     #:
     #: EMPTY on a workspace-scoped API key, and empty rather than ``None`` so
-    #: that iterating it never needs a check first. Usage is metered and billed
+    #: that iterating it never needs a check first. Usage is metered
     #: per ACCOUNT, so these lines cover the whole account and would name
     #: computers outside such a key's scope; the platform withholds them and
     #: sends the account-wide totals either way.
@@ -2172,13 +2172,13 @@ class UsageReport:
     #: shape (the platform omits the field rather than sending an empty list), so
     #: an empty breakdown can be told from an invisible one.
     breakdown: bool
-    #: The last UTC day (``YYYY-MM-DD``) whose usage has settled for billing — a
+    #: The last UTC day (``YYYY-MM-DD``) whose usage has settled for metering — a
     #: contiguous prefix, so a day still being held back stops the count where it
     #: is. ``None`` when none of the window has settled yet.
     #:
     #: NOT a caveat on the totals, which are live from the ledger and true
     #: through :attr:`to`. It answers the other question, and it is the one to
-    #: check before comparing these numbers against an invoice.
+    #: check to distinguish settled metering from live usage.
     reported_through: str | None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -3718,9 +3718,10 @@ class PublicUrl:
     label: str
     #: The port inside the computer this URL serves.
     port: int
-    #: ``"public"``: anyone with the link. ``"private"``: only a request
-    #: carrying an API key of this account as ``Authorization: Bearer``, which
-    #: never reaches the app. Never anything else: an answer naming another
+    #: ``"public"``: anyone with the link. ``"private"``: an account API key
+    #: (workspace-scoped keys must match the computer's workspace), or browser
+    #: sign-in through the dashboard's Open button. The key never reaches the
+    #: app. Never another access mode: an answer naming another
     #: mode is refused, since a caller branching on :attr:`is_private` would
     #: otherwise read an unknown policy as public.
     access: str
@@ -3736,7 +3737,7 @@ class PublicUrl:
 
     @property
     def is_private(self) -> bool:
-        """Only a request with one of the account's API keys may open it."""
+        """Requires an appropriately scoped account API key or dashboard browser sign-in."""
         return self.access == "private"
 
     @classmethod

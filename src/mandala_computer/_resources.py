@@ -159,11 +159,11 @@ Cleanup runs even if the block raises, and does not displace the exception that
 was on its way out: if the delete itself fails while the block is already
 raising, the computer is reported with a warning rather than a second exception,
 so what you catch is still your own error. That warning means a machine outlived
-its block and is still billable.
+its block and still consumes resources.
 
 A cleanup delete answered :class:`~mandala_computer.NotFoundError` is not a
 failure, on either path: the block deleted the computer itself, nothing is
-left to bill, and there is nothing to warn about.
+left to clean up, and there is nothing to warn about.
 """
 
 
@@ -396,7 +396,7 @@ class Computers:
         A create that builds a computer which then will not boot is *not* an
         error: it returns the computer, stopped, with
         :attr:`Computer.start_error` saying what went wrong. The machine exists
-        and is billable either way, so it comes back rather than being thrown
+        and consumes resources either way, so it comes back rather than being thrown
         away with the exception — check ``start_error`` if it matters, and
         :meth:`Computer.start` may work on a second attempt.
         """
@@ -503,7 +503,7 @@ class Computers:
         Such an error whose ``idempotency_key`` is ``None`` (a readiness wait
         that ran out of time, say, or a start that succeeded but whose refresh
         failed) also came after a successful create: the computer exists and
-        is billable. Recover through the id its message names
+        consumes resources. Recover through the id its message names
         (``computers.get`` or a ``wait_*`` method), or delete it. Do not launch
         again without a key: ``idempotency_key=None`` makes a fresh key, and
         that launch creates a second computer.
@@ -646,13 +646,13 @@ class Computers:
             # Not a bare `finally`. A delete that fails here would replace the
             # exception on its way out, and the caller would see a
             # ConflictError about a snapshot in flight instead of the error
-            # their own code raised. The machine is billable until it goes, so
+            # their own code raised. The machine consumes resources until it goes, so
             # a failed cleanup is still news — it is warned about rather than
             # raised, which says it without taking the exception's place.
             try:
                 computer.delete()
             except NotFoundError:
-                # The block deleted it itself: nothing is left to bill.
+                # The block deleted it itself: nothing is left to clean up.
                 pass
             except Exception as cleanup_failed:  # noqa: BLE001
                 # Every failure, not just MandalaError: a caller-supplied
@@ -676,12 +676,12 @@ def warn_cleanup_failed(computer_id: str, error: Exception) -> None:
 
     Shared by both halves. This runs only while another exception is already on
     its way out, so raising would take that exception's place — but a computer
-    that outlived its block is billing, and silence about it is worse than a
+    that outlived its block still consumes resources, and silence about it is worse than a
     warning nobody reads.
     """
     warnings.warn(
         f"ephemeral: could not delete {computer_id}: {error}. "
-        "It is still running and still billable.",
+        "It is still running and still consuming resources.",
         # warn_cleanup_failed -> generator context manager -> contextlib -> user.
         stacklevel=4,
     )
@@ -809,7 +809,7 @@ class Snapshots:
 
         ``include_unfinished`` widens it to deletions that began and did not
         finish. Nothing can be restored or cloned from one, but they still hold
-        objects and are still billed, so it is the flag for a question about
+        objects and still count against storage, so it is the flag for a question about
         storage rather than about what can be used.
 
         CAPTURES IN FLIGHT ARE LISTED TOO, and they are not snapshots yet: a
@@ -1754,7 +1754,7 @@ class Usage:
     Its own collection because ``GET /usage`` is its own route, account-scoped
     like ``GET /moves`` rather than hanging off a computer — which it could not
     be: the figures include computers that have since been deleted, and those are
-    exactly the ones an unexplained line on an invoice belongs to.
+    exactly the ones an unexpected usage total belongs to.
     """
 
     def __init__(self, transport: Transport) -> None:
@@ -1771,15 +1771,12 @@ class Usage:
         """Running hours weighted by cores and memory, the storage held, and
         the per-computer breakdown behind the totals.
 
-        The read to build a spend check around: a loop that launches computers is
-        the caller that can run up a bill without noticing, and this is the same
-        figure the dashboard shows the person who will ask about it.
+        Use this to monitor resource use. These measurements do not add a usage
+        charge to the monthly subscription; AI-credit usage is separate.
 
-        With no arguments the window is the account's current billing period,
-        which is what makes the numbers comparable with an invoice. Name
-        ``since``/``until`` for a window that has CLOSED — the billing period is
-        always the current one, and by the time an invoice arrives the period it
-        covers is not. Both take an aware ``datetime`` or an RFC 3339 string with
+        With no arguments the window is the account's current billing period.
+        Name ``since``/``until`` for a window that has closed.
+        Both take an aware ``datetime`` or an RFC 3339 string with
         a zone; a naive datetime is refused rather than guessed at, because the
         zone that would have to be assumed is not necessarily yours. They are
         sent as ``from``/``to``, which ``from`` being a keyword is the whole
@@ -1980,7 +1977,7 @@ class PublicUrlsResource:
         label: str | None = None,
         access: Literal["public", "private"] | None = None,
     ) -> PublicUrl:
-        """Serve a port at a new URL; the default access is public.
+        """Serve a port at a new URL; default access is public on paid plans, private on trials.
 
         The app must listen on ``0.0.0.0:<port>``. Uses the same validation,
         defaults and errors as :meth:`~mandala_computer.Computer.create_public_url`.

@@ -701,7 +701,7 @@ def files_params(path: str, no_wake: bool = False) -> dict[str, str]:
 
     ``no_wake`` sends ``no_wake=1``: the platform then requires a running
     computer and refuses one that is not with a 409 rather than resuming it —
-    and billing the resume. Checked with :func:`flag`, like every arming flag.
+    and consuming running capacity. Checked with :func:`flag`, like every arming flag.
     """
     # Canonical first, for the reason :func:`canonical` gives. ``startswith`` is
     # overridable, so a str subclass could satisfy the absoluteness check and
@@ -852,7 +852,7 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
 #: before a trailing newline, so ``"2026-08-01T00:00:00Z\n"`` — a stamp read
 #: from a config file — satisfied the anchored pattern and was sent as
 #: ``from=...%0A``. Same trap as :data:`_VERSION`, and on the one call whose
-#: output somebody checks against an invoice.
+#: output somebody uses to compare usage across periods.
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})")
 
 
@@ -863,7 +863,7 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
     accepted: a naive datetime has no zone, so rendering it would mean this SDK
     choosing between "the machine that called" and "UTC" — and being wrong about
     that shifts the window by hours on the one call whose output somebody checks
-    against an invoice. ``datetime.now(timezone.utc)`` and
+    across periods. ``datetime.now(timezone.utc)`` and
     ``datetime(2026, 8, 1, tzinfo=timezone.utc)`` are both fine; a bare
     ``datetime(2026, 8, 1)`` is refused, with the remedy in the message.
 
@@ -886,8 +886,8 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
         return value.isoformat()
     # `canonical` before the regex, and the CANONICAL string is what goes back:
     # a `str` subclass can hold a valid 2026 stamp and answer a valid 2030 one
-    # to httpx, which bills a window nobody asked about on the one call whose
-    # output is compared against an invoice.
+    # to httpx, which measures a window nobody asked about on the one call whose
+    # output is used to compare usage across periods.
     if not isinstance(value, str):
         raise ValueError(  # noqa: TRY004
             f"{what} must be an RFC 3339 timestamp with a time zone, e.g. "
@@ -993,7 +993,7 @@ def snapshot_listing_params(*, include_unfinished: bool, allow_partial: bool) ->
 
     ``include=unfinished`` widens the listing to deletions that began and did
     not finish. They are not restorable or clonable — their state reads
-    ``deleting`` — but they still hold objects and are still billed, so this is
+    ``deleting`` — but they still hold objects and still count against storage, so this is
     the flag for a question about storage rather than about what can be used.
     """
     params = dict(partial_params(allow_partial) or {})
@@ -3098,7 +3098,7 @@ def computer_public_url(computer_id: str, url_id: str) -> str:
 
 
 #: The two ways a public URL may be opened. ``public``: anyone with the link.
-#: ``private``: only a request carrying an API key of the account.
+#: ``private``: an appropriately scoped account API key or dashboard browser sign-in.
 PUBLIC_URL_ACCESS = ("public", "private")
 #: The computer's own SSH port, which a public URL may not serve.
 PUBLIC_URL_RESERVED_PORT = 22
@@ -3135,8 +3135,9 @@ def public_url_body(
     """The create or update payload, with only the fields the caller named.
 
     A create needs ``port`` and may name a ``label`` and an ``access``; without
-    an ``access`` the platform makes the URL ``public``. An update may change
-    ``port`` and ``access`` but never the label, which IS the URL, and must
+    an ``access`` the platform chooses public on paid plans, private on trials.
+    An update may change ``port`` and ``access`` but never the label, which IS
+    the URL, and must
     change something: an update naming nothing is a 400 upstream, refused here
     first for :func:`webhook_body`'s reason.
 

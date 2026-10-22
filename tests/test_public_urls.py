@@ -267,6 +267,22 @@ def test_refusals_keep_the_platforms_code() -> None:
 
 
 @respx.mock
+def test_trial_public_refusal_preserves_plan_error_and_code() -> None:
+    respx.post(f"{BASE}/computers/vm-9/public-urls").mock(
+        return_value=httpx.Response(
+            402,
+            json={
+                "error": "Trial accounts can only use private URLs.",
+                "code": "PUBLIC_ACCESS_REQUIRES_PLAN",
+            },
+        )
+    )
+    with mc.Client() as client, pytest.raises(mc.PlanLimitError) as raised:
+        client.public_urls.create("vm-9", 3000, access="public")
+    assert raised.value.code == "PUBLIC_ACCESS_REQUIRES_PLAN"
+
+
+@respx.mock
 async def test_async_methods() -> None:
     respx.get(f"{BASE}/computers/vm-9/public-urls").mock(
         return_value=httpx.Response(200, json=LISTING)

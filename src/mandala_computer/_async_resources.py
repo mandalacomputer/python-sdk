@@ -357,7 +357,7 @@ class AsyncComputers:
         A create that builds a computer which then will not boot is *not* an
         error: it returns the computer, stopped, with
         :attr:`AsyncComputer.start_error` saying what went wrong. The machine
-        exists and is billable either way, so it comes back rather than being
+        exists and consumes resources either way, so it comes back rather than being
         thrown away with the exception — check ``start_error`` if it matters,
         and :meth:`AsyncComputer.start` may work on a second attempt.
         """
@@ -464,7 +464,7 @@ class AsyncComputers:
         Such an error whose ``idempotency_key`` is ``None`` (a readiness wait
         that ran out of time, say, or a start that succeeded but whose refresh
         failed) also came after a successful create: the computer exists and
-        is billable. Recover through the id its message names
+        consumes resources. Recover through the id its message names
         (``computers.get`` or a ``wait_*`` method), or delete it. Do not launch
         again without a key: ``idempotency_key=None`` makes a fresh key, and
         that launch creates a second computer.
@@ -637,7 +637,7 @@ class AsyncSnapshots:
 
         ``include_unfinished`` widens it to deletions that began and did not
         finish. Nothing can be restored or cloned from one, but they still hold
-        objects and are still billed, so it is the flag for a question about
+        objects and still count against storage, so it is the flag for a question about
         storage rather than about what can be used.
 
         CAPTURES IN FLIGHT ARE LISTED TOO, and they are not snapshots yet: a
@@ -1202,7 +1202,7 @@ class AsyncUsage:
     Its own collection because ``GET /usage`` is its own route, account-scoped
     like ``GET /moves`` rather than hanging off a computer — which it could not
     be: the figures include computers that have since been deleted, and those are
-    exactly the ones an unexplained line on an invoice belongs to.
+    exactly the ones an unexpected usage total belongs to.
     """
 
     def __init__(self, transport: AsyncTransport) -> None:
@@ -1219,15 +1219,12 @@ class AsyncUsage:
         """Running hours weighted by cores and memory, the storage held, and
         the per-computer breakdown behind the totals.
 
-        The read to build a spend check around: a loop that launches computers is
-        the caller that can run up a bill without noticing, and this is the same
-        figure the dashboard shows the person who will ask about it.
+        Use this to monitor resource use. These measurements do not add a usage
+        charge to the monthly subscription; AI-credit usage is separate.
 
-        With no arguments the window is the account's current billing period,
-        which is what makes the numbers comparable with an invoice. Name
-        ``since``/``until`` for a window that has CLOSED — the billing period is
-        always the current one, and by the time an invoice arrives the period it
-        covers is not. Both take an aware ``datetime`` or an RFC 3339 string with
+        With no arguments the window is the account's current billing period.
+        Name ``since``/``until`` for a window that has closed.
+        Both take an aware ``datetime`` or an RFC 3339 string with
         a zone; a naive datetime is refused rather than guessed at, because the
         zone that would have to be assumed is not necessarily yours. They are
         sent as ``from``/``to``, which ``from`` being a keyword is the whole

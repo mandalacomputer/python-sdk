@@ -1288,7 +1288,7 @@ def _request_failed(method: str, path: str, exc: httpx.RequestError) -> Connecti
     treated as possibly dispatched. The two wrong answers do not cost the same:
     calling a connect failure a possible dispatch costs one retry a caller
     could have made blind, and calling a lost response a connect failure costs a
-    second billable computer.
+    second computer.
     """
     if isinstance(exc, _NEVER_DISPATCHED):
         return ConnectionError(f"{method} {path} could not complete ({type(exc).__name__}): {exc}")
@@ -1929,7 +1929,7 @@ class Transport(_BaseTransport):
         parses to ``None``, and ``delete`` read that as the platform having
         destroyed the computer without naming a count. On the one irreversible
         call on this surface, that tells a caller to stop tracking a machine
-        that is still running and still billable (adversarial review,
+        that is still running and still consuming resources (adversarial review,
         OPL-4232).
         """
         resp = self.request(method, path, **kw)
@@ -2394,7 +2394,7 @@ class AsyncTransport(_BaseTransport):
         parses to ``None``, and ``delete`` read that as the platform having
         destroyed the computer without naming a count. On the one irreversible
         call on this surface, that tells a caller to stop tracking a machine
-        that is still running and still billable (adversarial review,
+        that is still running and still consuming resources (adversarial review,
         OPL-4232).
         """
         resp = await self.request(method, path, **kw)

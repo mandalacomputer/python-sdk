@@ -6,6 +6,9 @@ AI agents.
 > **Status: alpha.** The API surface is settling; expect breaking changes
 > before 1.0.
 
+Runtime and individual exec calls do not add a charge to the monthly subscription.
+Running computers consume running capacity; AI-credit usage is charged separately.
+
 ## Install
 
 ```sh
@@ -205,7 +208,7 @@ unambiguously the machine's whole lifetime — which `ephemeral()` declares and
 `create()` does not.
 
 A create that builds a computer which then will not boot is not an error. The
-machine exists and is billable, so it comes back — stopped, with the reason on
+machine exists and consumes resources, so it comes back — stopped, with the reason on
 it — rather than being thrown away with an exception:
 
 ```python
@@ -1563,7 +1566,7 @@ resident `xclip` held the pipe the guest agent reads and the call ran to its
 full timeout before answering. The text had to travel base64 and quoted, since
 an apostrophe would otherwise end the shell word. And because being granted a
 selection is asynchronous, the result had to be polled for in a loop bounded in
-*attempts* — each one a billable exec — rather than trusted. `set_clipboard()`
+*attempts* — each one an extra exec — rather than trusted. `set_clipboard()`
 does all of it in one call.
 
 ### Letting the platform drive
@@ -1641,7 +1644,7 @@ up to 100 — the platform's ceiling, which the SDK refuses past rather than
 spending a round trip to be told.
 
 **The computer must already be running.** This route will not start one for you:
-starting is billable, and it is not a decision to make on your behalf because
+starting consumes running capacity, and it is not a decision to make on your behalf because
 you sent a prompt. A stopped or suspended computer is a `ConflictError`, and so
 is one another run is already driving.
 
@@ -1920,7 +1923,7 @@ whether to try again. One refusal is the exception: during a platform update
 the endpoint refuses new runs with HTTP 503, a `Retry-After` header and
 `"reason": "draining"` in the JSON body, before anything starts, and the same
 request is safe to send again once that wait is over.
-Existing Mandala computer charges and rate budgets apply,
+Existing Mandala capacity limits and rate budgets apply,
 and the selected provider bills model usage to your key. This does not add hosted inference,
 included model credits or dashboard chat persistence.
 
@@ -2752,9 +2755,12 @@ Existing handles still support `c.public_urls()`, `c.create_public_url(...)`,
 management, prefer `client.public_urls` over fetching a handle with
 `client.computers.get(...)`, which needs the computer's host.
 
-`access` is `"public"` (the default: anyone with the link) or `"private"`: only
-a request carrying one of the account's API keys as `Authorization: Bearer`
-opens it, and the key never reaches the app. The label is the URL and never
+`access` is `"public"` (anyone with the link) or `"private"`. Omitted access
+defaults to public on paid plans and private on trials; trials cannot request
+public access. A private URL accepts an account API key as `Authorization:
+Bearer` (a workspace-scoped key must match the computer's workspace), or a
+browser signed in to that URL through the dashboard's Open button. The API key
+never reaches the app. The label is the URL and never
 changes; delete the URL and make another for a new name. A deleted URL's label
 stays with the account: no other account can ever take it, and the account may
 use it again unless the platform has blocked it. A port outside 1 to 65535,
@@ -2773,6 +2779,7 @@ The platform's refusals keep its `code` on `APIError.code`:
 | `WORKSPACE_MOVING` | 409 `ConflictError` | the computer's workspace change is unsettled. With `reason: "contention"` it clears once the move finishes; with `reason: "unsupported"` check the change in the dashboard |
 | `INVALID_LABEL`, `INVALID_PORT`, `INVALID_ACCESS` | 400 `APIError` | the label is reserved or reads as the platform's or another company's address, or a value the SDK did not catch first |
 | `PLAN_REQUIRED` | 402 `PlanLimitError` | the account's plan includes no public URLs |
+| `PUBLIC_ACCESS_REQUIRES_PLAN` | 402 `PlanLimitError` | trials support private URLs only; use private access or choose a paid plan |
 | `PUBLIC_URLS_BLOCKED` | 403 `PermissionDeniedError` | the platform has turned public URLs off for this computer or account |
 | `PUBLIC_URLS_DISABLED` | 404 `NotFoundError` | public URLs are not enabled on this platform. It reads like "computer not found", so check the `code` |
 | `RATE_LIMITED` | 429 `RateLimitError` | too many made by this account in the last 24 hours, deleted ones included; `retry_after` says when to try again |
@@ -3134,7 +3141,7 @@ SDK's own waits refuse that reading for the same reason.
 `TimeoutError` means the *wait* stopped and not the capture — the id is in the
 message and the snapshot is still coming. A `MandalaError` saying the capture
 failed means the row went and nothing took its place; there is nothing to find
-and nothing being billed.
+and no storage being held.
 
 ```python
 try:
@@ -3281,7 +3288,7 @@ puts the disk back on a source that no longer exists.
 
 `include_unfinished=True` widens a listing to deletions that began and did not
 finish. Nothing can be restored or cloned from one, but they still hold objects
-and are still billed — so it is the flag for a question about storage rather
+and still count against storage — so it is the flag for a question about storage rather
 than about what you can act on.
 
 #### Deleting a computer, and its snapshots
@@ -3537,9 +3544,10 @@ not use a saved workspace default.
 
 ### Usage
 
-What the account has spent, in the same figures the dashboard shows and the
-invoice bills on. This is the read to build a spend check around: a loop that
-launches computers is the caller that can run up a bill without noticing.
+What the account has used: running hours weighted by cores and memory, and
+storage held over time. Use this to monitor resource use across a batch of
+computers. These measurements do not add a runtime or storage usage charge to
+the monthly subscription; AI-credit usage is separate.
 
 ```python
 u = client.usage.read()
@@ -3549,10 +3557,8 @@ for c in u.usage.computers:
     print(f"  {c.name or c.id}{' (deleted)' if c.gone else ''}  {c.run_hours}h")
 ```
 
-With no arguments the window is the account's **current billing period**, which
-is what makes the numbers comparable with an invoice. Name a window for one that
-has closed — the billing period is always the current one, and by the time an
-invoice arrives the period it covers is not:
+With no arguments the window is the account's **current billing period**.
+Name both bounds to inspect a period that has closed:
 
 ```python
 from datetime import datetime, timezone
@@ -3578,7 +3584,7 @@ same two bounds under the wire's names — `client.usage.read(from_=..., to=...)
 `"2026-08-01T00:00:00"`. A naive datetime is refused rather than rendered,
 because the zone that would have to be assumed is not necessarily yours, and a
 window silently shifted by a few hours is the worst possible failure on the one
-call whose output somebody checks against a bill.
+call used to compare usage across periods.
 
 **Read `degraded` and `unmetered` before you use the numbers.** Every figure is a
 sum across the hypervisors your computers are on, so a host that did not
@@ -3589,7 +3595,7 @@ quietly too small.
 if u.degraded or u.unmetered:
     # Short, and saying so. `degraded` clears when the host comes back;
     # `unmetered` is a host running a daemon older than the meter and never does.
-    print("these totals may be low — do not reconcile them against an invoice")
+    print("these totals may be low — do not treat them as complete usage")
 ```
 
 This is why the call returns rather than raising, unlike a partial listing below:
@@ -3598,12 +3604,12 @@ row can — and one of the two shortfalls would never clear by retrying.
 
 Two more fields worth knowing:
 
-- `reported_through` — the last UTC day whose usage has settled for billing, as a
+- `reported_through` — the last UTC day whose usage has settled for metering, as a
   contiguous prefix. Not a caveat on the totals, which are live and true through
-  `to`; it is the boundary to check before comparing anything with an invoice.
+  `to`; settlement does not imply a usage charge on the subscription.
   `None` while none of the window has settled.
 - `breakdown` — `False` when the API key is scoped to a workspace. Usage is
-  metered and billed per **account**, so `usage.computers` would name computers
+  metered per **account**, so `usage.computers` would name computers
   outside such a key's scope and the platform withholds it; the account-wide
   totals still arrive. The tuple is empty either way, and this flag is what tells
   "no computers ran" from "this key may not see which did".
@@ -3802,7 +3808,7 @@ one call away.
 Guest paths are absolute; a relative path is refused before the request is
 made, because nothing about a transfer runs in a shell with a working
 directory. A transfer resumes a suspended computer, like any other use, and a
-resume is charged. Pass `no_wake=True` to any transfer to require a running
+resume consumes running capacity. Pass `no_wake=True` to any transfer to require a running
 computer instead: one that is not running raises `ComputerNotRunningError`, a
 `ConflictError` that is not transient, since only a start changes it.
 
@@ -4233,7 +4239,7 @@ means the platform *was* reached and the exchange broke on the way back. So the
 work may have happened in full, in part, or not at all. Retrying a read costs
 nothing; before retrying anything that *creates* something, check whether the
 first attempt took effect — the alternative is two computers where you meant
-one, both billable, on the strength of an error that looked like nothing
+one, both consuming resources, on the strength of an error that looked like nothing
 happened.
 
 The rule of thumb across all four: reads are always safe to retry, and anything
