@@ -3076,8 +3076,9 @@ class ExecStatus:
     #: restarted, so :attr:`running`, :attr:`exited` and :attr:`exit_code` are
     #: still reported but both streams are empty on this read and every later
     #: one. Treat any value, including one this version does not name, as "no
-    #: output is coming"; a command that must be read in full needs running
-    #: again.
+    #: output is coming". Losing the output undid nothing the command did, so
+    #: running it again to recover the output repeats its effects; check what
+    #: it changed inside the computer first.
     #:
     #: NOT :attr:`output_unreadable`, which is output that arrived and could not
     #: be decoded. Here nothing was sent. A value that is present but is not
