@@ -9,6 +9,18 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- `ExecStatus.output_unavailable`: set (today to `"daemon_restarted"`) when a
+  background command's streams are empty because the platform can no longer
+  read its output — the command was already running when the service on the
+  computer's host restarted. Its status and exit code are still reported.
+
+### Fixed
+
+- `BackgroundCommand.execution_id` reads an empty `execution_id` as `None`
+  instead of raising. Any other malformed ID still raises.
+
 ## [0.17.2] — 2026-10-22
 
 ### Fixed

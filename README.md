@@ -1253,6 +1253,16 @@ host answers with until its own daemon is redeployed. Empty bytes stand in
 either way, and on a `poll()` the difference cannot be recovered by asking
 again: that read consumed the daemon's cursor.
 
+**`output_unavailable` says no output is coming at all.** A command that was
+already running when the service on the computer's host restarted still reports
+`running`, `exited` and `exit_code`, but never its output again: every read has
+empty streams and `status.output_unavailable == "daemon_restarted"`. Treat any
+value there as "no output is coming". For a few seconds after the restart a
+`poll()` can raise `ConflictError` with `reason == "contention"`, which
+`is_transient()` calls worth retrying; a `ConflictError` with no `reason` is
+final. `job.kill()` on such a command raises that final `ConflictError` while it
+is still running, so stop it from inside the computer instead.
+
 `job.kill()` stops the command and everything it started, and answers with its
 final state including whatever it printed that you had not read — so it collects
 the tail as well as ending the job. `job.pid` survives the process: a later run
@@ -1263,7 +1273,8 @@ request until you poll it.
 
 Newer servers return `job.execution_id` from a background start. The value is a
 canonical `exec_` followed by 32 lowercase hex digits. Older servers and handles
-rebuilt with `background_command(pid)` have `None`; the SDK never discovers an ID
+rebuilt with `background_command(pid)` have `None`, and so does an empty
+`execution_id` in the reply; the SDK never discovers an ID
 by consuming a poll. PID polling and killing keep their existing behavior and
 can address a newer command after PID reuse.
 
