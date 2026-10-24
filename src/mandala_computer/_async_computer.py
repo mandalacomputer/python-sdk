@@ -1949,6 +1949,12 @@ class AsyncComputer(ComputerFields):
         This makes one request by default; opt-in safe GET retries may repeat it.
         It never resumes or replays work.
         Malformed or mismatched evidence raises :class:`~mandala_computer.MandalaError`.
+
+        A command already running when the service on the computer's host
+        restarted answers with ``output_unavailable`` set, and for a few seconds
+        after the restart raises :class:`~mandala_computer.ConflictError` with
+        ``reason == "contention"``, which ``is_transient()`` calls worth
+        retrying. A ``ConflictError`` with no ``reason`` is final.
         """
         identity = _api.execution_id(execution_id)
         computer_id = self.id
@@ -1975,6 +1981,10 @@ class AsyncComputer(ComputerFields):
         It never resumes, tails, or falls back to PID polling. Invalid
         arguments raise ``ValueError`` before I/O; malformed response evidence
         raises :class:`~mandala_computer.MandalaError` without moving a cursor.
+
+        Output lost to a restart of the service on the computer's host raises a
+        final :class:`~mandala_computer.ConflictError` with
+        ``code == "output_unavailable"``; no retry changes it.
         """
         identity = _api.execution_id(execution_id)
         params = _api.execution_output_params(stdout_offset, stderr_offset, limit)

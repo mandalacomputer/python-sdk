@@ -1261,7 +1261,10 @@ value there as "no output is coming". For a few seconds after the restart a
 `poll()` can raise `ConflictError` with `reason == "contention"`, which
 `is_transient()` calls worth retrying; a `ConflictError` with no `reason` is
 final. `job.kill()` on such a command raises that final `ConflictError` while it
-is still running, so stop it from inside the computer instead.
+is still running, so stop it from inside the computer instead. Its
+`status.command` is the platform's kept copy of the command line: at most the
+first 1 KiB, with `status.command_truncated` set where it was cut, and empty if
+the command started before the host was upgraded.
 
 `job.kill()` stops the command and everything it started, and answers with its
 final state including whatever it printed that you had not read — so it collects
@@ -1305,6 +1308,17 @@ fallback. Metadata returns `ExecutionMetadata`: the last observed `running`,
 `exited` or `lost` state. Only `exited` includes `ended_at` and a signed
 `exit_code`; `lost` proves no outcome, and `running` does not prove the computer
 is awake. A zero exit code does not prove the task achieved its goal.
+
+A command that was already running when the service on the computer's host
+restarted keeps its `execution_id`. `execution()` still reports its status,
+exit code and end time, with `observed.output_unavailable == "daemon_restarted"`,
+and `execution_output()` for it raises a final `ConflictError` with
+`code == "output_unavailable"` that no retry changes; treat any
+`output_unavailable` value as "no output is coming". For a few seconds after the
+restart both reads can raise `ConflictError` with `reason == "contention"`,
+which `is_transient()` calls worth retrying; once the computer has stopped
+answering about the command for five minutes they raise a `ConflictError` with
+no `reason`, which is final.
 
 `execution_output()` returns `ExecutionOutput` with exact `stdout`/`stderr`
 bytes, independent next offsets, and separate `stdout_more`/`stderr_more` flags.
