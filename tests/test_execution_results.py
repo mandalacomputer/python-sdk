@@ -866,3 +866,114 @@ async def test_a_reasonless_409_on_a_background_command_is_final(
         await resolved(getattr(job, method)())
     assert mc.is_transient(raised.value) is transient
     assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("fields", "command", "truncated"),
+    [
+        ({}, "", False),
+        ({"command": "sleep 60"}, "sleep 60", False),
+        ({"command": "make all", "command_truncated": True}, "make all", True),
+        ({"command": "sleep 60", "command_truncated": False}, "sleep 60", False),
+        ({"command": "sleep 60", "command_truncated": None}, "sleep 60", False),
+        ({"command": "sleep 60", "command_truncated": "cut"}, "sleep 60", True),
+    ],
+)
+@respx.mock
+async def test_a_recovered_command_reports_whether_its_command_line_was_cut(
+    client: Any, fields: dict[str, Any], command: str, truncated: bool
+) -> None:
+    body = {**RECOVERED, "running": True, **fields}
+    respx.get(f"{BASE}/computers/vm-1/exec/42").mock(httpx.Response(200, json=body))
+    respx.delete(f"{BASE}/computers/vm-1/exec/42").mock(httpx.Response(200, json=body))
+    job = computer(client).background_command(42)
+    for read in (await resolved(job.poll()), await resolved(job.kill())):
+        assert read.command == command
+        assert read.command_truncated is truncated
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("daemon_restarted", "daemon_restarted"),
+        ("some_later_reason", "some_later_reason"),
+        (True, "unknown"),
+        ({}, "unknown"),
+    ],
+)
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"status": "running"},
+        {"status": "exited", "ended_at": "2026-09-15T12:01:00Z", "exit_code": 3},
+    ],
+)
+@respx.mock
+async def test_metadata_reads_output_unavailable_as_a_claim_whenever_it_is_present(
+    client: Any, state: dict[str, Any], value: Any, expected: str | None
+) -> None:
+    body = {**METADATA, **state, "output_unavailable": value}
+    respx.get(f"{BASE}/computers/vm-1/executions/{EXECUTION_ID}").mock(
+        httpx.Response(200, json=body)
+    )
+    result = await resolved(computer(client).execution(EXECUTION_ID))
+    assert result.status == state["status"]
+    assert result.output_unavailable == expected
+
+
+@respx.mock
+async def test_metadata_without_output_unavailable_reads_none(client: Any) -> None:
+    respx.get(f"{BASE}/computers/vm-1/executions/{EXECUTION_ID}").mock(
+        httpx.Response(200, json=METADATA)
+    )
+    result = await resolved(computer(client).execution(EXECUTION_ID))
+    assert result.output_unavailable is None
+
+
+@pytest.mark.parametrize(
+    ("body", "transient"),
+    [
+        ({"error": "not answering"}, False),
+        ({"error": "not yet checked", "reason": "contention"}, True),
+    ],
+)
+@respx.mock
+async def test_a_reasonless_409_on_execution_metadata_is_final(
+    client: Any, body: dict[str, Any], transient: bool
+) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/executions/{EXECUTION_ID}").mock(
+        httpx.Response(409, json=body)
+    )
+    with pytest.raises(mc.ConflictError) as raised:
+        await resolved(computer(client).execution(EXECUTION_ID))
+    assert mc.is_transient(raised.value) is transient
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {
+            "error": "unavailable",
+            "code": "output_unavailable",
+            "output_unavailable": "daemon_restarted",
+        },
+        {"error": "unavailable", "code": "output_unavailable"},
+    ],
+)
+@respx.mock
+async def test_output_unavailable_on_the_output_route_is_final(
+    client: Any, body: dict[str, Any]
+) -> None:
+    route = respx.get(f"{BASE}/computers/vm-1/executions/{EXECUTION_ID}/output").mock(
+        httpx.Response(409, json=body)
+    )
+    with pytest.raises(mc.ConflictError) as raised:
+        await resolved(
+            computer(client).execution_output(EXECUTION_ID, stdout_offset=0, stderr_offset=0)
+        )
+    assert raised.value.code == "output_unavailable"
+    assert mc.is_transient(raised.value) is False
+    assert route.call_count == 1

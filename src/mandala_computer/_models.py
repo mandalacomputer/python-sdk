@@ -3017,7 +3017,11 @@ class ExecStatus:
     """
 
     pid: int
-    #: The command line, echoed back.
+    #: The command line, echoed back. On a command that was already running
+    #: when the service on the computer's host restarted, it is the platform's
+    #: kept copy: at most the first 1 KiB, with :attr:`command_truncated` set
+    #: where it was cut, and empty if the command started before the platform
+    #: kept one.
     command: str
     running: bool
     exited: bool
@@ -3086,6 +3090,14 @@ class ExecStatus:
     #: present the empty streams as a quiet command. Keyword-only with a
     #: default, so it changes no existing construction.
     output_unavailable: str | None = field(default=None, kw_only=True)
+    #: :attr:`command` is only the first part of the command line. Set only on
+    #: a command that was already running when the service on the computer's
+    #: host restarted, and whose command line was longer than the platform
+    #: keeps. A value that is present but unreadable reads True, like the other
+    #: truncation caveats: the claim it might be making is that :attr:`command`
+    #: is not the whole line. Keyword-only with a default, so it changes no
+    #: existing construction.
+    command_truncated: bool = field(default=False, kw_only=True)
 
     # Normalize only the wire evidence that changes completion or draining.
     # init=False preserves positional construction and pattern matching;
@@ -3224,6 +3236,7 @@ class ExecStatus:
             decoded=True,
             output_unreadable=unreadable,
             output_unavailable=_output_unavailable(d.get("output_unavailable")),
+            command_truncated=_wire(d, "command_truncated") in (_Wire.TRUE, _Wire.MALFORMED),
         )
 
 

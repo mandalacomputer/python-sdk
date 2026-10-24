@@ -6,11 +6,12 @@ import base64
 import binascii
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from . import _api
 from ._exceptions import MandalaError
+from ._models import _output_unavailable
 from ._timestamps import parse_rfc3339
 
 __all__ = ["ExecutionMetadata", "ExecutionOutput"]
@@ -40,6 +41,17 @@ class ExecutionMetadata:
     ended_at: str | None
     exit_code: int | None
     output_source: Literal["volatile_guest_files"]
+    #: Why :meth:`~mandala_computer.Computer.execution_output` cannot read this
+    #: execution's output, or ``None`` when nothing says so.
+    #: ``"daemon_restarted"`` is the one value today: the command was already
+    #: running when the service on the computer's host restarted, so
+    #: :attr:`status`, :attr:`exit_code` and :attr:`ended_at` are still reported
+    #: but the output read raises a final :class:`~mandala_computer.ConflictError`
+    #: with ``code == "output_unavailable"``. Treat any value, including one this
+    #: version does not name, as "no output is coming"; a value that is present
+    #: but is not text reads ``"unknown"`` rather than ``None``. Keyword-only
+    #: with a default, so it changes no existing construction.
+    output_unavailable: str | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,7 @@ def decode_metadata(
         ended_at=ended_at,
         exit_code=exit_code,
         output_source="volatile_guest_files",
+        output_unavailable=_output_unavailable(data.get("output_unavailable")),
     )
 
 

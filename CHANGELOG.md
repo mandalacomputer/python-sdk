@@ -11,6 +11,15 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- `ExecStatus.command_truncated`. A background command that was already
+  running when the service on the computer's host restarted now reports its
+  `command`, kept to at most the first 1 KiB, and `command_truncated` is
+  `True` where it was cut.
+- `ExecutionMetadata.output_unavailable`: `execution()` sets it (today to
+  `"daemon_restarted"`) on such a command, whose `execution_output()` raises a
+  final `ConflictError` with `code == "output_unavailable"`. A present non-text
+  value reads `"unknown"` rather than `None`.
+
 - `ExecStatus.output_unavailable`: set (today to `"daemon_restarted"`) when a
   background command's streams are empty because the platform can no longer
   read its output — the command was already running when the service on the
