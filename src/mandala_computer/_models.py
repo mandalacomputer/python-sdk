@@ -3070,6 +3070,22 @@ class ExecStatus:
     #: output it already had was lost. Keyword-only with a default, so it
     #: changes no existing construction.
     output_unreadable: bool = field(default=False, kw_only=True)
+    #: Why the platform cannot give this command's output at all, or ``None``
+    #: when nothing says so. ``"daemon_restarted"`` is the one value today: the
+    #: command was already running when the service on the computer's host
+    #: restarted, so :attr:`running`, :attr:`exited` and :attr:`exit_code` are
+    #: still reported but both streams are empty on this read and every later
+    #: one. Treat any value, including one this version does not name, as "no
+    #: output is coming". Losing the output undid nothing the command did, so
+    #: running it again to recover the output repeats its effects; check what
+    #: it changed inside the computer first.
+    #:
+    #: NOT :attr:`output_unreadable`, which is output that arrived and could not
+    #: be decoded. Here nothing was sent. A value that is present but is not
+    #: text reads ``"unknown"`` rather than ``None``, since ``None`` would
+    #: present the empty streams as a quiet command. Keyword-only with a
+    #: default, so it changes no existing construction.
+    output_unavailable: str | None = field(default=None, kw_only=True)
 
     # Normalize only the wire evidence that changes completion or draining.
     # init=False preserves positional construction and pattern matching;
@@ -3207,7 +3223,15 @@ class ExecStatus:
             raw=dict(d),
             decoded=True,
             output_unreadable=unreadable,
+            output_unavailable=_output_unavailable(d.get("output_unavailable")),
         )
+
+
+def _output_unavailable(value: Any) -> str | None:
+    """``output_unavailable`` off the wire: absent, null and empty are unsaid."""
+    if value is None or value == "":
+        return None
+    return value if isinstance(value, str) else "unknown"
 
 
 @dataclass(frozen=True)

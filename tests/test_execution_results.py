@@ -581,7 +581,7 @@ async def test_start_id_remains_original_after_pid_reuse_and_reconstruction(
     assert len(respx.calls) == 4
 
 
-@pytest.mark.parametrize("bad", [None, False, 4242, "", "exec_" + "G" * 32])
+@pytest.mark.parametrize("bad", [None, False, 4242, " ", "exec_" + "G" * 32])
 @respx.mock
 async def test_malformed_optional_id_does_not_break_legacy_start(client: Any, bad: Any) -> None:
     respx.post(f"{BASE}/computers/vm-1/exec").mock(
@@ -774,3 +774,95 @@ def test_existing_execution_dataclasses_keep_positional_construction_and_matchin
     assert status == dataclasses.replace(status, raw={"execution_id": EXECUTION_ID})
     assert result == dataclasses.replace(result, raw={"execution_id": EXECUTION_ID})
     assert hash(status) == hash(dataclasses.replace(status, raw={"unknown": True}))
+
+
+def test_an_empty_start_identity_reads_as_none_and_a_malformed_one_raises() -> None:
+    with mc.Client("gck_test", base_url=BASE) as api:
+        assert mc.BackgroundCommand(api._t, "vm-1", {"pid": 4242}).execution_id is None
+        empty = mc.BackgroundCommand(api._t, "vm-1", {"pid": 4242, "execution_id": ""})
+        assert empty.execution_id is None
+        for bad in (None, " ", "exec_bad", f"{EXECUTION_ID}\n"):
+            job = mc.BackgroundCommand(api._t, "vm-1", {"pid": 4242, "execution_id": bad})
+            with pytest.raises(mc.MandalaError):
+                _ = job.execution_id
+
+
+RECOVERED = {
+    "pid": 42,
+    "command": "",
+    "execution_id": "",
+    "stdout_b64": "",
+    "stderr_b64": "",
+    "stdout_offset": 0,
+    "stderr_offset": 0,
+    "output_unavailable": "daemon_restarted",
+}
+
+
+@pytest.mark.parametrize(
+    ("state", "running", "exit_code"),
+    [
+        ({"running": True, "exited": False}, True, None),
+        ({"exited": True, "exit_code": 3}, False, 3),
+    ],
+)
+@respx.mock
+async def test_a_command_running_across_a_host_restart_reports_status_but_no_output(
+    client: Any, state: dict[str, Any], running: bool, exit_code: int | None
+) -> None:
+    respx.get(f"{BASE}/computers/vm-1/exec/42").mock(
+        httpx.Response(200, json={**RECOVERED, **state})
+    )
+    respx.delete(f"{BASE}/computers/vm-1/exec/42").mock(
+        httpx.Response(200, json={**RECOVERED, **state})
+    )
+    job = computer(client).background_command(42)
+    for read in (await resolved(job.poll()), await resolved(job.kill())):
+        assert read.output_unavailable == "daemon_restarted"
+        assert read.output_unreadable is False
+        assert read.running is running
+        assert read.exit_code == exit_code
+        assert read.stdout == b""
+        assert read.stderr == b""
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("daemon_restarted", "daemon_restarted"),
+        ("some_later_reason", "some_later_reason"),
+        (True, "unknown"),
+        (1, "unknown"),
+        ({}, "unknown"),
+    ],
+)
+def test_output_unavailable_is_read_as_a_claim_whenever_it_is_present(
+    value: Any, expected: str | None
+) -> None:
+    status = mc.ExecStatus.from_api({"pid": 42, "stdout_b64": "", "output_unavailable": value})
+    assert status.output_unavailable == expected
+    assert mc.ExecStatus.from_api({"pid": 42, "stdout_b64": ""}).output_unavailable is None
+
+
+@pytest.mark.parametrize("method", ["poll", "kill"])
+@pytest.mark.parametrize(
+    ("body", "transient"),
+    [
+        ({"error": "not answering"}, False),
+        ({"error": "not yet checked", "reason": "contention"}, True),
+    ],
+)
+@respx.mock
+async def test_a_reasonless_409_on_a_background_command_is_final(
+    client: Any, method: str, body: dict[str, Any], transient: bool
+) -> None:
+    route = respx.route(
+        method="GET" if method == "poll" else "DELETE", url=f"{BASE}/computers/vm-1/exec/42"
+    ).mock(httpx.Response(409, json=body))
+    job = computer(client).background_command(42)
+    with pytest.raises(mc.ConflictError) as raised:
+        await resolved(getattr(job, method)())
+    assert mc.is_transient(raised.value) is transient
+    assert route.call_count == 1

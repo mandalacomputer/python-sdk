@@ -6607,9 +6607,11 @@ class BackgroundCommandFields:
 
         Reconstructed PID handles have no stable ID. Poll and kill never fill
         this field: after PID reuse their responses may describe another job.
-        A present malformed identity raises :class:`~mandala_computer.MandalaError`.
+        An empty one is the platform saying it has none, and reads ``None``
+        like an absent one; any other malformed identity raises
+        :class:`~mandala_computer.MandalaError`.
         """
-        if "execution_id" not in self._data:
+        if self._data.get("execution_id", "") == "":
             return None
         try:
             return _api.execution_id(self._data["execution_id"])
