@@ -1658,6 +1658,12 @@ are stored by OpenAI; the task, screenshots and tool results go to that provider
 An OpenAI action batch must fit the remaining step and API budget before it
 starts. A partial batch failure stops the run without replaying input.
 
+All agent runs have a fixed 60-minute wall-clock limit. Reaching it ends the
+run with `stop: "time_limit"`, preserving the work already done. A background
+status of `completed` means the loop ended; only `stop: "end_turn"` means the
+task finished. Background runs accept 1–500 steps (default 20); foreground
+sync, streaming and chat runs accept 1–100 (default 20).
+
 `max_steps` bounds the loop, and bounds your model spend only loosely. A
 step is one **action on the desktop**, not one exchange with the model, and the
 two do not line up in either direction: one model reply may ask for several
@@ -1665,7 +1671,7 @@ actions and spends a step on each, while a reply that asks for none — or a
 paused turn, resubmitted — costs tokens and no step at all. Nor does every step
 take a screenshot; a `bash` call or a cursor read does not. Size the run from
 this; size the bill from your own key. It defaults to 20 and is a whole number
-up to 100 — the platform's ceiling, which the SDK refuses past rather than
+up to 100 for foreground runs, or 500 for background runs — the platform's ceiling, which the SDK refuses past rather than
 spending a round trip to be told.
 
 **The computer must already be running.** This route will not start one for you:
@@ -1718,6 +1724,7 @@ this SDK was written. The others the platform documents:
 | --- | --- |
 | `end_turn` | The model finished. The only one that means the task is done. |
 | `max_steps` | The run reached `max_steps`. |
+| `time_limit` | The run reached its fixed 60-minute wall-clock limit. |
 | `rate_limited` | The account's API rate budget ran out mid-run. |
 | `refusal` | The model declined. |
 | `pause_turn` | The model kept pausing its turn. |
@@ -1854,6 +1861,8 @@ else:
     print(run.status, run.error, len(run.steps_taken), "steps")
 ```
 
+`wait` defaults to a 30-minute local waiting budget, shorter than the server's
+60-minute run limit; pass a longer `timeout` to wait for a long run.
 `wait(run, timeout=1800, poll=3)` returns the run however it ended and does not
 raise for any ending — every one leaves real work on the desktop, and the run
 is the account of it. A `TimeoutError` means the run is still going, not that it

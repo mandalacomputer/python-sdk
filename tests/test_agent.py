@@ -161,7 +161,7 @@ def test_usage_is_carried_off_the_result(computer: mc.Computer) -> None:
 
 
 @respx.mock
-@pytest.mark.parametrize("stop", ["max_steps", "rate_limited", "refusal"])
+@pytest.mark.parametrize("stop", ["max_steps", "time_limit", "rate_limited", "refusal"])
 def test_a_run_that_did_not_finish_is_returned_not_raised(computer: mc.Computer, stop: str) -> None:
     """The steps already taken are real, and what they did to the desktop stands.
 

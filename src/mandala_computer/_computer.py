@@ -5983,7 +5983,7 @@ class Computer(ComputerFields):
         :attr:`~mandala_computer.AgentResult.thread_id` is the thread to
         continue.
 
-        It does **not** raise when a run ends unfinished. ``max_steps``,
+        It does **not** raise when a run ends unfinished. ``time_limit``, ``max_steps``,
         ``rate_limited``, ``refusal``, ``max_cost`` and ``credits_exhausted``
         leave real work on the desktop, and raising would discard the only
         account of what was done to the machine — check
@@ -6181,6 +6181,10 @@ class Computer(ComputerFields):
         messages: Sequence[AgentMessage] | None = None,
     ) -> AgentRun:
         """Start the agent loop on this computer and walk away: a background run.
+
+        Accepts ``max_steps`` from 1 to 500 (default 20). All agent runs have
+        a fixed 60-minute wall-clock limit, ending with ``stop="time_limit"``.
+        A ``completed`` status means the loop ended; only ``end_turn`` is finished.
 
         The same loop as :meth:`agent`, with its arguments but ``store``, and
         nothing streams. This returns once the run holds the computer, with the

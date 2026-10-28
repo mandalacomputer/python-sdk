@@ -166,6 +166,9 @@ def test_the_handle_starts_the_same_run_and_a_funded_one_sends_no_key() -> None:
         ({"messages": [{"role": "user", "content": "hi"}], "thread_id": THREAD_ID}, ValueError),
         ({"thread_id": RUN_ID}, ValueError),
         ({"max_steps": 0}, ValueError),
+        ({"max_steps": 501}, ValueError),
+        ({"max_steps": 1.5}, ValueError),
+        ({"max_steps": True}, ValueError),
         ({"max_cost_usd": 50}, ValueError),
         ({"model_key": " "}, mc.MandalaError),
     ],
@@ -269,8 +272,9 @@ def test_the_result_names_the_runs_own_thread_whatever_it_carried(nested: object
     assert unkept.result is not None and unkept.result.thread_id is None
 
 
-def test_completed_is_not_finished_unless_the_model_ended_its_turn() -> None:
-    capped = {**COMPLETED, "result": {**COMPLETED["result"], "stop": "max_steps"}}
+@pytest.mark.parametrize("stop", ["max_steps", "time_limit"])
+def test_completed_is_not_finished_unless_the_model_ended_its_turn(stop: str) -> None:
+    capped = {**COMPLETED, "result": {**COMPLETED["result"], "stop": stop}}
     run = mc.AgentRun.from_api(capped)
     assert run.ended and not run.finished
 
@@ -517,3 +521,26 @@ async def test_async_wait_times_out_and_refuses_store() -> None:
                 await c.agent_runs.wait(RUN_ID, timeout=0.05, poll=0.01)
             with pytest.raises(TypeError):
                 await c.agent_runs.start("vm-1", "rename", store=False)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("steps", [1, 101, 500])
+@respx.mock
+def test_background_accepts_its_own_step_cap(steps: int) -> None:
+    route = respx.post(START).mock(return_value=httpx.Response(202, json=RUNNING))
+    client().agent_runs.start("vm-1", "go", max_steps=steps)
+    assert sent(route)["max_steps"] == steps
+    mc.Computer(client()._t, COMPUTER).start_agent_run("go", max_steps=steps)
+    assert sent(route)["max_steps"] == steps
+
+
+@pytest.mark.parametrize("steps", [1, 101, 500])
+@respx.mock
+async def test_async_background_accepts_its_own_step_cap(steps: int) -> None:
+    route = respx.post(START).mock(return_value=httpx.Response(202, json=RUNNING))
+    async with aclient() as c:
+        await c.agent_runs.start("vm-1", "go", max_steps=steps)
+        assert sent(route)["max_steps"] == steps
+        await mc.AsyncComputer(c._t, COMPUTER).start_agent_run("go", max_steps=steps)
+        assert sent(route)["max_steps"] == steps
+        with pytest.raises(ValueError, match="may not exceed 500"):
+            await c.agent_runs.start("vm-1", "go", max_steps=501)
