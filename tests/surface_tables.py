@@ -11,6 +11,10 @@ from __future__ import annotations
 
 # (method, pattern) with ids replaced by ":id" — mirrors the platform's v1 route table.
 ALLOWED = {
+    # Credential gateway management is API-first; use direct HTTP until wrappers ship.
+    ("GET", "computers/:id/credential-gateway"),
+    ("POST", "computers/:id/credential-gateway"),
+    ("DELETE", "computers/:id/credential-gateway/:binding"),
     ("GET", "templates"),
     # The template document format (platform OPL-3568): the published JSON
     # Schema, and a check of a document against it that stores nothing.
@@ -174,6 +178,14 @@ ALLOWED = {
 # a stop, `fresh` on a screenshot and `env` on an exec are each the difference
 # between a call that works and a call that works wrongly and says nothing.
 PARAMETERS: dict[str, set[str]] = {
+    "GET computers/:id/credential-gateway": set(),
+    "DELETE computers/:id/credential-gateway/:binding": set(),
+    "POST computers/:id/credential-gateway": {
+        "body:methods",
+        "body:origin",
+        "body:path_prefix",
+        "body:secret_id",
+    },
     "POST computers/:id/browser-connections": {
         "body:lifecycle_version",
         "body:lease_seconds",
