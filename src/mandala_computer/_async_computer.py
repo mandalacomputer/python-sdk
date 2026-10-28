@@ -44,6 +44,7 @@ from ._client import (
     NO_DEADLINE,
     SNAPSHOT_POLL,
     SNAPSHOT_WAIT_TIMEOUT,
+    STOP_TIMEOUT,
     AsyncTransport,
     _retained_exec_object,
 )
@@ -287,10 +288,13 @@ class AsyncComputer(ComputerFields):
         skips the asking and pulls the power — what to reach for when a guest
         will not come down on its own, at the cost of whatever it had not
         written to disk.
+        This call widens finite read/write timeouts to at least 95 seconds.
+        Larger or disabled timeouts remain unchanged; connect/pool limits do not change.
         """
         resp = await self._t.request(
             "POST",
             _api.computer_action(self.id, "stop"),
+            timeout=STOP_TIMEOUT,
             params=_api.stop_params(force),
             headers=_api.idempotency_headers(idempotency_key),
         )
