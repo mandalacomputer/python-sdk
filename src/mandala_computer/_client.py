@@ -61,6 +61,9 @@ DEFAULT_BASE_URL = "https://app.mandala.computer/api/v1"
 #: request; see :meth:`_BaseTransport._budget`.
 DEFAULT_TIMEOUT = 60.0
 
+# The platform stop route allows 83s; leave transport slack for its answer.
+STOP_TIMEOUT = 95.0
+
 #: The longest one transport retry may wait, when the call set no budget.
 #:
 #: A ``Retry-After`` longer than this raises the error it came with, carrying
