@@ -2488,6 +2488,8 @@ def screenshot_region(region: Sequence[int]) -> str:
 #: the work and not the bill, and the README says so where a caller sizing a run
 #: will read it.
 MAX_STEPS = 100
+#: Background runs accept more actions; foreground runs retain their cap.
+MAX_BACKGROUND_STEPS = 500
 #: The range a funded run's ``max_cost_usd`` must fall in, in dollars. The
 #: platform's default, when it is left out, is $2.
 MIN_MAX_COST_USD = 0.25
@@ -2607,8 +2609,9 @@ def agent_body(
         )
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
-        if max_steps > MAX_STEPS:
-            raise ValueError(f"max_steps may not exceed {MAX_STEPS}")
+        step_limit = MAX_BACKGROUND_STEPS if stream is None else MAX_STEPS
+        if max_steps > step_limit:
+            raise ValueError(f"max_steps may not exceed {step_limit}")
     if provider is not None and provider not in ("anthropic", "openai"):
         raise ValueError("provider must be anthropic or openai")
     if max_cost_usd is not None:

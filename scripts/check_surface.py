@@ -71,6 +71,7 @@ MANIFEST_VERSION = 1
 #: each number MEANS, never by the platform's own name for it.
 LIMITS = [
     ("MAX_STEPS", "agent.maxSteps"),
+    ("MAX_BACKGROUND_STEPS", "agent.maxBackgroundSteps"),
     ("MAX_CLIPBOARD_BYTES", "clipboard.writeMaxBytes"),
     ("MAX_ENV_ENTRIES", "exec.maxEnvEntries"),
     ("MAX_ENV_ENTRY_BYTES", "exec.maxEnvEntryBytes"),

@@ -2621,7 +2621,7 @@ class AgentThreads:
         self._t.json_object("DELETE", _api.agent_thread(thread_id))
 
 
-#: How long :meth:`AgentRuns.wait` waits by default: a long run of 100 steps.
+#: How long :meth:`AgentRuns.wait` waits locally by default (not the server run limit).
 AGENT_RUN_WAIT_TIMEOUT = 1800.0
 #: Seconds between its polls by default. A step takes at least that long.
 AGENT_RUN_WAIT_POLL = 3.0

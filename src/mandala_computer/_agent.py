@@ -221,6 +221,7 @@ class AgentResult:
     #: documents:
     #:
     #: - ``max_steps`` — the run reached ``max_steps``.
+    #: - ``time_limit`` — the run reached its fixed 60-minute wall-clock limit.
     #: - ``rate_limited`` — the account's API rate budget ran out mid-run.
     #: - ``refusal`` — the model declined.
     #: - ``pause_turn`` — the model kept pausing its turn.
