@@ -246,7 +246,7 @@ from ._results import (
 from ._uploads import FileUpload, UploadInterruptedError
 from ._webhooks import REPLAY_WINDOW_S, verify
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 
 __all__ = [
