@@ -68,6 +68,10 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
+    # API-first credential gateway management, without SDK wrappers yet.
+    ("GET", "computers/:id/credential-gateway"),
+    ("POST", "computers/:id/credential-gateway"),
+    ("DELETE", "computers/:id/credential-gateway/:binding"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
