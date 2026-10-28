@@ -178,7 +178,14 @@ ALLOWED = {
 # a stop, `fresh` on a screenshot and `env` on an exec are each the difference
 # between a call that works and a call that works wrongly and says nothing.
 PARAMETERS: dict[str, set[str]] = {
-    "POST computers/:id/credential-gateway": {"body:methods", "body:origin", "body:path_prefix", "body:secret_id"},
+    "GET computers/:id/credential-gateway": set(),
+    "DELETE computers/:id/credential-gateway/:binding": set(),
+    "POST computers/:id/credential-gateway": {
+        "body:methods",
+        "body:origin",
+        "body:path_prefix",
+        "body:secret_id",
+    },
     "POST computers/:id/browser-connections": {
         "body:lifecycle_version",
         "body:lease_seconds",
