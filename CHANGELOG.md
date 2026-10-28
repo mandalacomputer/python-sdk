@@ -9,6 +9,29 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-28
+
+### Added
+
+- `start_agent_run` accepts `max_steps` up to 500 (default 20). Foreground
+  `agent`, `agent_once` and `agent_stream` runs keep the ceiling of 100, and the
+  SDK still refuses a larger value before the call.
+- `time_limit` stop reason. Every agent run has a fixed 60-minute wall-clock
+  limit; reaching it ends the run with `stop="time_limit"` and keeps the work
+  already done. A background `status` of `completed` only means the loop
+  ended: `stop="end_turn"` is the one that means the task finished.
+  `AgentRuns.wait` does not raise for it, like the other unfinished stops.
+
+### Changed
+
+- `Computer.stop()` (sync and async) widens finite read/write timeouts to at
+  least 95 seconds. The platform now gives a guest up to 45 seconds to shut
+  down on its own, so an ordinary stop can take about 83 seconds to answer;
+  an older client with a shorter timeout gives up before the answer. Larger or
+  disabled timeouts, and connect/pool limits, are unchanged.
+- `AgentRuns.wait` documents its 30-minute default as a local waiting budget,
+  not the server's run limit; pass a longer `timeout` to wait for a long run.
+
 ## [0.18.0] - 2026-10-24
 
 ### Added
@@ -1716,7 +1739,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.0...v0.17.2
 [0.17.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.16.0...v0.17.0
