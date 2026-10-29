@@ -43,7 +43,7 @@ import io
 import json
 import sys
 from contextlib import aclosing, closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -929,7 +929,18 @@ def api_handler(request: httpx.Request) -> httpx.Response:
             200, json=[WORKSPACE_MEMBER] if path.endswith("/members") else WORKSPACE
         )
     if path.endswith("/api-keys"):
-        return httpx.Response(200 if get else 201, json=[API_KEY] if get else API_KEY_CREATED)
+        if get:
+            return httpx.Response(200, json=[API_KEY])
+        # Limits asked for are echoed back, as a server that applied them does.
+        sent = json.loads(request.content)
+        echo: dict[str, object] = {}
+        if "expires_at" in sent:
+            echo["expires_at"] = sent["expires_at"]
+        if "expires_in_hours" in sent:
+            echo["expires_at"] = datetime.now(timezone.utc).isoformat()
+        if "computer_ids" in sent:
+            echo["computer_ids"] = sent["computer_ids"]
+        return httpx.Response(201, json={**API_KEY_CREATED, **echo})
     if "/api-keys/" in path:
         return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh-keys"):
@@ -955,8 +966,25 @@ def api_handler(request: httpx.Request) -> httpx.Response:
     if path.endswith("/secrets"):
         return httpx.Response(200, json=SECRET_BINDINGS)
     if path.endswith("/computers"):
-        return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
-    return httpx.Response(200, json=COMPUTER)
+        return httpx.Response(200, json=[COMPUTER] if get else _with_end_time(request))
+    return httpx.Response(200, json=COMPUTER if get else _with_end_time(request))
+
+
+def _with_end_time(request: httpx.Request) -> dict[str, object]:
+    """A computer, carrying an end time when the request set one, as a server
+    that applied it answers."""
+    try:
+        sent = json.loads(request.content or b"{}")
+    except ValueError:
+        return COMPUTER
+    if not isinstance(sent, dict):
+        return COMPUTER
+    if isinstance(sent.get("ends_at"), str):
+        return {**COMPUTER, "ends_at": sent["ends_at"]}
+    if isinstance(sent.get("ends_in_hours"), (int, float)):
+        ends = datetime.now(timezone.utc) + timedelta(hours=sent["ends_in_hours"])
+        return {**COMPUTER, "ends_at": ends.isoformat()}
+    return COMPUTER
 
 
 def sent_parameters(calls: object) -> dict[str, set[str]]:
@@ -1047,6 +1075,9 @@ def exercise_everything(client: mc.Client) -> None:
     client.computers.create(size="small")
     # Into a workspace, by an account-wide key (OPL-5543).
     client.computers.create(template="base", workspace_id="wsp-0123456789ab")
+    # An end time, as a time and as hours from now.
+    client.computers.create(template="base", ends_at="2026-11-01T12:00:00Z")
+    client.computers.create(template="base", ends_in_hours=1.5)
     # Secrets bound at create, one as a variable and one as a file.
     client.computers.create(
         template="base",
@@ -1181,6 +1212,9 @@ def exercise_everything(client: mc.Client) -> None:
     client.credits.read(before=7, limit=10)
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
+    c.set_end_time(datetime(2026, 11, 1, 12, tzinfo=timezone.utc))
+    c.set_end_time(ends_in_hours=2)
+    c.set_end_time(None)
     c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
     c.set_browser_proxy(None)
     c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})
@@ -1375,6 +1409,8 @@ def exercise_everything(client: mc.Client) -> None:
     client.api_keys.list()
     client.api_keys.create()
     client.api_keys.create(name="ci", workspace_id="wsp-1")
+    client.api_keys.create(expires_at="2026-11-01T12:00:00Z", computer_ids=["vm-1"])
+    client.api_keys.create(expires_in_hours=24)
     client.api_keys.revoke(API_KEY["id"])
     # The account's workspaces, read only (OPL-5057).
     client.workspaces.list()
@@ -1431,6 +1467,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     )
     await client.computers.create(size="small")
     await client.computers.create(template="base", workspace_id="wsp-0123456789ab")
+    # An end time, as a time and as hours from now.
+    await client.computers.create(template="base", ends_at="2026-11-01T12:00:00Z")
+    await client.computers.create(template="base", ends_in_hours=1.5)
     await client.computers.create(
         template="base",
         secrets=[
@@ -1550,6 +1589,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.credits.read(before=7, limit=10)
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
+    await c.set_end_time(datetime(2026, 11, 1, 12, tzinfo=timezone.utc))
+    await c.set_end_time(ends_in_hours=2)
+    await c.set_end_time(None)
     await c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
     await c.set_browser_proxy(None)
     await c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})
@@ -1717,6 +1759,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.api_keys.list()
     await client.api_keys.create()
     await client.api_keys.create(name="ci", workspace_id="wsp-1")
+    await client.api_keys.create(expires_at="2026-11-01T12:00:00Z", computer_ids=["vm-1"])
+    await client.api_keys.create(expires_in_hours=24)
     await client.api_keys.revoke(API_KEY["id"])
     await client.workspaces.list()
     await client.workspaces.get(WORKSPACE["id"])

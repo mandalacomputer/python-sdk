@@ -1663,6 +1663,9 @@ class ComputerFields:
     # answers an acknowledgement is followed by a refresh that replaces
     # ``_data``.
     _operation_id: str | None = None
+    #: How the last PATCH went — when, by which clocks, and whether its answer
+    #: was the stored one of an earlier call — for judging a time it answered.
+    _patch_exchange: _api.Exchange | None = None
 
     def _note_clone_answer(self, data: Mapping[str, Any]) -> None:
         self._memory_dropped = data.get("memory_dropped") is True
@@ -1676,7 +1679,8 @@ class ComputerFields:
         """The lifecycle operation the last lifecycle call made through this
         handle started (platform OPL-5055): the create or clone that returned
         it, or the latest ``start``, ``stop``, ``suspend``, ``restart``,
-        ``rename``, ``move_to_workspace``, ``resize``, ``set_idle_suspend``, ``set_browser_proxy`` or
+        ``rename``, ``move_to_workspace``, ``resize``, ``set_idle_suspend``, ``set_end_time``,
+        ``set_browser_proxy`` or
         ``set_egress_proxy`` since. ``client.operations.wait(id)`` polls it to
         its end.
 
@@ -2453,6 +2457,23 @@ class ComputerFields:
         return _require_whole(value, "computer answered with an invalid idle_suspend_min")
 
     @property
+    def ends_at(self) -> str | None:
+        """When this computer's host will stop it (RFC 3339, UTC), or ``None``
+        when it has no end time.
+
+        Set at create (``ends_at`` / ``ends_in_hours``) or with
+        :meth:`Computer.set_end_time`. It happens once: the stop is the same as
+        :meth:`Computer.stop` (the disk is kept), and the end time is cleared
+        afterwards.
+        """
+        value = self._data.get("ends_at")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise MandalaError("computer answered with an invalid ends_at")
+        return str.__str__(value)
+
+    @property
     def workspace_id(self) -> str:
         """The workspace this computer is in, or ``""`` when it is in none.
 
@@ -2806,14 +2827,13 @@ class Computer(ComputerFields):
         as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
         rather than leaving this handle holding a record with no id.
         """
-        data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=body,
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        sent = _api.idempotency_headers(idempotency_key)
+        start = _api.exchange_start()
+        answer, headers = self._t.json_object_with_headers(
+            "PATCH", _api.computer(self.id), json=body, headers=sent
         )
+        self._patch_exchange = _api.exchange_end(start, headers)
+        data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):
             self._data = data
@@ -3190,6 +3210,49 @@ class Computer(ComputerFields):
         polls the screen is the one thing this setting can surprise.
         """
         return self._patch("set_idle_suspend", _api.idle_suspend_body(minutes), idempotency_key)
+
+    def set_end_time(
+        self,
+        ends_at: datetime | str | None = None,
+        *,
+        ends_in_hours: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> Computer:
+        """Give this computer an end time, move it, or clear it.
+
+        ``ends_at`` is an aware ``datetime`` or an RFC 3339 string with a time
+        zone, and only has to be in the future; ``ends_in_hours`` is the same
+        as hours from now (more than 0, fractions are fine). Send one or the
+        other, not both; with neither, the end time is cleared and the computer
+        runs until something else stops it.
+
+        At its end time the host stops the computer, as :meth:`stop` would —
+        the disk is kept — and clears the end time. It is one stop, not a
+        schedule: starting the computer again does not bring it back. A host
+        that cannot keep end times raises a
+        :class:`~mandala_computer.ConflictError` with reason ``unsupported``.
+
+        An answer that does not confirm the change — no end time after setting
+        one, or one still there after clearing it, as from a server too old to
+        know them — raises :class:`~mandala_computer.MandalaError` naming the
+        computer. Nothing is stopped or deleted.
+
+        Resent under the same ``idempotency_key``, the answer is the first
+        call's, measured from whenever that was sent. For ``ends_in_hours`` it
+        is then only confirmed to be no later than hours from now: an earlier
+        end time from that first call is accepted as it is.
+        """
+        body = _api.end_time_body(ends_at, ends_in_hours)
+        updated = self._patch("set_end_time", body, idempotency_key)
+        refusal = _api.end_time_refusal(
+            self.id,
+            body,
+            self._data.get("ends_at"),
+            self._patch_exchange or _api.exchange_end(_api.exchange_start(), {}),
+        )
+        if refusal is not None:
+            raise refusal
+        return updated
 
     def set_browser_proxy(
         self,

@@ -10,6 +10,8 @@ from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 
+import anyio
+
 from . import _api
 from ._agent import AgentMessage, AgentProvider
 from ._agent_records import AgentRun, AgentRunPage, AgentRunStatus, AgentThread, AgentThreadPage
@@ -127,7 +129,6 @@ from ._resources import (
     _operation_settled,
     _operation_timed_out,
     _publish_refusal,
-    _replayed,
     _usage_window,
     _wait_timed_out,
     classify_poll_failure,
@@ -247,6 +248,8 @@ class AsyncComputers:
         browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         workspace_id: str | None = None,
+        ends_at: datetime | str | None = None,
+        ends_in_hours: float | None = None,
         idempotency_key: str | None = None,
     ) -> AsyncComputer:
         """Provision a computer.
@@ -355,6 +358,25 @@ class AsyncComputers:
         ``https://`` one, or one naming credentials — answers 409 with reason
         ``unsupported``.
 
+        ``ends_at`` gives the computer an end time: an aware ``datetime`` or an
+        RFC 3339 string with a time zone, at least 10 minutes and at most 366
+        days ahead. ``ends_in_hours`` says the same thing as hours from now
+        (fractions are fine); send one or the other, not both. At that moment
+        its host stops the computer, as :meth:`AsyncComputer.stop` would — the disk
+        and everything on it are kept, and it starts again like any stopped
+        computer. It happens once and is then cleared:
+        :attr:`AsyncComputer.ends_at` reads it, and :meth:`AsyncComputer.set_end_time`
+        changes or clears it. A host that cannot keep end times answers 409
+        with reason ``unsupported``. An answer without the end time asked for —
+        from a server too old to know them — raises
+        :class:`~mandala_computer.MandalaError` naming the computer, which is
+        left as it is, not deleted or stopped. A create resent under an
+        idempotency key after its end time has passed answers the first call's
+        computer, now stopped with no end time, and raises the same way. A
+        replayed ``ends_in_hours`` answer was measured from the first call,
+        whenever that was sent, so it is only confirmed to be no later than
+        hours from now.
+
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
 
@@ -379,18 +401,27 @@ class AsyncComputers:
             egress_proxy=egress_proxy,
             size=size,
             workspace_id=workspace_id,
+            ends_at=ends_at,
+            ends_in_hours=ends_in_hours,
         )
-        return (await self._create(body, idempotency_key))[0]
+        computer, ex = await self._create(body, idempotency_key)
+        refusal = _api.end_time_refusal(computer.id, body, computer.raw.get("ends_at"), ex)
+        if refusal is not None:
+            raise refusal
+        return computer
 
     async def _create(
         self, body: Mapping[str, Any], idempotency_key: str | None
-    ) -> tuple[AsyncComputer, bool]:
-        """:meth:`create`, also saying whether the answer replayed an earlier call's."""
+    ) -> tuple[AsyncComputer, _api.Exchange]:
+        """:meth:`create`, also saying how the request went: when, by
+        which clocks, and whether the answer replayed an earlier call's."""
+        sent = _api.idempotency_headers(idempotency_key)
+        start = _api.exchange_start()
         data, headers = await self._t.json_object_with_headers(
-            "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
+            "POST", _api.COMPUTERS, json=body, headers=sent
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return AsyncComputer(self._t, record), _replayed(headers)
+        return AsyncComputer(self._t, record), _api.exchange_end(start, headers)
 
     async def launch(
         self,
@@ -408,6 +439,8 @@ class AsyncComputers:
         browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         workspace_id: str | None = None,
+        ends_at: datetime | str | None = None,
+        ends_in_hours: float | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
         idempotency_key: str | None = None,
@@ -478,7 +511,12 @@ class AsyncComputers:
         attempt's, up to 24 hours old, so launch reads the computer afresh
         before acting on it: a start that attempt reported failed is sent
         again rather than raised again, and a computer stopped or suspended
-        since is started.
+        since is started — except when launch was asked for an end time: a
+        computer created with one is never started by launch once found
+        stopped or suspended (its end time may be what stopped it), and
+        :class:`~mandala_computer.MandalaError` names it instead. Call
+        ``start()`` on it if you still want it running. That includes
+        ``start=False`` with an end time.
         """
         check_wait_args(timeout, poll)
         body = _api.create_body(
@@ -495,10 +533,24 @@ class AsyncComputers:
             egress_proxy=egress_proxy,
             size=size,
             workspace_id=workspace_id,
+            ends_at=ends_at,
+            ends_in_hours=ends_in_hours,
         )
         # See the sync twin: the create's key, settled before the create.
         launch_key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
-        computer, replayed = await self._create(body, launch_key)
+        computer, ex = await self._create(body, launch_key)
+        replayed = ex.replayed
+        # A replayed answer is the first call's, and says nothing of the end
+        # time now; that is checked below, once the computer has been read.
+        refusal = (
+            None
+            if replayed
+            else _api.end_time_refusal(
+                computer.id, body, computer.raw.get("ends_at"), ex, launching=True
+            )
+        )
+        if refusal is not None:
+            raise refusal
         computer_id = computer.id
         deadline = time.monotonic() + timeout
 
@@ -542,6 +594,19 @@ class AsyncComputers:
             await computer.wait_until_built(timeout=remaining(), poll=poll)
             if computer.start_error:
                 raise MandalaError(f"did not start: {computer.start_error}")
+            # Asked for an end time and read without one: it has passed — the
+            # host stopped the computer and cleared it, and this is a replay —
+            # or it never took. Either way starting it would leave it running
+            # with no end time, so it is left as it is.
+            refusal = _api.end_time_refusal(
+                computer.id,
+                body,
+                computer.raw.get("ends_at"),
+                ex,
+                launching=True,
+            )
+            if refusal is not None:
+                raise refusal
             if (
                 not start_admitted
                 and computer.status in ("stopped", "suspended")
@@ -550,6 +615,11 @@ class AsyncComputers:
                     or (not start and "running_ram_mb" not in computer.raw)
                 )
             ):
+                # A computer asked to end at a time is never started here: found
+                # stopped, its end time may be what stopped it, and a start
+                # would leave it running past the moment it was meant to end.
+                if _api.wants_end_time(body):
+                    raise _api.end_time_not_started(computer.id, computer.status)
                 remaining()
                 await computer.start()
             await computer.wait_until_running(timeout=remaining(), poll=poll)
@@ -1517,10 +1587,66 @@ class AsyncApiKeys:
         return [ApiKey.from_api(k, f"API key {i}") for i, k in enumerate(rows)]
 
     async def create(
-        self, *, name: str | None = None, workspace_id: str | None = None
+        self,
+        *,
+        name: str | None = None,
+        workspace_id: str | None = None,
+        expires_at: datetime | str | None = None,
+        expires_in_hours: float | None = None,
+        computer_ids: Sequence[str] | None = None,
     ) -> ApiKeyCreated:
-        body = _api.api_key_body(name, workspace_id)
-        return ApiKeyCreated.from_api(await self._t.json_object("POST", _api.API_KEYS, json=body))
+        body = _api.api_key_body(
+            name,
+            workspace_id,
+            expires_at=expires_at,
+            expires_in_hours=expires_in_hours,
+            computer_ids=computer_ids,
+        )
+        start = _api.exchange_start()
+        data, headers = await self._t.json_object_with_headers("POST", _api.API_KEYS, json=body)
+        created, key_id, problem = _api.minted_key(body, data, _api.exchange_end(start, headers))
+        if created is not None:
+            return created
+        revoked: bool | None = None
+        if key_id is not None:
+            revoked = await self._revoke_to_the_end(key_id)
+        raise _api.key_limits_refusal(key_id, problem or "", revoked)
+
+    async def _revoke_to_the_end(self, key_id: str) -> bool:
+        """Revoke a key minted without its limits, whatever happens to the caller.
+
+        In this task, not a detached one: a task left to finish on its own is
+        cancelled with the rest when the loop shuts down — ``asyncio.run``
+        returning, say — and the key it was revoking keeps working. So a
+        cancellation is held until the revoke is done (an interrupted DELETE
+        is sent again, and a 404 then means the first one landed), within a
+        budget of its own, and raised after. ``False`` when it failed.
+        """
+        deadline = time.monotonic() + _api.CLEANUP_TIMEOUT_SECONDS
+        held: asyncio.CancelledError | None = None
+        revoked = False
+        # Shielded from AnyIO cancellation too: a cancelled scope around the
+        # caller would otherwise cancel every await in here, again and again,
+        # until the budget ran out with the key still working.
+        with anyio.CancelScope(shield=True):
+            while (left := deadline - time.monotonic()) > 0:
+                try:
+                    await self._t.request(
+                        "DELETE", _api.api_key(key_id), timeout=left, timeout_cap=left
+                    )
+                except asyncio.CancelledError as cancelled:
+                    held = held or cancelled
+                    continue
+                except NotFoundError:
+                    revoked = held is not None
+                except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
+                    revoked = False
+                else:
+                    revoked = True
+                break
+        if held is not None:
+            raise held
+        return revoked
 
     async def revoke(self, key_id: str) -> None:
         await self._t.request("DELETE", _api.api_key(key_id))

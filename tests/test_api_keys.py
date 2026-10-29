@@ -4,12 +4,16 @@ the ``mandala-py`` commands on top of them: ``whoami``, ``api-keys``,
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 import respx
@@ -754,3 +758,393 @@ def test_readme_names_the_permission_as_the_dashboard_does() -> None:
     assert "Manage keys" not in readme
     assert "checkbox" not in readme
     assert "the key's menu → **Allow managing keys**" in " ".join(readme.split())
+
+
+@respx.mock
+def test_create_sends_an_expiry_and_a_computer_list_and_reads_them_back() -> None:
+    answer = {
+        **API_KEY_CREATED,
+        "expires_at": "2026-11-01T12:00:00.000Z",
+        "computer_ids": ["vm-1", "vm-2"],
+    }
+    route = respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=answer))
+    created = client().api_keys.create(
+        expires_at="2026-11-01T12:00:00Z", computer_ids=["vm-1", "vm-2"]
+    )
+    assert json.loads(route.calls.last.request.content) == {
+        "expires_at": "2026-11-01T12:00:00Z",
+        "computer_ids": ["vm-1", "vm-2"],
+    }
+    assert created.expires_at == "2026-11-01T12:00:00.000Z"
+    assert created.computer_ids == ("vm-1", "vm-2")
+    soon = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    route.mock(return_value=httpx.Response(201, json={**API_KEY_CREATED, "expires_at": soon}))
+    assert client().api_keys.create(expires_in_hours=24).expires_at == soon
+    assert json.loads(route.calls.last.request.content) == {"expires_in_hours": 24}
+
+
+@respx.mock
+def test_a_key_without_limits_reads_as_none() -> None:
+    respx.get(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(
+            200, json=[API_KEY, {**API_KEY, "expires_at": None, "computer_ids": None}]
+        )
+    )
+    for key in client().api_keys.list():
+        assert key.expires_at is None
+        assert key.computer_ids is None
+
+
+@pytest.mark.parametrize("ids", ["vm-1", 7, {"vm-1": True}, ["vm-1", 7]])
+@respx.mock
+def test_list_refuses_an_unreadable_computer_list(ids: object) -> None:
+    respx.get(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(200, json=[{**API_KEY, "computer_ids": ids}])
+    )
+    with pytest.raises(mc.MandalaError, match="computer_ids"):
+        client().api_keys.list()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"expires_at": "2026-11-01T12:00:00Z", "expires_in_hours": 1}, "not both"),
+        ({"expires_in_hours": 0}, "expires_in_hours"),
+        ({"expires_at": "2026-11-01"}, "RFC 3339"),
+        ({"computer_ids": "vm-1"}, "list of computer ids"),
+        ({"computer_ids": []}, "at least one"),
+        ({"computer_ids": [" vm-1"]}, "no spaces"),
+    ],
+)
+def test_create_refuses_limits_it_can_tell_are_wrong_before_sending(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/api-keys")
+        with pytest.raises(ValueError, match=match):
+            client().api_keys.create(**kwargs)
+        assert not route.called
+
+
+# --- a mint that does not confirm the limits asked for is revoked -------------
+#
+# A server that predates key limits ignores the fields and mints a key that
+# never expires and reaches every computer. That key is revoked, never handed
+# back, and the error says whether the revoke went through.
+
+LIMITED = {"expires_at": "2026-11-01T12:00:00Z", "computer_ids": ["vm-1", "vm-2"]}
+
+UNCONFIRMED = [
+    pytest.param({"expires_at": "2026-11-01T12:00:00Z"}, {}, "no expiry", id="expiry-omitted"),
+    pytest.param(
+        {"expires_at": "2026-11-01T12:00:00Z"}, {"expires_at": None}, "no expiry", id="expiry-null"
+    ),
+    pytest.param(
+        {"expires_at": "2026-11-01T12:00:00Z"},
+        {"expires_at": "2026-11-01T12:00:02Z"},
+        "later than asked",
+        id="expiry-later",
+    ),
+    pytest.param(
+        {"expires_at": "2026-11-01T12:00:00Z"},
+        {"expires_at": "next week"},
+        "no expiry",
+        id="expiry-unreadable",
+    ),
+    pytest.param({"expires_in_hours": 1}, {}, "no expiry", id="hours-omitted"),
+    pytest.param(
+        {"expires_in_hours": 1},
+        {"expires_at": "2099-01-01T00:00:00Z"},
+        "later than asked",
+        id="hours-later",
+    ),
+    pytest.param({"computer_ids": ["vm-1"]}, {}, "not confined", id="ids-omitted"),
+    pytest.param({"computer_ids": ["vm-1"]}, {"computer_ids": None}, "not confined", id="ids-null"),
+    pytest.param(
+        {"computer_ids": ["vm-1"]},
+        {"computer_ids": ["vm-1", "vm-9"]},
+        "reaches computers that were not named",
+        id="ids-wider",
+    ),
+    pytest.param(
+        {"computer_ids": ["vm-1"]},
+        {"computer_ids": "vm-1"},
+        "could not be read",
+        id="ids-unreadable",
+    ),
+    # The key decodes no further than its id: still revoked, by that id.
+    pytest.param(
+        {"expires_in_hours": 1}, {"expires_at": 17}, "could not be read", id="expiry-not-a-string"
+    ),
+    pytest.param(
+        {"computer_ids": ["vm-1"]},
+        {"manage_keys": "yes", "computer_ids": ["vm-1"]},
+        "could not be read",
+        id="model-unreadable",
+    ),
+]
+
+
+@pytest.mark.parametrize(("asked", "answered", "problem"), UNCONFIRMED)
+@respx.mock
+def test_a_key_minted_without_its_limits_is_revoked_and_not_returned(
+    asked: dict[str, Any], answered: dict[str, Any], problem: str
+) -> None:
+    respx.post(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(201, json={**API_KEY_CREATED, **answered})
+    )
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    with pytest.raises(mc.MandalaError, match="did not apply the requested limits") as caught:
+        client().api_keys.create(**asked)
+    message = str(caught.value)
+    assert problem in message
+    assert f"the new key {API_KEY_CREATED['id']} has been revoked" in message
+    assert API_KEY_CREATED["raw"] not in message
+    assert revoke.call_count == 1
+
+
+@respx.mock
+def test_a_failed_revoke_is_said_and_names_the_key_to_revoke() -> None:
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    with pytest.raises(mc.MandalaError, match="FAILED") as caught:
+        client().api_keys.create(expires_in_hours=1)
+    assert API_KEY_CREATED["id"] in str(caught.value)
+    assert API_KEY_CREATED["raw"] not in str(caught.value)
+
+
+@respx.mock
+def test_a_key_minted_with_its_limits_is_returned() -> None:
+    respx.post(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(
+            201, json={**API_KEY_CREATED, **LIMITED, "computer_ids": ["vm-1"]}
+        )
+    )
+    created = client().api_keys.create(**LIMITED)
+    assert created.key == API_KEY_CREATED["raw"]
+    assert created.computer_ids == ("vm-1",)
+
+
+@pytest.mark.parametrize(("asked", "answered", "problem"), UNCONFIRMED)
+@respx.mock
+async def test_the_async_mint_revokes_the_same(
+    asked: dict[str, Any], answered: dict[str, Any], problem: str
+) -> None:
+    respx.post(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(201, json={**API_KEY_CREATED, **answered})
+    )
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    aclient = mc.AsyncClient("com_test", base_url=BASE)
+    with pytest.raises(mc.MandalaError, match="did not apply the requested limits") as caught:
+        await aclient.api_keys.create(**asked)
+    assert problem in str(caught.value)
+    assert API_KEY_CREATED["raw"] not in str(caught.value)
+    assert revoke.call_count == 1
+
+
+@respx.mock
+def test_the_revoke_has_its_own_bounded_budget() -> None:
+    """However patient the caller's client, the compensating revoke is capped."""
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    patient = mc.Client("com_test", base_url=BASE, timeout=3600)
+    with pytest.raises(mc.MandalaError, match="has been revoked"):
+        patient.api_keys.create(expires_in_hours=1)
+    sent = revoke.calls.last.request.extensions["timeout"]
+    assert all(v is not None and v <= 30 for v in sent.values())
+
+
+@respx.mock
+async def test_cancelling_the_async_mint_does_not_cancel_its_revoke() -> None:
+    """A caller's cancellation (a timeout around the call, say) reaches the
+    caller, but the revoke of the key it would have stranded still finishes."""
+    started, finished = asyncio.Event(), asyncio.Event()
+
+    async def slow_revoke(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.set()
+        return httpx.Response(200, json={"ok": True})
+
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(side_effect=slow_revoke)
+    aclient = mc.AsyncClient("com_test", base_url=BASE)
+    mint = asyncio.ensure_future(aclient.api_keys.create(expires_in_hours=1))
+    await asyncio.wait_for(started.wait(), 5)
+    mint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await mint
+    await asyncio.wait_for(finished.wait(), 5)
+    assert revoke.call_count == 1
+
+
+# --- a client clock set wrong does not decide an expiry ----------------------
+
+
+def minting_server(off: timedelta) -> respx.Route:
+    """A server that sets the expiry from ITS clock (plus ``off``, to be wrong)
+    and says what that clock reads in its Date header."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        hours = json.loads(request.content)["expires_in_hours"]
+        now = datetime.now(timezone.utc)
+        body = {**API_KEY_CREATED, "expires_at": (now + timedelta(hours=hours) + off).isoformat()}
+        return httpx.Response(201, json=body, headers={"Date": format_datetime(now, usegmt=True)})
+
+    respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    return respx.post(f"{BASE}/api-keys").mock(side_effect=answer)
+
+
+@pytest.mark.parametrize("skew", [timedelta(seconds=5), timedelta(minutes=-2)])
+@respx.mock
+def test_a_skewed_client_clock_accepts_the_servers_expiry(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    monkeypatch.setattr(mc._api, "utcnow", lambda: datetime.now(timezone.utc) + skew)
+    minting_server(timedelta(0))
+    assert client().api_keys.create(expires_in_hours=1).key == API_KEY_CREATED["raw"]
+
+
+@pytest.mark.parametrize("skew", [timedelta(seconds=5), timedelta(minutes=-2)])
+@respx.mock
+async def test_a_skewed_client_clock_accepts_the_servers_expiry_async(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    monkeypatch.setattr(mc._api, "utcnow", lambda: datetime.now(timezone.utc) + skew)
+    minting_server(timedelta(0))
+    created = await mc.AsyncClient("com_test", base_url=BASE).api_keys.create(expires_in_hours=1)
+    assert created.key == API_KEY_CREATED["raw"]
+
+
+@pytest.mark.parametrize("skew", [timedelta(seconds=5), timedelta(minutes=-2)])
+@respx.mock
+def test_an_expiry_later_by_the_servers_own_clock_is_refused(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    monkeypatch.setattr(mc._api, "utcnow", lambda: datetime.now(timezone.utc) + skew)
+    minting_server(timedelta(minutes=5))
+    with pytest.raises(mc.MandalaError, match="later than asked"):
+        client().api_keys.create(expires_in_hours=1)
+
+
+def test_a_cancelled_mint_finishes_its_revoke_before_the_loop_shuts_down() -> None:
+    """Cancelled during the revoke, and the loop torn down at once (as
+    ``asyncio.run`` returning does): the DELETE still completes."""
+    finished: list[bool] = []
+
+    async def slow_revoke(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        finished.append(True)
+        return httpx.Response(200, json={"ok": True})
+
+    async def main() -> None:
+        started = asyncio.Event()
+
+        async def revoke(request: httpx.Request) -> httpx.Response:
+            started.set()
+            return await slow_revoke(request)
+
+        respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(side_effect=revoke)
+        aclient = mc.AsyncClient("com_test", base_url=BASE)
+        mint = asyncio.ensure_future(aclient.api_keys.create(expires_in_hours=1))
+        await asyncio.wait_for(started.wait(), 5)
+        mint.cancel()
+        # Return at once: asyncio.run cancels what is left and shuts down.
+
+    with respx.mock:
+        respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+        asyncio.run(main())
+    assert finished == [True]
+
+
+@respx.mock
+def test_an_expiry_five_seconds_later_by_the_servers_date_is_refused() -> None:
+    minting_server(timedelta(seconds=5))
+    with pytest.raises(mc.MandalaError, match="later than asked"):
+        client().api_keys.create(expires_in_hours=1 / 60)
+
+
+@respx.mock
+async def test_an_anyio_scope_cancelled_during_the_revoke_does_not_stop_it() -> None:
+    """AnyIO cancels every await in a cancelled scope, again and again: the
+    revoke runs shielded from that and completes."""
+    started = asyncio.Event()
+    finished: list[bool] = []
+
+    async def slow_revoke(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.append(True)
+        return httpx.Response(200, json={"ok": True})
+
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(side_effect=slow_revoke)
+    aclient = mc.AsyncClient("com_test", base_url=BASE)
+    errors: list[str] = []
+
+    async def mint() -> None:
+        try:
+            await aclient.api_keys.create(expires_in_hours=1)
+        except mc.MandalaError as e:
+            errors.append(str(e))
+
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(mint)
+            await started.wait()
+            tg.cancel_scope.cancel()
+    assert finished == [True]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"expires_at": "2026-11-31T12:00:00Z"}, "not a real date"),
+        ({"expires_at": "2026-02-30T00:00:00+01:00"}, "not a real date"),
+        ({"expires_in_hours": 8785}, "at most 8784"),
+        ({"expires_in_hours": 1e300}, "at most 8784"),
+    ],
+)
+async def test_limits_that_cannot_be_a_time_are_refused_before_minting(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/api-keys")
+        with pytest.raises(ValueError, match=match):
+            client().api_keys.create(**kwargs)
+        with pytest.raises(ValueError, match=match):
+            await mc.AsyncClient("com_test", base_url=BASE).api_keys.create(**kwargs)
+        assert not route.called
+
+
+def broken_check(*_: object) -> str | None:
+    raise OverflowError("date value out of range")
+
+
+@respx.mock
+async def test_a_failure_checking_the_answer_revokes_the_key_by_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mc._api, "key_limits_unapplied", broken_check)
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    with pytest.raises(mc.MandalaError, match="could not be checked") as caught:
+        client().api_keys.create(expires_in_hours=1)
+    assert f"the new key {API_KEY_CREATED['id']} has been revoked" in str(caught.value)
+    assert API_KEY_CREATED["raw"] not in str(caught.value)
+    with pytest.raises(mc.MandalaError, match="could not be checked") as caught:
+        await mc.AsyncClient("com_test", base_url=BASE).api_keys.create(computer_ids=["vm-1"])
+    assert API_KEY_CREATED["id"] in str(caught.value)
+    assert revoke.call_count == 2

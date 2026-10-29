@@ -239,6 +239,9 @@ PARAMETERS: dict[str, set[str]] = {
         "body:browser_proxy",
         "body:egress_proxy",
         "body:workspace_id",
+        # A one-shot stop at a set time, as a time or as hours from now.
+        "body:ends_at",
+        "body:ends_in_hours",
         # Every lifecycle call carries one (platform OPL-5127).
         "header:Idempotency-Key",
     },
@@ -255,6 +258,8 @@ PARAMETERS: dict[str, set[str]] = {
         "body:ram_mb",
         "body:disk_gb",
         "body:idle_suspend_min",
+        "body:ends_at",
+        "body:ends_in_hours",
         "body:browser_proxy",
         "body:egress_proxy",
         "header:Idempotency-Key",
@@ -483,7 +488,14 @@ PARAMETERS: dict[str, set[str]] = {
     # Who the credential is, and the holder's own API keys (OPL-5053).
     "GET whoami": set(),
     "GET api-keys": set(),
-    "POST api-keys": {"body:manage_keys", "body:name", "body:workspace_id"},
+    "POST api-keys": {
+        "body:manage_keys",
+        "body:name",
+        "body:workspace_id",
+        "body:expires_at",
+        "body:expires_in_hours",
+        "body:computer_ids",
+    },
     "DELETE api-keys/:id": set(),
     # Lifecycle operations, read only (OPL-5055).
     "GET operations": {"query:computer_id", "query:cursor", "query:limit", "query:idempotency_key"},

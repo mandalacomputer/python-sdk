@@ -9,6 +9,48 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- Computer end times. `computers.create(...)` and `computers.launch(...)` take
+  `ends_at=` (an aware `datetime` or an RFC 3339 string with a time zone, 10
+  minutes to 366 days ahead) or `ends_in_hours=` (hours from now, fractions
+  allowed), on both clients. At that moment the host stops the computer, as
+  `stop()` would, keeping its disk; it happens once and is then cleared.
+  `Computer.set_end_time(ends_at)` / `set_end_time(ends_in_hours=…)` sets or
+  moves it on an existing computer, and `set_end_time(None)` clears it.
+  `Computer.ends_at` reads it back (`None` when there is none). Sending both
+  forms, a naive `datetime`, a time without a zone or on a date that does not
+  exist, or hours that are not a positive number of at most 8784 (366 days)
+  raises `ValueError` before any request. A host that cannot
+  keep end times answers `ConflictError` with reason `unsupported`. An answer
+  that does not carry the end time asked for (none, a different or unreadable
+  one, or one still there after a clear, as from a server too old to know end
+  times) raises `MandalaError` naming the computer; the computer is not
+  stopped or deleted. A `launch` resent under its idempotency key after the
+  end time has passed finds the computer stopped with no end time and raises
+  rather than starting it again. More generally, `launch` with an end time
+  never starts a computer it finds stopped or suspended: it raises, naming it,
+  and `start()` is yours to call. Relative times
+  (`ends_in_hours`, `expires_in_hours`) are checked against the server's clock
+  (its `Date` header), so a client clock set wrong does not fail them. A
+  replayed answer to a call resent under the same idempotency key was measured
+  from the first call, whenever that was sent: its `ends_in_hours` end time is
+  only confirmed to be no later than hours from now.
+- Expiring and computer-limited API keys. `api_keys.create(...)` takes
+  `expires_at=` or `expires_in_hours=` (at most 366 days / 8784 hours) and
+  `computer_ids=[...]` (1 to 50 computers the key is confined to). `ApiKey` and
+  `ApiKeyCreated`, and whoami's `key`, carry `expires_at` and `computer_ids`
+  (`None` when the key has no such limit). An expired key is refused with
+  `AuthenticationError` (`API key expired`). A bare string or an empty list for
+  `computer_ids`, an `expires_at` on a date that does not exist, or
+  `expires_in_hours` above 8784 raises `ValueError` before any request. A mint whose answer
+  does not confirm the limits asked for (no expiry or a later one, no
+  confinement or a wider one) is revoked and never returned: `create` raises
+  `MandalaError` naming the key id and whether the revoke succeeded. The revoke
+  has its own time limit and, on the async client, finishes even when the call
+  is cancelled (by asyncio or an AnyIO cancel scope), before the cancellation
+  is raised.
+
 ## [0.20.0] - 2026-10-29
 
 ### Added

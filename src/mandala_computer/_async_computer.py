@@ -16,6 +16,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import replace
+from datetime import datetime
 from typing import IO, Any, Literal, overload
 
 from . import _api
@@ -238,14 +239,13 @@ class AsyncComputer(ComputerFields):
         as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
         rather than leaving this handle holding a record with no id.
         """
-        data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=body,
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        sent = _api.idempotency_headers(idempotency_key)
+        start = _api.exchange_start()
+        answer, headers = await self._t.json_object_with_headers(
+            "PATCH", _api.computer(self.id), json=body, headers=sent
         )
+        self._patch_exchange = _api.exchange_end(start, headers)
+        data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):
             self._data = data
@@ -631,6 +631,49 @@ class AsyncComputer(ComputerFields):
         return await self._patch(
             "set_idle_suspend", _api.idle_suspend_body(minutes), idempotency_key
         )
+
+    async def set_end_time(
+        self,
+        ends_at: datetime | str | None = None,
+        *,
+        ends_in_hours: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> AsyncComputer:
+        """Give this computer an end time, move it, or clear it.
+
+        ``ends_at`` is an aware ``datetime`` or an RFC 3339 string with a time
+        zone, and only has to be in the future; ``ends_in_hours`` is the same
+        as hours from now (more than 0, fractions are fine). Send one or the
+        other, not both; with neither, the end time is cleared and the computer
+        runs until something else stops it.
+
+        At its end time the host stops the computer, as :meth:`stop` would —
+        the disk is kept — and clears the end time. It is one stop, not a
+        schedule: starting the computer again does not bring it back. A host
+        that cannot keep end times raises a
+        :class:`~mandala_computer.ConflictError` with reason ``unsupported``.
+
+        An answer that does not confirm the change — no end time after setting
+        one, or one still there after clearing it, as from a server too old to
+        know them — raises :class:`~mandala_computer.MandalaError` naming the
+        computer. Nothing is stopped or deleted.
+
+        Resent under the same ``idempotency_key``, the answer is the first
+        call's, measured from whenever that was sent. For ``ends_in_hours`` it
+        is then only confirmed to be no later than hours from now: an earlier
+        end time from that first call is accepted as it is.
+        """
+        body = _api.end_time_body(ends_at, ends_in_hours)
+        updated = await self._patch("set_end_time", body, idempotency_key)
+        refusal = _api.end_time_refusal(
+            self.id,
+            body,
+            self._data.get("ends_at"),
+            self._patch_exchange or _api.exchange_end(_api.exchange_start(), {}),
+        )
+        if refusal is not None:
+            raise refusal
+        return updated
 
     async def set_browser_proxy(
         self,

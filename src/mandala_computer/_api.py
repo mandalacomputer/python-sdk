@@ -12,16 +12,23 @@ import ipaddress
 import math
 import re
 import shlex
+import time
 import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime
-from typing import Any, Literal, TypeVar
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote
 
 import httpx
 
 from ._exceptions import APIError, MandalaError
+from ._timestamps import parse_rfc3339
+
+if TYPE_CHECKING:
+    from ._models import ApiKeyCreated
 
 T = TypeVar("T")
 
@@ -858,7 +865,7 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})")
 
 
-def _usage_stamp(value: datetime | str, what: str) -> str:
+def _usage_stamp(value: object, what: str) -> str:
     """One bound of a usage window, in the spelling the platform reads.
 
     A ``datetime`` is the shape to prefer, and an AWARE one is the only kind
@@ -878,7 +885,7 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(
                 f"{what} must be an aware datetime — a naive one has no time zone, and "
-                "guessing one would move the window. Try "
+                "guessing one could move it by hours. Try "
                 f"{what}=your_datetime.replace(tzinfo=timezone.utc)."
             )
         # isoformat() renders the offset it carries; UTC comes out as +00:00,
@@ -1176,6 +1183,8 @@ def create_body(
     browser_proxy: object = None,
     egress_proxy: object = None,
     workspace_id: object = None,
+    ends_at: object = None,
+    ends_in_hours: object = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -1196,6 +1205,9 @@ def create_body(
 
     ``workspace_id`` (platform OPL-5543) is the workspace to create in, checked
     as a secret's scope is; ``None`` sends no key, the credential's own scope.
+
+    ``ends_at`` and ``ends_in_hours`` go through :func:`end_time_fields`, and
+    neither key is sent when both are ``None``.
     """
     from ._models import NO_BROWSER_PROXY  # a cycle at import time; not at call time
 
@@ -1246,7 +1258,369 @@ def create_body(
     workspace = _workspace(workspace_id)
     if workspace is not None:
         body["workspace_id"] = workspace
+    body.update(end_time_fields(ends_at, ends_in_hours, "ends_at", "ends_in_hours"))
     return body
+
+
+#: The furthest ahead, in hours, an end time or a key's expiry may be set:
+#: 366 days. Checked here as well as by the platform so that a number too big
+#: to turn into a time never reaches the request, or the checks on its answer.
+MAX_HOURS_AHEAD = 366 * 24
+
+
+def _positive_hours(value: object, what: str) -> float:
+    hours = real(value, what, message=f"{what} must be a number of hours, not {value!r}")
+    if hours <= 0:
+        raise ValueError(f"{what} must be more than 0, not {value!r}")
+    if hours > MAX_HOURS_AHEAD:
+        raise ValueError(f"{what} must be at most {MAX_HOURS_AHEAD} (366 days), not {value!r}")
+    return hours
+
+
+def _real_stamp(value: object, what: str) -> str:
+    """:func:`_usage_stamp`, and a date that exists: the pattern alone lets
+    ``2026-11-31`` through, and a stamp nobody can read back is no deadline."""
+    text = _usage_stamp(value, what)
+    try:
+        _moment(text)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{what} is not a real date and time: {value!r}") from None
+    return text
+
+
+def end_time_fields(at: object, hours: object, at_key: str, hours_key: str) -> dict[str, Any]:
+    """A moment as either an absolute time or a number of hours from now — at
+    most one of them, and nothing when neither was given.
+
+    The platform turns hours into a time itself, so the two are one setting
+    spelt two ways, and it refuses a request carrying both. So does this, before
+    anything is sent. Whether the time is far enough ahead, and not too far, is
+    the platform's to judge against its own clock: this one may be wrong.
+
+    A time follows :func:`_usage_stamp`'s rules, for its reason: an aware
+    ``datetime`` or an RFC 3339 string with a zone, never a naive datetime,
+    whose zone this SDK would have to guess — and a guess moves the moment by
+    hours.
+    """
+    if at is not None and hours is not None:
+        raise ValueError(f"send {at_key} or {hours_key}, not both")
+    if at is not None:
+        return {at_key: _real_stamp(at, at_key)}
+    if hours is not None:
+        return {hours_key: _positive_hours(hours, hours_key)}
+    return {}
+
+
+def end_time_body(ends_at: object, ends_in_hours: object) -> dict[str, Any]:
+    """The PATCH that sets a computer's end time, or clears it.
+
+    Neither given clears it: ``ends_at`` is sent as an explicit null, for
+    :func:`idle_suspend_body`'s reason — dropped, it would mean "change
+    nothing", the opposite request. The platform requires this to be the only
+    field in the PATCH, which is why it has a method of its own.
+    """
+    return end_time_fields(ends_at, ends_in_hours, "ends_at", "ends_in_hours") or {"ends_at": None}
+
+
+#: How much later than asked an answered moment may be and still count as the
+#: one asked for: the platform stores times at its own precision, and may
+#: round. Generous next to that, and nothing next to what it guards against.
+_MOMENT_SLACK = timedelta(seconds=1)
+#: For a duration, which the platform turns into a time on its own clock after
+#: the request arrives: the trip there, and the two clocks disagreeing.
+_HOURS_SLACK = timedelta(seconds=60)
+
+
+def _moment(text: str) -> datetime:
+    """A stamp :func:`_usage_stamp` let through, as an aware datetime."""
+    return parse_rfc3339(text.upper(), fraction_digits=None)
+
+
+def utcnow() -> datetime:
+    """Now, aware. One spelling, so tests and callers bracket a request alike."""
+    return datetime.now(timezone.utc)
+
+
+#: Without the server's own clock to go by, a relative time is held to the
+#: client's, widened by this much either way for a clock set wrong.
+_NO_DATE_SLACK = timedelta(minutes=10)
+#: How far a relative time may sit from the answer's ``Date`` plus the hours:
+#: the platform stamps both to the second, between arrival and answer.
+_DATE_SLACK = timedelta(seconds=2)
+#: A replay without a ``Date`` is held to the client's clock, which reads it a
+#: little after the platform measured it: a few seconds more for that.
+_REPLAY_NO_DATE_SLACK = timedelta(seconds=10)
+
+
+@dataclass(frozen=True)
+class Exchange:
+    """One request, as far as judging a time it answered with needs.
+
+    ``began`` and ``ended`` are the client's clock around it, ``seconds`` how
+    long it took by a monotonic one, ``server_now`` the answer's ``Date``
+    header — the platform's own clock — when it carried a readable one, and
+    ``replayed`` whether the answer was the stored one of an earlier call.
+    """
+
+    began: datetime
+    ended: datetime
+    seconds: float
+    server_now: datetime | None = None
+    replayed: bool = False
+
+
+def exchange_start() -> tuple[datetime, float]:
+    """The moment a request goes out, by both clocks; :func:`exchange_end` takes it."""
+    return utcnow(), time.monotonic()
+
+
+def exchange_end(start: tuple[datetime, float], headers: Mapping[str, str]) -> Exchange:
+    """The :class:`Exchange` a request made, from :func:`exchange_start` and the
+    answer's headers."""
+    began, mono = start
+    server_now: datetime | None
+    try:
+        server_now = parsedate_to_datetime(headers.get("date", ""))
+    except (TypeError, ValueError, IndexError):
+        server_now = None
+    if server_now is not None and server_now.tzinfo is None:
+        server_now = server_now.replace(tzinfo=timezone.utc)
+    ex = Exchange(
+        began=began,
+        ended=utcnow(),
+        seconds=max(0.0, time.monotonic() - mono),
+        server_now=server_now,
+        replayed=is_replay(headers),
+    )
+    return ex
+
+
+def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
+    """Where hours from now may land, as the platform turned them into a time.
+
+    By the platform's clock when the answer says what it is: it computed the
+    time between the request's arrival and its ``Date`` stamp, both to the
+    second, so within :data:`_DATE_SLACK` of ``Date`` plus the hours, and
+    earlier by at most however long the request took. The
+    client's clock is not trusted for this — it may be minutes out — and is
+    used only when there is no ``Date``, widened by :data:`_NO_DATE_SLACK`
+    either way.
+
+    A replay (``Idempotent-Replayed``) is the first call's answer, measured
+    from whenever that call was sent, which this SDK does not know. So it is
+    held to the upper bound alone — not later than hours from now — and no
+    lower bound is established: a replayed relative time is only confirmed
+    to be no later than asked.
+    """
+    span = timedelta(hours=hours)
+    if ex.server_now is not None:
+        low = ex.server_now + span - timedelta(seconds=ex.seconds) - _DATE_SLACK
+        high = ex.server_now + span + _DATE_SLACK
+    else:
+        low = ex.began + span - _MOMENT_SLACK - _NO_DATE_SLACK
+        high = ex.ended + span + _HOURS_SLACK + _NO_DATE_SLACK
+    if ex.replayed:
+        low = datetime.min.replace(tzinfo=timezone.utc)
+        if ex.server_now is None:
+            high += _REPLAY_NO_DATE_SLACK
+    return low, high
+
+
+def _end_time_window(body: Mapping[str, Any], ex: Exchange) -> tuple[datetime, datetime] | None:
+    """Where an answered end time must fall to be the one asked for.
+
+    A time is stored to the second, so it comes back as the request truncated,
+    give or take one — exactly, whatever any clock says. Hours go through
+    :func:`_relative_window`. ``None``: nothing to compare against.
+    """
+    at = body.get("ends_at")
+    if isinstance(at, str):
+        asked = _moment(at).replace(microsecond=0)
+        return asked - _MOMENT_SLACK, asked + _MOMENT_SLACK
+    hours = body.get("ends_in_hours")
+    if hours is not None:
+        return _relative_window(hours, ex)
+    return None
+
+
+def wants_end_time(body: Mapping[str, Any]) -> bool:
+    """Whether a create or PATCH body asks for an end time."""
+    return body.get("ends_at") is not None or body.get("ends_in_hours") is not None
+
+
+def end_time_not_started(computer_id: str, status: str) -> MandalaError:
+    """The error for a launch that found its end-timed computer not running."""
+    return MandalaError(
+        f"{computer_id} is {status}, and launch does not start a computer created with an "
+        "end time: its end time may have passed and stopped it. Call start() if you still "
+        "want it running"
+    )
+
+
+def is_replay(headers: Mapping[str, str]) -> bool:
+    """Whether a keyed call's answer is the stored answer to an earlier call
+    (``Idempotent-Replayed: true``) rather than one measured against this one."""
+    return headers.get("idempotent-replayed", "").strip().lower() == "true"
+
+
+#: How long a compensating call may take — the revoke of a key minted without
+#: its limits. Its own budget, not the caller's: what it undoes is the very
+#: thing it exists to prevent.
+CLEANUP_TIMEOUT_SECONDS = 30.0
+
+
+def end_time_refusal(
+    computer_id: str,
+    body: Mapping[str, Any],
+    answered: object,
+    ex: Exchange,
+    *,
+    launching: bool = False,
+) -> MandalaError | None:
+    """The error to raise when an answer does not confirm the end time asked for.
+
+    ``answered`` is the ``ends_at`` the answer carried, unread; ``ex`` is the
+    request that asked.
+
+    A platform that predates end times ignores the fields it does not know and
+    answers as if they were never sent, so a computer meant to stop on its own
+    would run until somebody noticed. The answer is the only proof the setting
+    took, so its absence — or a value that is not the time asked for, such as
+    the one it had before — is a failure, never a deletion or a stop: the
+    computer is the caller's, and what to do with it is theirs to decide.
+
+    A create answered from its idempotency record is the first call's answer,
+    and that computer's end time may since have come and gone — the host
+    stopped it and cleared the setting. A launch must not then start it again:
+    that would leave a running computer with no end time at all.
+    """
+    replayed = ex.replayed
+    wanted = wants_end_time(body)
+    then = "so launch did not start it" if launching else "nothing was deleted or stopped"
+    if wanted and answered is None:
+        if replayed:
+            at = body.get("ends_at")
+            passed = isinstance(at, str) and _moment(at) <= utcnow()
+            why = (
+                "its end time has passed: the host has stopped it and cleared the setting"
+                if passed
+                else "its end time has most likely passed, or was never applied"
+            )
+            return MandalaError(
+                f"{computer_id}: this create was answered from an earlier request with the "
+                f"same idempotency key, and the computer has no end time — {why}; {then}"
+            )
+        return MandalaError(
+            f"{computer_id}: the end time was not applied — the server answered without "
+            f"ends_at, so it may not support end times; {then}"
+        )
+    if wanted:
+        try:
+            got = _moment(answered) if isinstance(answered, str) else None
+        except ValueError:
+            got = None
+        if got is None:
+            return MandalaError(
+                f"{computer_id}: the end time was not applied — the server answered an "
+                f"unreadable ends_at {answered!r}; {then}"
+            )
+        window = _end_time_window(body, ex)
+        if window is not None and not window[0] <= got <= window[1]:
+            return MandalaError(
+                f"{computer_id}: the end time was not applied — the server answers ends_at "
+                f"{answered}, not the time asked for; {then}"
+            )
+        return None
+    if "ends_at" in body and answered is not None:
+        return MandalaError(
+            f"{computer_id}: the end time was not cleared — the server still answers "
+            f"ends_at {answered!r}"
+        )
+    return None
+
+
+def key_limits_unapplied(
+    body: Mapping[str, Any],
+    expires_by: datetime | None,
+    expires_at: str | None,
+    computer_ids: Sequence[str] | None,
+) -> str | None:
+    """What a minted key's answer fails to confirm of the limits asked for, or ``None``.
+
+    A platform that predates key limits ignores the fields it does not know and
+    mints a key that never expires and reaches every computer — the opposite of
+    what was asked, and a key is a credential. ``expires_by`` is the latest
+    the expiry asked for may come back as.
+    """
+    problems = []
+    if expires_by is not None:
+        try:
+            at = None if expires_at is None else _moment(expires_at)
+        except ValueError:
+            at = None
+        if at is None:
+            problems.append("it has no expiry")
+        elif at > expires_by:
+            problems.append(f"it expires at {expires_at}, later than asked")
+    asked = body.get("computer_ids")
+    if asked is not None:
+        if computer_ids is None:
+            problems.append("it is not confined to the computers named")
+        elif not set(computer_ids) <= set(asked):
+            problems.append("it reaches computers that were not named")
+    return "; ".join(problems) or None
+
+
+def minted_key(
+    body: Mapping[str, Any], data: Mapping[str, Any], ex: Exchange
+) -> tuple[ApiKeyCreated | None, str | None, str | None]:
+    """A mint's answer read against what was asked: ``(key, id, problem)``.
+
+    With no problem, ``key`` is the key to hand back. With one, ``key`` is
+    ``None`` — a key minted without the limits asked for is never returned —
+    and ``id`` is what to revoke, when the answer named one.
+    """
+    from ._models import ApiKeyCreated  # a cycle at import time; not at call time
+
+    limited = any(
+        body.get(k) is not None for k in ("expires_at", "expires_in_hours", "computer_ids")
+    )
+    if not limited:
+        return ApiKeyCreated.from_api(data), None, None
+    # The id first, before anything that can fail: whatever goes wrong after
+    # this, the key exists, and this is what revokes it.
+    raw_id = data.get("id") if isinstance(data, Mapping) else None
+    key_id = raw_id if isinstance(raw_id, str) and raw_id.startswith("key-") else None
+    try:
+        created = ApiKeyCreated.from_api(data)
+    except MandalaError as e:
+        return None, key_id, f"its answer could not be read: {e}"
+    try:
+        expires_by: datetime | None = None
+        if isinstance(body.get("expires_at"), str):
+            expires_by = _moment(body["expires_at"]) + _MOMENT_SLACK
+        elif body.get("expires_in_hours") is not None:
+            expires_by = _relative_window(body["expires_in_hours"], ex)[1]
+        problem = key_limits_unapplied(body, expires_by, created.expires_at, created.computer_ids)
+    except Exception as e:  # noqa: BLE001 — any failure to check is a failure to confirm
+        return None, created.id, f"its answer could not be checked ({type(e).__name__})"
+    if problem is not None:
+        return None, created.id, problem
+    return created, None, None
+
+
+def key_limits_refusal(key_id: str | None, problem: str, revoked: bool | None) -> MandalaError:
+    """The error for a key minted without the limits asked for. Never the key itself."""
+    if revoked:
+        fate = f"the new key {key_id} has been revoked"
+    elif key_id is None:
+        fate = "the answer did not name the new key, so it could not be revoked: list your keys"
+    else:
+        fate = f"revoking the new key {key_id} FAILED — revoke it with api_keys.revoke({key_id!r})"
+    return MandalaError(
+        f"POST api-keys: the server did not apply the requested limits ({problem}); "
+        f"it may not support them. {fate}"
+    )
 
 
 _BROWSER_PROXY_KEYS = frozenset({"server", "bypass", "credentials_secret_id"})
@@ -3040,8 +3414,16 @@ def operations_params(
     return params or None
 
 
-def api_key_body(name: object, workspace_id: object) -> dict[str, Any]:
-    """``POST api-keys``: a label and a workspace, each only when given.
+def api_key_body(
+    name: object,
+    workspace_id: object,
+    *,
+    expires_at: object = None,
+    expires_in_hours: object = None,
+    computer_ids: object = None,
+) -> dict[str, Any]:
+    """``POST api-keys``: a label, a workspace, an expiry and a computer list,
+    each only when given.
 
     Never ``manage_keys``: the platform refuses ``true`` from every API key
     (403) and grants the permission only from a dashboard session, so there is
@@ -3060,7 +3442,32 @@ def api_key_body(name: object, workspace_id: object) -> dict[str, Any]:
                 "omit it for a key in your own scope"
             )
         body["workspace_id"] = ws
+    body.update(end_time_fields(expires_at, expires_in_hours, "expires_at", "expires_in_hours"))
+    if computer_ids is not None:
+        body["computer_ids"] = _computer_id_list(computer_ids)
     return body
+
+
+def _computer_id_list(value: object) -> list[str]:
+    """The computers a key is confined to: a real list of ids, never empty.
+
+    A bare string is a sequence of characters and would go out as one id per
+    letter; an empty list would confine the key to nothing, which the platform
+    refuses. How many may be named is the platform's rule.
+    """
+    if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, (list, tuple)):
+        raise ValueError(  # noqa: TRY004
+            f"computer_ids must be a list of computer ids, not {type(value).__name__}"
+        )
+    if not value:
+        raise ValueError("computer_ids must name at least one computer; omit it for any computer")
+    ids = []
+    for i, entry in enumerate(value):
+        cid = canonical(entry, f"computer_ids[{i}]")
+        if not cid.strip() or cid != cid.strip():
+            raise ValueError(f"computer_ids[{i}] must be a computer id, with no spaces around it")
+        ids.append(cid)
+    return ids
 
 
 def computer_ssh(computer_id: str) -> str:

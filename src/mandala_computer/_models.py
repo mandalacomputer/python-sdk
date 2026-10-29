@@ -4968,6 +4968,17 @@ def _nullable_text(d: Mapping[str, Any], key: str, where: str) -> str | None:
     return str.__str__(value)
 
 
+def _nullable_ids(d: Mapping[str, Any], key: str, where: str) -> tuple[str, ...] | None:
+    """A list of ids, or null. A confinement this cannot read is refused rather
+    than reported as none: ``None`` here means the key reaches everything."""
+    value = d.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise MandalaError(f"{where}: {key} is neither a list of ids nor null")
+    return tuple(str.__str__(v) for v in value)
+
+
 @dataclass(frozen=True)
 class ApiKey:
     """One API key, as the platform lists it — never the key itself.
@@ -4999,6 +5010,12 @@ class ApiKey:
     #: this is how to find them. Keyword-only at the end because this class is
     #: exported and its field order is its constructor.
     minted_by_key_id: str | None = field(default=None, kw_only=True)
+    #: When it stops working (RFC 3339); ``None`` for a key that does not
+    #: expire, and from a platform too old to send it.
+    expires_at: str | None = field(default=None, kw_only=True)
+    #: The only computers it may reach; ``None`` for a key that reaches every
+    #: computer in its scope, and from a platform too old to send it.
+    computer_ids: tuple[str, ...] | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "API key") -> ApiKey:
@@ -5025,6 +5042,8 @@ class ApiKey:
             manage_keys=manage,
             raw=dict(d),
             minted_by_key_id=_nullable_text(d, "minted_by_key_id", where),
+            expires_at=_nullable_text(d, "expires_at", where),
+            computer_ids=_nullable_ids(d, "computer_ids", where),
         )
 
 
