@@ -1601,9 +1601,25 @@ class AsyncApiKeys:
             return created
         revoked: bool | None = None
         if key_id is not None:
+            # Shielded: a caller cancelling now (a timeout around this call,
+            # say) must not also cancel the revoke and leave the key working.
+            # The cancellation still reaches the caller; the revoke finishes.
+            revoke = asyncio.ensure_future(
+                self._t.request(
+                    "DELETE",
+                    _api.api_key(key_id),
+                    timeout=_api.REVOKE_TIMEOUT_SECONDS,
+                    timeout_cap=_api.REVOKE_TIMEOUT_SECONDS,
+                )
+            )
+            # Read its outcome even when nobody is left waiting for it, so a
+            # failure after a cancellation is not reported as never retrieved.
+            revoke.add_done_callback(lambda t: t.cancelled() or t.exception())
             try:
-                await self._t.request("DELETE", _api.api_key(key_id))
+                await asyncio.shield(revoke)
                 revoked = True
+            except asyncio.CancelledError:
+                raise
             except Exception:  # noqa: BLE001 — best effort; the error below says it failed
                 revoked = False
         raise _api.key_limits_refusal(key_id, problem or "", revoked)

@@ -1342,18 +1342,35 @@ def _end_time_window(
     while the request is in flight: no earlier than the hours from when it was
     sent (less a second of truncation), no later than from when its answer
     arrived (plus a minute for clocks that disagree). A replayed answer was
-    measured against a request sent who knows when, so hours cannot be held to
-    a window then, and ``None`` asks only for a readable time.
+    measured against a request sent some time before, so for hours it is held
+    to the upper bound alone. ``None``: nothing to compare against.
     """
     at = body.get("ends_at")
     if isinstance(at, str):
         asked = _moment(at).replace(microsecond=0)
         return asked - _MOMENT_SLACK, asked + _MOMENT_SLACK
     hours = body.get("ends_in_hours")
-    if hours is not None and not replayed:
+    if hours is not None:
         span = timedelta(hours=hours)
-        return began + span - _MOMENT_SLACK, ended + span + _HOURS_SLACK
+        latest = ended + span + _HOURS_SLACK
+        # A replay was measured from the first request, sent some time ago:
+        # its end time can only be EARLIER than this one's would be.
+        return (
+            datetime.min.replace(tzinfo=timezone.utc) if replayed else began + span - _MOMENT_SLACK
+        ), latest
     return None
+
+
+def is_replay(headers: Mapping[str, str]) -> bool:
+    """Whether a keyed call's answer is the stored answer to an earlier call
+    (``Idempotent-Replayed: true``) rather than one measured against this one."""
+    return headers.get("idempotent-replayed", "").strip().lower() == "true"
+
+
+#: How long the revoke of a key minted without its limits may take. Its own
+#: budget, not the caller's: a key nobody holds and nobody revoked is the very
+#: thing this cleanup exists to prevent.
+REVOKE_TIMEOUT_SECONDS = 30.0
 
 
 def end_time_refusal(

@@ -4,6 +4,7 @@ the ``mandala-py`` commands on top of them: ``whoami``, ``api-keys``,
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -942,4 +943,42 @@ async def test_the_async_mint_revokes_the_same(
         await aclient.api_keys.create(**asked)
     assert problem in str(caught.value)
     assert API_KEY_CREATED["raw"] not in str(caught.value)
+    assert revoke.call_count == 1
+
+
+@respx.mock
+def test_the_revoke_has_its_own_bounded_budget() -> None:
+    """However patient the caller's client, the compensating revoke is capped."""
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    patient = mc.Client("com_test", base_url=BASE, timeout=3600)
+    with pytest.raises(mc.MandalaError, match="has been revoked"):
+        patient.api_keys.create(expires_in_hours=1)
+    sent = revoke.calls.last.request.extensions["timeout"]
+    assert all(v is not None and v <= 30 for v in sent.values())
+
+
+@respx.mock
+async def test_cancelling_the_async_mint_does_not_cancel_its_revoke() -> None:
+    """A caller's cancellation (a timeout around the call, say) reaches the
+    caller, but the revoke of the key it would have stranded still finishes."""
+    started, finished = asyncio.Event(), asyncio.Event()
+
+    async def slow_revoke(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.set()
+        return httpx.Response(200, json={"ok": True})
+
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(side_effect=slow_revoke)
+    aclient = mc.AsyncClient("com_test", base_url=BASE)
+    mint = asyncio.ensure_future(aclient.api_keys.create(expires_in_hours=1))
+    await asyncio.wait_for(started.wait(), 5)
+    mint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await mint
+    await asyncio.wait_for(finished.wait(), 5)
     assert revoke.call_count == 1

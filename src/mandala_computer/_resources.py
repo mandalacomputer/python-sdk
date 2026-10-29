@@ -185,7 +185,7 @@ def _replayed(headers: Mapping[str, str]) -> bool:
     The platform marks a replay with ``Idempotent-Replayed: true``. Everything in
     such a body describes the first attempt, up to 24 hours ago, not now.
     """
-    return headers.get("idempotent-replayed", "").strip().lower() == "true"
+    return _api.is_replay(headers)
 
 
 def _launch_start_admitted(data: Mapping[str, Any]) -> bool:
@@ -2458,7 +2458,12 @@ class ApiKeys:
         revoked: bool | None = None
         if key_id is not None:
             try:
-                self._t.request("DELETE", _api.api_key(key_id))
+                self._t.request(
+                    "DELETE",
+                    _api.api_key(key_id),
+                    timeout=_api.REVOKE_TIMEOUT_SECONDS,
+                    timeout_cap=_api.REVOKE_TIMEOUT_SECONDS,
+                )
                 revoked = True
             except Exception:  # noqa: BLE001 — best effort; the error below says it failed
                 revoked = False

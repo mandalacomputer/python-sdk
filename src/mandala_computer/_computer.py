@@ -1663,6 +1663,9 @@ class ComputerFields:
     # answers an acknowledgement is followed by a refresh that replaces
     # ``_data``.
     _operation_id: str | None = None
+    #: Whether the last PATCH was answered from its idempotency record — the
+    #: first call's answer, not one measured against this request.
+    _patch_replayed: bool = False
 
     def _note_clone_answer(self, data: Mapping[str, Any]) -> None:
         self._memory_dropped = data.get("memory_dropped") is True
@@ -2824,14 +2827,14 @@ class Computer(ComputerFields):
         as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
         rather than leaving this handle holding a record with no id.
         """
-        data = _api.computer_payload(
-            self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=body,
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        answer, headers = self._t.json_object_with_headers(
+            "PATCH",
+            _api.computer(self.id),
+            json=body,
+            headers=_api.idempotency_headers(idempotency_key),
         )
+        self._patch_replayed = _api.is_replay(headers)
+        data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):
             self._data = data
@@ -3239,7 +3242,12 @@ class Computer(ComputerFields):
         began = _api.utcnow()
         updated = self._patch("set_end_time", body, idempotency_key)
         refusal = _api.end_time_refusal(
-            self.id, body, self._data.get("ends_at"), began, _api.utcnow()
+            self.id,
+            body,
+            self._data.get("ends_at"),
+            began,
+            _api.utcnow(),
+            replayed=self._patch_replayed,
         )
         if refusal is not None:
             raise refusal

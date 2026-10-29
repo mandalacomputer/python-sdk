@@ -239,14 +239,14 @@ class AsyncComputer(ComputerFields):
         as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
         rather than leaving this handle holding a record with no id.
         """
-        data = _api.computer_payload(
-            await self._t.json_object(
-                "PATCH",
-                _api.computer(self.id),
-                json=body,
-                headers=_api.idempotency_headers(idempotency_key),
-            )
+        answer, headers = await self._t.json_object_with_headers(
+            "PATCH",
+            _api.computer(self.id),
+            json=body,
+            headers=_api.idempotency_headers(idempotency_key),
         )
+        self._patch_replayed = _api.is_replay(headers)
+        data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):
             self._data = data
@@ -663,7 +663,12 @@ class AsyncComputer(ComputerFields):
         began = _api.utcnow()
         updated = await self._patch("set_end_time", body, idempotency_key)
         refusal = _api.end_time_refusal(
-            self.id, body, self._data.get("ends_at"), began, _api.utcnow()
+            self.id,
+            body,
+            self._data.get("ends_at"),
+            began,
+            _api.utcnow(),
+            replayed=self._patch_replayed,
         )
         if refusal is not None:
             raise refusal

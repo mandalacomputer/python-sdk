@@ -328,3 +328,66 @@ async def test_an_async_replayed_launch_after_its_end_time_is_not_started_again(
         await client.computers.launch(template="base", idempotency_key="order-1", **kwargs)
     assert read.called
     assert not start.called
+
+
+# --- a replayed relative update ----------------------------------------------
+#
+# Resent under the same key, a set_end_time(ends_in_hours=...) is answered with
+# the FIRST call's stored answer: hours from then, a little earlier than hours
+# from now. It is held to the upper bound alone.
+
+
+def replayed_patch(ends_at: str, replayed: bool) -> None:
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.patch(f"{BASE}/computers/vm-1").mock(
+        httpx.Response(
+            200,
+            json={**COMPUTER, "ends_at": ends_at},
+            headers={"Idempotent-Replayed": "true"} if replayed else {},
+        )
+    )
+
+
+def hours_from(seconds_ago: float, hours: float) -> str:
+    then = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    return (then + timedelta(hours=hours)).isoformat()
+
+
+@respx.mock
+def test_a_replayed_relative_update_from_seconds_ago_is_accepted() -> None:
+    replayed_patch(hours_from(8, 2), replayed=True)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    c.set_end_time(ends_in_hours=2, idempotency_key="move-1")
+    assert c.ends_at is not None
+
+
+@respx.mock
+def test_the_same_answer_not_marked_a_replay_is_refused() -> None:
+    replayed_patch(hours_from(8, 2), replayed=False)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=2)
+
+
+@respx.mock
+def test_a_replayed_relative_update_past_the_upper_bound_is_refused() -> None:
+    replayed_patch(hours_from(-600, 2), replayed=True)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=2, idempotency_key="move-1")
+
+
+@respx.mock
+async def test_an_async_replayed_relative_update_from_seconds_ago_is_accepted() -> None:
+    replayed_patch(hours_from(8, 2), replayed=True)
+    c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
+    await c.set_end_time(ends_in_hours=2, idempotency_key="move-1")
+    assert c.ends_at is not None
+
+
+@respx.mock
+async def test_an_async_unmarked_or_too_late_answer_is_refused() -> None:
+    replayed_patch(hours_from(8, 2), replayed=False)
+    c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        await c.set_end_time(ends_in_hours=2)
