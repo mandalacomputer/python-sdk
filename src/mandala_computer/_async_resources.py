@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import time
-from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
@@ -157,27 +157,6 @@ __all__ = [
     "AsyncWebhooks",
     "AsyncWorkspaces",
 ]
-
-
-async def _cleanup(call: Awaitable[Any]) -> bool:
-    """Run a compensating call to its end, whatever happens to the caller.
-
-    Shielded: a caller cancelling now (a timeout around the call that needed
-    undoing, say) must not also cancel the undoing. The cancellation still
-    reaches the caller; the cleanup finishes on its own budget. ``False`` when
-    it failed, which the error that follows says.
-    """
-    task = asyncio.ensure_future(call)
-    # Read its outcome even when nobody is left waiting for it, so a failure
-    # after a cancellation is not reported as never retrieved.
-    task.add_done_callback(lambda t: t.cancelled() or t.exception())
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
-        return False
-    return True
 
 
 class AsyncComputers:
@@ -391,7 +370,10 @@ class AsyncComputers:
         :class:`~mandala_computer.MandalaError` naming the computer, which is
         left as it is, not deleted or stopped. A create resent under an
         idempotency key after its end time has passed answers the first call's
-        computer, now stopped with no end time, and raises the same way.
+        computer, now stopped with no end time, and raises the same way. A
+        replayed ``ends_in_hours`` answer was measured from the first call,
+        whenever that was sent, so it is only confirmed to be no later than
+        hours from now.
 
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
@@ -432,13 +414,12 @@ class AsyncComputers:
         """:meth:`create`, also saying how the request went: when, by
         which clocks, and whether the answer replayed an earlier call's."""
         sent = _api.idempotency_headers(idempotency_key)
-        remember = _api.timing_key("POST computers", body, sent)
-        start = _api.exchange_start(remember)
+        start = _api.exchange_start()
         data, headers = await self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=sent
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return AsyncComputer(self._t, record), _api.exchange_end(start, headers, remember)
+        return AsyncComputer(self._t, record), _api.exchange_end(start, headers)
 
     async def launch(
         self,
@@ -1626,15 +1607,40 @@ class AsyncApiKeys:
             return created
         revoked: bool | None = None
         if key_id is not None:
-            revoked = await _cleanup(
-                self._t.request(
-                    "DELETE",
-                    _api.api_key(key_id),
-                    timeout=_api.CLEANUP_TIMEOUT_SECONDS,
-                    timeout_cap=_api.CLEANUP_TIMEOUT_SECONDS,
-                )
-            )
+            revoked = await self._revoke_to_the_end(key_id)
         raise _api.key_limits_refusal(key_id, problem or "", revoked)
+
+    async def _revoke_to_the_end(self, key_id: str) -> bool:
+        """Revoke a key minted without its limits, whatever happens to the caller.
+
+        In this task, not a detached one: a task left to finish on its own is
+        cancelled with the rest when the loop shuts down — ``asyncio.run``
+        returning, say — and the key it was revoking keeps working. So a
+        cancellation is held until the revoke is done (an interrupted DELETE
+        is sent again, and a 404 then means the first one landed), within a
+        budget of its own, and raised after. ``False`` when it failed.
+        """
+        deadline = time.monotonic() + _api.CLEANUP_TIMEOUT_SECONDS
+        held: asyncio.CancelledError | None = None
+        revoked = False
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                await self._t.request(
+                    "DELETE", _api.api_key(key_id), timeout=left, timeout_cap=left
+                )
+            except asyncio.CancelledError as cancelled:
+                held = held or cancelled
+                continue
+            except NotFoundError:
+                revoked = held is not None
+            except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
+                revoked = False
+            else:
+                revoked = True
+            break
+        if held is not None:
+            raise held
+        return revoked
 
     async def revoke(self, key_id: str) -> None:
         await self._t.request("DELETE", _api.api_key(key_id))

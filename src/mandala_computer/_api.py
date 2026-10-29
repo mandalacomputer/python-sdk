@@ -12,14 +12,11 @@ import ipaddress
 import math
 import re
 import shlex
-import threading
 import time
 import urllib.parse
 import uuid
-from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from dataclasses import replace as _with_fields
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -1328,9 +1325,9 @@ def utcnow() -> datetime:
 #: Without the server's own clock to go by, a relative time is held to the
 #: client's, widened by this much either way for a clock set wrong.
 _NO_DATE_SLACK = timedelta(minutes=10)
-#: How long, past its send, a request whose answer was lost may have been
-#: carried out — its upper bound when a replay is judged by it.
-_LOST_ANSWER_SLACK = timedelta(minutes=2)
+#: A replay without a ``Date`` is held to the client's clock, which reads it a
+#: little after the platform measured it: a few seconds more for that.
+_REPLAY_NO_DATE_SLACK = timedelta(seconds=10)
 
 
 @dataclass(frozen=True)
@@ -1348,84 +1345,16 @@ class Exchange:
     seconds: float
     server_now: datetime | None = None
     replayed: bool = False
-    #: On a replay, the first request's own exchange, when this process sent
-    #: it and still remembers it (see :func:`exchange_end`); else ``None``.
-    original: Exchange | None = None
-    #: ``False`` for the record of a request sent and never answered — its
-    #: answer lost on the way back — which is all a replay of it can be held to.
-    answered: bool = True
-    #: Set on the record of a key whose first answer here was itself a replay:
-    #: the original was sent elsewhere, at a time this process cannot know.
-    unknown_origin: bool = False
 
 
-def exchange_start(remember: tuple[str, str] | None = None) -> tuple[datetime, float]:
-    """The moment a request goes out, by both clocks; :func:`exchange_end` takes it.
-
-    With ``remember`` (see :func:`exchange_end`), the FIRST send under that key
-    is noted before it goes, so that a replay after an answer lost on the way
-    back is still held to when it was sent. A resend does not move it.
-    """
-    began = utcnow()
-    if remember is not None and _timing(remember) is None:
-        _timing(remember, Exchange(began=began, ended=began, seconds=0.0, answered=False))
-    return began, time.monotonic()
+def exchange_start() -> tuple[datetime, float]:
+    """The moment a request goes out, by both clocks; :func:`exchange_end` takes it."""
+    return utcnow(), time.monotonic()
 
 
-#: The timing of keyed requests that asked for relative times, by
-#: ``(route, idempotency key)``, so a replay of one can be judged by when the
-#: FIRST was sent rather than by now. In this process only, at most
-#: :data:`_TIMINGS_MAX` of them, each for :data:`_TIMINGS_TTL` seconds.
-_TIMINGS: OrderedDict[tuple[str, str], tuple[float, Exchange]] = OrderedDict()
-_TIMINGS_LOCK = threading.Lock()
-_TIMINGS_MAX = 256
-_TIMINGS_TTL = 3600.0
-
-
-def _timing(key: tuple[str, str], ex: Exchange | None = None) -> Exchange | None:
-    """Remember ``ex`` under ``key``, or (without one) recall what was."""
-    now = time.monotonic()
-    with _TIMINGS_LOCK:
-        while _TIMINGS and now - next(iter(_TIMINGS.values()))[0] > _TIMINGS_TTL:
-            _TIMINGS.popitem(last=False)
-        if ex is not None:
-            _TIMINGS[key] = (now, ex)
-            _TIMINGS.move_to_end(key)
-            while len(_TIMINGS) > _TIMINGS_MAX:
-                _TIMINGS.popitem(last=False)
-            return ex
-        entry = _TIMINGS.get(key)
-        return None if entry is None else entry[1]
-
-
-def timing_key(
-    route: str, body: Mapping[str, Any], sent: Mapping[str, str]
-) -> tuple[str, str] | None:
-    """What :func:`exchange_end` remembers a request by: only one asking for
-    a relative end time needs it, so only such a request is remembered."""
-    if body.get("ends_in_hours") is None:
-        return None
-    return route, sent[IDEMPOTENCY_KEY_HEADER]
-
-
-def exchange_end(
-    start: tuple[datetime, float],
-    headers: Mapping[str, str],
-    remember: tuple[str, str] | None = None,
-) -> Exchange:
+def exchange_end(start: tuple[datetime, float], headers: Mapping[str, str]) -> Exchange:
     """The :class:`Exchange` a request made, from :func:`exchange_start` and the
-    answer's headers.
-
-    ``remember`` — ``(route, idempotency key)`` — keeps the timing of a request
-    that asked for a relative time, and attaches it as ``original`` to a later
-    replay under the same key, whose answer was measured from that first
-    request. The first exchange's timing is what is kept: a replay never
-    replaces it, so the window a replay is held to does not grow with the
-    delay before it. A replay this process has no timing for (another process
-    sent the first, or it has been forgotten) is held to the upper bound alone,
-    and so is every later one under that key: the record says its origin is
-    unknown, and no retry of this process's is taken for the original.
-    """
+    answer's headers."""
     began, mono = start
     server_now: datetime | None
     try:
@@ -1441,21 +1370,7 @@ def exchange_end(
         server_now=server_now,
         replayed=is_replay(headers),
     )
-    if remember is None:
-        return ex
-    if not ex.replayed:
-        return _timing(remember, ex) or ex
-    original = _timing(remember)
-    if original is not None and not original.answered and original.began == began:
-        # The record is this very send's, and its answer is a replay: the first
-        # was not ours (another process, or forgotten), so its timing is
-        # unknown — and stays so. Marked rather than dropped, so that no later
-        # send of this process is ever taken for the original.
-        _timing(remember, _with_fields(original, unknown_origin=True))
-        return ex
-    if original is None or original.unknown_origin:
-        return ex
-    return _with_fields(ex, original=original)
+    return ex
 
 
 def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
@@ -1465,20 +1380,15 @@ def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
     give or take a minute, and earlier by however long the request took. The
     client's clock is not trusted for this — it may be minutes out — and is
     used only when there is no ``Date``, widened by :data:`_NO_DATE_SLACK`
-    either way. A replay was measured from the first request: judged by that
-    request's timing when this process remembers it, and otherwise held to the
-    upper bound alone, since it was sent some time before.
+    either way.
+
+    A replay (``Idempotent-Replayed``) is the first call's answer, measured
+    from whenever that call was sent, which this SDK does not know. So it is
+    held to the upper bound alone — not later than hours from now — and no
+    lower bound is established: a replayed relative time is only confirmed
+    to be no later than asked.
     """
-    if ex.replayed and ex.original is not None:
-        return _relative_window(hours, ex.original)
     span = timedelta(hours=hours)
-    if not ex.answered:
-        # Sent and never answered: from when it went, by this clock, to that
-        # plus the hours, a minute, and two more for the trip it never finished.
-        return (
-            ex.began + span - _HOURS_SLACK,
-            ex.began + span + _HOURS_SLACK + _LOST_ANSWER_SLACK,
-        )
     if ex.server_now is not None:
         low = ex.server_now + span - _HOURS_SLACK - timedelta(seconds=ex.seconds)
         high = ex.server_now + span + _HOURS_SLACK
@@ -1487,6 +1397,8 @@ def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
         high = ex.ended + span + _HOURS_SLACK + _NO_DATE_SLACK
     if ex.replayed:
         low = datetime.min.replace(tzinfo=timezone.utc)
+        if ex.server_now is None:
+            high += _REPLAY_NO_DATE_SLACK
     return low, high
 
 

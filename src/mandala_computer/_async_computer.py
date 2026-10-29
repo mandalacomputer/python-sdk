@@ -240,12 +240,11 @@ class AsyncComputer(ComputerFields):
         rather than leaving this handle holding a record with no id.
         """
         sent = _api.idempotency_headers(idempotency_key)
-        remember = _api.timing_key(f"PATCH computers/{self.id}", body, sent)
-        start = _api.exchange_start(remember)
+        start = _api.exchange_start()
         answer, headers = await self._t.json_object_with_headers(
             "PATCH", _api.computer(self.id), json=body, headers=sent
         )
-        self._patch_exchange = _api.exchange_end(start, headers, remember)
+        self._patch_exchange = _api.exchange_end(start, headers)
         data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):
@@ -660,9 +659,9 @@ class AsyncComputer(ComputerFields):
         computer. Nothing is stopped or deleted.
 
         Resent under the same ``idempotency_key``, the answer is the first
-        call's, and ``ends_in_hours`` is judged by when that call was sent —
-        known when this process sent it within the last hour; otherwise the
-        answer is only checked not to be later than hours from now.
+        call's, measured from whenever that was sent. For ``ends_in_hours`` it
+        is then only confirmed to be no later than hours from now: an earlier
+        end time from that first call is accepted as it is.
         """
         body = _api.end_time_body(ends_at, ends_in_hours)
         updated = await self._patch("set_end_time", body, idempotency_key)

@@ -410,7 +410,10 @@ class Computers:
         :class:`~mandala_computer.MandalaError` naming the computer, which is
         left as it is, not deleted or stopped. A create resent under an
         idempotency key after its end time has passed answers the first call's
-        computer, now stopped with no end time, and raises the same way.
+        computer, now stopped with no end time, and raises the same way. A
+        replayed ``ends_in_hours`` answer was measured from the first call,
+        whenever that was sent, so it is only confirmed to be no later than
+        hours from now.
 
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`Computer.wait_for_guest`.
@@ -451,13 +454,12 @@ class Computers:
         """:meth:`create`, also saying how the request went: when, by
         which clocks, and whether the answer replayed an earlier call's."""
         sent = _api.idempotency_headers(idempotency_key)
-        remember = _api.timing_key("POST computers", body, sent)
-        start = _api.exchange_start(remember)
+        start = _api.exchange_start()
         data, headers = self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=sent
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return Computer(self._t, record), _api.exchange_end(start, headers, remember)
+        return Computer(self._t, record), _api.exchange_end(start, headers)
 
     def launch(
         self,

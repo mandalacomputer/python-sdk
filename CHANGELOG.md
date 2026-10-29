@@ -31,7 +31,10 @@ This is the summary you read to decide whether to upgrade.
   never starts a computer it finds stopped or suspended: it raises, naming it,
   and `start()` is yours to call. Relative times
   (`ends_in_hours`, `expires_in_hours`) are checked against the server's clock
-  (its `Date` header), so a client clock set wrong does not fail them.
+  (its `Date` header), so a client clock set wrong does not fail them. A
+  replayed answer to a call resent under the same idempotency key was measured
+  from the first call, whenever that was sent: its `ends_in_hours` end time is
+  only confirmed to be no later than hours from now.
 - Expiring and computer-limited API keys. `api_keys.create(...)` takes
   `expires_at=` or `expires_in_hours=` (at most 366 days / 8784 hours) and
   `computer_ids=[...]` (1 to 50 computers the key is confined to). `ApiKey` and
@@ -41,7 +44,9 @@ This is the summary you read to decide whether to upgrade.
   `computer_ids` raises `ValueError` before any request. A mint whose answer
   does not confirm the limits asked for (no expiry or a later one, no
   confinement or a wider one) is revoked and never returned: `create` raises
-  `MandalaError` naming the key id and whether the revoke succeeded.
+  `MandalaError` naming the key id and whether the revoke succeeded. The revoke
+  has its own time limit and, on the async client, finishes even when the call
+  is cancelled, before the cancellation is raised.
 
 ## [0.20.0] - 2026-10-29
 

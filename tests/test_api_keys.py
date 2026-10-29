@@ -1034,3 +1034,33 @@ def test_an_expiry_later_by_the_servers_own_clock_is_refused(
     minting_server(timedelta(minutes=5))
     with pytest.raises(mc.MandalaError, match="later than asked"):
         client().api_keys.create(expires_in_hours=1)
+
+
+def test_a_cancelled_mint_finishes_its_revoke_before_the_loop_shuts_down() -> None:
+    """Cancelled during the revoke, and the loop torn down at once (as
+    ``asyncio.run`` returning does): the DELETE still completes."""
+    finished: list[bool] = []
+
+    async def slow_revoke(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        finished.append(True)
+        return httpx.Response(200, json={"ok": True})
+
+    async def main() -> None:
+        started = asyncio.Event()
+
+        async def revoke(request: httpx.Request) -> httpx.Response:
+            started.set()
+            return await slow_revoke(request)
+
+        respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(side_effect=revoke)
+        aclient = mc.AsyncClient("com_test", base_url=BASE)
+        mint = asyncio.ensure_future(aclient.api_keys.create(expires_in_hours=1))
+        await asyncio.wait_for(started.wait(), 5)
+        mint.cancel()
+        # Return at once: asyncio.run cancels what is left and shuts down.
+
+    with respx.mock:
+        respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+        asyncio.run(main())
+    assert finished == [True]
