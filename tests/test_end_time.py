@@ -621,3 +621,25 @@ def test_a_replay_five_seconds_past_the_upper_bound_is_refused() -> None:
     c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
     with pytest.raises(mc.MandalaError, match="not the time asked for"):
         c.set_end_time(ends_in_hours=1 / 60, idempotency_key="move-1")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"ends_at": "2026-11-31T12:00:00Z"}, "not a real date"),
+        ({"ends_in_hours": 8785}, "at most 8784"),
+        ({"ends_in_hours": 1e300}, "at most 8784"),
+    ],
+)
+async def test_an_end_time_that_cannot_be_a_time_is_refused_before_sending(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/computers")
+        with pytest.raises(ValueError, match=match):
+            mc.Client("com_test", base_url=BASE).computers.create(template="base", **kwargs)
+        with pytest.raises(ValueError, match=match):
+            await mc.AsyncClient("com_test", base_url=BASE).computers.create(
+                template="base", **kwargs
+            )
+        assert not route.called

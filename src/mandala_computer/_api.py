@@ -1262,11 +1262,30 @@ def create_body(
     return body
 
 
+#: The furthest ahead, in hours, an end time or a key's expiry may be set:
+#: 366 days. Checked here as well as by the platform so that a number too big
+#: to turn into a time never reaches the request, or the checks on its answer.
+MAX_HOURS_AHEAD = 366 * 24
+
+
 def _positive_hours(value: object, what: str) -> float:
     hours = real(value, what, message=f"{what} must be a number of hours, not {value!r}")
     if hours <= 0:
         raise ValueError(f"{what} must be more than 0, not {value!r}")
+    if hours > MAX_HOURS_AHEAD:
+        raise ValueError(f"{what} must be at most {MAX_HOURS_AHEAD} (366 days), not {value!r}")
     return hours
+
+
+def _real_stamp(value: object, what: str) -> str:
+    """:func:`_usage_stamp`, and a date that exists: the pattern alone lets
+    ``2026-11-31`` through, and a stamp nobody can read back is no deadline."""
+    text = _usage_stamp(value, what)
+    try:
+        _moment(text)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{what} is not a real date and time: {value!r}") from None
+    return text
 
 
 def end_time_fields(at: object, hours: object, at_key: str, hours_key: str) -> dict[str, Any]:
@@ -1286,7 +1305,7 @@ def end_time_fields(at: object, hours: object, at_key: str, hours_key: str) -> d
     if at is not None and hours is not None:
         raise ValueError(f"send {at_key} or {hours_key}, not both")
     if at is not None:
-        return {at_key: _usage_stamp(at, at_key)}
+        return {at_key: _real_stamp(at, at_key)}
     if hours is not None:
         return {hours_key: _positive_hours(hours, hours_key)}
     return {}
@@ -1563,21 +1582,28 @@ def minted_key(
     """
     from ._models import ApiKeyCreated  # a cycle at import time; not at call time
 
-    expires_by: datetime | None = None
-    if isinstance(body.get("expires_at"), str):
-        expires_by = _moment(body["expires_at"]) + _MOMENT_SLACK
-    elif body.get("expires_in_hours") is not None:
-        expires_by = _relative_window(body["expires_in_hours"], ex)[1]
-    limited = expires_by is not None or body.get("computer_ids") is not None
+    limited = any(
+        body.get(k) is not None for k in ("expires_at", "expires_in_hours", "computer_ids")
+    )
     if not limited:
         return ApiKeyCreated.from_api(data), None, None
+    # The id first, before anything that can fail: whatever goes wrong after
+    # this, the key exists, and this is what revokes it.
+    raw_id = data.get("id") if isinstance(data, Mapping) else None
+    key_id = raw_id if isinstance(raw_id, str) and raw_id.startswith("key-") else None
     try:
         created = ApiKeyCreated.from_api(data)
     except MandalaError as e:
-        raw_id = data.get("id") if isinstance(data, Mapping) else None
-        key_id = raw_id if isinstance(raw_id, str) and raw_id.startswith("key-") else None
         return None, key_id, f"its answer could not be read: {e}"
-    problem = key_limits_unapplied(body, expires_by, created.expires_at, created.computer_ids)
+    try:
+        expires_by: datetime | None = None
+        if isinstance(body.get("expires_at"), str):
+            expires_by = _moment(body["expires_at"]) + _MOMENT_SLACK
+        elif body.get("expires_in_hours") is not None:
+            expires_by = _relative_window(body["expires_in_hours"], ex)[1]
+        problem = key_limits_unapplied(body, expires_by, created.expires_at, created.computer_ids)
+    except Exception as e:  # noqa: BLE001 — any failure to check is a failure to confirm
+        return None, created.id, f"its answer could not be checked ({type(e).__name__})"
     if problem is not None:
         return None, created.id, problem
     return created, None, None

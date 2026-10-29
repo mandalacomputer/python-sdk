@@ -10,6 +10,8 @@ from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 
+import anyio
+
 from . import _api
 from ._agent import AgentMessage, AgentProvider
 from ._agent_records import AgentRun, AgentRunPage, AgentRunStatus, AgentThread, AgentThreadPage
@@ -1623,21 +1625,25 @@ class AsyncApiKeys:
         deadline = time.monotonic() + _api.CLEANUP_TIMEOUT_SECONDS
         held: asyncio.CancelledError | None = None
         revoked = False
-        while (left := deadline - time.monotonic()) > 0:
-            try:
-                await self._t.request(
-                    "DELETE", _api.api_key(key_id), timeout=left, timeout_cap=left
-                )
-            except asyncio.CancelledError as cancelled:
-                held = held or cancelled
-                continue
-            except NotFoundError:
-                revoked = held is not None
-            except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
-                revoked = False
-            else:
-                revoked = True
-            break
+        # Shielded from AnyIO cancellation too: a cancelled scope around the
+        # caller would otherwise cancel every await in here, again and again,
+        # until the budget ran out with the key still working.
+        with anyio.CancelScope(shield=True):
+            while (left := deadline - time.monotonic()) > 0:
+                try:
+                    await self._t.request(
+                        "DELETE", _api.api_key(key_id), timeout=left, timeout_cap=left
+                    )
+                except asyncio.CancelledError as cancelled:
+                    held = held or cancelled
+                    continue
+                except NotFoundError:
+                    revoked = held is not None
+                except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
+                    revoked = False
+                else:
+                    revoked = True
+                break
         if held is not None:
             raise held
         return revoked

@@ -19,8 +19,9 @@ This is the summary you read to decide whether to upgrade.
   `Computer.set_end_time(ends_at)` / `set_end_time(ends_in_hours=…)` sets or
   moves it on an existing computer, and `set_end_time(None)` clears it.
   `Computer.ends_at` reads it back (`None` when there is none). Sending both
-  forms, a naive `datetime`, a time without a zone or hours that are not a
-  positive number raises `ValueError` before any request. A host that cannot
+  forms, a naive `datetime`, a time without a zone or on a date that does not
+  exist, or hours that are not a positive number of at most 8784 (366 days)
+  raises `ValueError` before any request. A host that cannot
   keep end times answers `ConflictError` with reason `unsupported`. An answer
   that does not carry the end time asked for (none, a different or unreadable
   one, or one still there after a clear, as from a server too old to know end
@@ -41,12 +42,14 @@ This is the summary you read to decide whether to upgrade.
   `ApiKeyCreated`, and whoami's `key`, carry `expires_at` and `computer_ids`
   (`None` when the key has no such limit). An expired key is refused with
   `AuthenticationError` (`API key expired`). A bare string or an empty list for
-  `computer_ids` raises `ValueError` before any request. A mint whose answer
+  `computer_ids`, an `expires_at` on a date that does not exist, or
+  `expires_in_hours` above 8784 raises `ValueError` before any request. A mint whose answer
   does not confirm the limits asked for (no expiry or a later one, no
   confinement or a wider one) is revoked and never returned: `create` raises
   `MandalaError` naming the key id and whether the revoke succeeded. The revoke
   has its own time limit and, on the async client, finishes even when the call
-  is cancelled, before the cancellation is raised.
+  is cancelled (by asyncio or an AnyIO cancel scope), before the cancellation
+  is raised.
 
 ## [0.20.0] - 2026-10-29
 

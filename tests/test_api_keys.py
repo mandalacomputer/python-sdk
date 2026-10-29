@@ -13,6 +13,7 @@ from email.utils import format_datetime
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 import respx
@@ -1071,3 +1072,79 @@ def test_an_expiry_five_seconds_later_by_the_servers_date_is_refused() -> None:
     minting_server(timedelta(seconds=5))
     with pytest.raises(mc.MandalaError, match="later than asked"):
         client().api_keys.create(expires_in_hours=1 / 60)
+
+
+@respx.mock
+async def test_an_anyio_scope_cancelled_during_the_revoke_does_not_stop_it() -> None:
+    """AnyIO cancels every await in a cancelled scope, again and again: the
+    revoke runs shielded from that and completes."""
+    started = asyncio.Event()
+    finished: list[bool] = []
+
+    async def slow_revoke(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.append(True)
+        return httpx.Response(200, json={"ok": True})
+
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(side_effect=slow_revoke)
+    aclient = mc.AsyncClient("com_test", base_url=BASE)
+    errors: list[str] = []
+
+    async def mint() -> None:
+        try:
+            await aclient.api_keys.create(expires_in_hours=1)
+        except mc.MandalaError as e:
+            errors.append(str(e))
+
+    with anyio.fail_after(10):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(mint)
+            await started.wait()
+            tg.cancel_scope.cancel()
+    assert finished == [True]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"expires_at": "2026-11-31T12:00:00Z"}, "not a real date"),
+        ({"expires_at": "2026-02-30T00:00:00+01:00"}, "not a real date"),
+        ({"expires_in_hours": 8785}, "at most 8784"),
+        ({"expires_in_hours": 1e300}, "at most 8784"),
+    ],
+)
+async def test_limits_that_cannot_be_a_time_are_refused_before_minting(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/api-keys")
+        with pytest.raises(ValueError, match=match):
+            client().api_keys.create(**kwargs)
+        with pytest.raises(ValueError, match=match):
+            await mc.AsyncClient("com_test", base_url=BASE).api_keys.create(**kwargs)
+        assert not route.called
+
+
+def broken_check(*_: object) -> str | None:
+    raise OverflowError("date value out of range")
+
+
+@respx.mock
+async def test_a_failure_checking_the_answer_revokes_the_key_by_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mc._api, "key_limits_unapplied", broken_check)
+    respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
+    revoke = respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    with pytest.raises(mc.MandalaError, match="could not be checked") as caught:
+        client().api_keys.create(expires_in_hours=1)
+    assert f"the new key {API_KEY_CREATED['id']} has been revoked" in str(caught.value)
+    assert API_KEY_CREATED["raw"] not in str(caught.value)
+    with pytest.raises(mc.MandalaError, match="could not be checked") as caught:
+        await mc.AsyncClient("com_test", base_url=BASE).api_keys.create(computer_ids=["vm-1"])
+    assert API_KEY_CREATED["id"] in str(caught.value)
+    assert revoke.call_count == 2
