@@ -9,6 +9,7 @@ import json
 import os
 import stat
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Any
 
@@ -982,3 +983,54 @@ async def test_cancelling_the_async_mint_does_not_cancel_its_revoke() -> None:
         await mint
     await asyncio.wait_for(finished.wait(), 5)
     assert revoke.call_count == 1
+
+
+# --- a client clock set wrong does not decide an expiry ----------------------
+
+
+def minting_server(off: timedelta) -> respx.Route:
+    """A server that sets the expiry from ITS clock (plus ``off``, to be wrong)
+    and says what that clock reads in its Date header."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        hours = json.loads(request.content)["expires_in_hours"]
+        now = datetime.now(timezone.utc)
+        body = {**API_KEY_CREATED, "expires_at": (now + timedelta(hours=hours) + off).isoformat()}
+        return httpx.Response(201, json=body, headers={"Date": format_datetime(now, usegmt=True)})
+
+    respx.delete(f"{BASE}/api-keys/{API_KEY_CREATED['id']}").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    return respx.post(f"{BASE}/api-keys").mock(side_effect=answer)
+
+
+@pytest.mark.parametrize("skew", [timedelta(seconds=5), timedelta(minutes=-2)])
+@respx.mock
+def test_a_skewed_client_clock_accepts_the_servers_expiry(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    monkeypatch.setattr(mc._api, "utcnow", lambda: datetime.now(timezone.utc) + skew)
+    minting_server(timedelta(0))
+    assert client().api_keys.create(expires_in_hours=1).key == API_KEY_CREATED["raw"]
+
+
+@pytest.mark.parametrize("skew", [timedelta(seconds=5), timedelta(minutes=-2)])
+@respx.mock
+async def test_a_skewed_client_clock_accepts_the_servers_expiry_async(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    monkeypatch.setattr(mc._api, "utcnow", lambda: datetime.now(timezone.utc) + skew)
+    minting_server(timedelta(0))
+    created = await mc.AsyncClient("com_test", base_url=BASE).api_keys.create(expires_in_hours=1)
+    assert created.key == API_KEY_CREATED["raw"]
+
+
+@pytest.mark.parametrize("skew", [timedelta(seconds=5), timedelta(minutes=-2)])
+@respx.mock
+def test_an_expiry_later_by_the_servers_own_clock_is_refused(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    monkeypatch.setattr(mc._api, "utcnow", lambda: datetime.now(timezone.utc) + skew)
+    minting_server(timedelta(minutes=5))
+    with pytest.raises(mc.MandalaError, match="later than asked"):
+        client().api_keys.create(expires_in_hours=1)

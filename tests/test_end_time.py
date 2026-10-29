@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any
 
 import httpx
@@ -20,7 +21,7 @@ ENDS = "2026-11-01T12:00:00Z"
 ENDING: dict[str, Any] = {**COMPUTER, "ends_at": ENDS}
 #: An end time already behind us, for a create resent after it fired.
 PAST = "2026-01-01T00:00:00Z"
-STOPPED: dict[str, Any] = {**COMPUTER, "status": "stopped"}
+STOPPED: dict[str, Any] = {**COMPUTER, "status": "stopped", "running_ram_mb": 0}
 
 
 def sent(route: respx.Route) -> Any:
@@ -153,13 +154,14 @@ async def test_the_async_half_refuses_a_wrong_end_time_alike(
 def test_a_time_stored_to_the_second_is_the_time_asked_for() -> None:
     """The platform keeps whole seconds; a request with a fraction comes back without it."""
     now = datetime.now(timezone.utc)
+    ex = _api.Exchange(began=now, ended=now, seconds=0.0)
     body = {"ends_at": "2026-11-01T12:00:00.750Z"}
     for answered in (
         "2026-11-01T12:00:00Z",
         "2026-11-01T12:00:00.000Z",
         "2026-11-01T13:00:00+01:00",
     ):
-        assert _api.end_time_refusal("vm-1", body, answered, now, now) is None
+        assert _api.end_time_refusal("vm-1", body, answered, ex) is None
 
 
 def test_a_time_and_hours_together_are_refused_before_sending() -> None:
@@ -337,14 +339,18 @@ async def test_an_async_replayed_launch_after_its_end_time_is_not_started_again(
 # from now. It is held to the upper bound alone.
 
 
+def server_date() -> str:
+    """The ``Date`` header a server answers with: its clock, to the second."""
+    return format_datetime(datetime.now(timezone.utc), usegmt=True)
+
+
 def replayed_patch(ends_at: str, replayed: bool) -> None:
+    headers = {"Date": server_date()}
+    if replayed:
+        headers["Idempotent-Replayed"] = "true"
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
     respx.patch(f"{BASE}/computers/vm-1").mock(
-        httpx.Response(
-            200,
-            json={**COMPUTER, "ends_at": ends_at},
-            headers={"Idempotent-Replayed": "true"} if replayed else {},
-        )
+        httpx.Response(200, json={**COMPUTER, "ends_at": ends_at}, headers=headers)
     )
 
 
@@ -354,8 +360,8 @@ def hours_from(seconds_ago: float, hours: float) -> str:
 
 
 @respx.mock
-def test_a_replayed_relative_update_from_seconds_ago_is_accepted() -> None:
-    replayed_patch(hours_from(8, 2), replayed=True)
+def test_a_replayed_relative_update_from_minutes_ago_is_accepted() -> None:
+    replayed_patch(hours_from(300, 2), replayed=True)
     c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
     c.set_end_time(ends_in_hours=2, idempotency_key="move-1")
     assert c.ends_at is not None
@@ -363,7 +369,7 @@ def test_a_replayed_relative_update_from_seconds_ago_is_accepted() -> None:
 
 @respx.mock
 def test_the_same_answer_not_marked_a_replay_is_refused() -> None:
-    replayed_patch(hours_from(8, 2), replayed=False)
+    replayed_patch(hours_from(300, 2), replayed=False)
     c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
     with pytest.raises(mc.MandalaError, match="not the time asked for"):
         c.set_end_time(ends_in_hours=2)
@@ -378,8 +384,8 @@ def test_a_replayed_relative_update_past_the_upper_bound_is_refused() -> None:
 
 
 @respx.mock
-async def test_an_async_replayed_relative_update_from_seconds_ago_is_accepted() -> None:
-    replayed_patch(hours_from(8, 2), replayed=True)
+async def test_an_async_replayed_relative_update_from_minutes_ago_is_accepted() -> None:
+    replayed_patch(hours_from(300, 2), replayed=True)
     c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
     await c.set_end_time(ends_in_hours=2, idempotency_key="move-1")
     assert c.ends_at is not None
@@ -387,7 +393,167 @@ async def test_an_async_replayed_relative_update_from_seconds_ago_is_accepted() 
 
 @respx.mock
 async def test_an_async_unmarked_or_too_late_answer_is_refused() -> None:
-    replayed_patch(hours_from(8, 2), replayed=False)
+    replayed_patch(hours_from(300, 2), replayed=False)
     c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
     with pytest.raises(mc.MandalaError, match="not the time asked for"):
         await c.set_end_time(ends_in_hours=2)
+
+
+# --- a client clock set wrong ------------------------------------------------
+#
+# Hours are turned into a time by the platform's clock, which its answer's
+# Date header carries. The client's clock is not what the answer is judged by,
+# so one a few seconds ahead or minutes behind changes nothing — and a value
+# that is wrong by the server's own clock is still refused.
+
+SKEWS = [
+    pytest.param(timedelta(seconds=5), id="client-5s-ahead"),
+    pytest.param(timedelta(minutes=-2), id="client-2min-behind"),
+]
+
+
+def skew_client_clock(monkeypatch: pytest.MonkeyPatch, by: timedelta) -> None:
+    monkeypatch.setattr(_api, "utcnow", lambda: datetime.now(timezone.utc) + by)
+
+
+def honest_patch(off: timedelta = timedelta(0), *, date: bool = True) -> None:
+    """A server that sets hours from ITS now (plus ``off``, to be wrong)."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        hours = json.loads(request.content)["ends_in_hours"]
+        ends = datetime.now(timezone.utc) + timedelta(hours=hours) + off
+        return httpx.Response(
+            200,
+            json={**COMPUTER, "ends_at": ends.isoformat()},
+            headers={"Date": server_date()} if date else {},
+        )
+
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.patch(f"{BASE}/computers/vm-1").mock(side_effect=answer)
+
+
+@pytest.mark.parametrize("skew", SKEWS)
+@respx.mock
+def test_a_skewed_client_clock_accepts_the_servers_hours(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    skew_client_clock(monkeypatch, skew)
+    honest_patch()
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    c.set_end_time(ends_in_hours=2)
+    assert c.ends_at is not None
+
+
+@pytest.mark.parametrize("skew", SKEWS)
+@respx.mock
+async def test_a_skewed_client_clock_accepts_the_servers_hours_async(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    skew_client_clock(monkeypatch, skew)
+    honest_patch()
+    c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
+    await c.set_end_time(ends_in_hours=2)
+    assert c.ends_at is not None
+
+
+@pytest.mark.parametrize("skew", SKEWS)
+@pytest.mark.parametrize("off", [timedelta(minutes=5), timedelta(minutes=-5)])
+@respx.mock
+def test_a_wrong_value_is_refused_by_the_servers_clock(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta, off: timedelta
+) -> None:
+    skew_client_clock(monkeypatch, skew)
+    honest_patch(off)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=2)
+
+
+@pytest.mark.parametrize("skew", SKEWS)
+@respx.mock
+def test_without_a_date_the_client_window_is_widened(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    skew_client_clock(monkeypatch, skew)
+    honest_patch(date=False)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    c.set_end_time(ends_in_hours=2)
+    honest_patch(timedelta(minutes=30), date=False)
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=2)
+
+
+@pytest.mark.parametrize("skew", SKEWS)
+@respx.mock
+def test_an_absolute_end_time_ignores_every_clock(
+    monkeypatch: pytest.MonkeyPatch, skew: timedelta
+) -> None:
+    skew_client_clock(monkeypatch, skew)
+    replayed_patch(ENDS, replayed=False)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    c.set_end_time(ENDS)
+    replayed_patch("2026-11-01T12:00:05Z", replayed=False)
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ENDS)
+
+
+# --- an end time that passes while launch starts the computer ----------------
+
+
+def lapsing_launch(after_start: dict[str, Any]) -> tuple[respx.Route, respx.Route]:
+    """A replayed launch whose fresh read still has the end time, but whose
+    start answers with it gone: it passed in between."""
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(200, json=ENDING, headers={"Idempotent-Replayed": "true"})
+    )
+    respx.get(f"{BASE}/computers/vm-1").mock(
+        side_effect=[
+            httpx.Response(200, json={**STOPPED, "ends_at": ENDS}),
+            httpx.Response(200, json=after_start),
+        ]
+    )
+    start = respx.post(f"{BASE}/computers/vm-1/start").mock(httpx.Response(200, json={"ok": True}))
+    stop = respx.post(f"{BASE}/computers/vm-1/stop").mock(httpx.Response(200, json={"ok": True}))
+    return start, stop
+
+
+AFTER_START = [
+    pytest.param(COMPUTER, id="cleared"),
+    pytest.param({**COMPUTER, "ends_at": PAST}, id="passed"),
+]
+
+
+@pytest.mark.parametrize("after_start", AFTER_START)
+@respx.mock
+def test_a_computer_whose_end_time_lapses_during_the_start_is_stopped_again(
+    after_start: dict[str, Any],
+) -> None:
+    start, stop = lapsing_launch(after_start)
+    client = mc.Client("com_test", base_url=BASE)
+    with pytest.raises(mc.MandalaError, match=r"vm-1: its end time passed.*stopped again"):
+        client.computers.launch(template="base", ends_at=ENDS, idempotency_key="order-1")
+    assert start.call_count == 1
+    assert stop.call_count == 1
+    assert stop.calls.last.request.headers.get("Idempotency-Key")
+
+
+@pytest.mark.parametrize("after_start", AFTER_START)
+@respx.mock
+async def test_an_async_computer_whose_end_time_lapses_during_the_start_is_stopped_again(
+    after_start: dict[str, Any],
+) -> None:
+    start, stop = lapsing_launch(after_start)
+    client = mc.AsyncClient("com_test", base_url=BASE)
+    with pytest.raises(mc.MandalaError, match=r"vm-1: its end time passed.*stopped again"):
+        await client.computers.launch(template="base", ends_at=ENDS, idempotency_key="order-1")
+    assert start.call_count == 1
+    assert stop.call_count == 1
+
+
+@respx.mock
+def test_a_failed_stop_after_a_lapse_says_so() -> None:
+    lapsing_launch(COMPUTER)
+    respx.post(f"{BASE}/computers/vm-1/stop").mock(httpx.Response(500, json={"error": "x"}))
+    client = mc.Client("com_test", base_url=BASE)
+    with pytest.raises(mc.MandalaError, match="stopping it again FAILED"):
+        client.computers.launch(template="base", ends_at=ENDS, idempotency_key="order-1")

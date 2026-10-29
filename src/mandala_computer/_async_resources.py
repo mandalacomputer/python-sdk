@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
@@ -127,7 +127,6 @@ from ._resources import (
     _operation_settled,
     _operation_timed_out,
     _publish_refusal,
-    _replayed,
     _usage_window,
     _wait_timed_out,
     classify_poll_failure,
@@ -158,6 +157,27 @@ __all__ = [
     "AsyncWebhooks",
     "AsyncWorkspaces",
 ]
+
+
+async def _cleanup(call: Awaitable[Any]) -> bool:
+    """Run a compensating call to its end, whatever happens to the caller.
+
+    Shielded: a caller cancelling now (a timeout around the call that needed
+    undoing, say) must not also cancel the undoing. The cancellation still
+    reaches the caller; the cleanup finishes on its own budget. ``False`` when
+    it failed, which the error that follows says.
+    """
+    task = asyncio.ensure_future(call)
+    # Read its outcome even when nobody is left waiting for it, so a failure
+    # after a cancellation is not reported as never retrieved.
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
+        return False
+    return True
 
 
 class AsyncComputers:
@@ -400,24 +420,36 @@ class AsyncComputers:
             ends_at=ends_at,
             ends_in_hours=ends_in_hours,
         )
-        began = _api.utcnow()
-        computer, replayed = await self._create(body, idempotency_key)
-        refusal = _api.end_time_refusal(
-            computer.id, body, computer.raw.get("ends_at"), began, _api.utcnow(), replayed=replayed
-        )
+        computer, ex = await self._create(body, idempotency_key)
+        refusal = _api.end_time_refusal(computer.id, body, computer.raw.get("ends_at"), ex)
         if refusal is not None:
             raise refusal
         return computer
 
     async def _create(
         self, body: Mapping[str, Any], idempotency_key: str | None
-    ) -> tuple[AsyncComputer, bool]:
-        """:meth:`create`, also saying whether the answer replayed an earlier call's."""
+    ) -> tuple[AsyncComputer, _api.Exchange]:
+        """:meth:`create`, also saying how the request went: when, by
+        which clocks, and whether the answer replayed an earlier call's."""
+        start = _api.exchange_start()
         data, headers = await self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return AsyncComputer(self._t, record), _replayed(headers)
+        return AsyncComputer(self._t, record), _api.exchange_end(start, headers)
+
+    async def _stop_quietly(self, computer_id: str) -> bool:
+        """Stop a computer launch must not leave running; whether that worked.
+        Its own budget, and shielded from the caller's cancellation."""
+        return await _cleanup(
+            self._t.request(
+                "POST",
+                _api.computer_action(computer_id, "stop"),
+                headers=_api.idempotency_headers(None),
+                timeout=_api.CLEANUP_TIMEOUT_SECONDS,
+                timeout_cap=_api.CLEANUP_TIMEOUT_SECONDS,
+            )
+        )
 
     async def launch(
         self,
@@ -532,16 +564,15 @@ class AsyncComputers:
         )
         # See the sync twin: the create's key, settled before the create.
         launch_key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
-        began = _api.utcnow()
-        computer, replayed = await self._create(body, launch_key)
-        ended = _api.utcnow()
+        computer, ex = await self._create(body, launch_key)
+        replayed = ex.replayed
         # A replayed answer is the first call's, and says nothing of the end
         # time now; that is checked below, once the computer has been read.
         refusal = (
             None
             if replayed
             else _api.end_time_refusal(
-                computer.id, body, computer.raw.get("ends_at"), began, ended, launching=True
+                computer.id, body, computer.raw.get("ends_at"), ex, launching=True
             )
         )
         if refusal is not None:
@@ -597,9 +628,7 @@ class AsyncComputers:
                 computer.id,
                 body,
                 computer.raw.get("ends_at"),
-                began,
-                ended,
-                replayed=replayed,
+                ex,
                 launching=True,
             )
             if refusal is not None:
@@ -614,6 +643,12 @@ class AsyncComputers:
             ):
                 remaining()
                 await computer.start()
+                # Read back by the start. The end time may have passed between
+                # the check above and the start, and the host cleared it: then
+                # this start made a running computer with none, which is undone.
+                if _api.wants_end_time(body) and _api.end_time_gone(computer.raw.get("ends_at")):
+                    stopped = await self._stop_quietly(computer.id)
+                    raise _api.end_time_lapsed(computer.id, stopped)
             await computer.wait_until_running(timeout=remaining(), poll=poll)
             await computer.wait_for_guest(timeout=remaining(), poll=poll)
             # The sync twin says why: a bound computer's guest answers seconds
@@ -1594,34 +1629,21 @@ class AsyncApiKeys:
             expires_in_hours=expires_in_hours,
             computer_ids=computer_ids,
         )
-        expires_by = _api.requested_until(body, "expires_at", "expires_in_hours")
-        data = await self._t.json_object("POST", _api.API_KEYS, json=body)
-        created, key_id, problem = _api.minted_key(body, expires_by, data)
+        start = _api.exchange_start()
+        data, headers = await self._t.json_object_with_headers("POST", _api.API_KEYS, json=body)
+        created, key_id, problem = _api.minted_key(body, data, _api.exchange_end(start, headers))
         if created is not None:
             return created
         revoked: bool | None = None
         if key_id is not None:
-            # Shielded: a caller cancelling now (a timeout around this call,
-            # say) must not also cancel the revoke and leave the key working.
-            # The cancellation still reaches the caller; the revoke finishes.
-            revoke = asyncio.ensure_future(
+            revoked = await _cleanup(
                 self._t.request(
                     "DELETE",
                     _api.api_key(key_id),
-                    timeout=_api.REVOKE_TIMEOUT_SECONDS,
-                    timeout_cap=_api.REVOKE_TIMEOUT_SECONDS,
+                    timeout=_api.CLEANUP_TIMEOUT_SECONDS,
+                    timeout_cap=_api.CLEANUP_TIMEOUT_SECONDS,
                 )
             )
-            # Read its outcome even when nobody is left waiting for it, so a
-            # failure after a cancellation is not reported as never retrieved.
-            revoke.add_done_callback(lambda t: t.cancelled() or t.exception())
-            try:
-                await asyncio.shield(revoke)
-                revoked = True
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 — best effort; the error below says it failed
-                revoked = False
         raise _api.key_limits_refusal(key_id, problem or "", revoked)
 
     async def revoke(self, key_id: str) -> None:

@@ -27,7 +27,10 @@ This is the summary you read to decide whether to upgrade.
   times) raises `MandalaError` naming the computer; the computer is not
   stopped or deleted. A `launch` resent under its idempotency key after the
   end time has passed finds the computer stopped with no end time and raises
-  rather than starting it again.
+  rather than starting it again; one whose end time passes while launch is
+  starting it is stopped again, and launch raises. Relative times
+  (`ends_in_hours`, `expires_in_hours`) are checked against the server's clock
+  (its `Date` header), so a client clock set wrong does not fail them.
 - Expiring and computer-limited API keys. `api_keys.create(...)` takes
   `expires_at=` or `expires_in_hours=` (at most 366 days / 8784 hours) and
   `computer_ids=[...]` (1 to 50 computers the key is confined to). `ApiKey` and

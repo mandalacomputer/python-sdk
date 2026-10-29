@@ -6,7 +6,7 @@ import builtins
 import math
 import time
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from datetime import datetime
 from enum import Enum, auto
@@ -104,6 +104,16 @@ __all__ = [
 ]
 
 
+def _cleanup(call: Callable[[], object]) -> bool:
+    """Run a compensating call, best effort: ``False`` when it failed, which
+    the error that follows says."""
+    try:
+        call()
+    except Exception:  # noqa: BLE001 — best effort; the caller's error says it failed
+        return False
+    return True
+
+
 class _LastPoll(Enum):
     """What became of the most recent poll, in three states rather than two.
 
@@ -177,15 +187,6 @@ def _names_egress_credentials(proxy: object) -> bool:
     if isinstance(proxy, EgressProxy):
         return proxy.credentials_secret_id is not None
     return isinstance(proxy, Mapping) and bool(proxy.get("credentials_secret_id"))
-
-
-def _replayed(headers: Mapping[str, str]) -> bool:
-    """Whether a keyed create's answer is the stored answer to an earlier call.
-
-    The platform marks a replay with ``Idempotent-Replayed: true``. Everything in
-    such a body describes the first attempt, up to 24 hours ago, not now.
-    """
-    return _api.is_replay(headers)
 
 
 def _launch_start_admitted(data: Mapping[str, Any]) -> bool:
@@ -438,24 +439,36 @@ class Computers:
             ends_at=ends_at,
             ends_in_hours=ends_in_hours,
         )
-        began = _api.utcnow()
-        computer, replayed = self._create(body, idempotency_key)
-        refusal = _api.end_time_refusal(
-            computer.id, body, computer.raw.get("ends_at"), began, _api.utcnow(), replayed=replayed
-        )
+        computer, ex = self._create(body, idempotency_key)
+        refusal = _api.end_time_refusal(computer.id, body, computer.raw.get("ends_at"), ex)
         if refusal is not None:
             raise refusal
         return computer
 
     def _create(
         self, body: Mapping[str, Any], idempotency_key: str | None
-    ) -> tuple[Computer, bool]:
-        """:meth:`create`, also saying whether the answer replayed an earlier call's."""
+    ) -> tuple[Computer, _api.Exchange]:
+        """:meth:`create`, also saying how the request went: when, by
+        which clocks, and whether the answer replayed an earlier call's."""
+        start = _api.exchange_start()
         data, headers = self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return Computer(self._t, record), _replayed(headers)
+        return Computer(self._t, record), _api.exchange_end(start, headers)
+
+    def _stop_quietly(self, computer_id: str) -> bool:
+        """Stop a computer launch must not leave running; whether that worked.
+        Its own budget, whatever the caller's."""
+        return _cleanup(
+            lambda: self._t.request(
+                "POST",
+                _api.computer_action(computer_id, "stop"),
+                headers=_api.idempotency_headers(None),
+                timeout=_api.CLEANUP_TIMEOUT_SECONDS,
+                timeout_cap=_api.CLEANUP_TIMEOUT_SECONDS,
+            )
+        )
 
     def launch(
         self,
@@ -571,16 +584,15 @@ class Computers:
         # Settled here rather than in create, so an error from a later stage
         # can be handed back with the key that replays THIS create.
         launch_key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
-        began = _api.utcnow()
-        computer, replayed = self._create(body, launch_key)
-        ended = _api.utcnow()
+        computer, ex = self._create(body, launch_key)
+        replayed = ex.replayed
         # A replayed answer is the first call's, and says nothing of the end
         # time now; that is checked below, once the computer has been read.
         refusal = (
             None
             if replayed
             else _api.end_time_refusal(
-                computer.id, body, computer.raw.get("ends_at"), began, ended, launching=True
+                computer.id, body, computer.raw.get("ends_at"), ex, launching=True
             )
         )
         if refusal is not None:
@@ -640,9 +652,7 @@ class Computers:
                 computer.id,
                 body,
                 computer.raw.get("ends_at"),
-                began,
-                ended,
-                replayed=replayed,
+                ex,
                 launching=True,
             )
             if refusal is not None:
@@ -657,6 +667,12 @@ class Computers:
             ):
                 remaining()
                 computer.start()
+                # Read back by the start. The end time may have passed between
+                # the check above and the start, and the host cleared it: then
+                # this start made a running computer with none, which is undone.
+                if _api.wants_end_time(body) and _api.end_time_gone(computer.raw.get("ends_at")):
+                    stopped = self._stop_quietly(computer.id)
+                    raise _api.end_time_lapsed(computer.id, stopped)
             computer.wait_until_running(timeout=remaining(), poll=poll)
             computer.wait_for_guest(timeout=remaining(), poll=poll)
             # A bound computer's guest answers seconds before its secrets land,
@@ -2450,23 +2466,21 @@ class ApiKeys:
             expires_in_hours=expires_in_hours,
             computer_ids=computer_ids,
         )
-        expires_by = _api.requested_until(body, "expires_at", "expires_in_hours")
-        data = self._t.json_object("POST", _api.API_KEYS, json=body)
-        created, key_id, problem = _api.minted_key(body, expires_by, data)
+        start = _api.exchange_start()
+        data, headers = self._t.json_object_with_headers("POST", _api.API_KEYS, json=body)
+        created, key_id, problem = _api.minted_key(body, data, _api.exchange_end(start, headers))
         if created is not None:
             return created
         revoked: bool | None = None
         if key_id is not None:
-            try:
-                self._t.request(
+            revoked = _cleanup(
+                lambda: self._t.request(
                     "DELETE",
                     _api.api_key(key_id),
-                    timeout=_api.REVOKE_TIMEOUT_SECONDS,
-                    timeout_cap=_api.REVOKE_TIMEOUT_SECONDS,
+                    timeout=_api.CLEANUP_TIMEOUT_SECONDS,
+                    timeout_cap=_api.CLEANUP_TIMEOUT_SECONDS,
                 )
-                revoked = True
-            except Exception:  # noqa: BLE001 — best effort; the error below says it failed
-                revoked = False
+            )
         raise _api.key_limits_refusal(key_id, problem or "", revoked)
 
     def revoke(self, key_id: str) -> None:

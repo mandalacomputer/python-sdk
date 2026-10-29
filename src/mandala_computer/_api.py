@@ -12,10 +12,13 @@ import ipaddress
 import math
 import re
 import shlex
+import time
 import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote
 
@@ -1314,36 +1317,86 @@ def _moment(text: str) -> datetime:
     return parse_rfc3339(text.upper(), fraction_digits=None)
 
 
-def requested_until(body: Mapping[str, Any], at_key: str, hours_key: str) -> datetime | None:
-    """The latest moment a body's time-or-hours setting may come back as, or
-    ``None`` when it asks for none. Call it BEFORE the request: hours count from
-    when it was sent, so measured afterwards the bound would only grow."""
-    at = body.get(at_key)
-    if isinstance(at, str):
-        return _moment(at) + _MOMENT_SLACK
-    hours = body.get(hours_key)
-    if hours is not None:
-        return utcnow() + timedelta(hours=hours) + _HOURS_SLACK
-    return None
-
-
 def utcnow() -> datetime:
     """Now, aware. One spelling, so tests and callers bracket a request alike."""
     return datetime.now(timezone.utc)
 
 
-def _end_time_window(
-    body: Mapping[str, Any], began: datetime, ended: datetime, *, replayed: bool
-) -> tuple[datetime, datetime] | None:
+#: Without the server's own clock to go by, a relative time is held to the
+#: client's, widened by this much either way for a clock set wrong.
+_NO_DATE_SLACK = timedelta(minutes=10)
+
+
+@dataclass(frozen=True)
+class Exchange:
+    """One request, as far as judging a time it answered with needs.
+
+    ``began`` and ``ended`` are the client's clock around it, ``seconds`` how
+    long it took by a monotonic one, ``server_now`` the answer's ``Date``
+    header — the platform's own clock — when it carried a readable one, and
+    ``replayed`` whether the answer was the stored one of an earlier call.
+    """
+
+    began: datetime
+    ended: datetime
+    seconds: float
+    server_now: datetime | None = None
+    replayed: bool = False
+
+
+def exchange_start() -> tuple[datetime, float]:
+    """The moment a request goes out, by both clocks; :func:`exchange_end` takes it."""
+    return utcnow(), time.monotonic()
+
+
+def exchange_end(start: tuple[datetime, float], headers: Mapping[str, str]) -> Exchange:
+    """The :class:`Exchange` a request made, from :func:`exchange_start` and the
+    answer's headers."""
+    began, mono = start
+    server_now: datetime | None
+    try:
+        server_now = parsedate_to_datetime(headers.get("date", ""))
+    except (TypeError, ValueError, IndexError):
+        server_now = None
+    if server_now is not None and server_now.tzinfo is None:
+        server_now = server_now.replace(tzinfo=timezone.utc)
+    return Exchange(
+        began=began,
+        ended=utcnow(),
+        seconds=max(0.0, time.monotonic() - mono),
+        server_now=server_now,
+        replayed=is_replay(headers),
+    )
+
+
+def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
+    """Where hours from now may land, as the platform turned them into a time.
+
+    By the platform's clock when the answer says what it is: its ``Date``,
+    give or take a minute, and earlier by however long the request took. The
+    client's clock is not trusted for this — it may be minutes out — and is
+    used only when there is no ``Date``, widened by :data:`_NO_DATE_SLACK`
+    either way. A replay was measured from the first request, sent some time
+    before, so it is held to the upper bound alone.
+    """
+    span = timedelta(hours=hours)
+    if ex.server_now is not None:
+        low = ex.server_now + span - _HOURS_SLACK - timedelta(seconds=ex.seconds)
+        high = ex.server_now + span + _HOURS_SLACK
+    else:
+        low = ex.began + span - _MOMENT_SLACK - _NO_DATE_SLACK
+        high = ex.ended + span + _HOURS_SLACK + _NO_DATE_SLACK
+    if ex.replayed:
+        low = datetime.min.replace(tzinfo=timezone.utc)
+    return low, high
+
+
+def _end_time_window(body: Mapping[str, Any], ex: Exchange) -> tuple[datetime, datetime] | None:
     """Where an answered end time must fall to be the one asked for.
 
     A time is stored to the second, so it comes back as the request truncated,
-    give or take one. Hours are turned into a time on the platform's clock
-    while the request is in flight: no earlier than the hours from when it was
-    sent (less a second of truncation), no later than from when its answer
-    arrived (plus a minute for clocks that disagree). A replayed answer was
-    measured against a request sent some time before, so for hours it is held
-    to the upper bound alone. ``None``: nothing to compare against.
+    give or take one — exactly, whatever any clock says. Hours go through
+    :func:`_relative_window`. ``None``: nothing to compare against.
     """
     at = body.get("ends_at")
     if isinstance(at, str):
@@ -1351,14 +1404,35 @@ def _end_time_window(
         return asked - _MOMENT_SLACK, asked + _MOMENT_SLACK
     hours = body.get("ends_in_hours")
     if hours is not None:
-        span = timedelta(hours=hours)
-        latest = ended + span + _HOURS_SLACK
-        # A replay was measured from the first request, sent some time ago:
-        # its end time can only be EARLIER than this one's would be.
-        return (
-            datetime.min.replace(tzinfo=timezone.utc) if replayed else began + span - _MOMENT_SLACK
-        ), latest
+        return _relative_window(hours, ex)
     return None
+
+
+def wants_end_time(body: Mapping[str, Any]) -> bool:
+    """Whether a create or PATCH body asks for an end time."""
+    return body.get("ends_at") is not None or body.get("ends_in_hours") is not None
+
+
+def end_time_gone(answered: object) -> bool:
+    """Whether a computer read back has no end time ahead of it: none, an
+    unreadable one, or one already past."""
+    try:
+        return not isinstance(answered, str) or _moment(answered) <= utcnow()
+    except ValueError:
+        return True
+
+
+def end_time_lapsed(computer_id: str, stopped: bool) -> MandalaError:
+    """The error for a computer launch started just as its end time passed."""
+    fate = (
+        "it has been stopped again"
+        if stopped
+        else f"stopping it again FAILED — stop it yourself ({computer_id} is running)"
+    )
+    return MandalaError(
+        f"{computer_id}: its end time passed (or was cleared) while launch was starting it, "
+        f"so it would run with none; {fate}"
+    )
 
 
 def is_replay(headers: Mapping[str, str]) -> bool:
@@ -1367,26 +1441,24 @@ def is_replay(headers: Mapping[str, str]) -> bool:
     return headers.get("idempotent-replayed", "").strip().lower() == "true"
 
 
-#: How long the revoke of a key minted without its limits may take. Its own
-#: budget, not the caller's: a key nobody holds and nobody revoked is the very
-#: thing this cleanup exists to prevent.
-REVOKE_TIMEOUT_SECONDS = 30.0
+#: How long a compensating call may take — the revoke of a key minted without
+#: its limits, the stop of a computer started past its end time. Its own budget,
+#: not the caller's: what it undoes is the very thing it exists to prevent.
+CLEANUP_TIMEOUT_SECONDS = 30.0
 
 
 def end_time_refusal(
     computer_id: str,
     body: Mapping[str, Any],
     answered: object,
-    began: datetime,
-    ended: datetime,
+    ex: Exchange,
     *,
-    replayed: bool = False,
     launching: bool = False,
 ) -> MandalaError | None:
     """The error to raise when an answer does not confirm the end time asked for.
 
-    ``answered`` is the ``ends_at`` the answer carried, unread; ``began`` and
-    ``ended`` bracket the request that asked.
+    ``answered`` is the ``ends_at`` the answer carried, unread; ``ex`` is the
+    request that asked.
 
     A platform that predates end times ignores the fields it does not know and
     answers as if they were never sent, so a computer meant to stop on its own
@@ -1400,7 +1472,8 @@ def end_time_refusal(
     stopped it and cleared the setting. A launch must not then start it again:
     that would leave a running computer with no end time at all.
     """
-    wanted = body.get("ends_at") is not None or body.get("ends_in_hours") is not None
+    replayed = ex.replayed
+    wanted = wants_end_time(body)
     then = "so launch did not start it" if launching else "nothing was deleted or stopped"
     if wanted and answered is None:
         if replayed:
@@ -1429,7 +1502,7 @@ def end_time_refusal(
                 f"{computer_id}: the end time was not applied — the server answered an "
                 f"unreadable ends_at {answered!r}; {then}"
             )
-        window = _end_time_window(body, began, ended, replayed=replayed)
+        window = _end_time_window(body, ex)
         if window is not None and not window[0] <= got <= window[1]:
             return MandalaError(
                 f"{computer_id}: the end time was not applied — the server answers ends_at "
@@ -1454,8 +1527,8 @@ def key_limits_unapplied(
 
     A platform that predates key limits ignores the fields it does not know and
     mints a key that never expires and reaches every computer — the opposite of
-    what was asked, and a key is a credential. ``expires_by`` is
-    :func:`requested_until` of the body, taken before the request.
+    what was asked, and a key is a credential. ``expires_by`` is the latest
+    the expiry asked for may come back as.
     """
     problems = []
     if expires_by is not None:
@@ -1477,7 +1550,7 @@ def key_limits_unapplied(
 
 
 def minted_key(
-    body: Mapping[str, Any], expires_by: datetime | None, data: Mapping[str, Any]
+    body: Mapping[str, Any], data: Mapping[str, Any], ex: Exchange
 ) -> tuple[ApiKeyCreated | None, str | None, str | None]:
     """A mint's answer read against what was asked: ``(key, id, problem)``.
 
@@ -1487,6 +1560,11 @@ def minted_key(
     """
     from ._models import ApiKeyCreated  # a cycle at import time; not at call time
 
+    expires_by: datetime | None = None
+    if isinstance(body.get("expires_at"), str):
+        expires_by = _moment(body["expires_at"]) + _MOMENT_SLACK
+    elif body.get("expires_in_hours") is not None:
+        expires_by = _relative_window(body["expires_in_hours"], ex)[1]
     limited = expires_by is not None or body.get("computer_ids") is not None
     if not limited:
         return ApiKeyCreated.from_api(data), None, None
