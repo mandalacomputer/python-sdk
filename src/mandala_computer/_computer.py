@@ -3229,10 +3229,21 @@ class Computer(ComputerFields):
         schedule: starting the computer again does not bring it back. A host
         that cannot keep end times raises a
         :class:`~mandala_computer.ConflictError` with reason ``unsupported``.
+
+        An answer that does not confirm the change — no end time after setting
+        one, or one still there after clearing it, as from a server too old to
+        know them — raises :class:`~mandala_computer.MandalaError` naming the
+        computer. Nothing is stopped or deleted.
         """
-        return self._patch(
-            "set_end_time", _api.end_time_body(ends_at, ends_in_hours), idempotency_key
+        body = _api.end_time_body(ends_at, ends_in_hours)
+        began = _api.utcnow()
+        updated = self._patch("set_end_time", body, idempotency_key)
+        refusal = _api.end_time_refusal(
+            self.id, body, self._data.get("ends_at"), began, _api.utcnow()
         )
+        if refusal is not None:
+            raise refusal
+        return updated
 
     def set_browser_proxy(
         self,

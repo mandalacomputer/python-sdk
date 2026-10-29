@@ -43,7 +43,7 @@ import io
 import json
 import sys
 from contextlib import aclosing, closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -929,7 +929,18 @@ def api_handler(request: httpx.Request) -> httpx.Response:
             200, json=[WORKSPACE_MEMBER] if path.endswith("/members") else WORKSPACE
         )
     if path.endswith("/api-keys"):
-        return httpx.Response(200 if get else 201, json=[API_KEY] if get else API_KEY_CREATED)
+        if get:
+            return httpx.Response(200, json=[API_KEY])
+        # Limits asked for are echoed back, as a server that applied them does.
+        sent = json.loads(request.content)
+        echo: dict[str, object] = {}
+        if "expires_at" in sent:
+            echo["expires_at"] = sent["expires_at"]
+        if "expires_in_hours" in sent:
+            echo["expires_at"] = datetime.now(timezone.utc).isoformat()
+        if "computer_ids" in sent:
+            echo["computer_ids"] = sent["computer_ids"]
+        return httpx.Response(201, json={**API_KEY_CREATED, **echo})
     if "/api-keys/" in path:
         return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh-keys"):
@@ -955,8 +966,25 @@ def api_handler(request: httpx.Request) -> httpx.Response:
     if path.endswith("/secrets"):
         return httpx.Response(200, json=SECRET_BINDINGS)
     if path.endswith("/computers"):
-        return httpx.Response(200, json=[COMPUTER] if get else COMPUTER)
-    return httpx.Response(200, json=COMPUTER)
+        return httpx.Response(200, json=[COMPUTER] if get else _with_end_time(request))
+    return httpx.Response(200, json=COMPUTER if get else _with_end_time(request))
+
+
+def _with_end_time(request: httpx.Request) -> dict[str, object]:
+    """A computer, carrying an end time when the request set one, as a server
+    that applied it answers."""
+    try:
+        sent = json.loads(request.content or b"{}")
+    except ValueError:
+        return COMPUTER
+    if not isinstance(sent, dict):
+        return COMPUTER
+    if isinstance(sent.get("ends_at"), str):
+        return {**COMPUTER, "ends_at": sent["ends_at"]}
+    if isinstance(sent.get("ends_in_hours"), (int, float)):
+        ends = datetime.now(timezone.utc) + timedelta(hours=sent["ends_in_hours"])
+        return {**COMPUTER, "ends_at": ends.isoformat()}
+    return COMPUTER
 
 
 def sent_parameters(calls: object) -> dict[str, set[str]]:

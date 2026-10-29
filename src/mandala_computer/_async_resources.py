@@ -366,7 +366,12 @@ class AsyncComputers:
         computer. It happens once and is then cleared:
         :attr:`AsyncComputer.ends_at` reads it, and :meth:`AsyncComputer.set_end_time`
         changes or clears it. A host that cannot keep end times answers 409
-        with reason ``unsupported``.
+        with reason ``unsupported``. An answer without the end time asked for —
+        from a server too old to know them — raises
+        :class:`~mandala_computer.MandalaError` naming the computer, which is
+        left as it is, not deleted or stopped. A create resent under an
+        idempotency key after its end time has passed answers the first call's
+        computer, now stopped with no end time, and raises the same way.
 
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
@@ -395,7 +400,14 @@ class AsyncComputers:
             ends_at=ends_at,
             ends_in_hours=ends_in_hours,
         )
-        return (await self._create(body, idempotency_key))[0]
+        began = _api.utcnow()
+        computer, replayed = await self._create(body, idempotency_key)
+        refusal = _api.end_time_refusal(
+            computer.id, body, computer.raw.get("ends_at"), began, _api.utcnow(), replayed=replayed
+        )
+        if refusal is not None:
+            raise refusal
+        return computer
 
     async def _create(
         self, body: Mapping[str, Any], idempotency_key: str | None
@@ -495,7 +507,10 @@ class AsyncComputers:
         attempt's, up to 24 hours old, so launch reads the computer afresh
         before acting on it: a start that attempt reported failed is sent
         again rather than raised again, and a computer stopped or suspended
-        since is started.
+        since is started — except one created with an end time that it no
+        longer has: its end time has passed (or was never applied), and
+        starting it again would leave it running with none, so launch raises
+        :class:`~mandala_computer.MandalaError` naming it instead.
         """
         check_wait_args(timeout, poll)
         body = _api.create_body(
@@ -517,7 +532,20 @@ class AsyncComputers:
         )
         # See the sync twin: the create's key, settled before the create.
         launch_key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
+        began = _api.utcnow()
         computer, replayed = await self._create(body, launch_key)
+        ended = _api.utcnow()
+        # A replayed answer is the first call's, and says nothing of the end
+        # time now; that is checked below, once the computer has been read.
+        refusal = (
+            None
+            if replayed
+            else _api.end_time_refusal(
+                computer.id, body, computer.raw.get("ends_at"), began, ended, launching=True
+            )
+        )
+        if refusal is not None:
+            raise refusal
         computer_id = computer.id
         deadline = time.monotonic() + timeout
 
@@ -561,6 +589,21 @@ class AsyncComputers:
             await computer.wait_until_built(timeout=remaining(), poll=poll)
             if computer.start_error:
                 raise MandalaError(f"did not start: {computer.start_error}")
+            # Asked for an end time and read without one: it has passed — the
+            # host stopped the computer and cleared it, and this is a replay —
+            # or it never took. Either way starting it would leave it running
+            # with no end time, so it is left as it is.
+            refusal = _api.end_time_refusal(
+                computer.id,
+                body,
+                computer.raw.get("ends_at"),
+                began,
+                ended,
+                replayed=replayed,
+                launching=True,
+            )
+            if refusal is not None:
+                raise refusal
             if (
                 not start_admitted
                 and computer.status in ("stopped", "suspended")
@@ -1551,7 +1594,19 @@ class AsyncApiKeys:
             expires_in_hours=expires_in_hours,
             computer_ids=computer_ids,
         )
-        return ApiKeyCreated.from_api(await self._t.json_object("POST", _api.API_KEYS, json=body))
+        expires_by = _api.requested_until(body, "expires_at", "expires_in_hours")
+        data = await self._t.json_object("POST", _api.API_KEYS, json=body)
+        created, key_id, problem = _api.minted_key(body, expires_by, data)
+        if created is not None:
+            return created
+        revoked: bool | None = None
+        if key_id is not None:
+            try:
+                await self._t.request("DELETE", _api.api_key(key_id))
+                revoked = True
+            except Exception:  # noqa: BLE001 — best effort; the error below says it failed
+                revoked = False
+        raise _api.key_limits_refusal(key_id, problem or "", revoked)
 
     async def revoke(self, key_id: str) -> None:
         await self._t.request("DELETE", _api.api_key(key_id))

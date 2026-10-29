@@ -21,14 +21,23 @@ This is the summary you read to decide whether to upgrade.
   `Computer.ends_at` reads it back (`None` when there is none). Sending both
   forms, a naive `datetime`, a time without a zone or hours that are not a
   positive number raises `ValueError` before any request. A host that cannot
-  keep end times answers `ConflictError` with reason `unsupported`.
+  keep end times answers `ConflictError` with reason `unsupported`. An answer
+  that does not carry the end time asked for (none, a different or unreadable
+  one, or one still there after a clear, as from a server too old to know end
+  times) raises `MandalaError` naming the computer; the computer is not
+  stopped or deleted. A `launch` resent under its idempotency key after the
+  end time has passed finds the computer stopped with no end time and raises
+  rather than starting it again.
 - Expiring and computer-limited API keys. `api_keys.create(...)` takes
   `expires_at=` or `expires_in_hours=` (at most 366 days / 8784 hours) and
   `computer_ids=[...]` (1 to 50 computers the key is confined to). `ApiKey` and
   `ApiKeyCreated`, and whoami's `key`, carry `expires_at` and `computer_ids`
   (`None` when the key has no such limit). An expired key is refused with
   `AuthenticationError` (`API key expired`). A bare string or an empty list for
-  `computer_ids` raises `ValueError` before any request.
+  `computer_ids` raises `ValueError` before any request. A mint whose answer
+  does not confirm the limits asked for (no expiry or a later one, no
+  confinement or a wider one) is revoked and never returned: `create` raises
+  `MandalaError` naming the key id and whether the revoke succeeded.
 
 ## [0.20.0] - 2026-10-29
 

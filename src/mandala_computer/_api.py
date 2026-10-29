@@ -15,13 +15,17 @@ import shlex
 import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime
-from typing import Any, Literal, TypeVar
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote
 
 import httpx
 
 from ._exceptions import APIError, MandalaError
+from ._timestamps import parse_rfc3339
+
+if TYPE_CHECKING:
+    from ._models import ApiKeyCreated
 
 T = TypeVar("T")
 
@@ -1294,6 +1298,205 @@ def end_time_body(ends_at: object, ends_in_hours: object) -> dict[str, Any]:
     field in the PATCH, which is why it has a method of its own.
     """
     return end_time_fields(ends_at, ends_in_hours, "ends_at", "ends_in_hours") or {"ends_at": None}
+
+
+#: How much later than asked an answered moment may be and still count as the
+#: one asked for: the platform stores times at its own precision, and may
+#: round. Generous next to that, and nothing next to what it guards against.
+_MOMENT_SLACK = timedelta(seconds=1)
+#: For a duration, which the platform turns into a time on its own clock after
+#: the request arrives: the trip there, and the two clocks disagreeing.
+_HOURS_SLACK = timedelta(seconds=60)
+
+
+def _moment(text: str) -> datetime:
+    """A stamp :func:`_usage_stamp` let through, as an aware datetime."""
+    return parse_rfc3339(text.upper(), fraction_digits=None)
+
+
+def requested_until(body: Mapping[str, Any], at_key: str, hours_key: str) -> datetime | None:
+    """The latest moment a body's time-or-hours setting may come back as, or
+    ``None`` when it asks for none. Call it BEFORE the request: hours count from
+    when it was sent, so measured afterwards the bound would only grow."""
+    at = body.get(at_key)
+    if isinstance(at, str):
+        return _moment(at) + _MOMENT_SLACK
+    hours = body.get(hours_key)
+    if hours is not None:
+        return utcnow() + timedelta(hours=hours) + _HOURS_SLACK
+    return None
+
+
+def utcnow() -> datetime:
+    """Now, aware. One spelling, so tests and callers bracket a request alike."""
+    return datetime.now(timezone.utc)
+
+
+def _end_time_window(
+    body: Mapping[str, Any], began: datetime, ended: datetime, *, replayed: bool
+) -> tuple[datetime, datetime] | None:
+    """Where an answered end time must fall to be the one asked for.
+
+    A time is stored to the second, so it comes back as the request truncated,
+    give or take one. Hours are turned into a time on the platform's clock
+    while the request is in flight: no earlier than the hours from when it was
+    sent (less a second of truncation), no later than from when its answer
+    arrived (plus a minute for clocks that disagree). A replayed answer was
+    measured against a request sent who knows when, so hours cannot be held to
+    a window then, and ``None`` asks only for a readable time.
+    """
+    at = body.get("ends_at")
+    if isinstance(at, str):
+        asked = _moment(at).replace(microsecond=0)
+        return asked - _MOMENT_SLACK, asked + _MOMENT_SLACK
+    hours = body.get("ends_in_hours")
+    if hours is not None and not replayed:
+        span = timedelta(hours=hours)
+        return began + span - _MOMENT_SLACK, ended + span + _HOURS_SLACK
+    return None
+
+
+def end_time_refusal(
+    computer_id: str,
+    body: Mapping[str, Any],
+    answered: object,
+    began: datetime,
+    ended: datetime,
+    *,
+    replayed: bool = False,
+    launching: bool = False,
+) -> MandalaError | None:
+    """The error to raise when an answer does not confirm the end time asked for.
+
+    ``answered`` is the ``ends_at`` the answer carried, unread; ``began`` and
+    ``ended`` bracket the request that asked.
+
+    A platform that predates end times ignores the fields it does not know and
+    answers as if they were never sent, so a computer meant to stop on its own
+    would run until somebody noticed. The answer is the only proof the setting
+    took, so its absence — or a value that is not the time asked for, such as
+    the one it had before — is a failure, never a deletion or a stop: the
+    computer is the caller's, and what to do with it is theirs to decide.
+
+    A create answered from its idempotency record is the first call's answer,
+    and that computer's end time may since have come and gone — the host
+    stopped it and cleared the setting. A launch must not then start it again:
+    that would leave a running computer with no end time at all.
+    """
+    wanted = body.get("ends_at") is not None or body.get("ends_in_hours") is not None
+    then = "so launch did not start it" if launching else "nothing was deleted or stopped"
+    if wanted and answered is None:
+        if replayed:
+            at = body.get("ends_at")
+            passed = isinstance(at, str) and _moment(at) <= utcnow()
+            why = (
+                "its end time has passed: the host has stopped it and cleared the setting"
+                if passed
+                else "its end time has most likely passed, or was never applied"
+            )
+            return MandalaError(
+                f"{computer_id}: this create was answered from an earlier request with the "
+                f"same idempotency key, and the computer has no end time — {why}; {then}"
+            )
+        return MandalaError(
+            f"{computer_id}: the end time was not applied — the server answered without "
+            f"ends_at, so it may not support end times; {then}"
+        )
+    if wanted:
+        try:
+            got = _moment(answered) if isinstance(answered, str) else None
+        except ValueError:
+            got = None
+        if got is None:
+            return MandalaError(
+                f"{computer_id}: the end time was not applied — the server answered an "
+                f"unreadable ends_at {answered!r}; {then}"
+            )
+        window = _end_time_window(body, began, ended, replayed=replayed)
+        if window is not None and not window[0] <= got <= window[1]:
+            return MandalaError(
+                f"{computer_id}: the end time was not applied — the server answers ends_at "
+                f"{answered}, not the time asked for; {then}"
+            )
+        return None
+    if "ends_at" in body and answered is not None:
+        return MandalaError(
+            f"{computer_id}: the end time was not cleared — the server still answers "
+            f"ends_at {answered!r}"
+        )
+    return None
+
+
+def key_limits_unapplied(
+    body: Mapping[str, Any],
+    expires_by: datetime | None,
+    expires_at: str | None,
+    computer_ids: Sequence[str] | None,
+) -> str | None:
+    """What a minted key's answer fails to confirm of the limits asked for, or ``None``.
+
+    A platform that predates key limits ignores the fields it does not know and
+    mints a key that never expires and reaches every computer — the opposite of
+    what was asked, and a key is a credential. ``expires_by`` is
+    :func:`requested_until` of the body, taken before the request.
+    """
+    problems = []
+    if expires_by is not None:
+        try:
+            at = None if expires_at is None else _moment(expires_at)
+        except ValueError:
+            at = None
+        if at is None:
+            problems.append("it has no expiry")
+        elif at > expires_by:
+            problems.append(f"it expires at {expires_at}, later than asked")
+    asked = body.get("computer_ids")
+    if asked is not None:
+        if computer_ids is None:
+            problems.append("it is not confined to the computers named")
+        elif not set(computer_ids) <= set(asked):
+            problems.append("it reaches computers that were not named")
+    return "; ".join(problems) or None
+
+
+def minted_key(
+    body: Mapping[str, Any], expires_by: datetime | None, data: Mapping[str, Any]
+) -> tuple[ApiKeyCreated | None, str | None, str | None]:
+    """A mint's answer read against what was asked: ``(key, id, problem)``.
+
+    With no problem, ``key`` is the key to hand back. With one, ``key`` is
+    ``None`` — a key minted without the limits asked for is never returned —
+    and ``id`` is what to revoke, when the answer named one.
+    """
+    from ._models import ApiKeyCreated  # a cycle at import time; not at call time
+
+    limited = expires_by is not None or body.get("computer_ids") is not None
+    if not limited:
+        return ApiKeyCreated.from_api(data), None, None
+    try:
+        created = ApiKeyCreated.from_api(data)
+    except MandalaError as e:
+        raw_id = data.get("id") if isinstance(data, Mapping) else None
+        key_id = raw_id if isinstance(raw_id, str) and raw_id.startswith("key-") else None
+        return None, key_id, f"its answer could not be read: {e}"
+    problem = key_limits_unapplied(body, expires_by, created.expires_at, created.computer_ids)
+    if problem is not None:
+        return None, created.id, problem
+    return created, None, None
+
+
+def key_limits_refusal(key_id: str | None, problem: str, revoked: bool | None) -> MandalaError:
+    """The error for a key minted without the limits asked for. Never the key itself."""
+    if revoked:
+        fate = f"the new key {key_id} has been revoked"
+    elif key_id is None:
+        fate = "the answer did not name the new key, so it could not be revoked: list your keys"
+    else:
+        fate = f"revoking the new key {key_id} FAILED — revoke it with api_keys.revoke({key_id!r})"
+    return MandalaError(
+        f"POST api-keys: the server did not apply the requested limits ({problem}); "
+        f"it may not support them. {fate}"
+    )
 
 
 _BROWSER_PROXY_KEYS = frozenset({"server", "bypass", "credentials_secret_id"})
