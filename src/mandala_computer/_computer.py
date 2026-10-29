@@ -1406,6 +1406,31 @@ def _ramp_delay(turn: int, poll: float) -> float:
     return min(FIRST_POLL * 2.0 ** min(turn, 30), poll)
 
 
+DESKTOP_FAST_POLL = 0.1
+"""The sleep between :meth:`Computer.wait_for_desktop`'s first probes, in seconds."""
+
+DESKTOP_FAST_PROBES = 10
+"""How many "not yet" answers :meth:`Computer.wait_for_desktop` sleeps
+:data:`DESKTOP_FAST_POLL` after before it falls back to :func:`_ramp_delay`."""
+
+
+def _desktop_delay(turn: int, poll: float) -> float:
+    """The sleep after the desktop probe's ``turn``-th "not yet" (counting from 0).
+
+    :data:`DESKTOP_FAST_POLL` for the first :data:`DESKTOP_FAST_PROBES`, then
+    the ordinary ramp from 0.25s, never more than ``poll``. The desktop of a
+    computer created with secrets logs in well under a second after its guest
+    answers, and the ramp's 0.25s-then-0.5s sleeps found it up to half a second
+    late every time. A probe is one short request, and a session that is that
+    close is worth asking about more often; the ten fast probes cover about two
+    seconds, and a desktop that takes longer than that (a cold boot) is waited
+    on as before.
+    """
+    if turn < DESKTOP_FAST_PROBES:
+        return min(DESKTOP_FAST_POLL, poll)
+    return _ramp_delay(turn - DESKTOP_FAST_PROBES, poll)
+
+
 def _guest_not_running(err: BaseException) -> bool:
     """Whether this is the guest routes' 400 for a machine that is not up yet.
 
@@ -3803,17 +3828,18 @@ class Computer(ComputerFields):
 
         Like :meth:`wait_for_guest`, the probe resumes a suspended computer.
 
-        Probes again 0.25s after the first probe, then doubling up to ``poll``,
-        so a session that appears a moment after a probe is not a whole
-        interval late. The reasonless no-session 409 uses this ramp too;
-        other transient failures wait ``poll`` (or their ``Retry-After``).
+        Probes every 0.1s for the first ten "not yet" answers (about two
+        seconds), then 0.25s later, doubling up to ``poll``, so a session that
+        appears a moment after a probe is not a whole interval late. The
+        reasonless no-session 409 counts as "not yet"; other transient failures
+        wait ``poll`` (or their ``Retry-After``).
         """
         check_wait_args(timeout, poll)
         if _desktop_wait_skipped(self._data):
             return self
         deadline = time.monotonic() + timeout
-        # Ordinary "not yet" answers so far, which ramp the sleep (see
-        # _ramp_delay); other transient failures set their own delay instead.
+        # Ordinary "not yet" answers so far, which pace the sleep (see
+        # _desktop_delay); other transient failures set their own delay instead.
         not_yet = 0
         while True:
             delay: float | None = None
@@ -3839,7 +3865,7 @@ class Computer(ComputerFields):
                 if not _desktop_not_yet(err):
                     delay = _poll_delay(err, poll)
             if delay is None:
-                delay = _ramp_delay(not_yet, poll)
+                delay = _desktop_delay(not_yet, poll)
                 not_yet += 1
             time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
 
