@@ -1676,7 +1676,8 @@ class ComputerFields:
         """The lifecycle operation the last lifecycle call made through this
         handle started (platform OPL-5055): the create or clone that returned
         it, or the latest ``start``, ``stop``, ``suspend``, ``restart``,
-        ``rename``, ``move_to_workspace``, ``resize``, ``set_idle_suspend``, ``set_browser_proxy`` or
+        ``rename``, ``move_to_workspace``, ``resize``, ``set_idle_suspend``, ``set_end_time``,
+        ``set_browser_proxy`` or
         ``set_egress_proxy`` since. ``client.operations.wait(id)`` polls it to
         its end.
 
@@ -2453,6 +2454,23 @@ class ComputerFields:
         return _require_whole(value, "computer answered with an invalid idle_suspend_min")
 
     @property
+    def ends_at(self) -> str | None:
+        """When this computer's host will stop it (RFC 3339, UTC), or ``None``
+        when it has no end time.
+
+        Set at create (``ends_at`` / ``ends_in_hours``) or with
+        :meth:`Computer.set_end_time`. It happens once: the stop is the same as
+        :meth:`Computer.stop` (the disk is kept), and the end time is cleared
+        afterwards.
+        """
+        value = self._data.get("ends_at")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise MandalaError("computer answered with an invalid ends_at")
+        return str.__str__(value)
+
+    @property
     def workspace_id(self) -> str:
         """The workspace this computer is in, or ``""`` when it is in none.
 
@@ -3190,6 +3208,31 @@ class Computer(ComputerFields):
         polls the screen is the one thing this setting can surprise.
         """
         return self._patch("set_idle_suspend", _api.idle_suspend_body(minutes), idempotency_key)
+
+    def set_end_time(
+        self,
+        ends_at: datetime | str | None = None,
+        *,
+        ends_in_hours: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> Computer:
+        """Give this computer an end time, move it, or clear it.
+
+        ``ends_at`` is an aware ``datetime`` or an RFC 3339 string with a time
+        zone, and only has to be in the future; ``ends_in_hours`` is the same
+        as hours from now (more than 0, fractions are fine). Send one or the
+        other, not both; with neither, the end time is cleared and the computer
+        runs until something else stops it.
+
+        At its end time the host stops the computer, as :meth:`stop` would —
+        the disk is kept — and clears the end time. It is one stop, not a
+        schedule: starting the computer again does not bring it back. A host
+        that cannot keep end times raises a
+        :class:`~mandala_computer.ConflictError` with reason ``unsupported``.
+        """
+        return self._patch(
+            "set_end_time", _api.end_time_body(ends_at, ends_in_hours), idempotency_key
+        )
 
     def set_browser_proxy(
         self,

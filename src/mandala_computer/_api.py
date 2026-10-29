@@ -858,7 +858,7 @@ def files_range(offset: int, length: int | None) -> dict[str, str]:
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})")
 
 
-def _usage_stamp(value: datetime | str, what: str) -> str:
+def _usage_stamp(value: object, what: str) -> str:
     """One bound of a usage window, in the spelling the platform reads.
 
     A ``datetime`` is the shape to prefer, and an AWARE one is the only kind
@@ -878,7 +878,7 @@ def _usage_stamp(value: datetime | str, what: str) -> str:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(
                 f"{what} must be an aware datetime — a naive one has no time zone, and "
-                "guessing one would move the window. Try "
+                "guessing one could move it by hours. Try "
                 f"{what}=your_datetime.replace(tzinfo=timezone.utc)."
             )
         # isoformat() renders the offset it carries; UTC comes out as +00:00,
@@ -1176,6 +1176,8 @@ def create_body(
     browser_proxy: object = None,
     egress_proxy: object = None,
     workspace_id: object = None,
+    ends_at: object = None,
+    ends_in_hours: object = None,
 ) -> dict[str, Any]:
     """Build a create payload, omitting anything unset.
 
@@ -1196,6 +1198,9 @@ def create_body(
 
     ``workspace_id`` (platform OPL-5543) is the workspace to create in, checked
     as a secret's scope is; ``None`` sends no key, the credential's own scope.
+
+    ``ends_at`` and ``ends_in_hours`` go through :func:`end_time_fields`, and
+    neither key is sent when both are ``None``.
     """
     from ._models import NO_BROWSER_PROXY  # a cycle at import time; not at call time
 
@@ -1246,7 +1251,49 @@ def create_body(
     workspace = _workspace(workspace_id)
     if workspace is not None:
         body["workspace_id"] = workspace
+    body.update(end_time_fields(ends_at, ends_in_hours, "ends_at", "ends_in_hours"))
     return body
+
+
+def _positive_hours(value: object, what: str) -> float:
+    hours = real(value, what, message=f"{what} must be a number of hours, not {value!r}")
+    if hours <= 0:
+        raise ValueError(f"{what} must be more than 0, not {value!r}")
+    return hours
+
+
+def end_time_fields(at: object, hours: object, at_key: str, hours_key: str) -> dict[str, Any]:
+    """A moment as either an absolute time or a number of hours from now — at
+    most one of them, and nothing when neither was given.
+
+    The platform turns hours into a time itself, so the two are one setting
+    spelt two ways, and it refuses a request carrying both. So does this, before
+    anything is sent. Whether the time is far enough ahead, and not too far, is
+    the platform's to judge against its own clock: this one may be wrong.
+
+    A time follows :func:`_usage_stamp`'s rules, for its reason: an aware
+    ``datetime`` or an RFC 3339 string with a zone, never a naive datetime,
+    whose zone this SDK would have to guess — and a guess moves the moment by
+    hours.
+    """
+    if at is not None and hours is not None:
+        raise ValueError(f"send {at_key} or {hours_key}, not both")
+    if at is not None:
+        return {at_key: _usage_stamp(at, at_key)}
+    if hours is not None:
+        return {hours_key: _positive_hours(hours, hours_key)}
+    return {}
+
+
+def end_time_body(ends_at: object, ends_in_hours: object) -> dict[str, Any]:
+    """The PATCH that sets a computer's end time, or clears it.
+
+    Neither given clears it: ``ends_at`` is sent as an explicit null, for
+    :func:`idle_suspend_body`'s reason — dropped, it would mean "change
+    nothing", the opposite request. The platform requires this to be the only
+    field in the PATCH, which is why it has a method of its own.
+    """
+    return end_time_fields(ends_at, ends_in_hours, "ends_at", "ends_in_hours") or {"ends_at": None}
 
 
 _BROWSER_PROXY_KEYS = frozenset({"server", "bypass", "credentials_secret_id"})
@@ -3040,8 +3087,16 @@ def operations_params(
     return params or None
 
 
-def api_key_body(name: object, workspace_id: object) -> dict[str, Any]:
-    """``POST api-keys``: a label and a workspace, each only when given.
+def api_key_body(
+    name: object,
+    workspace_id: object,
+    *,
+    expires_at: object = None,
+    expires_in_hours: object = None,
+    computer_ids: object = None,
+) -> dict[str, Any]:
+    """``POST api-keys``: a label, a workspace, an expiry and a computer list,
+    each only when given.
 
     Never ``manage_keys``: the platform refuses ``true`` from every API key
     (403) and grants the permission only from a dashboard session, so there is
@@ -3060,7 +3115,32 @@ def api_key_body(name: object, workspace_id: object) -> dict[str, Any]:
                 "omit it for a key in your own scope"
             )
         body["workspace_id"] = ws
+    body.update(end_time_fields(expires_at, expires_in_hours, "expires_at", "expires_in_hours"))
+    if computer_ids is not None:
+        body["computer_ids"] = _computer_id_list(computer_ids)
     return body
+
+
+def _computer_id_list(value: object) -> list[str]:
+    """The computers a key is confined to: a real list of ids, never empty.
+
+    A bare string is a sequence of characters and would go out as one id per
+    letter; an empty list would confine the key to nothing, which the platform
+    refuses. How many may be named is the platform's rule.
+    """
+    if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, (list, tuple)):
+        raise ValueError(  # noqa: TRY004
+            f"computer_ids must be a list of computer ids, not {type(value).__name__}"
+        )
+    if not value:
+        raise ValueError("computer_ids must name at least one computer; omit it for any computer")
+    ids = []
+    for i, entry in enumerate(value):
+        cid = canonical(entry, f"computer_ids[{i}]")
+        if not cid.strip() or cid != cid.strip():
+            raise ValueError(f"computer_ids[{i}] must be a computer id, with no spaces around it")
+        ids.append(cid)
+    return ids
 
 
 def computer_ssh(computer_id: str) -> str:

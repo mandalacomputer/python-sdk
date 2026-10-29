@@ -1047,6 +1047,9 @@ def exercise_everything(client: mc.Client) -> None:
     client.computers.create(size="small")
     # Into a workspace, by an account-wide key (OPL-5543).
     client.computers.create(template="base", workspace_id="wsp-0123456789ab")
+    # An end time, as a time and as hours from now.
+    client.computers.create(template="base", ends_at="2026-11-01T12:00:00Z")
+    client.computers.create(template="base", ends_in_hours=1.5)
     # Secrets bound at create, one as a variable and one as a file.
     client.computers.create(
         template="base",
@@ -1181,6 +1184,9 @@ def exercise_everything(client: mc.Client) -> None:
     client.credits.read(before=7, limit=10)
     c.set_idle_suspend(15)
     c.set_idle_suspend(None)
+    c.set_end_time(datetime(2026, 11, 1, 12, tzinfo=timezone.utc))
+    c.set_end_time(ends_in_hours=2)
+    c.set_end_time(None)
     c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
     c.set_browser_proxy(None)
     c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})
@@ -1375,6 +1381,8 @@ def exercise_everything(client: mc.Client) -> None:
     client.api_keys.list()
     client.api_keys.create()
     client.api_keys.create(name="ci", workspace_id="wsp-1")
+    client.api_keys.create(expires_at="2026-11-01T12:00:00Z", computer_ids=["vm-1"])
+    client.api_keys.create(expires_in_hours=24)
     client.api_keys.revoke(API_KEY["id"])
     # The account's workspaces, read only (OPL-5057).
     client.workspaces.list()
@@ -1431,6 +1439,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     )
     await client.computers.create(size="small")
     await client.computers.create(template="base", workspace_id="wsp-0123456789ab")
+    # An end time, as a time and as hours from now.
+    await client.computers.create(template="base", ends_at="2026-11-01T12:00:00Z")
+    await client.computers.create(template="base", ends_in_hours=1.5)
     await client.computers.create(
         template="base",
         secrets=[
@@ -1550,6 +1561,9 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.credits.read(before=7, limit=10)
     await c.set_idle_suspend(15)
     await c.set_idle_suspend(None)
+    await c.set_end_time(datetime(2026, 11, 1, 12, tzinfo=timezone.utc))
+    await c.set_end_time(ends_in_hours=2)
+    await c.set_end_time(None)
     await c.set_browser_proxy({"server": "socks5://127.0.0.1:1080"})
     await c.set_browser_proxy(None)
     await c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})
@@ -1717,6 +1731,8 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.api_keys.list()
     await client.api_keys.create()
     await client.api_keys.create(name="ci", workspace_id="wsp-1")
+    await client.api_keys.create(expires_at="2026-11-01T12:00:00Z", computer_ids=["vm-1"])
+    await client.api_keys.create(expires_in_hours=24)
     await client.api_keys.revoke(API_KEY["id"])
     await client.workspaces.list()
     await client.workspaces.get(WORKSPACE["id"])

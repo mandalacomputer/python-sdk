@@ -85,6 +85,7 @@ LIFECYCLE: list[tuple[str, Call]] = [
     ("rename", lambda _c, vm, k: vm.rename("renamed", idempotency_key=k)),
     ("resize", lambda _c, vm, k: vm.resize(ram_mb=4096, idempotency_key=k)),
     ("set_idle_suspend", lambda _c, vm, k: vm.set_idle_suspend(30, idempotency_key=k)),
+    ("set_end_time", lambda _c, vm, k: vm.set_end_time(ends_in_hours=2, idempotency_key=k)),
     ("set_browser_proxy", lambda _c, vm, k: vm.set_browser_proxy(None, idempotency_key=k)),
     ("relocate", lambda _c, vm, k: vm.relocate(ram_mb=32768, idempotency_key=k)),
     ("delete", lambda _c, vm, k: vm.delete(idempotency_key=k)),

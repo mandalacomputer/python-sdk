@@ -9,6 +9,27 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- Computer end times. `computers.create(...)` and `computers.launch(...)` take
+  `ends_at=` (an aware `datetime` or an RFC 3339 string with a time zone, 10
+  minutes to 366 days ahead) or `ends_in_hours=` (hours from now, fractions
+  allowed), on both clients. At that moment the host stops the computer, as
+  `stop()` would, keeping its disk; it happens once and is then cleared.
+  `Computer.set_end_time(ends_at)` / `set_end_time(ends_in_hours=…)` sets or
+  moves it on an existing computer, and `set_end_time(None)` clears it.
+  `Computer.ends_at` reads it back (`None` when there is none). Sending both
+  forms, a naive `datetime`, a time without a zone or hours that are not a
+  positive number raises `ValueError` before any request. A host that cannot
+  keep end times answers `ConflictError` with reason `unsupported`.
+- Expiring and computer-limited API keys. `api_keys.create(...)` takes
+  `expires_at=` or `expires_in_hours=` (at most 366 days / 8784 hours) and
+  `computer_ids=[...]` (1 to 50 computers the key is confined to). `ApiKey` and
+  `ApiKeyCreated`, and whoami's `key`, carry `expires_at` and `computer_ids`
+  (`None` when the key has no such limit). An expired key is refused with
+  `AuthenticationError` (`API key expired`). A bare string or an empty list for
+  `computer_ids` raises `ValueError` before any request.
+
 ## [0.20.0] - 2026-10-29
 
 ### Added

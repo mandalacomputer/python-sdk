@@ -754,3 +754,67 @@ def test_readme_names_the_permission_as_the_dashboard_does() -> None:
     assert "Manage keys" not in readme
     assert "checkbox" not in readme
     assert "the key's menu → **Allow managing keys**" in " ".join(readme.split())
+
+
+@respx.mock
+def test_create_sends_an_expiry_and_a_computer_list_and_reads_them_back() -> None:
+    answer = {
+        **API_KEY_CREATED,
+        "expires_at": "2026-11-01T12:00:00.000Z",
+        "computer_ids": ["vm-1", "vm-2"],
+    }
+    route = respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=answer))
+    created = client().api_keys.create(
+        expires_at="2026-11-01T12:00:00Z", computer_ids=["vm-1", "vm-2"]
+    )
+    assert json.loads(route.calls.last.request.content) == {
+        "expires_at": "2026-11-01T12:00:00Z",
+        "computer_ids": ["vm-1", "vm-2"],
+    }
+    assert created.expires_at == "2026-11-01T12:00:00.000Z"
+    assert created.computer_ids == ("vm-1", "vm-2")
+    client().api_keys.create(expires_in_hours=24)
+    assert json.loads(route.calls.last.request.content) == {"expires_in_hours": 24}
+
+
+@respx.mock
+def test_a_key_without_limits_reads_as_none() -> None:
+    respx.get(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(
+            200, json=[API_KEY, {**API_KEY, "expires_at": None, "computer_ids": None}]
+        )
+    )
+    for key in client().api_keys.list():
+        assert key.expires_at is None
+        assert key.computer_ids is None
+
+
+@pytest.mark.parametrize("ids", ["vm-1", 7, {"vm-1": True}, ["vm-1", 7]])
+@respx.mock
+def test_list_refuses_an_unreadable_computer_list(ids: object) -> None:
+    respx.get(f"{BASE}/api-keys").mock(
+        return_value=httpx.Response(200, json=[{**API_KEY, "computer_ids": ids}])
+    )
+    with pytest.raises(mc.MandalaError, match="computer_ids"):
+        client().api_keys.list()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"expires_at": "2026-11-01T12:00:00Z", "expires_in_hours": 1}, "not both"),
+        ({"expires_in_hours": 0}, "expires_in_hours"),
+        ({"expires_at": "2026-11-01"}, "RFC 3339"),
+        ({"computer_ids": "vm-1"}, "list of computer ids"),
+        ({"computer_ids": []}, "at least one"),
+        ({"computer_ids": [" vm-1"]}, "no spaces"),
+    ],
+)
+def test_create_refuses_limits_it_can_tell_are_wrong_before_sending(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/api-keys")
+        with pytest.raises(ValueError, match=match):
+            client().api_keys.create(**kwargs)
+        assert not route.called

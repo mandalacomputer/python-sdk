@@ -16,6 +16,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import replace
+from datetime import datetime
 from typing import IO, Any, Literal, overload
 
 from . import _api
@@ -630,6 +631,31 @@ class AsyncComputer(ComputerFields):
         """
         return await self._patch(
             "set_idle_suspend", _api.idle_suspend_body(minutes), idempotency_key
+        )
+
+    async def set_end_time(
+        self,
+        ends_at: datetime | str | None = None,
+        *,
+        ends_in_hours: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> AsyncComputer:
+        """Give this computer an end time, move it, or clear it.
+
+        ``ends_at`` is an aware ``datetime`` or an RFC 3339 string with a time
+        zone, and only has to be in the future; ``ends_in_hours`` is the same
+        as hours from now (more than 0, fractions are fine). Send one or the
+        other, not both; with neither, the end time is cleared and the computer
+        runs until something else stops it.
+
+        At its end time the host stops the computer, as :meth:`stop` would —
+        the disk is kept — and clears the end time. It is one stop, not a
+        schedule: starting the computer again does not bring it back. A host
+        that cannot keep end times raises a
+        :class:`~mandala_computer.ConflictError` with reason ``unsupported``.
+        """
+        return await self._patch(
+            "set_end_time", _api.end_time_body(ends_at, ends_in_hours), idempotency_key
         )
 
     async def set_browser_proxy(

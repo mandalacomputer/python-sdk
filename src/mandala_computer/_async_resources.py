@@ -247,6 +247,8 @@ class AsyncComputers:
         browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         workspace_id: str | None = None,
+        ends_at: datetime | str | None = None,
+        ends_in_hours: float | None = None,
         idempotency_key: str | None = None,
     ) -> AsyncComputer:
         """Provision a computer.
@@ -355,6 +357,17 @@ class AsyncComputers:
         ``https://`` one, or one naming credentials — answers 409 with reason
         ``unsupported``.
 
+        ``ends_at`` gives the computer an end time: an aware ``datetime`` or an
+        RFC 3339 string with a time zone, at least 10 minutes and at most 366
+        days ahead. ``ends_in_hours`` says the same thing as hours from now
+        (fractions are fine); send one or the other, not both. At that moment
+        its host stops the computer, as :meth:`AsyncComputer.stop` would — the disk
+        and everything on it are kept, and it starts again like any stopped
+        computer. It happens once and is then cleared:
+        :attr:`AsyncComputer.ends_at` reads it, and :meth:`AsyncComputer.set_end_time`
+        changes or clears it. A host that cannot keep end times answers 409
+        with reason ``unsupported``.
+
         Returns as soon as the API does — the machine is starting, not ready.
         Follow with :meth:`AsyncComputer.wait_for_guest`.
 
@@ -379,6 +392,8 @@ class AsyncComputers:
             egress_proxy=egress_proxy,
             size=size,
             workspace_id=workspace_id,
+            ends_at=ends_at,
+            ends_in_hours=ends_in_hours,
         )
         return (await self._create(body, idempotency_key))[0]
 
@@ -408,6 +423,8 @@ class AsyncComputers:
         browser_proxy: BrowserProxyArgs | BrowserProxy | NoBrowserProxy | None = None,
         egress_proxy: EgressProxyArgs | EgressProxy | None = None,
         workspace_id: str | None = None,
+        ends_at: datetime | str | None = None,
+        ends_in_hours: float | None = None,
         timeout: float = 180.0,
         poll: float = 3.0,
         idempotency_key: str | None = None,
@@ -495,6 +512,8 @@ class AsyncComputers:
             egress_proxy=egress_proxy,
             size=size,
             workspace_id=workspace_id,
+            ends_at=ends_at,
+            ends_in_hours=ends_in_hours,
         )
         # See the sync twin: the create's key, settled before the create.
         launch_key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
@@ -1517,9 +1536,21 @@ class AsyncApiKeys:
         return [ApiKey.from_api(k, f"API key {i}") for i, k in enumerate(rows)]
 
     async def create(
-        self, *, name: str | None = None, workspace_id: str | None = None
+        self,
+        *,
+        name: str | None = None,
+        workspace_id: str | None = None,
+        expires_at: datetime | str | None = None,
+        expires_in_hours: float | None = None,
+        computer_ids: Sequence[str] | None = None,
     ) -> ApiKeyCreated:
-        body = _api.api_key_body(name, workspace_id)
+        body = _api.api_key_body(
+            name,
+            workspace_id,
+            expires_at=expires_at,
+            expires_in_hours=expires_in_hours,
+            computer_ids=computer_ids,
+        )
         return ApiKeyCreated.from_api(await self._t.json_object("POST", _api.API_KEYS, json=body))
 
     async def revoke(self, key_id: str) -> None:
