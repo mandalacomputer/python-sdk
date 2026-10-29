@@ -2823,6 +2823,62 @@ The platform's refusals keep its `code` on `APIError.code`:
 that says `unsupported`; `True` for `RATE_LIMITED` and a `WORKSPACE_MOVING` move
 in progress.
 
+### Credential gateway
+
+A credential gateway binding lets code inside a computer call one HTTPS API
+with a secret the computer never holds. The computer sends its request to the
+binding's `base_url`, followed by the provider's path, with `Authorization:
+Bearer <placeholder>`; the platform swaps the placeholder for the secret's
+latest value on the way out, over verified TLS to exactly `origin` on port 443,
+for the allowed `methods` on paths under `path_prefix` only. Nothing is
+delivered into the computer, so nothing in it can read the secret.
+
+```python
+computer_id = "vm-..."
+token = client.secrets.set("GITHUB_TOKEN", "github_pat_...")
+binding = client.credential_gateway.create(
+    computer_id,
+    secret_id=token.id,
+    origin="https://api.github.com",
+    path_prefix="/repos/example/project",
+    methods=["GET"],
+)
+# Inside the computer, with any non-browser HTTP client:
+#   curl -H "Authorization: Bearer $PLACEHOLDER" "$BASE_URL/repos/example/project/issues"
+# where BASE_URL is binding.base_url and PLACEHOLDER is binding.placeholder.
+client.credential_gateway.list(computer_id)  # policies and secret ids, never values
+client.credential_gateway.delete(computer_id, binding.id)
+```
+
+Handles have the same three as `c.credential_gateway_bindings()`,
+`c.create_credential_gateway_binding(...)` and
+`c.delete_credential_gateway_binding(binding_id)`, and the async client has
+them all with `await`. Members may list; only owners may create and revoke. A
+computer may have up to eight bindings, each using a secret in the computer's
+workspace or account scope. A binding never changes: revoke it and make
+another. Revoking stops calls not yet sent to the provider; one already sent
+may finish.
+
+Read `base_url` and `placeholder` from the binding rather than writing them
+in. The path prefix matches at a `/` boundary, so `/repos/example` allows
+`/repos/example/issues` but not `/repos/example-two`. Only non-browser HTTP
+clients are supported: no redirects, streaming or WebSocket upgrades, and the
+platform's API reference gives the size and time limits. A call that fails
+after it was sent may still have done its work at the provider, so check
+before retrying. Use a narrowly scoped provider key: the gateway keeps the
+secret out of the computer, not the allowed API calls out of the computer's
+hands.
+
+An empty `secret_id`, an `origin` that is not an exact `https://host` (with a
+path, query, fragment, user, port or IP address), a `path_prefix` that is not a
+canonical absolute path (`//`, `?`, `#`, `.` or `..` segments, spaces), or
+`methods` that are not one to six distinct ones of `GET`, `HEAD`, `POST`,
+`PUT`, `PATCH` and `DELETE` raise `ValueError` before any request. The
+platform answers 400 for a secret not in the computer's scope, 403 where the
+account cannot use the gateway, 409 `ConflictError` when the computer already
+has eight or is changing workspace or host (with `reason: "contention"`: send
+it again), and 503 when the computer's host has no ready gateway.
+
 ### Secrets
 
 The account keeps secrets — API keys, tokens, kubeconfigs — encrypted, and
@@ -4399,7 +4455,8 @@ and [the clipboard](#the-clipboard); [execution records](#stable-execution-reads
 [activities and signals](#activity-and-signals); and the computer
 [event stream](#events). Background commands, deleting a computer with its
 snapshots, snapshot holdings, the usage window, waiting for a computer and
-[public URLs](#public-urls) have `mandala` commands but no `mandala-py` one; see
+[public URLs](#public-urls) and the [credential gateway](#credential-gateway) have
+`mandala` commands but no `mandala-py` one; see
 [Relationship to the other clients](#relationship-to-the-other-clients).
 
 ```sh
@@ -4867,6 +4924,7 @@ several names. Where a client has no way to do it, the cell says so with —.
 | Wait until the computer is ready | `waitForGuest()`, `waitForDesktop()` | `wait_for_guest()`, `wait_for_desktop()` | `wait_for_computer` with `until: "guest"`, which on Linux also waits for the desktop session | `computers wait --until guest` or `--until desktop` | — |
 | The windows after an input action | `{ context: true }` on an input method, e.g. `click(x, y, [], { context: true })` | `context=True` on an input method, e.g. `click(x, y, context=True)` | `context: true` on an input tool | — | — |
 | Public URLs | `publicUrls()`, `createPublicUrl({ port, label, access })`, `updatePublicUrl(urlId, { port, access })`, `deletePublicUrl(urlId)` | `client.public_urls.list(id)`, `.create(id, port, label=…, access=…)`, `.update(id, url_id, port=…, access=…)`, `.delete(id, url_id)`; also handle methods | `list_public_urls`, `create_public_url`, `update_public_url`, `delete_public_url` | `computers urls list`, `create`, `update`, `rm` | — |
+| Credential gateway | `credentialGatewayBindings()`, `createCredentialGatewayBinding({ secretId, origin, pathPrefix, methods })`, `deleteCredentialGatewayBinding(bindingId)` | `client.credential_gateway.list(id)`, `.create(id, secret_id=…, origin=…, path_prefix=…, methods=…)`, `.delete(id, binding_id)`; also handle methods | `list_credential_gateway_bindings`, `create_credential_gateway_binding`, `delete_credential_gateway_binding` | `computers gateway list`, `create`, `rm` | — |
 
 ## Design notes
 

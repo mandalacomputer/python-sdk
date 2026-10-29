@@ -43,6 +43,7 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
+    CredentialGatewayBinding,
     CreditReport,
     EgressProxy,
     EgressProxyArgs,
@@ -75,6 +76,7 @@ from ._models import (
     WorkspaceDeleted,
     WorkspaceMember,
     build_contradiction,
+    credential_gateway_bindings_from_api,
     move_rows,
 )
 from ._sse import SSEEvent
@@ -86,6 +88,7 @@ __all__ = [
     "ApiKeys",
     "Builds",
     "Computers",
+    "CredentialGatewayResource",
     "Credits",
     "Moves",
     "Operations",
@@ -2013,6 +2016,59 @@ class PublicUrlsResource:
         :meth:`~mandala_computer.Computer.delete_public_url`.
         """
         self._t.json_object("DELETE", _api.computer_public_url(computer_id, url_id))
+
+
+class CredentialGatewayResource:
+    """Manage a computer's credential gateway bindings by its ID.
+
+    Available as ``client.credential_gateway``. A binding lets code inside the
+    computer call one HTTPS API with a secret the computer never holds: the
+    platform adds the secret on the way out. These calls are answered without
+    the computer's host, except that a create first checks the host's gateway
+    is ready. Reading needs a member or owner; creating and revoking need an
+    owner.
+    """
+
+    def __init__(self, transport: Transport) -> None:
+        self._t = transport
+
+    def list(self, computer_id: str) -> builtins.list[CredentialGatewayBinding]:
+        """The computer's bindings, oldest first: policies and secret IDs, never values.
+
+        See :meth:`~mandala_computer.Computer.credential_gateway_bindings`.
+        """
+        path = _api.computer_credential_gateway(computer_id)
+        data = self._t.json_object("GET", path)
+        return credential_gateway_bindings_from_api(data, f"GET {path}")
+
+    def create(
+        self,
+        computer_id: str,
+        *,
+        secret_id: str,
+        origin: str,
+        path_prefix: str,
+        methods: Sequence[_api.CredentialGatewayMethod],
+    ) -> CredentialGatewayBinding:
+        """Bind a secret to an HTTPS API for this computer's calls.
+
+        Uses the same validation and errors as
+        :meth:`~mandala_computer.Computer.create_credential_gateway_binding`.
+        """
+        body = _api.credential_gateway_body(
+            secret_id=secret_id, origin=origin, path_prefix=path_prefix, methods=methods
+        )
+        path = _api.computer_credential_gateway(computer_id)
+        data = self._t.json_object("POST", path, json=body)
+        return CredentialGatewayBinding.from_api(data, f"POST {path}")
+
+    def delete(self, computer_id: str, binding_id: str) -> None:
+        """Revoke a binding. See
+        :meth:`~mandala_computer.Computer.delete_credential_gateway_binding`.
+        """
+        self._t.json_object(
+            "DELETE", _api.computer_credential_gateway_binding(computer_id, binding_id)
+        )
 
 
 class SshKeys:

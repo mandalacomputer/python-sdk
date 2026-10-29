@@ -8,6 +8,7 @@ from the shared ``ComputerFields``; paths, payloads, and validation come from
 from __future__ import annotations
 
 import asyncio
+import builtins
 import math
 import os
 import time
@@ -127,6 +128,7 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     ComputerDeletion,
+    CredentialGatewayBinding,
     EgressProxy,
     EgressProxyArgs,
     ExecResult,
@@ -154,6 +156,7 @@ from ._models import (
     WindowResult,
     _optional_result_id,
     answered_operation_id,
+    credential_gateway_bindings_from_api,
     is_unreachable_stub,
     operation_id_of,
     window_contradiction,
@@ -825,6 +828,69 @@ class AsyncComputer(ComputerFields):
         Allowed at any time, an unsettled workspace change included.
         """
         await self._t.json_object("DELETE", _api.computer_public_url(self.id, url_id))
+
+    async def credential_gateway_bindings(self) -> builtins.list[CredentialGatewayBinding]:
+        """The secrets bound to HTTPS APIs for this computer's calls, oldest first.
+
+        See :class:`~mandala_computer.CredentialGatewayBinding`. Policies and
+        secret IDs only, never a value. Members and owners may read them.
+        """
+        path = _api.computer_credential_gateway(self.id)
+        data = await self._t.json_object("GET", path)
+        return credential_gateway_bindings_from_api(data, f"GET {path}")
+
+    async def create_credential_gateway_binding(
+        self,
+        *,
+        secret_id: str,
+        origin: str,
+        path_prefix: str,
+        methods: Sequence[_api.CredentialGatewayMethod],
+    ) -> CredentialGatewayBinding:
+        """Let this computer call one HTTPS API with a secret it never holds.
+
+        Code inside the computer calls the binding's ``base_url`` followed by
+        the provider's path, with ``Authorization: Bearer <placeholder>`` (the
+        binding's ``placeholder``); the platform replaces it with the latest
+        value of ``secret_id`` as a Bearer credential, over verified TLS to
+        exactly ``origin`` on port 443, for the listed ``methods`` on paths
+        under ``path_prefix`` (at a ``/`` boundary) only. Nothing is delivered
+        to the computer, and nothing in it changes.
+
+        Owners only, at most eight bindings a computer, with a secret in the
+        computer's workspace or account scope, on an account that can use
+        secrets. A binding never changes: revoke it and make another. Only
+        non-browser HTTP clients are supported; no redirects, streaming or
+        WebSocket upgrades. The platform documents its size and time limits.
+
+        A ``secret_id`` that is empty, an ``origin`` that is not an exact HTTPS
+        origin (no path, query, fragment, user or port, and not an IP address),
+        a ``path_prefix`` that is not a canonical absolute path, or ``methods``
+        that are not one to six distinct ones of ``GET``, ``HEAD``, ``POST``,
+        ``PUT``, ``PATCH`` and ``DELETE`` raises :class:`ValueError` before any
+        request. The platform answers 400 for a secret not in the computer's
+        scope, 403 where the account cannot use the gateway, 409 when the
+        computer already has eight or is changing workspace or host (that one
+        with ``reason: "contention"``: send it again), and 503 when the
+        computer's host has no ready gateway.
+        """
+        body = _api.credential_gateway_body(
+            secret_id=secret_id, origin=origin, path_prefix=path_prefix, methods=methods
+        )
+        path = _api.computer_credential_gateway(self.id)
+        data = await self._t.json_object("POST", path, json=body)
+        return CredentialGatewayBinding.from_api(data, f"POST {path}")
+
+    async def delete_credential_gateway_binding(self, binding_id: str) -> None:
+        """Revoke a credential gateway binding. Owners only.
+
+        Calls not yet sent to the provider can no longer use it; one already
+        sent may finish. An unknown ID raises
+        :class:`~mandala_computer.NotFoundError`.
+        """
+        await self._t.json_object(
+            "DELETE", _api.computer_credential_gateway_binding(self.id, binding_id)
+        )
 
     async def secrets(self) -> SecretBindings:
         """The secrets this computer is bound to, and the ``version`` to send back.

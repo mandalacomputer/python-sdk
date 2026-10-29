@@ -9,6 +9,24 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- Credential gateway bindings. `client.credential_gateway.list(computer_id)`,
+  `.create(computer_id, secret_id=…, origin=…, path_prefix=…, methods=[…])`
+  and `.delete(computer_id, binding_id)`, with the same three on `Computer`
+  and `AsyncComputer` (`credential_gateway_bindings()`,
+  `create_credential_gateway_binding(...)`,
+  `delete_credential_gateway_binding(binding_id)`), on both clients. A binding
+  lets code inside a computer call one HTTPS API with a secret the computer
+  never holds: it calls the binding's `base_url` with its `placeholder` as the
+  Bearer token, and the platform sends the secret instead. Answers are
+  `CredentialGatewayBinding`, decoded strictly: a binding without a usable id,
+  origin, path prefix, methods, base URL or placeholder refuses the answer. An
+  empty secret id, an origin that is not an exact `https://host`, a path prefix
+  that is not canonical, or methods that are not one to six distinct ones of
+  `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE` raise `ValueError` before
+  any request.
+
 ### Changed
 
 - `wait_for_desktop` (and so `launch`) probes the desktop session every 0.1

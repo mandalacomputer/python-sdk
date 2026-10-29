@@ -60,6 +60,7 @@ from ._async_resources import (
     AsyncApiKeys,
     AsyncBuilds,
     AsyncComputers,
+    AsyncCredentialGatewayResource,
     AsyncCredits,
     AsyncMoves,
     AsyncOperations,
@@ -142,6 +143,7 @@ from ._models import (
     BuildStep,
     ComputerDeletion,
     ComputerUsage,
+    CredentialGatewayBinding,
     CreditEntry,
     CreditGrant,
     CreditLot,
@@ -218,6 +220,7 @@ from ._resources import (
     ApiKeys,
     Builds,
     Computers,
+    CredentialGatewayResource,
     Credits,
     Moves,
     Operations,
@@ -322,6 +325,7 @@ __all__ = [
     "ConnectionError",
     "ConnectionInterruptedError",
     "CreateOnlyConflictError",
+    "CredentialGatewayBinding",
     "CreditEntry",
     "CreditGrant",
     "CreditLot",
@@ -477,6 +481,7 @@ class Client:
         self.moves = Moves(self._t)
         self.operations = Operations(self._t)
         self.public_urls = PublicUrlsResource(self._t)
+        self.credential_gateway = CredentialGatewayResource(self._t)
         self.snapshots = Snapshots(self._t)
         self.templates = Templates(self._t)
         self.sizes = Sizes(self._t)
@@ -544,6 +549,7 @@ class AsyncClient:
         self.moves = AsyncMoves(self._t)
         self.operations = AsyncOperations(self._t)
         self.public_urls = AsyncPublicUrlsResource(self._t)
+        self.credential_gateway = AsyncCredentialGatewayResource(self._t)
         self.snapshots = AsyncSnapshots(self._t)
         self.templates = AsyncTemplates(self._t)
         self.sizes = AsyncSizes(self._t)
