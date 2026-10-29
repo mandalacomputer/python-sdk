@@ -2827,14 +2827,14 @@ class Computer(ComputerFields):
         as ``{"ok": true}``) is followed by a read, as the lifecycle calls are,
         rather than leaving this handle holding a record with no id.
         """
+        sent = _api.idempotency_headers(idempotency_key)
         start = _api.exchange_start()
         answer, headers = self._t.json_object_with_headers(
-            "PATCH",
-            _api.computer(self.id),
-            json=body,
-            headers=_api.idempotency_headers(idempotency_key),
+            "PATCH", _api.computer(self.id), json=body, headers=sent
         )
-        self._patch_exchange = _api.exchange_end(start, headers)
+        self._patch_exchange = _api.exchange_end(
+            start, headers, _api.timing_key(f"PATCH computers/{self.id}", body, sent)
+        )
         data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):
@@ -3238,6 +3238,11 @@ class Computer(ComputerFields):
         one, or one still there after clearing it, as from a server too old to
         know them — raises :class:`~mandala_computer.MandalaError` naming the
         computer. Nothing is stopped or deleted.
+
+        Resent under the same ``idempotency_key``, the answer is the first
+        call's, and ``ends_in_hours`` is judged by when that call was sent —
+        known when this process sent it within the last hour; otherwise the
+        answer is only checked not to be later than hours from now.
         """
         body = _api.end_time_body(ends_at, ends_in_hours)
         updated = self._patch("set_end_time", body, idempotency_key)

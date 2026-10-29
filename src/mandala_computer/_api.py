@@ -12,11 +12,14 @@ import ipaddress
 import math
 import re
 import shlex
+import threading
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import replace as _with_fields
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -1342,6 +1345,9 @@ class Exchange:
     seconds: float
     server_now: datetime | None = None
     replayed: bool = False
+    #: On a replay, the first request's own exchange, when this process sent
+    #: it and still remembers it (see :func:`exchange_end`); else ``None``.
+    original: Exchange | None = None
 
 
 def exchange_start() -> tuple[datetime, float]:
@@ -1349,9 +1355,56 @@ def exchange_start() -> tuple[datetime, float]:
     return utcnow(), time.monotonic()
 
 
-def exchange_end(start: tuple[datetime, float], headers: Mapping[str, str]) -> Exchange:
+#: The timing of keyed requests that asked for relative times, by
+#: ``(route, idempotency key)``, so a replay of one can be judged by when the
+#: FIRST was sent rather than by now. In this process only, at most
+#: :data:`_TIMINGS_MAX` of them, each for :data:`_TIMINGS_TTL` seconds.
+_TIMINGS: OrderedDict[tuple[str, str], tuple[float, Exchange]] = OrderedDict()
+_TIMINGS_LOCK = threading.Lock()
+_TIMINGS_MAX = 256
+_TIMINGS_TTL = 3600.0
+
+
+def _timing(key: tuple[str, str], ex: Exchange | None = None) -> Exchange | None:
+    """Remember ``ex`` under ``key``, or (without one) recall what was."""
+    now = time.monotonic()
+    with _TIMINGS_LOCK:
+        while _TIMINGS and now - next(iter(_TIMINGS.values()))[0] > _TIMINGS_TTL:
+            _TIMINGS.popitem(last=False)
+        if ex is not None:
+            _TIMINGS[key] = (now, ex)
+            _TIMINGS.move_to_end(key)
+            while len(_TIMINGS) > _TIMINGS_MAX:
+                _TIMINGS.popitem(last=False)
+            return ex
+        entry = _TIMINGS.get(key)
+        return None if entry is None else entry[1]
+
+
+def timing_key(
+    route: str, body: Mapping[str, Any], sent: Mapping[str, str]
+) -> tuple[str, str] | None:
+    """What :func:`exchange_end` remembers a request by: only one asking for
+    a relative end time needs it, so only such a request is remembered."""
+    if body.get("ends_in_hours") is None:
+        return None
+    return route, sent[IDEMPOTENCY_KEY_HEADER]
+
+
+def exchange_end(
+    start: tuple[datetime, float],
+    headers: Mapping[str, str],
+    remember: tuple[str, str] | None = None,
+) -> Exchange:
     """The :class:`Exchange` a request made, from :func:`exchange_start` and the
-    answer's headers."""
+    answer's headers.
+
+    ``remember`` — ``(route, idempotency key)`` — keeps the timing of a request
+    that asked for a relative time, and attaches it as ``original`` to a later
+    replay under the same key, whose answer was measured from that first
+    request. A replay this process has no timing for (another process sent
+    the first, or it has been forgotten) is held to the upper bound alone.
+    """
     began, mono = start
     server_now: datetime | None
     try:
@@ -1360,13 +1413,19 @@ def exchange_end(start: tuple[datetime, float], headers: Mapping[str, str]) -> E
         server_now = None
     if server_now is not None and server_now.tzinfo is None:
         server_now = server_now.replace(tzinfo=timezone.utc)
-    return Exchange(
+    ex = Exchange(
         began=began,
         ended=utcnow(),
         seconds=max(0.0, time.monotonic() - mono),
         server_now=server_now,
         replayed=is_replay(headers),
     )
+    if remember is None:
+        return ex
+    if not ex.replayed:
+        return _timing(remember, ex) or ex
+    original = _timing(remember)
+    return ex if original is None else _with_fields(ex, original=original)
 
 
 def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
@@ -1376,9 +1435,12 @@ def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
     give or take a minute, and earlier by however long the request took. The
     client's clock is not trusted for this — it may be minutes out — and is
     used only when there is no ``Date``, widened by :data:`_NO_DATE_SLACK`
-    either way. A replay was measured from the first request, sent some time
-    before, so it is held to the upper bound alone.
+    either way. A replay was measured from the first request: judged by that
+    request's timing when this process remembers it, and otherwise held to the
+    upper bound alone, since it was sent some time before.
     """
+    if ex.replayed and ex.original is not None:
+        return _relative_window(hours, ex.original)
     span = timedelta(hours=hours)
     if ex.server_now is not None:
         low = ex.server_now + span - _HOURS_SLACK - timedelta(seconds=ex.seconds)
@@ -1413,25 +1475,12 @@ def wants_end_time(body: Mapping[str, Any]) -> bool:
     return body.get("ends_at") is not None or body.get("ends_in_hours") is not None
 
 
-def end_time_gone(answered: object) -> bool:
-    """Whether a computer read back has no end time ahead of it: none, an
-    unreadable one, or one already past."""
-    try:
-        return not isinstance(answered, str) or _moment(answered) <= utcnow()
-    except ValueError:
-        return True
-
-
-def end_time_lapsed(computer_id: str, stopped: bool) -> MandalaError:
-    """The error for a computer launch started just as its end time passed."""
-    fate = (
-        "it has been stopped again"
-        if stopped
-        else f"stopping it again FAILED — stop it yourself ({computer_id} is running)"
-    )
+def end_time_not_started(computer_id: str, status: str) -> MandalaError:
+    """The error for a launch that found its end-timed computer not running."""
     return MandalaError(
-        f"{computer_id}: its end time passed (or was cleared) while launch was starting it, "
-        f"so it would run with none; {fate}"
+        f"{computer_id} is {status}, and launch does not start a computer created with an "
+        "end time: its end time may have passed and stopped it. Call start() if you still "
+        "want it running"
     )
 
 
@@ -1442,8 +1491,8 @@ def is_replay(headers: Mapping[str, str]) -> bool:
 
 
 #: How long a compensating call may take — the revoke of a key minted without
-#: its limits, the stop of a computer started past its end time. Its own budget,
-#: not the caller's: what it undoes is the very thing it exists to prevent.
+#: its limits. Its own budget, not the caller's: what it undoes is the very
+#: thing it exists to prevent.
 CLEANUP_TIMEOUT_SECONDS = 30.0
 
 

@@ -450,24 +450,14 @@ class Computers:
     ) -> tuple[Computer, _api.Exchange]:
         """:meth:`create`, also saying how the request went: when, by
         which clocks, and whether the answer replayed an earlier call's."""
+        sent = _api.idempotency_headers(idempotency_key)
         start = _api.exchange_start()
         data, headers = self._t.json_object_with_headers(
-            "POST", _api.COMPUTERS, json=body, headers=_api.idempotency_headers(idempotency_key)
+            "POST", _api.COMPUTERS, json=body, headers=sent
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return Computer(self._t, record), _api.exchange_end(start, headers)
-
-    def _stop_quietly(self, computer_id: str) -> bool:
-        """Stop a computer launch must not leave running; whether that worked.
-        Its own budget, whatever the caller's."""
-        return _cleanup(
-            lambda: self._t.request(
-                "POST",
-                _api.computer_action(computer_id, "stop"),
-                headers=_api.idempotency_headers(None),
-                timeout=_api.CLEANUP_TIMEOUT_SECONDS,
-                timeout_cap=_api.CLEANUP_TIMEOUT_SECONDS,
-            )
+        return Computer(self._t, record), _api.exchange_end(
+            start, headers, _api.timing_key("POST computers", body, sent)
         )
 
     def launch(
@@ -558,10 +548,12 @@ class Computers:
         attempt's, up to 24 hours old, so launch reads the computer afresh
         before acting on it: a start that attempt reported failed is sent
         again rather than raised again, and a computer stopped or suspended
-        since is started — except one created with an end time that it no
-        longer has: its end time has passed (or was never applied), and
-        starting it again would leave it running with none, so launch raises
-        :class:`~mandala_computer.MandalaError` naming it instead.
+        since is started — except when launch was asked for an end time: a
+        computer created with one is never started by launch once found
+        stopped or suspended (its end time may be what stopped it), and
+        :class:`~mandala_computer.MandalaError` names it instead. Call
+        ``start()`` on it if you still want it running. That includes
+        ``start=False`` with an end time.
         """
         check_wait_args(timeout, poll)
         body = _api.create_body(
@@ -665,14 +657,13 @@ class Computers:
                     or (not start and "running_ram_mb" not in computer.raw)
                 )
             ):
+                # A computer asked to end at a time is never started here: found
+                # stopped, its end time may be what stopped it, and a start
+                # would leave it running past the moment it was meant to end.
+                if _api.wants_end_time(body):
+                    raise _api.end_time_not_started(computer.id, computer.status)
                 remaining()
                 computer.start()
-                # Read back by the start. The end time may have passed between
-                # the check above and the start, and the host cleared it: then
-                # this start made a running computer with none, which is undone.
-                if _api.wants_end_time(body) and _api.end_time_gone(computer.raw.get("ends_at")):
-                    stopped = self._stop_quietly(computer.id)
-                    raise _api.end_time_lapsed(computer.id, stopped)
             computer.wait_until_running(timeout=remaining(), poll=poll)
             computer.wait_for_guest(timeout=remaining(), poll=poll)
             # A bound computer's guest answers seconds before its secrets land,

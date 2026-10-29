@@ -529,35 +529,6 @@ def test_a_replayed_create_is_read_afresh_and_started(monkeypatch, stale):
     )
 
 
-class EndingReplay(Replay):
-    """:class:`Replay` for a computer whose end time is still ahead: every
-    answer carries it, as the platform's do until it passes."""
-
-    def handle(self, request):
-        answer = super().handle(request)
-        body = json.loads(answer.content)
-        if isinstance(body, dict) and "id" in body:
-            body["ends_at"] = "2099-01-01T00:00:00Z"
-        return httpx.Response(answer.status_code, json=body, headers=answer.headers)
-
-
-def test_a_replayed_launch_whose_end_time_is_still_ahead_is_started(monkeypatch):
-    # Only a computer read WITHOUT the end time it was created with is left
-    # stopped; one that still has it is started exactly as before.
-    scenario = EndingReplay({**state("stopped", 0), "ends_at": "2099-01-01T00:00:00Z"})
-    scenario.install(monkeypatch, resources, computers)
-    with (
-        httpx.Client(transport=httpx.MockTransport(scenario.handle)) as http,
-        mc.Client("com_test", base_url=BASE, http_client=http) as client,
-    ):
-        c = client.computers.launch(
-            ends_at="2099-01-01T00:00:00Z", idempotency_key="k-1", timeout=30, poll=0
-        )
-    assert c.status == "running"
-    assert c.ends_at == "2099-01-01T00:00:00Z"
-    assert scenario.starts == 1
-
-
 def test_a_failed_later_stage_carries_the_creates_key():
     # The start's key sent on a create would build a second computer; the
     # create's replays this one, so that is the key the error hands back.
