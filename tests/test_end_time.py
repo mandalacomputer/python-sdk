@@ -583,3 +583,41 @@ def test_a_replayed_relative_create_is_held_to_the_upper_bound_alone() -> None:
     )
     with pytest.raises(mc.MandalaError, match="not the time asked for"):
         client.computers.create(template="base", ends_in_hours=2)
+
+
+@pytest.mark.parametrize("off", [timedelta(seconds=5), timedelta(seconds=-5)])
+@respx.mock
+def test_a_minute_from_now_answered_five_seconds_out_is_refused(off: timedelta) -> None:
+    """With a Date, the window is the server's second-precision stamp, give or
+    take two seconds: five seconds out is not the time asked for."""
+    honest_patch(off)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=1 / 60)
+
+
+@pytest.mark.parametrize("off", [timedelta(seconds=5), timedelta(seconds=-5)])
+@respx.mock
+async def test_an_async_minute_from_now_answered_five_seconds_out_is_refused(
+    off: timedelta,
+) -> None:
+    honest_patch(off)
+    c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        await c.set_end_time(ends_in_hours=1 / 60)
+
+
+@respx.mock
+def test_a_minute_from_now_answered_on_time_is_accepted() -> None:
+    honest_patch()
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    c.set_end_time(ends_in_hours=1 / 60)
+    assert c.ends_at is not None
+
+
+@respx.mock
+def test_a_replay_five_seconds_past_the_upper_bound_is_refused() -> None:
+    replayed_patch(hours_from(-5, 1 / 60), replayed=True)
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=1 / 60, idempotency_key="move-1")

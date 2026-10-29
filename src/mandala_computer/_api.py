@@ -1325,6 +1325,9 @@ def utcnow() -> datetime:
 #: Without the server's own clock to go by, a relative time is held to the
 #: client's, widened by this much either way for a clock set wrong.
 _NO_DATE_SLACK = timedelta(minutes=10)
+#: How far a relative time may sit from the answer's ``Date`` plus the hours:
+#: the platform stamps both to the second, between arrival and answer.
+_DATE_SLACK = timedelta(seconds=2)
 #: A replay without a ``Date`` is held to the client's clock, which reads it a
 #: little after the platform measured it: a few seconds more for that.
 _REPLAY_NO_DATE_SLACK = timedelta(seconds=10)
@@ -1376,8 +1379,10 @@ def exchange_end(start: tuple[datetime, float], headers: Mapping[str, str]) -> E
 def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
     """Where hours from now may land, as the platform turned them into a time.
 
-    By the platform's clock when the answer says what it is: its ``Date``,
-    give or take a minute, and earlier by however long the request took. The
+    By the platform's clock when the answer says what it is: it computed the
+    time between the request's arrival and its ``Date`` stamp, both to the
+    second, so within :data:`_DATE_SLACK` of ``Date`` plus the hours, and
+    earlier by at most however long the request took. The
     client's clock is not trusted for this — it may be minutes out — and is
     used only when there is no ``Date``, widened by :data:`_NO_DATE_SLACK`
     either way.
@@ -1390,8 +1395,8 @@ def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
     """
     span = timedelta(hours=hours)
     if ex.server_now is not None:
-        low = ex.server_now + span - _HOURS_SLACK - timedelta(seconds=ex.seconds)
-        high = ex.server_now + span + _HOURS_SLACK
+        low = ex.server_now + span - timedelta(seconds=ex.seconds) - _DATE_SLACK
+        high = ex.server_now + span + _DATE_SLACK
     else:
         low = ex.began + span - _MOMENT_SLACK - _NO_DATE_SLACK
         high = ex.ended + span + _HOURS_SLACK + _NO_DATE_SLACK

@@ -1064,3 +1064,10 @@ def test_a_cancelled_mint_finishes_its_revoke_before_the_loop_shuts_down() -> No
         respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=API_KEY_CREATED))
         asyncio.run(main())
     assert finished == [True]
+
+
+@respx.mock
+def test_an_expiry_five_seconds_later_by_the_servers_date_is_refused() -> None:
+    minting_server(timedelta(seconds=5))
+    with pytest.raises(mc.MandalaError, match="later than asked"):
+        client().api_keys.create(expires_in_hours=1 / 60)
