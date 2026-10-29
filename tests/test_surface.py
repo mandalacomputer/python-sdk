@@ -68,10 +68,6 @@ BASE = "https://api.test/api/v1"
 # makes a route added upstream show up here as a failing test rather than as a
 # feature nobody noticed.
 UNIMPLEMENTED = {
-    # API-first credential gateway management, without SDK wrappers yet.
-    ("GET", "computers/:id/credential-gateway"),
-    ("POST", "computers/:id/credential-gateway"),
-    ("DELETE", "computers/:id/credential-gateway/:binding"),
     # The OpenAI-shaped door onto the agent loop, which `POST
     # computers/:id/agent` is the front of and this SDK does drive.
     #
@@ -200,6 +196,18 @@ PUBLIC_URLS = {
     "base_domain": "mandala.dev",
     "limit": 2,
     "public_urls": [PUBLIC_URL],
+}
+# A computer's credential gateway binding, and the listing's envelope.
+GATEWAY_BINDING = {
+    "id": "cgw-0123456789abcdef01234567",
+    "computer_id": "vm-1",
+    "secret_id": "csec-0123456789abcdef",
+    "origin": "https://api.example.com",
+    "path_prefix": "/repos/example",
+    "methods": ["GET"],
+    "created_at": "2026-10-29T00:00:00.000Z",
+    "base_url": "http://gateway.invalid/cgw-0123456789abcdef01234567",
+    "placeholder": "placeholder-token",
 }
 SSH_ACCESS = {
     "computer": "vm-1",
@@ -592,6 +600,9 @@ def pattern_for(path: str) -> str:
         # A public URL's id (platform OPL-3753), pinned to the same position.
         if i == 3 and parts[0] == "computers" and parts[2] == "public-urls":
             return ":urlId"
+        # A credential gateway binding's id, pinned to the same position.
+        if i == 3 and parts[0] == "computers" and parts[2] == "credential-gateway":
+            return ":binding"
         # An agent thread's and a background run's id, second segment under
         # `agent` only, as the platform pins them.
         if i == 2 and parts[0] == "agent" and parts[1] == "threads":
@@ -933,6 +944,14 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200 if get else 201, json=PUBLIC_URLS if get else PUBLIC_URL)
     if "/public-urls/" in path:
         return httpx.Response(200, json={"ok": True} if request.method == "DELETE" else PUBLIC_URL)
+    # A computer's credential gateway: the listing and a create on the
+    # collection, an ack on a revoke.
+    if path.endswith("/credential-gateway"):
+        return httpx.Response(
+            200 if get else 201, json={"bindings": [GATEWAY_BINDING]} if get else GATEWAY_BINDING
+        )
+    if "/credential-gateway/" in path:
+        return httpx.Response(200, json={"ok": True})
     if path.endswith("/secrets"):
         return httpx.Response(200, json=SECRET_BINDINGS)
     if path.endswith("/computers"):
@@ -1318,6 +1337,18 @@ def exercise_everything(client: mc.Client) -> None:
     served_by_id = client.public_urls.create(c.id, 3000, label="cool-thing", access="private")
     client.public_urls.update(c.id, served_by_id.id, port=8000, access="public")
     client.public_urls.delete(c.id, served_by_id.id)
+    gateway = {
+        "secret_id": "csec-0123456789abcdef",
+        "origin": "https://api.example.com",
+        "path_prefix": "/repos/example",
+        "methods": ["GET", "POST"],
+    }
+    c.credential_gateway_bindings()
+    bound_api = c.create_credential_gateway_binding(**gateway)
+    c.delete_credential_gateway_binding(bound_api.id)
+    client.credential_gateway.list(c.id)
+    bound_by_id = client.credential_gateway.create(c.id, **gateway)
+    client.credential_gateway.delete(c.id, bound_by_id.id)
     # A computer's secret bindings, read and replaced against the version read.
     bound = c.secrets()
     c.set_secrets(
@@ -1651,6 +1682,18 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     served_by_id = await client.public_urls.create(c.id, 3000, label="cool-thing", access="private")
     await client.public_urls.update(c.id, served_by_id.id, port=8000, access="public")
     await client.public_urls.delete(c.id, served_by_id.id)
+    gateway = {
+        "secret_id": "csec-0123456789abcdef",
+        "origin": "https://api.example.com",
+        "path_prefix": "/repos/example",
+        "methods": ["GET", "POST"],
+    }
+    await c.credential_gateway_bindings()
+    bound_api = await c.create_credential_gateway_binding(**gateway)
+    await c.delete_credential_gateway_binding(bound_api.id)
+    await client.credential_gateway.list(c.id)
+    bound_by_id = await client.credential_gateway.create(c.id, **gateway)
+    await client.credential_gateway.delete(c.id, bound_by_id.id)
     bound = await c.secrets()
     await c.set_secrets(
         [{"secret_id": "csec-0123456789abcdef", "env": "API_TOKEN"}], version=bound.version
@@ -2090,6 +2133,12 @@ def test_retained_path_placeholders_do_not_hide_literal_segments() -> None:
         == "computers/:id/public-urls/:urlId"
     )
     assert pattern_for("/computers/public-urls/start") == "computers/:id/start"
+    # A credential gateway binding's id likewise.
+    assert pattern_for("/computers/vm-1/credential-gateway") == "computers/:id/credential-gateway"
+    assert (
+        pattern_for("/computers/vm-1/credential-gateway/cgw-0123456789abcdef01234567")
+        == "computers/:id/credential-gateway/:binding"
+    )
     # An activity id is an id now that the SDK reaches the route (OPL-5026),
     # and `results` after it stays the literal the platform's pattern has.
     assert (

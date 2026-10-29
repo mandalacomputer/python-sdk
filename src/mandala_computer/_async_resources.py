@@ -23,6 +23,7 @@ from ._models import (
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
+    CredentialGatewayBinding,
     CreditReport,
     EgressProxy,
     EgressProxyArgs,
@@ -55,6 +56,7 @@ from ._models import (
     WorkspaceDeleted,
     WorkspaceMember,
     build_contradiction,
+    credential_gateway_bindings_from_api,
     move_rows,
 )
 
@@ -106,6 +108,7 @@ from ._resources import (
     AgentThreads,
     ApiKeys,
     Builds,
+    CredentialGatewayResource,
     Operations,
     PublicUrlsResource,
     Secrets,
@@ -141,6 +144,7 @@ __all__ = [
     "AsyncApiKeys",
     "AsyncBuilds",
     "AsyncComputers",
+    "AsyncCredentialGatewayResource",
     "AsyncCredits",
     "AsyncMoves",
     "AsyncOperations",
@@ -1440,6 +1444,43 @@ class AsyncPublicUrlsResource:
     create.__doc__ = PublicUrlsResource.create.__doc__
     update.__doc__ = PublicUrlsResource.update.__doc__
     delete.__doc__ = PublicUrlsResource.delete.__doc__
+
+
+class AsyncCredentialGatewayResource:
+    __doc__ = CredentialGatewayResource.__doc__
+
+    def __init__(self, transport: AsyncTransport) -> None:
+        self._t = transport
+
+    async def list(self, computer_id: str) -> builtins.list[CredentialGatewayBinding]:
+        path = _api.computer_credential_gateway(computer_id)
+        data = await self._t.json_object("GET", path)
+        return credential_gateway_bindings_from_api(data, f"GET {path}")
+
+    async def create(
+        self,
+        computer_id: str,
+        *,
+        secret_id: str,
+        origin: str,
+        path_prefix: str,
+        methods: Sequence[_api.CredentialGatewayMethod],
+    ) -> CredentialGatewayBinding:
+        body = _api.credential_gateway_body(
+            secret_id=secret_id, origin=origin, path_prefix=path_prefix, methods=methods
+        )
+        path = _api.computer_credential_gateway(computer_id)
+        data = await self._t.json_object("POST", path, json=body)
+        return CredentialGatewayBinding.from_api(data, f"POST {path}")
+
+    async def delete(self, computer_id: str, binding_id: str) -> None:
+        await self._t.json_object(
+            "DELETE", _api.computer_credential_gateway_binding(computer_id, binding_id)
+        )
+
+    list.__doc__ = CredentialGatewayResource.list.__doc__
+    create.__doc__ = CredentialGatewayResource.create.__doc__
+    delete.__doc__ = CredentialGatewayResource.delete.__doc__
 
 
 class AsyncSshKeys:

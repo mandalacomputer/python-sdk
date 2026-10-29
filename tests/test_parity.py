@@ -71,6 +71,7 @@ PAIRS = [
     (_resources.ApiKeys, _async_resources.AsyncApiKeys),
     (_resources.Operations, _async_resources.AsyncOperations),
     (_resources.PublicUrlsResource, _async_resources.AsyncPublicUrlsResource),
+    (_resources.CredentialGatewayResource, _async_resources.AsyncCredentialGatewayResource),
     (_resources.Workspaces, _async_resources.AsyncWorkspaces),
     (_resources.AgentThreads, _async_resources.AsyncAgentThreads),
     (_resources.AgentRuns, _async_resources.AsyncAgentRuns),

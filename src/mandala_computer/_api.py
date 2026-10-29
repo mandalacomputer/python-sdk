@@ -8,9 +8,11 @@ platform's allowlist would only be checking one of them.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import re
 import shlex
+import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
@@ -3166,6 +3168,142 @@ def public_url_body(
     if not body:
         raise ValueError("an update must name a port, an access, or both")
     return body
+
+
+# --- credential gateway -----------------------------------------------------
+
+
+def computer_credential_gateway(computer_id: str) -> str:
+    """A computer's credential gateway bindings: list with GET, make one with POST."""
+    return computer_action(computer_id, "credential-gateway")
+
+
+def computer_credential_gateway_binding(computer_id: str, binding_id: str) -> str:
+    """One of a computer's credential gateway bindings: revoke it with DELETE."""
+    return f"{computer_credential_gateway(computer_id)}/{seg(binding_id)}"
+
+
+#: An HTTP method a credential gateway binding may allow.
+CredentialGatewayMethod = Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+#: The HTTP methods a credential gateway binding may allow.
+CREDENTIAL_GATEWAY_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+#: The longest origin the platform accepts, in characters.
+CREDENTIAL_GATEWAY_ORIGIN_MAX = 256
+#: The longest path prefix the platform accepts, in characters.
+CREDENTIAL_GATEWAY_PATH_MAX = 4096
+
+
+def _gateway_origin(value: object) -> str:
+    """An exact public ``https://host`` origin, as far as it is knowable here.
+
+    No path, query, fragment, userinfo or port, and a dotted name rather than
+    an IP address: the platform refuses each, and its 400 does not say which
+    part was wrong. Which names resolve publicly is still the platform's check.
+    Sent as given; the platform keeps the origin it normalises it to.
+    """
+    origin = canonical(value, "origin")
+    message = (
+        "origin must be an exact HTTPS origin such as https://api.example.com: "
+        f"no path, query, fragment, user, password or port (got {origin!r})"
+    )
+    if len(origin) > CREDENTIAL_GATEWAY_ORIGIN_MAX or any(
+        ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in origin
+    ):
+        raise ValueError(message)
+    try:
+        parts = urllib.parse.urlsplit(origin)
+        port = parts.port
+    except ValueError:
+        raise ValueError(message) from None
+    host = parts.hostname or ""
+    if (
+        parts.scheme.lower() != "https"
+        or "@" in parts.netloc
+        or port is not None
+        or parts.netloc.endswith(":")
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+        or not host
+        or "[" in parts.netloc
+        or "." not in host
+    ):
+        raise ValueError(message)
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return origin
+    raise ValueError(f"origin must name a host, not an IP address (got {origin!r})")
+
+
+def _gateway_path_prefix(value: object) -> str:
+    """A canonical absolute path prefix: what the platform would accept.
+
+    It starts with ``/`` and not ``//``, has no query, fragment, backslash,
+    whitespace, control or non-ASCII character, no empty segment and no ``.``
+    or ``..`` segment. Percent-encoded separators and dots are refused by the
+    platform as well; that is its 400 to give.
+    """
+    path = canonical(value, "path_prefix")
+    message = (
+        "path_prefix must be a canonical absolute path such as /repos/example: "
+        f"starting with /, without //, ?, #, \\, spaces, or . and .. segments (got {path!r})"
+    )
+    if (
+        not path.startswith("/")
+        or len(path) > CREDENTIAL_GATEWAY_PATH_MAX
+        or "//" in path
+        or any(ch in path for ch in "?#\\")
+        or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in path)
+        or any(part in (".", "..") for part in path.split("/"))
+    ):
+        raise ValueError(message)
+    return path
+
+
+def _gateway_methods(value: object) -> list[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(  # noqa: TRY004
+            f'methods must be a list of HTTP methods, such as ["GET"] (got {type(value).__name__})'
+        )
+    methods = [canonical(m, "methods") for m in value]
+    if not 1 <= len(methods) <= len(CREDENTIAL_GATEWAY_METHODS):
+        raise ValueError(
+            f"methods must name 1 to {len(CREDENTIAL_GATEWAY_METHODS)} HTTP methods "
+            f"(got {len(methods)})"
+        )
+    for method in methods:
+        if method not in CREDENTIAL_GATEWAY_METHODS:
+            raise ValueError(
+                f"methods may use {', '.join(CREDENTIAL_GATEWAY_METHODS)}, in capitals "
+                f"(got {method!r})"
+            )
+    if len(set(methods)) != len(methods):
+        raise ValueError("methods must not repeat a method")
+    return methods
+
+
+def credential_gateway_body(
+    *, secret_id: object, origin: object, path_prefix: object, methods: object
+) -> dict[str, Any]:
+    """``POST computers/:id/credential-gateway``: every field is required.
+
+    Checked here for what is knowable without the platform: the secret id is a
+    non-empty string, the origin an exact HTTPS origin, the path prefix a
+    canonical absolute path and the methods one to six distinct ones from
+    :data:`CREDENTIAL_GATEWAY_METHODS`. Whether the secret exists in the
+    computer's scope, and whether the host's gateway is ready, are the
+    platform's to answer.
+    """
+    secret = canonical(secret_id, "secret_id")
+    if not secret.strip():
+        raise ValueError("secret_id must not be empty")
+    return {
+        "secret_id": secret,
+        "origin": _gateway_origin(origin),
+        "path_prefix": _gateway_path_prefix(path_prefix),
+        "methods": _gateway_methods(methods),
+    }
 
 
 # --- secret bindings --------------------------------------------------------
