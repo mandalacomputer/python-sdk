@@ -240,13 +240,12 @@ class AsyncComputer(ComputerFields):
         rather than leaving this handle holding a record with no id.
         """
         sent = _api.idempotency_headers(idempotency_key)
-        start = _api.exchange_start()
+        remember = _api.timing_key(f"PATCH computers/{self.id}", body, sent)
+        start = _api.exchange_start(remember)
         answer, headers = await self._t.json_object_with_headers(
             "PATCH", _api.computer(self.id), json=body, headers=sent
         )
-        self._patch_exchange = _api.exchange_end(
-            start, headers, _api.timing_key(f"PATCH computers/{self.id}", body, sent)
-        )
+        self._patch_exchange = _api.exchange_end(start, headers, remember)
         data = _api.computer_payload(answer)
         self._operation_id = operation_id_of(data)
         if _api.names_a_computer(data):

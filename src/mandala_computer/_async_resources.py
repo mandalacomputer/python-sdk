@@ -432,14 +432,13 @@ class AsyncComputers:
         """:meth:`create`, also saying how the request went: when, by
         which clocks, and whether the answer replayed an earlier call's."""
         sent = _api.idempotency_headers(idempotency_key)
-        start = _api.exchange_start()
+        remember = _api.timing_key("POST computers", body, sent)
+        start = _api.exchange_start(remember)
         data, headers = await self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=sent
         )
         record = _api.computer_record(data, "POST", _api.COMPUTERS)
-        return AsyncComputer(self._t, record), _api.exchange_end(
-            start, headers, _api.timing_key("POST computers", body, sent)
-        )
+        return AsyncComputer(self._t, record), _api.exchange_end(start, headers, remember)
 
     async def launch(
         self,

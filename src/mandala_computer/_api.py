@@ -1328,6 +1328,9 @@ def utcnow() -> datetime:
 #: Without the server's own clock to go by, a relative time is held to the
 #: client's, widened by this much either way for a clock set wrong.
 _NO_DATE_SLACK = timedelta(minutes=10)
+#: How long, past its send, a request whose answer was lost may have been
+#: carried out — its upper bound when a replay is judged by it.
+_LOST_ANSWER_SLACK = timedelta(minutes=2)
 
 
 @dataclass(frozen=True)
@@ -1348,11 +1351,25 @@ class Exchange:
     #: On a replay, the first request's own exchange, when this process sent
     #: it and still remembers it (see :func:`exchange_end`); else ``None``.
     original: Exchange | None = None
+    #: ``False`` for the record of a request sent and never answered — its
+    #: answer lost on the way back — which is all a replay of it can be held to.
+    answered: bool = True
+    #: Set on the record of a key whose first answer here was itself a replay:
+    #: the original was sent elsewhere, at a time this process cannot know.
+    unknown_origin: bool = False
 
 
-def exchange_start() -> tuple[datetime, float]:
-    """The moment a request goes out, by both clocks; :func:`exchange_end` takes it."""
-    return utcnow(), time.monotonic()
+def exchange_start(remember: tuple[str, str] | None = None) -> tuple[datetime, float]:
+    """The moment a request goes out, by both clocks; :func:`exchange_end` takes it.
+
+    With ``remember`` (see :func:`exchange_end`), the FIRST send under that key
+    is noted before it goes, so that a replay after an answer lost on the way
+    back is still held to when it was sent. A resend does not move it.
+    """
+    began = utcnow()
+    if remember is not None and _timing(remember) is None:
+        _timing(remember, Exchange(began=began, ended=began, seconds=0.0, answered=False))
+    return began, time.monotonic()
 
 
 #: The timing of keyed requests that asked for relative times, by
@@ -1402,8 +1419,12 @@ def exchange_end(
     ``remember`` — ``(route, idempotency key)`` — keeps the timing of a request
     that asked for a relative time, and attaches it as ``original`` to a later
     replay under the same key, whose answer was measured from that first
-    request. A replay this process has no timing for (another process sent
-    the first, or it has been forgotten) is held to the upper bound alone.
+    request. The first exchange's timing is what is kept: a replay never
+    replaces it, so the window a replay is held to does not grow with the
+    delay before it. A replay this process has no timing for (another process
+    sent the first, or it has been forgotten) is held to the upper bound alone,
+    and so is every later one under that key: the record says its origin is
+    unknown, and no retry of this process's is taken for the original.
     """
     began, mono = start
     server_now: datetime | None
@@ -1425,7 +1446,16 @@ def exchange_end(
     if not ex.replayed:
         return _timing(remember, ex) or ex
     original = _timing(remember)
-    return ex if original is None else _with_fields(ex, original=original)
+    if original is not None and not original.answered and original.began == began:
+        # The record is this very send's, and its answer is a replay: the first
+        # was not ours (another process, or forgotten), so its timing is
+        # unknown — and stays so. Marked rather than dropped, so that no later
+        # send of this process is ever taken for the original.
+        _timing(remember, _with_fields(original, unknown_origin=True))
+        return ex
+    if original is None or original.unknown_origin:
+        return ex
+    return _with_fields(ex, original=original)
 
 
 def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
@@ -1442,6 +1472,13 @@ def _relative_window(hours: float, ex: Exchange) -> tuple[datetime, datetime]:
     if ex.replayed and ex.original is not None:
         return _relative_window(hours, ex.original)
     span = timedelta(hours=hours)
+    if not ex.answered:
+        # Sent and never answered: from when it went, by this clock, to that
+        # plus the hours, a minute, and two more for the trip it never finished.
+        return (
+            ex.began + span - _HOURS_SLACK,
+            ex.began + span + _HOURS_SLACK + _LOST_ANSWER_SLACK,
+        )
     if ex.server_now is not None:
         low = ex.server_now + span - _HOURS_SLACK - timedelta(seconds=ex.seconds)
         high = ex.server_now + span + _HOURS_SLACK

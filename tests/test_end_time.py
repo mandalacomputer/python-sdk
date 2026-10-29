@@ -648,3 +648,120 @@ def test_the_timing_memory_is_bounded_and_expires(monkeypatch: pytest.MonkeyPatc
     real = time.monotonic
     monkeypatch.setattr(_api.time, "monotonic", lambda: real() + _api._TIMINGS_TTL + 1)
     assert _api._timing(("r", str(_api._TIMINGS_MAX + 9))) is None
+
+
+# --- the first exchange's window, however late the replay --------------------
+
+
+def late_server(clock: dict[str, timedelta], off: timedelta) -> None:
+    """Answers hours from its now plus ``off`` (wrong when ``off`` is large)
+    the first time a key is seen, and replays that answer after. Its Date, and
+    the client's clock, both read ``clock["now"]`` ahead of real time."""
+    first: dict[str, dict[str, Any]] = {}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        now = datetime.now(timezone.utc) + clock["now"]
+        headers = {"Date": format_datetime(now, usegmt=True)}
+        key = request.headers["Idempotency-Key"]
+        if key in first:
+            headers["Idempotent-Replayed"] = "true"
+        else:
+            hours = json.loads(request.content)["ends_in_hours"]
+            first[key] = {**COMPUTER, "ends_at": (now + timedelta(hours=hours) + off).isoformat()}
+        return httpx.Response(200, json=first[key], headers=headers)
+
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=COMPUTER))
+    respx.patch(f"{BASE}/computers/vm-1").mock(side_effect=answer)
+
+
+@respx.mock
+def test_a_rejected_late_deadline_replayed_half_an_hour_later_stays_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": timedelta(0)}
+    monkeypatch.setattr(_api, "utcnow", lambda: datetime.now(timezone.utc) + clock["now"])
+    late_server(clock, timedelta(minutes=10))
+    c = mc.Client("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=2, idempotency_key="late-1")
+    # Thirty minutes on, by every clock, the same late answer is replayed. Hours
+    # from THEN would cover it; the first exchange's window does not.
+    clock["now"] = timedelta(minutes=30)
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        c.set_end_time(ends_in_hours=2, idempotency_key="late-1")
+
+
+@respx.mock
+async def test_an_async_rejected_late_deadline_replayed_later_stays_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": timedelta(0)}
+    monkeypatch.setattr(_api, "utcnow", lambda: datetime.now(timezone.utc) + clock["now"])
+    late_server(clock, timedelta(minutes=10))
+    c = await mc.AsyncClient("com_test", base_url=BASE).computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        await c.set_end_time(ends_in_hours=2, idempotency_key="late-1")
+    clock["now"] = timedelta(minutes=30)
+    with pytest.raises(mc.MandalaError, match="not the time asked for"):
+        await c.set_end_time(ends_in_hours=2, idempotency_key="late-1")
+
+
+def test_a_replay_of_a_send_whose_answer_was_lost_is_held_to_that_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first send went and its answer never came back: its replay is held
+    to [first send + hours − 1 min, first send + hours + 1 min + 2 min] — not
+    to hours from whenever the resend happened."""
+    clock = {"now": timedelta(0)}
+    monkeypatch.setattr(_api, "utcnow", lambda: datetime.now(timezone.utc) + clock["now"])
+    key = ("PATCH computers/vm-1", "lost-1")
+    body = {"ends_in_hours": 2}
+    first = _api.exchange_start(key)[0]  # sent; the answer never arrives
+    clock["now"] = timedelta(minutes=30)
+    replay = httpx.Headers(
+        {"Idempotent-Replayed": "true", "Date": format_datetime(_api.utcnow(), usegmt=True)}
+    )
+    # A resend does not move the first send's record.
+    ex = _api.exchange_end(_api.exchange_start(key), replay, key)
+    assert ex.original is not None and not ex.original.answered
+    assert ex.original.began == first
+
+    def judged(ends: datetime) -> mc.MandalaError | None:
+        return _api.end_time_refusal("vm-1", body, ends.isoformat(), ex)
+
+    assert judged(first + timedelta(hours=2, seconds=30)) is None
+    assert judged(first + timedelta(hours=2, minutes=2)) is None
+    assert judged(first + timedelta(hours=2, minutes=4)) is not None
+    assert judged(first + timedelta(hours=2, minutes=-2)) is not None
+    # Hours from the resend — what a growing bound would let through.
+    assert judged(_api.utcnow() + timedelta(hours=2)) is not None
+
+
+def test_a_key_whose_original_was_sent_elsewhere_stays_upper_bound_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original went from another process: this one's first send is
+    answered as a replay. Neither it nor any later retry is the original, so
+    each is held to the upper bound alone — never to a retry's own timing."""
+    key = ("PATCH computers/vm-1", "elsewhere-1")
+    body = {"ends_in_hours": 2}
+    elsewhere = _api.utcnow() - timedelta(minutes=20)  # when the original was set
+    answered = (elsewhere + timedelta(hours=2)).isoformat()
+
+    def retry() -> _api.Exchange:
+        headers = httpx.Headers(
+            {"Idempotent-Replayed": "true", "Date": format_datetime(_api.utcnow(), usegmt=True)}
+        )
+        return _api.exchange_end(_api.exchange_start(key), headers, key)
+
+    first = retry()
+    assert first.original is None
+    assert _api.end_time_refusal("vm-1", body, answered, first) is None
+    # A second identical retry, a minute on: still no original — were the
+    # first retry's timing taken for one, twenty minutes early would be refused.
+    real = _api.utcnow
+    monkeypatch.setattr(_api, "utcnow", lambda: real() + timedelta(minutes=1))
+    second = retry()
+    assert second.original is None
+    assert _api.end_time_refusal("vm-1", body, answered, second) is None
+    assert _api._timing(key) is not None and _api._timing(key).unknown_origin  # type: ignore[union-attr]
