@@ -27,6 +27,15 @@ This is the summary you read to decide whether to upgrade.
   `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE` raise `ValueError` before
   any request.
 
+### Changed
+
+- `wait_for_desktop` (and so `launch`) probes the desktop session every 0.1
+  seconds for its first ten "not yet" answers, then ramps from 0.25 seconds to
+  `poll` as before. A computer created with secrets logs its desktop in under a
+  second after its guest answers, and the 0.25s-then-0.5s ramp noticed it up to
+  half a second late; `launch` with secrets now returns about 0.3 to 0.4
+  seconds sooner. A smaller `poll` still caps every sleep.
+
 ## [0.19.0] - 2026-10-28
 
 ### Added

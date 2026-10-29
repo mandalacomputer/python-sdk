@@ -478,7 +478,8 @@ class Computers:
         transport deadlines: this is not a total wall-clock limit on launch.
         ``poll`` is the delay in seconds between polls in every stage, and the
         ceiling for the secrets, browser proxy, egress proxy and desktop stages,
-        which poll 0.25s after their first read and double from there: an answer
+        which poll 0.25s after their first read and double from there (the
+        desktop probes every 0.1s for its first ten answers first): an answer
         that lands just after a read is noticed within moments rather than a
         whole interval later.
 

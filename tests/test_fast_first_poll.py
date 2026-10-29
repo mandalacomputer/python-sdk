@@ -182,10 +182,10 @@ LINUX = {**COMPUTER, "os": "linux", "desktop": "wayland"}
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-async def test_wait_for_desktop_ramps_from_a_quarter_second_to_the_poll(monkeypatch, flavour):
+async def test_wait_for_desktop_probes_fast_then_ramps_to_the_poll(monkeypatch, flavour):
     clock = Clock(
         desktop_platform(
-            lambda n: httpx.Response(200, json=UNFINISHED if n < 6 else GUEST),
+            lambda n: httpx.Response(200, json=UNFINISHED if n < 16 else GUEST),
         )
     )
     clock.install(monkeypatch)
@@ -194,7 +194,7 @@ async def test_wait_for_desktop_ramps_from_a_quarter_second_to_the_poll(monkeypa
         flavour,
         lambda client: handle(flavour, client, LINUX).wait_for_desktop(timeout=60, poll=1.5),
     )
-    assert clock.sleeps == [0.25, 0.5, 1.0, 1.5, 1.5]
+    assert clock.sleeps == [0.1] * 10 + [0.25, 0.5, 1.0, 1.5, 1.5]
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -211,4 +211,4 @@ async def test_wait_for_desktop_waits_out_a_retry_after_rather_than_ramping(monk
         flavour,
         lambda client: handle(flavour, client, LINUX).wait_for_desktop(timeout=60, poll=3),
     )
-    assert clock.sleeps == [0.25, 5.0, 0.5]
+    assert clock.sleeps == [0.1, 5.0, 0.1]

@@ -66,6 +66,7 @@ from ._computer import (
     _clipboard_text,
     _continues,
     _cursor,
+    _desktop_delay,
     _desktop_not_yet,
     _desktop_timeout,
     _desktop_wait_fatal,
@@ -1268,7 +1269,7 @@ class AsyncComputer(ComputerFields):
                 if not _desktop_not_yet(err):
                     delay = _poll_delay(err, poll)
             if delay is None:
-                delay = _ramp_delay(not_yet, poll)
+                delay = _desktop_delay(not_yet, poll)
                 not_yet += 1
             await asyncio.sleep(min(delay, max(deadline - time.monotonic(), 0)))
 

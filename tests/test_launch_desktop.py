@@ -136,24 +136,45 @@ async def wait_for_desktop(rig, flavour, **kwargs):
 @pytest.mark.parametrize(
     ("poll", "sleeps"),
     [
-        (3, [0.25, 0.5, 1, 2, 3, 3]),
-        (0.1, [0.1] * 6),
-        (0, [0] * 6),
+        (3, [0.1] * 10 + [0.25, 0.5, 1, 2, 3, 3]),
+        (0.1, [0.1] * 16),
+        (0.05, [0.05] * 16),
+        (0, [0] * 16),
     ],
 )
-async def test_reasonless_desktop_conflicts_use_the_ramp_and_poll_cap(
+async def test_reasonless_desktop_conflicts_probe_fast_then_ramp_to_the_poll_cap(
     monkeypatch, flavour, poll, sleeps
 ):
     rig = Rig(
         linux(),
         lambda n: (
-            httpx.Response(409, json=NO_DESKTOP) if n <= 6 else httpx.Response(200, json=GUEST)
+            httpx.Response(409, json=NO_DESKTOP) if n <= 16 else httpx.Response(200, json=GUEST)
         ),
     )
     rig.install(monkeypatch)
     await wait_for_desktop(rig, flavour, timeout=60, poll=poll)
-    assert rig.sleeps == sleeps
-    assert rig.probe_times == pytest.approx([sum(sleeps[:n]) for n in range(7)])
+    assert rig.sleeps == pytest.approx(sleeps)
+    assert rig.probe_times == pytest.approx([sum(sleeps[:n]) for n in range(17)])
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+async def test_a_desktop_that_appears_between_probes_is_seen_within_a_fast_poll(
+    monkeypatch, flavour
+):
+    # A bound computer's desktop logs in a fraction of a second after its guest
+    # answers. Ready 0.55s into the wait, it is seen at the next 0.1s probe,
+    # not at the 0.75s that the 0.25s-then-0.5s ramp reached.
+    def probe(n):
+        return (
+            httpx.Response(200, json=GUEST)
+            if rig.now >= 0.55
+            else httpx.Response(409, json=NO_DESKTOP)
+        )
+
+    rig = Rig(linux(), probe)
+    rig.install(monkeypatch)
+    await wait_for_desktop(rig, flavour, timeout=60, poll=3)
+    assert rig.probe_times[-1] == pytest.approx(0.6)
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -173,12 +194,12 @@ async def test_bound_launch_notices_the_desktop_within_its_remaining_budget(monk
         secrets=[{"secret_id": BINDING["secret_id"], "env": "TOKEN"}],
     )
     assert c.secrets_delivering is False
-    assert rig.sleeps == [0.25, 0.25, 0.5]
-    assert rig.probe_times == [0.25, 0.5, 1.0]
+    assert rig.sleeps == pytest.approx([0.25, 0.1, 0.1])
+    assert rig.probe_times == pytest.approx([0.25, 0.35, 0.45])
     assert len([r for r in rig.requests if r.method == "GET"]) == 3
     assert len([r for r in rig.requests if r.url.path == "/api/v1/computers"]) == 1
     assert [max(r.extensions["timeout"].values()) for r in rig.desktop_probes()] == pytest.approx(
-        [0.95, 0.7, 0.2]
+        [0.95, 0.85, 0.75]
     )
 
 
@@ -208,7 +229,7 @@ async def test_desktop_failures_keep_their_delay_without_advancing_the_ramp(
     rig = Rig(linux(), lambda n: answers[n - 1])
     rig.install(monkeypatch)
     await wait_for_desktop(rig, flavour, timeout=60, poll=3)
-    assert rig.sleeps == [0.25, delay, 0.5]
+    assert rig.sleeps == [0.1, delay, 0.1]
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -219,13 +240,13 @@ async def test_desktop_ramp_and_probe_timeouts_respect_the_deadline(monkeypatch,
 
     rig = Rig(linux(), probe)
     rig.install(monkeypatch)
-    with pytest.raises(mc.TimeoutError, match="desktop session was not active within 0.6s"):
-        await wait_for_desktop(rig, flavour, timeout=0.6, poll=3)
-    assert rig.now == pytest.approx(0.6)
-    assert rig.sleeps == pytest.approx([0.25, 0.05])
-    assert rig.probe_times == pytest.approx([0, 0.4])
+    with pytest.raises(mc.TimeoutError, match="desktop session was not active within 0.45s"):
+        await wait_for_desktop(rig, flavour, timeout=0.45, poll=3)
+    assert rig.now == pytest.approx(0.45)
+    assert rig.sleeps == pytest.approx([0.1, 0.05])
+    assert rig.probe_times == pytest.approx([0, 0.25])
     assert [max(r.extensions["timeout"].values()) for r in rig.desktop_probes()] == pytest.approx(
-        [0.6, 0.2]
+        [0.45, 0.2]
     )
 
 
@@ -284,7 +305,7 @@ async def test_desktop_wait_does_not_swallow_an_interrupted_ramp_sleep(monkeypat
     with pytest.raises(type(interruption)) as caught:
         await wait_for_desktop(rig, flavour)
     assert caught.value is interruption
-    assert rig.sleeps == [0.25]
+    assert rig.sleeps == [0.1]
     assert len(rig.desktop_probes()) == 1
 
 
