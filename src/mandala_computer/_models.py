@@ -53,6 +53,7 @@ __all__ = [
     "BuildStep",
     "ComputerDeletion",
     "ComputerUsage",
+    "CredentialGatewayBinding",
     "CreditEntry",
     "CreditGrant",
     "CreditLot",
@@ -3865,6 +3866,103 @@ class PublicUrls:
             public_urls=urls,
             raw=dict(d),
         )
+
+
+# --- credential gateway -----------------------------------------------------
+
+_GATEWAY_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+
+
+def _gateway_text(d: Mapping[str, Any], key: str, where: str) -> str:
+    value = d.get(key)
+    if not isinstance(value, str) or not value:
+        raise MandalaError(f"{where}: a credential gateway binding has no usable {key}")
+    return str.__str__(value)
+
+
+@dataclass(frozen=True)
+class CredentialGatewayBinding:
+    """A secret the platform adds to a computer's calls to one HTTPS API.
+
+    From ``client.credential_gateway.list/create`` or
+    :meth:`~mandala_computer.Computer.credential_gateway_bindings` and
+    :meth:`~mandala_computer.Computer.create_credential_gateway_binding`. The
+    computer never holds the secret: code inside it calls :attr:`base_url`
+    followed by the provider's path, with ``Authorization: Bearer`` and
+    :attr:`placeholder`, and the platform swaps in the secret's latest value on
+    the way out, for :attr:`origin`, :attr:`path_prefix` and :attr:`methods`
+    only. A binding never changes: revoke it and make another to change one.
+    """
+
+    #: ``cgw-`` and twenty-four hex characters: what a revoke names.
+    id: str
+    #: The computer whose calls it serves.
+    computer_id: str
+    #: The secret whose value is sent. Never the value itself.
+    secret_id: str
+    #: The exact HTTPS origin calls go to, such as ``https://api.github.com``.
+    origin: str
+    #: The path every allowed call starts with, matched at a ``/`` boundary.
+    path_prefix: str
+    #: The HTTP methods it allows.
+    methods: builtins.list[str]
+    #: RFC 3339.
+    created_at: str
+    #: The address to call from inside the computer, before the provider's path.
+    base_url: str
+    #: The bearer token to send from inside the computer in place of the secret.
+    placeholder: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(
+        cls, d: Mapping[str, Any], where: str = "credential gateway binding"
+    ) -> CredentialGatewayBinding:
+        """Refuses an answer that is not a whole binding.
+
+        A binding read wrong is one used or revoked wrong: an id that is not
+        there cannot be revoked, and a policy defaulted to nothing would say the
+        computer can reach less, or more, than it can.
+        """
+        methods = d.get("methods")
+        if (
+            not isinstance(methods, list)
+            or not methods
+            or any(not isinstance(m, str) or m not in _GATEWAY_METHODS for m in methods)
+        ):
+            raise MandalaError(f"{where}: a credential gateway binding has no usable methods")
+        return cls(
+            id=_gateway_text(d, "id", where),
+            computer_id=_text(d.get("computer_id")),
+            secret_id=_text(d.get("secret_id")),
+            origin=_gateway_text(d, "origin", where),
+            path_prefix=_gateway_text(d, "path_prefix", where),
+            methods=[str.__str__(m) for m in methods],
+            created_at=_text(d.get("created_at")),
+            base_url=_gateway_text(d, "base_url", where),
+            placeholder=_gateway_text(d, "placeholder", where),
+            raw=dict(d),
+        )
+
+
+def credential_gateway_bindings_from_api(
+    d: Mapping[str, Any], where: str = "credential gateway bindings"
+) -> builtins.list[CredentialGatewayBinding]:
+    """``{"bindings": [...]}``, every row readable, or :class:`MandalaError`.
+
+    A row this client cannot read refuses the whole answer rather than vanish
+    from it: a binding left out of a listing is a credential in use that the
+    caller never saw and so never revokes.
+    """
+    rows = d.get("bindings")
+    if not isinstance(rows, list):
+        raise MandalaError(f"expected credential gateway bindings from {where}")
+    out = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise MandalaError(f"{where}: a credential gateway binding is not an object")
+        out.append(CredentialGatewayBinding.from_api(row, where))
+    return out
 
 
 # --- browser proxy ----------------------------------------------------------

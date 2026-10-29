@@ -11,7 +11,8 @@ from __future__ import annotations
 
 # (method, pattern) with ids replaced by ":id" — mirrors the platform's v1 route table.
 ALLOWED = {
-    # Credential gateway management is API-first; use direct HTTP until wrappers ship.
+    # The credential gateway: a secret added to one computer's calls to one
+    # HTTPS API, listed, made and revoked by the computer's id.
     ("GET", "computers/:id/credential-gateway"),
     ("POST", "computers/:id/credential-gateway"),
     ("DELETE", "computers/:id/credential-gateway/:binding"),
