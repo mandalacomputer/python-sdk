@@ -136,6 +136,8 @@ class FakePlatform:
         self.lose_create = False
         #: Answer creates as a platform that does not know end times.
         self.ignore_end_time = False
+        #: Seconds the next write of a file with this name takes to land.
+        self.put_delay: dict[str, float] = {}
         #: Seconds a create takes to answer (the computer exists meanwhile).
         self.create_delay = 0.0
         #: Seconds a background start takes to answer.
@@ -341,6 +343,16 @@ class FakePlatform:
         if rest == ["uploads"]:
             return self._upload(request, path)
         if request.method == "PUT":
+            delay = self.put_delay.pop(path.name, 0.0)
+            if delay:
+                content = request.content
+
+                async def later() -> httpx.Response:
+                    await asyncio.sleep(delay)
+                    path.write_bytes(content)
+                    return httpx.Response(200, json={"bytes": len(content)})
+
+                return later()  # type: ignore[return-value]
             path.write_bytes(request.content)
             return httpx.Response(200, json={"bytes": len(request.content)})
         if not path.is_file():

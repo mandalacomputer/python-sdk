@@ -1207,3 +1207,61 @@ async def test_a_cancelled_create_whose_answer_was_lost_is_recovered_and_deleted
     # ...and that computer was deleted.
     assert fake.computers == {}
     assert len(fake.calls("DELETE", "/vm-1")) == 1
+
+
+# --- review round 6 -------------------------------------------------------------
+
+
+async def test_a_failed_restore_never_overwrites_the_snapshot(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+    )
+    await session.start()
+    await session.write(Path("good.txt"), io.BytesIO(b"the good snapshot"))
+    await session.aclose()  # saved, then deleted
+    saved = {p.name: p.read_bytes() for p in store.iterdir()}
+    assert saved and fake.computers == {}
+
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    fake.fail_once[("PUT", "files")] = (500, {"error": "boom"})  # the restore's upload
+    with pytest.raises(Exception):  # noqa: B017 - the SDK's start error
+        await resumed.start()
+    # What the runner's cleanup does next.
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await resumed.stop()
+    assert caught.value.context["reason"] == "workspace_not_ready"
+    await resumed.shutdown()
+    await client.delete(resumed)
+    assert {p.name: p.read_bytes() for p in store.iterdir()} == saved
+    assert fake.computers["vm-2"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-2")
+
+
+async def test_a_write_in_flight_when_the_save_captures_is_not_counted_saved(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.put_delay["late.txt"] = 1.0
+    writing = asyncio.ensure_future(session.write(Path("late.txt"), io.BytesIO(b"late")))
+    while not fake.calls("PUT", "/files"):
+        await asyncio.sleep(0.01)  # the write is under way and has not landed
+    await session.stop()  # captures and saves without it
+    await writing
+    assert session.state.workspace_unsaved is True  # type: ignore[attr-defined]
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.start()
+    assert (await resumed.read(Path("late.txt"))).read() == b"late"
+    await resumed.aclose()

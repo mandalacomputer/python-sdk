@@ -56,6 +56,7 @@ What a session supports, and what it refuses rather than approximating:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import functools
 import io
@@ -65,7 +66,7 @@ import posixpath
 import shlex
 import tarfile
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NoReturn, TypeVar
 
@@ -294,17 +295,37 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: copy of the workspace whenever the two differ.
         self._generation = 0
         self._saved_generation: int | None = None
+        #: Changes started and not yet finished, and how many there were when
+        #: the running save captured the workspace.
+        self._in_flight = 0
+        self._in_flight_at_capture = 0
+        #: Set once start() has fully succeeded, a restore included. Until then
+        #: the workspace may be empty or half restored, so it is never saved
+        #: over a snapshot, and the computer is never deleted.
+        self._workspace_ready = False
         #: As saved: whether this computer's disk was already newer than the
         #: snapshot. Read once, since starting the session runs commands too.
         self._resumed_unsaved = state.workspace_unsaved
 
-    def _touch(self) -> None:
-        """Note that the workspace may be about to change."""
+    @contextlib.contextmanager
+    def _mutating(self) -> Iterator[None]:
+        """Around anything that may change the workspace.
+
+        The generation goes up before it starts, and it counts as in flight
+        until it ends, so a save that captures the workspace meanwhile knows it
+        may have missed it. The save's own commands are exempt, and only those.
+        """
         if _SAVING.get() is self:
-            return  # the save's own commands, and only those
+            yield
+            return
         self._generation += 1
         if not isinstance(self.state.snapshot, NoopSnapshot):
             self.state.workspace_unsaved = True
+        self._in_flight += 1
+        try:
+            yield
+        finally:
+            self._in_flight -= 1
 
     @property
     def computer(self) -> AsyncComputer:
@@ -372,7 +393,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         *command: str | Path,
         timeout: float | None = None,
     ) -> ExecResult:
-        self._touch()
+        with self._mutating():
+            return await self._exec_command(*command, timeout=timeout)
+
+    async def _exec_command(
+        self,
+        *command: str | Path,
+        timeout: float | None,
+    ) -> ExecResult:
         argv = [str(part) for part in command]
         line = shlex.join(argv)
         cwd = self.state.manifest.root if self._workspace_root_ready else None
@@ -646,7 +674,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> None:
         _refuse_user(user, op="write")
-        self._touch()
+        with self._mutating():
+            await self._write(path, data)
+
+    async def _write(self, path: Path, data: io.IOBase) -> None:
         payload = data.read()
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
@@ -690,6 +721,8 @@ class MandalaSandboxSession(BaseSandboxSession):
     # --- workspace archives -------------------------------------------------
 
     async def persist_workspace(self) -> io.IOBase:
+        # Captured now: a change still in flight may or may not be in the tar.
+        self._in_flight_at_capture = self._in_flight
         root = self._workspace_root_path()
         error_root = posix_path_for_error(root)
         archive = f"{_GUEST_TMP}/mandala-agents-persist-{uuid.uuid4().hex}.tar"
@@ -743,7 +776,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         return io.BytesIO(restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
-        self._touch()
+        with self._mutating():
+            await self._hydrate(data)
+
+    async def _hydrate(self, data: io.IOBase) -> None:
         root = self._workspace_root_path()
         error_root = posix_path_for_error(root)
         raw = data.read()
@@ -797,7 +833,16 @@ class MandalaSandboxSession(BaseSandboxSession):
         # The whole persist, archive and store both: only a store that returned
         # counts as saved. A failure or a cancellation anywhere leaves it unsaved,
         # and says so in the state a resume reads.
+        if not self._workspace_ready and not isinstance(self.state.snapshot, NoopSnapshot):
+            # The session never finished starting: the workspace may be empty
+            # or half restored, and saving it would replace a good snapshot.
+            raise WorkspaceArchiveReadError(
+                path=posix_path_for_error(self._workspace_root_path()),
+                context={"backend": _BACKEND_ID, "reason": "workspace_not_ready"},
+                retryable=False,
+            )
         started_at = self._generation
+        self._in_flight_at_capture = self._in_flight
         if not isinstance(self.state.snapshot, NoopSnapshot):
             self.state.workspace_unsaved = True
         # Scoped to this call and what it awaits: a write from another task
@@ -807,9 +852,11 @@ class MandalaSandboxSession(BaseSandboxSession):
             await super()._persist_snapshot()
         finally:
             _SAVING.reset(token)
-        # Saved as of when the save began; anything since is not in it.
-        self._saved_generation = started_at
-        self.state.workspace_unsaved = self._generation != started_at
+        # Saved as of when the save began, and only if nothing was mid-change
+        # when the workspace was captured; anything since is not in it.
+        if self._in_flight_at_capture == 0:
+            self._saved_generation = started_at
+        self.state.workspace_unsaved = self._workspace_unsaved()
 
     async def _can_reuse_restorable_snapshot_workspace(self) -> bool:
         if self._resumed_unsaved and self._workspace_state_preserved_on_start():
@@ -824,10 +871,15 @@ class MandalaSandboxSession(BaseSandboxSession):
         return await super()._can_reuse_restorable_snapshot_workspace()
 
     def _workspace_unsaved(self) -> bool:
-        return (
-            not isinstance(self.state.snapshot, NoopSnapshot)
-            and self._saved_generation != self._generation
+        if not self._workspace_ready and self._workspace_state_preserved_on_start():
+            return True  # a kept disk the session never finished starting on
+        return not isinstance(self.state.snapshot, NoopSnapshot) and (
+            not self._workspace_ready or self._saved_generation != self._generation
         )
+
+    async def _after_start(self) -> None:
+        await super()._after_start()
+        self._workspace_ready = True
 
     async def _remove_quietly(self, guest_path: str) -> None:
         try:

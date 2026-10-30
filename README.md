@@ -2590,7 +2590,10 @@ second.
   snapshot store configured, `on_shutdown="delete"` deletes the computer only
   when the store has confirmed a save covering everything the session did;
   if that save failed, was cancelled, never ran, or a command or write came
-  after it, the computer is stopped instead, keeping its disk.
+  after it or was still under way when it captured the workspace, the
+  computer is stopped instead, keeping its disk. A session that never
+  finished starting (a restore that failed, say) never saves over the
+  snapshot and never deletes its computer.
 - **Refused, before anything is created**: manifest users and groups, mount
   entries, and path grants with a `host_path`. Refused when asked for: a
   `user` other than `root` on a command or file call, and PTY sessions (the
