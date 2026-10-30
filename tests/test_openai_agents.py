@@ -2254,3 +2254,32 @@ async def test_a_create_overlapping_client_close_is_deleted(fake: FakePlatform, 
     assert fake.computers == {}
     with pytest.raises(WorkspaceStartError):
         await sandbox_client.create(manifest=manifest(root))
+
+
+# --- review round 29 ------------------------------------------------------------
+
+
+async def test_a_command_start_landing_after_a_suspend_shutdown_leaves_it_stopped(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    fake.start_late_effect = 0.5
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running  # its start is now the client's to finish
+    await session.shutdown()
+    # Something may still reach it, so it was stopped rather than suspended.
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await asyncio.sleep(0.6)  # the start lands, waking it; the cleanup stops it again
+    await sandbox_client._reaper.aclose(5)
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    await sandbox_client.aclose()

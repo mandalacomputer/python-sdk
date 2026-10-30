@@ -337,6 +337,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: Set when shutdown begins: from then on changes are refused.
         self._shut_down = False
         self._shutdown_task: asyncio.Future[None] | None = None
+        #: How shutdown left the computer, once it has.
+        self._released: str | None = None
+        #: Work handed to the client's cleanup and not yet finished.
+        self._unsettled = 0
         #: Bumped before anything that may change the workspace. A save covers
         #: the generation it started at, and the computer's disk is the only
         #: copy of the workspace whenever the two differ.
@@ -528,6 +532,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                     _kill_quietly,
                     self._reaper,
                     f"a command start on computer {self.state.computer_id}",
+                    owner=self,
                 )
             )
             if not settled:
@@ -864,7 +869,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                     if isinstance(error, MandalaError) and not _clean_refusal(error):
                         await self._sweep_new_urls(port, before)
 
-            self._reaper.later(create, remove, f"a public URL create for port {port}", failed)
+            self._reaper.later(
+                create, remove, f"a public URL create for port {port}", failed, owner=self
+            )
             return
         except MandalaError as error:
             if not _clean_refusal(error):
@@ -1297,6 +1304,13 @@ class MandalaSandboxSession(BaseSandboxSession):
         assert self._shutdown_task is not None
         await asyncio.shield(self._shutdown_task)
 
+    async def _settled_late(self) -> None:
+        """After background cleanup finishes: undo what it may have woken."""
+        task = self._shutdown_task
+        if task is not None and task.done() and self._released in ("stop", "suspend"):
+            # It may have reached the computer after shutdown put it down.
+            await _stop_quietly(self._computer)
+
     def _shutdown_now(self) -> asyncio.Future[None]:
         """This session's shutdown task, started if it has not been."""
         if self._shutdown_task is None:
@@ -1342,6 +1356,10 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
             )
             mode = "stop"  # not delete, and not a suspend a late change would wake
+        if mode == "suspend" and self._unsettled:
+            # Something handed to the client's cleanup may still reach the
+            # computer and wake it: stop it instead (a delete stays a delete).
+            mode = "stop"
         # Held across the decision and its action, so no save runs between them.
         async with self._save_lock:
             await self._release(mode)
@@ -1360,7 +1378,9 @@ class MandalaSandboxSession(BaseSandboxSession):
             mode = "stop"
         # The computer first, so that is done whatever happens to the rest; a
         # stopped computer serves nothing, so its URLs can come down after.
-        if not await self._act(mode):
+        gone = await self._act(mode)
+        self._released = "delete" if gone else mode
+        if not gone:
             await self._settle_resolutions()
             await self._remove_public_urls()
 
@@ -1939,15 +1959,25 @@ class _Reaper:
         then: Callable[[_ReadT], Awaitable[object]],
         what: str,
         failed: Callable[[BaseException], Awaitable[object]] | None = None,
+        owner: MandalaSandboxSession | None = None,
     ) -> None:
+        """Finish ``pending`` in the background; ``owner`` counts it as unsettled."""
+        if owner is not None:
+            owner._unsettled += 1
+
         async def run() -> None:
             try:
-                result = await pending
-            except BaseException as error:  # noqa: BLE001 - handed to ``failed``
-                if failed is not None:
-                    await failed(error)
-                return
-            await then(result)
+                try:
+                    result = await pending
+                except BaseException as error:  # noqa: BLE001 - handed to ``failed``
+                    if failed is not None:
+                        await failed(error)
+                else:
+                    await then(result)
+            finally:
+                if owner is not None:
+                    owner._unsettled -= 1
+                    await owner._settled_late()
 
         task = asyncio.ensure_future(run())
         self._tasks[task] = what
@@ -1971,6 +2001,7 @@ async def _after(
     reaper: _Reaper,
     what: str,
     failed: Callable[[BaseException], Awaitable[object]] | None = None,
+    owner: MandalaSandboxSession | None = None,
 ) -> bool:
     """Undo what an abandoned request made: now if it answers soon, later if not.
 
@@ -1981,7 +2012,7 @@ async def _after(
     try:
         result = await asyncio.wait_for(asyncio.shield(pending), _ANSWER_WAIT)
     except asyncio.TimeoutError:
-        reaper.later(pending, then, what, failed)
+        reaper.later(pending, then, what, failed, owner)
         return False
     except MandalaError as error:
         if _clean_refusal(error):

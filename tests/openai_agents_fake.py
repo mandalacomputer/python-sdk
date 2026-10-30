@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds before the next command start reaches the computer (waking it).
+        self.start_late_effect = 0.0
         #: Seconds the next computer start takes to take effect and answer.
         self.power_on_delay = 0.0
         #: Seconds a public URL delete takes.
@@ -243,7 +245,7 @@ class FakePlatform:
             ]
             return httpx.Response(200, json={"ok": True})
         if rest[0] == "exec":
-            return self._exec(request, rest[1:])
+            return self._exec(request, rest[1:], record)
         if rest[0] == "executions":
             return self._execution(request, record["id"], rest[1:])
         if rest[0] == "files":
@@ -296,7 +298,9 @@ class FakePlatform:
 
     # --- commands -------------------------------------------------------------
 
-    def _exec(self, request: httpx.Request, rest: list[str]) -> httpx.Response:
+    def _exec(
+        self, request: httpx.Request, rest: list[str], record: dict[str, Any]
+    ) -> httpx.Response:
         if not rest and request.method == "POST":
             body = json.loads(request.content)
             if not body.get("background"):
@@ -304,6 +308,17 @@ class FakePlatform:
                 return httpx.Response(
                     200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}
                 )
+            if self.start_late_effect:
+                late, self.start_late_effect = self.start_late_effect, 0.0
+
+                async def land_late() -> httpx.Response:
+                    # It reaches the computer only after the delay, and like any
+                    # command it wakes a computer that was put down.
+                    await asyncio.sleep(late)
+                    record["status"] = "running"
+                    return self._start(body)
+
+                return land_late()  # type: ignore[return-value]
             started = self._start(body)
             if self.lose_start:
                 # Started, and the answer lost on the way back.
