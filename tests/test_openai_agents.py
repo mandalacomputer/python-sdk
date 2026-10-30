@@ -1994,3 +1994,22 @@ async def test_a_cancelled_shutdown_still_finishes_and_later_calls_wait_for_it(
     await writing
     await client.delete(session)  # and so does this
     assert len(fake.calls("POST", "/vm-1/stop")) == 1
+
+
+# --- review round 22 ------------------------------------------------------------
+
+
+async def test_a_failed_delete_falls_back_to_removing_urls_and_stopping(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(exposed_ports=(8080,))
+    )
+    await session.start()
+    await session.resolve_exposed_port(8080)
+    fake.fail[("DELETE", "vm-1")] = (500, {"error": "cannot delete"})
+    await session.aclose()
+    fake.fail.clear()
+    assert fake.public_urls["vm-1"] == []
+    assert fake.calls("POST", "/vm-1/stop")
+    assert fake.computers["vm-1"]["status"] == "stopped"

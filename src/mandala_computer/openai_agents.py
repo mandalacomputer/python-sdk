@@ -1273,9 +1273,21 @@ class MandalaSandboxSession(BaseSandboxSession):
             if mode == "delete":
                 try:
                     await computer.delete()
+                    return
                 except NotFoundError:
-                    pass
-                return
+                    return
+                except MandalaError as error:
+                    # Not deleted: it and its URLs are still up. Take them down
+                    # as a stop would, and stop it below.
+                    logger.warning(
+                        "could not delete computer %s on shutdown (%s); removing its "
+                        "public URLs and stopping it instead",
+                        computer.id,
+                        type(error).__name__,
+                    )
+                    mode = "stop"
+                    await self._settle_resolutions()
+                    await self._remove_public_urls()
             if mode == "suspend":
                 try:
                     await computer.suspend()
