@@ -98,7 +98,7 @@ def test_options_parse_by_type_and_refuse_unknown_fields() -> None:
     parsed = BaseSandboxClientOptions.parse({"type": "mandala", "size": "small"})
     assert isinstance(parsed, MandalaSandboxClientOptions)
     assert parsed.size == "small" and parsed.ends_in_hours == 24.0
-    assert parsed.on_shutdown is None  # stop with a snapshot store, delete without
+    assert parsed.on_shutdown == "delete"
     with pytest.raises(ValueError):
         MandalaSandboxClientOptions(image="python:3.14")  # type: ignore[call-arg]
 
@@ -730,9 +730,8 @@ async def test_a_runner_drives_the_session_end_to_end(
     body = sent_create(fake)
     assert str(body.pop("name")).startswith("agents-")
     assert body == {"size": "small", "start": True, "ends_in_hours": 24.0}
-    # The runner keeps a snapshot by default, so by default the computer is
-    # stopped, its disk kept, rather than deleted.
-    assert fake.computers["vm-1"]["status"] == "stopped"
+    # The runner owned the session and saved it, so the computer is gone.
+    assert fake.computers == {}
 
 
 # --- packaging ------------------------------------------------------------------
@@ -1695,34 +1694,35 @@ async def test_a_public_url_made_after_its_request_was_abandoned_is_removed(
     assert fake.public_urls["vm-1"] == []
 
 
-# --- stop by default --------------------------------------------------------------
+# --- the guarded default ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("with_store", "on_shutdown", "deleted"),
+    ("with_store", "saved", "deleted"),
     [
-        (True, None, False),  # a store: stopped, even after a confirmed save
-        (False, None, True),  # no store: deleted
-        (True, "delete", True),  # asked for, after a confirmed save: deleted
+        (True, True, True),  # a store and a confirmed save: deleted
+        (True, False, False),  # a store, no confirmed save: stopped
+        (False, False, True),  # no store: deleted
     ],
 )
-async def test_the_shutdown_default_follows_the_snapshot_store(
+async def test_the_default_deletes_only_after_a_confirmed_save(
     fake: FakePlatform,
     client: MandalaSandboxClient,
     root: Path,
     tmp_path: Path,
     with_store: bool,
-    on_shutdown: str | None,
+    saved: bool,
     deleted: bool,
 ) -> None:
     session = await client.create(
         manifest=manifest(root),
         snapshot=LocalSnapshotSpec(base_path=tmp_path) if with_store else None,
-        options=MandalaSandboxClientOptions(on_shutdown=on_shutdown),  # type: ignore[arg-type]
     )
     await session.start()
     await session.write(Path("work.txt"), io.BytesIO(b"done"))
-    await session.aclose()  # a confirmed save where there is a store
+    if saved:
+        await session.stop()
+    await session.shutdown()
     if deleted:
         assert fake.computers == {}
     else:

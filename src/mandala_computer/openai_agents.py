@@ -215,13 +215,14 @@ class MandalaSandboxClientOptions(BaseSandboxClientOptions):
     any work.
 
     ``on_shutdown`` is what happens to the computer when the session shuts
-    down: ``"delete"`` destroys it and its disk; ``"stop"`` keeps the disk;
-    ``"suspend"`` keeps the disk and the RAM, so a resume picks up running
-    processes as they were. Left as ``None`` it stops the computer when the run
-    has a snapshot store and deletes it when it has none. ``"delete"`` with a
-    store deletes only after a confirmed save of the whole workspace, and
-    files written after that save by background processes you started are
-    lost with it. A kept computer is reattached by
+    down: ``"delete"`` (the default, as with the SDK's other backends)
+    destroys it and its disk; ``"stop"`` keeps the disk; ``"suspend"`` keeps
+    the disk and the RAM, so a resume picks up running processes as they
+    were. With a snapshot store, the delete happens only after the last
+    confirmed save of the whole workspace (otherwise the computer is
+    stopped), and files written after that save by background processes you
+    started are lost with it. Use ``"stop"`` for a run you mean to resume. A
+    kept computer is reattached by
     :meth:`MandalaSandboxClient.resume` and keeps using its plan's disk until
     it is deleted; its end time stops it if nothing else does.
 
@@ -243,7 +244,7 @@ class MandalaSandboxClientOptions(BaseSandboxClientOptions):
     name: str | None = None
     workspace_id: str | None = None
     ends_in_hours: float | None = 24.0
-    on_shutdown: ShutdownMode | None = None
+    on_shutdown: ShutdownMode = "delete"
     exposed_ports: tuple[int, ...] = ()
     public_url_access: Literal["public", "private"] | None = None
     launch_timeout_s: float = Field(default=300.0, gt=0)
@@ -282,7 +283,7 @@ class MandalaSandboxSessionState(SandboxSessionState):
     name: str | None = None
     workspace_id: str | None = None
     ends_in_hours: float | None = None
-    on_shutdown: ShutdownMode | None = None
+    on_shutdown: ShutdownMode = "delete"
     public_url_access: Literal["public", "private"] | None = None
     launch_timeout_s: float = 300.0
     #: Public URLs this session created, by port. Ones that already existed are
@@ -1120,8 +1121,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         if self._shut_down:
             return
         self._shut_down = True
-        has_store = not isinstance(self.state.snapshot, NoopSnapshot)
-        mode = self.state.on_shutdown or ("stop" if has_store else "delete")
+        mode = self.state.on_shutdown
         computer = self._computer
         if mode == "delete" and self._workspace_unsaved():
             # A snapshot store is configured and nothing confirms the workspace

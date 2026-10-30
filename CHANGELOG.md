@@ -19,9 +19,10 @@ This is the summary you read to decide whether to upgrade.
   workspace, exposed ports through public URLs. `MandalaSandboxClientOptions`
   takes `size` (or `template`, `cpu`, `ram_mb`, `disk_gb`), `name`,
   `workspace_id`, `ends_in_hours` (24 by default, `None` for none),
-  `on_shutdown` (`"delete"`, `"stop"` or `"suspend"`; unset, it stops the
-  computer when the session keeps a snapshot, as the runner's do by default,
-  and deletes it when there is none),
+  `on_shutdown` (`"delete"` by default, as with the SDK's other backends,
+  deleting only after the last confirmed save, so files background processes
+  write after it are lost; `"stop"` or `"suspend"` for runs you mean to
+  resume),
   `exposed_ports`, `public_url_access` and `launch_timeout_s`. A saved run
   state resumes onto the same computer when it still exists (starting it if
   stopped or suspended) and onto a new one restored from the snapshot when it

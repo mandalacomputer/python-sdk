@@ -2496,7 +2496,7 @@ is optional, and `options` may be left out of `SandboxRunConfig` altogether:
 | `name` | `agents-<session>` | the computer's name; without one it is named after the session, so a computer left behind can be traced |
 | `workspace_id` | none | the same as for `computers.create()` |
 | `ends_in_hours` | `24` | a safety end time: the platform stops the computer then, keeping its disk, even if the process that made it is gone. Sent with the create, so even a computer left behind stops on its own; an answer without it fails the session, and an unnamed session's computer is found by name and deleted. `None` for none |
-| `on_shutdown` | `None` | what happens to the computer when the session ends: `"delete"`, `"stop"` or `"suspend"`. `None` stops it when the run keeps a snapshot (the runner does by default) and deletes it when there is none |
+| `on_shutdown` | `"delete"` | what happens to the computer when the session ends: `"delete"`, `"stop"` or `"suspend"`. The delete waits for a confirmed save (see below); use `"stop"` for a run you mean to resume |
 | `exposed_ports` | none | ports the SDK may expose, served through [public URLs](#public-urls) |
 | `public_url_access` | the plan's | `"public"` or `"private"` for those URLs |
 | `launch_timeout_s` | `300` | how long creating (or restarting) a computer may take to answer |
@@ -2538,17 +2538,17 @@ ports.
 
 When the runner owns the session it persists the workspace snapshot (if the
 run config has one), shuts the session down, and calls the client's
-`delete()`. Shutting down applies `on_shutdown` once. Left unset, it is
-`"stop"` when the session has a snapshot store, which the runner gives every
-session unless told otherwise, and `"delete"` when it has none: a run's
-computer is kept, stopped, and its end time is the backstop. Set
-`on_shutdown="delete"` for a computer that should not outlive the run.
+`delete()`. Shutting down applies `on_shutdown` once. The default is
+`"delete"`, as with the SDK's other backends: with a snapshot store (the
+runner gives every session one unless told otherwise) the computer is
+deleted only after the last confirmed save, and stopped instead when there
+is none. Files written after that save by background processes you started
+are lost with the computer. Use `on_shutdown="stop"` when you intend to
+resume.
 
 - `"delete"` destroys the computer and its disk. A later resume of the saved
   run state makes a new computer from the same options and restores the
-  workspace from the snapshot. With a snapshot store it deletes only after
-  the last confirmed save; files written after that save by background
-  processes you started are lost with the computer.
+  workspace from the snapshot.
 - `"stop"` keeps the disk. A resume starts the same computer again (and sets
   its end time again), and the workspace is still on it.
 - `"suspend"` keeps the disk and the RAM, so a resume picks up running
