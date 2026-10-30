@@ -2478,3 +2478,32 @@ async def test_a_failed_start_that_was_admitted_anyway_is_stopped_when_it_lands(
     assert record["status"] == "stopped" and record["running_ram_mb"] == 0
     await asyncio.sleep(0.3)
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 36 ------------------------------------------------------------
+
+
+async def test_an_accepted_stop_whose_read_back_failed_still_guards_late_work(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    fake.start_late_effect = 0.5
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    fake.fail_refresh_after_stop = True  # the stop lands; reading it back fails
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await asyncio.sleep(0.6)  # the start lands after shutdown returned
+    await sandbox_client._reaper.aclose(5)
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await sandbox_client.aclose()

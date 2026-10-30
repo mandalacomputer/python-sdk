@@ -146,6 +146,9 @@ class FakePlatform:
         #: Seconds the read after the next stop takes to answer.
         self.slow_refresh_after_stop = 0.0
         self._slow_get: dict[str, float] = {}
+        #: The read after the next stop fails.
+        self.fail_refresh_after_stop = False
+        self._failing_get: set[str] = set()
         #: Seconds before the next command start reaches the computer (waking it).
         self.start_late_effect = 0.0
         #: Seconds the next computer start takes to take effect and answer.
@@ -248,6 +251,9 @@ class FakePlatform:
                 return httpx.Response(200, json={"ok": True})
 
             return later()  # type: ignore[return-value]
+        if rest == ["stop"] and request.method == "POST" and self.fail_refresh_after_stop:
+            self.fail_refresh_after_stop = False
+            self._failing_get.add(record["id"])
         if rest == ["stop"] and request.method == "POST" and self.slow_refresh_after_stop:
             self._slow_get[record["id"]] = self.slow_refresh_after_stop
             self.slow_refresh_after_stop = 0.0
@@ -304,6 +310,9 @@ class FakePlatform:
         return httpx.Response(201, json=record)
 
     def _computer(self, request: httpx.Request, record: dict[str, Any]) -> httpx.Response:
+        if request.method == "GET" and record["id"] in self._failing_get:
+            self._failing_get.discard(record["id"])
+            return httpx.Response(503, json={"error": "a blip"})
         if request.method == "GET" and record["id"] in self._slow_get:
             delay = self._slow_get.pop(record["id"])
 

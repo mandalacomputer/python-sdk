@@ -595,7 +595,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             return result
         finally:
             if not finished and self._shut_down:
-                if self._released in ("stop", "suspend"):
+                if self._released not in (None, "delete"):
                     # Shutdown already put the computer down and this command
                     # reached it anyway: kill it; the stop is applied again as
                     # this leaves.
@@ -1339,7 +1339,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         if self._releasing is None:
             return
         self._settled_after_release = True
-        if self._released in ("stop", "suspend"):
+        if self._released not in (None, "delete"):
             await _stop_quietly(self._computer)
 
     def _shutdown_now(self) -> asyncio.Future[None]:
@@ -1480,8 +1480,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         landed_before = self._settled_after_release
         self._settled_after_release = False
         outcome = await self._act(mode)
-        self._released = outcome
-        if outcome in ("stop", "suspend"):
+        # Anything short of a confirmed delete leaves the computer to watch:
+        # "uncertain" when the action could not be confirmed at all.
+        self._released = outcome or "uncertain"
+        if outcome != "delete":
             woken = self._settled_after_release
             if not woken:
                 # Running, or a start admitted on it (memory held while it
@@ -1540,7 +1542,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             # Stopped with memory still held is a start being admitted, not a
             # stopped computer: it is stopped anyway.
             if await _status_or_none(computer) != "stopped" or not _settled_down(computer):
-                await computer.stop()
+                try:
+                    await computer.stop()
+                except MandalaError as error:
+                    if not _accepted_unread(error):
+                        raise
+                    # The stop was accepted; only reading the computer back
+                    # failed. It counts as stopped.
             return "stop"
         except MandalaError as error:
             # Best effort, like the SDK's own backends: shutdown runs during
@@ -2143,6 +2151,15 @@ async def _kill_quietly(job: AsyncBackgroundCommand) -> bool:
 def _clean_refusal(error: MandalaError) -> bool:
     """A refusal that did nothing: a 4xx answer, not a lost or failed one."""
     return isinstance(error, APIError) and error.status is not None and error.status < 500
+
+
+def _accepted_unread(error: MandalaError) -> bool:
+    """A lifecycle call the platform accepted, whose read-back alone failed.
+
+    The SDK reports that as a plain ``MandalaError`` caused by the read's error,
+    distinct from any failure of the call itself.
+    """
+    return type(error) is MandalaError and isinstance(error.__cause__, MandalaError)
 
 
 def _settled_down(computer: AsyncComputer) -> bool:
