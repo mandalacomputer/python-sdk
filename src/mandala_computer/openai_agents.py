@@ -925,6 +925,17 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._workspace_root_ready = True
 
     async def _persist_snapshot(self) -> None:
+        try:
+            await self._save()
+        except BaseException:
+            # The SDK's own close skips shutdown when stop() raises, which would
+            # leave the computer and its URLs up. Shut down here (it stops rather
+            # than deletes, the save being unconfirmed), then raise the save's
+            # own error. A later shutdown() finds it done.
+            await _shielded(self._shutdown_quietly())
+            raise
+
+    async def _save(self) -> None:
         # The whole persist, archive and store both: only a store that returned
         # counts as saved. A failure or a cancellation anywhere leaves it unsaved.
         if not self._workspace_ready and not isinstance(self.state.snapshot, NoopSnapshot):
@@ -977,6 +988,20 @@ class MandalaSandboxSession(BaseSandboxSession):
     async def _after_start(self) -> None:
         await super()._after_start()
         self._workspace_ready = True
+        # Disk wins here too: a later start of this session (after an idle
+        # suspend, say) treats the workspace as kept, so only ephemeral
+        # manifest entries are applied again and edited files are left alone.
+        self._set_start_state_preserved(True, system=True)
+
+    async def _shutdown_quietly(self) -> None:
+        try:
+            await self.shutdown()
+        except Exception as error:  # noqa: BLE001 - the save's error is the one raised
+            logger.warning(
+                "could not shut down computer %s after a failed save (%s)",
+                self.state.computer_id,
+                type(error).__name__,
+            )
 
     async def _remove_quietly(self, guest_path: str) -> None:
         try:

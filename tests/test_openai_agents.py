@@ -1503,3 +1503,57 @@ async def test_hard_links_expanding_past_the_limit_are_refused(
     assert not list(store.iterdir())
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 12 ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("with_store", [False, True])
+async def test_a_second_start_keeps_an_edited_manifest_file(
+    client: MandalaSandboxClient, root: Path, tmp_path: Path, with_store: bool
+) -> None:
+    from agents.sandbox.entries import File
+
+    snapshot = LocalSnapshotSpec(base_path=tmp_path) if with_store else None
+    session = await client.create(
+        manifest=manifest(root, entries={"config.txt": File(content=b"from the manifest")}),
+        snapshot=snapshot,
+    )
+    await session.start()
+    assert (root / "config.txt").read_bytes() == b"from the manifest"
+    if with_store:
+        await session.stop()  # a save, which the edit below then outdates
+    await session.write(Path("config.txt"), io.BytesIO(b"edited by the agent"))
+    # What the runner does after an idle suspend, or a failed health check.
+    await session.start()
+    assert (root / "config.txt").read_bytes() == b"edited by the agent"
+    await session.aclose()
+
+
+@pytest.mark.parametrize("closing", ["aclose", "async with"])
+async def test_a_failed_save_at_close_still_shuts_down(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path, closing: str
+) -> None:
+    (tmp_path / "a-file").write_text("not a directory")
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=LocalSnapshotSpec(base_path=tmp_path / "a-file" / "store"),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,)),
+    )
+    with pytest.raises(Exception) as caught:
+        if closing == "aclose":
+            await session.start()
+            await session.resolve_exposed_port(8080)
+            await session.aclose()
+        else:
+            async with session:
+                await session.resolve_exposed_port(8080)
+    assert not isinstance(caught.value, ExposedPortUnavailableError)
+    # Not deleted (the save failed), but stopped, with its URL removed.
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []
+    assert not fake.calls("DELETE", "/vm-1")
+    # And a later shutdown finds it done.
+    stops = len(fake.calls("POST", "/vm-1/stop"))
+    await session.shutdown()
+    assert len(fake.calls("POST", "/vm-1/stop")) == stops
