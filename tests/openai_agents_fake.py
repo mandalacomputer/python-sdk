@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: The next public URL create is joined by another caller's on its port.
+        self.foreign_url = False
         #: Seconds the read after the next stop takes to answer.
         self.slow_refresh_after_stop = 0.0
         self._slow_get: dict[str, float] = {}
@@ -583,7 +585,7 @@ class FakePlatform:
         self, computer_id: str, urls: list[dict[str, Any]], body: dict[str, Any]
     ) -> httpx.Response:
         self.url_count += 1
-        label = f"agent-{body['port']}-{len(urls)}"
+        label = body.get("label") or f"agent-{body['port']}-{len(urls)}"
         url = {
             "id": f"pu-{computer_id}-{body['port']}"
             + ("" if self.url_count == 1 else f"-{self.url_count}"),
@@ -597,6 +599,18 @@ class FakePlatform:
             "updated_at": "2026-10-29T00:00:00.000Z",
         }
         urls.append(url)
+        if self.foreign_url:
+            # Somebody else's URL for the same port, made at the same moment.
+            self.foreign_url = False
+            urls.append(
+                {
+                    **url,
+                    "id": f"{url['id']}-foreign",
+                    "label": "someone-else",
+                    "hostname": "someone-else.mandala.dev",
+                    "url": "https://someone-else.mandala.dev",
+                }
+            )
         if self.lose_public_url:
             # Made, and the answer lost on the way back.
             self.lose_public_url = False

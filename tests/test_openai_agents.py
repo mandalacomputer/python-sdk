@@ -454,12 +454,13 @@ async def test_an_exposed_port_is_served_through_a_public_url(
     )
     await session.start()
     endpoint = await session.resolve_exposed_port(8080)
-    assert (endpoint.host, endpoint.port, endpoint.tls) == ("agent-8080-0.mandala.dev", 443, True)
-    assert endpoint.url_for("http") == "https://agent-8080-0.mandala.dev/"
-    assert json.loads(fake.calls("POST", "/public-urls")[0].content) == {
-        "port": 8080,
-        "access": "private",
-    }
+    sent = json.loads(fake.calls("POST", "/public-urls")[0].content)
+    # Labelled for this session, so a URL whose answer is lost is known as its.
+    label = sent.pop("label")
+    assert label.startswith(f"agents-{inner(session).state.session_id.hex[:12]}-8080-")
+    assert sent == {"port": 8080, "access": "private"}
+    assert (endpoint.host, endpoint.port, endpoint.tls) == (f"{label}.mandala.dev", 443, True)
+    assert endpoint.url_for("http") == f"https://{label}.mandala.dev/"
     # Resolved again, the same URL is reused rather than another made.
     assert (await session.resolve_exposed_port(8080)).host == endpoint.host
     assert len(fake.calls("POST", "/public-urls")) == 1
@@ -2420,3 +2421,36 @@ async def test_a_cancelled_start_on_a_kept_computer_is_tracked_like_a_shutdown(
     await sandbox_client._reaper.aclose(5)
     assert fake.computers["vm-1"]["status"] == "stopped"
     await sandbox_client.aclose()
+
+
+# --- review round 34 ------------------------------------------------------------
+
+
+async def test_a_failed_status_read_does_not_skip_the_stop(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    fake.fail_once[("GET", "vm-1")] = (503, {"error": "a blip"})
+    await session.shutdown()
+    assert fake.calls("POST", "/vm-1/stop")
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_someone_elses_url_on_the_same_port_is_never_taken_or_removed(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.lose_public_url = True  # ours is made, its answer lost...
+    fake.foreign_url = True  # ...as another caller makes one on the same port
+    with pytest.raises(ExposedPortUnavailableError):
+        await session.resolve_exposed_port(8080)
+    owned = inner(session).state.public_url_ids[8080]
+    assert len(owned) == 1 and not owned[0].endswith("-foreign")
+    await session.aclose()
+    assert [u["label"] for u in fake.public_urls["vm-1"]] == ["someone-else"]

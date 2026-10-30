@@ -363,7 +363,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: One resolution per port at a time, so a port gets one URL.
         self._port_locks: dict[int, asyncio.Lock] = {}
         #: Ports with a URL create abandoned and not yet answered.
-        self._abandoned_ports: set[int] = set()
+        #: Labels this session gave the public URLs it asked for, by port: how
+        #: a URL whose create answer was lost is known to be this session's.
+        self._url_labels: dict[int, set[str]] = {}
         #: Set once start() has fully succeeded, a restore included. Until then
         #: the workspace may be empty or half restored, so it is never saved
         #: over a snapshot, and the computer is never deleted.
@@ -762,32 +764,38 @@ class MandalaSandboxSession(BaseSandboxSession):
                     },
                     retryable=False,
                 )
-            served = next(
-                (u for u in listing.public_urls if u.port == port and not u.disabled), None
+            candidates = [u for u in listing.public_urls if u.port == port and not u.disabled]
+            mine = self._url_labels.get(port, set())
+            # One this session's earlier, abandoned create made comes first.
+            served = next((u for u in candidates if u.label in mine), None) or next(
+                iter(candidates), None
             )
             wanted = self.state.public_url_access
             if (
                 served is not None
-                and port in self._abandoned_ports
+                and served.label in mine
                 and served.id not in self.state.public_url_ids.get(port, [])
             ):
-                # Most likely what this session's abandoned create made: take it
-                # as the session's own, so shutdown removes it.
+                # Made by this session's abandoned create (it carries the label
+                # the session gave it): take it as the session's own.
                 await _shielded(self._own_url(port, served.id))
             if served is None:
-                before = {u.id for u in listing.public_urls if u.port == port}
+                # A label only this session uses, so a URL whose answer is lost
+                # can be told apart from anyone else's on the same port.
+                label = f"agents-{self.state.session_id.hex[:12]}-{port}-{uuid.uuid4().hex[:6]}"
+                self._url_labels.setdefault(port, set()).add(label)
                 create = asyncio.ensure_future(
-                    self._computer.create_public_url(port, access=wanted)
+                    self._computer.create_public_url(port, label=label, access=wanted)
                 )
                 try:
                     served = await asyncio.shield(create)
                 except asyncio.CancelledError:
-                    await _shielded(self._settle_url(create, port, before))
+                    await _shielded(self._settle_url(create, port, label))
                     raise
                 except MandalaError as error:
                     if not _clean_refusal(error):
                         # It may have been made: find it, so shutdown removes it.
-                        await _shielded(self._adopt_new_url(port, before))
+                        await _shielded(self._adopt_new_url(port, label))
                     raise
                 if not await _shielded(self._own_url(port, served.id)):
                     raise ExposedPortUnavailableError(
@@ -846,9 +854,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                 type(error).__name__,
             )
 
-    async def _settle_url(
-        self, create: asyncio.Future[PublicUrl], port: int, before: set[str]
-    ) -> None:
+    async def _settle_url(self, create: asyncio.Future[PublicUrl], port: int, label: str) -> None:
         """Own what an abandoned URL create made, or remove it when it lands late."""
         try:
             served = await asyncio.wait_for(asyncio.shield(create), _ANSWER_WAIT)
@@ -856,11 +862,9 @@ class MandalaSandboxSession(BaseSandboxSession):
             computer_id = self.state.computer_id
 
             lock = self._port_locks.setdefault(port, asyncio.Lock())
-            self._abandoned_ports.add(port)
 
             async def remove(late: PublicUrl) -> None:
                 async with lock:
-                    self._abandoned_ports.discard(port)
                     if late.id in self.state.public_url_ids.get(port, []):
                         return  # a later resolution took it as the session's own
                     try:
@@ -876,10 +880,9 @@ class MandalaSandboxSession(BaseSandboxSession):
 
             async def failed(error: BaseException) -> None:
                 async with lock:
-                    self._abandoned_ports.discard(port)
                     # Its answer was lost: it may still have made the URL.
                     if isinstance(error, MandalaError) and not _clean_refusal(error):
-                        await self._sweep_new_urls(port, before)
+                        await self._sweep_new_urls(port, label)
 
             self._reaper.later(
                 create, remove, f"a public URL create for port {port}", failed, owner=self
@@ -887,14 +890,14 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         except MandalaError as error:
             if not _clean_refusal(error):
-                await self._adopt_new_url(port, before)
+                await self._adopt_new_url(port, label)
             return
         except Exception:  # noqa: BLE001 - refused before it was sent
             return
         await self._own_url(port, served.id)
 
-    async def _sweep_new_urls(self, port: int, before: set[str]) -> None:
-        """Delete URLs for ``port`` that an abandoned create may have made."""
+    async def _sweep_new_urls(self, port: int, label: str) -> None:
+        """Delete the URL an abandoned create may have made, known by its label."""
         owned = set(self.state.public_url_ids.get(port, []))
         try:
             listing = await asyncio.wait_for(self._computer.public_urls(), _CLEANUP_TIMEOUT)
@@ -908,10 +911,10 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
             return
         for url in listing.public_urls:
-            if url.port == port and url.id not in before and url.id not in owned:
+            if url.port == port and url.label == label and url.id not in owned:
                 await self._remove_url_quietly(port, url.id)
 
-    async def _adopt_new_url(self, port: int, before: set[str]) -> None:
+    async def _adopt_new_url(self, port: int, label: str) -> None:
         """Record a public URL a lost create may have made, as this session's.
 
         Once the session is shutting down, one found is deleted instead.
@@ -928,7 +931,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
             return
         for url in listing.public_urls:
-            if url.port == port and url.id not in before:
+            if url.port == port and url.label == label:
                 await self._own_url(port, url.id)
 
     # --- files ------------------------------------------------------------
@@ -1484,10 +1487,10 @@ class MandalaSandboxSession(BaseSandboxSession):
                     await computer.suspend()
                     return "suspend"
                 except MandalaError as error:
-                    await computer.refresh()
-                    if computer.status == "suspended":
+                    status = await _status_or_none(computer)
+                    if status == "suspended":
                         return "suspend"
-                    if computer.status == "stopped":
+                    if status == "stopped":
                         return "stop"
                     # Not suspendable now: stopping keeps the disk, which is the
                     # part of the session a resume can always rebuild from.
@@ -1496,8 +1499,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                         computer.id,
                         type(error).__name__,
                     )
-            await computer.refresh()
-            if computer.status not in ("stopped",):
+            # The read only saves a needless stop: unless it confirms the
+            # computer is stopped, stop it, whether or not the read worked.
+            if await _status_or_none(computer) != "stopped":
                 await computer.stop()
             return "stop"
         except MandalaError as error:
@@ -2101,6 +2105,15 @@ async def _kill_quietly(job: AsyncBackgroundCommand) -> bool:
 def _clean_refusal(error: MandalaError) -> bool:
     """A refusal that did nothing: a 4xx answer, not a lost or failed one."""
     return isinstance(error, APIError) and error.status is not None and error.status < 500
+
+
+async def _status_or_none(computer: AsyncComputer) -> str | None:
+    """The computer's status, or ``None`` when it cannot be read."""
+    try:
+        await computer.refresh()
+    except MandalaError:
+        return None
+    return computer.status
 
 
 async def _stop_quietly(computer: AsyncComputer) -> None:
