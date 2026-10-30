@@ -1883,3 +1883,58 @@ async def test_a_late_answer_does_not_remove_a_url_a_retry_took(
     await session.aclose()
     await sandbox_client.aclose()
     assert fake.public_urls["vm-1"] == []
+
+
+# --- review round 20 ------------------------------------------------------------
+
+
+async def test_a_write_during_shutdown_is_refused(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    fake.delete_delay = 0.4
+    closing = asyncio.ensure_future(session.shutdown())
+    while not fake.calls("DELETE", "/vm-1"):
+        await asyncio.sleep(0.01)  # the delete is under way
+    with pytest.raises(WorkspaceArchiveWriteError) as caught:
+        await session.write(Path("late.txt"), io.BytesIO(b"too late"))
+    assert caught.value.context["reason"] == "session_shutting_down"
+    with pytest.raises(ExecTransportError):
+        await session.exec("true")
+    await closing
+    assert fake.computers == {}
+
+
+async def test_shutdown_waits_for_a_write_under_way_and_then_keeps_it(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    await session.stop()  # a confirmed save
+    fake.put_delay["late.txt"] = 0.4
+    writing = asyncio.ensure_future(session.write(Path("late.txt"), io.BytesIO(b"landed")))
+    while not fake.calls("PUT", "/files"):
+        await asyncio.sleep(0.01)
+    await session.shutdown()  # waits for the write, which outdates the save
+    await writing
+    assert (root / "late.txt").read_bytes() == b"landed"
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+
+async def test_a_change_that_outlasts_the_drain_wait_keeps_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    session = await client.create(manifest=manifest(root))  # no store: would delete
+    await session.start()
+    fake.put_delay["slow.txt"] = 0.5
+    writing = asyncio.ensure_future(session.write(Path("slow.txt"), io.BytesIO(b"x")))
+    while not fake.calls("PUT", "/files"):
+        await asyncio.sleep(0.01)
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await writing

@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds the next computer delete takes.
+        self.delete_delay = 0.0
         #: With url_delay: publish the URL at once and only delay the answer.
         self.url_publish_first = False
         #: Chunks of the next upload to accept before one fails.
@@ -254,6 +256,14 @@ class FakePlatform:
     def _computer(self, request: httpx.Request, record: dict[str, Any]) -> httpx.Response:
         if request.method == "GET":
             return httpx.Response(200, json=record)
+        if request.method == "DELETE" and self.delete_delay:
+            delay, self.delete_delay = self.delete_delay, 0.0
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                return self._computer(request, record)
+
+            return later()  # type: ignore[return-value]
         if request.method == "DELETE":
             del self.computers[record["id"]]
             for path in self.wipe:

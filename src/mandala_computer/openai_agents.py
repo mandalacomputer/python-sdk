@@ -192,6 +192,9 @@ _ARCHIVE_LIMIT = 2 * 1024 * 1024 * 1024
 #: How much of an archive is held in memory before it spills to a temp file.
 _SPOOL_IN_MEMORY = 64 * 1024 * 1024
 
+#: How long shutdown waits for changes already under way to finish.
+_DRAIN_WAIT = 30.0
+
 #: Where archives are staged inside the computer on the way in and out.
 _GUEST_TMP = "/tmp"
 
@@ -345,17 +348,21 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._workspace_ready = False
 
     @contextlib.contextmanager
-    def _mutating(self) -> Iterator[None]:
+    def _mutating(self, refuse: Callable[[], Exception]) -> Iterator[None]:
         """Around anything that may change the workspace.
 
         The generation goes up before it starts, and it counts as in flight
         until it ends, so a save that captures the workspace meanwhile knows it
         may have missed it. The save's own commands are exempt, and only those.
+        Once shutdown has begun nothing else may change it: ``refuse()`` is
+        raised, since a change landing then could be deleted with the computer.
         """
         save = _SAVING.get()
         if save is not None and save.session is self:
             yield
             return
+        if self._shut_down:
+            raise refuse()
         self._generation += 1
         self._in_flight += 1
         # Saved while this runs, the state must say it is uncertain.
@@ -432,7 +439,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         *command: str | Path,
         timeout: float | None = None,
     ) -> ExecResult:
-        with self._mutating():
+        def refuse() -> Exception:
+            return ExecTransportError(
+                command=[str(part) for part in command],
+                context={"backend": _BACKEND_ID, "reason": "session_shutting_down"},
+                retryable=False,
+            )
+
+        with self._mutating(refuse):
             return await self._exec_command(*command, timeout=timeout)
 
     async def _exec_command(
@@ -899,7 +913,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> None:
         _refuse_user(user, op="write")
-        with self._mutating():
+        with self._mutating(lambda: _closing_write_error(path)):
             await self._write(path, data)
 
     async def _write(self, path: Path, data: io.IOBase) -> None:
@@ -1052,7 +1066,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         return cast(io.IOBase, restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
-        with self._mutating():
+        with self._mutating(lambda: _closing_write_error(self._workspace_root_path())):
             await self._hydrate(data)
 
     async def _hydrate(self, data: io.IOBase) -> None:
@@ -1178,6 +1192,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         # manifest entries are applied again and edited files are left alone.
         self._set_start_state_preserved(True, system=True)
 
+    async def _drained(self) -> bool:
+        """Wait, bounded, for changes already under way to finish."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DRAIN_WAIT
+        while self._in_flight and loop.time() < deadline:
+            await asyncio.sleep(_POLL_FIRST)
+        return not self._in_flight
+
     async def _shutdown_quietly(self) -> None:
         try:
             await self.shutdown()
@@ -1199,9 +1221,18 @@ class MandalaSandboxSession(BaseSandboxSession):
     async def _shutdown_backend(self) -> None:
         if self._shut_down:
             return
-        self._shut_down = True
+        self._shut_down = True  # from here on, changes are refused
         mode = self.state.on_shutdown
         computer = self._computer
+        if not await self._drained():
+            # A change is still landing and could not be waited out: keep the
+            # disk it is landing on.
+            logger.warning(
+                "a change to the workspace of computer %s was still under way at "
+                "shutdown; stopping it instead of deleting it",
+                computer.id,
+            )
+            mode = "stop" if mode == "delete" else mode
         if mode == "delete" and self._workspace_unsaved():
             # A snapshot store is configured and nothing confirms the workspace
             # reached it (the persist failed, was cancelled, or never ran), so
@@ -1720,6 +1751,14 @@ async def _stop_quietly(computer: AsyncComputer) -> None:
             computer.id,
             type(error).__name__,
         )
+
+
+def _closing_write_error(path: Path) -> WorkspaceArchiveWriteError:
+    return WorkspaceArchiveWriteError(
+        path=path,
+        context={"backend": _BACKEND_ID, "reason": "session_shutting_down"},
+        retryable=False,
+    )
 
 
 class _ArchiveTooLarge(Exception):
