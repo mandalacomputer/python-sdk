@@ -401,13 +401,16 @@ class MandalaSandboxSession(BaseSandboxSession):
 
         The generation goes up before it starts, and it counts as in flight
         until it ends, so a save that captures the workspace meanwhile knows it
-        may have missed it. The save's own commands are exempt, and only those.
-        Once shutdown has begun nothing else may change it: ``refuse()`` is
-        raised, since a change landing then could be deleted with the computer.
+        may have missed it. The save's own commands are exempt from that
+        accounting, and only from that: they still reach the computer, so they
+        are counted, refused and followed up like any other operation. Once
+        shutdown has begun nothing else may change it: ``refuse()`` is raised,
+        since a change landing then could be deleted with the computer.
         """
         save = _SAVING.get()
         if save is not None and save.session is self:
-            yield
+            async with self._active(refuse):
+                yield
             return
         async with self._active(refuse):
             self._generation += 1
@@ -1589,8 +1592,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         if outcome != "delete":
             await self._settle_resolutions()
             await self._remove_public_urls()
-            if self._settled_after_release:
-                # Background work landed after the stop: make sure once more.
+            # Background work landed after the stop: make sure once more,
+            # unless another session has taken the computer meanwhile.
+            if self._settled_after_release and not self._held_by_another():
                 await _stop_quietly(self._computer)
 
     async def _put_down(self, mode: ShutdownMode) -> str | None:
@@ -1616,7 +1620,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                 woken = await _status_or_none(self._computer) is not None and not (
                     _settled_down(self._computer)
                 )
-            if woken:
+            if woken and not self._held_by_another():
                 await _stop_quietly(self._computer)
                 self._released = "stop"
         self._settled_after_release = self._settled_after_release or landed_before
@@ -1916,6 +1920,23 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 context={"backend": _BACKEND_ID, "computer_id": state.computer_id},
                 retryable=False,
             )
+
+        if computer is not None:
+            # A previous session's shutdown of this computer may still be under
+            # way: wait for it to finish before taking the computer over, so
+            # its last stops cannot land on the resumed one.
+            previous = self._owners.get(computer.id)
+            pending = previous._shutdown_task if previous is not None else None
+            if pending is not None and not pending.done():
+                try:
+                    await _within(deadline, asyncio.shield(pending))
+                except TimeoutError as error:
+                    _raise_start_error(state, error, "reattach")
+                # Read it again: that shutdown may have changed it.
+                try:
+                    await _within(deadline, computer.refresh())
+                except (MandalaError, TimeoutError) as error:
+                    _raise_start_error(state, error, "reattach")
 
         # Disk wins only for a disk a start finished setting up.
         preserved = computer is not None and state.initialized

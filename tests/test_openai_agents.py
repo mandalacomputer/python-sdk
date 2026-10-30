@@ -2938,3 +2938,49 @@ async def test_late_cleanup_leaves_alone_a_computer_a_new_session_has_taken(
     assert fake.computers["vm-1"]["status"] == "running"  # ...but not the new run's computer
     await resumed.aclose()
     await sandbox_client.aclose()
+
+
+# --- review round 48 ------------------------------------------------------------
+
+
+async def test_a_save_command_outlasting_shutdown_is_followed_up(
+    fake: FakePlatform, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        snapshot=LocalSnapshotSpec(base_path=tmp_path),
+        options=MandalaSandboxClientOptions(on_shutdown="suspend"),
+    )
+    await session.start()
+    fake.start_late_effect = 0.5  # the save's first command lands late, waking it
+    saving = asyncio.ensure_future(session.stop())
+    await asyncio.sleep(0.05)
+    await session.shutdown()  # gives up waiting on the save; stops the computer
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    with pytest.raises(Exception):  # noqa: B017 - the save fails, the session closing
+        await saving
+    await sandbox_client.aclose()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_a_resume_waits_for_the_previous_shutdown_to_finish(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(on_shutdown="stop", exposed_ports=(8080,)),
+    )
+    await session.start()
+    await session.resolve_exposed_port(8080)
+    payload = client.serialize_session_state(session.state)
+    fake.url_delete_delay = 0.5  # the old shutdown is still removing URLs...
+    closing = asyncio.ensure_future(session.shutdown())
+    while fake.computers["vm-1"]["status"] != "stopped":
+        await asyncio.sleep(0.01)
+    resumed = await client.resume(client.deserialize_session_state(payload))  # ...meanwhile
+    assert closing.done()  # it waited for that shutdown
+    await asyncio.sleep(0.3)
+    assert fake.computers["vm-1"]["status"] == "running"
+    await resumed.aclose()
