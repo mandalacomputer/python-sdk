@@ -138,6 +138,10 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: With url_delay: publish the URL at once and only delay the answer.
+        self.url_publish_first = False
+        #: Chunks of the next upload to accept before one fails.
+        self.fail_chunk_at: int | None = None
         self.url_count = 0
         #: The next public URL create makes it, and its answer is lost.
         self.lose_public_url = False
@@ -408,6 +412,11 @@ class FakePlatform:
             return httpx.Response(200, json={"ok": True})
         staged = self.uploads.setdefault(key, bytearray())
         size = int(params["size"])
+        if request.method == "PUT" and self.fail_chunk_at is not None:
+            if self.fail_chunk_at == 0:
+                self.fail_chunk_at = None
+                return httpx.Response(500, json={"error": "chunk lost"})
+            self.fail_chunk_at -= 1
         if request.method == "PUT":
             assert int(params["offset"]) == len(staged)
             staged += request.content
@@ -442,6 +451,16 @@ class FakePlatform:
                     "public_urls": urls,
                 },
             )
+        if request.method == "POST" and self.url_delay and self.url_publish_first:
+            delay, self.url_delay = self.url_delay, 0.0
+            made = self._make_url(computer_id, urls, json.loads(request.content))
+
+            async def answer_later() -> httpx.Response:
+                # Published at once; the answer is what is slow.
+                await asyncio.sleep(delay)
+                return made
+
+            return answer_later()  # type: ignore[return-value]
         if request.method == "POST" and self.url_delay:
             delay, self.url_delay = self.url_delay, 0.0
             content = request.content

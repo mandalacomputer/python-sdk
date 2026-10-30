@@ -1841,3 +1841,45 @@ async def test_a_url_that_lands_after_shutdown_stopped_waiting_is_removed(
     await sandbox_client.aclose()
     assert fake.public_urls["vm-1"] == []
     assert session.state.public_url_ids == {}  # type: ignore[attr-defined]
+
+
+# --- review round 19 ------------------------------------------------------------
+
+
+async def test_an_interrupted_chunked_upload_removes_its_staging(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "FILE_SIZE_LIMIT", 4)
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    fake.fail_chunk_at = 1  # the first 4 MiB chunk lands, the second fails
+    with pytest.raises(WorkspaceArchiveWriteError):
+        await session.write(Path("big.bin"), io.BytesIO(b"z" * (5 * 1024 * 1024)))
+    assert len(fake.calls("PUT", "/files/uploads")) == 2
+    assert fake.calls("DELETE", "/files/uploads")
+    assert fake.uploads == {}
+    await session.aclose()
+
+
+async def test_a_late_answer_does_not_remove_a_url_a_retry_took(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.url_delay = 0.5
+    fake.url_publish_first = True  # the URL exists at once; its answer is slow
+    task = asyncio.ensure_future(session.resolve_exposed_port(8080))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    endpoint = await session.resolve_exposed_port(8080)  # finds it, takes it
+    await asyncio.sleep(0.6)  # the late answer arrives
+    assert [u["hostname"] for u in fake.public_urls["vm-1"]] == [endpoint.host]
+    await session.aclose()
+    await sandbox_client.aclose()
+    assert fake.public_urls["vm-1"] == []

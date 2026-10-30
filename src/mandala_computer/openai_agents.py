@@ -337,6 +337,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._contaminated = state.uncertain
         #: One resolution per port at a time, so a port gets one URL.
         self._port_locks: dict[int, asyncio.Lock] = {}
+        #: Ports with a URL create abandoned and not yet answered.
+        self._abandoned_ports: set[int] = set()
         #: Set once start() has fully succeeded, a restore included. Until then
         #: the workspace may be empty or half restored, so it is never saved
         #: over a snapshot, and the computer is never deleted.
@@ -690,6 +692,14 @@ class MandalaSandboxSession(BaseSandboxSession):
                 (u for u in listing.public_urls if u.port == port and not u.disabled), None
             )
             wanted = self.state.public_url_access
+            if (
+                served is not None
+                and port in self._abandoned_ports
+                and served.id not in self.state.public_url_ids.get(port, [])
+            ):
+                # Most likely what this session's abandoned create made: take it
+                # as the session's own, so shutdown removes it.
+                await _shielded(self._own_url(port, served.id))
             if served is None:
                 before = {u.id for u in listing.public_urls if u.port == port}
                 create = asyncio.ensure_future(
@@ -771,22 +781,31 @@ class MandalaSandboxSession(BaseSandboxSession):
         except asyncio.TimeoutError:
             computer_id = self.state.computer_id
 
+            lock = self._port_locks.setdefault(port, asyncio.Lock())
+            self._abandoned_ports.add(port)
+
             async def remove(late: PublicUrl) -> None:
-                try:
-                    await self._computer.delete_public_url(late.id)
-                except MandalaError as error:
-                    logger.warning(
-                        "could not remove a public URL for port %s on computer %s that "
-                        "was made after its request was abandoned (%s)",
-                        port,
-                        computer_id,
-                        type(error).__name__,
-                    )
+                async with lock:
+                    self._abandoned_ports.discard(port)
+                    if late.id in self.state.public_url_ids.get(port, []):
+                        return  # a later resolution took it as the session's own
+                    try:
+                        await self._computer.delete_public_url(late.id)
+                    except MandalaError as error:
+                        logger.warning(
+                            "could not remove a public URL for port %s on computer %s that "
+                            "was made after its request was abandoned (%s)",
+                            port,
+                            computer_id,
+                            type(error).__name__,
+                        )
 
             async def failed(error: BaseException) -> None:
-                # Its answer was lost: it may still have made the URL.
-                if isinstance(error, MandalaError) and not _clean_refusal(error):
-                    await self._sweep_new_urls(port, before)
+                async with lock:
+                    self._abandoned_ports.discard(port)
+                    # Its answer was lost: it may still have made the URL.
+                    if isinstance(error, MandalaError) and not _clean_refusal(error):
+                        await self._sweep_new_urls(port, before)
 
             self._reaper.later(create, remove, f"a public URL create for port {port}", failed)
             return
@@ -919,12 +938,32 @@ class MandalaSandboxSession(BaseSandboxSession):
         if len(payload) <= FILE_SIZE_LIMIT:
             await self._computer.write_file(guest_path, payload)
             return
-        done = await self._computer.upload_file(guest_path, io.BytesIO(payload), size=len(payload))
         try:
-            # The receipt outlives the upload until it is removed.
-            await self._computer.cancel_file_upload(guest_path, done.upload_id)
-        except MandalaError:
-            logger.debug("could not remove the upload receipt for %s", guest_path)
+            done = await self._computer.upload_file(
+                guest_path, io.BytesIO(payload), size=len(payload)
+            )
+        except BaseException as error:
+            # Chunks already staged stay on the computer's disk until the upload
+            # is cancelled; the SDK tags the error with the upload's id.
+            upload_id = getattr(error, "upload_id", None)
+            if isinstance(upload_id, str):
+                await _shielded(self._cancel_upload_quietly(guest_path, upload_id))
+            raise
+        # The receipt outlives the upload until it is removed.
+        await self._cancel_upload_quietly(guest_path, done.upload_id)
+
+    async def _cancel_upload_quietly(self, guest_path: str, upload_id: str) -> None:
+        try:
+            await asyncio.wait_for(
+                self._computer.cancel_file_upload(guest_path, upload_id), _CLEANUP_TIMEOUT
+            )
+        except Exception as error:  # noqa: BLE001 - reported; the original error is raised
+            logger.warning(
+                "could not remove upload staging for %s on computer %s (%s)",
+                guest_path,
+                self.state.computer_id,
+                type(error).__name__,
+            )
 
     async def running(self) -> bool:
         # A failed read is raised, not taken for "not running": that answer
