@@ -646,6 +646,7 @@ async def test_resume_replaces_a_missing_computer_from_the_snapshot(
 async def test_persist_and_hydrate_round_trip(
     client: MandalaSandboxClient, root: Path, tmp_path: Path
 ) -> None:
+    staged_before = set(Path("/tmp").glob("mandala-agents-*"))
     session = await client.create(manifest=manifest(root))
     await session.start()
     await session.write(Path("a/b/c.txt"), io.BytesIO(b"deep"))
@@ -656,7 +657,7 @@ async def test_persist_and_hydrate_round_trip(
     assert (root / "a" / "b" / "c.txt").read_bytes() == b"deep"
     assert (root / "shortcut").is_symlink()
     # Nothing staged is left in the guest's temporary directory.
-    assert not list(Path("/tmp").glob("mandala-agents-*"))
+    assert set(Path("/tmp").glob("mandala-agents-*")) <= staged_before
     await session.aclose()
 
 
