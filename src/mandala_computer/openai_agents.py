@@ -1585,20 +1585,33 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         if computer is not None and not state.initialized:
             state.workspace_root_ready = False
         if computer is not None:
+            # The session exists, and the client counts it, before the start:
+            # a client closed meanwhile shuts it down too.
+            inner = MandalaSandboxSession(
+                state=state, computer=computer, reaper=self._reaper, live=self._live
+            )
+            inner._set_start_state_preserved(preserved, system=preserved)
             was_running = computer.status == "running"
+            starts: list[asyncio.Future[AsyncComputer]] = []
             try:
-                await _bring_up(computer, state.launch_timeout_s)
+                await _bring_up(computer, state.launch_timeout_s, starts)
                 if not was_running and state.ends_in_hours is not None:
                     await computer.set_end_time(ends_in_hours=state.ends_in_hours)
             except BaseException as error:
                 if not was_running:
                     # This resume started it; a failure or a cancellation after
                     # that must not leave it running, possibly with no end time.
-                    # Stopped, it keeps its disk for the next attempt.
-                    await _shielded(_stop_quietly(computer))
+                    # Stopped, it keeps its disk for the next attempt, and a
+                    # start still on its way is stopped again once it lands.
+                    inner._begin_shutdown(self._undo_start(computer, starts))
+                    assert inner._shutdown_task is not None
+                    await _shielded(inner._shutdown_task)
+                else:
+                    inner._live.discard(inner)
                 if isinstance(error, MandalaError):
                     _raise_start_error(state, error, "start")
                 raise
+            return self._wrap_session(inner, instrumentation=self._instrumentation)
         else:
             state.computer_id = ""
             state.workspace_root_ready = False
@@ -1612,6 +1625,19 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         )
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
+
+    async def _undo_start(
+        self, computer: AsyncComputer, starts: list[asyncio.Future[AsyncComputer]]
+    ) -> None:
+        """Stop a computer a failed resume started, including a start still landing."""
+
+        async def stop(_: object) -> None:
+            await _stop_quietly(computer)
+
+        for start in starts:
+            if not start.done():
+                await _after(start, stop, self._reaper, f"the start of {computer.id}", stop)
+        await _stop_quietly(computer)
 
     async def delete(self, session: SandboxSession) -> SandboxSession:
         """Release the session's computer as its ``on_shutdown`` says, once.
@@ -1744,8 +1770,16 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
 # --- helpers ----------------------------------------------------------------
 
 
-async def _bring_up(computer: AsyncComputer, timeout: float) -> None:
-    """Wait for ``computer`` to be built, start it if nothing is, and wait for its guest."""
+async def _bring_up(
+    computer: AsyncComputer,
+    timeout: float,
+    starts: list[asyncio.Future[AsyncComputer]] | None = None,
+) -> None:
+    """Wait for ``computer`` to be built, start it if nothing is, and wait for its guest.
+
+    The start runs as its own task, kept in ``starts`` when given, so a caller
+    cancelled meanwhile can see whether it is still on its way.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
 
@@ -1755,7 +1789,10 @@ async def _bring_up(computer: AsyncComputer, timeout: float) -> None:
     if computer.status == "building":
         await computer.wait_until_built(timeout=left())
     if computer.status in ("stopped", "suspended") or computer.start_error:
-        await computer.start()
+        start = asyncio.ensure_future(computer.start())
+        if starts is not None:
+            starts.append(start)
+        await asyncio.shield(start)
     if computer.status != "running":
         await computer.wait_until_running(timeout=left())
     await computer.wait_for_guest(timeout=left())
@@ -1879,6 +1916,7 @@ async def _after(
     then: Callable[[_ReadT], Awaitable[object]],
     reaper: _Reaper,
     what: str,
+    failed: Callable[[BaseException], Awaitable[object]] | None = None,
 ) -> bool:
     """Undo what an abandoned request made: now if it answers soon, later if not.
 
@@ -1889,10 +1927,14 @@ async def _after(
     try:
         result = await asyncio.wait_for(asyncio.shield(pending), _ANSWER_WAIT)
     except asyncio.TimeoutError:
-        reaper.later(pending, then, what)
+        reaper.later(pending, then, what, failed)
         return False
     except MandalaError as error:
-        return _clean_refusal(error)
+        if _clean_refusal(error):
+            return True
+        if failed is not None:
+            await failed(error)
+        return False
     except Exception:  # noqa: BLE001 - refused before it was sent
         return True
     return await then(result) is not False

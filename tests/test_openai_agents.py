@@ -2183,3 +2183,34 @@ async def test_client_close_stops_the_computer_before_slow_url_cleanup(
     task = inner(session)._shutdown_task
     assert task is not None and task.done()
     assert "vm-1" in caplog.text
+
+
+# --- review round 27 ------------------------------------------------------------
+
+
+async def test_a_start_landing_after_a_cancelled_resume_is_stopped_again(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = sandbox_client.serialize_session_state(session.state)
+
+    fake.power_on_delay = 0.5  # takes effect after the cleanup's first stop
+    task = asyncio.ensure_future(
+        sandbox_client.resume(sandbox_client.deserialize_session_state(payload))
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert fake.computers["vm-1"]["status"] == "stopped"  # the first stop
+    await asyncio.sleep(0.6)  # the start lands, and is stopped again
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert len(fake.calls("POST", "/vm-1/stop")) >= 3  # close, cleanup, after the start
+    await sandbox_client.aclose()
+    assert fake.computers["vm-1"]["status"] == "stopped"

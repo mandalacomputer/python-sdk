@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds the next computer start takes to take effect and answer.
+        self.power_on_delay = 0.0
         #: Seconds a public URL delete takes.
         self.url_delete_delay = 0.0
         #: Seconds each ranged file read takes.
@@ -225,6 +227,16 @@ class FakePlatform:
         rest = parts[2:]
         if not rest:
             return self._computer(request, record)
+        if rest == ["start"] and request.method == "POST" and self.power_on_delay:
+            delay, self.power_on_delay = self.power_on_delay, 0.0
+
+            async def later() -> httpx.Response:
+                # The start takes effect, and answers, only after the delay.
+                await asyncio.sleep(delay)
+                record["status"] = "running"
+                return httpx.Response(200, json={"ok": True})
+
+            return later()  # type: ignore[return-value]
         if rest in (["start"], ["stop"], ["suspend"]) and request.method == "POST":
             record["status"] = {"start": "running", "stop": "stopped", "suspend": "suspended"}[
                 rest[0]
