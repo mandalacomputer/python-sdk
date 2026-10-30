@@ -2013,3 +2013,34 @@ async def test_a_failed_delete_falls_back_to_removing_urls_and_stopping(
     assert fake.public_urls["vm-1"] == []
     assert fake.calls("POST", "/vm-1/stop")
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 23 ------------------------------------------------------------
+
+
+async def test_a_chunked_upload_past_the_drain_stops_and_does_not_wake(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "FILE_SIZE_LIMIT", 4)
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    fake.chunk_delay = 0.3
+    writing = asyncio.ensure_future(
+        session.write(Path("big.bin"), io.BytesIO(b"z" * (9 * 1024 * 1024)))  # three chunks
+    )
+    while not fake.calls("PUT", "/files/uploads"):
+        await asyncio.sleep(0.01)
+    await session.shutdown()  # the upload outlasts the drain
+    with pytest.raises(WorkspaceArchiveWriteError):
+        await writing  # it stopped at the next chunk
+    fake.chunk_delay = 0.0
+    # Stopped rather than suspended, so a late chunk could not have been waking it,
+    # and no chunk was sent after shutdown began.
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert len(fake.calls("PUT", "/files/uploads")) == 1
+    (cancel,) = fake.calls("DELETE", "/files/uploads")
+    assert cancel.url.params.get("no_wake") == "1"
+    assert fake.uploads == {}

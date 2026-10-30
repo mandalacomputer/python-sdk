@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds each upload chunk takes to land.
+        self.chunk_delay = 0.0
         #: Seconds the next computer delete takes.
         self.delete_delay = 0.0
         #: With url_delay: publish the URL at once and only delay the answer.
@@ -414,7 +416,7 @@ class FakePlatform:
             },
         )
 
-    def _upload(self, request: httpx.Request, path: Path) -> httpx.Response:
+    def _upload(self, request: httpx.Request, path: Path, delayed: bool = False) -> httpx.Response:
         params = request.url.params
         key = f"{params['path']}:{params['upload_id']}"
         if request.method == "DELETE":
@@ -422,6 +424,18 @@ class FakePlatform:
             return httpx.Response(200, json={"ok": True})
         staged = self.uploads.setdefault(key, bytearray())
         size = int(params["size"])
+        if request.method == "PUT" and self.chunk_delay:
+            delay = self.chunk_delay
+            content = request.content
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                return self._upload(
+                    httpx.Request("PUT", request.url, content=content), path, delayed=True
+                )
+
+            if not delayed:
+                return later()  # type: ignore[return-value]
         if request.method == "PUT" and self.fail_chunk_at is not None:
             if self.fail_chunk_at == 0:
                 self.fail_chunk_at = None

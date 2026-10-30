@@ -956,7 +956,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         try:
             done = await self._computer.upload_file(
-                guest_path, io.BytesIO(payload), size=len(payload)
+                guest_path, _StopWhenClosing(payload, lambda: self._shut_down), size=len(payload)
             )
         except BaseException as error:
             # Chunks already staged stay on the computer's disk until the upload
@@ -971,7 +971,9 @@ class MandalaSandboxSession(BaseSandboxSession):
     async def _cancel_upload_quietly(self, guest_path: str, upload_id: str) -> None:
         try:
             await asyncio.wait_for(
-                self._computer.cancel_file_upload(guest_path, upload_id), _CLEANUP_TIMEOUT
+                # Once closing, it must not wake a computer shutdown has put down.
+                self._computer.cancel_file_upload(guest_path, upload_id, no_wake=self._shut_down),
+                _CLEANUP_TIMEOUT,
             )
         except Exception as error:  # noqa: BLE001 - reported; the original error is raised
             logger.warning(
@@ -1249,7 +1251,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                 "shutdown; stopping it instead of deleting it",
                 computer.id,
             )
-            mode = "stop" if mode == "delete" else mode
+            mode = "stop"  # not delete, and not a suspend a late change would wake
         # Held across the decision and its action, so no save runs between them.
         async with self._save_lock:
             await self._release(mode)
@@ -1786,6 +1788,27 @@ async def _stop_quietly(computer: AsyncComputer) -> None:
             computer.id,
             type(error).__name__,
         )
+
+
+class _Closing(Exception):
+    """The session began shutting down in the middle of a chunked upload."""
+
+
+class _StopWhenClosing(io.BytesIO):
+    """An upload's source that ends the upload, between chunks, once shutdown begins.
+
+    A chunk sent after shutdown could land on a computer being deleted, or
+    wake one it suspended.
+    """
+
+    def __init__(self, payload: bytes, closing: Callable[[], bool]) -> None:
+        super().__init__(payload)
+        self._closing = closing
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self._closing():
+            raise _Closing("the session is shutting down")
+        return super().read(size)
 
 
 def _closing_write_error(path: Path) -> WorkspaceArchiveWriteError:
