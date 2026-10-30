@@ -2562,7 +2562,10 @@ health check, never restores a snapshot over the disk, however old the
 snapshot, and applies only the manifest's ephemeral entries again, so files
 the agent edited stay edited. A rebuilt computer is restored from the snapshot; if that restore
 fails, the new computer, which holds nothing yet, is deleted and the error
-raised, and the snapshot is untouched. A check of whether the computer is
+raised, and the snapshot is untouched. A computer whose first start never
+finished (its restore failed and it could not be deleted) is not trusted:
+the saved state says so (`initialized`), and a resume onto it restores again.
+A check of whether the computer is
 running that cannot reach the platform raises rather than answering "not
 running".
 
