@@ -705,9 +705,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                         # It may have been made: find it, so shutdown removes it.
                         await _shielded(self._adopt_new_url(port, before))
                     raise
-                if self._shut_down:
-                    # Made after shutdown gave up waiting for it: remove it.
-                    await _shielded(self._remove_url_quietly(port, served.id))
+                if not await _shielded(self._own_url(port, served.id)):
                     raise ExposedPortUnavailableError(
                         port=port,
                         exposed_ports=self.state.exposed_ports,
@@ -715,7 +713,6 @@ class MandalaSandboxSession(BaseSandboxSession):
                         context={"backend": _BACKEND_ID, "detail": "session_shutting_down"},
                         retryable=False,
                     )
-                self.state.public_url_ids.setdefault(port, []).append(served.id)
             elif wanted is not None and served.access != wanted:
                 # Reused, it must still be as open as asked and no more.
                 served = await self._computer.update_public_url(served.id, access=wanted)
@@ -739,6 +736,18 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=_retryable(error),
             ) from error
         return ExposedPortEndpoint(host=served.hostname, port=443, tls=True)
+
+    async def _own_url(self, port: int, url_id: str) -> bool:
+        """Take a URL the session made as its own; the only place that does.
+
+        Once shutdown has begun, its URL cleanup may already have run, so the
+        URL is deleted instead of recorded. True when it was recorded.
+        """
+        if self._shut_down:
+            await self._remove_url_quietly(port, url_id)
+            return False
+        self.state.public_url_ids.setdefault(port, []).append(url_id)
+        return True
 
     async def _remove_url_quietly(self, port: int, url_id: str) -> None:
         try:
@@ -787,7 +796,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         except Exception:  # noqa: BLE001 - refused before it was sent
             return
-        self.state.public_url_ids.setdefault(port, []).append(served.id)
+        await self._own_url(port, served.id)
 
     async def _sweep_new_urls(self, port: int, before: set[str]) -> None:
         """Delete URLs for ``port`` that an abandoned create may have made."""
@@ -825,10 +834,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         for url in listing.public_urls:
             if url.port == port and url.id not in before:
-                if self._shut_down:
-                    await self._remove_url_quietly(port, url.id)
-                else:
-                    self.state.public_url_ids.setdefault(port, []).append(url.id)
+                await self._own_url(port, url.id)
 
     # --- files ------------------------------------------------------------
 

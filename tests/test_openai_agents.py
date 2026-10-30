@@ -1814,3 +1814,30 @@ async def test_a_half_restored_computer_that_survived_is_restored_again(
     assert {p.name: p.read_bytes() for p in store.iterdir()} == saved  # untouched so far
     assert again.state.initialized is True  # type: ignore[attr-defined]
     await again.aclose()
+
+
+# --- review round 18 ------------------------------------------------------------
+
+
+async def test_a_url_that_lands_after_shutdown_stopped_waiting_is_removed(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.url_delay = 0.4
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 1.0)  # the cancelled create's own wait
+    task = asyncio.ensure_future(session.resolve_exposed_port(8080))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)  # its cleanup is now waiting for the answer
+    # Shutdown's wait for that port gives up before the answer comes.
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.05)
+    await session.aclose()
+    with pytest.raises(asyncio.CancelledError):
+        await task  # the create answered, after shutdown had cleaned up
+    await sandbox_client.aclose()
+    assert fake.public_urls["vm-1"] == []
+    assert session.state.public_url_ids == {}  # type: ignore[attr-defined]
