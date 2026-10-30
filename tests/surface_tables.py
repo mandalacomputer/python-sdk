@@ -182,6 +182,7 @@ PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/credential-gateway": set(),
     "DELETE computers/:id/credential-gateway/:binding": set(),
     "POST computers/:id/credential-gateway": {
+        "body:auth_header",
         "body:methods",
         "body:origin",
         "body:path_prefix",

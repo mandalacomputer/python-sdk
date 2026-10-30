@@ -3594,6 +3594,12 @@ def computer_credential_gateway_binding(computer_id: str, binding_id: str) -> st
 CredentialGatewayMethod = Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
 #: The HTTP methods a credential gateway binding may allow.
 CREDENTIAL_GATEWAY_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+#: Where a credential gateway binding puts the secret upstream:
+#: ``authorization`` as ``Authorization: Bearer <secret>``, ``x-api-key`` as
+#: ``x-api-key: <secret>`` (Anthropic's API).
+CredentialGatewayAuthHeader = Literal["authorization", "x-api-key"]
+#: The values ``auth_header`` may take.
+CREDENTIAL_GATEWAY_AUTH_HEADERS = ("authorization", "x-api-key")
 #: The longest origin the platform accepts, in characters.
 CREDENTIAL_GATEWAY_ORIGIN_MAX = 256
 #: The longest path prefix the platform accepts, in characters.
@@ -3691,26 +3697,40 @@ def _gateway_methods(value: object) -> list[str]:
 
 
 def credential_gateway_body(
-    *, secret_id: object, origin: object, path_prefix: object, methods: object
+    *,
+    secret_id: object,
+    origin: object,
+    path_prefix: object,
+    methods: object,
+    auth_header: object = None,
 ) -> dict[str, Any]:
-    """``POST computers/:id/credential-gateway``: every field is required.
+    """``POST computers/:id/credential-gateway``: every field but ``auth_header`` is required.
 
     Checked here for what is knowable without the platform: the secret id is a
     non-empty string, the origin an exact HTTPS origin, the path prefix a
-    canonical absolute path and the methods one to six distinct ones from
-    :data:`CREDENTIAL_GATEWAY_METHODS`. Whether the secret exists in the
-    computer's scope, and whether the host's gateway is ready, are the
-    platform's to answer.
+    canonical absolute path, the methods one to six distinct ones from
+    :data:`CREDENTIAL_GATEWAY_METHODS`, and ``auth_header``, when given, one of
+    :data:`CREDENTIAL_GATEWAY_AUTH_HEADERS`. ``auth_header`` is sent only when
+    given, so a platform without the field still takes the binding. Whether the
+    secret exists in the computer's scope, and whether the host's gateway is
+    ready, are the platform's to answer.
     """
     secret = canonical(secret_id, "secret_id")
     if not secret.strip():
         raise ValueError("secret_id must not be empty")
-    return {
+    body: dict[str, Any] = {
         "secret_id": secret,
         "origin": _gateway_origin(origin),
         "path_prefix": _gateway_path_prefix(path_prefix),
         "methods": _gateway_methods(methods),
     }
+    if auth_header is not None:
+        if not isinstance(auth_header, str) or auth_header not in CREDENTIAL_GATEWAY_AUTH_HEADERS:
+            raise ValueError(
+                f'auth_header must be "authorization" or "x-api-key" (got {auth_header!r})'
+            )
+        body["auth_header"] = str.__str__(auth_header)
+    return body
 
 
 # --- secret bindings --------------------------------------------------------

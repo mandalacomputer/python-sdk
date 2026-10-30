@@ -3018,11 +3018,14 @@ in progress.
 
 A credential gateway binding lets code inside a computer call one HTTPS API
 with a secret the computer never holds. The computer sends its request to the
-binding's `base_url`, followed by the provider's path, with `Authorization:
-Bearer <placeholder>`; the platform swaps the placeholder for the secret's
-latest value on the way out, over verified TLS to exactly `origin` on port 443,
-for the allowed `methods` on paths under `path_prefix` only. Nothing is
-delivered into the computer, so nothing in it can read the secret.
+binding's `base_url`, followed by the provider's path, with the placeholder as
+its API key (`Authorization: Bearer <placeholder>` or `x-api-key:
+<placeholder>`); the platform swaps the placeholder for the secret's latest
+value on the way out, over verified TLS to exactly `origin` on port 443, for
+the allowed `methods` on paths under `path_prefix` only. The secret goes
+upstream as `Authorization: Bearer <secret>`, or as `x-api-key: <secret>` with
+`auth_header="x-api-key"`. Nothing is delivered into the computer, so nothing
+in it can read the secret.
 
 ```python
 computer_id = "vm-..."
@@ -3050,11 +3053,36 @@ workspace or account scope. A binding never changes: revoke it and make
 another. Revoking stops calls not yet sent to the provider; one already sent
 may finish.
 
+A model key works the same way. Anthropic's API takes its key in `x-api-key`,
+so an Anthropic key binding uses `auth_header="x-api-key"`, and Claude Code (or
+an Anthropic SDK) inside the computer uses it with
+`ANTHROPIC_BASE_URL=<base_url>` and `ANTHROPIC_API_KEY=mandala-placeholder`:
+
+```python
+key = client.secrets.set("ANTHROPIC_API_KEY", "sk-ant-...")
+claude = client.credential_gateway.create(
+    computer_id,
+    secret_id=key.id,
+    origin="https://api.anthropic.com",
+    path_prefix="/v1",
+    methods=["POST"],
+    auth_header="x-api-key",
+)
+# Inside the computer:
+#   ANTHROPIC_BASE_URL=<claude.base_url> ANTHROPIC_API_KEY=mandala-placeholder claude
+```
+
+`binding.auth_header` is `"authorization"` or `"x-api-key"`, and reads
+`"authorization"` from a platform that does not report it. Leaving
+`auth_header` out (or `None`) sends nothing, and the platform uses
+`"authorization"`.
+
 Read `base_url` and `placeholder` from the binding rather than writing them
 in. The path prefix matches at a `/` boundary, so `/repos/example` allows
 `/repos/example/issues` but not `/repos/example-two`. Only non-browser HTTP
-clients are supported: no redirects, streaming or WebSocket upgrades, and the
-platform's API reference gives the size and time limits. A call that fails
+clients are supported: no redirects or WebSocket upgrades. Answers stream as
+the provider sends them, server-sent events included. A request is limited to
+7 MiB, an answer to 64 MiB and a call to 10 minutes. A call that fails
 after it was sent may still have done its work at the provider, so check
 before retrying. Use a narrowly scoped provider key: the gateway keeps the
 secret out of the computer, not the allowed API calls out of the computer's
@@ -3064,11 +3092,13 @@ An empty `secret_id`, an `origin` that is not an exact `https://host` (with a
 path, query, fragment, user, port or IP address), a `path_prefix` that is not a
 canonical absolute path (`//`, `?`, `#`, `.` or `..` segments, spaces), or
 `methods` that are not one to six distinct ones of `GET`, `HEAD`, `POST`,
-`PUT`, `PATCH` and `DELETE` raise `ValueError` before any request. The
+`PUT`, `PATCH` and `DELETE`, or an `auth_header` other than `"authorization"`
+and `"x-api-key"`, raise `ValueError` before any request. The
 platform answers 400 for a secret not in the computer's scope, 403 where the
 account cannot use the gateway, 409 `ConflictError` when the computer already
 has eight or is changing workspace or host (with `reason: "contention"`: send
-it again), and 503 when the computer's host has no ready gateway.
+it again) or when its host cannot send `x-api-key` yet (`reason:
+"unsupported"`), and 503 when the computer's host has no ready gateway.
 
 ### Secrets
 
@@ -5115,7 +5145,7 @@ several names. Where a client has no way to do it, the cell says so with —.
 | Wait until the computer is ready | `waitForGuest()`, `waitForDesktop()` | `wait_for_guest()`, `wait_for_desktop()` | `wait_for_computer` with `until: "guest"`, which on Linux also waits for the desktop session | `computers wait --until guest` or `--until desktop` | — |
 | The windows after an input action | `{ context: true }` on an input method, e.g. `click(x, y, [], { context: true })` | `context=True` on an input method, e.g. `click(x, y, context=True)` | `context: true` on an input tool | — | — |
 | Public URLs | `publicUrls()`, `createPublicUrl({ port, label, access })`, `updatePublicUrl(urlId, { port, access })`, `deletePublicUrl(urlId)` | `client.public_urls.list(id)`, `.create(id, port, label=…, access=…)`, `.update(id, url_id, port=…, access=…)`, `.delete(id, url_id)`; also handle methods | `list_public_urls`, `create_public_url`, `update_public_url`, `delete_public_url` | `computers urls list`, `create`, `update`, `rm` | — |
-| Credential gateway | `credentialGatewayBindings()`, `createCredentialGatewayBinding({ secretId, origin, pathPrefix, methods })`, `deleteCredentialGatewayBinding(bindingId)` | `client.credential_gateway.list(id)`, `.create(id, secret_id=…, origin=…, path_prefix=…, methods=…)`, `.delete(id, binding_id)`; also handle methods | `list_credential_gateway_bindings`, `create_credential_gateway_binding`, `delete_credential_gateway_binding` | `computers gateway list`, `create`, `rm` | — |
+| Credential gateway | `credentialGatewayBindings()`, `createCredentialGatewayBinding({ secretId, origin, pathPrefix, methods, authHeader })`, `deleteCredentialGatewayBinding(bindingId)` | `client.credential_gateway.list(id)`, `.create(id, secret_id=…, origin=…, path_prefix=…, methods=…, auth_header=…)`, `.delete(id, binding_id)`; also handle methods | `list_credential_gateway_bindings`, `create_credential_gateway_binding`, `delete_credential_gateway_binding` | `computers gateway list`, `create`, `rm` | — |
 
 ## Design notes
 

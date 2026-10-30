@@ -1536,9 +1536,14 @@ class AsyncCredentialGatewayResource:
         origin: str,
         path_prefix: str,
         methods: Sequence[_api.CredentialGatewayMethod],
+        auth_header: _api.CredentialGatewayAuthHeader | None = None,
     ) -> CredentialGatewayBinding:
         body = _api.credential_gateway_body(
-            secret_id=secret_id, origin=origin, path_prefix=path_prefix, methods=methods
+            secret_id=secret_id,
+            origin=origin,
+            path_prefix=path_prefix,
+            methods=methods,
+            auth_header=auth_header,
         )
         path = _api.computer_credential_gateway(computer_id)
         data = await self._t.json_object("POST", path, json=body)

@@ -205,6 +205,7 @@ GATEWAY_BINDING = {
     "origin": "https://api.example.com",
     "path_prefix": "/repos/example",
     "methods": ["GET"],
+    "auth_header": "authorization",
     "created_at": "2026-10-29T00:00:00.000Z",
     "base_url": "http://gateway.invalid/cgw-0123456789abcdef01234567",
     "placeholder": "placeholder-token",
@@ -1376,6 +1377,7 @@ def exercise_everything(client: mc.Client) -> None:
         "origin": "https://api.example.com",
         "path_prefix": "/repos/example",
         "methods": ["GET", "POST"],
+        "auth_header": "x-api-key",
     }
     c.credential_gateway_bindings()
     bound_api = c.create_credential_gateway_binding(**gateway)
@@ -1729,6 +1731,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
         "origin": "https://api.example.com",
         "path_prefix": "/repos/example",
         "methods": ["GET", "POST"],
+        "auth_header": "x-api-key",
     }
     await c.credential_gateway_bindings()
     bound_api = await c.create_credential_gateway_binding(**gateway)

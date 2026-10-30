@@ -3888,10 +3888,11 @@ class CredentialGatewayBinding:
     :meth:`~mandala_computer.Computer.credential_gateway_bindings` and
     :meth:`~mandala_computer.Computer.create_credential_gateway_binding`. The
     computer never holds the secret: code inside it calls :attr:`base_url`
-    followed by the provider's path, with ``Authorization: Bearer`` and
-    :attr:`placeholder`, and the platform swaps in the secret's latest value on
-    the way out, for :attr:`origin`, :attr:`path_prefix` and :attr:`methods`
-    only. A binding never changes: revoke it and make another to change one.
+    followed by the provider's path, with :attr:`placeholder` as the API key
+    (``Authorization: Bearer`` or ``x-api-key``), and the platform swaps in the
+    secret's latest value on the way out, in the header :attr:`auth_header`
+    names, for :attr:`origin`, :attr:`path_prefix` and :attr:`methods` only. A
+    binding never changes: revoke it and make another to change one.
     """
 
     #: ``cgw-`` and twenty-four hex characters: what a revoke names.
@@ -3910,8 +3911,13 @@ class CredentialGatewayBinding:
     created_at: str
     #: The address to call from inside the computer, before the provider's path.
     base_url: str
-    #: The bearer token to send from inside the computer in place of the secret.
+    #: The API key to send from inside the computer in place of the secret, as
+    #: ``Authorization: Bearer <placeholder>`` or ``x-api-key: <placeholder>``.
     placeholder: str
+    #: Where the secret goes upstream: ``"authorization"`` (a Bearer token) or
+    #: ``"x-api-key"``. A platform that does not report it reads
+    #: ``"authorization"``, which is what it sends.
+    auth_header: str = "authorization"
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -3931,6 +3937,7 @@ class CredentialGatewayBinding:
             or any(not isinstance(m, str) or m not in _GATEWAY_METHODS for m in methods)
         ):
             raise MandalaError(f"{where}: a credential gateway binding has no usable methods")
+        auth_header = d.get("auth_header")
         return cls(
             id=_gateway_text(d, "id", where),
             computer_id=_text(d.get("computer_id")),
@@ -3941,6 +3948,9 @@ class CredentialGatewayBinding:
             created_at=_text(d.get("created_at")),
             base_url=_gateway_text(d, "base_url", where),
             placeholder=_gateway_text(d, "placeholder", where),
+            auth_header=str.__str__(auth_header)
+            if isinstance(auth_header, str) and auth_header
+            else "authorization",
             raw=dict(d),
         )
 
