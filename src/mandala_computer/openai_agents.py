@@ -304,6 +304,12 @@ class MandalaSandboxSessionState(SandboxSessionState):
     #: Public URLs this session created, by port. Ones that already existed are
     #: reused and never removed.
     public_url_ids: dict[int, list[str]] = Field(default_factory=dict)
+    #: Labels of the public URLs this session asked for, by port, recorded
+    #: before each create is sent. A URL carrying one is the session's, even
+    #: when its create's answer was lost: shutdown and a resume onto the same
+    #: computer look for them. One is dropped once its create was refused or
+    #: its URL is gone.
+    public_url_labels: dict[int, list[str]] = Field(default_factory=dict)
     #: Something on this computer may have changed, or may still be running,
     #: that the session could not see: a lost command start or write, a stop
     #: that was not confirmed, or a change in flight when this was saved. A
@@ -360,6 +366,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._in_flight = 0
         #: Anything reaching the computer and not yet finished, changes included.
         self._busy = 0
+        #: The resume that made this session started the computer.
+        self._started_by_resume = False
         #: One save at a time, capture and store both, so saves land in order.
         self._save_lock = asyncio.Lock()
         #: A command start whose answer was lost: something may be running that
@@ -371,7 +379,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: Ports with a URL create abandoned and not yet answered.
         #: Labels this session gave the public URLs it asked for, by port: how
         #: a URL whose create answer was lost is known to be this session's.
-        self._url_labels: dict[int, set[str]] = {}
+        #: Which recorded label each known URL carries.
+        self._label_of: dict[str, str] = {}
         #: Set once start() has fully succeeded, a restore included. Until then
         #: the workspace may be empty or half restored, so it is never saved
         #: over a snapshot, and the computer is never deleted.
@@ -771,7 +780,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                     retryable=False,
                 )
             candidates = [u for u in listing.public_urls if u.port == port and not u.disabled]
-            mine = self._url_labels.get(port, set())
+            mine = set(self.state.public_url_labels.get(port, []))
             # One this session's earlier, abandoned create made comes first.
             served = next((u for u in candidates if u.label in mine), None) or next(
                 iter(candidates), None
@@ -784,12 +793,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             ):
                 # Made by this session's abandoned create (it carries the label
                 # the session gave it): take it as the session's own.
+                self._label_of[served.id] = served.label
                 await _shielded(self._own_url(port, served.id))
             if served is None:
                 # A label only this session uses, so a URL whose answer is lost
                 # can be told apart from anyone else's on the same port.
                 label = f"agents-{self.state.session_id.hex[:12]}-{port}-{uuid.uuid4().hex[:6]}"
-                self._url_labels.setdefault(port, set()).add(label)
+                self.state.public_url_labels.setdefault(port, []).append(label)
                 create = asyncio.ensure_future(
                     self._computer.create_public_url(port, label=label, access=wanted)
                 )
@@ -799,10 +809,13 @@ class MandalaSandboxSession(BaseSandboxSession):
                     await _shielded(self._settle_url(create, port, label))
                     raise
                 except MandalaError as error:
-                    if not _clean_refusal(error):
+                    if _clean_refusal(error):
+                        self._drop_label(port, label)  # refused: nothing was made
+                    else:
                         # It may have been made: find it, so shutdown removes it.
                         await _shielded(self._adopt_new_url(port, label))
                     raise
+                self._label_of[served.id] = label
                 if not await _shielded(self._own_url(port, served.id)):
                     raise ExposedPortUnavailableError(
                         port=port,
@@ -847,11 +860,45 @@ class MandalaSandboxSession(BaseSandboxSession):
         self.state.public_url_ids.setdefault(port, []).append(url_id)
         return True
 
+    def _drop_label(self, port: int, label: str) -> None:
+        labels = self.state.public_url_labels.get(port, [])
+        if label in labels:
+            labels.remove(label)
+        if not labels:
+            self.state.public_url_labels.pop(port, None)
+
+    def _forget_url(self, port: int, url_id: str) -> None:
+        """A URL confirmed gone: its label need not be looked for again."""
+        label = self._label_of.pop(url_id, None)
+        if label is not None:
+            self._drop_label(port, label)
+
+    async def _reconcile_urls(self) -> None:
+        """Take as the session's every URL on the computer carrying a recorded label."""
+        if not self.state.public_url_labels:
+            return
+        try:
+            listing = await asyncio.wait_for(self._computer.public_urls(), _CLEANUP_TIMEOUT)
+        except Exception as error:  # noqa: BLE001 - the labels stay, for another try
+            logger.warning(
+                "could not list the public URLs on computer %s to find this session's (%s)",
+                self.state.computer_id,
+                type(error).__name__,
+            )
+            return
+        for url in listing.public_urls:
+            if url.label in self.state.public_url_labels.get(url.port, []):
+                self._label_of[url.id] = url.label
+                owned = self.state.public_url_ids.setdefault(url.port, [])
+                if url.id not in owned:
+                    owned.append(url.id)
+
     async def _remove_url_quietly(self, port: int, url_id: str) -> None:
         try:
             await self._computer.delete_public_url(url_id)
+            self._forget_url(port, url_id)
         except NotFoundError:
-            pass
+            self._forget_url(port, url_id)
         except MandalaError as error:
             logger.warning(
                 "could not remove a public URL for port %s on computer %s (%s)",
@@ -875,6 +922,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                         return  # a later resolution took it as the session's own
                     try:
                         await self._computer.delete_public_url(late.id)
+                        self._drop_label(port, label)
                     except MandalaError as error:
                         logger.warning(
                             "could not remove a public URL for port %s on computer %s that "
@@ -895,11 +943,14 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
             return
         except MandalaError as error:
-            if not _clean_refusal(error):
+            if _clean_refusal(error):
+                self._drop_label(port, label)
+            else:
                 await self._adopt_new_url(port, label)
             return
         except Exception:  # noqa: BLE001 - refused before it was sent
             return
+        self._label_of[served.id] = label
         await self._own_url(port, served.id)
 
     async def _sweep_new_urls(self, port: int, label: str) -> None:
@@ -930,7 +981,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         except Exception as error:  # noqa: BLE001 - reported; nothing else to do
             logger.warning(
                 "a public URL for port %s on computer %s may have been made and could "
-                "not be checked (%s); shutdown will not remove it",
+                "not be checked (%s); its label is kept, so shutdown looks for it",
                 port,
                 self.state.computer_id,
                 type(error).__name__,
@@ -938,6 +989,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         for url in listing.public_urls:
             if url.port == port and url.label == label:
+                self._label_of[url.id] = label
                 await self._own_url(port, url.id)
 
     # --- files ------------------------------------------------------------
@@ -1359,9 +1411,10 @@ class MandalaSandboxSession(BaseSandboxSession):
     async def start(self) -> None:
         try:
             await super().start()
-        except asyncio.CancelledError:
-            # The SDK's own failure hook catches Exception, not a cancellation,
-            # so a start cancelled midway would leave the computer running.
+        except BaseException:
+            # A start that failed or was cancelled midway: a failed context
+            # entry never reaches its exit, and the SDK's own hook does not
+            # see a cancellation, so the computer is put down here.
             await _shielded(self._abandon_start())
             raise
 
@@ -1369,7 +1422,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         if self._workspace_ready or self._shutdown_task is not None:
             return
         if self._workspace_state_preserved_on_start():
-            # A kept computer: stop it, keeping its disk for the next attempt.
+            if not self._started_by_resume:
+                return  # it was running before; leave it as it was
+            # A kept computer this resume started: stop it, keeping its disk.
             self._begin_shutdown(self._put_down_quietly("stop"))
             assert self._shutdown_task is not None
             await asyncio.shield(self._shutdown_task)
@@ -1564,6 +1619,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         return None
 
     async def _remove_public_urls(self) -> None:
+        # Those whose create answers were lost, found by their labels, too.
+        await self._reconcile_urls()
         for port, url_ids in list(self.state.public_url_ids.items()):
             kept = []
             for url_id in url_ids:
@@ -1571,8 +1628,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                     await asyncio.wait_for(
                         self._computer.delete_public_url(url_id), _CLEANUP_TIMEOUT
                     )
+                    self._forget_url(port, url_id)
                 except NotFoundError:
-                    pass
+                    self._forget_url(port, url_id)
                 except (MandalaError, asyncio.TimeoutError) as error:
                     logger.warning(
                         "could not remove the public URL for port %s on %s (%s)",
@@ -1797,6 +1855,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             )
             inner._set_start_state_preserved(preserved, system=preserved)
             was_running = computer.status == "running"
+            inner._started_by_resume = not was_running
             starts: list[asyncio.Future[AsyncComputer]] = []
             try:
                 await _bring_up(computer, deadline, starts)
@@ -1816,11 +1875,14 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 if isinstance(error, (MandalaError, TimeoutError)):
                     _raise_start_error(state, error, "start")
                 raise
+            # URLs an earlier session made but lost track of are this one's.
+            await inner._reconcile_urls()
             return self._wrap_session(inner, instrumentation=self._instrumentation)
         else:
             state.computer_id = ""
             state.workspace_root_ready = False
             state.public_url_ids = {}
+            state.public_url_labels = {}  # a new computer has none of them
             state.uncertain = False  # a new computer: nothing unseen on it
             state.initialized = False
             computer = await self._make_computer(state, deadline)

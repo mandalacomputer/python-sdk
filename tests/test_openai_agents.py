@@ -2605,3 +2605,63 @@ async def test_a_computer_created_without_an_end_time_is_started_from_stopped(
     )
     assert fake.calls("POST", "/vm-1/start")
     await session.aclose()
+
+
+# --- review round 40 ------------------------------------------------------------
+
+
+async def test_a_failed_entry_after_resume_started_the_computer_stops_it(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    assert fake.computers["vm-1"]["status"] == "running"  # the resume started it
+    fake.fail[("POST", "exec")] = (500, {"error": "boom"})  # workspace setup fails
+    with pytest.raises(Exception):  # noqa: B017 - the SDK's start error
+        async with resumed:
+            pass
+    fake.fail.clear()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_a_failed_entry_leaves_a_computer_that_was_already_running(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    fake.fail[("POST", "exec")] = (500, {"error": "boom"})
+    with pytest.raises(Exception):  # noqa: B017 - the SDK's start error
+        await resumed.start()
+    fake.fail.clear()
+    assert fake.computers["vm-1"]["status"] == "running"
+    await session.aclose()
+
+
+async def test_a_lost_url_is_found_by_its_label_even_after_a_resume(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.lose_public_url = True  # made, its answer lost...
+    fake.unlistable_after_loss = True  # ...and the listing to recover it fails
+    with pytest.raises(ExposedPortUnavailableError):
+        await session.resolve_exposed_port(8080)
+    assert inner(session).state.public_url_ids == {}  # ownership not established
+    payload = client.serialize_session_state(session.state)
+    payload = json.loads(json.dumps(payload))  # as it would be stored
+    (label,) = payload["public_url_labels"]["8080"]
+    assert fake.public_urls["vm-1"][0]["label"] == label
+
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.aclose()  # a healthy shutdown finds it by its label
+    assert fake.public_urls["vm-1"] == []
+    assert resumed.state.public_url_labels == {}  # type: ignore[attr-defined]

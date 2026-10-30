@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: With lose_public_url: the listing right after the lost answer fails too.
+        self.unlistable_after_loss = False
         #: Seconds after a failed start request that its admitted start takes effect.
         self.admitted_start_fails = 0.0
         self._effects: list[asyncio.Future[None]] = []
@@ -658,6 +660,9 @@ class FakePlatform:
         if self.lose_public_url:
             # Made, and the answer lost on the way back.
             self.lose_public_url = False
+            if self.unlistable_after_loss:
+                self.unlistable_after_loss = False
+                self.fail_once[("GET", "public-urls")] = (503, {"error": "a blip"})
             return httpx.Response(504, json={"error": "gateway timeout"})
         return httpx.Response(201, json=url)
 
