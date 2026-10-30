@@ -1938,3 +1938,59 @@ async def test_a_change_that_outlasts_the_drain_wait_keeps_the_computer(
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     await writing
+
+
+# --- review round 21 ------------------------------------------------------------
+
+
+async def test_a_save_during_a_pending_delete_is_refused(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    _DESTRUCTIVE_SAVES[0] = 0
+    store = tmp_path / "store"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=DestructiveSnapshot(id="destructive", base_path=store),
+    )
+    await session.start()
+    await session.stop()  # the good, confirmed save
+    saved = {p.name: p.read_bytes() for p in store.iterdir()}
+    fake.delete_delay = 0.4
+    closing = asyncio.ensure_future(session.shutdown())
+    while not fake.calls("DELETE", "/vm-1"):
+        await asyncio.sleep(0.01)
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await session.stop()  # would overwrite the snapshot, then fail
+    assert caught.value.context["reason"] == "session_shutting_down"
+    await closing
+    assert _DESTRUCTIVE_SAVES[0] == 1  # the store was never touched again
+    assert {p.name: p.read_bytes() for p in store.iterdir()} == saved
+    assert fake.computers == {}
+
+
+async def test_a_cancelled_shutdown_still_finishes_and_later_calls_wait_for_it(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    await session.start()
+    await session.resolve_exposed_port(8080)
+    fake.put_delay["slow.txt"] = 0.5
+    writing = asyncio.ensure_future(session.write(Path("slow.txt"), io.BytesIO(b"x")))
+    while not fake.calls("PUT", "/files"):
+        await asyncio.sleep(0.01)
+    first = asyncio.ensure_future(session.shutdown())
+    await asyncio.sleep(0.1)  # it is waiting for the write
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert fake.computers["vm-1"]["status"] == "running"
+    await session.shutdown()  # waits for the same shutdown to finish
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []
+    await writing
+    await client.delete(session)  # and so does this
+    assert len(fake.calls("POST", "/vm-1/stop")) == 1

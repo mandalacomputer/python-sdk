@@ -324,7 +324,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._computer = computer
         self._reaper = reaper if reaper is not None else _Reaper()
         self._workspace_root_ready = state.workspace_root_ready
+        #: Set when shutdown begins: from then on changes are refused.
         self._shut_down = False
+        self._shutdown_task: asyncio.Future[None] | None = None
         #: Bumped before anything that may change the workspace. A save covers
         #: the generation it started at, and the computer's disk is the only
         #: copy of the workspace whenever the two differ.
@@ -1142,6 +1144,14 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             )
         async with self._save_lock:
+            if self._shut_down and not isinstance(self.state.snapshot, NoopSnapshot):
+                # The computer may be going; a save now could overwrite the
+                # snapshot with a workspace that is about to be deleted.
+                raise WorkspaceArchiveReadError(
+                    path=posix_path_for_error(self._workspace_root_path()),
+                    context={"backend": _BACKEND_ID, "reason": "session_shutting_down"},
+                    retryable=False,
+                )
             # Unconfirmed until this attempt succeeds: a failing store may
             # already have overwritten what an earlier save confirmed.
             self._saved_generation = None
@@ -1173,8 +1183,10 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         # A computer made for this session that never finished starting (its
         # restore failed, say) holds nothing: delete it rather than keep it.
+        # This is the session's shutdown, so a later one waits for it.
         self._shut_down = True
-        await _shielded(_delete_quietly(self._computer))
+        self._shutdown_task = asyncio.ensure_future(_delete_quietly(self._computer))
+        await asyncio.shield(self._shutdown_task)
 
     def _workspace_unsaved(self) -> bool:
         if not self._workspace_ready and self._workspace_state_preserved_on_start():
@@ -1219,9 +1231,14 @@ class MandalaSandboxSession(BaseSandboxSession):
     # --- shutdown -----------------------------------------------------------
 
     async def _shutdown_backend(self) -> None:
-        if self._shut_down:
-            return
-        self._shut_down = True  # from here on, changes are refused
+        # One shutdown, run as its own task: every call waits for that same
+        # task, and a caller's cancellation leaves it running to the end.
+        if self._shutdown_task is None:
+            self._shut_down = True  # from here on, changes are refused
+            self._shutdown_task = asyncio.ensure_future(self._shut_down_computer())
+        await asyncio.shield(self._shutdown_task)
+
+    async def _shut_down_computer(self) -> None:
         mode = self.state.on_shutdown
         computer = self._computer
         if not await self._drained():
@@ -1233,6 +1250,12 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
             )
             mode = "stop" if mode == "delete" else mode
+        # Held across the decision and its action, so no save runs between them.
+        async with self._save_lock:
+            await self._release(mode)
+
+    async def _release(self, mode: ShutdownMode) -> None:
+        computer = self._computer
         if mode == "delete" and self._workspace_unsaved():
             # A snapshot store is configured and nothing confirms the workspace
             # reached it (the persist failed, was cancelled, or never ran), so
