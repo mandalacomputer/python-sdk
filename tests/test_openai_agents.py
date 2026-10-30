@@ -1748,3 +1748,29 @@ async def test_a_url_still_being_made_at_shutdown_is_not_left_behind(
     with pytest.raises(ExposedPortUnavailableError) as caught:
         await session.resolve_exposed_port(8080)
     assert caught.value.context["detail"] == "session_shutting_down"
+
+
+# --- review round 16 ------------------------------------------------------------
+
+
+async def test_an_abandoned_url_create_whose_late_answer_is_lost_is_swept(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.url_delay = 0.4  # made after the cleanup gave up waiting...
+    fake.lose_public_url = True  # ...and its answer lost
+    task = asyncio.ensure_future(session.resolve_exposed_port(8080))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await session.aclose()  # shut down before the create settles
+    await sandbox_client.aclose()  # the client's cleanup finds it and removes it
+    assert fake.public_urls["vm-1"] == []
+    assert session.state.public_url_ids == {}  # type: ignore[attr-defined]
+    assert fake.computers["vm-1"]["status"] == "stopped"

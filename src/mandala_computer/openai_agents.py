@@ -770,7 +770,12 @@ class MandalaSandboxSession(BaseSandboxSession):
                         type(error).__name__,
                     )
 
-            self._reaper.later(create, remove, f"a public URL create for port {port}")
+            async def failed(error: BaseException) -> None:
+                # Its answer was lost: it may still have made the URL.
+                if isinstance(error, MandalaError) and not _clean_refusal(error):
+                    await self._sweep_new_urls(port, before)
+
+            self._reaper.later(create, remove, f"a public URL create for port {port}", failed)
             return
         except MandalaError as error:
             if not _clean_refusal(error):
@@ -780,8 +785,29 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         self.state.public_url_ids.setdefault(port, []).append(served.id)
 
+    async def _sweep_new_urls(self, port: int, before: set[str]) -> None:
+        """Delete URLs for ``port`` that an abandoned create may have made."""
+        owned = set(self.state.public_url_ids.get(port, []))
+        try:
+            listing = await asyncio.wait_for(self._computer.public_urls(), _CLEANUP_TIMEOUT)
+        except Exception as error:  # noqa: BLE001 - reported; nothing else to do
+            logger.warning(
+                "a public URL for port %s on computer %s may have been made after its "
+                "request was abandoned and could not be checked (%s)",
+                port,
+                self.state.computer_id,
+                type(error).__name__,
+            )
+            return
+        for url in listing.public_urls:
+            if url.port == port and url.id not in before and url.id not in owned:
+                await self._remove_url_quietly(port, url.id)
+
     async def _adopt_new_url(self, port: int, before: set[str]) -> None:
-        """Record a public URL a lost create may have made, as this session's."""
+        """Record a public URL a lost create may have made, as this session's.
+
+        Once the session is shutting down, one found is deleted instead.
+        """
         try:
             listing = await asyncio.wait_for(self._computer.public_urls(), _CLEANUP_TIMEOUT)
         except Exception as error:  # noqa: BLE001 - reported; nothing else to do
@@ -795,7 +821,10 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         for url in listing.public_urls:
             if url.port == port and url.id not in before:
-                self.state.public_url_ids.setdefault(port, []).append(url.id)
+                if self._shut_down:
+                    await self._remove_url_quietly(port, url.id)
+                else:
+                    self.state.public_url_ids.setdefault(port, []).append(url.id)
 
     # --- files ------------------------------------------------------------
 
@@ -1562,11 +1591,14 @@ class _Reaper:
         pending: asyncio.Future[_ReadT],
         then: Callable[[_ReadT], Awaitable[object]],
         what: str,
+        failed: Callable[[BaseException], Awaitable[object]] | None = None,
     ) -> None:
         async def run() -> None:
             try:
                 result = await pending
-            except BaseException:  # noqa: BLE001 - it failed, so nothing to undo
+            except BaseException as error:  # noqa: BLE001 - handed to ``failed``
+                if failed is not None:
+                    await failed(error)
                 return
             await then(result)
 
