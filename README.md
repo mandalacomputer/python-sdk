@@ -2427,6 +2427,167 @@ The async computer offers the same methods with `await`. Tokens are omitted
 from `repr(connection)`, but the `token` attribute still contains the secret.
 
 
+### OpenAI Agents SDK sandbox
+
+The [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) runs a
+`SandboxAgent`'s shell, file and patch tools inside a sandbox that a sandbox
+client provides. `mandala_computer.openai_agents` is that client for Mandala:
+each sandbox session is one computer, created when the run needs it and
+released when the run ends. The agent definition stays the same as with the
+SDK's local or Docker clients; only the run config changes.
+
+```sh
+pip install 'mandala-computer[openai-agents]'   # openai-agents 0.24
+```
+
+```python
+import asyncio
+
+from agents import Runner
+from agents.run import RunConfig
+from agents.sandbox import SandboxAgent, SandboxRunConfig
+from agents.sandbox.capabilities import Shell
+
+from mandala_computer.openai_agents import (
+    MandalaSandboxClient,
+    MandalaSandboxClientOptions,
+)
+
+agent = SandboxAgent(
+    name="builder",
+    instructions="Work in the workspace. Run what you write.",
+    capabilities=[Shell()],
+)
+
+
+async def main() -> None:
+    # The Mandala key comes from MANDALA_API_KEY or a saved profile, as for
+    # AsyncClient(); the model key is the Agents SDK's own (OPENAI_API_KEY).
+    async with MandalaSandboxClient() as client:
+        result = await Runner.run(
+            agent,
+            "Write a Python script that prints the first ten primes, and run it.",
+            run_config=RunConfig(
+                sandbox=SandboxRunConfig(
+                    client=client,
+                    options=MandalaSandboxClientOptions(size="small"),
+                ),
+            ),
+        )
+        print(result.final_output)
+
+
+asyncio.run(main())
+```
+
+`MandalaSandboxClient(client)` takes an `AsyncClient` you already have, which
+then stays yours to close; without one it makes its own and closes it on
+`aclose()` or at the end of the `async with`. The key stays on the client.
+The options and the saved session state never carry it, so a run state saved
+for later can be resumed by another process that holds its own key.
+
+`MandalaSandboxClientOptions` decides what computer a session gets. Every field
+is optional, and `options` may be left out of `SandboxRunConfig` altogether:
+
+| Option | Default | |
+| --- | --- | --- |
+| `size` | the template's | a catalogue shape from `client.sizes.list()`; the likeliest to start in about a second. Not with the next four |
+| `template`, `cpu`, `ram_mb`, `disk_gb` | the template's | the same as for `computers.create()` |
+| `name`, `workspace_id` | none | the same as for `computers.create()` |
+| `ends_in_hours` | `24` | a safety end time: the platform stops the computer then, keeping its disk, even if the process that made it is gone. Set right after the computer is made; a platform that cannot keep end times fails the session there, and the computer is deleted. `None` for none |
+| `on_shutdown` | `"delete"` | what happens to the computer when the session ends: `"delete"`, `"stop"` or `"suspend"` |
+| `exposed_ports` | none | ports the SDK may expose, served through [public URLs](#public-urls) |
+| `public_url_access` | the plan's | `"public"` or `"private"` for those URLs |
+| `launch_timeout_s` | `300` | how long creating (or restarting) a computer may take to answer |
+
+Unknown fields are refused, as are a `size` combined with explicit numbers, a
+port outside 1 to 65535 or 22, and an end time that is not more than 0 and at
+most 8784 hours.
+
+#### Exposed ports
+
+A port the agent's tools serve becomes reachable through a public URL. Name it
+in `exposed_ports`, then resolve it from the session; the first resolve makes
+the URL (or reuses one the computer already has for that port), and the
+endpoint is HTTPS on 443:
+
+```python
+from agents.sandbox import Manifest
+
+options = MandalaSandboxClientOptions(exposed_ports=(8000,))
+session = await client.create(manifest=Manifest(), options=options)
+async with session:
+    await session.exec("nohup python3 -m http.server 8000 >/dev/null 2>&1 &")
+    endpoint = await session.resolve_exposed_port(8000)
+    print(endpoint.url_for("http"))  # https://<label>.<base_domain>/
+await client.delete(session)
+```
+
+The server must listen on `0.0.0.0`, not `127.0.0.1`. A private URL needs an
+account API key (`Authorization: Bearer`) or a signed-in browser to open. A
+port that was not in `exposed_ports` is refused by the SDK; a plan without
+public URLs, or one at its limit, raises `ExposedPortUnavailableError` with the
+platform's `code` in its `context`. URLs the session made are removed when it
+shuts down; ones that already existed are left alone.
+
+#### Shutdown, and resuming
+
+When the runner owns the session it persists the workspace snapshot (if the
+run config has one), shuts the session down, and calls the client's
+`delete()`. Shutting down applies `on_shutdown` once:
+
+- `"delete"` destroys the computer and its disk. A later resume of the saved
+  run state makes a new computer from the same options and restores the
+  workspace from the snapshot.
+- `"stop"` keeps the disk. A resume starts the same computer again (and sets
+  its end time again), and the workspace is still on it.
+- `"suspend"` keeps the disk and the RAM, so a resume picks up running
+  processes as they were. A computer that cannot be suspended at that moment
+  is stopped instead.
+
+A kept computer keeps its disk on your plan until it is deleted. A resume
+reattaches a running computer as it is, starts a stopped or suspended one, and
+replaces one that is gone or can never run again. One it cannot read at all (a
+key without access, the platform unreachable) is an error rather than a reason
+to make another. A failure to stop or delete at shutdown is logged on the
+`mandala_computer.openai_agents` logger with the computer's id rather than
+raised over the run's own outcome; the end time is the backstop for that.
+
+A computer also suspends itself after the host's idle window (30 minutes by
+default). The next command or file transfer resumes it, which takes about a
+second.
+
+#### How it behaves, and what it refuses
+
+- **Commands run as `root`, with no display**, in the workspace root
+  (`Manifest.root`, `/workspace` unless you set another), with the manifest's
+  environment. They are started in the background and polled, so a command
+  may run longer than one HTTP request, and a timeout stops the command
+  rather than leaving it running. Each command costs a start and at least one
+  poll.
+- **Files** go through the computer's file API, a request at a time up to 64
+  MiB and in chunks past that. Paths are resolved inside the computer before
+  every read and write, so a symlink that points out of the workspace is
+  refused.
+- **Workspace snapshots** are a tar of the workspace root, staged under `/tmp`
+  in the computer and moved through the file API, so any snapshot store the SDK
+  offers works.
+- **Refused, before anything is created**: manifest users and groups, mount
+  entries, and path grants with a `host_path`. Refused when asked for: a
+  `user` other than `root` on a command or file call, and PTY sessions (the
+  shell tool then runs each command once, without an interactive session).
+  Nothing ever falls back to running on the machine your code runs on.
+- **Errors are the SDK's own**: a failed create or resume is a
+  `WorkspaceStartError`, a command that could not be run or read an
+  `ExecTransportError`, a timeout an `ExecTimeoutError`, a missing file a
+  `WorkspaceReadNotFoundError`. Each keeps the platform's status and `code` in
+  `context` and sets `retryable` from
+  [`is_transient()`](#errors); the platform's own error is
+  the `cause`.
+- **The supported Agents SDK line is 0.24.** The client implements that SDK's
+  provider hooks, some of them underscored, so the extra pins
+  `openai-agents>=0.24.0,<0.25.0` until a newer line has been tested.
+
 ### Events
 
 A computer never tells you anything unless you ask, and the only general way to

@@ -1,8 +1,8 @@
 name: Audit
 
 # pip-audit over what this package lets a user end up with. It ships no
-# lockfile, so two resolutions of the package and its `anthropic` extra are
-# checked: the newest versions a fresh install picks today, and the declared
+# lockfile, so two resolutions of the package and its `anthropic` and
+# `openai-agents` extras are checked: the newest versions a fresh install picks today, and the declared
 # floors (uv's lowest-direct: every direct dependency at its minimum, the rest
 # resolved as usual). The floors were where the advisories were: anyio>=3.5
 # and pydantic>=2 admitted versions with published fixes (OPL-6036). Each is
@@ -58,7 +58,7 @@ jobs:
           for python in 3.10 3.14; do
             for resolution in highest lowest-direct; do
               out="$RUNNER_TEMP/$resolution-$python.txt"
-              "$RUNNER_TEMP/tools/bin/uv" pip compile pyproject.toml --extra anthropic \
+              "$RUNNER_TEMP/tools/bin/uv" pip compile pyproject.toml --extra anthropic --extra openai-agents \
                 --resolution "$resolution" --python-version "$python" \
                 --quiet --no-header --no-annotate -o "$out"
               echo "== $resolution, Python $python"; cat "$out"
