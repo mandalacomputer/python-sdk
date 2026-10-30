@@ -56,6 +56,7 @@ What a session supports, and what it refuses rather than approximating:
 from __future__ import annotations
 
 import asyncio
+import functools
 import io
 import logging
 import math
@@ -63,9 +64,9 @@ import posixpath
 import shlex
 import tarfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, TypeVar
 
 try:
     from agents.sandbox.errors import (
@@ -148,7 +149,12 @@ _BROKEN = frozenset({"build-failed", "half-removed"})
 #: The first wait between polls of a running command, doubled up to the ceiling.
 _POLL_FIRST = 0.05
 _POLL_CEILING = 1.0
-#: How many transient poll failures in a row a command survives.
+#: The least time a command's start may take before it counts against the
+#: command's own timeout.
+_SUBMIT_FLOOR = 2.0
+#: The most output one read asks for, per stream.
+_READ_LIMIT = 1024 * 1024
+#: How many transient read failures in a row a command survives.
 _POLL_SETBACKS = 5
 #: How long one kill or cleanup command may take before it is abandoned.
 _CLEANUP_TIMEOUT = 30.0
@@ -245,6 +251,10 @@ class MandalaSandboxSessionState(SandboxSessionState):
     #: Public URLs this session created, by port. Ones that already existed are
     #: reused and never removed.
     public_url_ids: dict[int, str] = Field(default_factory=dict)
+    #: The computer's workspace has changes the snapshot does not: its last save
+    #: failed or never ran. A resume onto the same computer keeps its disk
+    #: rather than restoring the older snapshot over it.
+    workspace_unsaved: bool = False
 
 
 class MandalaSandboxSession(BaseSandboxSession):
@@ -336,8 +346,18 @@ class MandalaSandboxSession(BaseSandboxSession):
         line = shlex.join(argv)
         cwd = self.state.manifest.root if self._workspace_root_ready else None
         env = await self.state.manifest.environment.resolve()
+        loop = asyncio.get_running_loop()
+        # The deadline starts before the command is sent, so a slow start counts.
+        deadline = None if timeout is None else loop.time() + max(timeout, 0.0)
+        submit = asyncio.ensure_future(self._computer.start_exec(line, cwd=cwd, env=env or None))
         try:
-            job = await self._computer.start_exec(line, cwd=cwd, env=env or None)
+            if deadline is None:
+                job = await asyncio.shield(submit)
+            else:
+                # Bounded by the time left, with a floor: a start the platform
+                # takes a moment to answer is not the command running long.
+                budget = max(deadline - loop.time(), _SUBMIT_FLOOR)
+                job = await asyncio.wait_for(asyncio.shield(submit), budget)
         except ValueError as error:
             # Refused before sending: an environment too large for the platform,
             # say. Not worth retrying with the same input.
@@ -349,100 +369,155 @@ class MandalaSandboxSession(BaseSandboxSession):
             ) from error
         except MandalaError as error:
             _raise_exec_transport(error, argv)
-        return await self._collect(job, argv, timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError) as error:
+            # The start may still land: wait for it, out of the caller's
+            # cancellation, and stop the command it started.
+            await _shielded(_kill_when_started(submit))
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise ExecTimeoutError(
+                command=argv, timeout_s=timeout, context={"backend": _BACKEND_ID}
+            ) from None
+        return await self._collect(job, argv, timeout, deadline)
 
     async def _collect(
         self,
         job: AsyncBackgroundCommand,
         argv: Sequence[str],
         timeout: float | None,
+        deadline: float | None,
     ) -> ExecResult:
-        """Poll a started command to its end, or stop it at ``timeout``.
+        """Read a started command to its end, or stop it at ``deadline``.
 
         The deadline is checked after every read, whether or not more output is
         waiting, and each read is itself bounded by the time left, so neither a
         command that never stops printing nor a slow read outlasts it. A read
         that reports the command finished is returned as finished: there is
-        nothing left to stop.
+        nothing left to stop. Anything else that ends this (a timeout, a failed
+        read, a cancellation) stops the command.
         """
-        loop = asyncio.get_running_loop()
-        deadline = None if timeout is None else loop.time() + max(timeout, 0.0)
-        stdout, stderr = bytearray(), bytearray()
-        delay = _POLL_FIRST
         finished = False
-        setbacks = 0
-
-        def expired() -> NoReturn:
-            raise ExecTimeoutError(
-                command=argv, timeout_s=timeout, context={"backend": _BACKEND_ID}
-            )
-
         try:
+            if job.execution_id is not None:
+                result = await self._collect_by_offset(job.execution_id, argv, timeout, deadline)
+            else:
+                result = await self._collect_by_cursor(job, argv, timeout, deadline)
+            finished = True
+            return result
+        finally:
+            if not finished:
+                await _shielded(_kill_quietly(job))
+
+    async def _collect_by_offset(
+        self,
+        execution_id: str,
+        argv: Sequence[str],
+        timeout: float | None,
+        deadline: float | None,
+    ) -> ExecResult:
+        """Output read at offsets this reader keeps, so a failed read is safe to repeat.
+
+        Each round reads the command's state first and then its output to the
+        current end, so an ``exited`` state is followed by a read that has seen
+        everything the command printed.
+        """
+        clock = _Clock(argv, timeout, deadline)
+        stdout, stderr = bytearray(), bytearray()
+        while True:
+            meta = await clock.read(lambda: self._computer.execution(execution_id))
+            if meta.output_unavailable is not None or meta.status == "lost":
+                raise ExecTransportError(
+                    command=argv,
+                    context={
+                        "backend": _BACKEND_ID,
+                        "reason": "output_lost",
+                        "detail": meta.output_unavailable or meta.status,
+                    },
+                    retryable=False,
+                )
             while True:
-                try:
-                    if deadline is None:
-                        status = await job.poll()
-                    else:
-                        # At least one short read, so a command that has already
-                        # finished is still seen to have finished at timeout 0.
-                        budget = max(deadline - loop.time(), _POLL_FIRST)
-                        status = await asyncio.wait_for(job.poll(), budget)
-                    setbacks = 0
-                except MandalaError as error:
-                    # A poll is a read, so one the platform calls transient (a
-                    # host's service restarting, a rate limit) is asked again.
-                    setbacks += 1
-                    if not is_transient(error) or setbacks > _POLL_SETBACKS:
-                        _raise_exec_transport(error, argv)
-                    if deadline is not None and loop.time() >= deadline:
-                        expired()
-                    pause = error.retry_after if isinstance(error, APIError) else None
-                    wait = min(pause or delay, _POLL_CEILING * 5)
-                    if deadline is not None:
-                        wait = min(wait, deadline - loop.time())
-                    await asyncio.sleep(max(wait, 0.0))
-                    delay = min(delay * 2, _POLL_CEILING)
-                    continue
-                except asyncio.TimeoutError:
-                    expired()
-                stdout += status.stdout
-                stderr += status.stderr
-                if status.output_unreadable or status.output_unavailable is not None:
+                part = await clock.read(
+                    functools.partial(
+                        self._computer.execution_output,
+                        execution_id,
+                        stdout_offset=len(stdout),
+                        stderr_offset=len(stderr),
+                        limit=_READ_LIMIT,
+                    )
+                )
+                stdout += part.stdout
+                stderr += part.stderr
+                if not (part.stdout_more or part.stderr_more):
+                    break
+                clock.check()
+            if meta.status == "exited" and meta.exit_code is not None:
+                return ExecResult(
+                    stdout=bytes(stdout), stderr=bytes(stderr), exit_code=meta.exit_code
+                )
+            clock.check()
+            await clock.pause()
+
+    async def _collect_by_cursor(
+        self,
+        job: AsyncBackgroundCommand,
+        argv: Sequence[str],
+        timeout: float | None,
+        deadline: float | None,
+    ) -> ExecResult:
+        """The older read, for a platform that gives no execution id.
+
+        Each poll consumes the output it returns, so a poll whose answer was
+        lost cannot be asked again without losing that output: any failure
+        fails the command, and a gap in the reported offsets is refused.
+        """
+        clock = _Clock(argv, timeout, deadline)
+        stdout, stderr = bytearray(), bytearray()
+        while True:
+            status = await clock.read(job.poll, retry=False)
+            for name, got, before in (
+                ("stdout", status.stdout, len(stdout)),
+                ("stderr", status.stderr, len(stderr)),
+            ):
+                reported = status.raw.get(f"{name}_offset")
+                if (
+                    isinstance(reported, int)
+                    and not isinstance(reported, bool)
+                    and reported != before + len(got)
+                ):
+                    raise ExecTransportError(
+                        command=argv,
+                        context={"backend": _BACKEND_ID, "reason": "output_lost", "detail": name},
+                        retryable=False,
+                    )
+            stdout += status.stdout
+            stderr += status.stderr
+            if status.output_unreadable or status.output_unavailable is not None:
+                raise ExecTransportError(
+                    command=argv,
+                    context={
+                        "backend": _BACKEND_ID,
+                        "reason": "output_lost",
+                        "detail": status.output_unavailable or "unreadable",
+                    },
+                    retryable=False,
+                )
+            if status.drained:
+                if status.exit_code is None:
                     raise ExecTransportError(
                         command=argv,
                         context={
                             "backend": _BACKEND_ID,
-                            "reason": "output_lost",
-                            "detail": status.output_unavailable or "unreadable",
+                            "reason": "killed" if status.killed else "no_exit_code",
                         },
                         retryable=False,
                     )
-                if status.drained:
-                    finished = True
-                    if status.exit_code is None:
-                        raise ExecTransportError(
-                            command=argv,
-                            context={
-                                "backend": _BACKEND_ID,
-                                "reason": "killed" if status.killed else "no_exit_code",
-                            },
-                            retryable=False,
-                        )
-                    return ExecResult(
-                        stdout=bytes(stdout), stderr=bytes(stderr), exit_code=status.exit_code
-                    )
-                if deadline is not None and loop.time() >= deadline:
-                    expired()
-                if status.more:
-                    continue
-                wait = delay if deadline is None else min(delay, deadline - loop.time())
-                await asyncio.sleep(max(wait, 0.0))
-                delay = min(delay * 2, _POLL_CEILING)
-        finally:
-            if not finished:
-                # A timeout, a lost poll or a cancellation: stop the command
-                # rather than leaving it running inside the computer.
-                await _shielded(_kill_quietly(job))
+                return ExecResult(
+                    stdout=bytes(stdout), stderr=bytes(stderr), exit_code=status.exit_code
+                )
+            clock.check()
+            if status.more:
+                continue
+            await clock.pause()
 
     async def _resolve_exposed_port(self, port: int) -> ExposedPortEndpoint:
         try:
@@ -680,10 +755,26 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def _persist_snapshot(self) -> None:
         # The whole persist, archive and store both: only a store that returned
-        # counts as saved. A failure or a cancellation anywhere leaves it unsaved.
+        # counts as saved. A failure or a cancellation anywhere leaves it unsaved,
+        # and says so in the state a resume reads.
         self._persist_confirmed = False
+        if not isinstance(self.state.snapshot, NoopSnapshot):
+            self.state.workspace_unsaved = True
         await super()._persist_snapshot()
         self._persist_confirmed = True
+        self.state.workspace_unsaved = False
+
+    async def _can_reuse_restorable_snapshot_workspace(self) -> bool:
+        if self.state.workspace_unsaved and self._workspace_state_preserved_on_start():
+            # The disk is newer than the snapshot: restoring would undo the
+            # work the failed save was meant to keep.
+            logger.warning(
+                "computer %s holds workspace changes newer than its snapshot; "
+                "keeping them rather than restoring the snapshot",
+                self.state.computer_id,
+            )
+            return True
+        return await super()._can_reuse_restorable_snapshot_workspace()
 
     def _workspace_unsaved(self) -> bool:
         return not isinstance(self.state.snapshot, NoopSnapshot) and not self._persist_confirmed
@@ -712,6 +803,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
             )
             mode = "stop"
+            self.state.workspace_unsaved = True
         if mode != "delete":
             await self._remove_public_urls()
         try:
@@ -899,9 +991,16 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                     _raise_start_error(state, error, "start")
                 raise
         else:
+            if state.workspace_unsaved:
+                logger.warning(
+                    "computer %s, which held workspace changes newer than its snapshot, "
+                    "is gone; restoring the snapshot onto a new computer",
+                    state.computer_id,
+                )
             state.computer_id = ""
             state.workspace_root_ready = False
             state.public_url_ids = {}
+            state.workspace_unsaved = False
             computer = await self._make_computer(state)
 
         inner = MandalaSandboxSession(state=state, computer=computer)
@@ -982,6 +1081,72 @@ async def _bring_up(computer: AsyncComputer, timeout: float) -> None:
     if computer.status != "running":
         await computer.wait_until_running(timeout=left())
     await computer.wait_for_guest(timeout=left())
+
+
+_ReadT = TypeVar("_ReadT")
+
+
+class _Clock:
+    """One command's deadline, the reads bounded by it and the pauses between them."""
+
+    def __init__(self, argv: Sequence[str], timeout: float | None, deadline: float | None):
+        self._argv = argv
+        self._timeout = timeout
+        self._deadline = deadline
+        self._loop = asyncio.get_running_loop()
+        self._delay = _POLL_FIRST
+
+    def expired(self) -> NoReturn:
+        raise ExecTimeoutError(
+            command=self._argv, timeout_s=self._timeout, context={"backend": _BACKEND_ID}
+        )
+
+    def left(self) -> float | None:
+        return None if self._deadline is None else self._deadline - self._loop.time()
+
+    def check(self) -> None:
+        left = self.left()
+        if left is not None and left <= 0:
+            self.expired()
+
+    async def pause(self) -> None:
+        left = self.left()
+        wait = self._delay if left is None else min(self._delay, left)
+        await asyncio.sleep(max(wait, 0.0))
+        self._delay = min(self._delay * 2, _POLL_CEILING)
+
+    async def read(self, call: Callable[[], Awaitable[_ReadT]], *, retry: bool = True) -> _ReadT:
+        """One read, bounded by the time left, and asked again while transient."""
+        setbacks = 0
+        while True:
+            left = self.left()
+            try:
+                if left is None:
+                    return await call()
+                # At least one short read, so a command that has already
+                # finished is still seen to have finished at timeout 0.
+                return await asyncio.wait_for(call(), max(left, _POLL_FIRST))
+            except MandalaError as error:
+                setbacks += 1
+                if not retry or not is_transient(error) or setbacks > _POLL_SETBACKS:
+                    _raise_exec_transport(error, self._argv)
+                self.check()
+                pause = error.retry_after if isinstance(error, APIError) else None
+                wait = min(pause or self._delay, _POLL_CEILING * 5)
+                left = self.left()
+                await asyncio.sleep(max(wait if left is None else min(wait, left), 0.0))
+                self._delay = min(self._delay * 2, _POLL_CEILING)
+            except asyncio.TimeoutError:
+                self.expired()
+
+
+async def _kill_when_started(submit: asyncio.Future[AsyncBackgroundCommand]) -> None:
+    """Wait for a start that was abandoned, and stop the command if it began."""
+    try:
+        job = await asyncio.wait_for(asyncio.shield(submit), _CLEANUP_TIMEOUT)
+    except Exception:  # noqa: BLE001 - it did not start, or cannot be found to stop
+        return
+    await _kill_quietly(job)
 
 
 async def _kill_quietly(job: AsyncBackgroundCommand) -> None:

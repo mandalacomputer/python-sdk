@@ -10,6 +10,7 @@ deleted computer takes with it, so a replacement starts from an empty disk.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import itertools
 import json
@@ -19,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,6 +52,40 @@ class _Job:
     sent_err: int = 0
     killed: bool = False
     readers: list[threading.Thread] = field(default_factory=list)
+    execution_id: str = ""
+
+    def finished(self) -> bool:
+        return self.proc.poll() is not None and not any(t.is_alive() for t in self.readers)
+
+    def metadata(self, computer_id: str) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "execution_id": self.execution_id,
+            "computer_id": computer_id,
+            "pid": self.pid,
+            "status": "running",
+            "started_at": "2026-10-29T00:00:00Z",
+            "output_source": "volatile_guest_files",
+        }
+        if self.finished():
+            data.update(
+                status="exited", ended_at="2026-10-29T00:00:01Z", exit_code=self.proc.returncode
+            )
+        return data
+
+    def output(self, out_at: int, err_at: int, limit: int) -> dict[str, Any]:
+        out = bytes(self.stdout[out_at : out_at + limit])
+        err = bytes(self.stderr[err_at : err_at + limit])
+        return {
+            "execution_id": self.execution_id,
+            "stdout_b64": _b64(out),
+            "stderr_b64": _b64(err),
+            "stdout_offset": out_at + len(out),
+            "stderr_offset": err_at + len(err),
+            "stdout_more": len(out) == limit and out_at + limit < len(self.stdout),
+            "stderr_more": len(err) == limit and err_at + limit < len(self.stderr),
+            "diagnostic_b64": "",
+            "diagnostic_truncated": False,
+        }
 
     def status(self) -> dict[str, Any]:
         finished = self.proc.poll() is not None and not any(t.is_alive() for t in self.readers)
@@ -92,6 +128,14 @@ class FakePlatform:
         #: The same, answered once and then served normally.
         self.fail_once: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
         self.create_status = "running"
+        #: Answer like a platform without execution ids: cursor polls only.
+        self.legacy_exec = False
+        #: Seconds a background start takes to answer.
+        self.start_delay = 0.0
+        #: Pids whose next poll consumes output and then fails.
+        self.lose_poll: set[int] = set()
+        #: Pids whose next poll skips a byte, leaving a gap in the offsets.
+        self.skip_output: set[int] = set()
         self._ids = itertools.count(1)
         self._pids = itertools.count(1000)
 
@@ -137,6 +181,8 @@ class FakePlatform:
             return httpx.Response(200, json={"ok": True})
         if rest[0] == "exec":
             return self._exec(request, rest[1:])
+        if rest[0] == "executions":
+            return self._execution(request, record["id"], rest[1:])
         if rest[0] == "files":
             return self._files(request, rest[1:])
         if rest[0] == "public-urls":
@@ -187,7 +233,16 @@ class FakePlatform:
                 return httpx.Response(
                     200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}
                 )
-            return self._start(body)
+            started = self._start(body)
+            if self.start_delay:
+                delay = self.start_delay
+
+                async def later() -> httpx.Response:
+                    await asyncio.sleep(delay)
+                    return started
+
+                return later()  # type: ignore[return-value]
+            return started
         job = self.jobs.get(int(rest[0])) if rest else None
         if job is None:
             return httpx.Response(404, json={"error": "no such process"})
@@ -199,7 +254,31 @@ class FakePlatform:
             for reader in job.readers:
                 reader.join()
             return httpx.Response(200, json=job.status())
+        if job.pid in self.lose_poll:
+            # The read happens, then its answer is lost on the way back.
+            self.lose_poll.discard(job.pid)
+            job.status()
+            return httpx.Response(502, json={"error": "bad gateway"})
+        if job.pid in self.skip_output:
+            self.skip_output.discard(job.pid)
+            job.sent_out += 1
         return httpx.Response(200, json=job.status())
+
+    def _execution(
+        self, request: httpx.Request, computer_id: str, rest: list[str]
+    ) -> httpx.Response:
+        job = next((j for j in self.jobs.values() if j.execution_id == rest[0]), None)
+        if job is None:
+            return httpx.Response(404, json={"error": "no such execution"})
+        if rest[1:] == ["output"]:
+            params = request.url.params
+            return httpx.Response(
+                200,
+                json=job.output(
+                    int(params["stdout_offset"]), int(params["stderr_offset"]), int(params["limit"])
+                ),
+            )
+        return httpx.Response(200, json=job.metadata(computer_id))
 
     def _start(self, body: dict[str, Any]) -> httpx.Response:
         env = {**os.environ, **(body.get("env") or {})}
@@ -214,12 +293,17 @@ class FakePlatform:
             start_new_session=True,
         )
         job = _Job(pid=next(self._pids), command=body["command"], proc=proc)
+        if not self.legacy_exec:
+            job.execution_id = f"exec_{uuid.uuid4().hex}"
         for stream, sink in ((proc.stdout, job.stdout), (proc.stderr, job.stderr)):
             reader = threading.Thread(target=_drain, args=(stream, sink), daemon=True)
             reader.start()
             job.readers.append(reader)
         self.jobs[job.pid] = job
-        return httpx.Response(200, json={"pid": job.pid, "command": job.command, "running": True})
+        answer: dict[str, Any] = {"pid": job.pid, "command": job.command, "running": True}
+        if job.execution_id:
+            answer["execution_id"] = job.execution_id
+        return httpx.Response(200, json=answer)
 
     # --- files ----------------------------------------------------------------
 

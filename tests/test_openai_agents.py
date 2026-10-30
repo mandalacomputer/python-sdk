@@ -265,13 +265,13 @@ async def test_a_timed_out_command_is_stopped(
     await session.aclose()
 
 
-async def test_a_lost_poll_is_a_transport_error_and_stops_the_command(
+async def test_a_failed_read_is_a_transport_error_and_stops_the_command(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path
 ) -> None:
     session = await client.create(manifest=manifest(root))
     await session.start()
     next_pid = 1000 + len(fake.jobs)
-    fake.fail[("GET", str(next_pid))] = (500, {"error": "boom"})
+    fake.fail[("GET", "output")] = (500, {"error": "boom"})
     with pytest.raises(ExecTransportError) as caught:
         await session.exec("sleep 30")
     assert caught.value.context["status"] == 500
@@ -280,19 +280,93 @@ async def test_a_lost_poll_is_a_transport_error_and_stops_the_command(
     await session.aclose()
 
 
-async def test_a_transient_poll_failure_is_asked_again(
+async def test_a_transient_read_failure_is_asked_again_at_the_same_offsets(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path
 ) -> None:
     session = await client.create(manifest=manifest(root))
     await session.start()
-    next_pid = 1000 + len(fake.jobs)
-    fake.fail_once[("GET", str(next_pid))] = (
+    fake.fail_once[("GET", "output")] = (
         409,
         {"error": "the host's service is restarting", "reason": "contention"},
     )
+    before = len(fake.calls("GET", "/output"))
     result = await session.exec("printf ok")
     assert result.ok() and result.stdout == b"ok"
-    assert not fake.jobs[next_pid].killed
+    reads = [r.url.params for r in fake.calls("GET", "/output")[before:]]
+    # The failed read and its retry asked for the same bytes.
+    assert reads[0]["stdout_offset"] == reads[1]["stdout_offset"] == "0"
+    await session.aclose()
+
+
+async def test_without_execution_ids_a_lost_poll_fails_rather_than_drops_output(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.legacy_exec = True
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    next_pid = 1000 + len(fake.jobs)
+    fake.lose_poll.add(next_pid)
+    with pytest.raises(ExecTransportError):
+        await session.exec("printf 'early output'; sleep 1")
+    assert len(fake.calls("GET", f"/exec/{next_pid}")) == 1  # not asked again
+    await session.aclose()
+
+
+async def test_without_execution_ids_an_offset_gap_is_refused(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.legacy_exec = True
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    next_pid = 1000 + len(fake.jobs)
+    fake.skip_output.add(next_pid)
+    with pytest.raises(ExecTransportError) as caught:
+        await session.exec("printf abcdef; sleep 0.2")
+    assert caught.value.context["reason"] == "output_lost"
+    await session.aclose()
+
+
+async def test_without_execution_ids_commands_still_run(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.legacy_exec = True
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    result = await session.exec("seq 1 5000; exit 4")
+    assert result.exit_code == 4
+    assert result.stdout.decode().split() == [str(n) for n in range(1, 5001)]
+    await session.aclose()
+
+
+async def test_cancelling_during_a_slow_start_stops_the_command(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    fake.start_delay = 0.5
+    task = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    fake.start_delay = 0.0
+    await session.aclose()
+
+
+async def test_a_start_slower_than_the_timeout_times_out_and_is_stopped(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_SUBMIT_FLOOR", 0.1)
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    fake.start_delay = 0.5
+    with pytest.raises(ExecTimeoutError):
+        await session.exec("sleep 30", timeout=0.1)
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    fake.start_delay = 0.0
     await session.aclose()
 
 
@@ -915,3 +989,59 @@ async def test_a_reused_public_url_that_will_not_change_access_is_refused(
     assert caught.value.context["code"] == "PUBLIC_URLS_BLOCKED"
     fake.fail.clear()
     await session.aclose()
+
+
+# --- review round 3 -------------------------------------------------------------
+
+
+async def test_a_resume_after_a_failed_save_keeps_the_newer_disk(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+    )
+    await session.start()
+    await session.write(Path("notes.txt"), io.BytesIO(b"first"))
+    await session.stop()  # saved
+    await session.write(Path("notes.txt"), io.BytesIO(b"second, unsaved"))
+    store.chmod(0o500)  # the store now refuses writes
+    try:
+        with pytest.raises(Exception):  # noqa: B017 - whatever the store raises
+            await session.stop()
+        await session.shutdown()
+    finally:
+        store.chmod(0o700)
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    payload = client.serialize_session_state(session.state)
+    assert payload["workspace_unsaved"] is True
+
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.start()
+    # The older snapshot was not restored over the newer disk.
+    assert (await resumed.read(Path("notes.txt"))).read() == b"second, unsaved"
+    await resumed.stop()  # saved this time
+    assert resumed.state.workspace_unsaved is False  # type: ignore[attr-defined]
+    await resumed.shutdown()
+    assert fake.computers == {}
+
+
+async def test_a_resume_after_a_good_save_restores_a_drifted_disk(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=LocalSnapshotSpec(base_path=tmp_path),
+        options=MandalaSandboxClientOptions(on_shutdown="stop"),
+    )
+    await session.start()
+    await session.write(Path("notes.txt"), io.BytesIO(b"saved"))
+    await session.aclose()
+    (root / "notes.txt").write_bytes(b"changed behind the session's back")
+    payload = client.serialize_session_state(session.state)
+    assert payload["workspace_unsaved"] is False
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.start()
+    assert (await resumed.read(Path("notes.txt"))).read() == b"saved"
+    await resumed.aclose()

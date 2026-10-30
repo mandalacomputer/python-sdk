@@ -28,7 +28,7 @@ This is the summary you read to decide whether to upgrade.
   absolute in-workspace symlinks made relative); a symlink out of the workspace
   fails the persist. With a snapshot store configured, the computer is deleted
   at shutdown only after the workspace was confirmed saved, and stopped
-  otherwise.
+  otherwise; a resume onto that computer keeps its newer disk.
   PTY sessions, users other than `root`, manifest users and groups, mounts and
   host-path grants are refused with the SDK's `ConfigurationError`. Importing
   `mandala_computer` does not import the Agents SDK.

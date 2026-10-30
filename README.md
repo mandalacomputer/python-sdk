@@ -2549,7 +2549,10 @@ run config has one), shuts the session down, and calls the client's
 A kept computer keeps its disk on your plan until it is deleted. A resume
 reattaches a running computer as it is, starts a stopped or suspended one, and
 replaces one that is gone or can never run again. A computer the resume
-started is stopped again if the rest of the resume fails or is cancelled. One it cannot read at all (a
+started is stopped again if the rest of the resume fails or is cancelled. A
+computer kept because its workspace could not be saved is marked so in the
+saved state, and a resume onto it keeps its disk instead of restoring the older
+snapshot over the newer work. One it cannot read at all (a
 key without access, the platform unreachable) is an error rather than a reason
 to make another. A failure to stop or delete at shutdown is logged on the
 `mandala_computer.openai_agents` logger with the computer's id rather than
@@ -2563,10 +2566,14 @@ second.
 
 - **Commands run as `root`, with no display**, in the workspace root
   (`Manifest.root`, `/workspace` unless you set another), with the manifest's
-  environment. They are started in the background and polled, so a command
-  may run longer than one HTTP request, and a timeout stops the command
-  rather than leaving it running. Each command costs a start and at least one
-  poll.
+  environment. They are started in the background and their output is read
+  at offsets the client keeps, so a command may run longer than one HTTP
+  request, a read that fails transiently is asked again without losing
+  output, and a timeout or a cancellation (including one while the command is
+  still being started) stops the command rather than leaving it running. Each
+  command costs a start and at least two reads. On a platform without
+  execution ids the older consuming poll is used, and any failed read fails
+  the command rather than risking silently dropped output.
 - **Files** go through the computer's file API, a request at a time up to 64
   MiB and in chunks past that. Paths are resolved inside the computer before
   every read and write, so a symlink that points out of the workspace is
