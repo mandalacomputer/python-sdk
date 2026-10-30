@@ -2119,6 +2119,7 @@ class CredentialGatewayResource:
         origin: str,
         path_prefix: str,
         methods: Sequence[_api.CredentialGatewayMethod],
+        auth_header: _api.CredentialGatewayAuthHeader | None = None,
     ) -> CredentialGatewayBinding:
         """Bind a secret to an HTTPS API for this computer's calls.
 
@@ -2126,7 +2127,11 @@ class CredentialGatewayResource:
         :meth:`~mandala_computer.Computer.create_credential_gateway_binding`.
         """
         body = _api.credential_gateway_body(
-            secret_id=secret_id, origin=origin, path_prefix=path_prefix, methods=methods
+            secret_id=secret_id,
+            origin=origin,
+            path_prefix=path_prefix,
+            methods=methods,
+            auth_header=auth_header,
         )
         path = _api.computer_credential_gateway(computer_id)
         data = self._t.json_object("POST", path, json=body)

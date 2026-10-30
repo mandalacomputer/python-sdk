@@ -173,6 +173,9 @@ async def test_the_platforms_refusal_is_passed_on(gw: Any) -> None:
         ({"methods": ["CONNECT"]}, "in capitals"),
         ({"methods": ["GET", "GET"]}, "must not repeat"),
         ({"methods": [1]}, "methods must be a string"),
+        ({"auth_header": "X-API-Key"}, "auth_header must be"),
+        ({"auth_header": "bearer"}, "auth_header must be"),
+        ({"auth_header": 7}, "auth_header must be"),
     ],
 )
 async def test_what_the_platform_would_refuse_is_refused_first(
@@ -203,6 +206,42 @@ async def test_valid_policies_are_sent_as_given(gw: Any, origin: str, path_prefi
             "path_prefix": path_prefix,
             "methods": ["HEAD"],
         }
+
+
+@pytest.mark.parametrize("auth_header", ["x-api-key", "authorization"])
+async def test_auth_header_is_sent_when_given(gw: Any, auth_header: str) -> None:
+    with respx.mock as router:
+        route = router.post(COLLECTION).respond(201, json={**BINDING, "auth_header": auth_header})
+        made = await gw("create", **ARGS, auth_header=auth_header)
+        assert json.loads(route.calls.last.request.content) == {**ARGS, "auth_header": auth_header}
+        assert made.auth_header == auth_header
+
+
+async def test_no_auth_header_sends_none(gw: Any) -> None:
+    # Left out, a platform that predates the field still takes the binding.
+    with respx.mock as router:
+        route = router.post(COLLECTION).respond(201, json=BINDING)
+        await gw("create", **ARGS, auth_header=None)
+        assert "auth_header" not in json.loads(route.calls.last.request.content)
+
+
+@pytest.mark.parametrize(
+    ("sent", "read"),
+    [
+        ("x-api-key", "x-api-key"),
+        (None, "authorization"),
+        ("", "authorization"),
+        (7, "authorization"),
+        ("x-other-key", "x-other-key"),
+    ],
+)
+async def test_auth_header_is_read_with_authorization_as_its_default(
+    gw: Any, sent: Any, read: str
+) -> None:
+    with respx.mock as router:
+        router.get(COLLECTION).respond(200, json={"bindings": [{**BINDING, "auth_header": sent}]})
+        [binding] = await gw("list")
+        assert binding.auth_header == read
 
 
 @pytest.mark.parametrize(
