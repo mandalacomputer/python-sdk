@@ -2283,3 +2283,34 @@ async def test_a_command_start_landing_after_a_suspend_shutdown_leaves_it_stoppe
     (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
     assert job.killed
     await sandbox_client.aclose()
+
+
+# --- review round 30 ------------------------------------------------------------
+
+
+async def test_a_start_landing_while_urls_are_still_coming_down_is_stopped_again(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(on_shutdown="suspend", exposed_ports=(8080,)),
+    )
+    await session.start()
+    await session.resolve_exposed_port(8080)
+    fake.start_late_effect = 0.4
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    fake.url_delete_delay = 1.0  # URL removal outlasts the late start
+    closing = asyncio.ensure_future(session.shutdown())
+    await asyncio.sleep(0.6)  # stopped, then woken by the start, URLs still pending
+    assert not closing.done()
+    await sandbox_client._reaper.aclose(5)
+    await closing
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert len(fake.calls("POST", "/vm-1/stop")) >= 2
+    await sandbox_client.aclose()

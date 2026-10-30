@@ -341,6 +341,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._released: str | None = None
         #: Work handed to the client's cleanup and not yet finished.
         self._unsettled = 0
+        #: Background work finished after shutdown acted on the computer.
+        self._settled_after_release = False
         #: Bumped before anything that may change the workspace. A save covers
         #: the generation it started at, and the computer's disk is the only
         #: copy of the workspace whenever the two differ.
@@ -1306,9 +1308,10 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def _settled_late(self) -> None:
         """After background cleanup finishes: undo what it may have woken."""
-        task = self._shutdown_task
-        if task is not None and task.done() and self._released in ("stop", "suspend"):
-            # It may have reached the computer after shutdown put it down.
+        if self._released in ("stop", "suspend"):
+            # Shutdown has acted on the computer: this may have reached it
+            # after, and woken it.
+            self._settled_after_release = True
             await _stop_quietly(self._computer)
 
     def _shutdown_now(self) -> asyncio.Future[None]:
@@ -1383,6 +1386,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         if not gone:
             await self._settle_resolutions()
             await self._remove_public_urls()
+            if self._settled_after_release:
+                # Background work landed after the stop: make sure once more.
+                await _stop_quietly(self._computer)
 
     async def _act(self, mode: ShutdownMode) -> bool:
         """Delete, suspend or stop the computer; True when it is gone."""
