@@ -1818,10 +1818,10 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         computer: AsyncComputer | None = None
         try:
             if state.computer_id:
-                computer = await self._client.computers.get(state.computer_id)
+                computer = await _within(deadline, self._client.computers.get(state.computer_id))
         except NotFoundError:
             computer = None
-        except MandalaError as error:
+        except (MandalaError, TimeoutError) as error:
             _raise_start_error(state, error, "reattach")
 
         if computer is not None and computer.status in _BROKEN:
@@ -1857,10 +1857,18 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             was_running = computer.status == "running"
             inner._started_by_resume = not was_running
             starts: list[asyncio.Future[AsyncComputer]] = []
+            # Everything from here until the session is handed back is one
+            # unit within the launch budget: any failure, timeout or
+            # cancellation in it is rolled back.
             try:
                 await _bring_up(computer, deadline, starts)
                 if not was_running and state.ends_in_hours is not None:
-                    await computer.set_end_time(ends_in_hours=state.ends_in_hours)
+                    await _within(
+                        deadline, computer.set_end_time(ends_in_hours=state.ends_in_hours)
+                    )
+                # URLs an earlier session made but lost track of are this one's.
+                await _within(deadline, inner._reconcile_urls())
+                return self._wrap_session(inner, instrumentation=self._instrumentation)
             except BaseException as error:
                 if not was_running:
                     # This resume started it; a failure or a cancellation after
@@ -1875,9 +1883,6 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 if isinstance(error, (MandalaError, TimeoutError)):
                     _raise_start_error(state, error, "start")
                 raise
-            # URLs an earlier session made but lost track of are this one's.
-            await inner._reconcile_urls()
-            return self._wrap_session(inner, instrumentation=self._instrumentation)
         else:
             state.computer_id = ""
             state.workspace_root_ready = False
@@ -2049,6 +2054,20 @@ def _end_time_ahead(computer: AsyncComputer) -> bool:
 
 class _LaunchTimeout(TimeoutError):
     """The launch budget (``launch_timeout_s``) ran out."""
+
+
+async def _within(deadline: float, step: Awaitable[_ReadT]) -> _ReadT:
+    """One launch step, given only what is left of the budget."""
+    try:
+        left = _left(deadline)
+    except _LaunchTimeout:
+        if isinstance(step, Coroutine):
+            step.close()
+        raise
+    try:
+        return await asyncio.wait_for(step, left)
+    except asyncio.TimeoutError:
+        raise _LaunchTimeout() from None
 
 
 def _launch_deadline(seconds: float) -> float:

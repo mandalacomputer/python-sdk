@@ -2665,3 +2665,42 @@ async def test_a_lost_url_is_found_by_its_label_even_after_a_resume(
     await resumed.aclose()  # a healthy shutdown finds it by its label
     assert fake.public_urls["vm-1"] == []
     assert resumed.state.public_url_labels == {}  # type: ignore[attr-defined]
+
+
+# --- review round 41 ------------------------------------------------------------
+
+
+async def _stopped_session_payload(client: MandalaSandboxClient, root: Path) -> dict[str, object]:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    return client.serialize_session_state(session.state)
+
+
+async def test_cancelling_a_resume_during_url_reconciliation_rolls_it_back(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    payload = await _stopped_session_payload(client, root)
+    payload["public_url_labels"] = {8080: ["agents-earlier-8080-abcdef"]}
+    fake.list_delay = 0.5  # the reconciliation listing is slow
+    resuming = asyncio.ensure_future(client.resume(client.deserialize_session_state(payload)))
+    while not fake.calls("GET", "/public-urls"):
+        await asyncio.sleep(0.01)
+    resuming.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resuming
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_an_end_time_renewal_past_the_budget_times_out_and_rolls_back(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    payload = await _stopped_session_payload(client, root)
+    payload["launch_timeout_s"] = 0.3
+    fake.patch_delay = 0.6  # the end time is renewed after the budget
+    with pytest.raises(WorkspaceStartError) as caught:
+        await client.resume(client.deserialize_session_state(payload))
+    assert caught.value.context["reason"] == "timeout"
+    assert fake.computers["vm-1"]["status"] == "stopped"

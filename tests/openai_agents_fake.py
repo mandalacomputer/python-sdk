@@ -138,6 +138,9 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds the next public URL listing, and the next computer update, take.
+        self.list_delay = 0.0
+        self.patch_delay = 0.0
         #: With lose_public_url: the listing right after the lost answer fails too.
         self.unlistable_after_loss = False
         #: Seconds after a failed start request that its admitted start takes effect.
@@ -350,6 +353,15 @@ class FakePlatform:
             for path in self.wipe:
                 shutil.rmtree(path, ignore_errors=True)
             return httpx.Response(200, json={"ok": True, "snapshots_deleted": 0})
+        if request.method == "PATCH" and self.patch_delay:
+            delay, self.patch_delay = self.patch_delay, 0.0
+            later_request = httpx.Request("PATCH", request.url, content=request.content)
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                return self._computer(later_request, record)
+
+            return later()  # type: ignore[return-value]
         if request.method == "PATCH":
             body = json.loads(request.content)
             if body.get("ends_in_hours") is not None:
@@ -573,6 +585,14 @@ class FakePlatform:
         self, request: httpx.Request, computer_id: str, rest: list[str]
     ) -> httpx.Response:
         urls = self.public_urls.setdefault(computer_id, [])
+        if request.method == "GET" and self.list_delay:
+            delay, self.list_delay = self.list_delay, 0.0
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                return self._public_urls(request, computer_id, rest)
+
+            return later()  # type: ignore[return-value]
         if request.method == "GET":
             return httpx.Response(
                 200,
