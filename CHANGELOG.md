@@ -28,7 +28,10 @@ This is the summary you read to decide whether to upgrade.
   absolute in-workspace symlinks made relative); a symlink out of the workspace
   fails the persist. With a snapshot store configured, the computer is deleted
   at shutdown only when a confirmed save covers everything the session did,
-  and stopped otherwise; a resume onto that computer keeps its newer disk. A
+  and stopped otherwise. While a computer exists its disk is the truth: a
+  resume onto it never restores a snapshot over the disk, and a snapshot only
+  rebuilds a computer that is gone (a rebuild whose restore fails deletes the
+  new computer and leaves the snapshot untouched). A
   computer without a `name` is named `agents-<session>`, and a create or a
   command start abandoned by cancellation is cleaned up once it answers.
   PTY sessions, users other than `root`, manifest users and groups, mounts and

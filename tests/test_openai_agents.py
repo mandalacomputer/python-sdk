@@ -42,6 +42,7 @@ from agents.testing import ScriptedModel, assistant_message, function_call
 from tests.openai_agents_fake import FakePlatform
 
 import mandala_computer.openai_agents as oa
+from mandala_computer import MandalaError
 from mandala_computer.openai_agents import (
     MandalaSandboxClient,
     MandalaSandboxClientOptions,
@@ -1037,19 +1038,17 @@ async def test_a_resume_after_a_failed_save_keeps_the_newer_disk(
         store.chmod(0o700)
     assert fake.computers["vm-1"]["status"] == "stopped"
     payload = client.serialize_session_state(session.state)
-    assert payload["workspace_unsaved"] is True
 
     resumed = await client.resume(client.deserialize_session_state(payload))
     await resumed.start()
     # The older snapshot was not restored over the newer disk.
     assert (await resumed.read(Path("notes.txt"))).read() == b"second, unsaved"
     await resumed.stop()  # saved this time
-    assert resumed.state.workspace_unsaved is False  # type: ignore[attr-defined]
     await resumed.shutdown()
     assert fake.computers == {}
 
 
-async def test_a_resume_after_a_good_save_restores_a_drifted_disk(
+async def test_a_resume_onto_a_stopped_computer_keeps_a_disk_newer_than_the_snapshot(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
 ) -> None:
     session = await client.create(
@@ -1062,10 +1061,10 @@ async def test_a_resume_after_a_good_save_restores_a_drifted_disk(
     await session.aclose()
     (root / "notes.txt").write_bytes(b"changed behind the session's back")
     payload = client.serialize_session_state(session.state)
-    assert payload["workspace_unsaved"] is False
     resumed = await client.resume(client.deserialize_session_state(payload))
     await resumed.start()
-    assert (await resumed.read(Path("notes.txt"))).read() == b"saved"
+    # Disk wins: the computer still exists, so its disk is the truth.
+    assert (await resumed.read(Path("notes.txt"))).read() == (b"changed behind the session's back")
     await resumed.aclose()
 
 
@@ -1081,9 +1080,7 @@ async def test_a_change_after_a_save_keeps_the_computer_and_the_change(
     await session.start()
     await session.write(Path("notes.txt"), io.BytesIO(b"saved"))
     await session.stop()
-    assert session.state.workspace_unsaved is False  # type: ignore[attr-defined]
     await session.write(Path("notes.txt"), io.BytesIO(b"newer than the snapshot"))
-    assert session.state.workspace_unsaved is True  # type: ignore[attr-defined]
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert not fake.calls("DELETE", "/vm-1")
@@ -1179,7 +1176,6 @@ async def test_a_write_during_a_save_still_counts_as_a_change(
     await session.write(Path("notes.txt"), io.BytesIO(b"written during the save"))
     _UPLOAD_RELEASE.set()
     await saving
-    assert session.state.workspace_unsaved is True  # type: ignore[attr-defined]
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert not fake.calls("DELETE", "/vm-1")
@@ -1238,8 +1234,17 @@ async def test_a_failed_restore_never_overwrites_the_snapshot(
     await resumed.shutdown()
     await client.delete(resumed)
     assert {p.name: p.read_bytes() for p in store.iterdir()} == saved
-    assert fake.computers["vm-2"]["status"] == "stopped"
-    assert not fake.calls("DELETE", "/vm-2")
+    # The replacement held nothing, so it was deleted.
+    assert "vm-2" not in fake.computers
+
+    # Resumed again, onto another replacement that restores, the save keeps
+    # the good workspace.
+    payload = client.serialize_session_state(resumed.state)
+    again = await client.resume(client.deserialize_session_state(payload))
+    await again.start()
+    assert (await again.read(Path("good.txt"))).read() == b"the good snapshot"
+    await again.aclose()
+    assert fake.computers == {}
 
 
 async def test_a_write_in_flight_when_the_save_captures_is_not_counted_saved(
@@ -1255,7 +1260,6 @@ async def test_a_write_in_flight_when_the_save_captures_is_not_counted_saved(
         await asyncio.sleep(0.01)  # the write is under way and has not landed
     await session.stop()  # captures and saves without it
     await writing
-    assert session.state.workspace_unsaved is True  # type: ignore[attr-defined]
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert not fake.calls("DELETE", "/vm-1")
@@ -1265,3 +1269,26 @@ async def test_a_write_in_flight_when_the_save_captures_is_not_counted_saved(
     await resumed.start()
     assert (await resumed.read(Path("late.txt"))).read() == b"late"
     await resumed.aclose()
+
+
+# --- disk wins ------------------------------------------------------------------
+
+
+async def test_a_refresh_failure_raises_and_never_restores_over_writes(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    await session.write(Path("notes.txt"), io.BytesIO(b"older"))
+    await session.stop()  # the snapshot now holds "older"
+    await session.write(Path("notes.txt"), io.BytesIO(b"newer"))
+    fake.fail_once[("GET", "vm-1")] = (503, {"error": "a blip"})
+    with pytest.raises(MandalaError):
+        await session.running()
+    # What the runner does after a "not running": start again. It must not
+    # restore the snapshot over the disk.
+    await session.start()
+    assert (await session.read(Path("notes.txt"))).read() == b"newer"
+    await session.aclose()

@@ -263,10 +263,6 @@ class MandalaSandboxSessionState(SandboxSessionState):
     #: Public URLs this session created, by port. Ones that already existed are
     #: reused and never removed.
     public_url_ids: dict[int, str] = Field(default_factory=dict)
-    #: The computer's workspace has changes the snapshot does not: its last save
-    #: failed or never ran. A resume onto the same computer keeps its disk
-    #: rather than restoring the older snapshot over it.
-    workspace_unsaved: bool = False
 
 
 class MandalaSandboxSession(BaseSandboxSession):
@@ -303,9 +299,6 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: the workspace may be empty or half restored, so it is never saved
         #: over a snapshot, and the computer is never deleted.
         self._workspace_ready = False
-        #: As saved: whether this computer's disk was already newer than the
-        #: snapshot. Read once, since starting the session runs commands too.
-        self._resumed_unsaved = state.workspace_unsaved
 
     @contextlib.contextmanager
     def _mutating(self) -> Iterator[None]:
@@ -319,8 +312,6 @@ class MandalaSandboxSession(BaseSandboxSession):
             yield
             return
         self._generation += 1
-        if not isinstance(self.state.snapshot, NoopSnapshot):
-            self.state.workspace_unsaved = True
         self._in_flight += 1
         try:
             yield
@@ -712,10 +703,9 @@ class MandalaSandboxSession(BaseSandboxSession):
             logger.debug("could not remove the upload receipt for %s", guest_path)
 
     async def running(self) -> bool:
-        try:
-            await self._computer.refresh()
-        except MandalaError:
-            return False
+        # A failed read is raised, not taken for "not running": that answer
+        # makes the SDK start the session again.
+        await self._computer.refresh()
         return self._computer.status == "running"
 
     # --- workspace archives -------------------------------------------------
@@ -831,8 +821,7 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def _persist_snapshot(self) -> None:
         # The whole persist, archive and store both: only a store that returned
-        # counts as saved. A failure or a cancellation anywhere leaves it unsaved,
-        # and says so in the state a resume reads.
+        # counts as saved. A failure or a cancellation anywhere leaves it unsaved.
         if not self._workspace_ready and not isinstance(self.state.snapshot, NoopSnapshot):
             # The session never finished starting: the workspace may be empty
             # or half restored, and saving it would replace a good snapshot.
@@ -843,8 +832,6 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
         started_at = self._generation
         self._in_flight_at_capture = self._in_flight
-        if not isinstance(self.state.snapshot, NoopSnapshot):
-            self.state.workspace_unsaved = True
         # Scoped to this call and what it awaits: a write from another task
         # while the save is uploading still counts as a change.
         token = _SAVING.set(self)
@@ -856,19 +843,23 @@ class MandalaSandboxSession(BaseSandboxSession):
         # when the workspace was captured; anything since is not in it.
         if self._in_flight_at_capture == 0:
             self._saved_generation = started_at
-        self.state.workspace_unsaved = self._workspace_unsaved()
 
     async def _can_reuse_restorable_snapshot_workspace(self) -> bool:
-        if self._resumed_unsaved and self._workspace_state_preserved_on_start():
-            # The disk is newer than the snapshot: restoring would undo the
-            # work the failed save was meant to keep.
-            logger.warning(
-                "computer %s holds workspace changes newer than its snapshot; "
-                "keeping them rather than restoring the snapshot",
-                self.state.computer_id,
-            )
+        # Disk wins: while the computer exists its disk is the truth, and a
+        # snapshot only rebuilds a computer that is gone. So a resume onto the
+        # same computer, or a second start of this session, never restores.
+        if self._workspace_state_preserved_on_start() or self._workspace_ready:
             return True
         return await super()._can_reuse_restorable_snapshot_workspace()
+
+    async def _after_start_failed(self) -> None:
+        await super()._after_start_failed()
+        if self._workspace_state_preserved_on_start() or self._workspace_ready:
+            return
+        # A computer made for this session that never finished starting (its
+        # restore failed, say) holds nothing: delete it rather than keep it.
+        self._shut_down = True
+        await _shielded(_delete_quietly(self._computer))
 
     def _workspace_unsaved(self) -> bool:
         if not self._workspace_ready and self._workspace_state_preserved_on_start():
@@ -905,7 +896,6 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
             )
             mode = "stop"
-            self.state.workspace_unsaved = True
         if mode != "delete":
             await self._remove_public_urls()
         try:
@@ -1099,16 +1089,9 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                     _raise_start_error(state, error, "start")
                 raise
         else:
-            if state.workspace_unsaved:
-                logger.warning(
-                    "computer %s, which held workspace changes newer than its snapshot, "
-                    "is gone; restoring the snapshot onto a new computer",
-                    state.computer_id,
-                )
             state.computer_id = ""
             state.workspace_root_ready = False
             state.public_url_ids = {}
-            state.workspace_unsaved = False
             computer = await self._make_computer(state)
 
         inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)

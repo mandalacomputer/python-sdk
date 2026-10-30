@@ -2547,13 +2547,21 @@ run config has one), shuts the session down, and calls the client's
   processes as they were. A computer that cannot be suspended at that moment
   is stopped instead.
 
+**The disk wins.** While a computer exists, its disk is the truth about the
+workspace, and a snapshot is used only to rebuild a computer that is gone. A
+resume onto the same computer, or a second start of a session after a failed
+health check, never restores a snapshot over the disk, however old the
+snapshot. A rebuilt computer is restored from the snapshot; if that restore
+fails, the new computer, which holds nothing yet, is deleted and the error
+raised, and the snapshot is untouched. A check of whether the computer is
+running that cannot reach the platform raises rather than answering "not
+running".
+
 A kept computer keeps its disk on your plan until it is deleted. A resume
 reattaches a running computer as it is, starts a stopped or suspended one, and
 replaces one that is gone or can never run again. A computer the resume
-started is stopped again if the rest of the resume fails or is cancelled. A
-computer kept because its workspace could not be saved is marked so in the
-saved state, and a resume onto it keeps its disk instead of restoring the older
-snapshot over the newer work. One it cannot read at all (a
+started is stopped again if the rest of the resume fails or is cancelled. One
+it cannot read at all (a
 key without access, the platform unreachable) is an error rather than a reason
 to make another. A failure to stop or delete at shutdown is logged on the
 `mandala_computer.openai_agents` logger with the computer's id rather than
