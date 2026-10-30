@@ -165,9 +165,18 @@ _CLEANUP_TIMEOUT = 30.0
 #: cleanup takes it over.
 _ANSWER_WAIT = 30.0
 
-#: The session whose save is running in this context: its own commands do not
-#: count as changes to the workspace it is saving.
-_SAVING: contextvars.ContextVar[object] = contextvars.ContextVar(
+
+class _Save:
+    """One save in progress: whose, and what it saw when it captured."""
+
+    def __init__(self, session: object, in_flight: int) -> None:
+        self.session = session
+        self.in_flight_at_capture = in_flight
+
+
+#: The save running in this context: its own session's commands do not count
+#: as changes to the workspace it is saving.
+_SAVING: contextvars.ContextVar[_Save | None] = contextvars.ContextVar(
     "mandala_agents_saving", default=None
 )
 
@@ -291,10 +300,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: copy of the workspace whenever the two differ.
         self._generation = 0
         self._saved_generation: int | None = None
-        #: Changes started and not yet finished, and how many there were when
-        #: the running save captured the workspace.
+        #: Changes started and not yet finished.
         self._in_flight = 0
-        self._in_flight_at_capture = 0
+        #: One save at a time, capture and store both, so saves land in order.
+        self._save_lock = asyncio.Lock()
+        #: A command start whose answer was lost: something may be running that
+        #: this session cannot see or stop, so no later save is trusted as
+        #: complete, and shutdown stops the computer rather than deleting it.
+        self._contaminated = False
         #: Set once start() has fully succeeded, a restore included. Until then
         #: the workspace may be empty or half restored, so it is never saved
         #: over a snapshot, and the computer is never deleted.
@@ -308,7 +321,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         until it ends, so a save that captures the workspace meanwhile knows it
         may have missed it. The save's own commands are exempt, and only those.
         """
-        if _SAVING.get() is self:
+        save = _SAVING.get()
+        if save is not None and save.session is self:
             yield
             return
         self._generation += 1
@@ -418,6 +432,24 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             ) from error
         except MandalaError as error:
+            if not (
+                isinstance(error, APIError) and error.status is not None and error.status < 500
+            ):
+                # Not a clean refusal: the command may have started anyway.
+                self._contaminated = True
+                logger.warning(
+                    "the answer to a command start on computer %s was lost (%s); the "
+                    "command may be running, so this session's saves are no longer "
+                    "trusted as complete and shutdown will keep the computer",
+                    self.state.computer_id,
+                    type(error).__name__,
+                )
+                raise ExecTransportError(
+                    command=argv,
+                    context={"backend": _BACKEND_ID, **_error_context(error)},
+                    cause=error,
+                    retryable=False,
+                ) from error
             _raise_exec_transport(error, argv)
         except (asyncio.CancelledError, asyncio.TimeoutError) as error:
             # The start may still land: wait for it, out of the caller's
@@ -712,7 +744,9 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def persist_workspace(self) -> io.IOBase:
         # Captured now: a change still in flight may or may not be in the tar.
-        self._in_flight_at_capture = self._in_flight
+        save = _SAVING.get()
+        if save is not None and save.session is self:
+            save.in_flight_at_capture = self._in_flight
         root = self._workspace_root_path()
         error_root = posix_path_for_error(root)
         archive = f"{_GUEST_TMP}/mandala-agents-persist-{uuid.uuid4().hex}.tar"
@@ -830,19 +864,20 @@ class MandalaSandboxSession(BaseSandboxSession):
                 context={"backend": _BACKEND_ID, "reason": "workspace_not_ready"},
                 retryable=False,
             )
-        started_at = self._generation
-        self._in_flight_at_capture = self._in_flight
-        # Scoped to this call and what it awaits: a write from another task
-        # while the save is uploading still counts as a change.
-        token = _SAVING.set(self)
-        try:
-            await super()._persist_snapshot()
-        finally:
-            _SAVING.reset(token)
-        # Saved as of when the save began, and only if nothing was mid-change
-        # when the workspace was captured; anything since is not in it.
-        if self._in_flight_at_capture == 0:
-            self._saved_generation = started_at
+        async with self._save_lock:
+            started_at = self._generation
+            save = _Save(self, self._in_flight)
+            # Scoped to this call and what it awaits: a write from another task
+            # while the save is uploading still counts as a change.
+            token = _SAVING.set(save)
+            try:
+                await super()._persist_snapshot()
+            finally:
+                _SAVING.reset(token)
+            # Saved as of when the save began, and only if nothing was mid-change
+            # when the workspace was captured; anything since is not in it.
+            if save.in_flight_at_capture == 0 and not self._contaminated:
+                self._saved_generation = started_at
 
     async def _can_reuse_restorable_snapshot_workspace(self) -> bool:
         # Disk wins: while the computer exists its disk is the truth, and a

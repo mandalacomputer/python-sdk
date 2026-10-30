@@ -136,6 +136,8 @@ class FakePlatform:
         self.lose_create = False
         #: Answer creates as a platform that does not know end times.
         self.ignore_end_time = False
+        #: The next command start runs, and its answer is lost.
+        self.lose_start = False
         #: Seconds the next write of a file with this name takes to land.
         self.put_delay: dict[str, float] = {}
         #: Seconds a create takes to answer (the computer exists meanwhile).
@@ -264,6 +266,10 @@ class FakePlatform:
                     200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""}
                 )
             started = self._start(body)
+            if self.lose_start:
+                # Started, and the answer lost on the way back.
+                self.lose_start = False
+                return httpx.Response(504, json={"error": "gateway timeout"})
             if self.start_delay:
                 delay = self.start_delay
 

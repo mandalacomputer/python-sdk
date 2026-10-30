@@ -1292,3 +1292,46 @@ async def test_a_refresh_failure_raises_and_never_restores_over_writes(
     await session.start()
     assert (await session.read(Path("notes.txt"))).read() == b"newer"
     await session.aclose()
+
+
+# --- review round 8 -------------------------------------------------------------
+
+
+async def test_overlapping_saves_never_confirm_a_write_still_in_flight(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.put_delay["late.txt"] = 2.0
+    writing = asyncio.ensure_future(session.write(Path("late.txt"), io.BytesIO(b"late")))
+    while not fake.calls("PUT", "/files"):
+        await asyncio.sleep(0.01)
+    # Two saves at once: they run one after the other, each judged on its own.
+    await asyncio.gather(session.stop(), session.stop())
+    assert not writing.done()
+    await writing
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+
+async def test_a_lost_command_start_means_no_save_is_trusted(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.lose_start = True
+    with pytest.raises(ExecTransportError) as caught:
+        await session.exec("sleep 0.1")
+    assert caught.value.retryable is False
+    # The session stays usable...
+    assert (await session.exec("printf ok")).stdout == b"ok"
+    # ...but its saves are not trusted as complete, so shutdown keeps the computer.
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")

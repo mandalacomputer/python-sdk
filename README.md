@@ -2599,7 +2599,10 @@ second.
   when the store has confirmed a save covering everything the session did;
   if that save failed, was cancelled, never ran, or a command or write came
   after it or was still under way when it captured the workspace, the
-  computer is stopped instead, keeping its disk. A session that never
+  computer is stopped instead, keeping its disk. The same goes for a session
+  where a command's start was sent but its answer lost: that command may be
+  running unseen, so the session's saves are no longer trusted as complete.
+  Saves in one session run one at a time. A session that never
   finished starting (a restore that failed, say) never saves over the
   snapshot and never deletes its computer.
 - **Refused, before anything is created**: manifest users and groups, mount
