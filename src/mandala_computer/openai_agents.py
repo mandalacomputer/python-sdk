@@ -195,6 +195,9 @@ _SPOOL_IN_MEMORY = 64 * 1024 * 1024
 #: How much of a file one read request asks for.
 _READ_PART = 8 * 1024 * 1024
 
+#: How long closing the client waits for its sessions' shutdowns.
+_CLOSE_WAIT = 300.0
+
 #: How long shutdown waits for changes already under way to finish.
 _DRAIN_WAIT = 30.0
 
@@ -1294,6 +1297,13 @@ class MandalaSandboxSession(BaseSandboxSession):
         assert self._shutdown_task is not None
         await asyncio.shield(self._shutdown_task)
 
+    def _shutdown_now(self) -> asyncio.Future[None]:
+        """This session's shutdown task, started if it has not been."""
+        if self._shutdown_task is None:
+            self._begin_shutdown(self._shut_down_computer())
+        assert self._shutdown_task is not None
+        return self._shutdown_task
+
     def _begin_shutdown(self, body: Awaitable[None]) -> None:
         """Start this session's one shutdown; from here on, changes are refused."""
         self._shut_down = True
@@ -1348,36 +1358,40 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
             )
             mode = "stop"
-        if mode != "delete":
+        # The computer first, so that is done whatever happens to the rest; a
+        # stopped computer serves nothing, so its URLs can come down after.
+        if not await self._act(mode):
             await self._settle_resolutions()
             await self._remove_public_urls()
+
+    async def _act(self, mode: ShutdownMode) -> bool:
+        """Delete, suspend or stop the computer; True when it is gone."""
+        computer = self._computer
         try:
             if mode == "delete":
                 try:
                     await computer.delete()
-                    return
+                    return True
                 except NotFoundError:
-                    return
+                    return True
                 except MandalaError as error:
-                    # Not deleted: it and its URLs are still up. Take them down
-                    # as a stop would, and stop it below.
+                    # Not deleted: it and its URLs are still up. Stop it, and
+                    # its URLs come down after.
                     logger.warning(
-                        "could not delete computer %s on shutdown (%s); removing its "
-                        "public URLs and stopping it instead",
+                        "could not delete computer %s on shutdown (%s); stopping it "
+                        "and removing its public URLs instead",
                         computer.id,
                         type(error).__name__,
                     )
                     mode = "stop"
-                    await self._settle_resolutions()
-                    await self._remove_public_urls()
             if mode == "suspend":
                 try:
                     await computer.suspend()
-                    return
+                    return False
                 except MandalaError as error:
                     await computer.refresh()
                     if computer.status in ("suspended", "stopped"):
-                        return
+                        return False
                     # Not suspendable now: stopping keeps the disk, which is the
                     # part of the session a resume can always rebuild from.
                     logger.warning(
@@ -1398,16 +1412,19 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
                 type(error).__name__,
             )
+        return False
 
     async def _remove_public_urls(self) -> None:
         for port, url_ids in list(self.state.public_url_ids.items()):
             kept = []
             for url_id in url_ids:
                 try:
-                    await self._computer.delete_public_url(url_id)
+                    await asyncio.wait_for(
+                        self._computer.delete_public_url(url_id), _CLEANUP_TIMEOUT
+                    )
                 except NotFoundError:
                     pass
-                except MandalaError as error:
+                except (MandalaError, asyncio.TimeoutError) as error:
                     logger.warning(
                         "could not remove the public URL for port %s on %s (%s)",
                         port,
@@ -1462,17 +1479,20 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         """
         # Cleanup waiting on answers first, while the computers are still up.
         await self._reaper.aclose(_CLEANUP_TIMEOUT)
-        for session in list(self._live):
-            try:
-                await _shielded(
-                    asyncio.wait_for(session.shutdown(), _DRAIN_WAIT + _CLEANUP_TIMEOUT)
-                )
-            except Exception as error:  # noqa: BLE001 - reported; close goes on
+        # The shutdown tasks themselves are waited on, not a call that gives
+        # up on them, and the transport they use is closed only after.
+        shutdowns = {session._shutdown_now(): session for session in list(self._live)}
+        if shutdowns:
+            _, pending = await asyncio.wait(list(shutdowns), timeout=_CLOSE_WAIT)
+            for task in pending:
                 logger.warning(
-                    "could not shut down the session on computer %s at client close (%s)",
-                    session.computer_id,
-                    type(error).__name__,
+                    "the shutdown of computer %s had not finished at client close; "
+                    "it was cancelled",
+                    shutdowns[task].computer_id,
                 )
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending)
         await self._reaper.aclose(_CLEANUP_TIMEOUT)
         if self._owns_client:
             await self._client.aclose()

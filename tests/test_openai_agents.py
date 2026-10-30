@@ -2156,3 +2156,30 @@ async def test_a_session_never_closed_is_shut_down_by_the_client(
         # ...and the caller forgets to close it.
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert fake.public_urls["vm-1"] == []
+
+
+# --- review round 26 ------------------------------------------------------------
+
+
+async def test_client_close_stops_the_computer_before_slow_url_cleanup(
+    fake: FakePlatform,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(oa, "_CLOSE_WAIT", 0.3)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(on_shutdown="stop", exposed_ports=(8080,)),
+    )
+    await session.start()
+    await session.resolve_exposed_port(8080)
+    fake.url_delete_delay = 2.0  # slower than the close budget
+    await sandbox_client.aclose()
+    # The computer was stopped first, before the budget ran out...
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    # ...and the shutdown still removing URLs was not left running.
+    task = inner(session)._shutdown_task
+    assert task is not None and task.done()
+    assert "vm-1" in caplog.text

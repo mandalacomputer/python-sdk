@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds a public URL delete takes.
+        self.url_delete_delay = 0.0
         #: Seconds each ranged file read takes.
         self.range_delay = 0.0
         #: Seconds each upload chunk takes to land.
@@ -522,6 +524,15 @@ class FakePlatform:
                     url.update({k: v for k, v in body.items() if k in ("port", "access")})
                     return httpx.Response(200, json=url)
             return httpx.Response(404, json={"error": "no such URL"})
+        if request.method == "DELETE" and rest and self.url_delete_delay:
+            delay = self.url_delete_delay
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                self.public_urls[computer_id] = [u for u in urls if u["id"] != rest[0]]
+                return httpx.Response(200, json={"ok": True})
+
+            return later()  # type: ignore[return-value]
         if request.method == "DELETE" and rest:
             self.public_urls[computer_id] = [u for u in urls if u["id"] != rest[0]]
             return httpx.Response(200, json={"ok": True})
