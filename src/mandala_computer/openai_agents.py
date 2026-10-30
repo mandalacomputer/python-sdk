@@ -68,7 +68,7 @@ import tarfile
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, NoReturn, TypeVar
+from typing import Literal, NoReturn, TypeVar
 
 try:
     from agents.sandbox.errors import (
@@ -432,18 +432,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             ) from error
         except MandalaError as error:
-            if not (
-                isinstance(error, APIError) and error.status is not None and error.status < 500
-            ):
+            if not _clean_refusal(error):
                 # Not a clean refusal: the command may have started anyway.
-                self._contaminated = True
-                logger.warning(
-                    "the answer to a command start on computer %s was lost (%s); the "
-                    "command may be running, so this session's saves are no longer "
-                    "trusted as complete and shutdown will keep the computer",
-                    self.state.computer_id,
-                    type(error).__name__,
-                )
+                self._taint(f"the answer to a command start was lost ({type(error).__name__})")
                 raise ExecTransportError(
                     command=argv,
                     context={"backend": _BACKEND_ID, **_error_context(error)},
@@ -454,7 +445,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         except (asyncio.CancelledError, asyncio.TimeoutError) as error:
             # The start may still land: wait for it, out of the caller's
             # cancellation, and stop the command it started.
-            await _shielded(
+            settled = await _shielded(
                 _after(
                     submit,
                     _kill_quietly,
@@ -462,12 +453,24 @@ class MandalaSandboxSession(BaseSandboxSession):
                     f"a command start on computer {self.state.computer_id}",
                 )
             )
+            if not settled:
+                self._taint("an abandoned command start was not confirmed stopped")
             if isinstance(error, asyncio.CancelledError):
                 raise
             raise ExecTimeoutError(
                 command=argv, timeout_s=timeout, context={"backend": _BACKEND_ID}
             ) from None
         return await self._collect(job, argv, timeout, deadline)
+
+    def _taint(self, why: str) -> None:
+        """A command may be running unseen: no later save counts as complete."""
+        self._contaminated = True
+        logger.warning(
+            "%s on computer %s; it may still be running, so this session's saves are "
+            "no longer trusted as complete and shutdown will keep the computer",
+            why,
+            self.state.computer_id,
+        )
 
     async def _collect(
         self,
@@ -494,8 +497,8 @@ class MandalaSandboxSession(BaseSandboxSession):
             finished = True
             return result
         finally:
-            if not finished:
-                await _shielded(_kill_quietly(job))
+            if not finished and not await _shielded(_kill_quietly(job)):
+                self._taint(f"command {job.pid} could not be confirmed stopped")
 
     async def _collect_by_offset(
         self,
@@ -1351,7 +1354,7 @@ class _Reaper:
     def later(
         self,
         pending: asyncio.Future[_ReadT],
-        then: Callable[[_ReadT], Awaitable[None]],
+        then: Callable[[_ReadT], Awaitable[object]],
         what: str,
     ) -> None:
         async def run() -> None:
@@ -1379,26 +1382,41 @@ class _Reaper:
 
 async def _after(
     pending: asyncio.Future[_ReadT],
-    then: Callable[[_ReadT], Awaitable[None]],
+    then: Callable[[_ReadT], Awaitable[object]],
     reaper: _Reaper,
     what: str,
-) -> None:
-    """Undo what an abandoned request made: now if it answers soon, later if not."""
+) -> bool:
+    """Undo what an abandoned request made: now if it answers soon, later if not.
+
+    True only when that is settled: the request was cleanly refused, or what it
+    made was undone. Handed to the client's cleanup, or undone uncertainly, is
+    False.
+    """
     try:
         result = await asyncio.wait_for(asyncio.shield(pending), _ANSWER_WAIT)
     except asyncio.TimeoutError:
         reaper.later(pending, then, what)
-        return
-    except Exception:  # noqa: BLE001 - it failed, so nothing to undo
-        return
-    await then(result)
+        return False
+    except MandalaError as error:
+        return _clean_refusal(error)
+    except Exception:  # noqa: BLE001 - refused before it was sent
+        return True
+    return await then(result) is not False
 
 
-async def _kill_quietly(job: AsyncBackgroundCommand) -> None:
+async def _kill_quietly(job: AsyncBackgroundCommand) -> bool:
+    """Stop a command; True only when the platform confirmed it."""
     try:
         await asyncio.wait_for(job.kill(), _CLEANUP_TIMEOUT)
-    except Exception:  # noqa: BLE001 - it may have ended on its own meanwhile
+    except Exception:  # noqa: BLE001 - reported to the caller as unconfirmed
         logger.debug("could not stop guest command %s", job.pid)
+        return False
+    return True
+
+
+def _clean_refusal(error: MandalaError) -> bool:
+    """A refusal that did nothing: a 4xx answer, not a lost or failed one."""
+    return isinstance(error, APIError) and error.status is not None and error.status < 500
 
 
 async def _stop_quietly(computer: AsyncComputer) -> None:
@@ -1497,11 +1515,11 @@ async def _delete_quietly(computer: AsyncComputer) -> None:
         )
 
 
-async def _shielded(cleanup: Any) -> None:
+async def _shielded(cleanup: Awaitable[_ReadT]) -> _ReadT:
     """Run a cleanup coroutine to the end even when the caller is being cancelled."""
     task = asyncio.ensure_future(cleanup)
     try:
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
         await task
         raise

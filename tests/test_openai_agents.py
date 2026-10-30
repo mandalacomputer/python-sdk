@@ -1335,3 +1335,50 @@ async def test_a_lost_command_start_means_no_save_is_trusted(
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert not fake.calls("DELETE", "/vm-1")
+
+
+# --- review round 9 -------------------------------------------------------------
+
+
+async def test_a_save_before_deferred_cleanup_finishes_does_not_delete(
+    fake: FakePlatform, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.start_delay = 1.0
+    task = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    fake.start_delay = 0.0
+    # The stop of that command is still pending in the client's cleanup.
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+    await sandbox_client.aclose()
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+
+
+async def test_a_command_that_could_not_be_stopped_keeps_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    next_pid = 1000 + len(fake.jobs)
+    fake.fail[("DELETE", str(next_pid))] = (500, {"error": "could not stop it"})
+    with pytest.raises(ExecTimeoutError):
+        await session.exec("sleep 30", timeout=0.3)
+    fake.fail.clear()
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
