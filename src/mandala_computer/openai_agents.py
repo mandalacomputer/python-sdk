@@ -342,6 +342,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         computer: AsyncComputer,
         reaper: _Reaper | None = None,
         live: set[MandalaSandboxSession] | None = None,
+        owners: dict[str, MandalaSandboxSession] | None = None,
     ) -> None:
         self.state = state
         self._computer = computer
@@ -349,6 +350,13 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: The client's sessions not yet shut down; this one leaves it then.
         self._live = live if live is not None else set()
         self._live.add(self)
+        #: The client's record of which session holds which computer. A
+        #: session taking a computer becomes its holder; one finishing its
+        #: shutdown lets it go. Late cleanup stops a computer only while no
+        #: other session holds it.
+        self._owners = owners if owners is not None else {}
+        if state.computer_id:
+            self._owners[state.computer_id] = self
         self._workspace_root_ready = state.workspace_root_ready
         #: Set when shutdown begins: from then on changes are refused.
         self._shut_down = False
@@ -1420,7 +1428,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         if self._releasing is None:
             return
         self._settled_after_release = True
-        if self._released not in (None, "delete"):
+        if self._released not in (None, "delete") and not self._held_by_another():
             await _stop_quietly(self._computer)
 
     def _shutdown_now(self) -> asyncio.Future[None]:
@@ -1434,7 +1442,17 @@ class MandalaSandboxSession(BaseSandboxSession):
         """Start this session's one shutdown; from here on, changes are refused."""
         self._shut_down = True
         self._shutdown_task = asyncio.ensure_future(body)
-        self._shutdown_task.add_done_callback(lambda _: self._live.discard(self))
+        self._shutdown_task.add_done_callback(lambda _: self._let_go())
+
+    def _let_go(self) -> None:
+        self._live.discard(self)
+        if self._owners.get(self.state.computer_id) is self:
+            del self._owners[self.state.computer_id]
+
+    def _held_by_another(self) -> bool:
+        """Another session has since taken this computer: leave it to that one."""
+        holder = self._owners.get(self.state.computer_id)
+        return holder is not None and holder is not self
 
     async def start(self) -> None:
         try:
@@ -1503,6 +1521,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         while True:
             status = await _status_or_none(self._computer)
             if status == "running":
+                if self._held_by_another():
+                    return True  # another session runs it now
                 self._settled_after_release = True
                 await _stop_quietly(self._computer)
             elif status is not None and _settled_down(self._computer):
@@ -1534,8 +1554,22 @@ class MandalaSandboxSession(BaseSandboxSession):
             # it instead (a delete stays a delete).
             mode = "stop"
         # Held across the decision and its action, so no save runs between them.
-        async with self._save_lock:
+        locked = await _acquire_within(self._save_lock, _DRAIN_WAIT)
+        if not locked:
+            # A save has held on too long (a stalled upload, say). It cannot be
+            # confirmed now, so nothing is deleted: the computer is stopped,
+            # keeping its disk, and its URLs come down, without the lock.
+            logger.warning(
+                "a save on computer %s did not finish in time for shutdown; stopping "
+                "the computer instead",
+                computer.id,
+            )
+            mode = "stop"
+        try:
             await self._release(mode)
+        finally:
+            if locked:
+                self._save_lock.release()
 
     async def _release(self, mode: ShutdownMode) -> None:
         computer = self._computer
@@ -1710,6 +1744,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         self._dependencies = dependencies
         self._reaper = _Reaper()
         self._live: set[MandalaSandboxSession] = set()
+        self._owners: dict[str, MandalaSandboxSession] = {}
         #: Set when aclose() begins: no create or resume may begin after it.
         self._closing = False
         #: Creates and resumes under way, which aclose() waits for first.
@@ -1838,7 +1873,11 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         )
         computer = await self._make_computer(state, deadline)
         inner = MandalaSandboxSession(
-            state=state, computer=computer, reaper=self._reaper, live=self._live
+            state=state,
+            computer=computer,
+            reaper=self._reaper,
+            live=self._live,
+            owners=self._owners,
         )
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
@@ -1886,7 +1925,11 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             # The session exists, and the client counts it, before the start:
             # a client closed meanwhile shuts it down too.
             inner = MandalaSandboxSession(
-                state=state, computer=computer, reaper=self._reaper, live=self._live
+                state=state,
+                computer=computer,
+                reaper=self._reaper,
+                live=self._live,
+                owners=self._owners,
             )
             inner._set_start_state_preserved(preserved, system=preserved)
             was_running = computer.status == "running"
@@ -1928,7 +1971,11 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             computer = await self._make_computer(state, deadline)
 
         inner = MandalaSandboxSession(
-            state=state, computer=computer, reaper=self._reaper, live=self._live
+            state=state,
+            computer=computer,
+            reaper=self._reaper,
+            live=self._live,
+            owners=self._owners,
         )
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
@@ -2107,6 +2154,22 @@ def _end_time_ahead(computer: AsyncComputer) -> bool:
 
 class _LaunchTimeout(TimeoutError):
     """The launch budget (``launch_timeout_s``) ran out."""
+
+
+async def _acquire_within(lock: asyncio.Lock, timeout: float) -> bool:
+    """Take ``lock`` within ``timeout``; False, and not holding it, if not."""
+    take = asyncio.ensure_future(lock.acquire())
+    done, _ = await asyncio.wait({take}, timeout=timeout)
+    if done:
+        return True
+    take.cancel()
+    try:
+        await take
+    except asyncio.CancelledError:
+        return False
+    # Taken just as it was given up on: let it go again.
+    lock.release()
+    return False
 
 
 async def _within(deadline: float, step: Awaitable[_ReadT]) -> _ReadT:

@@ -2883,3 +2883,58 @@ async def test_a_resume_rolled_back_during_readiness_removes_owned_urls(
     assert fake.public_urls["vm-1"] == []
     await client.aclose()
     assert fake.public_urls["vm-1"] == []
+
+
+# --- review round 47 ------------------------------------------------------------
+
+
+async def test_client_close_during_a_stalled_save_still_stops_and_removes_urls(
+    fake: FakePlatform, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.2)
+    global _UPLOAD_REACHED, _UPLOAD_RELEASE
+    _UPLOAD_REACHED, _UPLOAD_RELEASE = asyncio.Event(), asyncio.Event()
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        snapshot=PausedSnapshot(id="paused", base_path=tmp_path),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,)),
+    )
+    await session.start()
+    await session.resolve_exposed_port(8080)
+    saving = asyncio.ensure_future(session.stop())
+    await asyncio.wait_for(_UPLOAD_REACHED.wait(), 10)  # the upload stalls here
+    await sandbox_client.aclose()
+    assert fake.computers["vm-1"]["status"] == "stopped"  # not deleted, not running
+    assert fake.public_urls["vm-1"] == []
+    _UPLOAD_RELEASE.set()
+    await saving  # finishing late changes nothing
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_late_cleanup_leaves_alone_a_computer_a_new_session_has_taken(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    fake.start_late_effect = 0.6
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running  # its start is the client's to finish
+    await session.shutdown()
+    payload = sandbox_client.serialize_session_state(session.state)
+    resumed = await sandbox_client.resume(sandbox_client.deserialize_session_state(payload))
+    await resumed.start()  # a new session runs the computer now
+    await asyncio.sleep(0.7)  # the old command start lands
+    await sandbox_client._reaper.aclose(5)
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed  # the old run's command is still killed...
+    assert fake.computers["vm-1"]["status"] == "running"  # ...but not the new run's computer
+    await resumed.aclose()
+    await sandbox_client.aclose()
