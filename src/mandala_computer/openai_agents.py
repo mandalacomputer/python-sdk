@@ -63,11 +63,12 @@ import io
 import logging
 import math
 import posixpath
+import re
 import shlex
 import tarfile
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal, NoReturn, TypeVar, cast
@@ -100,7 +101,6 @@ try:
         RESOLVE_WORKSPACE_PATH_HELPER,
         RuntimeHelperScript,
     )
-    from agents.sandbox.session.tar_workspace import shell_tar_exclude_args
     from agents.sandbox.snapshot import (
         NoopSnapshot,
         SnapshotBase,
@@ -1137,9 +1137,16 @@ class MandalaSandboxSession(BaseSandboxSession):
         root = self._workspace_root_path()
         error_root = posix_path_for_error(root)
         archive = f"{_GUEST_TMP}/mandala-agents-persist-{uuid.uuid4().hex}.tar"
-        excludes = " ".join(shell_tar_exclude_args(self._persist_workspace_skip_relpaths()))
+        skips = self._persist_workspace_skip_relpaths()
+        # Exclusions are paths, not patterns: GNU tar (the computer's) is told
+        # so; any other tar gets them with their wildcard characters escaped.
+        literal = " ".join(_tar_excludes(skips, escape=False))
+        escaped = " ".join(_tar_excludes(skips, escape=True))
+        where = f"-C {shlex.quote(sandbox_path_str(root))} -cf {shlex.quote(archive)} ."
         script = (
-            f"tar {excludes} -C {shlex.quote(sandbox_path_str(root))} -cf {shlex.quote(archive)} ."
+            "if tar --version 2>/dev/null | grep -q 'GNU tar'; then "
+            f"tar --no-wildcards --anchored {literal} {where}; "
+            f"else tar {escaped} {where}; fi"
             f" && wc -c < {shlex.quote(archive)}"
         )
         sink: Any = None
@@ -2316,6 +2323,19 @@ def _accepted_unread(error: MandalaError) -> bool:
     distinct from any failure of the call itself.
     """
     return type(error) is MandalaError and isinstance(error.__cause__, MandalaError)
+
+
+def _tar_excludes(relpaths: Iterable[Path], *, escape: bool) -> list[str]:
+    """``--exclude`` options naming exactly these workspace paths."""
+    options = []
+    for rel in sorted(relpaths, key=lambda path: path.as_posix()):
+        rel_posix = rel.as_posix().lstrip("/")
+        if not rel_posix or rel_posix in {".", "/"}:
+            continue
+        if escape:
+            rel_posix = re.sub(r"([\\\[\]*?])", r"\\\1", rel_posix)
+        options.append(f"--exclude={shlex.quote(f'./{rel_posix}')}")
+    return options
 
 
 def _settled_down(computer: AsyncComputer) -> bool:

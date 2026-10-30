@@ -2758,3 +2758,29 @@ async def test_an_inherited_uncertainty_makes_a_suspend_shutdown_stop(
     await resumed.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     await session.aclose()
+
+
+# --- review round 44 ------------------------------------------------------------
+
+
+async def test_snapshot_exclusions_are_paths_not_patterns(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store), options=DELETE
+    )
+    await session.start()
+    await session.write(Path("cache[1]/scratch"), io.BytesIO(b"ephemeral"))
+    await session.write(Path("cache1/kept"), io.BytesIO(b"durable"))
+    session.register_persist_workspace_skip_path("cache[1]")
+    await session.aclose()  # saved, then deleted
+    assert fake.computers == {}
+
+    payload = client.serialize_session_state(session.state)
+    rebuilt = await client.resume(client.deserialize_session_state(payload))
+    await rebuilt.start()
+    assert (await rebuilt.read(Path("cache1/kept"))).read() == b"durable"
+    assert not (root / "cache[1]").exists()
+    await rebuilt.aclose()
