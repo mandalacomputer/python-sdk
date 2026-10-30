@@ -427,6 +427,12 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._busy += 1
         try:
             yield
+        except BaseException as error:
+            if _outcome_unknown(error):
+                # Cancelled, or failed after a request may have gone out: its
+                # effect may still reach the computer.
+                self._taint(f"a request ended with its outcome unknown ({type(error).__name__})")
+            raise
         finally:
             self._busy -= 1
             await _shielded(self._landed_late())
@@ -1130,6 +1136,11 @@ class MandalaSandboxSession(BaseSandboxSession):
     # --- workspace archives -------------------------------------------------
 
     async def persist_workspace(self) -> io.IOBase:
+        root = self._workspace_root_path()
+        async with self._active(lambda: _closing_read_error(posix_path_for_error(root))):
+            return await self._persist_workspace()
+
+    async def _persist_workspace(self) -> io.IOBase:
         # Captured now: a change still in flight may or may not be in the tar.
         save = _SAVING.get()
         if save is not None and save.session is self:
@@ -1169,8 +1180,17 @@ class MandalaSandboxSession(BaseSandboxSession):
             # Closed below on every path, or handed on inside the rewrite.
             sink = tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY)  # noqa: SIM115
             await self._computer.download_file(
-                archive, cast(IO[bytes], _Capped(sink, _ARCHIVE_LIMIT))
+                archive,
+                cast(
+                    IO[bytes],
+                    _SinkUntilClosing(_Capped(sink, _ARCHIVE_LIMIT), lambda: self._shut_down),
+                ),
+                part_size=_READ_PART,
             )
+        except _Closing:
+            if sink is not None:
+                sink.close()
+            raise _closing_read_error(error_root) from None
         except _ArchiveTooLarge as error:
             if sink is not None:
                 sink.close()
@@ -2325,6 +2345,27 @@ def _accepted_unread(error: MandalaError) -> bool:
     return type(error) is MandalaError and isinstance(error.__cause__, MandalaError)
 
 
+def _outcome_unknown(error: BaseException) -> bool:
+    """Whether an operation ended with a request it sent possibly still to land.
+
+    A cancellation, or a platform failure anywhere in the chain that is not a
+    clean refusal. Refusals made here (paths, users, a session shutting down)
+    and plain command results are not.
+    """
+    if isinstance(error, asyncio.CancelledError):
+        return True
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _Closing):
+            return False
+        if isinstance(current, MandalaError):
+            return not _clean_refusal(current)
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _tar_excludes(relpaths: Iterable[Path], *, escape: bool) -> list[str]:
     """``--exclude`` options naming exactly these workspace paths."""
     options = []
@@ -2397,7 +2438,7 @@ class _StopWhenClosing(io.BytesIO):
 class _SinkUntilClosing(io.RawIOBase):
     """A download's sink that ends the download, between ranges, once closing."""
 
-    def __init__(self, sink: io.BytesIO, closing: Callable[[], bool]) -> None:
+    def __init__(self, sink: Any, closing: Callable[[], bool]) -> None:
         self._sink = sink
         self._closing = closing
 

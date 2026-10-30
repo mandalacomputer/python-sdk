@@ -2784,3 +2784,50 @@ async def test_snapshot_exclusions_are_paths_not_patterns(
     assert (await rebuilt.read(Path("cache1/kept"))).read() == b"durable"
     assert not (root / "cache[1]").exists()
     await rebuilt.aclose()
+
+
+# --- review round 45 ------------------------------------------------------------
+
+
+async def test_an_export_overlapping_a_suspend_shutdown_asks_for_no_more_ranges(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_READ_PART", 1024)  # many ranges
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    await session.write(Path("data.bin"), io.BytesIO(b"d" * 8000))
+    fake.range_delay = 0.2
+    exporting = asyncio.ensure_future(session.persist_workspace())
+    while not fake.calls("GET", "/files"):
+        await asyncio.sleep(0.01)
+    await session.shutdown()
+    with pytest.raises(WorkspaceArchiveReadError):
+        await exporting
+    asked = len(fake.calls("GET", "/files"))
+    await asyncio.sleep(0.5)
+    fake.range_delay = 0.0
+    assert len(fake.calls("GET", "/files")) == asked  # nothing after closing
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_a_cancelled_read_makes_a_suspend_shutdown_stop(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    await session.write(Path("note.txt"), io.BytesIO(b"x" * 100))
+    fake.range_delay = 0.4
+    reading = asyncio.ensure_future(session.read(Path("note.txt")))
+    while not fake.calls("GET", "/files"):
+        await asyncio.sleep(0.01)
+    reading.cancel()  # its request is out, and may still be served
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+    fake.range_delay = 0.0
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
