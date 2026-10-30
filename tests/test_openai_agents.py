@@ -2214,3 +2214,43 @@ async def test_a_start_landing_after_a_cancelled_resume_is_stopped_again(
     assert len(fake.calls("POST", "/vm-1/stop")) >= 3  # close, cleanup, after the start
     await sandbox_client.aclose()
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 28 ------------------------------------------------------------
+
+
+async def test_a_resume_overlapping_client_close_leaves_nothing_running(
+    fake: FakePlatform, root: Path
+) -> None:
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = sandbox_client.serialize_session_state(session.state)
+    fake.power_on_delay = 0.4
+    resuming = asyncio.ensure_future(
+        sandbox_client.resume(sandbox_client.deserialize_session_state(payload))
+    )
+    await asyncio.sleep(0.05)  # the start is in flight
+    await sandbox_client.aclose()
+    with pytest.raises(WorkspaceStartError) as caught:
+        await resuming
+    assert caught.value.context["reason"] == "client_closing"
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    with pytest.raises(WorkspaceStartError):
+        await sandbox_client.resume(sandbox_client.deserialize_session_state(payload))
+
+
+async def test_a_create_overlapping_client_close_is_deleted(fake: FakePlatform, root: Path) -> None:
+    sandbox_client = MandalaSandboxClient(fake.client())
+    fake.create_delay = 0.3
+    creating = asyncio.ensure_future(sandbox_client.create(manifest=manifest(root)))
+    await asyncio.sleep(0.05)
+    await sandbox_client.aclose()
+    with pytest.raises(WorkspaceStartError):
+        await creating
+    assert fake.computers == {}
+    with pytest.raises(WorkspaceStartError):
+        await sandbox_client.create(manifest=manifest(root))

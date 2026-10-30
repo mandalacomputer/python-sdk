@@ -67,7 +67,7 @@ import shlex
 import tarfile
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal, NoReturn, TypeVar, cast
 
@@ -1468,6 +1468,10 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         self._dependencies = dependencies
         self._reaper = _Reaper()
         self._live: set[MandalaSandboxSession] = set()
+        #: Set when aclose() begins: no create or resume may begin after it.
+        self._closing = False
+        #: Creates and resumes under way, which aclose() waits for first.
+        self._calls: set[asyncio.Future[SandboxSession]] = set()
 
     async def aclose(self) -> None:
         """Shut down sessions still open, finish outstanding cleanup, then close.
@@ -1477,7 +1481,17 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         start, a create) is given a bounded time to finish; what is left is
         logged and dropped. The API client is closed if this one made it.
         """
-        # Cleanup waiting on answers first, while the computers are still up.
+        self._closing = True
+        # Creates and resumes under way first: each that finishes now undoes
+        # its own computer rather than handing back a session.
+        if self._calls:
+            _, unfinished = await asyncio.wait(list(self._calls), timeout=_CLOSE_WAIT)
+            for call in unfinished:
+                logger.warning("a create or resume had not finished at client close")
+                call.cancel()
+            if unfinished:
+                await asyncio.wait(unfinished)
+        # Cleanup waiting on answers, while the computers are still up.
         await self._reaper.aclose(_CLEANUP_TIMEOUT)
         # The shutdown tasks themselves are waited on, not a call that gives
         # up on them, and the transport they use is closed only after.
@@ -1504,6 +1518,46 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         await self.aclose()
 
     async def create(
+        self,
+        *,
+        snapshot: SnapshotSpec | SnapshotBase | None = None,
+        manifest: Manifest | None = None,
+        options: MandalaSandboxClientOptions | None = None,
+    ) -> SandboxSession:
+        return await self._call(
+            self._create_session(snapshot=snapshot, manifest=manifest, options=options),
+            Path((manifest or Manifest()).root),
+        )
+
+    async def resume(self, state: SandboxSessionState) -> SandboxSession:
+        return await self._call(self._resume_session(state), Path(state.manifest.root))
+
+    async def _call(self, work: Awaitable[SandboxSession], root: Path) -> SandboxSession:
+        """A create or resume the client can wait for, and refuse once closing."""
+        if self._closing:
+            if isinstance(work, Coroutine):
+                work.close()
+            raise _client_closing(root)
+        task = asyncio.ensure_future(work)
+        self._calls.add(task)
+        task.add_done_callback(self._calls.discard)
+        session = await task
+        if self._closing:
+            # Finished after close began: put its computer down rather than
+            # hand back a session nothing will close.
+            inner = session._inner
+            if isinstance(inner, MandalaSandboxSession):
+                if inner._shutdown_task is None:
+                    kept = inner._workspace_state_preserved_on_start()
+                    inner._begin_shutdown(
+                        (_stop_quietly if kept else _delete_quietly)(inner.computer)
+                    )
+                assert inner._shutdown_task is not None
+                await _shielded(inner._shutdown_task)
+            raise _client_closing(root)
+        return session
+
+    async def _create_session(
         self,
         *,
         snapshot: SnapshotSpec | SnapshotBase | None = None,
@@ -1546,7 +1600,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         )
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
-    async def resume(self, state: SandboxSessionState) -> SandboxSession:
+    async def _resume_session(self, state: SandboxSessionState) -> SandboxSession:
         if not isinstance(state, MandalaSandboxSessionState):
             raise TypeError("MandalaSandboxClient.resume expects a MandalaSandboxSessionState")
         state.assert_path_grants_rebound()
@@ -2002,6 +2056,15 @@ class _SinkUntilClosing(io.RawIOBase):
         if self._closing():
             raise _Closing("the session is shutting down")
         return len(data)
+
+
+def _client_closing(root: Path) -> WorkspaceStartError:
+    return WorkspaceStartError(
+        path=posix_path_for_error(root),
+        message="the Mandala sandbox client is closing",
+        context={"backend": _BACKEND_ID, "reason": "client_closing"},
+        retryable=False,
+    )
 
 
 def _closing_read_error(path: Path) -> WorkspaceArchiveReadError:
