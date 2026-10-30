@@ -2535,7 +2535,9 @@ public URLs, or one at its limit, raises `ExposedPortUnavailableError` with the
 platform's `code` in its `context`. URLs the session made are removed when it
 shuts down, along with one still being made when shutdown begins; ones that
 already existed are left alone. A session that is shutting down refuses new
-ports.
+ports. Each URL the session asks for carries a label of its own
+(`agents-<session>-<port>-<random>`), which is how one whose answer was lost
+is told apart from anyone else's on the same port.
 
 #### Shutdown, and resuming
 
