@@ -1452,8 +1452,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         if self._workspace_state_preserved_on_start():
             if not self._started_by_resume:
                 return  # it was running before; leave it as it was
-            # A kept computer this resume started: stop it, keeping its disk.
-            self._begin_shutdown(self._put_down_quietly("stop"))
+            # A kept computer this resume started: stop it, keeping its disk,
+            # and take down its URLs, as a shutdown would.
+            self._begin_shutdown(self._shut_down_computer("stop"))
             assert self._shutdown_task is not None
             await asyncio.shield(self._shutdown_task)
             return
@@ -1464,7 +1465,7 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def _undo_start(self, starts: list[asyncio.Future[AsyncComputer]]) -> None:
         """Stop the computer a failed resume started, and again if a start lands late."""
-        await self._put_down("stop")
+        await self._shut_down_computer("stop")
         for start in starts:
             if not start.done():
                 await _after(
@@ -1510,8 +1511,13 @@ class MandalaSandboxSession(BaseSandboxSession):
                 return False
             await asyncio.sleep(_ADMITTED_POLL)
 
-    async def _shut_down_computer(self) -> None:
-        mode = self.state.on_shutdown
+    async def _shut_down_computer(self, forced: ShutdownMode | None = None) -> None:
+        """The whole release: the computer put down, then its URLs removed.
+
+        ``forced`` overrides ``on_shutdown``: a rolled-back resume stops the
+        computer it started, whatever the session would do at its end.
+        """
+        mode = forced or self.state.on_shutdown
         computer = self._computer
         if not await self._drained():
             # A change is still landing and could not be waited out: keep the

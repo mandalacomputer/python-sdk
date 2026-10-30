@@ -2832,3 +2832,54 @@ async def test_a_cancelled_read_makes_a_suspend_shutdown_stop(
     fake.range_delay = 0.0
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 46 ------------------------------------------------------------
+
+
+async def _resumable_with_a_url(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> dict[str, object]:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    await session.start()
+    fake.lose_public_url = True  # made, answer lost...
+    fake.unlistable_after_loss = True  # ...and not recovered: only its label knows it
+    with pytest.raises(ExposedPortUnavailableError):
+        await session.resolve_exposed_port(8080)
+    payload = client.serialize_session_state(session.state)
+    # Put down without its own shutdown, so the URL is still up.
+    fake.computers["vm-1"]["status"] = "stopped"
+    fake.computers["vm-1"]["running_ram_mb"] = 0
+    inner(session)._live.discard(inner(session))
+    assert len(fake.public_urls["vm-1"]) == 1
+    return payload
+
+
+async def test_a_resume_rolled_back_after_a_failed_start_removes_owned_urls(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    payload = await _resumable_with_a_url(fake, client, root)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    fake.fail[("POST", "exec")] = (500, {"error": "boom"})
+    with pytest.raises(Exception):  # noqa: B017 - the SDK's start error
+        await resumed.start()
+    fake.fail.clear()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []
+
+
+async def test_a_resume_rolled_back_during_readiness_removes_owned_urls(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    payload = await _resumable_with_a_url(fake, client, root)
+    payload["launch_timeout_s"] = 0.3
+    fake.patch_delay = 0.6  # the end-time renewal outlasts the budget
+    with pytest.raises(WorkspaceStartError):
+        await client.resume(client.deserialize_session_state(payload))
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []
+    await client.aclose()
+    assert fake.public_urls["vm-1"] == []
