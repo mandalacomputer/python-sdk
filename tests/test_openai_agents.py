@@ -1136,7 +1136,7 @@ async def test_a_start_answering_after_the_cleanup_wait_is_still_stopped(
         await task
     # The cleanup gave up waiting before the start answered; the client's
     # own cleanup still stops the command once it does.
-    await sandbox_client.aclose()
+    await sandbox_client._reaper.aclose(5)  # the pending cleanup, alone
     (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
     assert job.killed
     fake.start_delay = 0.0
@@ -1684,7 +1684,9 @@ async def test_a_public_url_made_after_its_request_was_abandoned_is_removed(
         await task
     # Asked again meanwhile: one URL for the port.
     endpoint = await session.resolve_exposed_port(8080)
-    await sandbox_client.aclose()  # the late URL lands, and is removed
+    await sandbox_client._reaper.aclose(
+        5
+    )  # the pending cleanup, alone  # the late URL lands, and is removed
     assert len(fake.calls("POST", "/public-urls")) == 2
     assert (
         len([r for r in fake.requests if r.method == "DELETE" and "public-urls" in r.url.path]) == 1
@@ -2096,3 +2098,61 @@ async def test_a_command_being_read_at_shutdown_reads_no_further(
     assert len(fake.calls("GET", "/output")) + len(fake.calls("GET", "/executions")) == reads
     # The read stops at once, so the drain completes and the suspend goes ahead.
     assert fake.computers["vm-1"]["status"] == "suspended"
+
+
+# --- review round 25 ------------------------------------------------------------
+
+
+async def test_cancelling_during_session_entry_leaves_no_running_computer(
+    fake: FakePlatform, root: Path
+) -> None:
+    async with MandalaSandboxClient(fake.client()) as sandbox_client:
+        session = await sandbox_client.create(manifest=manifest(root))
+        fake.start_delay = 0.5  # workspace setup is slow
+
+        async def enter() -> None:
+            async with session:
+                await asyncio.sleep(10)
+
+        task = asyncio.ensure_future(enter())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        fake.start_delay = 0.0
+    assert fake.computers == {}  # a new computer that never finished starting
+
+
+async def test_a_resumed_computer_cancelled_during_entry_is_stopped(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    fake.start_delay = 0.5
+    task = asyncio.ensure_future(resumed.start())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    fake.start_delay = 0.0
+    assert fake.computers["vm-1"]["status"] == "stopped"  # kept, not running
+
+
+async def test_a_session_never_closed_is_shut_down_by_the_client(
+    fake: FakePlatform, root: Path
+) -> None:
+    async with MandalaSandboxClient(fake.client()) as sandbox_client:
+        session = await sandbox_client.create(
+            manifest=manifest(root),
+            options=MandalaSandboxClientOptions(on_shutdown="stop", exposed_ports=(8080,)),
+        )
+        await session.start()
+        await session.resolve_exposed_port(8080)
+        # ...and the caller forgets to close it.
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []

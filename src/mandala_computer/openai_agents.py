@@ -322,10 +322,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         state: MandalaSandboxSessionState,
         computer: AsyncComputer,
         reaper: _Reaper | None = None,
+        live: set[MandalaSandboxSession] | None = None,
     ) -> None:
         self.state = state
         self._computer = computer
         self._reaper = reaper if reaper is not None else _Reaper()
+        #: The client's sessions not yet shut down; this one leaves it then.
+        self._live = live if live is not None else set()
+        self._live.add(self)
         self._workspace_root_ready = state.workspace_root_ready
         #: Set when shutdown begins: from then on changes are refused.
         self._shut_down = False
@@ -1236,8 +1240,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         # A computer made for this session that never finished starting (its
         # restore failed, say) holds nothing: delete it rather than keep it.
         # This is the session's shutdown, so a later one waits for it.
-        self._shut_down = True
-        self._shutdown_task = asyncio.ensure_future(_delete_quietly(self._computer))
+        self._begin_shutdown(_delete_quietly(self._computer))
+        assert self._shutdown_task is not None
         await asyncio.shield(self._shutdown_task)
 
     def _workspace_unsaved(self) -> bool:
@@ -1286,9 +1290,35 @@ class MandalaSandboxSession(BaseSandboxSession):
         # One shutdown, run as its own task: every call waits for that same
         # task, and a caller's cancellation leaves it running to the end.
         if self._shutdown_task is None:
-            self._shut_down = True  # from here on, changes are refused
-            self._shutdown_task = asyncio.ensure_future(self._shut_down_computer())
+            self._begin_shutdown(self._shut_down_computer())
+        assert self._shutdown_task is not None
         await asyncio.shield(self._shutdown_task)
+
+    def _begin_shutdown(self, body: Awaitable[None]) -> None:
+        """Start this session's one shutdown; from here on, changes are refused."""
+        self._shut_down = True
+        self._shutdown_task = asyncio.ensure_future(body)
+        self._shutdown_task.add_done_callback(lambda _: self._live.discard(self))
+
+    async def start(self) -> None:
+        try:
+            await super().start()
+        except asyncio.CancelledError:
+            # The SDK's own failure hook catches Exception, not a cancellation,
+            # so a start cancelled midway would leave the computer running.
+            await _shielded(self._abandon_start())
+            raise
+
+    async def _abandon_start(self) -> None:
+        if self._workspace_ready or self._shutdown_task is not None:
+            return
+        if self._workspace_state_preserved_on_start():
+            # A kept computer: stop it, keeping its disk for the next attempt.
+            self._begin_shutdown(_stop_quietly(self._computer))
+            assert self._shutdown_task is not None
+            await asyncio.shield(self._shutdown_task)
+            return
+        await self._after_start_failed()
 
     async def _shut_down_computer(self) -> None:
         mode = self.state.on_shutdown
@@ -1420,13 +1450,29 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         )
         self._dependencies = dependencies
         self._reaper = _Reaper()
+        self._live: set[MandalaSandboxSession] = set()
 
     async def aclose(self) -> None:
-        """Finish outstanding cleanup, then close the API client if this one made it.
+        """Shut down sessions still open, finish outstanding cleanup, then close.
 
-        Cleanup still waiting on a platform answer (a command start, a create)
-        is given a bounded time to finish; what is left is logged and dropped.
+        A session its caller never closed is shut down as its ``on_shutdown``
+        says, bounded. Cleanup still waiting on a platform answer (a command
+        start, a create) is given a bounded time to finish; what is left is
+        logged and dropped. The API client is closed if this one made it.
         """
+        # Cleanup waiting on answers first, while the computers are still up.
+        await self._reaper.aclose(_CLEANUP_TIMEOUT)
+        for session in list(self._live):
+            try:
+                await _shielded(
+                    asyncio.wait_for(session.shutdown(), _DRAIN_WAIT + _CLEANUP_TIMEOUT)
+                )
+            except Exception as error:  # noqa: BLE001 - reported; close goes on
+                logger.warning(
+                    "could not shut down the session on computer %s at client close (%s)",
+                    session.computer_id,
+                    type(error).__name__,
+                )
         await self._reaper.aclose(_CLEANUP_TIMEOUT)
         if self._owns_client:
             await self._client.aclose()
@@ -1475,7 +1521,9 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             exposed_ports=options.exposed_ports,
         )
         computer = await self._make_computer(state)
-        inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)
+        inner = MandalaSandboxSession(
+            state=state, computer=computer, reaper=self._reaper, live=self._live
+        )
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     async def resume(self, state: SandboxSessionState) -> SandboxSession:
@@ -1539,7 +1587,9 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             state.initialized = False
             computer = await self._make_computer(state)
 
-        inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)
+        inner = MandalaSandboxSession(
+            state=state, computer=computer, reaper=self._reaper, live=self._live
+        )
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 

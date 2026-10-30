@@ -2482,7 +2482,10 @@ asyncio.run(main())
 
 `MandalaSandboxClient(client)` takes an `AsyncClient` you already have, which
 then stays yours to close; without one it makes its own and closes it on
-`aclose()` or at the end of the `async with`. The key stays on the client.
+`aclose()` or at the end of the `async with`. Closing the client also shuts
+down any session that was never closed, as its `on_shutdown` says, and a
+session whose start is cancelled midway is cleaned up like one whose start
+failed. The key stays on the client.
 The options and the saved session state never carry it, so a run state saved
 for later can be resumed by another process that holds its own key.
 
