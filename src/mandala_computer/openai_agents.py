@@ -68,6 +68,7 @@ import tarfile
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal, NoReturn, TypeVar, cast
 
@@ -1954,7 +1955,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         computer = await self._create(state, deadline)
         state.computer_id = computer.id
         try:
-            await _bring_up(computer, deadline)
+            await _bring_up(computer, deadline, ends=state.ends_in_hours is not None)
         except BaseException as error:
             await _shielded(_delete_quietly(computer))
             if isinstance(error, (MandalaError, TimeoutError)):
@@ -1964,6 +1965,24 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
 
 
 # --- helpers ----------------------------------------------------------------
+
+
+class _EndTimePassed(MandalaError):
+    """A computer created with an end time was found stopped without one."""
+
+
+def _end_time_ahead(computer: AsyncComputer) -> bool:
+    """Whether the computer still carries an end time that has not passed."""
+    ends = computer.raw.get("ends_at")
+    if not isinstance(ends, str) or not ends:
+        return False
+    try:
+        moment = datetime.fromisoformat(ends.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        return False
+    return moment > datetime.now(timezone.utc)
 
 
 class _LaunchTimeout(TimeoutError):
@@ -1986,6 +2005,8 @@ async def _bring_up(
     computer: AsyncComputer,
     deadline: float,
     starts: list[asyncio.Future[AsyncComputer]] | None = None,
+    *,
+    ends: bool = False,
 ) -> None:
     """Wait for ``computer`` to be built, start it if nothing is, and wait for its guest.
 
@@ -1999,6 +2020,14 @@ async def _bring_up(
     if computer.status == "building":
         await computer.wait_until_built(timeout=left())
     if computer.status in ("stopped", "suspended") or computer.start_error:
+        if ends and not _end_time_ahead(computer):
+            # Created with an end time that is no longer on it: it has passed
+            # (and stopped it) while the disk was prepared. Starting it would
+            # leave it running with none.
+            raise _EndTimePassed(
+                f"{computer.id} is {computer.status} and its end time has passed; "
+                "it was not started"
+            )
         start = asyncio.ensure_future(computer.start())
         if starts is not None:
             starts.append(start)
@@ -2534,6 +2563,8 @@ def _raise_start_error(
     context: dict[str, object] = {"backend": _BACKEND_ID, "stage": stage, **_error_context(error)}
     if isinstance(error, TimeoutError):
         context["reason"] = "timeout"
+    if isinstance(error, _EndTimePassed):
+        context["reason"] = "end_time_passed"
     if state.computer_id:
         context["computer_id"] = state.computer_id
     raise WorkspaceStartError(

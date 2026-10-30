@@ -146,6 +146,8 @@ class FakePlatform:
         #: Seconds the read after the next stop takes to answer.
         self.slow_refresh_after_stop = 0.0
         self._slow_get: dict[str, float] = {}
+        #: A building computer's end time fires before the build finishes.
+        self.end_time_in_build = False
         #: Leave running_ram_mb out of computer reads.
         self.omit_ram = False
         #: The read after the next stop fails.
@@ -312,6 +314,10 @@ class FakePlatform:
         return httpx.Response(201, json=record)
 
     def _computer(self, request: httpx.Request, record: dict[str, Any]) -> httpx.Response:
+        if request.method == "GET" and record["status"] == "building" and self.end_time_in_build:
+            # The end time fires while the disk is prepared: stopped, and cleared.
+            record.update(status="stopped", running_ram_mb=0)
+            record.pop("ends_at", None)
         if request.method == "GET" and record["id"] in self._failing_get:
             self._failing_get.discard(record["id"])
             return httpx.Response(503, json={"error": "a blip"})

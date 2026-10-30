@@ -2579,3 +2579,29 @@ async def test_absolute_links_with_a_directory_suffix_are_refused(
         await session.persist_workspace()
     assert caught.value.context["reason"] == "unrestorable_member"
     await session.aclose()
+
+
+# --- review round 39 ------------------------------------------------------------
+
+
+async def test_a_computer_whose_end_time_passed_while_building_is_not_started(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.create_status = "building"
+    fake.end_time_in_build = True
+    with pytest.raises(WorkspaceStartError) as caught:
+        await client.create(manifest=manifest(root))  # 24-hour end time by default
+    assert caught.value.context["reason"] == "end_time_passed"
+    assert not fake.calls("POST", "/vm-1/start")
+    assert fake.computers == {}
+
+
+async def test_a_computer_created_without_an_end_time_is_started_from_stopped(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.create_status = "stopped"
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(ends_in_hours=None)
+    )
+    assert fake.calls("POST", "/vm-1/start")
+    await session.aclose()
