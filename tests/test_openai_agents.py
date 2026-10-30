@@ -2044,3 +2044,55 @@ async def test_a_chunked_upload_past_the_drain_stops_and_does_not_wake(
     (cancel,) = fake.calls("DELETE", "/files/uploads")
     assert cancel.url.params.get("no_wake") == "1"
     assert fake.uploads == {}
+
+
+# --- review round 24 ------------------------------------------------------------
+
+
+async def test_a_download_overlapping_shutdown_asks_for_no_more_ranges(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_READ_PART", 10)
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    await session.write(Path("long.txt"), io.BytesIO(b"x" * 30))  # three ranges
+    fake.range_delay = 0.3
+    reading = asyncio.ensure_future(session.read(Path("long.txt")))
+    while not fake.calls("GET", "/files"):
+        await asyncio.sleep(0.01)
+    await session.shutdown()  # the download outlasts the drain
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await reading
+    assert caught.value.context["reason"] == "session_shutting_down"
+    fake.range_delay = 0.0
+    assert len(fake.calls("GET", "/files")) == 1  # no range after shutdown
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    # And nothing new reaches it now.
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.read(Path("long.txt"))
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.read_bounded(Path("long.txt"), max_bytes=5)
+
+
+async def test_a_command_being_read_at_shutdown_reads_no_further(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    running = asyncio.ensure_future(session.exec("sleep 2"))
+    while not fake.calls("GET", "/output"):
+        await asyncio.sleep(0.01)
+    await session.shutdown()
+    with pytest.raises(ExecTransportError):
+        await running
+    reads = len(fake.calls("GET", "/output")) + len(fake.calls("GET", "/executions"))
+    await asyncio.sleep(0.3)
+    assert len(fake.calls("GET", "/output")) + len(fake.calls("GET", "/executions")) == reads
+    # The read stops at once, so the drain completes and the suspend goes ahead.
+    assert fake.computers["vm-1"]["status"] == "suspended"

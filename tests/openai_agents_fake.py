@@ -138,6 +138,8 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds each ranged file read takes.
+        self.range_delay = 0.0
         #: Seconds each upload chunk takes to land.
         self.chunk_delay = 0.0
         #: Seconds the next computer delete takes.
@@ -407,6 +409,22 @@ class FakePlatform:
             return httpx.Response(
                 416, json={"error": "range"}, headers={"content-range": f"bytes */{len(data)}"}
             )
+        if self.range_delay:
+            delay = self.range_delay
+            window = data[first : last + 1]
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                return httpx.Response(
+                    206,
+                    content=window,
+                    headers={
+                        "content-type": "application/octet-stream",
+                        "content-range": f"bytes {first}-{last}/{len(data)}",
+                    },
+                )
+
+            return later()  # type: ignore[return-value]
         return httpx.Response(
             206,
             content=data[first : last + 1],

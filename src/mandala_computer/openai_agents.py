@@ -192,6 +192,9 @@ _ARCHIVE_LIMIT = 2 * 1024 * 1024 * 1024
 #: How much of an archive is held in memory before it spills to a temp file.
 _SPOOL_IN_MEMORY = 64 * 1024 * 1024
 
+#: How much of a file one read request asks for.
+_READ_PART = 8 * 1024 * 1024
+
 #: How long shutdown waits for changes already under way to finish.
 _DRAIN_WAIT = 30.0
 
@@ -334,6 +337,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._saved_generation: int | None = None
         #: Changes started and not yet finished.
         self._in_flight = 0
+        #: Anything reaching the computer and not yet finished, changes included.
+        self._busy = 0
         #: One save at a time, capture and store both, so saves land in order.
         self._save_lock = asyncio.Lock()
         #: A command start whose answer was lost: something may be running that
@@ -363,17 +368,32 @@ class MandalaSandboxSession(BaseSandboxSession):
         if save is not None and save.session is self:
             yield
             return
+        with self._active(refuse):
+            self._generation += 1
+            self._in_flight += 1
+            # Saved while this runs, the state must say it is uncertain.
+            self.state.uncertain = True
+            try:
+                yield
+            finally:
+                self._in_flight -= 1
+                self.state.uncertain = self._contaminated or self._in_flight > 0
+
+    @contextlib.contextmanager
+    def _active(self, refuse: Callable[[], Exception]) -> Iterator[None]:
+        """Around anything that reaches the computer, outside shutdown's own calls.
+
+        Refused once shutdown has begun, so nothing new reaches a computer being
+        stopped, suspended or deleted (or wakes one); counted while it runs, so
+        shutdown can wait for it first.
+        """
         if self._shut_down:
             raise refuse()
-        self._generation += 1
-        self._in_flight += 1
-        # Saved while this runs, the state must say it is uncertain.
-        self.state.uncertain = True
+        self._busy += 1
         try:
             yield
         finally:
-            self._in_flight -= 1
-            self.state.uncertain = self._contaminated or self._in_flight > 0
+            self._busy -= 1
 
     @property
     def computer(self) -> AsyncComputer:
@@ -548,7 +568,10 @@ class MandalaSandboxSession(BaseSandboxSession):
             finished = True
             return result
         finally:
-            if not finished and not await _shielded(_kill_quietly(job)):
+            if not finished and self._shut_down:
+                # A kill now could wake the computer; shutdown ends it instead.
+                self._taint(f"command {job.pid} was left to shutdown to end")
+            elif not finished and not await _shielded(_kill_quietly(job)):
                 self._taint(f"command {job.pid} could not be confirmed stopped")
 
     async def _collect_by_offset(
@@ -564,7 +587,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         current end, so an ``exited`` state is followed by a read that has seen
         everything the command printed.
         """
-        clock = _Clock(argv, timeout, deadline)
+        clock = _Clock(argv, timeout, deadline, lambda: self._shut_down)
         stdout, stderr = bytearray(), bytearray()
         while True:
             meta = await clock.read(lambda: self._computer.execution(execution_id))
@@ -613,7 +636,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         lost cannot be asked again without losing that output: any failure
         fails the command, and a gap in the reported offsets is refused.
         """
-        clock = _Clock(argv, timeout, deadline)
+        clock = _Clock(argv, timeout, deadline, lambda: self._shut_down)
         stdout, stderr = bytearray(), bytearray()
         while True:
             status = await clock.read(job.poll, retry=False)
@@ -672,8 +695,19 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             )
         lock = self._port_locks.setdefault(port, asyncio.Lock())
-        async with lock:
-            return await self._resolve_port(port)
+
+        def refuse() -> Exception:
+            return ExposedPortUnavailableError(
+                port=port,
+                exposed_ports=self.state.exposed_ports,
+                reason="backend_unavailable",
+                context={"backend": _BACKEND_ID, "detail": "session_shutting_down"},
+                retryable=False,
+            )
+
+        with self._active(refuse):
+            async with lock:
+                return await self._resolve_port(port)
 
     async def _settle_resolutions(self) -> None:
         """Wait, bounded, for resolutions in flight, so their URLs are removed too."""
@@ -875,10 +909,22 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         _refuse_user(user, op="read")
+        with self._active(lambda: _closing_read_error(path)):
+            return await self._read(path)
+
+    async def _read(self, path: Path) -> io.IOBase:
         workspace_path = await self._validate_path_access(path)
         sink = io.BytesIO()
         try:
-            await self._computer.download_file(sandbox_path_str(workspace_path), sink)
+            # Range by range; once shutdown begins the next range is not asked
+            # for, so a late request cannot wake a computer it put down.
+            await self._computer.download_file(
+                sandbox_path_str(workspace_path),
+                cast(IO[bytes], _SinkUntilClosing(sink, lambda: self._shut_down)),
+                part_size=_READ_PART,
+            )
+        except _Closing:
+            raise _closing_read_error(path) from None
         except NotFoundError as error:
             raise WorkspaceReadNotFoundError(path=path, cause=error) from error
         except MandalaError as error:
@@ -892,6 +938,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         return sink
 
     async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        with self._active(lambda: _closing_read_error(path)):
+            return await self._read_prefix(path, max_bytes)
+
+    async def _read_prefix(self, path: Path, max_bytes: int) -> bytes:
         workspace_path = await self._validate_path_access(path)
         try:
             part = await self._computer.read_file_part(
@@ -1207,12 +1257,12 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._set_start_state_preserved(True, system=True)
 
     async def _drained(self) -> bool:
-        """Wait, bounded, for changes already under way to finish."""
+        """Wait, bounded, for everything already reaching the computer to finish."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _DRAIN_WAIT
-        while self._in_flight and loop.time() < deadline:
+        while self._busy and loop.time() < deadline:
             await asyncio.sleep(_POLL_FIRST)
-        return not self._in_flight
+        return not self._busy
 
     async def _shutdown_quietly(self) -> None:
         try:
@@ -1647,7 +1697,14 @@ _ReadT = TypeVar("_ReadT")
 class _Clock:
     """One command's deadline, the reads bounded by it and the pauses between them."""
 
-    def __init__(self, argv: Sequence[str], timeout: float | None, deadline: float | None):
+    def __init__(
+        self,
+        argv: Sequence[str],
+        timeout: float | None,
+        deadline: float | None,
+        closing: Callable[[], bool],
+    ):
+        self._closing = closing
         self._argv = argv
         self._timeout = timeout
         self._deadline = deadline
@@ -1677,6 +1734,13 @@ class _Clock:
         """One read, bounded by the time left, and asked again while transient."""
         setbacks = 0
         while True:
+            if self._closing():
+                # The computer is being put down: another read could wake it.
+                raise ExecTransportError(
+                    command=self._argv,
+                    context={"backend": _BACKEND_ID, "reason": "session_shutting_down"},
+                    retryable=False,
+                )
             left = self.left()
             try:
                 if left is None:
@@ -1809,6 +1873,31 @@ class _StopWhenClosing(io.BytesIO):
         if self._closing():
             raise _Closing("the session is shutting down")
         return super().read(size)
+
+
+class _SinkUntilClosing(io.RawIOBase):
+    """A download's sink that ends the download, between ranges, once closing."""
+
+    def __init__(self, sink: io.BytesIO, closing: Callable[[], bool]) -> None:
+        self._sink = sink
+        self._closing = closing
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data: Any) -> int:
+        self._sink.write(data)
+        if self._closing():
+            raise _Closing("the session is shutting down")
+        return len(data)
+
+
+def _closing_read_error(path: Path) -> WorkspaceArchiveReadError:
+    return WorkspaceArchiveReadError(
+        path=path,
+        context={"backend": _BACKEND_ID, "reason": "session_shutting_down"},
+        retryable=False,
+    )
 
 
 def _closing_write_error(path: Path) -> WorkspaceArchiveWriteError:
