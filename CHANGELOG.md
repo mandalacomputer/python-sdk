@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-30
+
 ### Added
 
 - A sandbox client for the OpenAI Agents SDK, `mandala_computer.openai_agents`
@@ -79,6 +81,18 @@ This is the summary you read to decide whether to upgrade.
   has its own time limit and, on the async client, finishes even when the call
   is cancelled (by asyncio or an AnyIO cancel scope), before the cancellation
   is raised.
+- Credential gateway `auth_header`. `create_credential_gateway_binding(...)`
+  and `client.credential_gateway.create(...)`, on both clients, take
+  `auth_header="x-api-key"` to have the platform send the secret as
+  `x-api-key: <secret>` rather than `Authorization: Bearer <secret>`, which is
+  what an Anthropic key needs; Claude Code inside the computer then runs with
+  `ANTHROPIC_BASE_URL=<base_url>` and `ANTHROPIC_API_KEY=mandala-placeholder`.
+  Left out (or `None`), nothing is sent and the default stays
+  `"authorization"`; any other value raises `ValueError` before any request.
+  `CredentialGatewayBinding.auth_header` reads `"authorization"` from a
+  platform that does not report it. The documented gateway limits are now a
+  7 MiB request, a 64 MiB answer and 10 minutes per call, with streamed
+  answers.
 
 ## [0.20.0] - 2026-10-29
 
@@ -1839,7 +1853,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.17.2...v0.18.0
