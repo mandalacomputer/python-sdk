@@ -146,6 +146,8 @@ class FakePlatform:
         #: Seconds the read after the next stop takes to answer.
         self.slow_refresh_after_stop = 0.0
         self._slow_get: dict[str, float] = {}
+        #: Leave running_ram_mb out of computer reads.
+        self.omit_ram = False
         #: The read after the next stop fails.
         self.fail_refresh_after_stop = False
         self._failing_get: set[str] = set()
@@ -321,6 +323,10 @@ class FakePlatform:
                 return httpx.Response(200, json=record)
 
             return later()  # type: ignore[return-value]
+        if request.method == "GET" and self.omit_ram:
+            return httpx.Response(
+                200, json={k: v for k, v in record.items() if k != "running_ram_mb"}
+            )
         if request.method == "GET":
             return httpx.Response(200, json=record)
         if request.method == "DELETE" and self.delete_delay:

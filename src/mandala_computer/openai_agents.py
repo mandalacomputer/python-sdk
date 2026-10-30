@@ -2163,10 +2163,17 @@ def _accepted_unread(error: MandalaError) -> bool:
 
 
 def _settled_down(computer: AsyncComputer) -> bool:
-    """Stopped or suspended with nothing admitted: no memory held for a start."""
+    """Stopped or suspended with nothing admitted: no memory held for a start.
+
+    Only a reported zero confirms that; a value that is missing or unreadable
+    is not taken for one.
+    """
     held = computer.raw.get("running_ram_mb")
-    return computer.status in ("stopped", "suspended") and not (
-        isinstance(held, (int, float)) and not isinstance(held, bool) and held > 0
+    return (
+        computer.status in ("stopped", "suspended")
+        and isinstance(held, (int, float))
+        and not isinstance(held, bool)
+        and held == 0
     )
 
 

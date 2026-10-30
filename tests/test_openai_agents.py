@@ -2507,3 +2507,28 @@ async def test_an_accepted_stop_whose_read_back_failed_still_guards_late_work(
     assert job.killed
     assert fake.computers["vm-1"]["status"] == "stopped"
     await sandbox_client.aclose()
+
+
+# --- review round 37 ------------------------------------------------------------
+
+
+async def test_an_unreported_memory_hold_is_never_taken_for_settled(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.2)
+    monkeypatch.setattr(oa, "_ADMITTED_WATCH", 1.0)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = sandbox_client.serialize_session_state(session.state)
+    fake.omit_ram = True  # reads no longer say whether a start is admitted
+    fake.admitted_start_fails = 0.5  # lands after the resume's own watch ends
+    with pytest.raises(WorkspaceStartError):
+        await sandbox_client.resume(sandbox_client.deserialize_session_state(payload))
+    await sandbox_client.aclose()  # the background watch sees it land, and stops it
+    record = fake.computers["vm-1"]
+    assert "admitting" not in record  # it did land
+    assert record["status"] == "stopped"
