@@ -1624,3 +1624,68 @@ async def test_overlapping_resolutions_of_a_port_make_one_url(
     assert len(fake.calls("POST", "/public-urls")) == 1
     await session.aclose()
     assert fake.public_urls["vm-1"] == []
+
+
+# --- review round 14 ------------------------------------------------------------
+
+#: How many saves DestructiveSnapshot has taken.
+_DESTRUCTIVE_SAVES = [0]
+
+
+class DestructiveSnapshot(LocalSnapshot):
+    """A store whose second save overwrites the first, then fails."""
+
+    type: Literal["destructive_local"] = "destructive_local"  # type: ignore[assignment]
+
+    async def persist(self, data: io.IOBase, *, dependencies: Any = None) -> None:
+        _DESTRUCTIVE_SAVES[0] += 1
+        if _DESTRUCTIVE_SAVES[0] == 1:
+            await super().persist(data, dependencies=dependencies)
+            return
+        for old in self.base_path.iterdir():
+            old.write_bytes(b"half written")
+        raise OSError("the store failed partway through")
+
+
+async def test_a_failed_save_after_a_good_one_is_not_confirmed(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    _DESTRUCTIVE_SAVES[0] = 0
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=DestructiveSnapshot(id="destructive", base_path=tmp_path),
+    )
+    await session.start()
+    await session.stop()  # good
+    with pytest.raises(OSError):
+        await session.stop()  # overwrites the good one, then fails
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+
+async def test_a_public_url_made_after_its_request_was_abandoned_is_removed(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.url_delay = 0.5  # made only when it answers, after the cleanup gave up
+    task = asyncio.ensure_future(session.resolve_exposed_port(8080))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Asked again meanwhile: one URL for the port.
+    endpoint = await session.resolve_exposed_port(8080)
+    await sandbox_client.aclose()  # the late URL lands, and is removed
+    assert len(fake.calls("POST", "/public-urls")) == 2
+    assert (
+        len([r for r in fake.requests if r.method == "DELETE" and "public-urls" in r.url.path]) == 1
+    )
+    assert [u["hostname"] for u in fake.public_urls["vm-1"]] == [endpoint.host]
+    await session.aclose()
+    assert fake.public_urls["vm-1"] == []

@@ -136,6 +136,9 @@ class FakePlatform:
         self.lose_create = False
         #: Answer creates as a platform that does not know end times.
         self.ignore_end_time = False
+        #: Seconds the next public URL create takes before it is made and answers.
+        self.url_delay = 0.0
+        self.url_count = 0
         #: The next public URL create makes it, and its answer is lost.
         self.lose_public_url = False
         #: Pids whose kill answers without stopping them.
@@ -439,26 +442,18 @@ class FakePlatform:
                     "public_urls": urls,
                 },
             )
+        if request.method == "POST" and self.url_delay:
+            delay, self.url_delay = self.url_delay, 0.0
+            content = request.content
+
+            async def later() -> httpx.Response:
+                # Committed only when it answers, after the delay.
+                await asyncio.sleep(delay)
+                return self._make_url(computer_id, urls, json.loads(content))
+
+            return later()  # type: ignore[return-value]
         if request.method == "POST":
-            body = json.loads(request.content)
-            label = f"agent-{body['port']}-{len(urls)}"
-            url = {
-                "id": f"pu-{computer_id}-{body['port']}",
-                "url": f"https://{label}.mandala.dev",
-                "hostname": f"{label}.mandala.dev",
-                "label": label,
-                "port": body["port"],
-                "access": body.get("access") or "public",
-                "disabled": False,
-                "created_at": "2026-10-29T00:00:00.000Z",
-                "updated_at": "2026-10-29T00:00:00.000Z",
-            }
-            urls.append(url)
-            if self.lose_public_url:
-                # Made, and the answer lost on the way back.
-                self.lose_public_url = False
-                return httpx.Response(504, json={"error": "gateway timeout"})
-            return httpx.Response(201, json=url)
+            return self._make_url(computer_id, urls, json.loads(request.content))
         if request.method == "PATCH" and rest:
             body = json.loads(request.content)
             for url in urls:
@@ -470,6 +465,30 @@ class FakePlatform:
             self.public_urls[computer_id] = [u for u in urls if u["id"] != rest[0]]
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(405, json={"error": "method"})
+
+    def _make_url(
+        self, computer_id: str, urls: list[dict[str, Any]], body: dict[str, Any]
+    ) -> httpx.Response:
+        self.url_count += 1
+        label = f"agent-{body['port']}-{len(urls)}"
+        url = {
+            "id": f"pu-{computer_id}-{body['port']}"
+            + ("" if self.url_count == 1 else f"-{self.url_count}"),
+            "url": f"https://{label}.mandala.dev",
+            "hostname": f"{label}.mandala.dev",
+            "label": label,
+            "port": body["port"],
+            "access": body.get("access") or "public",
+            "disabled": False,
+            "created_at": "2026-10-29T00:00:00.000Z",
+            "updated_at": "2026-10-29T00:00:00.000Z",
+        }
+        urls.append(url)
+        if self.lose_public_url:
+            # Made, and the answer lost on the way back.
+            self.lose_public_url = False
+            return httpx.Response(504, json={"error": "gateway timeout"})
+        return httpx.Response(201, json=url)
 
 
 def _drain(stream: Any, sink: bytearray) -> None:

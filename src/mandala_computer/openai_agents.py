@@ -131,6 +131,7 @@ from ._exceptions import (
     RangeNotSatisfiableError,
     is_transient,
 )
+from ._models import PublicUrl
 
 __all__ = [
     "MandalaSandboxClient",
@@ -659,10 +660,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             wanted = self.state.public_url_access
             if served is None:
                 before = {u.id for u in listing.public_urls if u.port == port}
+                create = asyncio.ensure_future(
+                    self._computer.create_public_url(port, access=wanted)
+                )
                 try:
-                    served = await self._computer.create_public_url(port, access=wanted)
+                    served = await asyncio.shield(create)
                 except asyncio.CancelledError:
-                    await _shielded(self._adopt_new_url(port, before))
+                    await _shielded(self._settle_url(create, port, before))
                     raise
                 except MandalaError as error:
                     if not _clean_refusal(error):
@@ -693,6 +697,37 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=_retryable(error),
             ) from error
         return ExposedPortEndpoint(host=served.hostname, port=443, tls=True)
+
+    async def _settle_url(
+        self, create: asyncio.Future[PublicUrl], port: int, before: set[str]
+    ) -> None:
+        """Own what an abandoned URL create made, or remove it when it lands late."""
+        try:
+            served = await asyncio.wait_for(asyncio.shield(create), _ANSWER_WAIT)
+        except asyncio.TimeoutError:
+            computer_id = self.state.computer_id
+
+            async def remove(late: PublicUrl) -> None:
+                try:
+                    await self._computer.delete_public_url(late.id)
+                except MandalaError as error:
+                    logger.warning(
+                        "could not remove a public URL for port %s on computer %s that "
+                        "was made after its request was abandoned (%s)",
+                        port,
+                        computer_id,
+                        type(error).__name__,
+                    )
+
+            self._reaper.later(create, remove, f"a public URL create for port {port}")
+            return
+        except MandalaError as error:
+            if not _clean_refusal(error):
+                await self._adopt_new_url(port, before)
+            return
+        except Exception:  # noqa: BLE001 - refused before it was sent
+            return
+        self.state.public_url_ids.setdefault(port, []).append(served.id)
 
     async def _adopt_new_url(self, port: int, before: set[str]) -> None:
         """Record a public URL a lost create may have made, as this session's."""
@@ -964,6 +999,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             )
         async with self._save_lock:
+            # Unconfirmed until this attempt succeeds: a failing store may
+            # already have overwritten what an earlier save confirmed.
+            self._saved_generation = None
             started_at = self._generation
             save = _Save(self, self._in_flight)
             # Scoped to this call and what it awaits: a write from another task
