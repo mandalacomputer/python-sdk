@@ -889,36 +889,55 @@ class AsyncComputer(ComputerFields):
         origin: str,
         path_prefix: str,
         methods: Sequence[_api.CredentialGatewayMethod],
+        auth_header: _api.CredentialGatewayAuthHeader | None = None,
     ) -> CredentialGatewayBinding:
         """Let this computer call one HTTPS API with a secret it never holds.
 
         Code inside the computer calls the binding's ``base_url`` followed by
-        the provider's path, with ``Authorization: Bearer <placeholder>`` (the
-        binding's ``placeholder``); the platform replaces it with the latest
-        value of ``secret_id`` as a Bearer credential, over verified TLS to
-        exactly ``origin`` on port 443, for the listed ``methods`` on paths
-        under ``path_prefix`` (at a ``/`` boundary) only. Nothing is delivered
-        to the computer, and nothing in it changes.
+        the provider's path, with the binding's ``placeholder`` as the API key
+        (``Authorization: Bearer <placeholder>`` or ``x-api-key:
+        <placeholder>``); the platform replaces it with the latest value of
+        ``secret_id``, over verified TLS to exactly ``origin`` on port 443, for
+        the listed ``methods`` on paths under ``path_prefix`` (at a ``/``
+        boundary) only. Nothing is delivered to the computer, and nothing in it
+        changes.
+
+        ``auth_header`` says where the secret goes upstream: ``"authorization"``
+        (the default; ``None`` sends nothing and gets it) as
+        ``Authorization: Bearer <secret>``, or ``"x-api-key"`` as
+        ``x-api-key: <secret>``, which Anthropic's API takes. For an Anthropic
+        key, bind ``https://api.anthropic.com`` with ``path_prefix="/v1"`` and
+        ``auth_header="x-api-key"``; Claude Code inside the computer then runs
+        with ``ANTHROPIC_BASE_URL=<base_url>`` and
+        ``ANTHROPIC_API_KEY=mandala-placeholder``.
 
         Owners only, at most eight bindings a computer, with a secret in the
         computer's workspace or account scope, on an account that can use
         secrets. A binding never changes: revoke it and make another. Only
-        non-browser HTTP clients are supported; no redirects, streaming or
-        WebSocket upgrades. The platform documents its size and time limits.
+        non-browser HTTP clients are supported; no redirects or WebSocket
+        upgrades. Answers stream as the provider sends them, server-sent events
+        included. A request is limited to 7 MiB, an answer to 64 MiB and a call
+        to 10 minutes.
 
         A ``secret_id`` that is empty, an ``origin`` that is not an exact HTTPS
         origin (no path, query, fragment, user or port, and not an IP address),
         a ``path_prefix`` that is not a canonical absolute path, or ``methods``
         that are not one to six distinct ones of ``GET``, ``HEAD``, ``POST``,
-        ``PUT``, ``PATCH`` and ``DELETE`` raises :class:`ValueError` before any
-        request. The platform answers 400 for a secret not in the computer's
-        scope, 403 where the account cannot use the gateway, 409 when the
-        computer already has eight or is changing workspace or host (that one
-        with ``reason: "contention"``: send it again), and 503 when the
+        ``PUT``, ``PATCH`` and ``DELETE``, or an ``auth_header`` other than
+        those two, raises :class:`ValueError` before any request. The platform
+        answers 400 for a secret not in the computer's scope, 403 where the
+        account cannot use the gateway, 409 when the computer already has eight
+        or is changing workspace or host (that one with ``reason:
+        "contention"``: send it again) or when its host cannot send
+        ``x-api-key`` yet (``reason: "unsupported"``), and 503 when the
         computer's host has no ready gateway.
         """
         body = _api.credential_gateway_body(
-            secret_id=secret_id, origin=origin, path_prefix=path_prefix, methods=methods
+            secret_id=secret_id,
+            origin=origin,
+            path_prefix=path_prefix,
+            methods=methods,
+            auth_header=auth_header,
         )
         path = _api.computer_credential_gateway(self.id)
         data = await self._t.json_object("POST", path, json=body)
