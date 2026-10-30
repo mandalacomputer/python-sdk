@@ -159,6 +159,10 @@ _POLL_SETBACKS = 5
 #: How long one kill or cleanup command may take before it is abandoned.
 _CLEANUP_TIMEOUT = 30.0
 
+#: How long an abandoned request's answer is waited for before the client's
+#: cleanup takes it over.
+_ANSWER_WAIT = 30.0
+
 #: Where archives are staged inside the computer on the way in and out.
 _GUEST_TMP = "/tmp"
 
@@ -266,15 +270,35 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     state: MandalaSandboxSessionState
 
-    def __init__(self, *, state: MandalaSandboxSessionState, computer: AsyncComputer) -> None:
+    def __init__(
+        self,
+        *,
+        state: MandalaSandboxSessionState,
+        computer: AsyncComputer,
+        reaper: _Reaper | None = None,
+    ) -> None:
         self.state = state
         self._computer = computer
+        self._reaper = reaper if reaper is not None else _Reaper()
         self._workspace_root_ready = state.workspace_root_ready
         self._shut_down = False
-        #: Whether the workspace has been saved to the snapshot store, start to
-        #: finish, since this session last could have changed it. Until then the
-        #: computer's disk may be the only copy.
-        self._persist_confirmed = False
+        #: Bumped before anything that may change the workspace. A save covers
+        #: the generation it started at, and the computer's disk is the only
+        #: copy of the workspace whenever the two differ.
+        self._generation = 0
+        self._saved_generation: int | None = None
+        self._persisting = False
+        #: As saved: whether this computer's disk was already newer than the
+        #: snapshot. Read once, since starting the session runs commands too.
+        self._resumed_unsaved = state.workspace_unsaved
+
+    def _touch(self) -> None:
+        """Note that the workspace may be about to change."""
+        if self._persisting:
+            return  # the save's own commands
+        self._generation += 1
+        if not isinstance(self.state.snapshot, NoopSnapshot):
+            self.state.workspace_unsaved = True
 
     @property
     def computer(self) -> AsyncComputer:
@@ -342,6 +366,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         *command: str | Path,
         timeout: float | None = None,
     ) -> ExecResult:
+        self._touch()
         argv = [str(part) for part in command]
         line = shlex.join(argv)
         cwd = self.state.manifest.root if self._workspace_root_ready else None
@@ -372,7 +397,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         except (asyncio.CancelledError, asyncio.TimeoutError) as error:
             # The start may still land: wait for it, out of the caller's
             # cancellation, and stop the command it started.
-            await _shielded(_kill_when_started(submit))
+            await _shielded(
+                _after(
+                    submit,
+                    _kill_quietly,
+                    self._reaper,
+                    f"a command start on computer {self.state.computer_id}",
+                )
+            )
             if isinstance(error, asyncio.CancelledError):
                 raise
             raise ExecTimeoutError(
@@ -608,6 +640,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> None:
         _refuse_user(user, op="write")
+        self._touch()
         payload = data.read()
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
@@ -704,6 +737,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         return io.BytesIO(restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
+        self._touch()
         root = self._workspace_root_path()
         error_root = posix_path_for_error(root)
         raw = data.read()
@@ -757,15 +791,20 @@ class MandalaSandboxSession(BaseSandboxSession):
         # The whole persist, archive and store both: only a store that returned
         # counts as saved. A failure or a cancellation anywhere leaves it unsaved,
         # and says so in the state a resume reads.
-        self._persist_confirmed = False
+        started_at = self._generation
         if not isinstance(self.state.snapshot, NoopSnapshot):
             self.state.workspace_unsaved = True
-        await super()._persist_snapshot()
-        self._persist_confirmed = True
-        self.state.workspace_unsaved = False
+        self._persisting = True
+        try:
+            await super()._persist_snapshot()
+        finally:
+            self._persisting = False
+        # Saved as of when the save began; anything since is not in it.
+        self._saved_generation = started_at
+        self.state.workspace_unsaved = self._generation != started_at
 
     async def _can_reuse_restorable_snapshot_workspace(self) -> bool:
-        if self.state.workspace_unsaved and self._workspace_state_preserved_on_start():
+        if self._resumed_unsaved and self._workspace_state_preserved_on_start():
             # The disk is newer than the snapshot: restoring would undo the
             # work the failed save was meant to keep.
             logger.warning(
@@ -777,7 +816,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         return await super()._can_reuse_restorable_snapshot_workspace()
 
     def _workspace_unsaved(self) -> bool:
-        return not isinstance(self.state.snapshot, NoopSnapshot) and not self._persist_confirmed
+        return (
+            not isinstance(self.state.snapshot, NoopSnapshot)
+            and self._saved_generation != self._generation
+        )
 
     async def _remove_quietly(self, guest_path: str) -> None:
         try:
@@ -887,9 +929,15 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             instrumentation if instrumentation is not None else Instrumentation()
         )
         self._dependencies = dependencies
+        self._reaper = _Reaper()
 
     async def aclose(self) -> None:
-        """Close the API client, if this one made it."""
+        """Finish outstanding cleanup, then close the API client if this one made it.
+
+        Cleanup still waiting on a platform answer (a command start, a create)
+        is given a bounded time to finish; what is left is logged and dropped.
+        """
+        await self._reaper.aclose(_CLEANUP_TIMEOUT)
         if self._owns_client:
             await self._client.aclose()
 
@@ -937,7 +985,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             exposed_ports=options.exposed_ports,
         )
         computer = await self._make_computer(state)
-        inner = MandalaSandboxSession(state=state, computer=computer)
+        inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     async def resume(self, state: SandboxSessionState) -> SandboxSession:
@@ -1003,7 +1051,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             state.workspace_unsaved = False
             computer = await self._make_computer(state)
 
-        inner = MandalaSandboxSession(state=state, computer=computer)
+        inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
@@ -1022,6 +1070,50 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
         return self._deserialize_session_state_payload(payload, MandalaSandboxSessionState)
 
+    async def _create(self, state: MandalaSandboxSessionState) -> AsyncComputer:
+        """The create request, cancellable without leaving a computer behind.
+
+        The request runs as its own task. A caller cancelled while it is in
+        flight waits, shielded, for its answer and deletes the computer it made,
+        or leaves that to the client's cleanup if the answer is slow. A create
+        whose outcome is unknown (a dropped connection, a timeout, a 5xx) is
+        sent once more under the same idempotency key, which answers with the
+        first attempt's computer rather than making a second.
+
+        Without a name of its own the computer is named after the session, so
+        one that does leak can be told apart.
+        """
+        name = state.name if state.name is not None else f"agents-{state.session_id.hex[:12]}"
+
+        def send(key: str | None) -> asyncio.Future[AsyncComputer]:
+            return asyncio.ensure_future(
+                self._client.computers.create(
+                    name=name,
+                    size=state.size,
+                    template=state.template,
+                    cpu=state.cpu,
+                    ram_mb=state.ram_mb,
+                    disk_gb=state.disk_gb,
+                    workspace_id=state.workspace_id,
+                    idempotency_key=key,
+                )
+            )
+
+        attempt = send(None)
+        try:
+            try:
+                return await asyncio.shield(attempt)
+            except MandalaError as error:
+                if error.idempotency_key is None:
+                    raise
+                attempt = send(error.idempotency_key)
+                return await asyncio.shield(attempt)
+        except asyncio.CancelledError:
+            await _shielded(_after(attempt, _delete_quietly, self._reaper, "a computer create"))
+            raise
+        except (MandalaError, ValueError) as error:
+            _raise_start_error(state, error, "create")
+
     async def _make_computer(self, state: MandalaSandboxSessionState) -> AsyncComputer:
         """Create a computer from ``state``'s inputs and wait for its guest.
 
@@ -1035,18 +1127,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         the handle to delete it. A platform that cannot keep end times fails
         the session here, before any work, rather than running without one.
         """
-        try:
-            computer = await self._client.computers.create(
-                name=state.name,
-                size=state.size,
-                template=state.template,
-                cpu=state.cpu,
-                ram_mb=state.ram_mb,
-                disk_gb=state.disk_gb,
-                workspace_id=state.workspace_id,
-            )
-        except (MandalaError, ValueError) as error:
-            _raise_start_error(state, error, "create")
+        computer = await self._create(state)
         state.computer_id = computer.id
         stage = "start"
         try:
@@ -1140,13 +1221,60 @@ class _Clock:
                 self.expired()
 
 
-async def _kill_when_started(submit: asyncio.Future[AsyncBackgroundCommand]) -> None:
-    """Wait for a start that was abandoned, and stop the command if it began."""
+class _Reaper:
+    """Cleanup that outlives the call that started it.
+
+    Held by the client, so its tasks stay referenced, and finished (or logged
+    and cancelled) when the client closes.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: dict[asyncio.Future[None], str] = {}
+
+    def later(
+        self,
+        pending: asyncio.Future[_ReadT],
+        then: Callable[[_ReadT], Awaitable[None]],
+        what: str,
+    ) -> None:
+        async def run() -> None:
+            try:
+                result = await pending
+            except BaseException:  # noqa: BLE001 - it failed, so nothing to undo
+                return
+            await then(result)
+
+        task = asyncio.ensure_future(run())
+        self._tasks[task] = what
+        task.add_done_callback(lambda done: self._tasks.pop(done, None))
+
+    async def aclose(self, timeout: float) -> None:
+        if not self._tasks:
+            return
+        _, pending = await asyncio.wait(list(self._tasks), timeout=timeout)
+        for task in pending:
+            logger.warning(
+                "closing before %s answered; whatever it made was not cleaned up",
+                self._tasks.get(task, "a request"),
+            )
+            task.cancel()
+
+
+async def _after(
+    pending: asyncio.Future[_ReadT],
+    then: Callable[[_ReadT], Awaitable[None]],
+    reaper: _Reaper,
+    what: str,
+) -> None:
+    """Undo what an abandoned request made: now if it answers soon, later if not."""
     try:
-        job = await asyncio.wait_for(asyncio.shield(submit), _CLEANUP_TIMEOUT)
-    except Exception:  # noqa: BLE001 - it did not start, or cannot be found to stop
+        result = await asyncio.wait_for(asyncio.shield(pending), _ANSWER_WAIT)
+    except asyncio.TimeoutError:
+        reaper.later(pending, then, what)
         return
-    await _kill_quietly(job)
+    except Exception:  # noqa: BLE001 - it failed, so nothing to undo
+        return
+    await then(result)
 
 
 async def _kill_quietly(job: AsyncBackgroundCommand) -> None:

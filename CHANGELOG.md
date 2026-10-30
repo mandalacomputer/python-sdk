@@ -27,8 +27,10 @@ This is the summary you read to decide whether to upgrade.
   Snapshots are saved only in a form a restore accepts (hard links as files,
   absolute in-workspace symlinks made relative); a symlink out of the workspace
   fails the persist. With a snapshot store configured, the computer is deleted
-  at shutdown only after the workspace was confirmed saved, and stopped
-  otherwise; a resume onto that computer keeps its newer disk.
+  at shutdown only when a confirmed save covers everything the session did,
+  and stopped otherwise; a resume onto that computer keeps its newer disk. A
+  computer without a `name` is named `agents-<session>`, and a create or a
+  command start abandoned by cancellation is cleaned up once it answers.
   PTY sessions, users other than `root`, manifest users and groups, mounts and
   host-path grants are refused with the SDK's `ConfigurationError`. Importing
   `mandala_computer` does not import the Agents SDK.

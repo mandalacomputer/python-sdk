@@ -130,6 +130,8 @@ class FakePlatform:
         self.create_status = "running"
         #: Answer like a platform without execution ids: cursor polls only.
         self.legacy_exec = False
+        #: Seconds a create takes to answer (the computer exists meanwhile).
+        self.create_delay = 0.0
         #: Seconds a background start takes to answer.
         self.start_delay = 0.0
         #: Pids whose next poll consumes output and then fails.
@@ -165,7 +167,16 @@ class FakePlatform:
         if failure is not None:
             return httpx.Response(failure[0], json=failure[1])
         if parts == ["computers"] and request.method == "POST":
-            return self._create(json.loads(request.content))
+            made = self._create(json.loads(request.content))
+            if self.create_delay:
+                delay = self.create_delay
+
+                async def later() -> httpx.Response:
+                    await asyncio.sleep(delay)
+                    return made
+
+                return later()  # type: ignore[return-value]
+            return made
         if parts[0] != "computers" or len(parts) < 2:
             return httpx.Response(404, json={"error": "no such route"})
         record = self.computers.get(parts[1])

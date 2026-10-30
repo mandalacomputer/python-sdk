@@ -139,7 +139,10 @@ async def test_create_without_options_uses_the_defaults(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path
 ) -> None:
     await client.create(manifest=manifest(root))
-    assert sent_create(fake) == {"start": True}
+    body = sent_create(fake)
+    # Unnamed, the computer is named after the session, so a leak is traceable.
+    assert str(body.pop("name")).startswith("agents-")
+    assert body == {"start": True}
     assert json.loads(fake.calls("PATCH", "/vm-1")[0].content) == {"ends_in_hours": 24.0}
 
 
@@ -703,7 +706,9 @@ async def test_a_runner_drives_the_session_end_to_end(
     model.assert_complete()
     outputs = [item.output for item in result.new_items if item.type == "tool_call_output_item"]
     assert any("mandala works" in str(output) for output in outputs), outputs
-    assert sent_create(fake) == {"size": "small", "start": True}
+    body = sent_create(fake)
+    assert str(body.pop("name")).startswith("agents-")
+    assert body == {"size": "small", "start": True}
     # The runner owned the session, so the computer is gone with it.
     assert fake.computers == {}
 
@@ -1045,3 +1050,77 @@ async def test_a_resume_after_a_good_save_restores_a_drifted_disk(
     await resumed.start()
     assert (await resumed.read(Path("notes.txt"))).read() == b"saved"
     await resumed.aclose()
+
+
+# --- review round 4 -------------------------------------------------------------
+
+
+async def test_a_change_after_a_save_keeps_the_computer_and_the_change(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    await session.write(Path("notes.txt"), io.BytesIO(b"saved"))
+    await session.stop()
+    assert session.state.workspace_unsaved is False  # type: ignore[attr-defined]
+    await session.write(Path("notes.txt"), io.BytesIO(b"newer than the snapshot"))
+    assert session.state.workspace_unsaved is True  # type: ignore[attr-defined]
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.start()
+    assert (await resumed.read(Path("notes.txt"))).read() == b"newer than the snapshot"
+    await resumed.aclose()
+    assert fake.computers == {}
+
+
+async def test_cancelling_during_a_slow_create_deletes_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.create_delay = 0.4
+    task = asyncio.ensure_future(client.create(manifest=manifest(root)))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(fake.calls("POST", "/computers")) == 1
+    assert fake.computers == {}
+    assert fake.calls("DELETE", "/vm-1")
+
+
+async def test_an_unknown_create_outcome_is_sent_again_under_its_key(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.fail_once[("POST", "computers")] = (503, {"error": "try again"})
+    session = await client.create(manifest=manifest(root))
+    first, second = fake.calls("POST", "/computers")
+    assert first.headers["idempotency-key"] == second.headers["idempotency-key"]
+    assert list(fake.computers) == [inner(session).computer_id]
+    await session.aclose()
+
+
+async def test_a_start_answering_after_the_cleanup_wait_is_still_stopped(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(manifest=manifest(root))
+    await session.start()
+    fake.start_delay = 0.6
+    task = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The cleanup gave up waiting before the start answered; the client's
+    # own cleanup still stops the command once it does.
+    await sandbox_client.aclose()
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    fake.start_delay = 0.0
+    await session.aclose()

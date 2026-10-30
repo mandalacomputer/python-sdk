@@ -2493,7 +2493,8 @@ is optional, and `options` may be left out of `SandboxRunConfig` altogether:
 | --- | --- | --- |
 | `size` | the template's | a catalogue shape from `client.sizes.list()`; the likeliest to start in about a second. Not with the next four |
 | `template`, `cpu`, `ram_mb`, `disk_gb` | the template's | the same as for `computers.create()` |
-| `name`, `workspace_id` | none | the same as for `computers.create()` |
+| `name` | `agents-<session>` | the computer's name; without one it is named after the session, so a computer left behind can be traced |
+| `workspace_id` | none | the same as for `computers.create()` |
 | `ends_in_hours` | `24` | a safety end time: the platform stops the computer then, keeping its disk, even if the process that made it is gone. Set right after the computer is made; a platform that cannot keep end times fails the session there, and the computer is deleted. `None` for none |
 | `on_shutdown` | `"delete"` | what happens to the computer when the session ends: `"delete"`, `"stop"` or `"suspend"` |
 | `exposed_ports` | none | ports the SDK may expose, served through [public URLs](#public-urls) |
@@ -2587,8 +2588,9 @@ second.
   cannot be restored, so persisting fails, naming it. An absolute target
   with a `..` in it is refused the same way rather than guessed at. With a
   snapshot store configured, `on_shutdown="delete"` deletes the computer only
-  after the workspace has been saved to the store; if that failed, was
-  cancelled or never ran, the computer is stopped instead, keeping its disk.
+  when the store has confirmed a save covering everything the session did;
+  if that save failed, was cancelled, never ran, or a command or write came
+  after it, the computer is stopped instead, keeping its disk.
 - **Refused, before anything is created**: manifest users and groups, mount
   entries, and path grants with a `host_path`. Refused when asked for: a
   `user` other than `root` on a command or file call, and PTY sessions (the
