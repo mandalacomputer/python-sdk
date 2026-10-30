@@ -1802,7 +1802,7 @@ async def test_a_half_restored_computer_that_survived_is_restored_again(
     with pytest.raises(Exception):  # noqa: B017 - the SDK's start error
         await resumed.start()
     fake.fail.clear()
-    assert fake.computers["vm-2"]["status"] == "running"  # it survived
+    assert "vm-2" in fake.computers  # it survived (stopped, the delete having failed)
     (root / "partial.txt").write_bytes(b"half restored")
     payload = client.serialize_session_state(resumed.state)
     assert payload["initialized"] is False
@@ -2364,5 +2364,59 @@ async def test_late_work_after_a_delete_that_fell_back_to_stop_is_stopped_again(
     await sandbox_client._reaper.aclose(5)
     (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
     assert job.killed
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await sandbox_client.aclose()
+
+
+# --- review round 33 ------------------------------------------------------------
+
+
+async def test_work_landing_while_the_stop_is_in_flight_is_stopped_again(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    fake.start_late_effect = 0.3
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    # The stop takes effect at once, but its read back is slow: the start
+    # lands, waking the computer, while the stop call is still in flight.
+    fake.slow_refresh_after_stop = 0.6
+    await session.shutdown()
+    await sandbox_client._reaper.aclose(5)
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    await sandbox_client.aclose()
+
+
+async def test_a_cancelled_start_on_a_kept_computer_is_tracked_like_a_shutdown(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = sandbox_client.serialize_session_state(session.state)
+    resumed = await sandbox_client.resume(sandbox_client.deserialize_session_state(payload))
+    fake.start_late_effect = 0.5  # the start's first command lands late
+    starting = asyncio.ensure_future(resumed.start())
+    await asyncio.sleep(0.05)
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert fake.computers["vm-1"]["status"] == "stopped"  # the first stop
+    await asyncio.sleep(0.6)  # the command lands, waking it
+    await sandbox_client._reaper.aclose(5)
     assert fake.computers["vm-1"]["status"] == "stopped"
     await sandbox_client.aclose()

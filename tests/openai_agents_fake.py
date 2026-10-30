@@ -138,6 +138,9 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds the read after the next stop takes to answer.
+        self.slow_refresh_after_stop = 0.0
+        self._slow_get: dict[str, float] = {}
         #: Seconds before the next command start reaches the computer (waking it).
         self.start_late_effect = 0.0
         #: Seconds the next computer start takes to take effect and answer.
@@ -239,6 +242,9 @@ class FakePlatform:
                 return httpx.Response(200, json={"ok": True})
 
             return later()  # type: ignore[return-value]
+        if rest == ["stop"] and request.method == "POST" and self.slow_refresh_after_stop:
+            self._slow_get[record["id"]] = self.slow_refresh_after_stop
+            self.slow_refresh_after_stop = 0.0
         if rest in (["start"], ["stop"], ["suspend"]) and request.method == "POST":
             record["status"] = {"start": "running", "stop": "stopped", "suspend": "suspended"}[
                 rest[0]
@@ -274,6 +280,14 @@ class FakePlatform:
         return httpx.Response(201, json=record)
 
     def _computer(self, request: httpx.Request, record: dict[str, Any]) -> httpx.Response:
+        if request.method == "GET" and record["id"] in self._slow_get:
+            delay = self._slow_get.pop(record["id"])
+
+            async def later() -> httpx.Response:
+                await asyncio.sleep(delay)
+                return httpx.Response(200, json=record)
+
+            return later()  # type: ignore[return-value]
         if request.method == "GET":
             return httpx.Response(200, json=record)
         if request.method == "DELETE" and self.delete_delay:

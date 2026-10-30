@@ -339,6 +339,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._shutdown_task: asyncio.Future[None] | None = None
         #: How shutdown left the computer, once it has.
         self._released: str | None = None
+        #: What the session set out to do to the computer, once it has begun.
+        self._releasing: str | None = None
         #: Work handed to the client's cleanup and not yet finished.
         self._unsettled = 0
         #: Background work finished after shutdown acted on the computer.
@@ -409,9 +411,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             yield
         finally:
             self._busy -= 1
-            if self._released in ("stop", "suspend"):
-                self._settled_after_release = True
-                await _shielded(_stop_quietly(self._computer))
+            await _shielded(self._landed_late())
 
     @property
     def computer(self) -> AsyncComputer:
@@ -1262,7 +1262,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         # A computer made for this session that never finished starting (its
         # restore failed, say) holds nothing: delete it rather than keep it.
         # This is the session's shutdown, so a later one waits for it.
-        self._begin_shutdown(_delete_quietly(self._computer))
+        self._begin_shutdown(self._put_down_quietly("delete"))
         assert self._shutdown_task is not None
         await asyncio.shield(self._shutdown_task)
 
@@ -1318,10 +1318,20 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def _settled_late(self) -> None:
         """After background cleanup finishes: undo what it may have woken."""
+        await self._landed_late()
+
+    async def _landed_late(self) -> None:
+        """Work that may have reached the computer just finished.
+
+        Once the session has begun putting the computer down, that work may
+        have woken it. While the action is in flight this is only noted, and
+        the action stops the computer again when it returns; once it has
+        stopped or suspended the computer, it is stopped again now.
+        """
+        if self._releasing is None:
+            return
+        self._settled_after_release = True
         if self._released in ("stop", "suspend"):
-            # Shutdown has acted on the computer: this may have reached it
-            # after, and woken it.
-            self._settled_after_release = True
             await _stop_quietly(self._computer)
 
     def _shutdown_now(self) -> asyncio.Future[None]:
@@ -1351,11 +1361,31 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         if self._workspace_state_preserved_on_start():
             # A kept computer: stop it, keeping its disk for the next attempt.
-            self._begin_shutdown(_stop_quietly(self._computer))
+            self._begin_shutdown(self._put_down_quietly("stop"))
             assert self._shutdown_task is not None
             await asyncio.shield(self._shutdown_task)
             return
         await self._after_start_failed()
+
+    async def _put_down_quietly(self, mode: ShutdownMode) -> None:
+        await self._put_down(mode)
+
+    async def _undo_start(self, starts: list[asyncio.Future[AsyncComputer]]) -> None:
+        """Stop the computer a failed resume started, and again if a start lands late."""
+        await self._put_down("stop")
+        for start in starts:
+            if not start.done():
+                await _after(
+                    start,
+                    self._again,
+                    self._reaper,
+                    f"the start of {self.computer_id}",
+                    self._again,
+                    owner=self,
+                )
+
+    async def _again(self, _: object) -> None:
+        await self._landed_late()
 
     async def _shut_down_computer(self) -> None:
         mode = self.state.on_shutdown
@@ -1391,15 +1421,40 @@ class MandalaSandboxSession(BaseSandboxSession):
             mode = "stop"
         # The computer first, so that is done whatever happens to the rest; a
         # stopped computer serves nothing, so its URLs can come down after.
-        outcome = await self._act(mode)
-        # What actually happened, so late work knows whether to stop it again.
-        self._released = outcome
+        outcome = await self._put_down(mode)
         if outcome != "delete":
             await self._settle_resolutions()
             await self._remove_public_urls()
             if self._settled_after_release:
                 # Background work landed after the stop: make sure once more.
                 await _stop_quietly(self._computer)
+
+    async def _put_down(self, mode: ShutdownMode) -> str | None:
+        """Stop, suspend or delete the computer: the only way the session does.
+
+        Marked before the action, so work landing while it is in flight is
+        noted; recorded after with what actually happened, so work landing
+        later stops it again. If anything landed during the action, or the
+        computer reads running after it, it is stopped again here.
+        """
+        self._releasing = mode
+        landed_before = self._settled_after_release
+        self._settled_after_release = False
+        outcome = await self._act(mode)
+        self._released = outcome
+        if outcome in ("stop", "suspend"):
+            woken = self._settled_after_release
+            if not woken:
+                try:
+                    await self._computer.refresh()
+                    woken = self._computer.status == "running"
+                except MandalaError:
+                    woken = False
+            if woken:
+                await _stop_quietly(self._computer)
+                self._released = "stop"
+        self._settled_after_release = self._settled_after_release or landed_before
+        return self._released
 
     async def _act(self, mode: ShutdownMode) -> str | None:
         """Delete, suspend or stop the computer, and say which it ended up being.
@@ -1592,9 +1647,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             if isinstance(inner, MandalaSandboxSession):
                 if inner._shutdown_task is None:
                     kept = inner._workspace_state_preserved_on_start()
-                    inner._begin_shutdown(
-                        (_stop_quietly if kept else _delete_quietly)(inner.computer)
-                    )
+                    inner._begin_shutdown(inner._put_down_quietly("stop" if kept else "delete"))
                 assert inner._shutdown_task is not None
                 await _shielded(inner._shutdown_task)
             raise _client_closing(root)
@@ -1700,7 +1753,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                     # that must not leave it running, possibly with no end time.
                     # Stopped, it keeps its disk for the next attempt, and a
                     # start still on its way is stopped again once it lands.
-                    inner._begin_shutdown(self._undo_start(computer, starts))
+                    inner._begin_shutdown(inner._undo_start(starts))
                     assert inner._shutdown_task is not None
                     await _shielded(inner._shutdown_task)
                 else:
@@ -1722,19 +1775,6 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         )
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
-
-    async def _undo_start(
-        self, computer: AsyncComputer, starts: list[asyncio.Future[AsyncComputer]]
-    ) -> None:
-        """Stop a computer a failed resume started, including a start still landing."""
-
-        async def stop(_: object) -> None:
-            await _stop_quietly(computer)
-
-        for start in starts:
-            if not start.done():
-                await _after(start, stop, self._reaper, f"the start of {computer.id}", stop)
-        await _stop_quietly(computer)
 
     async def delete(self, session: SandboxSession) -> SandboxSession:
         """Release the session's computer as its ``on_shutdown`` says, once.
