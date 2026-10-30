@@ -65,10 +65,11 @@ import math
 import posixpath
 import shlex
 import tarfile
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Literal, NoReturn, TypeVar
+from typing import IO, Any, Literal, NoReturn, TypeVar, cast
 
 try:
     from agents.sandbox.errors import (
@@ -106,7 +107,11 @@ try:
         resolve_snapshot,
     )
     from agents.sandbox.types import ExecResult, ExposedPortEndpoint, User
-    from agents.sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
+    from agents.sandbox.util.tar_utils import (
+        UnsafeTarMemberError,
+        validate_tar_bytes,
+        validate_tarfile,
+    )
     from agents.sandbox.workspace_paths import posix_path_for_error, sandbox_path_str
     from pydantic import ConfigDict, Field, field_validator, model_validator
     from typing_extensions import Self
@@ -182,6 +187,9 @@ _SAVING: contextvars.ContextVar[_Save | None] = contextvars.ContextVar(
 
 #: The largest workspace archive a restore can upload to a computer.
 _ARCHIVE_LIMIT = 2 * 1024 * 1024 * 1024
+
+#: How much of an archive is held in memory before it spills to a temp file.
+_SPOOL_IN_MEMORY = 64 * 1024 * 1024
 
 #: Where archives are staged inside the computer on the way in and out.
 _GUEST_TMP = "/tmp"
@@ -633,7 +641,17 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
             wanted = self.state.public_url_access
             if served is None:
-                served = await self._computer.create_public_url(port, access=wanted)
+                before = {u.id for u in listing.public_urls if u.port == port}
+                try:
+                    served = await self._computer.create_public_url(port, access=wanted)
+                except asyncio.CancelledError:
+                    await _shielded(self._adopt_new_url(port, before))
+                    raise
+                except MandalaError as error:
+                    if not _clean_refusal(error):
+                        # It may have been made: find it, so shutdown removes it.
+                        await _shielded(self._adopt_new_url(port, before))
+                    raise
                 self.state.public_url_ids[port] = served.id
             elif wanted is not None and served.access != wanted:
                 # Reused, it must still be as open as asked and no more.
@@ -658,6 +676,23 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=_retryable(error),
             ) from error
         return ExposedPortEndpoint(host=served.hostname, port=443, tls=True)
+
+    async def _adopt_new_url(self, port: int, before: set[str]) -> None:
+        """Record a public URL a lost create may have made, as this session's."""
+        try:
+            listing = await asyncio.wait_for(self._computer.public_urls(), _CLEANUP_TIMEOUT)
+        except Exception as error:  # noqa: BLE001 - reported; nothing else to do
+            logger.warning(
+                "a public URL for port %s on computer %s may have been made and could "
+                "not be checked (%s); shutdown will not remove it",
+                port,
+                self.state.computer_id,
+                type(error).__name__,
+            )
+            return
+        for url in listing.public_urls:
+            if url.port == port and url.id not in before:
+                self.state.public_url_ids[port] = url.id
 
     # --- files ------------------------------------------------------------
 
@@ -768,7 +803,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         excludes = " ".join(shell_tar_exclude_args(self._persist_workspace_skip_relpaths()))
         script = (
             f"tar {excludes} -C {shlex.quote(sandbox_path_str(root))} -cf {shlex.quote(archive)} ."
+            f" && wc -c < {shlex.quote(archive)}"
         )
+        sink: Any = None
         try:
             result = await self._exec_internal("sh", "-c", script)
             if not result.ok():
@@ -782,11 +819,25 @@ class MandalaSandboxSession(BaseSandboxSession):
                     },
                     retryable=False,
                 )
-            sink = io.BytesIO()
-            await self._computer.download_file(archive, sink)
+            size = int(result.stdout.decode("ascii", errors="replace").strip() or -1)
+            if size > _ARCHIVE_LIMIT:
+                raise _ArchiveTooLarge(size)
+            # Closed below on every path, or handed on inside the rewrite.
+            sink = tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY)  # noqa: SIM115
+            await self._computer.download_file(
+                archive, cast(IO[bytes], _Capped(sink, _ARCHIVE_LIMIT))
+            )
+        except _ArchiveTooLarge as error:
+            if sink is not None:
+                sink.close()
+            raise _too_large(error_root, error.size) from None
         except WorkspaceArchiveReadError:
+            if sink is not None:
+                sink.close()
             raise
-        except (MandalaError, ExecTransportError, ExecTimeoutError) as error:
+        except (MandalaError, ExecTransportError, ExecTimeoutError, ValueError) as error:
+            if sink is not None:
+                sink.close()
             raise WorkspaceArchiveReadError(
                 path=error_root,
                 context={"backend": _BACKEND_ID, **_error_context(error)},
@@ -796,7 +847,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         finally:
             await self._remove_quietly(archive)
         try:
-            restorable = _restorable_archive(sink.getvalue(), sandbox_path_str(root))
+            sink.seek(0)
+            restorable = _restorable_archive(sink, sandbox_path_str(root), _ARCHIVE_LIMIT)
+        except _ArchiveTooLarge as error:
+            raise _too_large(error_root, error.size) from None
         except UnsafeTarMemberError as error:
             # Saved as it is, this snapshot would be refused when it is restored:
             # fail the persist instead, so the run reports it and shutdown keeps
@@ -812,19 +866,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                 cause=error,
                 retryable=False,
             ) from error
-        if len(restorable) > _ARCHIVE_LIMIT:
-            # Larger than a restore can upload: saved, it could never be used.
-            raise WorkspaceArchiveReadError(
-                path=error_root,
-                context={
-                    "backend": _BACKEND_ID,
-                    "reason": "archive_too_large",
-                    "size": len(restorable),
-                    "limit": _ARCHIVE_LIMIT,
-                },
-                retryable=False,
-            )
-        return io.BytesIO(restorable)
+        finally:
+            sink.close()
+        return cast(io.IOBase, restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         with self._mutating():
@@ -1454,8 +1498,53 @@ async def _stop_quietly(computer: AsyncComputer) -> None:
         )
 
 
-def _restorable_archive(raw: bytes, root: str) -> bytes:
-    """``raw`` rewritten into what :meth:`hydrate_workspace` will accept.
+class _ArchiveTooLarge(Exception):
+    """An archive past what a restore can upload; ``size`` is how far it got."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(size)
+        self.size = size
+
+
+def _too_large(path: Path, size: int) -> WorkspaceArchiveReadError:
+    # Larger than a restore can upload: saved, it could never be used.
+    return WorkspaceArchiveReadError(
+        path=path,
+        context={
+            "backend": _BACKEND_ID,
+            "reason": "archive_too_large",
+            "size": size,
+            "limit": _ARCHIVE_LIMIT,
+        },
+        retryable=False,
+    )
+
+
+class _Capped(io.RawIOBase):
+    """A writable sink that refuses to grow past ``limit`` bytes."""
+
+    def __init__(self, sink: Any, limit: int) -> None:
+        self._sink = sink
+        self._limit = limit
+        self._written = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._written
+
+    def write(self, data: Any) -> int:
+        size = len(data)
+        if self._written + size > self._limit:
+            raise _ArchiveTooLarge(self._written + size)
+        self._sink.write(data)
+        self._written += size
+        return size
+
+
+def _restorable_archive(source: Any, root: str, limit: int) -> Any:
+    """``source`` rewritten into what :meth:`hydrate_workspace` will accept.
 
     Restoring refuses hard links and symlinks that point out of the workspace,
     as every SDK backend does. A hard link becomes a regular file holding the
@@ -1464,66 +1553,75 @@ def _restorable_archive(raw: bytes, root: str) -> bytes:
     workspace cannot be restored at all, so it raises ``UnsafeTarMemberError``
     naming it, and the result is checked against the restore policy before it
     is returned.
+
+    Written to a spooled file and counted as it grows, hard-link copies
+    included: past ``limit`` it raises ``_ArchiveTooLarge``. Returned rewound.
     """
-    out = io.BytesIO()
-    with (
-        tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as source,
-        tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as target,
-    ):
-        contents: dict[str, bytes] = {}
-        for member in source.getmembers():
-            name = posixpath.normpath(member.name)
-            if member.isreg():
-                handle = source.extractfile(member)
-                data = handle.read() if handle is not None else b""
-                contents[name] = data
-                target.addfile(member, io.BytesIO(data))
-            elif member.islnk():
-                linked = posixpath.normpath(member.linkname)
-                if linked not in contents:
-                    raise UnsafeTarMemberError(
-                        member=member.name,
-                        reason=f"hard link to a file not in the archive: {member.linkname}",
+    # Returned to the caller, who closes it; closed here only on failure.
+    out = tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY)  # noqa: SIM115
+    try:
+        with (
+            tarfile.open(fileobj=source, mode="r:") as tar,
+            tarfile.open(
+                fileobj=_Capped(out, limit), mode="w", format=tarfile.PAX_FORMAT
+            ) as target,
+        ):
+            files: dict[str, tarfile.TarInfo] = {}
+            for member in tar:
+                name = posixpath.normpath(member.name)
+                if member.isreg():
+                    files[name] = member
+                    target.addfile(member, tar.extractfile(member))
+                elif member.islnk():
+                    linked = files.get(posixpath.normpath(member.linkname))
+                    if linked is None:
+                        raise UnsafeTarMemberError(
+                            member=member.name,
+                            reason=f"hard link to a file not in the archive: {member.linkname}",
+                        )
+                    copy = tarfile.TarInfo(member.name)
+                    copy.size = linked.size
+                    copy.mode, copy.mtime = member.mode, member.mtime
+                    copy.uid, copy.gid = member.uid, member.gid
+                    copy.uname, copy.gname = member.uname, member.gname
+                    files[name] = linked
+                    target.addfile(copy, tar.extractfile(linked))
+                elif member.issym() and member.linkname.startswith("/"):
+                    # Rebased only when made of plain components: a ``..`` after
+                    # a symlinked component means something else on disk than it
+                    # does as text, so it is not resolved here but refused.
+                    parts = PurePosixPath(member.linkname).parts[1:]
+                    if ".." in parts:
+                        raise UnsafeTarMemberError(
+                            member=member.name,
+                            reason=f"absolute symlink target with '..': {member.linkname}",
+                        )
+                    root_parts = PurePosixPath(root).parts[1:]
+                    if tuple(parts[: len(root_parts)]) != tuple(root_parts):
+                        raise UnsafeTarMemberError(
+                            member=member.name,
+                            reason=f"symlink points outside the workspace: {member.linkname}",
+                        )
+                    member.linkname = posixpath.relpath(
+                        posixpath.join(".", *parts[len(root_parts) :]),
+                        posixpath.join(".", posixpath.dirname(name)),
                     )
-                copy = tarfile.TarInfo(member.name)
-                copy.size = len(contents[linked])
-                copy.mode, copy.mtime = member.mode, member.mtime
-                copy.uid, copy.gid = member.uid, member.gid
-                copy.uname, copy.gname = member.uname, member.gname
-                contents[name] = contents[linked]
-                target.addfile(copy, io.BytesIO(contents[linked]))
-            elif member.issym() and member.linkname.startswith("/"):
-                # Rebased only when made of plain components: a ``..`` after a
-                # symlinked component means something else on disk than it does
-                # as text, so it is not resolved here but refused.
-                parts = PurePosixPath(member.linkname).parts[1:]
-                if ".." in parts:
-                    raise UnsafeTarMemberError(
-                        member=member.name,
-                        reason=f"absolute symlink target with '..': {member.linkname}",
-                    )
-                root_parts = PurePosixPath(root).parts[1:]
-                if tuple(parts[: len(root_parts)]) != tuple(root_parts):
-                    raise UnsafeTarMemberError(
-                        member=member.name,
-                        reason=f"symlink points outside the workspace: {member.linkname}",
-                    )
-                relative = posixpath.relpath(
-                    posixpath.join(".", *parts[len(root_parts) :]),
-                    posixpath.join(".", posixpath.dirname(name)),
-                )
-                member.linkname = relative
-                # A long target travels in a PAX header, which would win over
-                # the field just set when the member is written again.
-                member.pax_headers = {
-                    k: v for k, v in member.pax_headers.items() if k != "linkpath"
-                }
-                target.addfile(member)
-            else:
-                target.addfile(member)
-    result = out.getvalue()
-    validate_tar_bytes(result, allow_external_symlink_targets=False)
-    return result
+                    # A long target travels in a PAX header, which would win
+                    # over the field just set when the member is written again.
+                    member.pax_headers = {
+                        k: v for k, v in member.pax_headers.items() if k != "linkpath"
+                    }
+                    target.addfile(member)
+                else:
+                    target.addfile(member)
+        out.seek(0)
+        with tarfile.open(fileobj=out, mode="r:") as check:
+            validate_tarfile(check, allow_external_symlink_targets=False)
+        out.seek(0)
+        return out
+    except BaseException:
+        out.close()
+        raise
 
 
 async def _delete_quietly(computer: AsyncComputer) -> None:

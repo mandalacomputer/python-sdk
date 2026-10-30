@@ -136,6 +136,8 @@ class FakePlatform:
         self.lose_create = False
         #: Answer creates as a platform that does not know end times.
         self.ignore_end_time = False
+        #: The next public URL create makes it, and its answer is lost.
+        self.lose_public_url = False
         #: Pids whose kill answers without stopping them.
         self.kill_noop: set[int] = set()
         #: The next command start runs, and its answer is lost.
@@ -452,6 +454,10 @@ class FakePlatform:
                 "updated_at": "2026-10-29T00:00:00.000Z",
             }
             urls.append(url)
+            if self.lose_public_url:
+                # Made, and the answer lost on the way back.
+                self.lose_public_url = False
+                return httpx.Response(504, json={"error": "gateway timeout"})
             return httpx.Response(201, json=url)
         if request.method == "PATCH" and rest:
             body = json.loads(request.content)

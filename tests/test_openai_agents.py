@@ -1455,3 +1455,51 @@ async def test_a_kill_that_does_not_confirm_the_stop_keeps_the_computer(
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert not fake.calls("DELETE", "/vm-1")
+
+
+# --- review round 11 ------------------------------------------------------------
+
+
+async def test_a_public_url_whose_answer_was_lost_is_still_removed(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.lose_public_url = True
+    with pytest.raises(ExposedPortUnavailableError):
+        await session.resolve_exposed_port(8080)
+    assert len(fake.public_urls["vm-1"]) == 1  # it was made
+    await session.aclose()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []
+
+
+async def test_hard_links_expanding_past_the_limit_are_refused(
+    fake: FakePlatform,
+    client: MandalaSandboxClient,
+    root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+    )
+    await session.start()
+    await session.exec(
+        "head -c 3000 /dev/zero > data && for n in 1 2 3 4 5; do ln data link$n; done"
+    )
+    # The tar on the computer fits (one copy of the data, padded to a record);
+    # the rewrite, with a copy per hard link, does not.
+    monkeypatch.setattr(oa, "_ARCHIVE_LIMIT", 12288)
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await session.stop()
+    assert caught.value.context["reason"] == "archive_too_large"
+    # Refused in the rewrite: the archive itself was small enough to fetch.
+    assert fake.calls("GET", "/files")
+    assert not list(store.iterdir())
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
