@@ -215,11 +215,15 @@ class MandalaSandboxClientOptions(BaseSandboxClientOptions):
     any work.
 
     ``on_shutdown`` is what happens to the computer when the session shuts
-    down: ``"delete"`` (the default) destroys it and its disk; ``"stop"`` keeps
-    the disk; ``"suspend"`` keeps the disk and the RAM, so a resume picks up
-    running processes as they were. A kept computer is reattached by
+    down: ``"delete"`` destroys it and its disk; ``"stop"`` keeps the disk;
+    ``"suspend"`` keeps the disk and the RAM, so a resume picks up running
+    processes as they were. Left as ``None`` it stops the computer when the run
+    has a snapshot store and deletes it when it has none. ``"delete"`` with a
+    store deletes only after a confirmed save of the whole workspace, and
+    files written after that save by background processes you started are
+    lost with it. A kept computer is reattached by
     :meth:`MandalaSandboxClient.resume` and keeps using its plan's disk until
-    it is deleted.
+    it is deleted; its end time stops it if nothing else does.
 
     ``exposed_ports`` are the ports the agent may ask the SDK to expose; each
     is served through a public URL the first time it is resolved.
@@ -239,7 +243,7 @@ class MandalaSandboxClientOptions(BaseSandboxClientOptions):
     name: str | None = None
     workspace_id: str | None = None
     ends_in_hours: float | None = 24.0
-    on_shutdown: ShutdownMode = "delete"
+    on_shutdown: ShutdownMode | None = None
     exposed_ports: tuple[int, ...] = ()
     public_url_access: Literal["public", "private"] | None = None
     launch_timeout_s: float = Field(default=300.0, gt=0)
@@ -278,7 +282,7 @@ class MandalaSandboxSessionState(SandboxSessionState):
     name: str | None = None
     workspace_id: str | None = None
     ends_in_hours: float | None = None
-    on_shutdown: ShutdownMode = "delete"
+    on_shutdown: ShutdownMode | None = None
     public_url_access: Literal["public", "private"] | None = None
     launch_timeout_s: float = 300.0
     #: Public URLs this session created, by port. Ones that already existed are
@@ -636,9 +640,32 @@ class MandalaSandboxSession(BaseSandboxSession):
             await clock.pause()
 
     async def _resolve_exposed_port(self, port: int) -> ExposedPortEndpoint:
+        if self._shut_down:
+            raise ExposedPortUnavailableError(
+                port=port,
+                exposed_ports=self.state.exposed_ports,
+                reason="backend_unavailable",
+                context={"backend": _BACKEND_ID, "detail": "session_shutting_down"},
+                retryable=False,
+            )
         lock = self._port_locks.setdefault(port, asyncio.Lock())
         async with lock:
             return await self._resolve_port(port)
+
+    async def _settle_resolutions(self) -> None:
+        """Wait, bounded, for resolutions in flight, so their URLs are removed too."""
+        for port, lock in list(self._port_locks.items()):
+            try:
+                await asyncio.wait_for(lock.acquire(), _ANSWER_WAIT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "a public URL for port %s on computer %s was still being made at "
+                    "shutdown; it is removed if it lands",
+                    port,
+                    self.state.computer_id,
+                )
+                continue
+            lock.release()
 
     async def _resolve_port(self, port: int) -> ExposedPortEndpoint:
         try:
@@ -673,6 +700,16 @@ class MandalaSandboxSession(BaseSandboxSession):
                         # It may have been made: find it, so shutdown removes it.
                         await _shielded(self._adopt_new_url(port, before))
                     raise
+                if self._shut_down:
+                    # Made after shutdown gave up waiting for it: remove it.
+                    await _shielded(self._remove_url_quietly(port, served.id))
+                    raise ExposedPortUnavailableError(
+                        port=port,
+                        exposed_ports=self.state.exposed_ports,
+                        reason="backend_unavailable",
+                        context={"backend": _BACKEND_ID, "detail": "session_shutting_down"},
+                        retryable=False,
+                    )
                 self.state.public_url_ids.setdefault(port, []).append(served.id)
             elif wanted is not None and served.access != wanted:
                 # Reused, it must still be as open as asked and no more.
@@ -697,6 +734,19 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=_retryable(error),
             ) from error
         return ExposedPortEndpoint(host=served.hostname, port=443, tls=True)
+
+    async def _remove_url_quietly(self, port: int, url_id: str) -> None:
+        try:
+            await self._computer.delete_public_url(url_id)
+        except NotFoundError:
+            pass
+        except MandalaError as error:
+            logger.warning(
+                "could not remove a public URL for port %s on computer %s (%s)",
+                port,
+                self.state.computer_id,
+                type(error).__name__,
+            )
 
     async def _settle_url(
         self, create: asyncio.Future[PublicUrl], port: int, before: set[str]
@@ -1070,7 +1120,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         if self._shut_down:
             return
         self._shut_down = True
-        mode = self.state.on_shutdown
+        has_store = not isinstance(self.state.snapshot, NoopSnapshot)
+        mode = self.state.on_shutdown or ("stop" if has_store else "delete")
         computer = self._computer
         if mode == "delete" and self._workspace_unsaved():
             # A snapshot store is configured and nothing confirms the workspace
@@ -1083,6 +1134,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
             mode = "stop"
         if mode != "delete":
+            await self._settle_resolutions()
             await self._remove_public_urls()
         try:
             if mode == "delete":

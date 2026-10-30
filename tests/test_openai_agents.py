@@ -50,6 +50,9 @@ from mandala_computer.openai_agents import (
     MandalaSandboxSessionState,
 )
 
+#: The guarded delete, asked for explicitly; with a snapshot store the default stops.
+DELETE = MandalaSandboxClientOptions(on_shutdown="delete")
+
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the stand-in guest is POSIX")
 
 
@@ -95,7 +98,7 @@ def test_options_parse_by_type_and_refuse_unknown_fields() -> None:
     parsed = BaseSandboxClientOptions.parse({"type": "mandala", "size": "small"})
     assert isinstance(parsed, MandalaSandboxClientOptions)
     assert parsed.size == "small" and parsed.ends_in_hours == 24.0
-    assert parsed.on_shutdown == "delete"
+    assert parsed.on_shutdown is None  # stop with a snapshot store, delete without
     with pytest.raises(ValueError):
         MandalaSandboxClientOptions(image="python:3.14")  # type: ignore[call-arg]
 
@@ -621,7 +624,7 @@ async def test_resume_replaces_a_missing_computer_from_the_snapshot(
     session = await client.create(
         manifest=manifest(root),
         snapshot=LocalSnapshotSpec(base_path=snapshots),
-        options=MandalaSandboxClientOptions(template="dev"),
+        options=MandalaSandboxClientOptions(on_shutdown="delete", template="dev"),
     )
     await session.start()
     await session.write(Path("src/app.py"), io.BytesIO(b"print('hi')\n"))
@@ -727,8 +730,9 @@ async def test_a_runner_drives_the_session_end_to_end(
     body = sent_create(fake)
     assert str(body.pop("name")).startswith("agents-")
     assert body == {"size": "small", "start": True, "ends_in_hours": 24.0}
-    # The runner owned the session, so the computer is gone with it.
-    assert fake.computers == {}
+    # The runner keeps a snapshot by default, so by default the computer is
+    # stopped, its disk kept, rather than deleted.
+    assert fake.computers["vm-1"]["status"] == "stopped"
 
 
 # --- packaging ------------------------------------------------------------------
@@ -919,7 +923,7 @@ async def test_a_confirmed_snapshot_lets_shutdown_delete(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
 ) -> None:
     session = await client.create(
-        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path), options=DELETE
     )
     await session.start()
     await session.stop()
@@ -1023,7 +1027,7 @@ async def test_a_resume_after_a_failed_save_keeps_the_newer_disk(
     store = tmp_path / "store"
     store.mkdir()
     session = await client.create(
-        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store), options=DELETE
     )
     await session.start()
     await session.write(Path("notes.txt"), io.BytesIO(b"first"))
@@ -1075,7 +1079,7 @@ async def test_a_change_after_a_save_keeps_the_computer_and_the_change(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
 ) -> None:
     session = await client.create(
-        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path), options=DELETE
     )
     await session.start()
     await session.write(Path("notes.txt"), io.BytesIO(b"saved"))
@@ -1214,7 +1218,7 @@ async def test_a_failed_restore_never_overwrites_the_snapshot(
     store = tmp_path / "store"
     store.mkdir()
     session = await client.create(
-        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store), options=DELETE
     )
     await session.start()
     await session.write(Path("good.txt"), io.BytesIO(b"the good snapshot"))
@@ -1407,7 +1411,7 @@ async def test_a_cleanly_refused_write_does_not(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
 ) -> None:
     session = await client.create(
-        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path), options=DELETE
     )
     await session.start()
     fake.fail_once[("PUT", "files")] = (403, {"error": "no"})
@@ -1689,3 +1693,58 @@ async def test_a_public_url_made_after_its_request_was_abandoned_is_removed(
     assert [u["hostname"] for u in fake.public_urls["vm-1"]] == [endpoint.host]
     await session.aclose()
     assert fake.public_urls["vm-1"] == []
+
+
+# --- stop by default --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("with_store", "on_shutdown", "deleted"),
+    [
+        (True, None, False),  # a store: stopped, even after a confirmed save
+        (False, None, True),  # no store: deleted
+        (True, "delete", True),  # asked for, after a confirmed save: deleted
+    ],
+)
+async def test_the_shutdown_default_follows_the_snapshot_store(
+    fake: FakePlatform,
+    client: MandalaSandboxClient,
+    root: Path,
+    tmp_path: Path,
+    with_store: bool,
+    on_shutdown: str | None,
+    deleted: bool,
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=LocalSnapshotSpec(base_path=tmp_path) if with_store else None,
+        options=MandalaSandboxClientOptions(on_shutdown=on_shutdown),  # type: ignore[arg-type]
+    )
+    await session.start()
+    await session.write(Path("work.txt"), io.BytesIO(b"done"))
+    await session.aclose()  # a confirmed save where there is a store
+    if deleted:
+        assert fake.computers == {}
+    else:
+        assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_a_url_still_being_made_at_shutdown_is_not_left_behind(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    fake.url_delay = 0.3
+    resolving = asyncio.ensure_future(session.resolve_exposed_port(8080))
+    await asyncio.sleep(0.05)
+    await session.aclose()  # overlaps the slow create
+    # It landed while the session was closing, so it removed its own URL.
+    with pytest.raises(ExposedPortUnavailableError):
+        await resolving
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert fake.public_urls["vm-1"] == []
+    with pytest.raises(ExposedPortUnavailableError) as caught:
+        await session.resolve_exposed_port(8080)
+    assert caught.value.context["detail"] == "session_shutting_down"
