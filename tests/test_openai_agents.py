@@ -2314,3 +2314,27 @@ async def test_a_start_landing_while_urls_are_still_coming_down_is_stopped_again
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert len(fake.calls("POST", "/vm-1/stop")) >= 2
     await sandbox_client.aclose()
+
+
+# --- review round 31 ------------------------------------------------------------
+
+
+async def test_a_command_start_outlasting_the_drain_is_killed_and_stopped_again(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_DRAIN_WAIT", 0.1)
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    fake.start_late_effect = 0.5  # lands after shutdown has stopped the computer
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    await session.shutdown()  # the drain gives up; it stops the computer
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    with pytest.raises(ExecTransportError):
+        await running  # the start lands, waking the computer
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert len(fake.calls("POST", "/vm-1/stop")) >= 2

@@ -67,7 +67,7 @@ import shlex
 import tarfile
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal, NoReturn, TypeVar, cast
 
@@ -367,8 +367,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: over a snapshot, and the computer is never deleted.
         self._workspace_ready = False
 
-    @contextlib.contextmanager
-    def _mutating(self, refuse: Callable[[], Exception]) -> Iterator[None]:
+    @contextlib.asynccontextmanager
+    async def _mutating(self, refuse: Callable[[], Exception]) -> AsyncIterator[None]:
         """Around anything that may change the workspace.
 
         The generation goes up before it starts, and it counts as in flight
@@ -381,7 +381,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         if save is not None and save.session is self:
             yield
             return
-        with self._active(refuse):
+        async with self._active(refuse):
             self._generation += 1
             self._in_flight += 1
             # Saved while this runs, the state must say it is uncertain.
@@ -392,13 +392,15 @@ class MandalaSandboxSession(BaseSandboxSession):
                 self._in_flight -= 1
                 self.state.uncertain = self._contaminated or self._in_flight > 0
 
-    @contextlib.contextmanager
-    def _active(self, refuse: Callable[[], Exception]) -> Iterator[None]:
+    @contextlib.asynccontextmanager
+    async def _active(self, refuse: Callable[[], Exception]) -> AsyncIterator[None]:
         """Around anything that reaches the computer, outside shutdown's own calls.
 
         Refused once shutdown has begun, so nothing new reaches a computer being
         stopped, suspended or deleted (or wakes one); counted while it runs, so
-        shutdown can wait for it first.
+        shutdown can wait for it first. One that outlasted shutdown's wait and
+        finished after shutdown put the computer down may have woken it, so the
+        computer is stopped again, and shutdown's last step does the same.
         """
         if self._shut_down:
             raise refuse()
@@ -407,6 +409,9 @@ class MandalaSandboxSession(BaseSandboxSession):
             yield
         finally:
             self._busy -= 1
+            if self._released in ("stop", "suspend"):
+                self._settled_after_release = True
+                await _shielded(_stop_quietly(self._computer))
 
     @property
     def computer(self) -> AsyncComputer:
@@ -481,7 +486,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             )
 
-        with self._mutating(refuse):
+        async with self._mutating(refuse):
             return await self._exec_command(*command, timeout=timeout)
 
     async def _exec_command(
@@ -583,7 +588,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             return result
         finally:
             if not finished and self._shut_down:
-                # A kill now could wake the computer; shutdown ends it instead.
+                if self._released in ("stop", "suspend"):
+                    # Shutdown already put the computer down and this command
+                    # reached it anyway: kill it; the stop is applied again as
+                    # this leaves.
+                    await _shielded(_kill_quietly(job))
+                # Before shutdown acts, a kill could wake the computer; the
+                # stop or delete ends it instead.
                 self._taint(f"command {job.pid} was left to shutdown to end")
             elif not finished and not await _shielded(_kill_quietly(job)):
                 self._taint(f"command {job.pid} could not be confirmed stopped")
@@ -719,9 +730,8 @@ class MandalaSandboxSession(BaseSandboxSession):
                 retryable=False,
             )
 
-        with self._active(refuse):
-            async with lock:
-                return await self._resolve_port(port)
+        async with self._active(refuse), lock:
+            return await self._resolve_port(port)
 
     async def _settle_resolutions(self) -> None:
         """Wait, bounded, for resolutions in flight, so their URLs are removed too."""
@@ -925,7 +935,7 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         _refuse_user(user, op="read")
-        with self._active(lambda: _closing_read_error(path)):
+        async with self._active(lambda: _closing_read_error(path)):
             return await self._read(path)
 
     async def _read(self, path: Path) -> io.IOBase:
@@ -954,7 +964,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         return sink
 
     async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
-        with self._active(lambda: _closing_read_error(path)):
+        async with self._active(lambda: _closing_read_error(path)):
             return await self._read_prefix(path, max_bytes)
 
     async def _read_prefix(self, path: Path, max_bytes: int) -> bytes:
@@ -981,7 +991,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> None:
         _refuse_user(user, op="write")
-        with self._mutating(lambda: _closing_write_error(path)):
+        async with self._mutating(lambda: _closing_write_error(path)):
             await self._write(path, data)
 
     async def _write(self, path: Path, data: io.IOBase) -> None:
@@ -1136,7 +1146,7 @@ class MandalaSandboxSession(BaseSandboxSession):
         return cast(io.IOBase, restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
-        with self._mutating(lambda: _closing_write_error(self._workspace_root_path())):
+        async with self._mutating(lambda: _closing_write_error(self._workspace_root_path())):
             await self._hydrate(data)
 
     async def _hydrate(self, data: io.IOBase) -> None:
