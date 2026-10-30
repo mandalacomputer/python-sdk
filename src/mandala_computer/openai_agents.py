@@ -195,6 +195,11 @@ _SPOOL_IN_MEMORY = 64 * 1024 * 1024
 #: How much of a file one read request asks for.
 _READ_PART = 8 * 1024 * 1024
 
+#: How often, and how long in the background, a start that failed but may
+#: have been admitted is watched.
+_ADMITTED_POLL = 0.25
+_ADMITTED_WATCH = 300.0
+
 #: How long closing the client waits for its sessions' shutdowns.
 _CLOSE_WAIT = 300.0
 
@@ -1383,12 +1388,43 @@ class MandalaSandboxSession(BaseSandboxSession):
                     self._again,
                     self._reaper,
                     f"the start of {self.computer_id}",
-                    self._again,
+                    self._admitted_maybe,
                     owner=self,
                 )
+            elif start.cancelled() or start.exception() is not None:
+                # The request failed, but the start may have been admitted and
+                # still take effect: follow it until the computer settles.
+                await self._admitted_maybe(start.exception() if not start.cancelled() else None)
 
     async def _again(self, _: object) -> None:
         await self._landed_late()
+
+    async def _admitted_maybe(self, error: BaseException | None) -> None:
+        """After a start that failed: watch for it taking effect anyway, then stop it."""
+        if isinstance(error, MandalaError) and _clean_refusal(error):
+            return  # refused outright: nothing was admitted
+        if await self._watch_admitted(_ANSWER_WAIT):
+            return
+        # Not settled yet: the client's cleanup keeps watching.
+        follow = asyncio.ensure_future(self._watch_admitted(_ADMITTED_WATCH))
+        self._reaper.later(
+            follow, self._again, f"a start admitted on {self.computer_id}", owner=self
+        )
+
+    async def _watch_admitted(self, limit: float) -> bool:
+        """Poll until the computer settles; stop it if a start took effect. True once settled."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit
+        while True:
+            status = await _status_or_none(self._computer)
+            if status == "running":
+                self._settled_after_release = True
+                await _stop_quietly(self._computer)
+            elif status is not None and _settled_down(self._computer):
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(_ADMITTED_POLL)
 
     async def _shut_down_computer(self) -> None:
         mode = self.state.on_shutdown
@@ -1448,11 +1484,11 @@ class MandalaSandboxSession(BaseSandboxSession):
         if outcome in ("stop", "suspend"):
             woken = self._settled_after_release
             if not woken:
-                try:
-                    await self._computer.refresh()
-                    woken = self._computer.status == "running"
-                except MandalaError:
-                    woken = False
+                # Running, or a start admitted on it (memory held while it
+                # reads stopped), is not down.
+                woken = await _status_or_none(self._computer) is not None and not (
+                    _settled_down(self._computer)
+                )
             if woken:
                 await _stop_quietly(self._computer)
                 self._released = "stop"
@@ -1488,9 +1524,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                     return "suspend"
                 except MandalaError as error:
                     status = await _status_or_none(computer)
-                    if status == "suspended":
+                    if status == "suspended" and _settled_down(computer):
                         return "suspend"
-                    if status == "stopped":
+                    if status == "stopped" and _settled_down(computer):
                         return "stop"
                     # Not suspendable now: stopping keeps the disk, which is the
                     # part of the session a resume can always rebuild from.
@@ -1501,7 +1537,9 @@ class MandalaSandboxSession(BaseSandboxSession):
                     )
             # The read only saves a needless stop: unless it confirms the
             # computer is stopped, stop it, whether or not the read worked.
-            if await _status_or_none(computer) != "stopped":
+            # Stopped with memory still held is a start being admitted, not a
+            # stopped computer: it is stopped anyway.
+            if await _status_or_none(computer) != "stopped" or not _settled_down(computer):
                 await computer.stop()
             return "stop"
         except MandalaError as error:
@@ -2105,6 +2143,14 @@ async def _kill_quietly(job: AsyncBackgroundCommand) -> bool:
 def _clean_refusal(error: MandalaError) -> bool:
     """A refusal that did nothing: a 4xx answer, not a lost or failed one."""
     return isinstance(error, APIError) and error.status is not None and error.status < 500
+
+
+def _settled_down(computer: AsyncComputer) -> bool:
+    """Stopped or suspended with nothing admitted: no memory held for a start."""
+    held = computer.raw.get("running_ram_mb")
+    return computer.status in ("stopped", "suspended") and not (
+        isinstance(held, (int, float)) and not isinstance(held, bool) and held > 0
+    )
 
 
 async def _status_or_none(computer: AsyncComputer) -> str | None:

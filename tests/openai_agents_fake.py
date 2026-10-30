@@ -138,6 +138,9 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: Seconds after a failed start request that its admitted start takes effect.
+        self.admitted_start_fails = 0.0
+        self._effects: list[asyncio.Future[None]] = []
         #: The next public URL create is joined by another caller's on its port.
         self.foreign_url = False
         #: Seconds the read after the next stop takes to answer.
@@ -241,16 +244,35 @@ class FakePlatform:
                 # The start takes effect, and answers, only after the delay.
                 await asyncio.sleep(delay)
                 record["status"] = "running"
+                record["running_ram_mb"] = 1024
                 return httpx.Response(200, json={"ok": True})
 
             return later()  # type: ignore[return-value]
         if rest == ["stop"] and request.method == "POST" and self.slow_refresh_after_stop:
             self._slow_get[record["id"]] = self.slow_refresh_after_stop
             self.slow_refresh_after_stop = 0.0
+        if rest == ["start"] and request.method == "POST" and self.admitted_start_fails:
+            # The start is admitted (memory held, still reading stopped) and
+            # takes effect later, but the request itself fails.
+            delay, self.admitted_start_fails = self.admitted_start_fails, 0.0
+            record["running_ram_mb"] = 1024
+            record["admitting"] = True
+
+            async def take_effect() -> None:
+                await asyncio.sleep(delay)
+                record.pop("admitting", None)
+                record["status"] = "running"
+                record["running_ram_mb"] = 1024
+
+            self._effects.append(asyncio.ensure_future(take_effect()))
+            return httpx.Response(500, json={"error": "start failed"})
         if rest in (["start"], ["stop"], ["suspend"]) and request.method == "POST":
             record["status"] = {"start": "running", "stop": "stopped", "suspend": "suspended"}[
                 rest[0]
             ]
+            if not record.get("admitting"):
+                # A start already admitted still holds its memory until it lands.
+                record["running_ram_mb"] = 1024 if rest == ["start"] else 0
             return httpx.Response(200, json={"ok": True})
         if rest[0] == "exec":
             return self._exec(request, rest[1:], record)
@@ -332,6 +354,7 @@ class FakePlatform:
                     # command it wakes a computer that was put down.
                     await asyncio.sleep(late)
                     record["status"] = "running"
+                    record["running_ram_mb"] = 1024
                     return self._start(body)
 
                 return land_late()  # type: ignore[return-value]

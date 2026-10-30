@@ -2454,3 +2454,27 @@ async def test_someone_elses_url_on_the_same_port_is_never_taken_or_removed(
     assert len(owned) == 1 and not owned[0].endswith("-foreign")
     await session.aclose()
     assert [u["label"] for u in fake.public_urls["vm-1"]] == ["someone-else"]
+
+
+# --- review round 35 ------------------------------------------------------------
+
+
+async def test_a_failed_start_that_was_admitted_anyway_is_stopped_when_it_lands(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    assert fake.computers["vm-1"]["running_ram_mb"] == 0
+    payload = client.serialize_session_state(session.state)
+    fake.admitted_start_fails = 0.4  # the request fails; the start lands later
+    with pytest.raises(WorkspaceStartError):
+        await client.resume(client.deserialize_session_state(payload))
+    # The resume watched the admitted start take effect, then stopped it.
+    record = fake.computers["vm-1"]
+    assert "admitting" not in record  # it did land
+    assert record["status"] == "stopped" and record["running_ram_mb"] == 0
+    await asyncio.sleep(0.3)
+    assert fake.computers["vm-1"]["status"] == "stopped"
