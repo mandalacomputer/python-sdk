@@ -11,6 +11,35 @@ This is the summary you read to decide whether to upgrade.
 
 ### Added
 
+- A sandbox client for the OpenAI Agents SDK, `mandala_computer.openai_agents`
+  (`pip install 'mandala-computer[openai-agents]'`, openai-agents 0.24).
+  `MandalaSandboxClient` goes in `SandboxRunConfig(client=...)` and runs each
+  sandbox session on its own computer: commands as `root` in the workspace
+  root, files through the file API, workspace snapshots as a tar of the
+  workspace, exposed ports through public URLs. `MandalaSandboxClientOptions`
+  takes `size` (or `template`, `cpu`, `ram_mb`, `disk_gb`), `name`,
+  `workspace_id`, `ends_in_hours` (24 by default, `None` for none),
+  `on_shutdown` (`"delete"` by default, as with the SDK's other backends,
+  deleting only after the last confirmed save, so files background processes
+  write after it are lost; `"stop"` or `"suspend"` for runs you mean to
+  resume),
+  `exposed_ports`, `public_url_access` and `launch_timeout_s`. A saved run
+  state resumes onto the same computer when it still exists (starting it if
+  stopped or suspended) and onto a new one restored from the snapshot when it
+  does not. The API key stays on the client, never in options or saved state.
+  Snapshots are saved only in a form a restore accepts (hard links as files,
+  absolute in-workspace symlinks made relative); a symlink out of the workspace
+  fails the persist. With a snapshot store configured, the computer is deleted
+  at shutdown only when a confirmed save covers everything the session did,
+  and stopped otherwise. While a computer exists its disk is the truth: a
+  resume onto it never restores a snapshot over the disk, and a snapshot only
+  rebuilds a computer that is gone (a rebuild whose restore fails deletes the
+  new computer and leaves the snapshot untouched). A
+  computer without a `name` is named `agents-<session>`, and a create or a
+  command start abandoned by cancellation is cleaned up once it answers.
+  PTY sessions, users other than `root`, manifest users and groups, mounts and
+  host-path grants are refused with the SDK's `ConfigurationError`. Importing
+  `mandala_computer` does not import the Agents SDK.
 - Computer end times. `computers.create(...)` and `computers.launch(...)` take
   `ends_at=` (an aware `datetime` or an RFC 3339 string with a time zone, 10
   minutes to 366 days ahead) or `ends_in_hours=` (hours from now, fractions

@@ -2427,6 +2427,223 @@ The async computer offers the same methods with `await`. Tokens are omitted
 from `repr(connection)`, but the `token` attribute still contains the secret.
 
 
+### OpenAI Agents SDK sandbox
+
+The [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) runs a
+`SandboxAgent`'s shell, file and patch tools inside a sandbox that a sandbox
+client provides. `mandala_computer.openai_agents` is that client for Mandala:
+each sandbox session is one computer, created when the run needs it and
+released when the run ends. The agent definition stays the same as with the
+SDK's local or Docker clients; only the run config changes.
+
+```sh
+pip install 'mandala-computer[openai-agents]'   # openai-agents 0.24
+```
+
+```python
+import asyncio
+
+from agents import Runner
+from agents.run import RunConfig
+from agents.sandbox import SandboxAgent, SandboxRunConfig
+from agents.sandbox.capabilities import Shell
+
+from mandala_computer.openai_agents import (
+    MandalaSandboxClient,
+    MandalaSandboxClientOptions,
+)
+
+agent = SandboxAgent(
+    name="builder",
+    instructions="Work in the workspace. Run what you write.",
+    capabilities=[Shell()],
+)
+
+
+async def main() -> None:
+    # The Mandala key comes from MANDALA_API_KEY or a saved profile, as for
+    # AsyncClient(); the model key is the Agents SDK's own (OPENAI_API_KEY).
+    async with MandalaSandboxClient() as client:
+        result = await Runner.run(
+            agent,
+            "Write a Python script that prints the first ten primes, and run it.",
+            run_config=RunConfig(
+                sandbox=SandboxRunConfig(
+                    client=client,
+                    options=MandalaSandboxClientOptions(size="small"),
+                ),
+            ),
+        )
+        print(result.final_output)
+
+
+asyncio.run(main())
+```
+
+`MandalaSandboxClient(client)` takes an `AsyncClient` you already have, which
+then stays yours to close; without one it makes its own and closes it on
+`aclose()` or at the end of the `async with`. Closing the client also shuts
+down any session that was never closed, as its `on_shutdown` says, and a
+session whose start is cancelled midway is cleaned up like one whose start
+failed. The key stays on the client.
+The options and the saved session state never carry it, so a run state saved
+for later can be resumed by another process that holds its own key.
+
+`MandalaSandboxClientOptions` decides what computer a session gets. Every field
+is optional, and `options` may be left out of `SandboxRunConfig` altogether:
+
+| Option | Default | |
+| --- | --- | --- |
+| `size` | the template's | a catalogue shape from `client.sizes.list()`; the likeliest to start in about a second. Not with the next four |
+| `template`, `cpu`, `ram_mb`, `disk_gb` | the template's | the same as for `computers.create()` |
+| `name` | `agents-<session>` | the computer's name; without one it is named after the session, so a computer left behind can be traced |
+| `workspace_id` | none | the same as for `computers.create()` |
+| `ends_in_hours` | `24` | a safety end time: the platform stops the computer then, keeping its disk, even if the process that made it is gone. Sent with the create, so even a computer left behind stops on its own; an answer without it fails the session, and an unnamed session's computer is found by name and deleted. `None` for none |
+| `on_shutdown` | `"delete"` | what happens to the computer when the session ends: `"delete"`, `"stop"` or `"suspend"`. The delete waits for a confirmed save (see below); use `"stop"` for a run you mean to resume |
+| `exposed_ports` | none | ports the SDK may expose, served through [public URLs](#public-urls) |
+| `public_url_access` | the plan's | `"public"` or `"private"` for those URLs |
+| `launch_timeout_s` | `300` | how long creating (or restarting) a computer may take to answer |
+
+Unknown fields are refused, as are a `size` combined with explicit numbers, a
+port outside 1 to 65535 or 22, and an end time that is not more than 0 and at
+most 8784 hours.
+
+#### Exposed ports
+
+A port the agent's tools serve becomes reachable through a public URL. Name it
+in `exposed_ports`, then resolve it from the session; the first resolve makes
+the URL (or reuses one the computer already has for that port, changing its
+access to `public_url_access` when that is set and differs), and the endpoint
+is HTTPS on 443:
+
+```python
+from agents.sandbox import Manifest
+
+options = MandalaSandboxClientOptions(exposed_ports=(8000,))
+session = await client.create(manifest=Manifest(), options=options)
+async with session:
+    await session.exec("nohup python3 -m http.server 8000 >/dev/null 2>&1 &")
+    endpoint = await session.resolve_exposed_port(8000)
+    print(endpoint.url_for("http"))  # https://<label>.<base_domain>/
+await client.delete(session)
+```
+
+The server must listen on `0.0.0.0`, not `127.0.0.1`. A private URL needs an
+account API key (`Authorization: Bearer`) or a signed-in browser to open. A
+port that was not in `exposed_ports` is refused by the SDK; a plan without
+public URLs, or one at its limit, raises `ExposedPortUnavailableError` with the
+platform's `code` in its `context`. URLs the session made are removed when it
+shuts down, along with one still being made when shutdown begins; ones that
+already existed are left alone. A session that is shutting down refuses new
+ports. Each URL the session asks for carries a label of its own
+(`agents-<session>-<port>-<random>`), which is how one whose answer was lost
+is told apart from anyone else's on the same port.
+
+#### Shutdown, and resuming
+
+When the runner owns the session it persists the workspace snapshot (if the
+run config has one), shuts the session down, and calls the client's
+`delete()`. Shutting down applies `on_shutdown` once. The default is
+`"delete"`, as with the SDK's other backends: with a snapshot store (the
+runner gives every session one unless told otherwise) the computer is
+deleted only after the last confirmed save, and stopped instead when there
+is none. Files written after that save by background processes you started
+are lost with the computer. Use `on_shutdown="stop"` when you intend to
+resume.
+
+- `"delete"` destroys the computer and its disk. A later resume of the saved
+  run state makes a new computer from the same options and restores the
+  workspace from the snapshot.
+- `"stop"` keeps the disk. A resume starts the same computer again (and sets
+  its end time again), and the workspace is still on it.
+- `"suspend"` keeps the disk and the RAM, so a resume picks up running
+  processes as they were. A computer that cannot be suspended at that moment
+  is stopped instead.
+
+**The disk wins.** While a computer exists, its disk is the truth about the
+workspace, and a snapshot is used only to rebuild a computer that is gone. A
+resume onto the same computer, or a second start of a session after a failed
+health check, never restores a snapshot over the disk, however old the
+snapshot, and applies only the manifest's ephemeral entries again, so files
+the agent edited stay edited. A rebuilt computer is restored from the snapshot; if that restore
+fails, the new computer, which holds nothing yet, is deleted and the error
+raised, and the snapshot is untouched. A computer whose first start never
+finished (its restore failed and it could not be deleted) is not trusted:
+the saved state says so (`initialized`), and a resume onto it restores again.
+A check of whether the computer is
+running that cannot reach the platform raises rather than answering "not
+running".
+
+A kept computer keeps its disk on your plan until it is deleted. A resume
+reattaches a running computer as it is, starts a stopped or suspended one, and
+replaces one that is gone or can never run again. A computer the resume
+started is stopped again if the rest of the resume fails or is cancelled. One
+it cannot read at all (a
+key without access, the platform unreachable) is an error rather than a reason
+to make another. A save that fails while the session is closing still shuts it down (a stop,
+the save being unconfirmed) before its error is raised. A failure to stop or
+delete at shutdown is logged on the
+`mandala_computer.openai_agents` logger with the computer's id rather than
+raised over the run's own outcome; the end time is the backstop for that.
+
+A computer also suspends itself after the host's idle window (30 minutes by
+default). The next command or file transfer resumes it, which takes about a
+second.
+
+#### How it behaves, and what it refuses
+
+- **Commands run as `root`, with no display**, in the workspace root
+  (`Manifest.root`, `/workspace` unless you set another), with the manifest's
+  environment. They are started in the background and their output is read
+  at offsets the client keeps, so a command may run longer than one HTTP
+  request, a read that fails transiently is asked again without losing
+  output, and a timeout or a cancellation (including one while the command is
+  still being started) stops the command rather than leaving it running. Each
+  command costs a start and at least two reads. On a platform without
+  execution ids the older consuming poll is used, and any failed read fails
+  the command rather than risking silently dropped output.
+- **Files** go through the computer's file API, a request at a time up to 64
+  MiB and in chunks past that. Paths are resolved inside the computer before
+  every read and write, so a symlink that points out of the workspace is
+  refused.
+- **Workspace snapshots** are a tar of the workspace root, staged under `/tmp`
+  in the computer and moved through the file API, so any snapshot store the SDK
+  offers works. A snapshot is saved only in a form a restore accepts: a hard
+  link is saved as a file with the same bytes, and a symlink with an absolute
+  target inside the workspace as the equivalent relative one. A symlink that
+  points outside the workspace (a virtualenv's link to the system Python, say)
+  cannot be restored, so persisting fails, naming it. An absolute target
+  with a `..` in it is refused the same way rather than guessed at. With a
+  snapshot store configured, `on_shutdown="delete"` deletes the computer only
+  when the store has confirmed a save covering everything the session did;
+  if that save failed, was cancelled, never ran, or a command or write came
+  after it or was still under way when it captured the workspace, the
+  computer is stopped instead, keeping its disk. The same goes for a session
+  where a command's start or a file write was sent but its answer lost, or a
+  command that had to be stopped could not be confirmed stopped: it may still
+  run or land unseen, so the session's saves are no longer trusted as
+  complete. That is kept in the saved state (`uncertain`) and survives a
+  resume onto the same computer; only a new computer clears it. A workspace archive larger than a restore can upload (2 GiB) is
+  refused rather than saved.
+  Saves in one session run one at a time. A session that never
+  finished starting (a restore that failed, say) never saves over the
+  snapshot and never deletes its computer.
+- **Refused, before anything is created**: manifest users and groups, mount
+  entries, and path grants with a `host_path`. Refused when asked for: a
+  `user` other than `root` on a command or file call, and PTY sessions (the
+  shell tool then runs each command once, without an interactive session).
+  Nothing ever falls back to running on the machine your code runs on.
+- **Errors are the SDK's own**: a failed create or resume is a
+  `WorkspaceStartError`, a command that could not be run or read an
+  `ExecTransportError`, a timeout an `ExecTimeoutError`, a missing file a
+  `WorkspaceReadNotFoundError`. Each keeps the platform's status and `code` in
+  `context` and sets `retryable` from
+  [`is_transient()`](#errors); the platform's own error is
+  the `cause`.
+- **The supported Agents SDK line is 0.24.** The client implements that SDK's
+  provider hooks, some of them underscored, so the extra pins
+  `openai-agents>=0.24.0,<0.25.0` until a newer line has been tested.
+
 ### Events
 
 A computer never tells you anything unless you ask, and the only general way to
