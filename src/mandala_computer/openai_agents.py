@@ -180,6 +180,9 @@ _SAVING: contextvars.ContextVar[_Save | None] = contextvars.ContextVar(
     "mandala_agents_saving", default=None
 )
 
+#: The largest workspace archive a restore can upload to a computer.
+_ARCHIVE_LIMIT = 2 * 1024 * 1024 * 1024
+
 #: Where archives are staged inside the computer on the way in and out.
 _GUEST_TMP = "/tmp"
 
@@ -716,7 +719,16 @@ class MandalaSandboxSession(BaseSandboxSession):
             made = await self._exec_internal("mkdir", "-p", "--", parent)
             if not made.ok():
                 raise ExecNonZeroError(made, command=("mkdir", "-p", "--", parent))
-            await self._put(target, bytes(payload))
+            try:
+                await self._put(target, bytes(payload))
+            except asyncio.CancelledError:
+                self._taint(f"a write of {target} was abandoned after it was sent")
+                raise
+            except MandalaError as error:
+                if not _clean_refusal(error):
+                    # Sent, and the answer lost or failed: it may still land.
+                    self._taint(f"a write of {target} ended uncertainly")
+                raise
         except (MandalaError, ValueError, ExecNonZeroError, ExecTransportError) as error:
             raise WorkspaceArchiveWriteError(
                 path=workspace_path,
@@ -800,6 +812,18 @@ class MandalaSandboxSession(BaseSandboxSession):
                 cause=error,
                 retryable=False,
             ) from error
+        if len(restorable) > _ARCHIVE_LIMIT:
+            # Larger than a restore can upload: saved, it could never be used.
+            raise WorkspaceArchiveReadError(
+                path=error_root,
+                context={
+                    "backend": _BACKEND_ID,
+                    "reason": "archive_too_large",
+                    "size": len(restorable),
+                    "limit": _ARCHIVE_LIMIT,
+                },
+                retryable=False,
+            )
         return io.BytesIO(restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
@@ -1405,13 +1429,13 @@ async def _after(
 
 
 async def _kill_quietly(job: AsyncBackgroundCommand) -> bool:
-    """Stop a command; True only when the platform confirmed it."""
+    """Stop a command; True only when the platform's answer says it has stopped."""
     try:
-        await asyncio.wait_for(job.kill(), _CLEANUP_TIMEOUT)
+        status = await asyncio.wait_for(job.kill(), _CLEANUP_TIMEOUT)
     except Exception:  # noqa: BLE001 - reported to the caller as unconfirmed
         logger.debug("could not stop guest command %s", job.pid)
         return False
-    return True
+    return status.done
 
 
 def _clean_refusal(error: MandalaError) -> bool:

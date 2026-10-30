@@ -1382,3 +1382,76 @@ async def test_a_command_that_could_not_be_stopped_keeps_the_computer(
     await session.shutdown()
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert not fake.calls("DELETE", "/vm-1")
+
+
+# --- review round 10 ------------------------------------------------------------
+
+
+async def test_an_uncertain_write_keeps_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.fail_once[("PUT", "files")] = (504, {"error": "gateway timeout"})
+    with pytest.raises(WorkspaceArchiveWriteError):
+        await session.write(Path("maybe.txt"), io.BytesIO(b"may land later"))
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+
+async def test_a_cleanly_refused_write_does_not(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.fail_once[("PUT", "files")] = (403, {"error": "no"})
+    with pytest.raises(WorkspaceArchiveWriteError):
+        await session.write(Path("refused.txt"), io.BytesIO(b"never"))
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers == {}
+
+
+async def test_an_archive_too_large_to_restore_is_not_saved(
+    fake: FakePlatform,
+    client: MandalaSandboxClient,
+    root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    monkeypatch.setattr(oa, "_ARCHIVE_LIMIT", 4096)
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+    )
+    await session.start()
+    await session.write(Path("big.bin"), io.BytesIO(b"x" * 20000))
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await session.stop()
+    assert caught.value.context["reason"] == "archive_too_large"
+    assert not list(store.iterdir())
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_a_kill_that_does_not_confirm_the_stop_keeps_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    fake.kill_noop.add(1000 + len(fake.jobs))
+    with pytest.raises(ExecTimeoutError):
+        await session.exec("sleep 30", timeout=0.3)
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")

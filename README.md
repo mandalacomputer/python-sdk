@@ -2600,9 +2600,11 @@ second.
   if that save failed, was cancelled, never ran, or a command or write came
   after it or was still under way when it captured the workspace, the
   computer is stopped instead, keeping its disk. The same goes for a session
-  where a command's start was sent but its answer lost, or a command that
-  had to be stopped could not be confirmed stopped: it may be running unseen,
-  so the session's saves are no longer trusted as complete.
+  where a command's start or a file write was sent but its answer lost, or a
+  command that had to be stopped could not be confirmed stopped: it may still
+  run or land unseen, so the session's saves are no longer trusted as
+  complete. A workspace archive larger than a restore can upload (2 GiB) is
+  refused rather than saved.
   Saves in one session run one at a time. A session that never
   finished starting (a restore that failed, say) never saves over the
   snapshot and never deletes its computer.

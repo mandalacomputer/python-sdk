@@ -136,6 +136,8 @@ class FakePlatform:
         self.lose_create = False
         #: Answer creates as a platform that does not know end times.
         self.ignore_end_time = False
+        #: Pids whose kill answers without stopping them.
+        self.kill_noop: set[int] = set()
         #: The next command start runs, and its answer is lost.
         self.lose_start = False
         #: Seconds the next write of a file with this name takes to land.
@@ -282,6 +284,9 @@ class FakePlatform:
         job = self.jobs.get(int(rest[0])) if rest else None
         if job is None:
             return httpx.Response(404, json={"error": "no such process"})
+        if request.method == "DELETE" and job.pid in self.kill_noop:
+            # Answered, but the command is still running.
+            return httpx.Response(200, json={**job.status(), "running": True, "exited": False})
         if request.method == "DELETE":
             if job.proc.poll() is None:
                 job.killed = True
