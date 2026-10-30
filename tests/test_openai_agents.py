@@ -1774,3 +1774,43 @@ async def test_an_abandoned_url_create_whose_late_answer_is_lost_is_swept(
     assert fake.public_urls["vm-1"] == []
     assert session.state.public_url_ids == {}  # type: ignore[attr-defined]
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 17 ------------------------------------------------------------
+
+
+async def test_a_half_restored_computer_that_survived_is_restored_again(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store), options=DELETE
+    )
+    await session.start()
+    await session.write(Path("good.txt"), io.BytesIO(b"the good snapshot"))
+    await session.aclose()  # saved, then deleted
+    saved = {p.name: p.read_bytes() for p in store.iterdir()}
+    payload = client.serialize_session_state(session.state)
+
+    # A replacement whose restore fails, and whose own deletion fails too.
+    resumed = await client.resume(client.deserialize_session_state(dict(payload)))
+    fake.fail_once[("PUT", "files")] = (500, {"error": "boom"})
+    fake.fail[("DELETE", "vm-2")] = (500, {"error": "cannot delete"})
+    with pytest.raises(Exception):  # noqa: B017 - the SDK's start error
+        await resumed.start()
+    fake.fail.clear()
+    assert fake.computers["vm-2"]["status"] == "running"  # it survived
+    (root / "partial.txt").write_bytes(b"half restored")
+    payload = client.serialize_session_state(resumed.state)
+    assert payload["initialized"] is False
+
+    # Retried onto that same computer: restored again, not trusted as it is.
+    again = await client.resume(client.deserialize_session_state(dict(payload)))
+    assert inner(again).computer_id == "vm-2"
+    await again.start()
+    assert (await again.read(Path("good.txt"))).read() == b"the good snapshot"
+    assert not (root / "partial.txt").exists()
+    assert {p.name: p.read_bytes() for p in store.iterdir()} == saved  # untouched so far
+    assert again.state.initialized is True  # type: ignore[attr-defined]
+    await again.aclose()

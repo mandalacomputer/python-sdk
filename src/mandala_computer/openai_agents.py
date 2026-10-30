@@ -295,6 +295,10 @@ class MandalaSandboxSessionState(SandboxSessionState):
     #: resume onto the same computer keeps it, so no save there counts as
     #: complete and shutdown stops rather than deletes; a new computer clears it.
     uncertain: bool = False
+    #: The computer's workspace was set up by a start that succeeded, a restore
+    #: included. Only then is its disk the truth: one that never got there may
+    #: hold a half-restored workspace, so a resume onto it restores again.
+    initialized: bool = False
 
 
 class MandalaSandboxSession(BaseSandboxSession):
@@ -1123,6 +1127,7 @@ class MandalaSandboxSession(BaseSandboxSession):
     async def _after_start(self) -> None:
         await super()._after_start()
         self._workspace_ready = True
+        self.state.initialized = True
         # Disk wins here too: a later start of this session (after an idle
         # suspend, say) treats the workspace as kept, so only ephemeral
         # manifest entries are applied again and edited files are left alone.
@@ -1344,7 +1349,10 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 retryable=False,
             )
 
-        preserved = computer is not None
+        # Disk wins only for a disk a start finished setting up.
+        preserved = computer is not None and state.initialized
+        if computer is not None and not state.initialized:
+            state.workspace_root_ready = False
         if computer is not None:
             was_running = computer.status == "running"
             try:
@@ -1365,6 +1373,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             state.workspace_root_ready = False
             state.public_url_ids = {}
             state.uncertain = False  # a new computer: nothing unseen on it
+            state.initialized = False
             computer = await self._make_computer(state)
 
         inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)
