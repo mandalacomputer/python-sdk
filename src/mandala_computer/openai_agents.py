@@ -56,6 +56,7 @@ What a session supports, and what it refuses rather than approximating:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import io
 import logging
@@ -163,6 +164,12 @@ _CLEANUP_TIMEOUT = 30.0
 #: cleanup takes it over.
 _ANSWER_WAIT = 30.0
 
+#: The session whose save is running in this context: its own commands do not
+#: count as changes to the workspace it is saving.
+_SAVING: contextvars.ContextVar[object] = contextvars.ContextVar(
+    "mandala_agents_saving", default=None
+)
+
 #: Where archives are staged inside the computer on the way in and out.
 _GUEST_TMP = "/tmp"
 
@@ -181,9 +188,9 @@ class MandalaSandboxClientOptions(BaseSandboxClientOptions):
     ``ends_in_hours`` is a safety end time: at that moment the platform stops
     the computer, keeping its disk, whatever happened to the process that made
     it. It is 24 hours unless you set another (``None`` for none), and a resume
-    that starts the computer again sets it again from then. A platform that
-    cannot keep end times fails the session before any work, and the computer
-    it made is deleted.
+    that starts the computer again sets it again from then. It is sent with
+    the create; an answer that does not confirm it fails the session before
+    any work.
 
     ``on_shutdown`` is what happens to the computer when the session shuts
     down: ``"delete"`` (the default) destroys it and its disk; ``"stop"`` keeps
@@ -287,15 +294,14 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: copy of the workspace whenever the two differ.
         self._generation = 0
         self._saved_generation: int | None = None
-        self._persisting = False
         #: As saved: whether this computer's disk was already newer than the
         #: snapshot. Read once, since starting the session runs commands too.
         self._resumed_unsaved = state.workspace_unsaved
 
     def _touch(self) -> None:
         """Note that the workspace may be about to change."""
-        if self._persisting:
-            return  # the save's own commands
+        if _SAVING.get() is self:
+            return  # the save's own commands, and only those
         self._generation += 1
         if not isinstance(self.state.snapshot, NoopSnapshot):
             self.state.workspace_unsaved = True
@@ -794,11 +800,13 @@ class MandalaSandboxSession(BaseSandboxSession):
         started_at = self._generation
         if not isinstance(self.state.snapshot, NoopSnapshot):
             self.state.workspace_unsaved = True
-        self._persisting = True
+        # Scoped to this call and what it awaits: a write from another task
+        # while the save is uploading still counts as a change.
+        token = _SAVING.set(self)
         try:
             await super()._persist_snapshot()
         finally:
-            self._persisting = False
+            _SAVING.reset(token)
         # Saved as of when the save began; anything since is not in it.
         self._saved_generation = started_at
         self.state.workspace_unsaved = self._generation != started_at
@@ -1073,46 +1081,93 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
     async def _create(self, state: MandalaSandboxSessionState) -> AsyncComputer:
         """The create request, cancellable without leaving a computer behind.
 
-        The request runs as its own task. A caller cancelled while it is in
-        flight waits, shielded, for its answer and deletes the computer it made,
-        or leaves that to the client's cleanup if the answer is slow. A create
+        The end time travels in the create itself, so even a computer that is
+        somehow left behind stops on its own.
+
+        The request, and its recovery, run as one task of their own. A create
         whose outcome is unknown (a dropped connection, a timeout, a 5xx) is
         sent once more under the same idempotency key, which answers with the
-        first attempt's computer rather than making a second.
+        first attempt's computer rather than making a second. A caller
+        cancelled meanwhile waits, shielded, for that task and deletes the
+        computer it comes back with, or leaves that to the client's cleanup if
+        the answer is slow. A create whose outcome is still unknown after that
+        is logged with its name and key.
+
+        An answer that does not confirm the end time is raised by the SDK with
+        no handle on the computer. The session's own name finds it, so it is
+        deleted; a computer you named is reported rather than looked up, since
+        another computer may share that name.
 
         Without a name of its own the computer is named after the session, so
         one that does leak can be told apart.
         """
+        generated = state.name is None
         name = state.name if state.name is not None else f"agents-{state.session_id.hex[:12]}"
+        key = uuid.uuid4().hex
+        abandoned = False
 
-        def send(key: str | None) -> asyncio.Future[AsyncComputer]:
-            return asyncio.ensure_future(
-                self._client.computers.create(
-                    name=name,
-                    size=state.size,
-                    template=state.template,
-                    cpu=state.cpu,
-                    ram_mb=state.ram_mb,
-                    disk_gb=state.disk_gb,
-                    workspace_id=state.workspace_id,
-                    idempotency_key=key,
-                )
+        async def send() -> AsyncComputer:
+            return await self._client.computers.create(
+                name=name,
+                size=state.size,
+                template=state.template,
+                cpu=state.cpu,
+                ram_mb=state.ram_mb,
+                disk_gb=state.disk_gb,
+                workspace_id=state.workspace_id,
+                ends_in_hours=state.ends_in_hours,
+                idempotency_key=key,
             )
 
-        attempt = send(None)
-        try:
+        async def attempt() -> AsyncComputer:
             try:
-                return await asyncio.shield(attempt)
+                try:
+                    return await send()
+                except MandalaError as error:
+                    if error.idempotency_key is None:
+                        raise
+                    return await send()  # the same key: the same create
             except MandalaError as error:
-                if error.idempotency_key is None:
-                    raise
-                attempt = send(error.idempotency_key)
-                return await asyncio.shield(attempt)
+                if error.idempotency_key is not None:
+                    if abandoned:
+                        logger.warning(
+                            "a create of computer %r (idempotency key %s) was abandoned "
+                            "with its outcome unknown; it may exist",
+                            name,
+                            key,
+                        )
+                elif not isinstance(error, APIError):
+                    # Answered, then refused here: the computer exists.
+                    await self._remove_unconfirmed(name, generated)
+                raise
+
+        task = asyncio.ensure_future(attempt())
+        try:
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
-            await _shielded(_after(attempt, _delete_quietly, self._reaper, "a computer create"))
+            abandoned = True
+            await _shielded(_after(task, _delete_quietly, self._reaper, f"the create of {name!r}"))
             raise
         except (MandalaError, ValueError) as error:
             _raise_start_error(state, error, "create")
+
+    async def _remove_unconfirmed(self, name: str, generated: bool) -> None:
+        """Delete a computer whose create answer was refused, found by its name."""
+        if not generated:
+            logger.warning(
+                "computer %r was created but its answer was refused; it was not deleted, "
+                "since another computer may share that name",
+                name,
+            )
+            return
+        try:
+            found = [c for c in await self._client.computers.list() if c.name == name]
+            for computer in found:
+                await _delete_quietly(computer)
+        except MandalaError as error:
+            logger.warning(
+                "could not find computer %r to delete it (%s)", name, type(error).__name__
+            )
 
     async def _make_computer(self, state: MandalaSandboxSessionState) -> AsyncComputer:
         """Create a computer from ``state``'s inputs and wait for its guest.
@@ -1121,25 +1176,17 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         the error is raised, cancellation included, so a failed create leaves
         nothing behind.
 
-        The end time is set by its own call once the computer exists, rather
-        than sent with the create: a create whose answer does not confirm one
-        raises with only the new computer's id in its message, and this needs
-        the handle to delete it. A platform that cannot keep end times fails
-        the session here, before any work, rather than running without one.
+        A platform that cannot keep end times fails the session here, before
+        any work, rather than running without one.
         """
         computer = await self._create(state)
         state.computer_id = computer.id
-        stage = "start"
         try:
-            if state.ends_in_hours is not None:
-                stage = "set the end time of"
-                await computer.set_end_time(ends_in_hours=state.ends_in_hours)
-                stage = "start"
             await _bring_up(computer, state.launch_timeout_s)
         except BaseException as error:
             await _shielded(_delete_quietly(computer))
             if isinstance(error, MandalaError):
-                _raise_start_error(state, error, stage)
+                _raise_start_error(state, error, "start")
             raise
         return computer
 

@@ -2495,7 +2495,7 @@ is optional, and `options` may be left out of `SandboxRunConfig` altogether:
 | `template`, `cpu`, `ram_mb`, `disk_gb` | the template's | the same as for `computers.create()` |
 | `name` | `agents-<session>` | the computer's name; without one it is named after the session, so a computer left behind can be traced |
 | `workspace_id` | none | the same as for `computers.create()` |
-| `ends_in_hours` | `24` | a safety end time: the platform stops the computer then, keeping its disk, even if the process that made it is gone. Set right after the computer is made; a platform that cannot keep end times fails the session there, and the computer is deleted. `None` for none |
+| `ends_in_hours` | `24` | a safety end time: the platform stops the computer then, keeping its disk, even if the process that made it is gone. Sent with the create, so even a computer left behind stops on its own; an answer without it fails the session, and an unnamed session's computer is found by name and deleted. `None` for none |
 | `on_shutdown` | `"delete"` | what happens to the computer when the session ends: `"delete"`, `"stop"` or `"suspend"` |
 | `exposed_ports` | none | ports the SDK may expose, served through [public URLs](#public-urls) |
 | `public_url_access` | the plan's | `"public"` or `"private"` for those URLs |

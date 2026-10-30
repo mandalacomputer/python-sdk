@@ -130,6 +130,12 @@ class FakePlatform:
         self.create_status = "running"
         #: Answer like a platform without execution ids: cursor polls only.
         self.legacy_exec = False
+        #: Idempotency keys already answered, to the computer each made.
+        self.keys: dict[str, str] = {}
+        #: The next create makes its computer and then loses its answer.
+        self.lose_create = False
+        #: Answer creates as a platform that does not know end times.
+        self.ignore_end_time = False
         #: Seconds a create takes to answer (the computer exists meanwhile).
         self.create_delay = 0.0
         #: Seconds a background start takes to answer.
@@ -166,8 +172,19 @@ class FakePlatform:
         failure = self.fail_once.pop(key, None) or self.fail.get(key)
         if failure is not None:
             return httpx.Response(failure[0], json=failure[1])
+        if parts == ["computers"] and request.method == "GET":
+            return httpx.Response(200, json=list(self.computers.values()))
         if parts == ["computers"] and request.method == "POST":
+            key = request.headers.get("idempotency-key", "")
+            replay = self.computers.get(self.keys.get(key, ""))
+            if replay is not None:
+                return httpx.Response(200, json=replay, headers={"idempotent-replayed": "true"})
             made = self._create(json.loads(request.content))
+            self.keys[key] = made.json()["id"]
+            if self.lose_create:
+                # Made, and the answer lost on the way back.
+                self.lose_create = False
+                made = httpx.Response(502, json={"error": "bad gateway"})
             if self.create_delay:
                 delay = self.create_delay
 
@@ -214,7 +231,7 @@ class FakePlatform:
             "created_at": "2026-10-29T00:00:00Z",
             "sent": body,
         }
-        if body.get("ends_in_hours") is not None:
+        if body.get("ends_in_hours") is not None and not self.ignore_end_time:
             record["ends_at"] = _hours_ahead(body["ends_in_hours"])
         self.computers[computer_id] = record
         return httpx.Response(201, json=record)

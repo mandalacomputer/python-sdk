@@ -16,6 +16,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any, Literal
 
 import pytest
 from agents import RunConfig, Runner
@@ -36,7 +37,7 @@ from agents.sandbox.errors import (
     WorkspaceStartError,
 )
 from agents.sandbox.session import BaseSandboxClientOptions, SandboxSessionState
-from agents.sandbox.snapshot import LocalSnapshotSpec
+from agents.sandbox.snapshot import LocalSnapshot, LocalSnapshotSpec
 from agents.testing import ScriptedModel, assistant_message, function_call
 from tests.openai_agents_fake import FakePlatform
 
@@ -125,9 +126,14 @@ async def test_create_sends_the_options_and_waits_for_the_guest(
         manifest=manifest(root),
         options=MandalaSandboxClientOptions(size="small", name="agent", ends_in_hours=2),
     )
-    assert sent_create(fake) == {"name": "agent", "size": "small", "start": True}
-    # The end time is set on the computer once it exists.
-    assert json.loads(fake.calls("PATCH", "/vm-1")[0].content) == {"ends_in_hours": 2}
+    # The end time travels in the create itself.
+    assert sent_create(fake) == {
+        "name": "agent",
+        "size": "small",
+        "start": True,
+        "ends_in_hours": 2,
+    }
+    assert not fake.calls("PATCH")
     # The readiness probe ran before create returned.
     probe = json.loads(fake.calls("POST", "/exec")[0].content)
     assert probe["command"] == "exit 0" and "background" not in probe
@@ -142,8 +148,7 @@ async def test_create_without_options_uses_the_defaults(
     body = sent_create(fake)
     # Unnamed, the computer is named after the session, so a leak is traceable.
     assert str(body.pop("name")).startswith("agents-")
-    assert body == {"start": True}
-    assert json.loads(fake.calls("PATCH", "/vm-1")[0].content) == {"ends_in_hours": 24.0}
+    assert body == {"start": True, "ends_in_hours": 24.0}
 
 
 async def test_no_end_time_when_none_is_asked_for(
@@ -152,21 +157,32 @@ async def test_no_end_time_when_none_is_asked_for(
     await client.create(
         manifest=manifest(root), options=MandalaSandboxClientOptions(ends_in_hours=None)
     )
-    assert not fake.calls("PATCH")
+    assert "ends_in_hours" not in sent_create(fake)
 
 
 async def test_a_platform_without_end_times_fails_the_create_and_cleans_up(
     fake: FakePlatform, client: MandalaSandboxClient, root: Path
 ) -> None:
-    fake.fail[("PATCH", "vm-1")] = (
-        409,
-        {"error": "this host cannot keep end times", "reason": "unsupported"},
-    )
+    # The answer comes back without the end time asked for: the SDK refuses
+    # it, and the computer it made is found by the session's name and deleted.
+    fake.ignore_end_time = True
     with pytest.raises(WorkspaceStartError) as caught:
         await client.create(manifest=manifest(root))
-    assert caught.value.context["stage"] == "set the end time of"
-    assert caught.value.retryable is False
+    assert caught.value.context["stage"] == "create"
     assert fake.computers == {}
+    assert fake.calls("DELETE", "/vm-1")
+
+
+async def test_a_refused_answer_for_a_named_computer_is_reported_not_deleted(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.ignore_end_time = True
+    with pytest.raises(WorkspaceStartError):
+        await client.create(
+            manifest=manifest(root), options=MandalaSandboxClientOptions(name="mine")
+        )
+    assert "mine" in caplog.text
+    assert list(fake.computers) == ["vm-1"]
 
 
 async def test_a_computer_that_does_not_come_up_is_deleted(
@@ -588,9 +604,10 @@ async def test_resume_starts_a_stopped_computer_and_renews_its_end_time(
     await resumed.start()
     assert fake.computers["vm-1"]["status"] == "running"
     assert len(fake.calls("POST", "/vm-1/start")) == 1
-    # Once at create, once more when the resume started it again.
+    # Sent with the create, and set again when the resume started it.
+    assert sent_create(fake)["ends_in_hours"] == 3
     patches = [json.loads(r.content) for r in fake.calls("PATCH", "/vm-1")]
-    assert patches == [{"ends_in_hours": 3}, {"ends_in_hours": 3}]
+    assert patches == [{"ends_in_hours": 3}]
     assert (await resumed.read(Path("kept.txt"))).read() == b"on disk"
     await resumed.aclose()
 
@@ -708,7 +725,7 @@ async def test_a_runner_drives_the_session_end_to_end(
     assert any("mandala works" in str(output) for output in outputs), outputs
     body = sent_create(fake)
     assert str(body.pop("name")).startswith("agents-")
-    assert body == {"size": "small", "start": True}
+    assert body == {"size": "small", "start": True, "ends_in_hours": 24.0}
     # The runner owned the session, so the computer is gone with it.
     assert fake.computers == {}
 
@@ -1124,3 +1141,69 @@ async def test_a_start_answering_after_the_cleanup_wait_is_still_stopped(
     assert job.killed
     fake.start_delay = 0.0
     await session.aclose()
+
+
+# --- review round 5 -------------------------------------------------------------
+
+#: Held by PausedSnapshot.persist until released, so a test can act mid-upload.
+_UPLOAD_REACHED = asyncio.Event()
+_UPLOAD_RELEASE = asyncio.Event()
+
+
+class PausedSnapshot(LocalSnapshot):
+    """A local snapshot store whose save waits partway through its upload."""
+
+    type: Literal["paused_local"] = "paused_local"  # type: ignore[assignment]
+
+    async def persist(self, data: io.IOBase, *, dependencies: Any = None) -> None:
+        _UPLOAD_REACHED.set()
+        await _UPLOAD_RELEASE.wait()
+        await super().persist(data, dependencies=dependencies)
+
+
+async def test_a_write_during_a_save_still_counts_as_a_change(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    # Made here, on this test's loop.
+    global _UPLOAD_REACHED, _UPLOAD_RELEASE
+    _UPLOAD_REACHED, _UPLOAD_RELEASE = asyncio.Event(), asyncio.Event()
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=PausedSnapshot(id="paused", base_path=tmp_path),
+    )
+    await session.start()
+    await session.write(Path("notes.txt"), io.BytesIO(b"in the snapshot"))
+    saving = asyncio.ensure_future(session.stop())
+    await asyncio.wait_for(_UPLOAD_REACHED.wait(), 10)
+    # Another task writes while the save is uploading the older archive.
+    await session.write(Path("notes.txt"), io.BytesIO(b"written during the save"))
+    _UPLOAD_RELEASE.set()
+    await saving
+    assert session.state.workspace_unsaved is True  # type: ignore[attr-defined]
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+    payload = client.serialize_session_state(session.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.start()
+    assert (await resumed.read(Path("notes.txt"))).read() == b"written during the save"
+    await resumed.aclose()
+
+
+async def test_a_cancelled_create_whose_answer_was_lost_is_recovered_and_deleted(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.create_delay = 0.3
+    fake.lose_create = True
+    task = asyncio.ensure_future(client.create(manifest=manifest(root)))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    first, second = fake.calls("POST", "/computers")
+    # Sent again under the same key, which answered with the first computer...
+    assert first.headers["idempotency-key"] == second.headers["idempotency-key"]
+    # ...and that computer was deleted.
+    assert fake.computers == {}
+    assert len(fake.calls("DELETE", "/vm-1")) == 1
