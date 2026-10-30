@@ -138,6 +138,9 @@ class FakePlatform:
         self.ignore_end_time = False
         #: Seconds the next public URL create takes before it is made and answers.
         self.url_delay = 0.0
+        #: With lose_create: seconds a resend of its key answers "in progress".
+        self.create_in_progress_for = 0.0
+        self._key_ready_at: dict[str, float] = {}
         #: Seconds the next public URL listing, and the next computer update, take.
         self.list_delay = 0.0
         self.patch_delay = 0.0
@@ -224,6 +227,13 @@ class FakePlatform:
         if parts == ["computers"] and request.method == "POST":
             key = request.headers.get("idempotency-key", "")
             replay = self.computers.get(self.keys.get(key, ""))
+            ready_at = self._key_ready_at.get(key)
+            busy = ready_at is not None and asyncio.get_running_loop().time() < ready_at
+            if replay is not None and busy:
+                return httpx.Response(
+                    409,
+                    json={"error": "still being carried out", "code": "idempotency_in_progress"},
+                )
             if replay is not None:
                 return httpx.Response(200, json=replay, headers={"idempotent-replayed": "true"})
             made = self._create(json.loads(request.content))
@@ -231,6 +241,10 @@ class FakePlatform:
             if self.lose_create:
                 # Made, and the answer lost on the way back.
                 self.lose_create = False
+                if self.create_in_progress_for:
+                    loop = asyncio.get_running_loop()
+                    self._key_ready_at[key] = loop.time() + self.create_in_progress_for
+                    self.create_in_progress_for = 0.0
                 made = httpx.Response(502, json={"error": "bad gateway"})
             if self.create_delay:
                 delay = self.create_delay

@@ -201,6 +201,10 @@ _READ_PART = 8 * 1024 * 1024
 _ADMITTED_POLL = 0.25
 _ADMITTED_WATCH = 300.0
 
+#: How long a create whose outcome is unknown is asked about again, under its
+#: idempotency key, while the platform says it is still being carried out.
+_CREATE_SETTLE = 300.0
+
 #: How long closing the client waits for its sessions' shutdowns.
 _CLOSE_WAIT = 300.0
 
@@ -376,9 +380,6 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._contaminated = state.uncertain
         #: One resolution per port at a time, so a port gets one URL.
         self._port_locks: dict[int, asyncio.Lock] = {}
-        #: Ports with a URL create abandoned and not yet answered.
-        #: Labels this session gave the public URLs it asked for, by port: how
-        #: a URL whose create answer was lost is known to be this session's.
         #: Which recorded label each known URL carries.
         self._label_of: dict[str, str] = {}
         #: Set once start() has fully succeeded, a restore included. Until then
@@ -1939,7 +1940,6 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         generated = state.name is None
         name = state.name if state.name is not None else f"agents-{state.session_id.hex[:12]}"
         key = uuid.uuid4().hex
-        abandoned = False
 
         async def send() -> AsyncComputer:
             return await self._client.computers.create(
@@ -1955,22 +1955,42 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             )
 
         async def attempt() -> AsyncComputer:
+            loop = asyncio.get_running_loop()
+            started = loop.time()
             try:
                 try:
                     return await send()
                 except MandalaError as error:
                     if error.idempotency_key is None:
                         raise
-                    return await send()  # the same key: the same create
+                # The outcome is unknown: the same key answers with the first
+                # attempt's computer, once its create has finished.
+                delay = 0.25
+                while True:
+                    try:
+                        return await send()
+                    except APIError as error:
+                        if error.code != "idempotency_in_progress":
+                            raise
+                        if loop.time() - started > _CREATE_SETTLE:
+                            raise
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 5.0)
             except MandalaError as error:
-                if error.idempotency_key is not None:
-                    if abandoned:
+                unresolved = error.idempotency_key is not None or (
+                    isinstance(error, APIError) and error.code == "idempotency_in_progress"
+                )
+                if unresolved:
+                    # Never learned whether it was made: look for it by the
+                    # session's name, which only it carries.
+                    if not generated:
                         logger.warning(
-                            "a create of computer %r (idempotency key %s) was abandoned "
-                            "with its outcome unknown; it may exist",
+                            "a create of computer %r (idempotency key %s) ended with its "
+                            "outcome unknown; it may exist",
                             name,
                             key,
                         )
+                    await self._remove_unconfirmed(name, generated)
                 elif not isinstance(error, APIError):
                     # Answered, then refused here: the computer exists.
                     await self._remove_unconfirmed(name, generated)
@@ -1980,7 +2000,6 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         try:
             return await asyncio.wait_for(asyncio.shield(task), _left(deadline))
         except (asyncio.CancelledError, asyncio.TimeoutError, _LaunchTimeout) as error:
-            abandoned = True
             # The create may still land: wait for it, and delete what it made.
             await _shielded(_after(task, _delete_quietly, self._reaper, f"the create of {name!r}"))
             if isinstance(error, asyncio.CancelledError):

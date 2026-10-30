@@ -2704,3 +2704,25 @@ async def test_an_end_time_renewal_past_the_budget_times_out_and_rolls_back(
         await client.resume(client.deserialize_session_state(payload))
     assert caught.value.context["reason"] == "timeout"
     assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+# --- review round 42 ------------------------------------------------------------
+
+
+async def test_a_create_still_in_progress_past_the_budget_is_deleted_at_client_close(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)  # the caller does not wait it out
+    sandbox_client = MandalaSandboxClient(fake.client())
+    fake.lose_create = True  # the first answer is lost...
+    fake.create_in_progress_for = 0.8  # ...and the resend says "in progress" for a while
+    with pytest.raises(WorkspaceStartError) as caught:
+        await sandbox_client.create(
+            manifest=manifest(root), options=MandalaSandboxClientOptions(launch_timeout_s=0.3)
+        )
+    assert caught.value.context["reason"] == "timeout"
+    assert "vm-1" in fake.computers  # it exists, and nothing has it yet
+    await sandbox_client.aclose()  # the background create finishes, and deletes it
+    assert fake.computers == {}
+    statuses = [r for r in fake.calls("POST", "/computers")]
+    assert len({r.headers["idempotency-key"] for r in statuses}) == 1
