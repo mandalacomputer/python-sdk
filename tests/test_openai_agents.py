@@ -1557,3 +1557,70 @@ async def test_a_failed_save_at_close_still_shuts_down(
     stops = len(fake.calls("POST", "/vm-1/stop"))
     await session.shutdown()
     assert len(fake.calls("POST", "/vm-1/stop")) == stops
+
+
+# --- review round 13 ------------------------------------------------------------
+
+
+async def test_an_uncertain_session_stays_uncertain_across_a_resume(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=LocalSnapshotSpec(base_path=tmp_path),
+        options=MandalaSandboxClientOptions(on_shutdown="stop"),
+    )
+    await session.start()
+    fake.lose_start = True
+    with pytest.raises(ExecTransportError):
+        await session.exec("sleep 0.1")
+    payload = client.serialize_session_state(session.state)
+    assert payload["uncertain"] is True
+    await session.aclose()
+
+    # Back onto the same computer: still uncertain, so it is not deleted.
+    resumed = await client.resume(client.deserialize_session_state(dict(payload)))
+    await resumed.start()
+    await resumed.stop()
+    resumed.state.on_shutdown = "delete"  # type: ignore[attr-defined]
+    await resumed.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+    # A replacement computer starts clean.
+    del fake.computers["vm-1"]
+    replaced = await client.resume(client.deserialize_session_state(dict(payload)))
+    assert replaced.state.uncertain is False  # type: ignore[attr-defined]
+    await replaced.start()
+    await replaced.aclose()
+
+
+async def test_a_change_in_flight_when_state_is_saved_is_uncertain(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    fake.put_delay["slow.txt"] = 0.5
+    writing = asyncio.ensure_future(session.write(Path("slow.txt"), io.BytesIO(b"x")))
+    while not fake.calls("PUT", "/files"):
+        await asyncio.sleep(0.01)
+    assert client.serialize_session_state(session.state)["uncertain"] is True
+    await writing
+    assert client.serialize_session_state(session.state)["uncertain"] is False
+    await session.aclose()
+
+
+async def test_overlapping_resolutions_of_a_port_make_one_url(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), on_shutdown="stop"),
+    )
+    first, second = await asyncio.gather(
+        session.resolve_exposed_port(8080), session.resolve_exposed_port(8080)
+    )
+    assert first.host == second.host
+    assert len(fake.calls("POST", "/public-urls")) == 1
+    await session.aclose()
+    assert fake.public_urls["vm-1"] == []

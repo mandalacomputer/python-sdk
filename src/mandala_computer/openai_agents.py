@@ -282,7 +282,13 @@ class MandalaSandboxSessionState(SandboxSessionState):
     launch_timeout_s: float = 300.0
     #: Public URLs this session created, by port. Ones that already existed are
     #: reused and never removed.
-    public_url_ids: dict[int, str] = Field(default_factory=dict)
+    public_url_ids: dict[int, list[str]] = Field(default_factory=dict)
+    #: Something on this computer may have changed, or may still be running,
+    #: that the session could not see: a lost command start or write, a stop
+    #: that was not confirmed, or a change in flight when this was saved. A
+    #: resume onto the same computer keeps it, so no save there counts as
+    #: complete and shutdown stops rather than deletes; a new computer clears it.
+    uncertain: bool = False
 
 
 class MandalaSandboxSession(BaseSandboxSession):
@@ -318,7 +324,9 @@ class MandalaSandboxSession(BaseSandboxSession):
         #: A command start whose answer was lost: something may be running that
         #: this session cannot see or stop, so no later save is trusted as
         #: complete, and shutdown stops the computer rather than deleting it.
-        self._contaminated = False
+        self._contaminated = state.uncertain
+        #: One resolution per port at a time, so a port gets one URL.
+        self._port_locks: dict[int, asyncio.Lock] = {}
         #: Set once start() has fully succeeded, a restore included. Until then
         #: the workspace may be empty or half restored, so it is never saved
         #: over a snapshot, and the computer is never deleted.
@@ -338,10 +346,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         self._generation += 1
         self._in_flight += 1
+        # Saved while this runs, the state must say it is uncertain.
+        self.state.uncertain = True
         try:
             yield
         finally:
             self._in_flight -= 1
+            self.state.uncertain = self._contaminated or self._in_flight > 0
 
     @property
     def computer(self) -> AsyncComputer:
@@ -476,6 +487,7 @@ class MandalaSandboxSession(BaseSandboxSession):
     def _taint(self, why: str) -> None:
         """A command may be running unseen: no later save counts as complete."""
         self._contaminated = True
+        self.state.uncertain = True
         logger.warning(
             "%s on computer %s; it may still be running, so this session's saves are "
             "no longer trusted as complete and shutdown will keep the computer",
@@ -623,6 +635,11 @@ class MandalaSandboxSession(BaseSandboxSession):
             await clock.pause()
 
     async def _resolve_exposed_port(self, port: int) -> ExposedPortEndpoint:
+        lock = self._port_locks.setdefault(port, asyncio.Lock())
+        async with lock:
+            return await self._resolve_port(port)
+
+    async def _resolve_port(self, port: int) -> ExposedPortEndpoint:
         try:
             listing = await self._computer.public_urls()
             if not listing.enabled:
@@ -652,7 +669,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                         # It may have been made: find it, so shutdown removes it.
                         await _shielded(self._adopt_new_url(port, before))
                     raise
-                self.state.public_url_ids[port] = served.id
+                self.state.public_url_ids.setdefault(port, []).append(served.id)
             elif wanted is not None and served.access != wanted:
                 # Reused, it must still be as open as asked and no more.
                 served = await self._computer.update_public_url(served.id, access=wanted)
@@ -692,7 +709,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             return
         for url in listing.public_urls:
             if url.port == port and url.id not in before:
-                self.state.public_url_ids[port] = url.id
+                self.state.public_url_ids.setdefault(port, []).append(url.id)
 
     # --- files ------------------------------------------------------------
 
@@ -1066,20 +1083,25 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
 
     async def _remove_public_urls(self) -> None:
-        for port, url_id in list(self.state.public_url_ids.items()):
-            try:
-                await self._computer.delete_public_url(url_id)
-            except NotFoundError:
-                pass
-            except MandalaError as error:
-                logger.warning(
-                    "could not remove the public URL for port %s on %s (%s)",
-                    port,
-                    self.state.computer_id,
-                    type(error).__name__,
-                )
-                continue
-            del self.state.public_url_ids[port]
+        for port, url_ids in list(self.state.public_url_ids.items()):
+            kept = []
+            for url_id in url_ids:
+                try:
+                    await self._computer.delete_public_url(url_id)
+                except NotFoundError:
+                    pass
+                except MandalaError as error:
+                    logger.warning(
+                        "could not remove the public URL for port %s on %s (%s)",
+                        port,
+                        self.state.computer_id,
+                        type(error).__name__,
+                    )
+                    kept.append(url_id)
+            if kept:
+                self.state.public_url_ids[port] = kept
+            else:
+                del self.state.public_url_ids[port]
 
 
 class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
@@ -1223,6 +1245,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             state.computer_id = ""
             state.workspace_root_ready = False
             state.public_url_ids = {}
+            state.uncertain = False  # a new computer: nothing unseen on it
             computer = await self._make_computer(state)
 
         inner = MandalaSandboxSession(state=state, computer=computer, reaper=self._reaper)
