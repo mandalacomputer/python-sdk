@@ -1391,25 +1391,29 @@ class MandalaSandboxSession(BaseSandboxSession):
             mode = "stop"
         # The computer first, so that is done whatever happens to the rest; a
         # stopped computer serves nothing, so its URLs can come down after.
-        gone = await self._act(mode)
-        self._released = "delete" if gone else mode
-        if not gone:
+        outcome = await self._act(mode)
+        # What actually happened, so late work knows whether to stop it again.
+        self._released = outcome
+        if outcome != "delete":
             await self._settle_resolutions()
             await self._remove_public_urls()
             if self._settled_after_release:
                 # Background work landed after the stop: make sure once more.
                 await _stop_quietly(self._computer)
 
-    async def _act(self, mode: ShutdownMode) -> bool:
-        """Delete, suspend or stop the computer; True when it is gone."""
+    async def _act(self, mode: ShutdownMode) -> str | None:
+        """Delete, suspend or stop the computer, and say which it ended up being.
+
+        ``"delete"``, ``"suspend"`` or ``"stop"``, or ``None`` when nothing took.
+        """
         computer = self._computer
         try:
             if mode == "delete":
                 try:
                     await computer.delete()
-                    return True
+                    return "delete"
                 except NotFoundError:
-                    return True
+                    return "delete"
                 except MandalaError as error:
                     # Not deleted: it and its URLs are still up. Stop it, and
                     # its URLs come down after.
@@ -1423,11 +1427,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             if mode == "suspend":
                 try:
                     await computer.suspend()
-                    return False
+                    return "suspend"
                 except MandalaError as error:
                     await computer.refresh()
-                    if computer.status in ("suspended", "stopped"):
-                        return False
+                    if computer.status == "suspended":
+                        return "suspend"
+                    if computer.status == "stopped":
+                        return "stop"
                     # Not suspendable now: stopping keeps the disk, which is the
                     # part of the session a resume can always rebuild from.
                     logger.warning(
@@ -1438,6 +1444,7 @@ class MandalaSandboxSession(BaseSandboxSession):
             await computer.refresh()
             if computer.status not in ("stopped",):
                 await computer.stop()
+            return "stop"
         except MandalaError as error:
             # Best effort, like the SDK's own backends: shutdown runs during
             # cleanup and must not mask the run's outcome. The computer's end
@@ -1448,7 +1455,7 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
                 type(error).__name__,
             )
-        return False
+        return None
 
     async def _remove_public_urls(self) -> None:
         for port, url_ids in list(self.state.public_url_ids.items()):

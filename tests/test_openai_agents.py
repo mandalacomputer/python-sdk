@@ -2338,3 +2338,31 @@ async def test_a_command_start_outlasting_the_drain_is_killed_and_stopped_again(
     assert job.killed
     assert fake.computers["vm-1"]["status"] == "stopped"
     assert len(fake.calls("POST", "/vm-1/stop")) >= 2
+
+
+# --- review round 32 ------------------------------------------------------------
+
+
+async def test_late_work_after_a_delete_that_fell_back_to_stop_is_stopped_again(
+    fake: FakePlatform, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oa, "_ANSWER_WAIT", 0.1)
+    sandbox_client = MandalaSandboxClient(fake.client())
+    session = await sandbox_client.create(manifest=manifest(root))  # delete by default
+    await session.start()
+    fake.start_late_effect = 0.5
+    running = asyncio.ensure_future(session.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running  # its start is the client's to finish
+    fake.fail[("DELETE", "vm-1")] = (500, {"error": "cannot delete"})
+    await session.shutdown()  # the delete fails; it is stopped instead
+    fake.fail.clear()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await asyncio.sleep(0.6)  # the start lands and wakes it
+    await sandbox_client._reaper.aclose(5)
+    (job,) = [j for j in fake.jobs.values() if "sleep 30" in j.command]
+    assert job.killed
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await sandbox_client.aclose()
