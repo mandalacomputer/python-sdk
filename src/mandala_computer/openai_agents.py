@@ -64,7 +64,7 @@ import shlex
 import tarfile
 import uuid
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NoReturn
 
 try:
@@ -96,7 +96,12 @@ try:
         RuntimeHelperScript,
     )
     from agents.sandbox.session.tar_workspace import shell_tar_exclude_args
-    from agents.sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
+    from agents.sandbox.snapshot import (
+        NoopSnapshot,
+        SnapshotBase,
+        SnapshotSpec,
+        resolve_snapshot,
+    )
     from agents.sandbox.types import ExecResult, ExposedPortEndpoint, User
     from agents.sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
     from agents.sandbox.workspace_paths import posix_path_for_error, sandbox_path_str
@@ -256,8 +261,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._computer = computer
         self._workspace_root_ready = state.workspace_root_ready
         self._shut_down = False
-        #: The last workspace persist failed, so the workspace exists only here.
-        self._persist_failed = False
+        #: Whether the workspace has been saved to the snapshot store, start to
+        #: finish, since this session last could have changed it. Until then the
+        #: computer's disk may be the only copy.
+        self._persist_confirmed = False
 
     @property
     def computer(self) -> AsyncComputer:
@@ -454,11 +461,21 @@ class MandalaSandboxSession(BaseSandboxSession):
             served = next(
                 (u for u in listing.public_urls if u.port == port and not u.disabled), None
             )
+            wanted = self.state.public_url_access
             if served is None:
-                served = await self._computer.create_public_url(
-                    port, access=self.state.public_url_access
-                )
+                served = await self._computer.create_public_url(port, access=wanted)
                 self.state.public_url_ids[port] = served.id
+            elif wanted is not None and served.access != wanted:
+                # Reused, it must still be as open as asked and no more.
+                served = await self._computer.update_public_url(served.id, access=wanted)
+                if served.access != wanted:
+                    raise ExposedPortUnavailableError(
+                        port=port,
+                        exposed_ports=self.state.exposed_ports,
+                        reason="backend_unavailable",
+                        context={"backend": _BACKEND_ID, "detail": "access_not_applied"},
+                        retryable=False,
+                    )
         except ExposedPortUnavailableError:
             raise
         except (MandalaError, ValueError) as error:
@@ -582,10 +599,8 @@ class MandalaSandboxSession(BaseSandboxSession):
             sink = io.BytesIO()
             await self._computer.download_file(archive, sink)
         except WorkspaceArchiveReadError:
-            self._persist_failed = True
             raise
         except (MandalaError, ExecTransportError, ExecTimeoutError) as error:
-            self._persist_failed = True
             raise WorkspaceArchiveReadError(
                 path=error_root,
                 context={"backend": _BACKEND_ID, **_error_context(error)},
@@ -600,7 +615,6 @@ class MandalaSandboxSession(BaseSandboxSession):
             # Saved as it is, this snapshot would be refused when it is restored:
             # fail the persist instead, so the run reports it and shutdown keeps
             # the computer that still has the files.
-            self._persist_failed = True
             raise WorkspaceArchiveReadError(
                 path=error_root,
                 context={
@@ -612,7 +626,6 @@ class MandalaSandboxSession(BaseSandboxSession):
                 cause=error,
                 retryable=False,
             ) from error
-        self._persist_failed = False
         return io.BytesIO(restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
@@ -665,6 +678,16 @@ class MandalaSandboxSession(BaseSandboxSession):
             )
         self._workspace_root_ready = True
 
+    async def _persist_snapshot(self) -> None:
+        # The whole persist, archive and store both: only a store that returned
+        # counts as saved. A failure or a cancellation anywhere leaves it unsaved.
+        self._persist_confirmed = False
+        await super()._persist_snapshot()
+        self._persist_confirmed = True
+
+    def _workspace_unsaved(self) -> bool:
+        return not isinstance(self.state.snapshot, NoopSnapshot) and not self._persist_confirmed
+
     async def _remove_quietly(self, guest_path: str) -> None:
         try:
             await self._exec_internal("rm", "-f", "--", guest_path, timeout=_CLEANUP_TIMEOUT)
@@ -679,12 +702,13 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._shut_down = True
         mode = self.state.on_shutdown
         computer = self._computer
-        if mode == "delete" and self._persist_failed:
-            # The snapshot that should carry this workspace was not saved, so
-            # the computer's disk is the only copy left: stop it, not delete it.
+        if mode == "delete" and self._workspace_unsaved():
+            # A snapshot store is configured and nothing confirms the workspace
+            # reached it (the persist failed, was cancelled, or never ran), so
+            # the computer's disk may be the only copy: stop it, not delete it.
             logger.warning(
-                "the workspace of computer %s could not be saved; stopping it instead "
-                "of deleting it so its disk is kept",
+                "the workspace of computer %s was not confirmed saved; stopping it "
+                "instead of deleting it so its disk is kept",
                 computer.id,
             )
             mode = "stop"
@@ -1017,15 +1041,23 @@ def _restorable_archive(raw: bytes, root: str) -> bytes:
                 contents[name] = contents[linked]
                 target.addfile(copy, io.BytesIO(contents[linked]))
             elif member.issym() and member.linkname.startswith("/"):
-                inside = posixpath.normpath(member.linkname)
-                prefix = root.rstrip("/") + "/"
-                if not (inside + "/").startswith(prefix):
+                # Rebased only when made of plain components: a ``..`` after a
+                # symlinked component means something else on disk than it does
+                # as text, so it is not resolved here but refused.
+                parts = PurePosixPath(member.linkname).parts[1:]
+                if ".." in parts:
+                    raise UnsafeTarMemberError(
+                        member=member.name,
+                        reason=f"absolute symlink target with '..': {member.linkname}",
+                    )
+                root_parts = PurePosixPath(root).parts[1:]
+                if tuple(parts[: len(root_parts)]) != tuple(root_parts):
                     raise UnsafeTarMemberError(
                         member=member.name,
                         reason=f"symlink points outside the workspace: {member.linkname}",
                     )
                 relative = posixpath.relpath(
-                    posixpath.join(".", inside[len(prefix) :]),
+                    posixpath.join(".", *parts[len(root_parts) :]),
                     posixpath.join(".", posixpath.dirname(name)),
                 )
                 member.linkname = relative

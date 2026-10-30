@@ -2508,8 +2508,9 @@ most 8784 hours.
 
 A port the agent's tools serve becomes reachable through a public URL. Name it
 in `exposed_ports`, then resolve it from the session; the first resolve makes
-the URL (or reuses one the computer already has for that port), and the
-endpoint is HTTPS on 443:
+the URL (or reuses one the computer already has for that port, changing its
+access to `public_url_access` when that is set and differs), and the endpoint
+is HTTPS on 443:
 
 ```python
 from agents.sandbox import Manifest
@@ -2576,9 +2577,11 @@ second.
   link is saved as a file with the same bytes, and a symlink with an absolute
   target inside the workspace as the equivalent relative one. A symlink that
   points outside the workspace (a virtualenv's link to the system Python, say)
-  cannot be restored, so persisting fails, naming it, and with
-  `on_shutdown="delete"` the computer is stopped instead of deleted, keeping
-  the only copy of the workspace on its disk.
+  cannot be restored, so persisting fails, naming it. An absolute target
+  with a `..` in it is refused the same way rather than guessed at. With a
+  snapshot store configured, `on_shutdown="delete"` deletes the computer only
+  after the workspace has been saved to the store; if that failed, was
+  cancelled or never ran, the computer is stopped instead, keeping its disk.
 - **Refused, before anything is created**: manifest users and groups, mount
   entries, and path grants with a `host_path`. Refused when asked for: a
   `user` other than `root` on a command or file call, and PTY sessions (the

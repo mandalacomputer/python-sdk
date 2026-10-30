@@ -793,3 +793,125 @@ async def test_a_resume_that_fails_on_a_running_computer_leaves_it_running(
     assert not fake.calls("POST", "/vm-1/stop")
     fake.fail.clear()
     await session.aclose()
+
+
+# --- review round 2 -------------------------------------------------------------
+
+
+async def test_a_failing_snapshot_store_keeps_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    # The store's directory sits under a regular file, so saving to it fails
+    # after the archive itself was made without trouble.
+    (tmp_path / "a-file").write_text("not a directory")
+    session = await client.create(
+        manifest=manifest(root),
+        snapshot=LocalSnapshotSpec(base_path=tmp_path / "a-file" / "store"),
+    )
+    await session.start()
+    await session.write(Path("work.txt"), io.BytesIO(b"only copy"))
+    with pytest.raises(Exception):  # noqa: B017 - whatever the store raises
+        await session.stop()
+    await session.shutdown()
+    await client.delete(session)
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+
+
+async def test_a_confirmed_snapshot_lets_shutdown_delete(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    await session.stop()
+    await session.shutdown()
+    assert fake.computers == {}
+
+
+async def test_a_snapshot_store_never_reached_keeps_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=tmp_path)
+    )
+    await session.start()
+    await session.shutdown()  # no persist ran
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_an_absolute_symlink_with_dot_dot_is_refused(
+    client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    await session.exec(
+        "mkdir -p sub/target && printf d > data && ln -s sub/target alias"
+        f" && ln -s {root}/alias/../data tricky"
+    )
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await session.persist_workspace()
+    assert caught.value.context["reason"] == "unrestorable_member"
+    assert "tricky" in str(caught.value.context["member"])
+    await session.exec("rm tricky")
+    assert (await session.persist_workspace()).read()
+    await session.aclose()
+
+
+async def test_a_reused_public_url_is_given_the_access_asked_for(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), public_url_access="private"),
+    )
+    fake.public_urls["vm-1"] = [
+        {
+            "id": "pu-existing",
+            "url": "https://mine.mandala.dev",
+            "hostname": "mine.mandala.dev",
+            "label": "mine",
+            "port": 8080,
+            "access": "public",
+            "disabled": False,
+            "created_at": "2026-10-29T00:00:00.000Z",
+            "updated_at": "2026-10-29T00:00:00.000Z",
+        }
+    ]
+    endpoint = await session.resolve_exposed_port(8080)
+    assert endpoint.host == "mine.mandala.dev"
+    assert fake.public_urls["vm-1"][0]["access"] == "private"
+    assert json.loads(fake.calls("PATCH", "/public-urls/pu-existing")[0].content) == {
+        "access": "private"
+    }
+    assert not fake.calls("POST", "/public-urls")
+    await session.aclose()
+
+
+async def test_a_reused_public_url_that_will_not_change_access_is_refused(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root),
+        options=MandalaSandboxClientOptions(exposed_ports=(8080,), public_url_access="private"),
+    )
+    fake.public_urls["vm-1"] = [
+        {
+            "id": "pu-existing",
+            "url": "https://mine.mandala.dev",
+            "hostname": "mine.mandala.dev",
+            "label": "mine",
+            "port": 8080,
+            "access": "public",
+            "disabled": False,
+            "created_at": "2026-10-29T00:00:00.000Z",
+            "updated_at": "2026-10-29T00:00:00.000Z",
+        }
+    ]
+    fake.fail[("PATCH", "pu-existing")] = (403, {"error": "no", "code": "PUBLIC_URLS_BLOCKED"})
+    with pytest.raises(ExposedPortUnavailableError) as caught:
+        await session.resolve_exposed_port(8080)
+    assert caught.value.context["code"] == "PUBLIC_URLS_BLOCKED"
+    fake.fail.clear()
+    await session.aclose()

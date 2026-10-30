@@ -26,7 +26,9 @@ This is the summary you read to decide whether to upgrade.
   does not. The API key stays on the client, never in options or saved state.
   Snapshots are saved only in a form a restore accepts (hard links as files,
   absolute in-workspace symlinks made relative); a symlink out of the workspace
-  fails the persist, and the computer is then stopped rather than deleted.
+  fails the persist. With a snapshot store configured, the computer is deleted
+  at shutdown only after the workspace was confirmed saved, and stopped
+  otherwise.
   PTY sessions, users other than `root`, manifest users and groups, mounts and
   host-path grants are refused with the SDK's `ConfigurationError`. Importing
   `mandala_computer` does not import the Agents SDK.

@@ -318,6 +318,13 @@ class FakePlatform:
             }
             urls.append(url)
             return httpx.Response(201, json=url)
+        if request.method == "PATCH" and rest:
+            body = json.loads(request.content)
+            for url in urls:
+                if url["id"] == rest[0]:
+                    url.update({k: v for k, v in body.items() if k in ("port", "access")})
+                    return httpx.Response(200, json=url)
+            return httpx.Response(404, json={"error": "no such URL"})
         if request.method == "DELETE" and rest:
             self.public_urls[computer_id] = [u for u in urls if u["id"] != rest[0]]
             return httpx.Response(200, json={"ok": True})
