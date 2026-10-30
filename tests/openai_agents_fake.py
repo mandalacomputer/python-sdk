@@ -31,6 +31,8 @@ import mandala_computer as mc
 BASE = "https://api.test/api/v1"
 _PREFIX = "/api/v1/"
 _RANGE = re.compile(r"bytes=(\d*)-(\d*)")
+#: The most output one poll returns.
+_WINDOW = 4096
 
 
 def _b64(data: bytes) -> str:
@@ -51,10 +53,13 @@ class _Job:
 
     def status(self) -> dict[str, Any]:
         finished = self.proc.poll() is not None and not any(t.is_alive() for t in self.readers)
-        out = bytes(self.stdout[self.sent_out :])
-        err = bytes(self.stderr[self.sent_err :])
+        # Like the platform, one read carries a bounded window and says whether
+        # more is waiting.
+        out = bytes(self.stdout[self.sent_out : self.sent_out + _WINDOW])
+        err = bytes(self.stderr[self.sent_err : self.sent_err + _WINDOW])
         self.sent_out += len(out)
         self.sent_err += len(err)
+        more = self.sent_out < len(self.stdout) or self.sent_err < len(self.stderr)
         return {
             "pid": self.pid,
             "command": self.command,
@@ -65,7 +70,7 @@ class _Job:
             "stderr_b64": _b64(err),
             "stdout_offset": self.sent_out,
             "stderr_offset": self.sent_err,
-            "more": False,
+            "more": more,
             "killed": self.killed,
         }
 

@@ -2547,7 +2547,8 @@ run config has one), shuts the session down, and calls the client's
 
 A kept computer keeps its disk on your plan until it is deleted. A resume
 reattaches a running computer as it is, starts a stopped or suspended one, and
-replaces one that is gone or can never run again. One it cannot read at all (a
+replaces one that is gone or can never run again. A computer the resume
+started is stopped again if the rest of the resume fails or is cancelled. One it cannot read at all (a
 key without access, the platform unreachable) is an error rather than a reason
 to make another. A failure to stop or delete at shutdown is logged on the
 `mandala_computer.openai_agents` logger with the computer's id rather than
@@ -2571,7 +2572,13 @@ second.
   refused.
 - **Workspace snapshots** are a tar of the workspace root, staged under `/tmp`
   in the computer and moved through the file API, so any snapshot store the SDK
-  offers works.
+  offers works. A snapshot is saved only in a form a restore accepts: a hard
+  link is saved as a file with the same bytes, and a symlink with an absolute
+  target inside the workspace as the equivalent relative one. A symlink that
+  points outside the workspace (a virtualenv's link to the system Python, say)
+  cannot be restored, so persisting fails, naming it, and with
+  `on_shutdown="delete"` the computer is stopped instead of deleted, keeping
+  the only copy of the workspace on its disk.
 - **Refused, before anything is created**: manifest users and groups, mount
   entries, and path grants with a `host_path`. Refused when asked for: a
   `user` other than `root` on a command or file call, and PTY sessions (the

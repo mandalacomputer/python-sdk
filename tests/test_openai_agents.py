@@ -30,6 +30,7 @@ from agents.sandbox.errors import (
     ExecTransportError,
     ExposedPortUnavailableError,
     InvalidManifestPathError,
+    WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
     WorkspaceStartError,
@@ -677,4 +678,118 @@ async def test_cancelling_a_command_stops_it(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert any(job.killed for job in fake.jobs.values() if "sleep 30" in job.command)
+    await session.aclose()
+
+
+# --- review round 1 -------------------------------------------------------------
+
+
+async def test_a_noisy_command_still_times_out_and_is_stopped(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    with pytest.raises(ExecTimeoutError):
+        await asyncio.wait_for(
+            session.exec("while true; do echo noise; done", timeout=0.5), timeout=20
+        )
+    noisy = [job for job in fake.jobs.values() if "noise" in job.command]
+    assert len(noisy) == 1 and noisy[0].killed
+    await session.aclose()
+
+
+async def test_a_long_output_is_read_to_the_end(client: MandalaSandboxClient, root: Path) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    result = await session.exec("seq 1 20000")
+    assert result.ok()
+    assert result.stdout.decode().split() == [str(n) for n in range(1, 20001)]
+    await session.aclose()
+
+
+async def test_links_in_the_workspace_survive_a_snapshot(
+    client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    await session.exec(
+        "mkdir -p .venv/bin && printf 'interp' > .venv/bin/python3.12"
+        " && ln -s python3.12 .venv/bin/python"
+        f" && ln -s {root}/.venv/bin/python3.12 .venv/bin/python3"
+        " && printf 'shared' > data.txt && ln data.txt data-link.txt"
+    )
+    archive = (await session.persist_workspace()).read()
+    await session.exec("rm -rf .venv data.txt data-link.txt")
+    await session.hydrate_workspace(io.BytesIO(archive))
+    assert (root / ".venv" / "bin" / "python").is_symlink()
+    assert (root / ".venv" / "bin" / "python").read_bytes() == b"interp"
+    # The absolute link inside the workspace comes back relative.
+    python3 = root / ".venv" / "bin" / "python3"
+    assert python3.is_symlink() and not str(python3.readlink()).startswith("/")
+    assert python3.read_bytes() == b"interp"
+    # The hard link comes back as a file with the same bytes.
+    assert (root / "data-link.txt").read_bytes() == b"shared"
+    assert not (root / "data-link.txt").is_symlink()
+    await session.aclose()
+
+
+async def test_an_unrestorable_snapshot_fails_and_the_computer_is_kept(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    session = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=snapshots)
+    )
+    await session.start()
+    await session.exec("ln -s /etc/hosts outside")
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await session.persist_workspace()
+    assert caught.value.context["reason"] == "unrestorable_member"
+    assert "outside" in str(caught.value.context["member"])
+    # The runner's cleanup persists again, fails again, and shuts down anyway:
+    # the computer holding the only copy is stopped, not deleted.
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.stop()
+    await session.shutdown()
+    await client.delete(session)
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert not fake.calls("DELETE", "/vm-1")
+    assert not list(snapshots.iterdir())
+
+
+async def test_a_resume_that_fails_after_starting_stops_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.aclose()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    payload = client.serialize_session_state(session.state)
+    fake.fail[("PATCH", "vm-1")] = (500, {"error": "boom"})
+    with pytest.raises(WorkspaceStartError):
+        await client.resume(client.deserialize_session_state(payload))
+    assert len(fake.calls("POST", "/vm-1/start")) == 1
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    assert len(fake.calls("POST", "/vm-1/stop")) == 2
+    fake.fail.clear()
+
+
+async def test_a_resume_that_fails_on_a_running_computer_leaves_it_running(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    payload = client.serialize_session_state(session.state)
+    fake.fail[("POST", "exec")] = (500, {"error": "boom"})
+    with pytest.raises(WorkspaceStartError):
+        await client.resume(
+            client.deserialize_session_state(
+                {**payload, "launch_timeout_s": 1}  # type: ignore[dict-item]
+            )
+        )
+    # It was running before the resume touched it, so it is not stopped.
+    assert fake.computers["vm-1"]["status"] == "running"
+    assert not fake.calls("POST", "/vm-1/stop")
+    fake.fail.clear()
     await session.aclose()

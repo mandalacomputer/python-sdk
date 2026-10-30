@@ -59,7 +59,9 @@ import asyncio
 import io
 import logging
 import math
+import posixpath
 import shlex
+import tarfile
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -254,6 +256,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._computer = computer
         self._workspace_root_ready = state.workspace_root_ready
         self._shut_down = False
+        #: The last workspace persist failed, so the workspace exists only here.
+        self._persist_failed = False
 
     @property
     def computer(self) -> AsyncComputer:
@@ -346,17 +350,36 @@ class MandalaSandboxSession(BaseSandboxSession):
         argv: Sequence[str],
         timeout: float | None,
     ) -> ExecResult:
-        """Poll a started command to its end, or stop it at ``timeout``."""
+        """Poll a started command to its end, or stop it at ``timeout``.
+
+        The deadline is checked after every read, whether or not more output is
+        waiting, and each read is itself bounded by the time left, so neither a
+        command that never stops printing nor a slow read outlasts it. A read
+        that reports the command finished is returned as finished: there is
+        nothing left to stop.
+        """
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + max(timeout, 0.0)
         stdout, stderr = bytearray(), bytearray()
         delay = _POLL_FIRST
         finished = False
         setbacks = 0
+
+        def expired() -> NoReturn:
+            raise ExecTimeoutError(
+                command=argv, timeout_s=timeout, context={"backend": _BACKEND_ID}
+            )
+
         try:
             while True:
                 try:
-                    status = await job.poll()
+                    if deadline is None:
+                        status = await job.poll()
+                    else:
+                        # At least one short read, so a command that has already
+                        # finished is still seen to have finished at timeout 0.
+                        budget = max(deadline - loop.time(), _POLL_FIRST)
+                        status = await asyncio.wait_for(job.poll(), budget)
                     setbacks = 0
                 except MandalaError as error:
                     # A poll is a read, so one the platform calls transient (a
@@ -364,10 +387,17 @@ class MandalaSandboxSession(BaseSandboxSession):
                     setbacks += 1
                     if not is_transient(error) or setbacks > _POLL_SETBACKS:
                         _raise_exec_transport(error, argv)
+                    if deadline is not None and loop.time() >= deadline:
+                        expired()
                     pause = error.retry_after if isinstance(error, APIError) else None
-                    await asyncio.sleep(min(pause or delay, _POLL_CEILING * 5))
+                    wait = min(pause or delay, _POLL_CEILING * 5)
+                    if deadline is not None:
+                        wait = min(wait, deadline - loop.time())
+                    await asyncio.sleep(max(wait, 0.0))
                     delay = min(delay * 2, _POLL_CEILING)
                     continue
+                except asyncio.TimeoutError:
+                    expired()
                 stdout += status.stdout
                 stderr += status.stderr
                 if status.output_unreadable or status.output_unavailable is not None:
@@ -394,14 +424,10 @@ class MandalaSandboxSession(BaseSandboxSession):
                     return ExecResult(
                         stdout=bytes(stdout), stderr=bytes(stderr), exit_code=status.exit_code
                     )
+                if deadline is not None and loop.time() >= deadline:
+                    expired()
                 if status.more:
                     continue
-                if deadline is not None and loop.time() >= deadline:
-                    raise ExecTimeoutError(
-                        command=argv,
-                        timeout_s=timeout,
-                        context={"backend": _BACKEND_ID},
-                    )
                 wait = delay if deadline is None else min(delay, deadline - loop.time())
                 await asyncio.sleep(max(wait, 0.0))
                 delay = min(delay * 2, _POLL_CEILING)
@@ -556,8 +582,10 @@ class MandalaSandboxSession(BaseSandboxSession):
             sink = io.BytesIO()
             await self._computer.download_file(archive, sink)
         except WorkspaceArchiveReadError:
+            self._persist_failed = True
             raise
         except (MandalaError, ExecTransportError, ExecTimeoutError) as error:
+            self._persist_failed = True
             raise WorkspaceArchiveReadError(
                 path=error_root,
                 context={"backend": _BACKEND_ID, **_error_context(error)},
@@ -566,8 +594,26 @@ class MandalaSandboxSession(BaseSandboxSession):
             ) from error
         finally:
             await self._remove_quietly(archive)
-        sink.seek(0)
-        return sink
+        try:
+            restorable = _restorable_archive(sink.getvalue(), sandbox_path_str(root))
+        except UnsafeTarMemberError as error:
+            # Saved as it is, this snapshot would be refused when it is restored:
+            # fail the persist instead, so the run reports it and shutdown keeps
+            # the computer that still has the files.
+            self._persist_failed = True
+            raise WorkspaceArchiveReadError(
+                path=error_root,
+                context={
+                    "backend": _BACKEND_ID,
+                    "reason": "unrestorable_member",
+                    "member": error.member,
+                    "detail": str(error),
+                },
+                cause=error,
+                retryable=False,
+            ) from error
+        self._persist_failed = False
+        return io.BytesIO(restorable)
 
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         root = self._workspace_root_path()
@@ -633,6 +679,15 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._shut_down = True
         mode = self.state.on_shutdown
         computer = self._computer
+        if mode == "delete" and self._persist_failed:
+            # The snapshot that should carry this workspace was not saved, so
+            # the computer's disk is the only copy left: stop it, not delete it.
+            logger.warning(
+                "the workspace of computer %s could not be saved; stopping it instead "
+                "of deleting it so its disk is kept",
+                computer.id,
+            )
+            mode = "stop"
         if mode != "delete":
             await self._remove_public_urls()
         try:
@@ -805,13 +860,20 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
 
         preserved = computer is not None
         if computer is not None:
+            was_running = computer.status == "running"
             try:
-                was_running = computer.status == "running"
                 await _bring_up(computer, state.launch_timeout_s)
                 if not was_running and state.ends_in_hours is not None:
                     await computer.set_end_time(ends_in_hours=state.ends_in_hours)
-            except MandalaError as error:
-                _raise_start_error(state, error, "start")
+            except BaseException as error:
+                if not was_running:
+                    # This resume started it; a failure or a cancellation after
+                    # that must not leave it running, possibly with no end time.
+                    # Stopped, it keeps its disk for the next attempt.
+                    await _shielded(_stop_quietly(computer))
+                if isinstance(error, MandalaError):
+                    _raise_start_error(state, error, "start")
+                raise
         else:
             state.computer_id = ""
             state.workspace_root_ready = False
@@ -903,6 +965,81 @@ async def _kill_quietly(job: AsyncBackgroundCommand) -> None:
         await asyncio.wait_for(job.kill(), _CLEANUP_TIMEOUT)
     except Exception:  # noqa: BLE001 - it may have ended on its own meanwhile
         logger.debug("could not stop guest command %s", job.pid)
+
+
+async def _stop_quietly(computer: AsyncComputer) -> None:
+    try:
+        await asyncio.wait_for(computer.stop(), _CLEANUP_TIMEOUT)
+    except Exception as error:  # noqa: BLE001 - reported; the end time may still apply
+        logger.warning(
+            "could not stop computer %s after a failed resume (%s)",
+            computer.id,
+            type(error).__name__,
+        )
+
+
+def _restorable_archive(raw: bytes, root: str) -> bytes:
+    """``raw`` rewritten into what :meth:`hydrate_workspace` will accept.
+
+    Restoring refuses hard links and symlinks that point out of the workspace,
+    as every SDK backend does. A hard link becomes a regular file holding the
+    same bytes. A symlink whose absolute target is inside the workspace root
+    becomes the equivalent relative one. A symlink that points outside the
+    workspace cannot be restored at all, so it raises ``UnsafeTarMemberError``
+    naming it, and the result is checked against the restore policy before it
+    is returned.
+    """
+    out = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as source,
+        tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as target,
+    ):
+        contents: dict[str, bytes] = {}
+        for member in source.getmembers():
+            name = posixpath.normpath(member.name)
+            if member.isreg():
+                handle = source.extractfile(member)
+                data = handle.read() if handle is not None else b""
+                contents[name] = data
+                target.addfile(member, io.BytesIO(data))
+            elif member.islnk():
+                linked = posixpath.normpath(member.linkname)
+                if linked not in contents:
+                    raise UnsafeTarMemberError(
+                        member=member.name,
+                        reason=f"hard link to a file not in the archive: {member.linkname}",
+                    )
+                copy = tarfile.TarInfo(member.name)
+                copy.size = len(contents[linked])
+                copy.mode, copy.mtime = member.mode, member.mtime
+                copy.uid, copy.gid = member.uid, member.gid
+                copy.uname, copy.gname = member.uname, member.gname
+                contents[name] = contents[linked]
+                target.addfile(copy, io.BytesIO(contents[linked]))
+            elif member.issym() and member.linkname.startswith("/"):
+                inside = posixpath.normpath(member.linkname)
+                prefix = root.rstrip("/") + "/"
+                if not (inside + "/").startswith(prefix):
+                    raise UnsafeTarMemberError(
+                        member=member.name,
+                        reason=f"symlink points outside the workspace: {member.linkname}",
+                    )
+                relative = posixpath.relpath(
+                    posixpath.join(".", inside[len(prefix) :]),
+                    posixpath.join(".", posixpath.dirname(name)),
+                )
+                member.linkname = relative
+                # A long target travels in a PAX header, which would win over
+                # the field just set when the member is written again.
+                member.pax_headers = {
+                    k: v for k, v in member.pax_headers.items() if k != "linkpath"
+                }
+                target.addfile(member)
+            else:
+                target.addfile(member)
+    result = out.getvalue()
+    validate_tar_bytes(result, allow_external_symlink_targets=False)
+    return result
 
 
 async def _delete_quietly(computer: AsyncComputer) -> None:
