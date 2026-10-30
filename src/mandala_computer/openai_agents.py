@@ -1495,9 +1495,10 @@ class MandalaSandboxSession(BaseSandboxSession):
                 computer.id,
             )
             mode = "stop"  # not delete, and not a suspend a late change would wake
-        if mode == "suspend" and self._unsettled:
-            # Something handed to the client's cleanup may still reach the
-            # computer and wake it: stop it instead (a delete stays a delete).
+        if mode == "suspend" and (self._unsettled or self._contaminated):
+            # Something handed to the client's cleanup, or a request whose
+            # outcome was lost, may still reach the computer and wake it: stop
+            # it instead (a delete stays a delete).
             mode = "stop"
         # Held across the decision and its action, so no save runs between them.
         async with self._save_lock:

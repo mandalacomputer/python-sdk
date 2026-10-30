@@ -2726,3 +2726,35 @@ async def test_a_create_still_in_progress_past_the_budget_is_deleted_at_client_c
     assert fake.computers == {}
     statuses = [r for r in fake.calls("POST", "/computers")]
     assert len({r.headers["idempotency-key"] for r in statuses}) == 1
+
+
+# --- review round 43 ------------------------------------------------------------
+
+
+async def test_a_lost_command_start_makes_a_suspend_shutdown_stop(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    fake.lose_start = True  # a 504: the command may still take effect
+    with pytest.raises(ExecTransportError):
+        await session.exec("sleep 0.1")
+    await session.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_an_inherited_uncertainty_makes_a_suspend_shutdown_stop(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="suspend")
+    )
+    await session.start()
+    payload = client.serialize_session_state(session.state)
+    payload["uncertain"] = True
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    await resumed.shutdown()
+    assert fake.computers["vm-1"]["status"] == "stopped"
+    await session.aclose()
