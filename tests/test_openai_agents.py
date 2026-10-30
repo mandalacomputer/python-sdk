@@ -2532,3 +2532,50 @@ async def test_an_unreported_memory_hold_is_never_taken_for_settled(
     record = fake.computers["vm-1"]
     assert "admitting" not in record  # it did land
     assert record["status"] == "stopped"
+
+
+# --- review round 38 ------------------------------------------------------------
+
+
+async def test_a_resume_over_its_launch_budget_raises_and_stops_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await session.start()
+    await session.aclose()
+    payload = client.serialize_session_state(session.state)
+    payload["launch_timeout_s"] = 0.01
+    fake.power_on_delay = 0.15  # longer than the whole budget
+    with pytest.raises(WorkspaceStartError) as caught:
+        await client.resume(client.deserialize_session_state(payload))
+    assert caught.value.context["reason"] == "timeout"
+    await asyncio.sleep(0.3)  # the start lands, and is stopped again
+    await client._reaper.aclose(5)
+    assert fake.computers["vm-1"]["status"] == "stopped"
+
+
+async def test_a_create_over_its_launch_budget_raises_and_deletes_the_computer(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    fake.create_delay = 0.15
+    with pytest.raises(WorkspaceStartError) as caught:
+        await client.create(
+            manifest=manifest(root), options=MandalaSandboxClientOptions(launch_timeout_s=0.01)
+        )
+    assert caught.value.context["reason"] == "timeout"
+    assert fake.computers == {}
+
+
+@pytest.mark.parametrize("suffix", ["/", "/."])
+async def test_absolute_links_with_a_directory_suffix_are_refused(
+    client: MandalaSandboxClient, root: Path, suffix: str
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    await session.exec(f"printf x > file && ln -s {root}/file{suffix} dirlink")
+    with pytest.raises(WorkspaceArchiveReadError) as caught:
+        await session.persist_workspace()
+    assert caught.value.context["reason"] == "unrestorable_member"
+    await session.aclose()

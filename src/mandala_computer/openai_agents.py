@@ -1721,6 +1721,8 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         self._validate_manifest_for_create(manifest)
         _check_manifest(manifest)
 
+        # One budget for the whole launch: create, start and readiness.
+        deadline = _launch_deadline(options.launch_timeout_s)
         session_id = uuid.uuid4()
         state = MandalaSandboxSessionState(
             session_id=session_id,
@@ -1740,7 +1742,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             launch_timeout_s=options.launch_timeout_s,
             exposed_ports=options.exposed_ports,
         )
-        computer = await self._make_computer(state)
+        computer = await self._make_computer(state, deadline)
         inner = MandalaSandboxSession(
             state=state, computer=computer, reaper=self._reaper, live=self._live
         )
@@ -1751,6 +1753,8 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             raise TypeError("MandalaSandboxClient.resume expects a MandalaSandboxSessionState")
         state.assert_path_grants_rebound()
         _check_manifest(state.manifest)
+        # One budget for the whole launch: reattach or create, start, readiness.
+        deadline = _launch_deadline(state.launch_timeout_s)
 
         computer: AsyncComputer | None = None
         try:
@@ -1794,7 +1798,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             was_running = computer.status == "running"
             starts: list[asyncio.Future[AsyncComputer]] = []
             try:
-                await _bring_up(computer, state.launch_timeout_s, starts)
+                await _bring_up(computer, deadline, starts)
                 if not was_running and state.ends_in_hours is not None:
                     await computer.set_end_time(ends_in_hours=state.ends_in_hours)
             except BaseException as error:
@@ -1808,7 +1812,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                     await _shielded(inner._shutdown_task)
                 else:
                     inner._live.discard(inner)
-                if isinstance(error, MandalaError):
+                if isinstance(error, (MandalaError, TimeoutError)):
                     _raise_start_error(state, error, "start")
                 raise
             return self._wrap_session(inner, instrumentation=self._instrumentation)
@@ -1818,7 +1822,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             state.public_url_ids = {}
             state.uncertain = False  # a new computer: nothing unseen on it
             state.initialized = False
-            computer = await self._make_computer(state)
+            computer = await self._make_computer(state, deadline)
 
         inner = MandalaSandboxSession(
             state=state, computer=computer, reaper=self._reaper, live=self._live
@@ -1841,7 +1845,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
         return self._deserialize_session_state_payload(payload, MandalaSandboxSessionState)
 
-    async def _create(self, state: MandalaSandboxSessionState) -> AsyncComputer:
+    async def _create(self, state: MandalaSandboxSessionState, deadline: float) -> AsyncComputer:
         """The create request, cancellable without leaving a computer behind.
 
         The end time travels in the create itself, so even a computer that is
@@ -1906,11 +1910,14 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
 
         task = asyncio.ensure_future(attempt())
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
+            return await asyncio.wait_for(asyncio.shield(task), _left(deadline))
+        except (asyncio.CancelledError, asyncio.TimeoutError, _LaunchTimeout) as error:
             abandoned = True
+            # The create may still land: wait for it, and delete what it made.
             await _shielded(_after(task, _delete_quietly, self._reaper, f"the create of {name!r}"))
-            raise
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            _raise_start_error(state, _LaunchTimeout(), "create")
         except (MandalaError, ValueError) as error:
             _raise_start_error(state, error, "create")
 
@@ -1932,7 +1939,9 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 "could not find computer %r to delete it (%s)", name, type(error).__name__
             )
 
-    async def _make_computer(self, state: MandalaSandboxSessionState) -> AsyncComputer:
+    async def _make_computer(
+        self, state: MandalaSandboxSessionState, deadline: float
+    ) -> AsyncComputer:
         """Create a computer from ``state``'s inputs and wait for its guest.
 
         A computer that was created and then did not come up is deleted before
@@ -1942,13 +1951,13 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
         A platform that cannot keep end times fails the session here, before
         any work, rather than running without one.
         """
-        computer = await self._create(state)
+        computer = await self._create(state, deadline)
         state.computer_id = computer.id
         try:
-            await _bring_up(computer, state.launch_timeout_s)
+            await _bring_up(computer, deadline)
         except BaseException as error:
             await _shielded(_delete_quietly(computer))
-            if isinstance(error, MandalaError):
+            if isinstance(error, (MandalaError, TimeoutError)):
                 _raise_start_error(state, error, "start")
             raise
         return computer
@@ -1957,9 +1966,25 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
 # --- helpers ----------------------------------------------------------------
 
 
+class _LaunchTimeout(TimeoutError):
+    """The launch budget (``launch_timeout_s``) ran out."""
+
+
+def _launch_deadline(seconds: float) -> float:
+    return asyncio.get_running_loop().time() + seconds
+
+
+def _left(deadline: float) -> float:
+    """What is left of a launch budget; raises once none is."""
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise _LaunchTimeout()
+    return remaining
+
+
 async def _bring_up(
     computer: AsyncComputer,
-    timeout: float,
+    deadline: float,
     starts: list[asyncio.Future[AsyncComputer]] | None = None,
 ) -> None:
     """Wait for ``computer`` to be built, start it if nothing is, and wait for its guest.
@@ -1967,11 +1992,9 @@ async def _bring_up(
     The start runs as its own task, kept in ``starts`` when given, so a caller
     cancelled meanwhile can see whether it is still on its way.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
 
     def left() -> float:
-        return max(deadline - loop.time(), 1.0)
+        return _left(deadline)
 
     if computer.status == "building":
         await computer.wait_until_built(timeout=left())
@@ -1979,7 +2002,10 @@ async def _bring_up(
         start = asyncio.ensure_future(computer.start())
         if starts is not None:
             starts.append(start)
-        await asyncio.shield(start)
+        try:
+            await asyncio.wait_for(asyncio.shield(start), left())
+        except asyncio.TimeoutError:
+            raise _LaunchTimeout() from None
     if computer.status != "running":
         await computer.wait_until_running(timeout=left())
     await computer.wait_for_guest(timeout=left())
@@ -2353,6 +2379,15 @@ def _restorable_archive(source: Any, root: str, limit: int) -> Any:
                     # a symlinked component means something else on disk than it
                     # does as text, so it is not resolved here but refused.
                     parts = PurePosixPath(member.linkname).parts[1:]
+                    raw = member.linkname.split("/")[1:]
+                    if "" in raw or "." in raw:
+                        # A trailing "/" or "/.", or an empty or "." component,
+                        # changes what the link resolves to (a trailing one
+                        # requires a directory) and would be lost in a rebase.
+                        raise UnsafeTarMemberError(
+                            member=member.name,
+                            reason=f"absolute symlink target not in plain form: {member.linkname}",
+                        )
                     if ".." in parts:
                         raise UnsafeTarMemberError(
                             member=member.name,
@@ -2497,6 +2532,8 @@ def _raise_start_error(
     state: MandalaSandboxSessionState, error: BaseException, stage: str
 ) -> NoReturn:
     context: dict[str, object] = {"backend": _BACKEND_ID, "stage": stage, **_error_context(error)}
+    if isinstance(error, TimeoutError):
+        context["reason"] = "timeout"
     if state.computer_id:
         context["computer_id"] = state.computer_id
     raise WorkspaceStartError(
