@@ -5492,6 +5492,9 @@ class CreditReport:
     #: Pass as ``before=`` for the next, older page; ``None`` on the last one.
     #: The balances and lots are current on every page.
     next_before: int | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    # After ``raw``, so a caller building one positionally binds what it did
+    # before pay as you go.
     #: How the account pays for computers: ``"subscription"``, ``"trial"``,
     #: ``"payg"`` (pay as you go, from this same balance) or ``"none"``. An open
     #: set. ``None`` from a platform that does not say.
@@ -5506,7 +5509,6 @@ class CreditReport:
     #: starts); ``None`` when nothing is burning, when the burn is unknown, and on
     #: any other billing mode.
     runway_seconds: int | None = None
-    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "GET credits") -> CreditReport:

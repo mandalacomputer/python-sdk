@@ -987,3 +987,14 @@ def test_any_other_402_stays_a_plain_plan_limit(client_sync: mc.Client) -> None:
     with pytest.raises(mc.PlanLimitError) as caught:
         client_sync.computers.create()
     assert not isinstance(caught.value, mc.InsufficientBalanceError)
+
+
+def test_credit_report_still_builds_positionally_as_before() -> None:
+    # Ten positional arguments, the tenth the raw payload, as before pay as you go.
+    report = mc.CreditReport(1, 1, 0, 0, False, None, [], [], None, {"k": "v"})
+    assert report.raw == {"k": "v"}
+    assert (report.billing_mode, report.burn_micros_per_hour, report.runway_seconds) == (
+        None,
+        None,
+        None,
+    )
