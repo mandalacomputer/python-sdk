@@ -33,6 +33,7 @@ from ._exceptions import (
     FileExistsError,
     FileTooLargeError,
     GatewayTimeoutError,
+    InsufficientBalanceError,
     MandalaError,
     MethodNotAllowedError,
     MoveRequiredError,
@@ -1061,6 +1062,19 @@ class _BaseTransport:
                     retry_after=_retry_after(resp),
                     **metadata,
                 )
+        # The 402 that is a balance rather than the plan, told apart by its code.
+        if (
+            cls is PlanLimitError
+            and isinstance(body, dict)
+            and body.get("code") == "INSUFFICIENT_BALANCE"
+        ):
+            return InsufficientBalanceError(
+                message,
+                status=resp.status_code,
+                body=body,
+                retry_after=_retry_after(resp),
+                **metadata,
+            )
         if cls is RateLimitError:
             return RateLimitError(
                 message,

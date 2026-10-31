@@ -926,3 +926,75 @@ def test_the_ledger_takes_what_the_platform_actually_sends() -> None:
     )
     assert report.available_micros == -(2**53 - 1)
     assert report.lots[0].expires_at == "2026-11-01T00:00:00.5Z"
+
+
+# OPL-6261: how the account pays, and on pay as you go its burn and runway.
+def test_credits_decode_the_billing_mode_burn_and_runway() -> None:
+    payg = mc.CreditReport.from_api(
+        {
+            **CREDITS,
+            "billing_mode": "payg",
+            "burn_micros_per_hour": 122_738,
+            "runway_seconds": 272_189,
+        }
+    )
+    assert (payg.billing_mode, payg.burn_micros_per_hour, payg.runway_seconds) == (
+        "payg",
+        122_738,
+        272_189,
+    )
+    idle = mc.CreditReport.from_api(
+        {**CREDITS, "billing_mode": "payg", "burn_micros_per_hour": 0, "runway_seconds": None}
+    )
+    assert (idle.burn_micros_per_hour, idle.runway_seconds) == (0, None)
+    # A platform that predates pay as you go sends none of them: unknown, not refused.
+    old = mc.CreditReport.from_api(CREDITS)
+    assert (old.billing_mode, old.burn_micros_per_hour, old.runway_seconds) == (None, None, None)
+    with pytest.raises(mc.MandalaError, match="burn_micros_per_hour"):
+        mc.CreditReport.from_api({**CREDITS, "billing_mode": "payg", "burn_micros_per_hour": -1})
+    with pytest.raises(mc.MandalaError, match="billing_mode"):
+        mc.CreditReport.from_api({**CREDITS, "billing_mode": 7})
+
+
+@respx.mock
+def test_a_short_balance_is_an_insufficient_balance_error_and_still_a_plan_limit(
+    client_sync: mc.Client,
+) -> None:
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(
+            402,
+            json={
+                "error": "Your credit balance is too low to start this.",
+                "code": "INSUFFICIENT_BALANCE",
+                "projected_micros": 120_000,
+                "required_micros": 250_000,
+            },
+        )
+    )
+    with pytest.raises(mc.InsufficientBalanceError) as caught:
+        client_sync.computers.create()
+    err = caught.value
+    assert isinstance(err, mc.PlanLimitError)
+    assert (err.projected_micros, err.required_micros) == (120_000, 250_000)
+    assert not mc.is_transient(err)
+
+
+@respx.mock
+def test_any_other_402_stays_a_plain_plan_limit(client_sync: mc.Client) -> None:
+    respx.post(f"{BASE}/computers").mock(
+        httpx.Response(402, json={"error": "Not enough RAM on your plan."})
+    )
+    with pytest.raises(mc.PlanLimitError) as caught:
+        client_sync.computers.create()
+    assert not isinstance(caught.value, mc.InsufficientBalanceError)
+
+
+def test_credit_report_still_builds_positionally_as_before() -> None:
+    # Ten positional arguments, the tenth the raw payload, as before pay as you go.
+    report = mc.CreditReport(1, 1, 0, 0, False, None, [], [], None, {"k": "v"})
+    assert report.raw == {"k": "v"}
+    assert (report.billing_mode, report.burn_micros_per_hour, report.runway_seconds) == (
+        None,
+        None,
+        None,
+    )

@@ -23,6 +23,7 @@ __all__ = [
     "FileTooLargeError",
     "GatewayTimeoutError",
     "InputBatchError",
+    "InsufficientBalanceError",
     "InsufficientCreditsError",
     "MandalaError",
     "MethodNotAllowedError",
@@ -374,6 +375,39 @@ class PlanLimitError(APIError):
     :class:`InsufficientCreditsError`, or the model provider's own billing refusal
     on your ``model_key``, which arrives as :class:`ModelProviderError`.
     """
+
+
+class InsufficientBalanceError(PlanLimitError):
+    """A pay-as-you-go account's credit balance is too low to start this (402).
+
+    Raised for a create, start, restart, restore, resume, clone or build on an
+    account that pays for computers from prepaid credits, where the platform
+    answers ``code`` ``INSUFFICIENT_BALANCE``. A :class:`PlanLimitError`, so code
+    that catches that keeps catching this. Starting anything needs a quarter of
+    an hour of what it costs, and never less than $0.25.
+
+    Not a retry: :func:`is_transient` answers ``False``, and the same request
+    succeeds once credits are added in Billing.
+    """
+
+    @property
+    def projected_micros(self) -> int | None:
+        """The spendable balance the platform saw, in USD micros, when it said."""
+        return _safe_micros(self.body, "projected_micros")
+
+    @property
+    def required_micros(self) -> int | None:
+        """What starting this needed, in USD micros, when it said."""
+        return _safe_micros(self.body, "required_micros")
+
+
+def _safe_micros(body: object, key: str) -> int | None:
+    value = body.get(key) if isinstance(body, dict) else None
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and abs(value) <= 2**53 - 1
+        else None
+    )
 
 
 class InsufficientCreditsError(APIError):

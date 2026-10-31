@@ -9,6 +9,24 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- Pay as you go. An account without a subscription can pay for computers from
+  prepaid credits, by the second while they run. `client.credits.read()` now
+  says how the account is billed, in `billing_mode` (`"subscription"`,
+  `"trial"`, `"payg"` or `"none"`; an open set). On `"payg"` it also says what
+  the account's computers cost an hour now (`burn_micros_per_hour`) and how
+  many seconds the balance lasts at that rate (`runway_seconds`, `0` once it
+  has run out). Against a platform that does not send these fields, all three
+  read `None`. The credit journal's `kind` gains `"compute"`: one day of
+  pay-as-you-go computers.
+- `InsufficientBalanceError`, a `PlanLimitError` raised for a 402 whose `code`
+  is `INSUFFICIENT_BALANCE`. It means a pay-as-you-go account's balance is too
+  low to start this: a create, start, restart, restore, resume, clone or
+  build. `projected_micros` and `required_micros` carry the balance and what
+  starting needed. `mandala-py --json` reports it as `insufficient_balance`.
+  Code that catches `PlanLimitError` still catches it.
+
 ## [0.21.0] - 2026-10-30
 
 ### Added
