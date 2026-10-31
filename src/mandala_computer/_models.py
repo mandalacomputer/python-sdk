@@ -5492,6 +5492,20 @@ class CreditReport:
     #: Pass as ``before=`` for the next, older page; ``None`` on the last one.
     #: The balances and lots are current on every page.
     next_before: int | None
+    #: How the account pays for computers: ``"subscription"``, ``"trial"``,
+    #: ``"payg"`` (pay as you go, from this same balance) or ``"none"``. An open
+    #: set. ``None`` from a platform that does not say.
+    billing_mode: str | None = None
+    #: On pay as you go, what the account's computers cost an hour right now, in
+    #: micros: compute for the running ones, disk for every one that exists.
+    #: ``None`` on any other billing mode, and while the platform cannot read
+    #: every computer's state, rather than a figure that would be short.
+    burn_micros_per_hour: int | None = None
+    #: On pay as you go, how many seconds the balance lasts at that rate. ``0``
+    #: once it has run out (running computers are then suspended and nothing new
+    #: starts); ``None`` when nothing is burning, when the burn is unknown, and on
+    #: any other billing mode.
+    runway_seconds: int | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -5508,6 +5522,11 @@ class CreditReport:
         if grant is not None and not isinstance(grant, Mapping):
             raise MandalaError(f"{where}: grant is neither an object nor null")
         next_before = _ledger_nullable_int(d, "next_before", where, least=1)
+        # Absent from a platform that predates pay as you go: read as unknown
+        # rather than refused, so this client can be upgraded first.
+        billing_mode = d.get("billing_mode")
+        if billing_mode is not None and not (isinstance(billing_mode, str) and billing_mode):
+            raise MandalaError(f"{where}: billing_mode is not a nonempty string")
         return cls(
             balance_micros=_ledger_int(d, "balance_micros", where),
             available_micros=_ledger_int(d, "available_micros", where, least=None),
@@ -5520,6 +5539,13 @@ class CreditReport:
                 CreditEntry.from_api(r, f"{where} entry") for r in _ledger_rows(d, "entries", where)
             ],
             next_before=next_before,
+            billing_mode=billing_mode,
+            burn_micros_per_hour=None
+            if d.get("burn_micros_per_hour") is None
+            else _ledger_int(d, "burn_micros_per_hour", where),
+            runway_seconds=None
+            if d.get("runway_seconds") is None
+            else _ledger_int(d, "runway_seconds", where),
             raw=dict(d),
         )
 
