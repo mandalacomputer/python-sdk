@@ -24,6 +24,7 @@ import pytest
 import respx
 
 import mandala_computer as mc
+from mandala_computer import _api
 
 BASE = "https://api.test/api/v1"
 INPUT = f"{BASE}/computers/vm-1/input"
@@ -502,3 +503,134 @@ def test_an_action_object_is_checked_as_a_mapping_is(
     with pytest.raises(ValueError, match=match):
         computer.input_batch([action])  # type: ignore[list-item]
     assert not respx.calls
+
+
+# --- wait_for checks ----------------------------------------------------------
+
+
+@respx.mock
+def test_a_check_goes_out_with_only_what_was_given(computer: mc.Computer) -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "completed": 4,
+                "results": [
+                    {"ok": True},
+                    {"ok": True, "waited_ms": 120},
+                    {"ok": True, "waited_ms": 0},
+                    {"ok": True, "waited_ms": 40},
+                ],
+            },
+        )
+    )
+    checks = [
+        {"type": "wait_for", "until": "screen_changed"},
+        {
+            "type": "wait_for",
+            "until": "screen_stable",
+            "region": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "stable_ms": 100,
+            "timeout_ms": 0,
+        },
+        {"type": "wait_for", "until": "window_title", "contains": "Save As"},
+    ]
+    done_ = computer.input_batch([{"type": "wait"}, *checks])
+    assert json.loads(route.calls[0].request.content) == [{"type": "wait"}, *checks]
+    assert [r.waited_ms for r in done_.results] == [None, 120, 0, 40]
+
+
+@respx.mock
+def test_a_check_that_fails_is_the_batch_stopping_at_a_400(computer: mc.Computer) -> None:
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        return_value=httpx.Response(400, json=stopped(1, 1))
+    )
+    with pytest.raises(mc.InputBatchError) as caught:
+        computer.input_batch(
+            [{"type": "wait"}, {"type": "wait_for", "until": "screen_changed", "timeout_ms": 0}]
+        )
+    assert caught.value.status == 400
+    assert caught.value.result.failed_index == 1
+    assert mc.is_transient(caught.value) is False
+
+
+@respx.mock
+def test_an_unreadable_waited_ms_reads_as_none(computer: mc.Computer) -> None:
+    respx.post(f"{BASE}/computers/vm-1/input").mock(
+        return_value=httpx.Response(
+            200, json={"ok": True, "completed": 1, "results": [{"ok": True, "waited_ms": "x"}]}
+        )
+    )
+    assert computer.input_batch([{"type": "wait"}]).results[0].waited_ms is None
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("check", "match"),
+    [
+        ({}, "until must be one of"),
+        ({"until": "SCREEN_CHANGED"}, "until must be one of"),
+        ({"until": "command"}, "until must be one of"),
+        ({"until": "screen_changed", "contains": "x"}, "does not take 'contains'"),
+        ({"until": "screen_changed", "stable_ms": 500}, "does not take 'stable_ms'"),
+        ({"until": "window_title", "region": {}}, "does not take 'region'"),
+        ({"until": "window_title"}, "contains must be text"),
+        ({"until": "window_title", "contains": ""}, "contains must be text"),
+        ({"until": "window_title", "contains": "é" * 129}, "contains must be text"),
+        ({"until": "screen_stable", "stable_ms": 99}, "stable_ms must be"),
+        ({"until": "screen_stable", "stable_ms": 10_001}, "stable_ms must be"),
+        ({"until": "screen_stable", "timeout_ms": -1}, "timeout_ms must be"),
+        ({"until": "screen_stable", "timeout_ms": 30_001}, "timeout_ms must be"),
+        ({"until": "screen_stable", "timeout_ms": 1.5}, "timeout_ms must be"),
+        ({"until": "screen_stable", "timeout_ms": None}, "timeout_ms must be"),
+        ({"until": "screen_stable", "timeout_ms": True}, "timeout_ms must be"),
+        ({"until": "screen_changed", "region": [0, 0, 1, 1]}, "region must be"),
+        ({"until": "screen_changed", "region": {"x": 0, "y": 0, "width": 1}}, "region must be"),
+        (
+            {"until": "screen_changed", "region": {"x": -1, "y": 0, "width": 1, "height": 1}},
+            "region must be",
+        ),
+        (
+            {"until": "screen_changed", "region": {"x": 0, "y": 0, "width": 0, "height": 1}},
+            "region must be",
+        ),
+    ],
+)
+def test_a_malformed_check_is_refused_before_anything_is_sent(
+    computer: mc.Computer, check: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        computer.input_batch([{"type": "wait_for", **check}])
+    assert not respx.calls
+
+
+def test_a_check_at_each_limit_is_accepted() -> None:
+    body = _api.input_batch_body(
+        [
+            {
+                "type": "wait_for",
+                "until": "screen_stable",
+                "stable_ms": 10_000,
+                "timeout_ms": 30_000,
+            },
+            {"type": "wait_for", "until": "window_title", "contains": "é" * 128},
+        ]
+    )
+    assert body[0]["timeout_ms"] == 30_000
+    assert len(body[1]["contains"]) == 128
+
+
+@respx.mock
+async def test_the_async_half_sends_a_check_and_reads_its_wait() -> None:
+    route = respx.post(f"{BASE}/computers/vm-1/input").mock(
+        return_value=httpx.Response(
+            200, json={"ok": True, "completed": 1, "results": [{"ok": True, "waited_ms": 7}]}
+        )
+    )
+    check = {"type": "wait_for", "until": "screen_stable"}
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = mc.AsyncComputer(client._t, COMPUTER)
+        answered = await c.input_batch([check])
+    assert json.loads(route.calls[0].request.content) == [check]
+    assert answered.results[0].waited_ms == 7

@@ -275,6 +275,9 @@ class APIError(MandalaError):
     #: carried out. :func:`is_transient` reads it for the one 503 it would
     #: otherwise call safe to send again on a change (OPL-6094).
     _redirected: bool = False
+    #: ``"unavailable"`` on an exec that asked for ``retain_output`` and failed
+    #: with no retained result published. ``None`` on every other error.
+    retained_output: str | None = None
 
     def __init__(
         self,
@@ -366,7 +369,10 @@ class PlanLimitError(APIError):
 
     Raised for computer-count caps, per-computer size ceilings, account-wide RAM
     and storage pools, and OS entitlements. ``str(e)`` carries the API's
-    explanation of which limit was hit.
+    explanation of which limit was hit, and :attr:`~APIError.code` the kind:
+    ``PLAN_REQUIRED`` is an account with no plan, or a trial that has ended;
+    ``TRIAL_LIMIT`` is something a trial does not allow; ``TRIAL_CREATES_USED``
+    is a trial that has launched all it may. None clears by sending it again.
 
     Not raised by the agent routes (:meth:`~mandala_computer.Computer.agent`,
     :meth:`~mandala_computer.Computer.agent_stream`,
@@ -392,7 +398,8 @@ class InsufficientBalanceError(PlanLimitError):
 
     @property
     def projected_micros(self) -> int | None:
-        """The spendable balance the platform saw, in USD micros, when it said."""
+        """What counted toward this, in USD micros, when it said: the spendable
+        balance, or, once a balance has run out, only the credit added since."""
         return _safe_micros(self.body, "projected_micros")
 
     @property
@@ -417,8 +424,8 @@ class InsufficientCreditsError(APIError):
     :meth:`~mandala_computer.Computer.agent_stream` and
     :meth:`~mandala_computer.Computer.agent_once` (and their async twins) when
     the run was started without a ``model_key`` — so it would have run on the
-    account's Mandala AI credits — and the account did not have the $0.25 the
-    first model call reserves. The platform says so with a 402 carrying
+    account's Mandala AI credits — and the account did not have the $0.02 the
+    first model call needs at least. The platform says so with a 402 carrying
     :attr:`top_up_url`, which is what tells it apart from the model provider's
     own 402 on a run with your key (:class:`ModelProviderError`). Nothing ran:
     the refusal comes before the first model call.

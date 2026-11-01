@@ -2359,6 +2359,9 @@ def test_terminal_refusals_escape_the_computer(payload: dict, want: str) -> None
     row = {**payload, "id": "vm-9", "name": EVIL_NAME}
     respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[row]))
     respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
+    respx.get(f"{BASE}/whoami").mock(
+        return_value=httpx.Response(200, json={"key": {"expires_at": None}})
+    )
     with pytest.raises(SystemExit) as caught:
         _cli.main(["terminal", "vm-9"])
     shown = str(caught.value.code)
@@ -3656,3 +3659,82 @@ def test_terminal_connection_failure_escapes_the_reason(monkeypatch: pytest.Monk
     assert shown == (
         "mandala-py: terminal connection failed: closed: \\u001b]0;x\\u0007\\u202e\\u000aforged"
     )
+
+
+@respx.mock
+def test_api_keys_create_sends_the_limits_it_was_given() -> None:
+    asked = {
+        "id": "key-1",
+        "name": None,
+        "prefix": "com_1",
+        "created_at": "2026-11-01T00:00:00Z",
+        "workspace_id": None,
+        "manage_keys": False,
+        "raw": "com_secret",
+        "expires_at": "2026-11-02T00:00:00Z",
+        "computer_ids": ["vm-0123456789ab", "vm-ba9876543210"],
+    }
+    route = respx.post(f"{BASE}/api-keys").mock(return_value=httpx.Response(201, json=asked))
+    assert (
+        _cli.main(
+            [
+                "api-keys",
+                "create",
+                "--expires-at",
+                "2026-11-02T00:00:00Z",
+                "--computer",
+                "vm-0123456789ab",
+                "--computer",
+                "vm-ba9876543210",
+            ]
+        )
+        == 0
+    )
+    sent = json.loads(route.calls[0].request.content)
+    assert sent == {
+        "expires_at": "2026-11-02T00:00:00Z",
+        "computer_ids": ["vm-0123456789ab", "vm-ba9876543210"],
+    }
+
+
+@pytest.mark.parametrize("hours", ["0", "-1", "8785", "nan", "inf"])
+def test_api_keys_create_refuses_an_expiry_before_any_request(
+    hours: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with respx.mock as router:
+        assert _cli.main(["api-keys", "create", f"--expires-in={hours}"]) == 1
+        assert not router.calls
+
+
+def test_api_keys_create_takes_one_expiry(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as caught:
+        _cli.main(["api-keys", "create", "--expires-in", "1", "--expires-at", "x"])
+    assert caught.value.code == 2
+
+
+@respx.mock
+def test_api_keys_list_shows_each_keys_limits(capsys: pytest.CaptureFixture[str]) -> None:
+    limited = {
+        **HOSTILE_KEY,
+        "expires_at": "2026-11-02T00:00:00Z",
+        "computer_ids": ["vm-0123456789ab"],
+    }
+    respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[limited]))
+    assert _cli.main(["api-keys", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "EXPIRES" in out and "COMPUTERS" in out
+    assert "2026-11-02T00:00:00Z" in out and "vm-0123456789ab" in out
+
+
+@respx.mock
+def test_terminal_on_a_key_that_expires_says_so() -> None:
+    computer = {"id": "vm-0123456789ab", "name": "dev", "status": "running", "os": "linux"}
+    respx.get(f"{BASE}/computers").mock(return_value=httpx.Response(200, json=[computer]))
+    respx.get(f"{BASE}/computers/vm-0123456789ab").mock(
+        return_value=httpx.Response(200, json=computer)
+    )
+    respx.get(f"{BASE}/whoami").mock(
+        return_value=httpx.Response(200, json={"key": {"expires_at": "2027-01-01T00:00:00Z"}})
+    )
+    with pytest.raises(SystemExit, match="no expiry"):
+        _cli.main(["terminal", "vm-0123456789ab"])

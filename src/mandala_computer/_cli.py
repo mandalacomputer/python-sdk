@@ -1034,6 +1034,9 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
         _die("interactive terminal requires a Unix-like local terminal")
     with _client() as client:
         c = _resolve(client, args.target).refresh()
+        no_channel = c.vnc is None and c.os != "windows" and c.status in ("running", "suspended")
+        if no_channel and c._key_expires():
+            _die(lambda s: _api.expiring_key_no_connection(s(c.id)), "permission_denied")
     vnc = c.vnc
     if vnc is None or not vnc.terminal_url:
         if c.os == "windows":
@@ -2630,10 +2633,13 @@ def _api_key_rows(keys: Sequence[ApiKey]) -> str:
             "yes" if k.manage_keys else "no",
             k.last_used_at or "never",
             _printable(k.minted_by_key_id) if k.minted_by_key_id else "-",
+            _printable(k.expires_at) if k.expires_at else "never",
+            ",".join(_printable(c) for c in k.computer_ids) if k.computer_ids else "all",
         )
         for k in keys
     ]
-    return _table(("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED", "MINTED BY"), rows)
+    headers = ("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED", "MINTED BY")
+    return _table((*headers, "EXPIRES", "COMPUTERS"), rows)
 
 
 def _whoami_person_account(w: Whoami) -> list[str]:
@@ -2731,7 +2737,13 @@ def _cmd_api_keys_list(args: argparse.Namespace) -> int:
 def _cmd_api_keys_create(args: argparse.Namespace) -> int:
     workspace = _scope(args)
     with _client() as client:
-        created = client.api_keys.create(name=args.name, workspace_id=workspace)
+        created = client.api_keys.create(
+            name=args.name,
+            workspace_id=workspace,
+            expires_at=args.expires_at,
+            expires_in_hours=args.expires_in,
+            computer_ids=args.computer,
+        )
     # The key alone on stdout, so `KEY=$(mandala-py api-keys create)` captures
     # it and nothing else; what it is and the warning go to stderr.
     if args.json:
@@ -2870,6 +2882,24 @@ def _keys_parsers(sub: Any) -> None:
             "confine the key to this workspace (default: the saved profile's workspace from "
             "`workspaces use`, else the calling key's own scope)"
         ),
+    )
+    expiry = create.add_mutually_exclusive_group()
+    expiry.add_argument(
+        "--expires-in",
+        type=float,
+        metavar="HOURS",
+        help="expire the key this many hours from now (at most 8784, 366 days)",
+    )
+    expiry.add_argument(
+        "--expires-at",
+        metavar="TIME",
+        help="expire the key at this RFC 3339 time, at most 366 days ahead",
+    )
+    create.add_argument(
+        "--computer",
+        action="append",
+        metavar="ID",
+        help="limit the key to this computer ID; repeat for more (up to 50)",
     )
     create.add_argument("--json", action="store_true", help="the new key as JSON, under raw")
     create.set_defaults(fn=_cmd_api_keys_create)

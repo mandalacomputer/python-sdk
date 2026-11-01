@@ -49,6 +49,7 @@ from ._client import (
     Transport,
     _retained_exec_object,
     error_for_status,
+    retained_output,
 )
 from ._events import (
     DEFAULT_MAX_QUEUE,
@@ -2777,6 +2778,8 @@ class Computer(ComputerFields):
         self._data = dict(data)
         self._note_clone_answer(data)
         self._operation_id = operation_id_of(data)
+        #: Whether this client's API key expires, once ``GET whoami`` has said.
+        self._key_expiry: bool | None = None
 
     # --- lifecycle ------------------------------------------------------
 
@@ -3199,7 +3202,8 @@ class Computer(ComputerFields):
         anything is sent.
 
         ``0`` means never: no idle suspend, and no eviction under memory
-        pressure either. It is capped per plan — Solo 0, Studio 1, Fleet 4
+        pressure either. It is capped per plan — Studio 1, Swarm 4, none on any
+        other plan
         computers pinned this way at once — and pinning one past the cap raises
         :class:`~mandala_computer.PlanLimitError`. Choose a timeout on another
         computer, or change the plan, to pin this one.
@@ -4665,6 +4669,19 @@ class Computer(ComputerFields):
         picture with :meth:`screenshot` afterwards. ``context=True`` adds the
         desktop after the batch, as :meth:`click` does.
 
+        A batch may also hold checks, which are this platform's rather than
+        OpenAI's: ``{"type": "wait_for", "until": "screen_changed"}`` holds the
+        batch until the screen differs from just before the previous action,
+        ``"screen_stable"`` until it stops changing, and ``"window_title"``
+        until the focused window's title contains ``contains`` (see
+        :class:`~mandala_computer.InputWaitFor`). A passed check's result
+        carries :attr:`~mandala_computer.InputBatchActionResult.waited_ms`. A
+        check that fails stops the batch there, as
+        :class:`~mandala_computer.InputBatchError` with status 400 whose
+        ``result.error`` names the condition. That 400 is not final: look at a
+        fresh screenshot and decide. Checks are only for batches, and a batch's
+        check timeouts and waits together are at most 60 seconds.
+
         A batch REFUSED before any action ran — a malformed one, a computer
         that is not running, the input lane busy — raises the ordinary error
         for its status, and nothing happened. The exception is a 503
@@ -4800,7 +4817,10 @@ class Computer(ComputerFields):
             # Explicit capture still refuses redirects and never replays a POST.
             follow_redirects=None if retain_output is False else False,
         )
-        result = ExecResult.from_api(_retained_exec_object(response, path))
+        result = replace(
+            ExecResult.from_api(_retained_exec_object(response, path)),
+            retained_output=retained_output(response),
+        )
         if response.status_code != 200:
             return result
         return replace(
@@ -5297,7 +5317,10 @@ class Computer(ComputerFields):
         :class:`~mandala_computer.CreateOnlyConflictError`, with ``reason``
         ``None`` and a message saying the reason is unknown: final, and not a
         claim that the path is taken. The default, ``True``, replaces whatever is at
-        ``path``, as this method always has. Linux computers only: a Windows
+        ``path``, as this method always has: it writes directly to it, so an
+        existing file is truncated as the body starts, and a failed or cut-off
+        write leaves only the bytes that arrived. Use ``overwrite=False`` or
+        :meth:`upload_file` when a partial file must never appear there. Linux computers only: a Windows
         computer refuses ``overwrite=False`` with a 400. A host that cannot do
         create-only yet refuses it with a 409 whose ``reason`` is
         ``"unsupported"``, and one whose support could not be confirmed with a
@@ -6717,6 +6740,24 @@ class Computer(ComputerFields):
         # not elapsed.
         raise MandalaError(f"{self.id}'s event stream ended before {names} arrived")
 
+    def _key_expires(self, timeout_cap: float | None = None) -> bool:
+        """Whether this client's API key has an expiry, from ``GET whoami``.
+
+        What tells an answer with no ``vnc`` on it apart: a key with an expiry
+        never gets one, and any other key misses one only while the host cannot
+        be reached. Asked once, and only when that question comes up. A read
+        that fails says nothing, so it is ``False`` and asked again next time.
+        """
+        if self._key_expiry is None:
+            if timeout_cap is not None and timeout_cap <= 0:
+                return False
+            try:
+                data = self._t.json_object("GET", _api.WHOAMI, timeout_cap=timeout_cap)
+            except MandalaError:
+                return False
+            self._key_expiry = _api.key_expires(data)
+        return self._key_expiry
+
     def _events_url(self, timeout_cap: float | None = None) -> str:
         """A fresh ``events_url``, on every connection and every reconnect.
 
@@ -6731,6 +6772,7 @@ class Computer(ComputerFields):
         ``wait_for(timeout=5)`` against an unresponsive control plane sat here
         for sixty seconds before anything looked at the five (Codex review).
         """
+        started = time.monotonic()
         try:
             self._refresh(timeout_cap=timeout_cap)
         except MandalaError as err:
@@ -6746,9 +6788,15 @@ class Computer(ComputerFields):
         if vnc is not None and vnc.events_url:
             return vnc.events_url
         if vnc is None:
-            # The platform could not reach the host holding this computer, so
-            # it sent no connect surface at all. Weather, and the stream's own
-            # backoff is the right response to it — deliberately not settled.
+            # An API key that expires is never given a connect surface, whatever
+            # state the computer is in, so that answer is final.
+            left = None if timeout_cap is None else timeout_cap - (time.monotonic() - started)
+            if self._key_expires(left):
+                raise _settle(MandalaError(_api.expiring_key_no_connection(self.id)))
+            # Otherwise the platform could not reach the host holding this
+            # computer, so it sent no connect surface at all. Weather, and the
+            # stream's own backoff is the right response to it — deliberately
+            # not settled.
             raise ConnectionError(
                 f"the platform did not return a connect surface for {self.id}; "
                 "its host may be unreachable"

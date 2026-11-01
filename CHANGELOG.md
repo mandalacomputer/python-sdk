@@ -18,14 +18,47 @@ This is the summary you read to decide whether to upgrade.
   the account's computers cost an hour now (`burn_micros_per_hour`) and how
   many seconds the balance lasts at that rate (`runway_seconds`, `0` once it
   has run out). Against a platform that does not send these fields, all three
-  read `None`. The credit journal's `kind` gains `"compute"`: one day of
-  pay-as-you-go computers.
+  read `None`. The credit journal's `kind` gains `"compute"`: one host's share
+  of one day of pay-as-you-go computers.
 - `InsufficientBalanceError`, a `PlanLimitError` raised for a 402 whose `code`
   is `INSUFFICIENT_BALANCE`. It means a pay-as-you-go account's balance is too
   low to start this: a create, start, restart, restore, resume, clone or
   build. `projected_micros` and `required_micros` carry the balance and what
   starting needed. `mandala-py --json` reports it as `insufficient_balance`.
   Code that catches `PlanLimitError` still catches it.
+- `input_batch` takes the platform's `wait_for` check, on both clients:
+  `{"type": "wait_for", "until": "screen_changed" | "screen_stable" |
+  "window_title", ...}`, with `timeout_ms`, `region`, `stable_ms` and `contains`.
+  It was refused with `ValueError` before. A malformed check still is, before
+  anything is sent. A check that is not met raises `InputBatchError` with status
+  400, which is not final. `InputWaitFor` and `WaitForRegion` type it, and
+  `InputBatchActionResult.waited_ms` says how long a passed check waited.
+- `ExecResult.retained_output` and `APIError.retained_output` read
+  `X-GC-Retained-Output`: `"unavailable"` when `retain_output` was asked for and
+  no retained result was published, on a success or a failure. `None` otherwise,
+  and `result_id` is unchanged.
+- `mandala-py api-keys create` takes `--expires-in HOURS`, `--expires-at TIME`
+  and `--computer ID`, as `mandala` does, and `api-keys list` gains `EXPIRES` and
+  `COMPUTERS` columns, after the existing ones.
+
+### Fixed
+
+- On an API key that expires, `events()` retried for ever and `wait_for()` waited
+  out its whole timeout, blaming the host. Such a key never gets a computer's
+  `vnc`, so both now raise `MandalaError` at once, saying a key with no expiry is
+  needed. The stream asks `GET whoami` once when an answer has no `vnc`; a read
+  that fails leaves the old behaviour, and any other key still waits out an
+  unreachable host. `mandala-py terminal` says the same.
+
+### Documentation
+
+- The README covers end times, key limits, pay as you go billing fields,
+  `InsufficientBalanceError`, trial `code`s, a suspended account's webhooks, `gap`
+  deliveries and usable credential gateway secret values. A funded run needs
+  $0.02 available, not $0.25; `max_cost_usd`'s floor of $0.25 is unchanged.
+  Corrected: earlier chat messages are given to the model, `agent_runs.cancel`
+  leaves a funded call in flight to finish, `write_file`'s default writes directly
+  to the path, and the plans that may pin a computer are Studio and Swarm.
 
 ## [0.21.0] - 2026-10-30
 

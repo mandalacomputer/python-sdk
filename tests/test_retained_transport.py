@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+import respx
 from tests.test_api_contract import computer, resolved
 from tests.test_artifacts import ARTIFACT_ID, artifact_manifest
 from tests.test_retained_results import EXECUTION_ID, RESULT_ID, result_manifest
@@ -470,3 +471,56 @@ async def test_default_exec_keeps_the_injected_clients_existing_redirect_policy(
         result = await resolved(c.exec("true", retain_output=False))
         assert result.exit_code == 0 and not raw.is_closed
     assert len(calls) == 2
+
+
+@respx.mock
+def test_exec_reports_a_capture_the_platform_could_not_publish() -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"X-GC-Retained-Output": "unavailable"},
+            json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""},
+        )
+    )
+    client = mc.Client("gck_test", base_url=BASE)
+    done = mc.Computer(client._t, {"id": "vm-1"}).exec("true", retain_output=True)
+    assert done.retained_output == "unavailable"
+    assert done.result_id is None
+
+
+@respx.mock
+def test_exec_without_the_header_reports_nothing() -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        return_value=httpx.Response(200, json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""})
+    )
+    client = mc.Client("gck_test", base_url=BASE)
+    assert mc.Computer(client._t, {"id": "vm-1"}).exec("true").retained_output is None
+
+
+@respx.mock
+def test_a_failed_exec_carries_the_same_word() -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        return_value=httpx.Response(
+            409,
+            headers={"X-GC-Retained-Output": "unavailable"},
+            json={"error": "busy", "reason": "contention"},
+        )
+    )
+    client = mc.Client("gck_test", base_url=BASE)
+    with pytest.raises(mc.ConflictError) as caught:
+        mc.Computer(client._t, {"id": "vm-1"}).exec("true", retain_output=True)
+    assert caught.value.retained_output == "unavailable"
+
+
+@respx.mock
+async def test_the_async_exec_reads_the_same_header() -> None:
+    respx.post(f"{BASE}/computers/vm-1/exec").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"X-GC-Retained-Output": "unavailable"},
+            json={"exit_code": 0, "stdout_b64": "", "stderr_b64": ""},
+        )
+    )
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        done = await mc.AsyncComputer(client._t, {"id": "vm-1"}).exec("true", retain_output=True)
+    assert done.retained_output == "unavailable"

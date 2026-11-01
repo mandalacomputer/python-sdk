@@ -94,6 +94,23 @@ SSH_KEYS = "ssh-keys"
 #: it acts with, the workspace it is confined to, and the key itself. Needs no
 #: permission, and answers a suspended account too.
 WHOAMI = "whoami"
+
+
+def key_expires(whoami: Mapping[str, Any]) -> bool:
+    """Whether a ``GET whoami`` answer describes a key minted with an expiry."""
+    key = whoami.get("key")
+    expires_at = key.get("expires_at") if isinstance(key, Mapping) else None
+    return isinstance(expires_at, str) and bool(expires_at)
+
+
+def expiring_key_no_connection(computer_id: str) -> str:
+    """Why a key with an expiry cannot reach a computer's connection channels."""
+    return (
+        f"{computer_id}: this API key expires, so it gets no desktop, terminal or event "
+        "connection: those credentials would outlive it. Use an API key with no expiry."
+    )
+
+
 #: The holder's own API keys (platform OPL-5053). Every verb needs the key to be
 #: allowed to manage keys, an opt-in only a dashboard session turns on;
 #: without it the platform answers 403 with a sentence that says so.
@@ -2382,8 +2399,91 @@ _OPENAI_FIELDS: dict[str, tuple[str, ...]] = {
     "type": ("text",),
     "wait": (),
     "screenshot": (),
+    "wait_for": ("until", "timeout_ms", "region", "stable_ms", "contains"),
 }
 _OPENAI_BUTTONS = ("left", "right", "wheel", "back", "forward")
+#: The optional fields each condition of a batch's ``wait_for`` check reads,
+#: beside ``timeout_ms``, which all three do.
+_WAIT_FOR_FIELDS: dict[str, tuple[str, ...]] = {
+    "screen_changed": ("region",),
+    "screen_stable": ("region", "stable_ms"),
+    "window_title": ("contains",),
+}
+WAIT_FOR_TIMEOUT_MAX_MS = 30_000
+WAIT_FOR_STABLE_MIN_MS = 100
+WAIT_FOR_STABLE_MAX_MS = 10_000
+WAIT_FOR_CONTAINS_MAX_BYTES = 256
+#: The largest coordinate the platform reads, and so the largest ``region`` field.
+INPUT_MAX_COORDINATE = 10_000_000
+
+
+def _wait_for_ms(value: object, name: str, low: int, high: int) -> int:
+    message = f"{name} must be a whole number of milliseconds from {low} to {high}, not {value!r}"
+    ms = whole(value, name, exc=ValueError, message=message)
+    if not low <= ms <= high:
+        raise ValueError(message)
+    return ms
+
+
+def _wait_for_region(value: object, at: str) -> dict[str, int]:
+    message = (
+        f"{at}.region must be {{x, y, width, height}}: whole numbers, x and y from 0, "
+        f"width and height above 0, each at most {INPUT_MAX_COORDINATE}"
+    )
+    if not isinstance(value, Mapping) or set(value) != {"x", "y", "width", "height"}:
+        raise ValueError(message)
+    region: dict[str, int] = {}
+    for key, low in (("x", 0), ("y", 0), ("width", 1), ("height", 1)):
+        number = whole(value[key], key, exc=ValueError, message=message)
+        if not low <= number <= INPUT_MAX_COORDINATE:
+            raise ValueError(message)
+        region[key] = number
+    return region
+
+
+def _wait_for_action(action: Mapping[str, Any], at: str) -> dict[str, Any]:
+    """One ``wait_for`` check, as the platform will read it.
+
+    Each field is sent only when given, so its default stays the platform's.
+    What a batch's checks and waits come to together is the platform's to
+    refuse, like the batch's other totals.
+    """
+    until = action.get("until")
+    until = str.__str__(until) if isinstance(until, str) else until
+    takes = _WAIT_FOR_FIELDS.get(until) if isinstance(until, str) else None
+    if takes is None:
+        raise ValueError(f"{at}.until must be one of {', '.join(_WAIT_FOR_FIELDS)}, not {until!r}")
+    for key in action:
+        if key not in ("type", "until", "timeout_ms", *takes):
+            raise ValueError(f"{at}: wait_for {until} does not take {key!r}")
+    out: dict[str, Any] = {"type": "wait_for", "until": until}
+    if "timeout_ms" in action:
+        out["timeout_ms"] = _wait_for_ms(
+            action["timeout_ms"], f"{at}.timeout_ms", 0, WAIT_FOR_TIMEOUT_MAX_MS
+        )
+    if "region" in action:
+        out["region"] = _wait_for_region(action["region"], at)
+    if "stable_ms" in action:
+        out["stable_ms"] = _wait_for_ms(
+            action["stable_ms"], f"{at}.stable_ms", WAIT_FOR_STABLE_MIN_MS, WAIT_FOR_STABLE_MAX_MS
+        )
+    if until == "window_title":
+        message = (
+            f"{at}.contains must be text of 1 to {WAIT_FOR_CONTAINS_MAX_BYTES} bytes "
+            "for window_title"
+        )
+        contains = action.get("contains")
+        if not isinstance(contains, str):
+            raise ValueError(message)
+        text = canonical(contains, f"{at}.contains")
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError(message) from exc
+        if not 1 <= size <= WAIT_FOR_CONTAINS_MAX_BYTES:
+            raise ValueError(message)
+        out["contains"] = text
+    return out
 
 
 def _openai_action(item: object, at: str) -> Mapping[str, Any]:
@@ -2433,6 +2533,9 @@ def input_batch_body(actions: object) -> list[dict[str, Any]]:
         reads = _OPENAI_FIELDS.get(kind) if isinstance(kind, str) else None
         if reads is None:
             raise ValueError(f"{at}.type must be one of {', '.join(_OPENAI_FIELDS)}, not {kind!r}")
+        if kind == "wait_for":
+            body.append(_wait_for_action(action, at))
+            continue
         for key in action:
             if key != "type" and key not in reads:
                 raise ValueError(f"{at}: OpenAI {kind} does not take {key!r}")

@@ -68,6 +68,7 @@ __all__ = [
     "InputBatchActionResult",
     "InputBatchResult",
     "InputContext",
+    "InputWaitFor",
     "LifecycleAck",
     "Listing",
     "Move",
@@ -110,6 +111,7 @@ __all__ = [
     "UsageReport",
     "UsageTotals",
     "VncConnect",
+    "WaitForRegion",
     "Webhook",
     "WebhookCreated",
     "WebhookDelivery",
@@ -2712,6 +2714,37 @@ class _OpenAIMarker(TypedDict):
     type: Literal["wait", "screenshot"]
 
 
+class WaitForRegion(TypedDict):
+    """A part of the screen, in pixels, for a ``wait_for`` check."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+class _WaitForFields(TypedDict, total=False):
+    timeout_ms: int
+    region: WaitForRegion
+    stable_ms: int
+    contains: str
+
+
+class InputWaitFor(_WaitForFields):
+    """A check inside a batch: hold it until a condition is met, or fail there.
+
+    Not one of OpenAI's actions, and only for
+    :meth:`~mandala_computer.Computer.input_batch`. ``until`` is
+    ``"screen_changed"`` (``region``), ``"screen_stable"`` (``region``,
+    ``stable_ms``, 100 to 10000, default 500) or ``"window_title"`` (``contains``,
+    1 to 256 bytes, required; Linux computers). ``timeout_ms`` is 0 to 30000,
+    default 10000, and 0 checks once.
+    """
+
+    type: Literal["wait_for"]
+    until: Literal["screen_changed", "screen_stable", "window_title"]
+
+
 class OpenAIActionObject(Protocol):
     """An ``openai`` package action object (``ActionClick`` and the rest), which
     :meth:`~mandala_computer.Computer.input_batch` takes as it is: anything
@@ -2736,6 +2769,7 @@ OpenAIComputerAction = (
     | _OpenAIKeypress
     | _OpenAIType
     | _OpenAIMarker
+    | InputWaitFor
 )
 
 
@@ -2749,6 +2783,9 @@ class InputBatchActionResult:
     #: :meth:`~mandala_computer.Computer.type` reports it. ``None`` otherwise.
     mechanism: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: On a passed ``wait_for`` check: how long it waited, in milliseconds.
+    #: ``None`` otherwise. Keyword-only, so it changes no existing construction.
+    waited_ms: int | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -2808,7 +2845,12 @@ class InputBatchResult:
             if mechanism is not None and not isinstance(mechanism, str):
                 refuse(f"results[{i}].mechanism", "a string when present")
             results.append(
-                InputBatchActionResult(ok=row["ok"], mechanism=mechanism or None, raw=dict(row))
+                InputBatchActionResult(
+                    ok=row["ok"],
+                    mechanism=mechanism or None,
+                    raw=dict(row),
+                    waited_ms=_opt_whole(row.get("waited_ms")),
+                )
             )
         at = d.get("failed_index")
         if at is not None and (isinstance(at, bool) or not isinstance(at, int) or at < 0):
@@ -3291,6 +3333,13 @@ class ExecResult:
     #: A confirmed retained version, absent when optional capture was unconfirmed.
     #: Keyword-only and excluded from equality/hash and positional matching.
     result_id: str | None = field(default=None, kw_only=True, compare=False)
+
+    #: ``"unavailable"`` when ``retain_output`` was asked for and no retained
+    #: result was published, so the command's own answer is all there is. ``None``
+    #: when one was published, and whenever retention was not asked for, as from
+    #: a platform that does not say. Keyword-only and out of equality, as
+    #: :attr:`result_id` is.
+    retained_output: str | None = field(default=None, kw_only=True, compare=False)
 
     @property
     def stdout_text(self) -> str:
@@ -5423,9 +5472,10 @@ class CreditEntry:
     id: int
     #: The lot credited or expired; ``None`` for a debit that spans lots.
     lot_id: str | None
-    #: ``credit``, ``debit``, ``expire``, ``clawback`` or ``debt_settle``. An
-    #: open set. The amount's DIRECTION depends on it, so do not sum entries
-    #: without reading this.
+    #: ``credit``, ``debit``, ``compute``, ``expire``, ``clawback`` or
+    #: ``debt_settle``. An open set. The amount's DIRECTION depends on it, so do
+    #: not sum entries without reading this. On pay as you go a ``compute`` entry
+    #: is one host's share of one day, so add them up to get the day.
     kind: str
     #: Never negative: a ``credit`` adds a lot, a ``debit`` or ``clawback``
     #: consumes credits (and may create debt), an ``expire`` removes a

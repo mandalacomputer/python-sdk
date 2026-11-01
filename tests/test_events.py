@@ -1082,10 +1082,81 @@ def test_a_host_that_could_not_be_reached_is_weather(
     holding this computer, and the backoff is the right response to that."""
     bare = {k: v for k, v in COMPUTER.items() if k != "vnc"}
     respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=bare))
+    respx.get(f"{BASE}/whoami").mock(
+        httpx.Response(200, json={"key": {"id": "key-1", "expires_at": None}})
+    )
     Dialer().install(monkeypatch)
     c = client.computers.get("vm-1")
     with pytest.raises(mc.ConnectionError, match="connect surface"):
         list(c.events(backoff=0.001, max_retries=1))
+
+
+@respx.mock
+def test_a_whoami_that_fails_leaves_it_weather_and_is_asked_again(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed read says nothing about the key, so it decides nothing."""
+    bare = {k: v for k, v in COMPUTER.items() if k != "vnc"}
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=bare))
+    whoami = respx.get(f"{BASE}/whoami").mock(httpx.Response(503, json={"error": "later"}))
+    Dialer().install(monkeypatch)
+    c = client.computers.get("vm-1")
+    with pytest.raises(mc.ConnectionError, match="connect surface"):
+        list(c.events(backoff=0.001, max_retries=2))
+    assert whoami.call_count >= 2
+
+
+@respx.mock
+def test_a_key_that_expires_ends_the_stream_and_says_why(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Such a key is never given a connect surface, on any computer in any
+    state, so reconnecting asks a question already answered."""
+    bare = {k: v for k, v in COMPUTER.items() if k != "vnc"}
+    read = respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=bare))
+    whoami = respx.get(f"{BASE}/whoami").mock(
+        httpx.Response(200, json={"key": {"id": "key-1", "expires_at": "2027-01-01T00:00:00Z"}})
+    )
+    Dialer().install(monkeypatch)
+    c = client.computers.get("vm-1")
+    reads = read.call_count
+    with pytest.raises(mc.MandalaError, match="no expiry") as caught:
+        list(c.events(backoff=0.001))
+    assert not isinstance(caught.value, mc.ConnectionError)
+    assert read.call_count == reads + 1
+    assert whoami.call_count == 1
+
+
+@respx.mock
+def test_wait_for_on_a_key_that_expires_ends_at_once(
+    client: mc.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bare = {k: v for k, v in COMPUTER.items() if k != "vnc"}
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=bare))
+    respx.get(f"{BASE}/whoami").mock(
+        httpx.Response(200, json={"key": {"expires_at": "2027-01-01T00:00:00Z"}})
+    )
+    Dialer().install(monkeypatch)
+    c = client.computers.get("vm-1")
+    with pytest.raises(mc.MandalaError, match="no expiry") as caught:
+        c.wait_for("computer.ready", timeout=30)
+    assert not isinstance(caught.value, mc.TimeoutError)
+
+
+@respx.mock
+async def test_the_async_stream_ends_on_a_key_that_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bare = {k: v for k, v in COMPUTER.items() if k != "vnc"}
+    respx.get(f"{BASE}/computers/vm-1").mock(httpx.Response(200, json=bare))
+    respx.get(f"{BASE}/whoami").mock(
+        httpx.Response(200, json={"key": {"expires_at": "2027-01-01T00:00:00Z"}})
+    )
+    Dialer(cls=AsyncFakeSocket).install(monkeypatch)
+    async with mc.AsyncClient("gck_test", base_url=BASE) as client:
+        c = await client.computers.get("vm-1")
+        with pytest.raises(mc.MandalaError, match="no expiry"):
+            [ev async for ev in c.events(backoff=0.001)]
 
 
 @respx.mock
