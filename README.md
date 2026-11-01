@@ -3119,10 +3119,10 @@ upstream as `Authorization: Bearer <secret>`, or as `x-api-key: <secret>` with
 in it can read the secret.
 
 The secret's value must be printable ASCII with no spaces or line breaks, and a
-trailing newline counts. A binding to any other value is still created, but
-every call through it is refused with a `503` inside the computer. Replacing the
-value with `client.secrets.set(...)` fixes that; the binding does not need
-remaking.
+trailing newline counts. Any other value is refused with a `400` when the binding
+is created. A later replace with such a value is not refused, and every call
+through the binding then answers `503` inside the computer until
+`client.secrets.set(...)` replaces it again; the binding does not need remaking.
 
 ```python
 computer_id = "vm-..."
