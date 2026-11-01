@@ -3607,7 +3607,7 @@ def test_wait_for_proxy_escapes_a_stopped_computers_name(
     row = {"id": "vm-9", "name": f"box\x1b[2J{RLO}", "status": "stopped", "running_ram_mb": 0}
     respx.get(f"{BASE}/computers/vm-9").mock(return_value=httpx.Response(200, json=row))
     c = _cli._client().computers.get("vm-9")
-    _cli._wait_for_proxy(c)
+    _cli._wait_for_proxy(c, expect_browser_proxy=False)
     err = capsys.readouterr().err
     _clean(err)
     assert err == (

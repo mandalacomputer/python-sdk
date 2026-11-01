@@ -32,11 +32,18 @@ This is the summary you read to decide whether to upgrade.
   It was refused with `ValueError` before. A malformed check still is, before
   anything is sent. A check that is not met raises `InputBatchError` with status
   400, which is not final. `InputWaitFor` and `WaitForRegion` type it, and
-  `InputBatchActionResult.waited_ms` says how long a passed check waited.
+  `InputBatchActionResult.waited_ms` says how long a passed check waited; one
+  that is not a count raises `MandalaError`, as `mechanism` does.
 - `ExecResult.retained_output` and `APIError.retained_output` read
   `X-GC-Retained-Output`: `"unavailable"` when `retain_output` was asked for and
   no retained result was published, on a success or a failure. `None` otherwise,
   and `result_id` is unchanged.
+- `mandala-py browser-proxy set --wait` and `clear --wait` judge every read by one
+  rule. Only an explicit `running_ram_mb` of 0 on a stopped or suspended computer
+  counts as stored for its next start. An unknown or admitted start is watched,
+  for up to 180 seconds, and running out of time on it is a `timeout` failure,
+  where an unknown one used to be reported as stored. Each read is bounded by that
+  deadline and retried like the SDK's waits, honouring a 429's `Retry-After`.
 - `mandala-py api-keys create` takes `--expires-in HOURS`, `--expires-at TIME`
   and `--computer ID`, as `mandala` does, and `api-keys list` gains `EXPIRES` and
   `COMPUTERS` columns, after the existing ones.

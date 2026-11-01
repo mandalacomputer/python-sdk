@@ -738,6 +738,136 @@ def test_cli_wait_on_a_stopped_computer_reports_the_change_stored(cli_env, capsy
 
 
 @respx.mock
+@pytest.mark.parametrize("held", [{}, {"running_ram_mb": 1024}], ids=["unknown", "admitted"])
+def test_cli_wait_watches_a_stopped_computer_that_may_be_starting(
+    cli_env, capsys, monkeypatch, held
+):
+    """An unknown or admitted start is watched, however often it is read, and
+    only then does the running answer decide."""
+    monkeypatch.setattr(computers.time, "sleep", lambda _: None)
+    listing()
+    starting = {**COMPUTER, "name": "dev", "status": "suspended", **held}
+    respx.patch(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=starting))
+    reads = respx.get(f"{BASE}/computers/launch-42").mock(
+        side_effect=[
+            httpx.Response(200, json=starting),
+            httpx.Response(200, json=starting),
+            httpx.Response(200, json={**COMPUTER, "name": "dev", "browser_proxy_pending": True}),
+            httpx.Response(200, json={**COMPUTER, "name": "dev"}),
+        ]
+    )
+    assert _cli.main(["browser-proxy", "clear", "dev", "--wait"]) == 0
+    assert reads.call_count == 4
+    assert "stored" not in capsys.readouterr().err
+
+
+@respx.mock
+def test_cli_wait_says_stored_at_the_read_that_shows_it(cli_env, capsys, monkeypatch):
+    """The rule is every read's: a start that lapses ends the wait as stored."""
+    monkeypatch.setattr(computers.time, "sleep", lambda _: None)
+    listing()
+    unknown = {**COMPUTER, "name": "dev", "status": "stopped"}
+    respx.patch(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=unknown))
+    respx.get(f"{BASE}/computers/launch-42").mock(
+        side_effect=[
+            httpx.Response(200, json=unknown),
+            httpx.Response(200, json={**unknown, "running_ram_mb": 1024}),
+            httpx.Response(200, json={**unknown, "running_ram_mb": 0}),
+        ]
+    )
+    assert _cli.main(["browser-proxy", "clear", "dev", "--wait"]) == 0
+    assert "the change is stored" in capsys.readouterr().err
+
+
+@respx.mock
+@pytest.mark.parametrize("held", [{}, {"running_ram_mb": 1024}], ids=["unknown", "admitted"])
+def test_cli_wait_that_runs_out_on_a_start_is_a_timeout(cli_env, capsys, monkeypatch, held):
+    listing()
+    monkeypatch.setattr(_cli, "_PROXY_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(_cli, "_PROXY_POLL_SECONDS", 0.001)
+    starting = {**COMPUTER, "name": "dev", "status": "stopped", **held}
+    respx.patch(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=starting))
+    respx.get(f"{BASE}/computers/launch-42").mock(return_value=httpx.Response(200, json=starting))
+    assert _cli.main(["browser-proxy", "clear", "dev", "--wait", "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "timeout"
+    assert "stopped" in error["message"]
+
+
+@respx.mock
+def test_cli_wait_that_never_reads_is_a_timeout(cli_env, capsys, monkeypatch):
+    listing()
+    monkeypatch.setattr(_cli, "_PROXY_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(_cli, "_PROXY_POLL_SECONDS", 0.001)
+    respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json={**COMPUTER, "name": "dev"})
+    )
+    respx.get(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(503, json={"error": "later"})
+    )
+    assert _cli.main(["browser-proxy", "clear", "dev", "--wait", "--json"]) == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "timeout"
+    assert "never read" in error["message"]
+
+
+@respx.mock
+def test_cli_wait_honours_a_429s_retry_after(cli_env, capsys, monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(computers.time, "sleep", slept.append)
+    listing()
+    respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json={**COMPUTER, "name": "dev"})
+    )
+    respx.get(f"{BASE}/computers/launch-42").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "7"}, json={"error": "slow down"}),
+            httpx.Response(200, json={**COMPUTER, "name": "dev"}),
+        ]
+    )
+    assert _cli.main(["browser-proxy", "clear", "dev", "--wait"]) == 0
+    assert slept and slept[0] >= 7
+
+
+@respx.mock
+def test_cli_wait_bounds_each_read_by_its_deadline(cli_env, monkeypatch):
+    listing()
+    monkeypatch.setattr(_cli, "_PROXY_WAIT_SECONDS", 5.0)
+    respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json={**COMPUTER, "name": "dev"})
+    )
+    read = respx.get(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json={**COMPUTER, "name": "dev"})
+    )
+    assert _cli.main(["browser-proxy", "clear", "dev", "--wait"]) == 0
+    assert 0 < read.calls.last.request.extensions["timeout"]["read"] <= 5.0
+
+
+@respx.mock
+def test_cli_wait_on_a_set_is_not_done_until_a_running_read_carries_the_proxy(
+    cli_env, capsys, monkeypatch
+):
+    """A running read with neither the setting nor a pending flag says nothing
+    about a proxy that was just set."""
+    monkeypatch.setattr(computers.time, "sleep", lambda _: None)
+    listing()
+    bare = {**COMPUTER, "name": "dev"}
+    bare.pop("browser_proxy", None)
+    respx.patch(f"{BASE}/computers/launch-42").mock(
+        return_value=httpx.Response(200, json=proxied(False, name="dev"))
+    )
+    reads = respx.get(f"{BASE}/computers/launch-42").mock(
+        side_effect=[
+            httpx.Response(200, json=bare),
+            httpx.Response(200, json=bare),
+            httpx.Response(200, json=proxied(False, name="dev")),
+        ]
+    )
+    assert _cli.main(["browser-proxy", "set", "dev", SERVER, "--wait"]) == 0
+    assert reads.call_count == 3
+
+
+@respx.mock
 def test_cli_wait_rides_through_an_admitted_start(cli_env, capsys, monkeypatch):
     monkeypatch.setattr(computers.time, "sleep", lambda _: None)
     listing()

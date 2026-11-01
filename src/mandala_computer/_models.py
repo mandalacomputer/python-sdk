@@ -2844,12 +2844,16 @@ class InputBatchResult:
             mechanism = row.get("mechanism")
             if mechanism is not None and not isinstance(mechanism, str):
                 refuse(f"results[{i}].mechanism", "a string when present")
+            waited = row.get("waited_ms")
+            if waited is not None and (
+                isinstance(waited, bool)
+                or not isinstance(waited, int)
+                or not 0 <= waited <= 2**53 - 1
+            ):
+                refuse(f"results[{i}].waited_ms", "a nonnegative whole number when present")
             results.append(
                 InputBatchActionResult(
-                    ok=row["ok"],
-                    mechanism=mechanism or None,
-                    raw=dict(row),
-                    waited_ms=_opt_whole(row.get("waited_ms")),
+                    ok=row["ok"], mechanism=mechanism or None, raw=dict(row), waited_ms=waited
                 )
             )
         at = d.get("failed_index")

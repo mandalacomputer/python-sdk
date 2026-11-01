@@ -556,13 +556,15 @@ def test_a_check_that_fails_is_the_batch_stopping_at_a_400(computer: mc.Computer
 
 
 @respx.mock
-def test_an_unreadable_waited_ms_reads_as_none(computer: mc.Computer) -> None:
+@pytest.mark.parametrize("waited", ["soon", -1, 1.5, True])
+def test_a_waited_ms_that_is_not_a_count_is_refused(computer: mc.Computer, waited: object) -> None:
     respx.post(f"{BASE}/computers/vm-1/input").mock(
         return_value=httpx.Response(
-            200, json={"ok": True, "completed": 1, "results": [{"ok": True, "waited_ms": "x"}]}
+            200, json={"ok": True, "completed": 1, "results": [{"ok": True, "waited_ms": waited}]}
         )
     )
-    assert computer.input_batch([{"type": "wait"}]).results[0].waited_ms is None
+    with pytest.raises(mc.MandalaError, match="waited_ms"):
+        computer.input_batch([{"type": "wait"}])
 
 
 @respx.mock

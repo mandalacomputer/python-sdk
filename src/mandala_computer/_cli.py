@@ -4444,24 +4444,51 @@ def _bypass_list(values: Sequence[str] | None) -> list[str] | None:
     return entries
 
 
-def _wait_for_proxy(c: Computer) -> None:
+#: How long ``--wait`` watches a computer that may be starting, and how often.
+_PROXY_WAIT_SECONDS = 180.0
+_PROXY_POLL_SECONDS = 2.0
+
+
+def _wait_for_proxy(c: Computer, *, expect_browser_proxy: bool) -> None:
     """``--wait``: until the computer's browsers have the change.
 
-    A computer that is not running and that no start is under way for runs no
-    browser, and is given the setting as it starts; the change is stored. That
-    is said rather than reported as a failure of a change that was made, and
-    rather than waited on until a start nobody asked for. Read first, so the
-    answer is about the computer now and not the PATCH's reply."""
-    c.refresh()
-    running_ram = c.running_ram_mb
-    if c.status in ("stopped", "suspended") and not (running_ram is not None and running_ram > 0):
+    Every read is judged the same way, and the first comes after the change, so
+    the answer is about the computer now and not the PATCH's reply. A running
+    computer is done once nothing is pending. A stopped or suspended one with an
+    explicit ``running_ram_mb`` of 0 has no start under way and runs no browser:
+    the change is stored and it is given the setting as it starts, which is said
+    rather than reported as a failure of a change that was made. An absent
+    ``running_ram_mb`` is unknown and a positive one is a start admitted, so
+    those are watched, and running out of time on them is a timeout. Any other
+    state is one only the SDK's own wait reads.
+
+    Reads are the SDK wait's: each bounded by the deadline, and one that failed
+    is polled through if it may pass, after its ``Retry-After``.
+    """
+
+    def judge(start_failed: str) -> str | MandalaError:
+        if c.status == "running":
+            pending = c.browser_proxy_pending or (expect_browser_proxy and not c.browser_proxy)
+            return "applying" if pending else "applied"
+        if c.status not in ("stopped", "suspended"):
+            return c._browser_proxy_state(expect_browser_proxy, start_failed)
+        if not c._nothing_admitted():
+            return "applying"
         print(
             f"{_shown(c.name or c.id)} is {_shown(c.status)}: "
             "the change is stored and applied as it starts",
             file=sys.stderr,
         )
-        return
-    c.wait_for_browser_proxy()
+        return "applied"
+
+    def timed_out(observed: bool, fresh: bool, state: str) -> str:
+        last = f"last read {_shown(c.status or 'unknown')}" if observed else "never read"
+        return (
+            f"{c.id} was not confirmed within {_PROXY_WAIT_SECONDS:g}s ({last}), so whether its "
+            "browsers have this change is unknown; the change itself is saved"
+        )
+
+    c._wait_for_state(_PROXY_WAIT_SECONDS, _PROXY_POLL_SECONDS, "applied", judge, timed_out)
 
 
 def _computer_record(c: Computer) -> dict[str, Any]:
@@ -4565,7 +4592,7 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
                 proxy["credentials_secret_id"] = current.credentials_secret_id
         c = c.set_browser_proxy(proxy, idempotency_key=key)
         if args.wait:
-            _wait_for_proxy(c)
+            _wait_for_proxy(c, expect_browser_proxy=True)
     return _proxy_result(args, c, record=True)
 
 
@@ -4574,7 +4601,7 @@ def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
     with _client() as client:
         c = _resolve(client, args.target).set_browser_proxy(None, idempotency_key=key)
         if args.wait:
-            _wait_for_proxy(c)
+            _wait_for_proxy(c, expect_browser_proxy=False)
     return _proxy_result(args, c, record=True)
 
 

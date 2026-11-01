@@ -4811,11 +4811,8 @@ the answer, never a computer named after it. Authentication is the SDK's:
 
 `mandala-py` is the Python package's command. The npm package
 (`npm install -g mandala-computer`) installs `mandala`, which does what the
-commands below do (`move` and the proxy commands sit under `computers` there),
-except two: it has no `browser-proxy get` or `egress-proxy get` (`mandala
-computers get` shows both proxies), and its proxy `set` and `clear` take no
-`--wait` (run `mandala computers wait NAME --until browser-proxy` or `--until
-egress-proxy` instead). It adds `login`, the computer lifecycle, `exec`, files,
+commands below do (`move` and the proxy commands sit under `computers` there).
+It adds `login`, the computer lifecycle, `exec`, files,
 screenshots, snapshots, templates, usage and agent runs; reach for it where
 Node is available. Through 0.5.0 both packages installed `mandala`, and
 whichever came first on PATH won.
