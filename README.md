@@ -1910,9 +1910,9 @@ else:
     print(run.status, run.error, len(run.steps_taken), "steps")
 ```
 
-`wait` defaults to a 30-minute local waiting budget, shorter than the server's
-60-minute run limit; pass a longer `timeout` to wait for a long run.
-`wait(run, timeout=1800, poll=3)` returns the run however it ended and does not
+`wait` defaults to a 65-minute local waiting budget, just past the server's
+60-minute run limit, so a default wait sees even a full-length run end.
+`wait(run, timeout=3900, poll=3)` returns the run however it ended and does not
 raise for any ending — every one leaves real work on the desktop, and the run
 is the account of it. A `TimeoutError` means the run is still going, not that it
 stopped; `client.agent_runs.cancel(run.id)` stops it where it is, and answers

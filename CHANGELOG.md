@@ -67,6 +67,11 @@ This is the summary you read to decide whether to upgrade.
   leaves a funded call in flight to finish, `write_file`'s default writes directly
   to the path, and the plans that may pin a computer are Studio and Swarm.
 
+### Changed
+
+- `agent_runs.wait()` now wait 65 minutes by default, up from 30, so a default wait
+  sees even a full-length run end. A run may last 60 minutes.
+
 ## [0.21.0] - 2026-10-30
 
 ### Added

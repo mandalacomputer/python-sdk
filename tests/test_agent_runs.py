@@ -14,6 +14,7 @@ import respx
 
 import mandala_computer as mc
 from mandala_computer._client import MODEL_KEY_HEADER
+from mandala_computer._resources import AGENT_RUN_WAIT_TIMEOUT
 
 BASE = "https://api.test/api/v1"
 START = f"{BASE}/computers/vm-1/agent/runs"
@@ -544,3 +545,7 @@ async def test_async_background_accepts_its_own_step_cap(steps: int) -> None:
         assert sent(route)["max_steps"] == steps
         with pytest.raises(ValueError, match="may not exceed 500"):
             await c.agent_runs.start("vm-1", "go", max_steps=501)
+
+
+def test_a_default_wait_outlasts_the_longest_run_the_platform_allows() -> None:
+    assert AGENT_RUN_WAIT_TIMEOUT > 3600

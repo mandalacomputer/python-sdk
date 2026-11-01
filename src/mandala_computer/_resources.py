@@ -2803,8 +2803,9 @@ class AgentThreads:
         self._t.json_object("DELETE", _api.agent_thread(thread_id))
 
 
-#: How long :meth:`AgentRuns.wait` waits locally by default (not the server run limit).
-AGENT_RUN_WAIT_TIMEOUT = 1800.0
+#: How long :meth:`AgentRuns.wait` waits locally by default: just past the server's
+#: 60-minute run limit, so a default wait sees even a full-length run end.
+AGENT_RUN_WAIT_TIMEOUT = 3900.0
 #: Seconds between its polls by default. A step takes at least that long.
 AGENT_RUN_WAIT_POLL = 3.0
 
@@ -2958,7 +2959,7 @@ class AgentRuns:
         which only a ``completed`` run that ended ``end_turn`` is.
 
         Raises :class:`~mandala_computer.TimeoutError` if it is still running
-        when ``timeout`` (seconds; default 30 minutes) runs out; the run is not
+        when ``timeout`` (seconds; default 65 minutes) runs out; the run is not
         stopped by that, only the waiting is — :meth:`cancel` stops it. A
         transient failure of a poll is ridden out, as every wait in this
         package does; an id this key cannot see is a
