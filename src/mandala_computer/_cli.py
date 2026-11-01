@@ -1034,6 +1034,9 @@ def _cmd_terminal(args: argparse.Namespace) -> int:
         _die("interactive terminal requires a Unix-like local terminal")
     with _client() as client:
         c = _resolve(client, args.target).refresh()
+        no_channel = c.vnc is None and c.os != "windows" and c.status in ("running", "suspended")
+        if no_channel and c._key_expires():
+            _die(lambda s: _api.expiring_key_no_connection(s(c.id)), "permission_denied")
     vnc = c.vnc
     if vnc is None or not vnc.terminal_url:
         if c.os == "windows":
@@ -2630,10 +2633,13 @@ def _api_key_rows(keys: Sequence[ApiKey]) -> str:
             "yes" if k.manage_keys else "no",
             k.last_used_at or "never",
             _printable(k.minted_by_key_id) if k.minted_by_key_id else "-",
+            _printable(k.expires_at) if k.expires_at else "never",
+            ",".join(_printable(c) for c in k.computer_ids) if k.computer_ids else "all",
         )
         for k in keys
     ]
-    return _table(("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED", "MINTED BY"), rows)
+    headers = ("ID", "NAME", "PREFIX", "SCOPE", "MANAGES KEYS", "LAST USED", "MINTED BY")
+    return _table((*headers, "EXPIRES", "COMPUTERS"), rows)
 
 
 def _whoami_person_account(w: Whoami) -> list[str]:
@@ -2731,7 +2737,13 @@ def _cmd_api_keys_list(args: argparse.Namespace) -> int:
 def _cmd_api_keys_create(args: argparse.Namespace) -> int:
     workspace = _scope(args)
     with _client() as client:
-        created = client.api_keys.create(name=args.name, workspace_id=workspace)
+        created = client.api_keys.create(
+            name=args.name,
+            workspace_id=workspace,
+            expires_at=args.expires_at,
+            expires_in_hours=args.expires_in,
+            computer_ids=args.computer,
+        )
     # The key alone on stdout, so `KEY=$(mandala-py api-keys create)` captures
     # it and nothing else; what it is and the warning go to stderr.
     if args.json:
@@ -2870,6 +2882,24 @@ def _keys_parsers(sub: Any) -> None:
             "confine the key to this workspace (default: the saved profile's workspace from "
             "`workspaces use`, else the calling key's own scope)"
         ),
+    )
+    expiry = create.add_mutually_exclusive_group()
+    expiry.add_argument(
+        "--expires-in",
+        type=float,
+        metavar="HOURS",
+        help="expire the key this many hours from now (at most 8784, 366 days)",
+    )
+    expiry.add_argument(
+        "--expires-at",
+        metavar="TIME",
+        help="expire the key at this RFC 3339 time, at most 366 days ahead",
+    )
+    create.add_argument(
+        "--computer",
+        action="append",
+        metavar="ID",
+        help="limit the key to this computer ID; repeat for more (up to 50)",
     )
     create.add_argument("--json", action="store_true", help="the new key as JSON, under raw")
     create.set_defaults(fn=_cmd_api_keys_create)
@@ -4414,24 +4444,51 @@ def _bypass_list(values: Sequence[str] | None) -> list[str] | None:
     return entries
 
 
-def _wait_for_proxy(c: Computer) -> None:
+#: How long ``--wait`` watches a computer that may be starting, and how often.
+_PROXY_WAIT_SECONDS = 180.0
+_PROXY_POLL_SECONDS = 2.0
+
+
+def _wait_for_proxy(c: Computer, *, expect_browser_proxy: bool) -> None:
     """``--wait``: until the computer's browsers have the change.
 
-    A computer that is not running and that no start is under way for runs no
-    browser, and is given the setting as it starts; the change is stored. That
-    is said rather than reported as a failure of a change that was made, and
-    rather than waited on until a start nobody asked for. Read first, so the
-    answer is about the computer now and not the PATCH's reply."""
-    c.refresh()
-    running_ram = c.running_ram_mb
-    if c.status in ("stopped", "suspended") and not (running_ram is not None and running_ram > 0):
+    Every read is judged the same way, and the first comes after the change, so
+    the answer is about the computer now and not the PATCH's reply. A running
+    computer is done once nothing is pending. A stopped or suspended one with an
+    explicit ``running_ram_mb`` of 0 has no start under way and runs no browser:
+    the change is stored and it is given the setting as it starts, which is said
+    rather than reported as a failure of a change that was made. An absent
+    ``running_ram_mb`` is unknown and a positive one is a start admitted, so
+    those are watched, and running out of time on them is a timeout. Any other
+    state is one only the SDK's own wait reads.
+
+    Reads are the SDK wait's: each bounded by the deadline, and one that failed
+    is polled through if it may pass, after its ``Retry-After``.
+    """
+
+    def judge(start_failed: str) -> str | MandalaError:
+        if c.status == "running":
+            pending = c.browser_proxy_pending or (expect_browser_proxy and not c.browser_proxy)
+            return "applying" if pending else "applied"
+        if c.status not in ("stopped", "suspended"):
+            return c._browser_proxy_state(expect_browser_proxy, start_failed)
+        if not c._nothing_admitted():
+            return "applying"
         print(
             f"{_shown(c.name or c.id)} is {_shown(c.status)}: "
             "the change is stored and applied as it starts",
             file=sys.stderr,
         )
-        return
-    c.wait_for_browser_proxy()
+        return "applied"
+
+    def timed_out(observed: bool, fresh: bool, state: str) -> str:
+        last = f"last read {_shown(c.status or 'unknown')}" if observed else "never read"
+        return (
+            f"{c.id} was not confirmed within {_PROXY_WAIT_SECONDS:g}s ({last}), so whether its "
+            "browsers have this change is unknown; the change itself is saved"
+        )
+
+    c._wait_for_state(_PROXY_WAIT_SECONDS, _PROXY_POLL_SECONDS, "applied", judge, timed_out)
 
 
 def _computer_record(c: Computer) -> dict[str, Any]:
@@ -4535,7 +4592,7 @@ def _cmd_browser_proxy_set(args: argparse.Namespace) -> int:
                 proxy["credentials_secret_id"] = current.credentials_secret_id
         c = c.set_browser_proxy(proxy, idempotency_key=key)
         if args.wait:
-            _wait_for_proxy(c)
+            _wait_for_proxy(c, expect_browser_proxy=True)
     return _proxy_result(args, c, record=True)
 
 
@@ -4544,7 +4601,7 @@ def _cmd_browser_proxy_clear(args: argparse.Namespace) -> int:
     with _client() as client:
         c = _resolve(client, args.target).set_browser_proxy(None, idempotency_key=key)
         if args.wait:
-            _wait_for_proxy(c)
+            _wait_for_proxy(c, expect_browser_proxy=False)
     return _proxy_result(args, c, record=True)
 
 

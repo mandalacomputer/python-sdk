@@ -2401,7 +2401,8 @@ class ApiKeys:
     another person's, which answer like an id that does not exist. A key
     confined to a workspace sees, mints and revokes only keys confined to that
     same workspace. Listing needs the viewer role; minting and revoking need
-    member.
+    member. A key limited to computers is refused here with
+    :class:`~mandala_computer.PermissionDeniedError`.
     """
 
     def __init__(self, transport: Transport) -> None:
@@ -2930,10 +2931,13 @@ class AgentRuns:
         return AgentRunPage.from_api(data, base_url=self._t.base_url)
 
     def cancel(self, run_id: str) -> AgentRun:
-        """Stop a running run where it is: the model call in flight is abandoned
-        and no further action is taken. What it already did to the desktop
-        stands, and so does what it cost. Answers the run, ``cancelled``; a run
-        that had already ended is answered as it is, unchanged."""
+        """Stop a running run where it is: no further action is taken. A model
+        call on your own key is abandoned. A funded call already in flight is
+        left to finish and is charged, so ``cost_usd`` can change after this
+        answers: read the run again for the final cost. What it already did to
+        the desktop stands, and so does what it cost. Answers the run,
+        ``cancelled``; a run that had already ended is answered as it is,
+        unchanged."""
         path = _api.agent_run_cancel(run_id)
         data = self._t.json_object("POST", path)
         return AgentRun.from_api(data, f"POST {path}", base_url=self._t.base_url)

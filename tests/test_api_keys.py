@@ -434,9 +434,9 @@ def test_cli_api_keys_list_names_the_minting_key(capsys: pytest.CaptureFixture[s
     respx.get(f"{BASE}/api-keys").mock(return_value=httpx.Response(200, json=[API_KEY, MINTED]))
     assert _cli.main(["api-keys", "list"]) == 0
     header, dashboard, minted = capsys.readouterr().out.splitlines()
-    assert header.split()[-2:] == ["MINTED", "BY"]
-    assert dashboard.split()[-1] == "-"
-    assert minted.split()[-1] == "key-000000000001"
+    assert header.split()[-4:] == ["MINTED", "BY", "EXPIRES", "COMPUTERS"]
+    assert dashboard.split()[-3] == "-"
+    assert minted.split()[-3] == "key-000000000001"
 
 
 @respx.mock

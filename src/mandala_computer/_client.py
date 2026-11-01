@@ -335,6 +335,15 @@ ORIGIN_TLS_MESSAGE = (
 #: count that would read as complete at zero.
 INCOMPLETE_HEADER = "X-GC-Incomplete"
 
+#: On an exec that asked for ``retain_output``, on any status: ``unavailable``
+#: when no retained result was published.
+RETAINED_OUTPUT_HEADER = "X-GC-Retained-Output"
+
+
+def retained_output(resp: httpx.Response) -> str | None:
+    """What the platform said of a requested capture, or ``None`` if nothing."""
+    return resp.headers.get(RETAINED_OUTPUT_HEADER) or None
+
 
 def _incomplete(resp: httpx.Response) -> int | None:
     """How many rows this listing is short by, or ``None`` when it is complete.
@@ -944,6 +953,7 @@ class _BaseTransport:
         a redirected request rather than the one sent (OPL-6094)."""
         error = _BaseTransport._classified_error(resp)
         error._redirected = bool(resp.history)
+        error.retained_output = retained_output(resp)
         return error
 
     @staticmethod

@@ -714,7 +714,7 @@ c.set_idle_suspend(None)  # back to the host's own sweep
 ```
 
 `0` means never: no idle suspend and no eviction under memory pressure. It is
-capped per plan — Solo 0, Studio 1, Fleet 4 computers pinned at once — and one
+capped per plan — Studio 1, Swarm 4, none on any other plan — and one
 past the cap raises `PlanLimitError`. The most a host accepts is 10080 minutes
 (a week); more is a `400` from the host. A negative number raises `ValueError`
 before anything is sent.
@@ -731,6 +731,24 @@ operator changes it.
 
 The screen is not part of this. `resolution` is fixed for the life of a
 computer — it is chosen at [create](#use) and nowhere else.
+
+### Ending at a set time
+
+```python
+c = client.computers.create(size="base", ends_in_hours=4)  # or ends_at=
+print(c.ends_at)
+c.set_end_time(ends_in_hours=1.5)  # move it; or set_end_time(ends_at)
+c.set_end_time(None)  # clear it
+```
+
+At that moment the host stops the computer, as `stop()` would, keeping its disk.
+It happens once and is then cleared, so a later start runs until stopped. A
+computer already stopped stays stopped, and the end time is spent all the same.
+It moves with the computer between hosts, and a clone does not inherit it.
+`ends_at` is an aware `datetime` or an RFC 3339 string with a time zone, 10 minutes
+to 366 days ahead; `ends_in_hours` is hours from now, fractions allowed, at most
+8784. Send one or the other. A host that cannot keep end times raises
+`ConflictError` with reason `unsupported`.
 
 ### A proxy for the browsers
 
@@ -1000,7 +1018,8 @@ before page context answers `error` saying so.
 **An OpenAI `computer_call` runs as one request.** `input_batch()` takes 1 to 32
 actions in OpenAI's own vocabulary — `click`, `double_click`, `move`, `drag`,
 `scroll`, `keypress`, `type`, `wait` and `screenshot` — and runs them in order
-on one input lane, so no other API input interleaves:
+on one input lane, so no other API input interleaves. It also takes the
+platform's own `wait_for` check, below:
 
 ```python
 done = c.input_batch(
@@ -1028,6 +1047,33 @@ one at `e.result.failed_index` may have partly applied. Never send the same
 batch again automatically, because that repeats what already ran. Take a fresh
 screenshot and decide; `is_transient()` answers `False` for it. `context=True`
 works as it does on a single action.
+
+**A batch can wait for the screen.** A `wait_for` step holds the batch until a
+condition is met, so it moves on when the screen has answered rather than after
+a guessed `wait`:
+
+```python
+done = c.input_batch(
+    [
+        {"type": "click", "x": 640, "y": 400, "button": "left"},
+        {"type": "wait_for", "until": "window_title", "contains": "Save As"},
+        {"type": "type", "text": "report.csv"},
+        {"type": "wait_for", "until": "screen_stable", "stable_ms": 500},
+    ]
+)
+print(done.results[1].waited_ms)
+```
+
+`until` is `screen_changed` (the screen, or `region`, differs from just before
+the previous action), `screen_stable` (unchanged for `stable_ms`, 100 to 10000,
+default 500) or `window_title` (the focused window's title contains `contains`,
+1 to 256 bytes, ignoring case; Linux computers). `region` is `{"x", "y", "width",
+"height"}` for the two screen checks. `timeout_ms` is 0 to 30000, default 10000,
+and 0 checks once. Anything else raises `ValueError` before anything is sent. A
+batch's check timeouts and one-second waits together are at most 60 seconds. A
+check that is not met stops the batch there as `InputBatchError` with status
+400, whose `result.error` names the condition. That 400 is not final: take a
+fresh screenshot and decide. Checks are only for batches.
 
 **Pass `fresh=True` whenever the image is feeding a decision.** A bare
 `screenshot()` may be answered from a frame up to 1.5 seconds old. That is the
@@ -1365,6 +1411,8 @@ c.delete_result(retained.result_id)
 result = c.exec("make", retain_output={"max_bytes_per_stream": 1048576})
 if result.result_id is not None:
     metadata = c.result(result.result_id)  # explicit metadata read
+elif result.retained_output == "unavailable":
+    ...  # asked for, and no retained result was published
 ```
 
 `retain_execution_output()` makes one POST and reads guest output explicitly.
@@ -1557,7 +1605,7 @@ no recognised reason is unclassified, and `is_transient()` answers `False` for
 it: read the computer's state before deciding to retry, and keep any retry
 loop of your own bounded.
 
-Two others worth knowing. A **400** never clears: a computer whose image lacks
+Two others worth knowing. A **400** here never clears: a computer whose image lacks
 its desktop's clipboard tool (`xclip` on X11, `wl-clipboard` on Wayland) is
 refused permanently, and the refusal names the tool — install that tool in the
 guest, or create a new computer from an image that includes it. And an over-cap read raises `FileTooLargeError`, whose
@@ -1618,7 +1666,7 @@ argument rather than something the client holds.
 
 **Or leave `model_key` out, and the run spends your account's Mandala AI
 credits** where the account is eligible (a plan, a supported billing country,
-funded runs enabled, and at least $0.25 available for the first model call). A
+funded runs enabled, and at least $0.02 available for the first model call). A
 funded run is Anthropic only, on the platform's own system prompt and tools:
 `claude-sonnet-5-5` by default, `claude-opus-5-5` the other choice. A custom
 `system`, another model or `provider="openai"` needs your own key. A blank
@@ -1635,7 +1683,8 @@ print(f"{result.stop}, ${result.cost_usd:.2f}")
 *admission* cap: the run will not start another model call that could take it
 past the cap, and ends with `stop == "max_cost"` instead. The call already made
 is charged in full, so `result.cost_usd` can end a little over it. Each model
-call reserves $0.25 and settles at the platform's rate. Every step reports
+call reserves $0.25, or all remaining credit when less, down to $0.02, and
+settles at the platform's rate. Every step reports
 `step.cost_usd` — the run's total so far, not that step's own, so never sum
 them — and `step.credits_remaining_usd`, the account's available credits after
 that call, which can go negative after an overrun. Credits running out part way
@@ -1867,7 +1916,9 @@ else:
 raise for any ending — every one leaves real work on the desktop, and the run
 is the account of it. A `TimeoutError` means the run is still going, not that it
 stopped; `client.agent_runs.cancel(run.id)` stops it where it is, and answers
-the run (unchanged, if it had already ended). `get(run_id)` reads it as it
+the run (unchanged, if it had already ended). A model call on your own key is
+abandoned. A funded call already in flight is left to finish and is charged, so
+`cost_usd` can still change: read the run again for the final cost. `get(run_id)` reads it as it
 stands — status, `steps_taken`, `cost_usd` on a funded run, and once it has
 ended its `result` (`completed`) or `error` (`failed`, `interrupted`), whose
 `top_up_url` is an absolute link when a funded run ran out of credits.
@@ -1946,7 +1997,9 @@ identifies the agent endpoint, not necessarily the requested provider model.
 Python's `extra_body` places `computer_id` and `max_steps` at the top level of
 the request JSON. `max_steps` bounds desktop actions, not tokens or spending.
 Only the last user message supplies the task; system messages are concatenated.
-Earlier user/assistant history is not replayed. This is a computer-agent
+The user and assistant messages before it are the conversation so far, given to
+the model as turns it is told are done: each is clipped to 32,000 characters, and
+the newest 64,000 characters are used. This is a computer-agent
 compatibility endpoint, with no general promise of developer messages, image
 inputs, tool-call conversations, the Responses API or other OpenAI features.
 
@@ -1959,7 +2012,7 @@ the endpoint refuses new runs with HTTP 503, a `Retry-After` header and
 request is safe to send again once that wait is over.
 Existing Mandala capacity limits and rate budgets apply,
 and the selected provider bills model usage to your key. This does not add hosted inference,
-included model credits or dashboard chat persistence.
+included model credits.
 
 Omitting `stream`, or setting `stream=False` as above, returns one JSON
 completion. Explicit `stream=True` returns OpenAI-style SSE chunks with
@@ -2972,7 +3025,19 @@ refused rather than sent. `client.webhooks.test(hook.id)` queues one signed
 delivery of a synthetic `webhook.test` event through the ordinary path, and the
 outcome is read from `deliveries`.
 
-Ten subscriptions per account on every paid plan, none without one; the
+While the account is suspended nothing new is queued and nothing is sent.
+Events during a suspension are skipped for good, and no `gap` stands in for
+them, so reconcile with a listing and each computer's `events_url` after
+reactivation. Deliveries already pending go out after reactivation with their
+original body, so `at` can be old. Reads still answer; every write,
+`webhooks.test` included, is a `PermissionDeniedError` with `reason` `revoked`.
+
+A `gap` delivery has no `seq`, and arrives whatever `events` filters on: the
+host holding that computer was out of reach for longer than its event journal
+holds, so events were lost. Reconcile with a listing rather than assume nothing
+happened.
+
+Ten subscriptions per account on a plan that includes webhooks, none on a trial; the
 eleventh is a `ConflictError` naming the cap. The endpoint must resolve to a
 public address — a private, loopback or link-local one is a 400 at create.
 
@@ -3052,6 +3117,12 @@ the allowed `methods` on paths under `path_prefix` only. The secret goes
 upstream as `Authorization: Bearer <secret>`, or as `x-api-key: <secret>` with
 `auth_header="x-api-key"`. Nothing is delivered into the computer, so nothing
 in it can read the secret.
+
+The secret's value must be printable ASCII with no spaces or line breaks, and a
+trailing newline counts. A binding to any other value is still created, but
+every call through it is refused with a `503` inside the computer. Replacing the
+value with `client.secrets.set(...)` fixes that; the binding does not need
+remaking.
 
 ```python
 computer_id = "vm-..."
@@ -3767,7 +3838,31 @@ with Client() as client:
     ci = client.api_keys.create(name="ci")
     new_key = ci.key  # shown ONCE: store it now
     client.api_keys.revoke(ci.id)
+
+    agent = client.api_keys.create(  # the shape for a key handed to an agent
+        name="agent", expires_in_hours=24, computer_ids=["vm-0123456789ab"]
+    )
+    print(agent.expires_at, agent.computer_ids)
 ```
+
+**A key can expire and be limited to computers.** `expires_at` (an aware
+`datetime` or an RFC 3339 string with a time zone, at most 366 days ahead) or
+`expires_in_hours` (above 0, at most 8784) sets the expiry; `computer_ids` limits
+the key to 1 to 50 computers. A key past its expiry is refused with
+`AuthenticationError` (`API key expired`). A key that expires can mint keys only
+if they expire no later than it does. A key limited to computers answers
+`NotFoundError` for any other computer, and `PermissionDeniedError` with no
+`reason` on a route the limit rules out, such as webhooks and API keys.
+
+A key that expires gets nothing that would outlive it. Computers read with one
+have no `vnc`, so it has no desktop, terminal or event connection: `c.events()`
+and `c.wait_for()` raise `MandalaError` at once saying so, and a key with no
+expiry is what those need. Without a session policy, or with one whose `max_duration_seconds`
+runs past the key's own expiry, `create_browser_connection` is a `400`: give it a
+`BrowserSessionPolicy` within that lifetime.
+
+`mandala-py api-keys create` takes the same limits as `--expires-in HOURS`,
+`--expires-at TIME` and `--computer ID`, and `api-keys list` shows them.
 
 **Every `api_keys` call needs the calling key to be allowed to manage keys.**
 That permission is off for every key until its holder turns it on in a signed-in
@@ -3982,8 +4077,9 @@ The journal comes a page at a time. Pass a page's `next_before` as `before=` for
 the next, older one, until it is `None`; `limit=` is 1 to 100 entries a page
 (the platform's default is 50). Entries recorded after the first page do not
 shift the pages behind it. Each entry's `kind` (`credit`, `debit`, `expire`,
-`clawback`, `debt_settle`) says which way its never-negative `amount_micros`
-moves the balance, so do not sum entries without reading it.
+`clawback`, `debt_settle`, and `compute` on pay as you go) says which way its
+never-negative `amount_micros` moves the balance, so do not sum entries without
+reading it.
 
 ```python
 page = client.credits.read(limit=100)
@@ -4000,6 +4096,16 @@ with `PermissionDeniedError`; every role can read it, and so can an account with
 no plan. Reading it never issues or expires anything. The decode is strict: a
 ledger with an amount, a flag or a list this client cannot read raises
 `MandalaError` rather than reporting it as nothing.
+
+`billing_mode` says how the account pays: `"subscription"`, `"trial"`, `"payg"`
+or `"none"`, an open set. Pay as you go is not offered to every account. On it,
+`burn_micros_per_hour` is what the account's computers cost now and
+`runway_seconds` how long the balance lasts at that rate, `0` once it has run
+out. Each is `None` on any other mode and from a platform that does not send
+them. One `compute` entry is one host's share of one day, so add them up to get
+the day. A positive runway does not promise a start: a start below the larger of
+$0.25 and a quarter of an hour of what it starts raises
+`InsufficientBalanceError`.
 
 ### Partial listings
 
@@ -4127,6 +4233,11 @@ report = c.read_file("/home/user/report.csv")
 
 `write_file()` returns how many bytes the platform says it wrote, or `None` if
 it did not say — never what was sent, which would claim everything landed.
+
+The default `overwrite=True` writes directly to the path: an existing file is
+truncated as the body starts, and a failed or cut-off upload leaves only the
+bytes that arrived there. Use `overwrite=False`, or `upload_file()`, when a
+partial file must never appear at the path.
 
 `read_file()` answers **bytes**, because a guest file is not promised to be
 text and decoding one that is not would put replacement characters at the SDK
@@ -4343,7 +4454,8 @@ this SDK refuses before it sends anything does not — see [below](#refused-befo
 | Exception | When |
 |---|---|
 | `AuthenticationError` | 401 — a credential was refused |
-| `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS |
+| `PlanLimitError` | 402 — plan caps: count, size, RAM/disk pools, OS; no plan, or a trial's limits (see `code`, below) |
+| `InsufficientBalanceError` | 402 `INSUFFICIENT_BALANCE`, a `PlanLimitError` — on pay as you go, the credit balance is too low to start this; `projected_micros` and `required_micros` say what counted and what it needed |
 | `ModelProviderError` | 402 on the agent routes — the model API's `billing_error` for the account behind `model_key`, not the plan |
 | `InsufficientCreditsError` | 402 on the agent routes carrying `top_up_url` — a funded run (no `model_key`) your Mandala AI credits could not start |
 | `PermissionDeniedError` | 403 — the credential is valid but lacks the role, membership or permission (such as a key's permission to manage keys), or the account or person is suspended |
@@ -4481,6 +4593,19 @@ the class the platform's own 413 arrives as, and that local one is also a
 `ValueError`.
 
 `PlanLimitError`'s message names the limit that was hit.
+
+Its `code` says which kind of refusal it was, and so do those of the other
+statuses on a trial. None of these has a class of its own, and none is
+`is_transient()`:
+
+| `code` | Status | Means |
+|---|---|---|
+| `PLAN_REQUIRED` | 402 | no plan, or the trial has ended: choose a plan |
+| `TRIAL_LIMIT` | 402 | the trial does not allow this: a clone, a snapshot, another template or size, a proxy, a longer idle window |
+| `TRIAL_CREATES_USED` | 402 | the trial has launched all the computers it may |
+| `TRIAL_CREATE_PENDING` | 409 | the trial's computer is still being created. It clears by itself: wait for that computer. Do not create again on a timer, which could make a second one |
+| `TRIAL_FULL` | 503 | every trial slot is taken. Nothing was sent and nothing used up, so send it again after `retry_after` |
+| `TRIAL_UNAVAILABLE` | 503 | trials are paused right now. Nothing was sent and nothing used up |
 
 `MoveRequiredError` is a 409 that does **not** clear, and it is a subclass
 of `ConflictError` so that an `except ConflictError` written before it existed
@@ -4686,11 +4811,8 @@ the answer, never a computer named after it. Authentication is the SDK's:
 
 `mandala-py` is the Python package's command. The npm package
 (`npm install -g mandala-computer`) installs `mandala`, which does what the
-commands below do (`move` and the proxy commands sit under `computers` there),
-except two: it has no `browser-proxy get` or `egress-proxy get` (`mandala
-computers get` shows both proxies), and its proxy `set` and `clear` take no
-`--wait` (run `mandala computers wait NAME --until browser-proxy` or `--until
-egress-proxy` instead). It adds `login`, the computer lifecycle, `exec`, files,
+commands below do (`move` and the proxy commands sit under `computers` there).
+It adds `login`, the computer lifecycle, `exec`, files,
 screenshots, snapshots, templates, usage and agent runs; reach for it where
 Node is available. Through 0.5.0 both packages installed `mandala`, and
 whichever came first on PATH won.
@@ -5167,7 +5289,7 @@ several names. Where a client has no way to do it, the cell says so with —.
 | Delete a computer with its snapshots | `delete({ deleteSnapshots: true, expect })` | `delete(delete_snapshots=True, expect=…)`; `purge_snapshots` is the deprecated name | `delete_computer` with `delete_snapshots` and `expect` | `computers delete --delete-snapshots --expect` | — |
 | Snapshot holdings (count, bytes, fingerprint) | `holdings()`, or its alias `snapshotHoldings()` | `snapshot_holdings()` | `snapshot_holdings` | `snapshots holdings` | — |
 | The usage window | `usage.read({ from, to })` | `usage.read(since=…, until=…)`, or `from_=` and `to=` | `get_usage` with `from` and `to` | `usage --from … --to …` | — |
-| Change a computer (`PATCH`) | `update({ … })` | `rename()`, `resize()`, `set_idle_suspend()`, `set_browser_proxy()`, `set_egress_proxy()` | `update_computer` | `computers rename`, `resize`, `idle-suspend`, `browser-proxy set`/`clear`, `egress-proxy set`/`clear` | `browser-proxy set`/`clear`, `egress-proxy set`/`clear` |
+| Change a computer (`PATCH`) | `update({ … })` | `rename()`, `resize()`, `set_idle_suspend()`, `set_end_time()`, `set_browser_proxy()`, `set_egress_proxy()` | `update_computer` | `computers rename`, `resize`, `idle-suspend`, `browser-proxy set`/`clear`, `egress-proxy set`/`clear` | `browser-proxy set`/`clear`, `egress-proxy set`/`clear` |
 | Wait until the computer is ready | `waitForGuest()`, `waitForDesktop()` | `wait_for_guest()`, `wait_for_desktop()` | `wait_for_computer` with `until: "guest"`, which on Linux also waits for the desktop session | `computers wait --until guest` or `--until desktop` | — |
 | The windows after an input action | `{ context: true }` on an input method, e.g. `click(x, y, [], { context: true })` | `context=True` on an input method, e.g. `click(x, y, context=True)` | `context: true` on an input tool | — | — |
 | Public URLs | `publicUrls()`, `createPublicUrl({ port, label, access })`, `updatePublicUrl(urlId, { port, access })`, `deletePublicUrl(urlId)` | `client.public_urls.list(id)`, `.create(id, port, label=…, access=…)`, `.update(id, url_id, port=…, access=…)`, `.delete(id, url_id)`; also handle methods | `list_public_urls`, `create_public_url`, `update_public_url`, `delete_public_url` | `computers urls list`, `create`, `update`, `rm` | — |
