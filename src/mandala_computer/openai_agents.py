@@ -1142,7 +1142,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         # A failed read is raised, not taken for "not running": that answer
         # makes the SDK start the session again.
         await self._computer.refresh()
-        return self._computer.status == "running"
+        # A fresh or resumed computer can be up before this session has applied
+        # its manifest or restored its snapshot. The runner must still start
+        # an injected session before letting tools use that workspace.
+        return self._workspace_ready and self._computer.status == "running"
 
     # --- workspace archives -------------------------------------------------
 

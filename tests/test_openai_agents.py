@@ -22,7 +22,7 @@ import pytest
 from agents import RunConfig, Runner
 from agents.sandbox import Manifest, SandboxAgent, SandboxRunConfig, User
 from agents.sandbox.capabilities import Shell
-from agents.sandbox.entries import S3Mount
+from agents.sandbox.entries import File, S3Mount
 from agents.sandbox.entries.mounts.base import InContainerMountStrategy
 from agents.sandbox.entries.mounts.patterns import RcloneMountPattern
 from agents.sandbox.errors import (
@@ -2984,3 +2984,89 @@ async def test_a_resume_waits_for_the_previous_shutdown_to_finish(
     await asyncio.sleep(0.3)
     assert fake.computers["vm-1"]["status"] == "running"
     await resumed.aclose()
+
+
+# --- injected sessions ----------------------------------------------------------
+
+
+async def _run_injected_command(session: Any, command: str) -> str:
+    model = ScriptedModel(
+        [
+            [function_call("exec_command", {"cmd": command}, call_id="injected-command")],
+            [assistant_message("done")],
+        ]
+    )
+    result = await Runner.run(
+        SandboxAgent(name="injected", model=model, capabilities=[Shell()]),
+        "Run the workspace command.",
+        run_config=RunConfig(tracing_disabled=True, sandbox=SandboxRunConfig(session=session)),
+    )
+    model.assert_complete()
+    return "\n".join(
+        str(item.output) for item in result.new_items if item.type == "tool_call_output_item"
+    )
+
+
+async def test_a_fresh_injected_session_prepares_its_manifest_and_saves_at_caller_close(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root, entries={"task.md": File(content=b"from the manifest")}),
+        snapshot=LocalSnapshotSpec(base_path=store),
+    )
+    output = await _run_injected_command(
+        session, "pwd; cat task.md; printf 'saved by run' > result.txt"
+    )
+    assert str(root) in output and "from the manifest" in output
+    assert inner(session).state.initialized
+    assert (root / "result.txt").read_bytes() == b"saved by run"
+    # Injection leaves cleanup to the caller; the run has not saved or closed it.
+    assert fake.computers["vm-1"]["status"] == "running"
+    assert not list(store.iterdir())
+    await session.aclose()
+    assert list(store.iterdir())
+    assert fake.computers == {}
+
+
+async def test_an_injected_replacement_session_restores_its_snapshot_before_tools(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    original = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+    )
+    await original.start()
+    await original.write(Path("kept.txt"), io.BytesIO(b"restored workspace"))
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    assert inner(resumed).computer_id == "vm-2"
+    assert not inner(resumed).state.initialized
+    output = await _run_injected_command(resumed, "pwd; cat kept.txt")
+    assert str(root) in output and "restored workspace" in output
+    assert inner(resumed).state.initialized
+    assert fake.computers["vm-2"]["status"] == "running"
+    await resumed.aclose()
+    assert fake.computers == {}
+
+
+async def test_an_initialized_injected_session_keeps_its_edited_manifest_file(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(
+            root, entries={"task.md": File(content=b"from the manifest", ephemeral=True)}
+        )
+    )
+    await session.start()
+    await session.write(Path("task.md"), io.BytesIO(b"edited before the run"))
+    output = await _run_injected_command(session, "pwd; cat task.md")
+    assert str(root) in output and "edited before the run" in output
+    assert "from the manifest" not in output
+    assert (root / "task.md").read_bytes() == b"edited before the run"
+    assert fake.computers["vm-1"]["status"] == "running"
+    await session.aclose()
+    assert fake.computers == {}

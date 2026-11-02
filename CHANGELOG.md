@@ -9,6 +9,14 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI Agents SDK sessions passed directly through `SandboxRunConfig(session=...)`
+  now prepare their workspace before the first tool call. A newly created or
+  rebuilt computer previously appeared ready before its manifest or snapshot
+  was applied, causing commands to use the wrong directory and later snapshot
+  saves to fail.
+
 ## [0.22.0] - 2026-11-01
 
 ### Added

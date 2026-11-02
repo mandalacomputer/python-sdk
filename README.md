@@ -2542,6 +2542,12 @@ failed. The key stays on the client.
 The options and the saved session state never carry it, so a run state saved
 for later can be resumed by another process that holds its own key.
 
+A session returned by `client.create()` or `client.resume()` can be passed
+directly as `SandboxRunConfig(session=session)`. The runner prepares its
+workspace before the first tool call, including manifest files and any needed
+snapshot restore. The caller owns that session: call `await session.aclose()`
+after the run to save its workspace and apply its shutdown policy.
+
 `MandalaSandboxClientOptions` decides what computer a session gets. Every field
 is optional, and `options` may be left out of `SandboxRunConfig` altogether:
 
