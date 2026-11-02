@@ -9,6 +9,19 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI Agents SDK sessions passed directly through `SandboxRunConfig(session=...)`
+  now prepare their workspace before the first tool call. A newly created or
+  rebuilt computer previously appeared ready before its manifest or snapshot
+  was applied, causing commands to use the wrong directory and later snapshot
+  saves to fail.
+- Injected sessions that will keep or restore workspace contents now refuse
+  capability manifest changes while not ready and running, rather than silently
+  omit new files from capabilities such as `Skills`. This includes idle-suspended
+  sessions. Call `await session.start()` before injecting the session with those
+  capabilities so the SDK can apply its normal live-session manifest update.
+
 ## [0.22.0] - 2026-11-01
 
 ### Added

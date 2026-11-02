@@ -2542,6 +2542,19 @@ failed. The key stays on the client.
 The options and the saved session state never carry it, so a run state saved
 for later can be resumed by another process that holds its own key.
 
+A session returned by `client.create()` or `client.resume()` can be passed
+directly as `SandboxRunConfig(session=session)`. The runner prepares its
+workspace before the first tool call, including manifest files and any needed
+snapshot restore. The caller owns that session: call `await session.aclose()`
+after the run to save its workspace and apply its shutdown policy.
+Before adding capabilities such as `Skills` to a resumed, snapshot-restored, or
+idle-suspended session, call `await session.start()` and then pass the session
+to the runner. This prepares the kept or restored workspace before the SDK
+applies the new entries. If the session is not ready and running and startup
+would keep or restore workspace contents, capability manifest changes raise a
+`ConfigurationError` before changing the manifest. A fresh workspace without a
+restorable snapshot can accept those capabilities directly.
+
 `MandalaSandboxClientOptions` decides what computer a session gets. Every field
 is optional, and `options` may be left out of `SandboxRunConfig` altogether:
 

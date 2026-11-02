@@ -483,6 +483,43 @@ class MandalaSandboxSession(BaseSandboxSession):
     async def _validate_path_access(self, path: Path | str, *, for_write: bool = False) -> Path:
         return await self._validate_remote_path_access(path, for_write=for_write)
 
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        await super()._validate_manifest_application(
+            only_ephemeral=only_ephemeral,
+            manifest=manifest,
+            session_running=session_running,
+        )
+        if (
+            session_running is False
+            and manifest is not None
+            and manifest != self.state.manifest
+            and (
+                self._workspace_state_preserved_on_start()
+                or await self.state.snapshot.restorable(dependencies=self.dependencies)
+            )
+        ):
+            # The runner has not replaced state.manifest yet. A preserved or
+            # restored workspace only reapplies ephemeral entries at start, so
+            # accepting new capability entries here could silently omit them.
+            # Once started, the SDK's live-session diff applies and validates
+            # those changes normally.
+            raise ConfigurationError(
+                message=(
+                    "Call await session.start() before changing capability manifest entries "
+                    "on an injected Mandala session whose workspace will be kept or restored."
+                ),
+                error_code=ErrorCode.SANDBOX_CONFIG_INVALID,
+                op="start",
+                context={"backend": _BACKEND_ID, "reason": "manifest_change_requires_start"},
+                retryable=False,
+            )
+
     def _mark_workspace_root_ready_from_probe(self) -> None:
         super()._mark_workspace_root_ready_from_probe()
         self._workspace_root_ready = True
@@ -1142,7 +1179,10 @@ class MandalaSandboxSession(BaseSandboxSession):
         # A failed read is raised, not taken for "not running": that answer
         # makes the SDK start the session again.
         await self._computer.refresh()
-        return self._computer.status == "running"
+        # A fresh or resumed computer can be up before this session has applied
+        # its manifest or restored its snapshot. The runner must still start
+        # an injected session before letting tools use that workspace.
+        return self._workspace_ready and self._computer.status == "running"
 
     # --- workspace archives -------------------------------------------------
 

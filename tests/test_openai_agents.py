@@ -21,8 +21,8 @@ from typing import Any, Literal
 import pytest
 from agents import RunConfig, Runner
 from agents.sandbox import Manifest, SandboxAgent, SandboxRunConfig, User
-from agents.sandbox.capabilities import Shell
-from agents.sandbox.entries import S3Mount
+from agents.sandbox.capabilities import Capability, Shell, Skill, Skills
+from agents.sandbox.entries import File, S3Mount
 from agents.sandbox.entries.mounts.base import InContainerMountStrategy
 from agents.sandbox.entries.mounts.patterns import RcloneMountPattern
 from agents.sandbox.errors import (
@@ -2984,3 +2984,262 @@ async def test_a_resume_waits_for_the_previous_shutdown_to_finish(
     await asyncio.sleep(0.3)
     assert fake.computers["vm-1"]["status"] == "running"
     await resumed.aclose()
+
+
+# --- injected sessions ----------------------------------------------------------
+
+
+async def _run_injected_command(
+    session: Any, command: str, *, capabilities: list[Capability] | None = None
+) -> str:
+    model = ScriptedModel(
+        [
+            [function_call("exec_command", {"cmd": command}, call_id="injected-command")],
+            [assistant_message("done")],
+        ]
+    )
+    result = await Runner.run(
+        SandboxAgent(name="injected", model=model, capabilities=[Shell(), *(capabilities or [])]),
+        "Run the workspace command.",
+        run_config=RunConfig(tracing_disabled=True, sandbox=SandboxRunConfig(session=session)),
+    )
+    model.assert_complete()
+    return "\n".join(
+        str(item.output) for item in result.new_items if item.type == "tool_call_output_item"
+    )
+
+
+async def test_a_fresh_injected_session_prepares_its_manifest_and_saves_at_caller_close(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    session = await client.create(
+        manifest=manifest(root, entries={"task.md": File(content=b"from the manifest")}),
+        snapshot=LocalSnapshotSpec(base_path=store),
+    )
+    output = await _run_injected_command(
+        session, "pwd; cat task.md; printf 'saved by run' > result.txt"
+    )
+    assert str(root) in output and "from the manifest" in output
+    assert inner(session).state.initialized
+    assert (root / "result.txt").read_bytes() == b"saved by run"
+    # Injection leaves cleanup to the caller; the run has not saved or closed it.
+    assert fake.computers["vm-1"]["status"] == "running"
+    assert not list(store.iterdir())
+    await session.aclose()
+    assert list(store.iterdir())
+    assert fake.computers == {}
+
+
+async def test_an_injected_replacement_session_restores_its_snapshot_before_tools(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    original = await client.create(
+        manifest=manifest(root), snapshot=LocalSnapshotSpec(base_path=store)
+    )
+    await original.start()
+    await original.write(Path("kept.txt"), io.BytesIO(b"restored workspace"))
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    assert inner(resumed).computer_id == "vm-2"
+    assert not inner(resumed).state.initialized
+    output = await _run_injected_command(resumed, "pwd; cat kept.txt")
+    assert str(root) in output and "restored workspace" in output
+    assert inner(resumed).state.initialized
+    assert fake.computers["vm-2"]["status"] == "running"
+    await resumed.aclose()
+    assert fake.computers == {}
+
+
+async def test_an_initialized_injected_session_keeps_its_edited_manifest_file(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path
+) -> None:
+    session = await client.create(
+        manifest=manifest(
+            root, entries={"task.md": File(content=b"from the manifest", ephemeral=True)}
+        )
+    )
+    await session.start()
+    await session.write(Path("task.md"), io.BytesIO(b"edited before the run"))
+    output = await _run_injected_command(session, "pwd; cat task.md")
+    assert str(root) in output and "edited before the run" in output
+    assert "from the manifest" not in output
+    assert (root / "task.md").read_bytes() == b"edited before the run"
+    assert fake.computers["vm-1"]["status"] == "running"
+    await session.aclose()
+    assert fake.computers == {}
+
+
+@pytest.mark.parametrize("replace_computer", [False, True])
+async def test_resumed_injected_skills_require_start_before_manifest_changes(
+    fake: FakePlatform,
+    client: MandalaSandboxClient,
+    root: Path,
+    tmp_path: Path,
+    replace_computer: bool,
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    original = await client.create(
+        manifest=manifest(root, entries={"notes.txt": File(content=b"initial notes")}),
+        snapshot=LocalSnapshotSpec(base_path=store),
+        options=MandalaSandboxClientOptions(on_shutdown="delete" if replace_computer else "stop"),
+    )
+    await original.start()
+    await original.write(Path("notes.txt"), io.BytesIO(b"edited notes"))
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    assert inner(resumed).computer_id == ("vm-2" if replace_computer else "vm-1")
+    before = resumed.state.manifest.model_copy(deep=True)
+    skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
+    with pytest.raises(ConfigurationError, match=r"await session\.start\(\)") as caught:
+        await _run_injected_command(resumed, "cat .agents/review/SKILL.md", capabilities=[skills])
+    assert caught.value.context["reason"] == "manifest_change_requires_start"
+    assert resumed.state.manifest == before  # refusal must not record unapplied entries
+    assert not (root / ".agents" / "review" / "SKILL.md").exists()
+    assert not inner(resumed)._shut_down
+
+    # Following the error's advice restores/keeps the old workspace first;
+    # the SDK's live-session diff then installs the new non-ephemeral skill.
+    await resumed.start()
+    output = await _run_injected_command(
+        resumed, "cat .agents/review/SKILL.md; cat notes.txt", capabilities=[skills]
+    )
+    assert "skill body" in output and "edited notes" in output
+    assert (root / ".agents" / "review" / "SKILL.md").read_text() == "skill body"
+    assert fake.computers[inner(resumed).computer_id]["status"] == "running"
+    await resumed.aclose()
+
+
+class _ChangeInjectedRoot(Capability):
+    type: Literal["test-change-root"] = "test-change-root"
+    new_root: str
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        return manifest.model_copy(update={"root": self.new_root})
+
+
+async def test_an_unstarted_resumed_session_refuses_capability_root_changes(
+    client: MandalaSandboxClient, root: Path
+) -> None:
+    original = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await original.start()
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    changed_root = root.parent / "changed-root"
+    capability = _ChangeInjectedRoot(new_root=str(changed_root))
+    with pytest.raises(ConfigurationError, match=r"await session\.start\(\)"):
+        await _run_injected_command(resumed, "pwd", capabilities=[capability])
+    assert resumed.state.manifest.root == str(root)
+    assert not changed_root.exists()
+    await resumed.start()
+    # Explicit startup enables the upstream restrictions too: a live workspace
+    # still cannot be redirected by a capability.
+    with pytest.raises(ValueError, match=r"manifest.root"):
+        await _run_injected_command(resumed, "pwd", capabilities=[capability])
+    assert resumed.state.manifest.root == str(root)
+    await resumed.aclose()
+
+
+async def test_a_resumed_injected_session_with_unchanged_manifest_starts_normally(
+    client: MandalaSandboxClient, root: Path
+) -> None:
+    original = await client.create(
+        manifest=manifest(root, entries={"notes.txt": File(content=b"initial notes")}),
+        options=MandalaSandboxClientOptions(on_shutdown="stop"),
+    )
+    await original.start()
+    await original.write(Path("notes.txt"), io.BytesIO(b"edited notes"))
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    output = await _run_injected_command(resumed, "pwd; cat notes.txt")
+    assert str(root) in output and "edited notes" in output
+    assert inner(resumed)._workspace_ready
+    await resumed.aclose()
+
+
+async def test_an_idle_suspended_session_requires_start_before_new_skills(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    await inner(session).computer.suspend()
+    assert inner(session)._workspace_ready
+    assert fake.computers["vm-1"]["status"] == "suspended"
+    before = session.state.manifest.model_copy(deep=True)
+    skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
+
+    # The real platform wakes an idle-suspended computer when a guest command
+    # is admitted. The fake normally omits that behavior; model it here to
+    # verify that the recommended start() actually sends the waking command.
+    execute = fake._exec
+    waking_commands: list[str] = []
+
+    def wake_on_exec(request: Any, rest: list[str], record: dict[str, Any]) -> Any:
+        if request.method == "POST" and not rest and record["status"] == "suspended":
+            waking_commands.append(json.loads(request.content)["command"])
+            record.update(status="running", running_ram_mb=1024)
+        return execute(request, rest, record)
+
+    monkeypatch.setattr(fake, "_exec", wake_on_exec)
+    with pytest.raises(ConfigurationError, match=r"await session\.start\(\)"):
+        await _run_injected_command(session, "cat .agents/review/SKILL.md", capabilities=[skills])
+    assert session.state.manifest == before
+    assert not waking_commands
+    assert not (root / ".agents" / "review" / "SKILL.md").exists()
+
+    await session.start()
+    assert waking_commands  # even an empty ephemeral manifest issues guest work
+    assert await session.running()
+    output = await _run_injected_command(
+        session, "cat .agents/review/SKILL.md", capabilities=[skills]
+    )
+    assert "skill body" in output
+    assert (root / ".agents" / "review" / "SKILL.md").read_text() == "skill body"
+    await session.aclose()
+
+
+@pytest.mark.parametrize("restorable", [False, True])
+async def test_fresh_injected_skills_follow_snapshot_startup_rules(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path, restorable: bool
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    snapshot: LocalSnapshotSpec | LocalSnapshot = LocalSnapshotSpec(base_path=store)
+    if restorable:
+        original = await client.create(manifest=manifest(root), snapshot=snapshot)
+        await original.start()
+        await original.write(Path("saved.txt"), io.BytesIO(b"saved workspace"))
+        await original.aclose()
+        assert isinstance(original.state.snapshot, LocalSnapshot)
+        snapshot = original.state.snapshot
+
+    # This is create(), including when it is given an existing snapshot; no
+    # resume flag should be needed to distinguish full apply from restoration.
+    session = await client.create(manifest=manifest(root), snapshot=snapshot)
+    skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
+    if restorable:
+        before = session.state.manifest.model_copy(deep=True)
+        with pytest.raises(ConfigurationError, match=r"await session\.start\(\)"):
+            await _run_injected_command(
+                session, "cat .agents/review/SKILL.md", capabilities=[skills]
+            )
+        assert session.state.manifest == before
+        await session.start()
+        assert (root / "saved.txt").read_bytes() == b"saved workspace"
+    output = await _run_injected_command(
+        session, "cat .agents/review/SKILL.md", capabilities=[skills]
+    )
+    assert "skill body" in output
+    assert (root / ".agents" / "review" / "SKILL.md").read_text() == "skill body"
+    await session.aclose()
+    assert fake.computers == {}
