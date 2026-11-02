@@ -21,7 +21,7 @@ from typing import Any, Literal
 import pytest
 from agents import RunConfig, Runner
 from agents.sandbox import Manifest, SandboxAgent, SandboxRunConfig, User
-from agents.sandbox.capabilities import Shell
+from agents.sandbox.capabilities import Capability, Shell, Skill, Skills
 from agents.sandbox.entries import File, S3Mount
 from agents.sandbox.entries.mounts.base import InContainerMountStrategy
 from agents.sandbox.entries.mounts.patterns import RcloneMountPattern
@@ -2989,7 +2989,9 @@ async def test_a_resume_waits_for_the_previous_shutdown_to_finish(
 # --- injected sessions ----------------------------------------------------------
 
 
-async def _run_injected_command(session: Any, command: str) -> str:
+async def _run_injected_command(
+    session: Any, command: str, *, capabilities: list[Capability] | None = None
+) -> str:
     model = ScriptedModel(
         [
             [function_call("exec_command", {"cmd": command}, call_id="injected-command")],
@@ -2997,7 +2999,7 @@ async def _run_injected_command(session: Any, command: str) -> str:
         ]
     )
     result = await Runner.run(
-        SandboxAgent(name="injected", model=model, capabilities=[Shell()]),
+        SandboxAgent(name="injected", model=model, capabilities=[Shell(), *(capabilities or [])]),
         "Run the workspace command.",
         run_config=RunConfig(tracing_disabled=True, sandbox=SandboxRunConfig(session=session)),
     )
@@ -3070,3 +3072,96 @@ async def test_an_initialized_injected_session_keeps_its_edited_manifest_file(
     assert fake.computers["vm-1"]["status"] == "running"
     await session.aclose()
     assert fake.computers == {}
+
+
+@pytest.mark.parametrize("replace_computer", [False, True])
+async def test_resumed_injected_skills_require_start_before_manifest_changes(
+    fake: FakePlatform,
+    client: MandalaSandboxClient,
+    root: Path,
+    tmp_path: Path,
+    replace_computer: bool,
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    original = await client.create(
+        manifest=manifest(root, entries={"notes.txt": File(content=b"initial notes")}),
+        snapshot=LocalSnapshotSpec(base_path=store),
+        options=MandalaSandboxClientOptions(on_shutdown="delete" if replace_computer else "stop"),
+    )
+    await original.start()
+    await original.write(Path("notes.txt"), io.BytesIO(b"edited notes"))
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    assert inner(resumed).computer_id == ("vm-2" if replace_computer else "vm-1")
+    before = resumed.state.manifest.model_copy(deep=True)
+    skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
+    with pytest.raises(ConfigurationError, match=r"await session\.start\(\)") as caught:
+        await _run_injected_command(resumed, "cat .agents/review/SKILL.md", capabilities=[skills])
+    assert caught.value.context["reason"] == "resumed_manifest_change"
+    assert resumed.state.manifest == before  # refusal must not record unapplied entries
+    assert not (root / ".agents" / "review" / "SKILL.md").exists()
+    assert not inner(resumed)._shut_down
+
+    # Following the error's advice restores/keeps the old workspace first;
+    # the SDK's live-session diff then installs the new non-ephemeral skill.
+    await resumed.start()
+    output = await _run_injected_command(
+        resumed, "cat .agents/review/SKILL.md; cat notes.txt", capabilities=[skills]
+    )
+    assert "skill body" in output and "edited notes" in output
+    assert (root / ".agents" / "review" / "SKILL.md").read_text() == "skill body"
+    assert fake.computers[inner(resumed).computer_id]["status"] == "running"
+    await resumed.aclose()
+
+
+class _ChangeInjectedRoot(Capability):
+    type: Literal["test-change-root"] = "test-change-root"
+    new_root: str
+
+    def process_manifest(self, manifest: Manifest) -> Manifest:
+        return manifest.model_copy(update={"root": self.new_root})
+
+
+async def test_an_unstarted_resumed_session_refuses_capability_root_changes(
+    client: MandalaSandboxClient, root: Path
+) -> None:
+    original = await client.create(
+        manifest=manifest(root), options=MandalaSandboxClientOptions(on_shutdown="stop")
+    )
+    await original.start()
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    changed_root = root.parent / "changed-root"
+    capability = _ChangeInjectedRoot(new_root=str(changed_root))
+    with pytest.raises(ConfigurationError, match=r"await session\.start\(\)"):
+        await _run_injected_command(resumed, "pwd", capabilities=[capability])
+    assert resumed.state.manifest.root == str(root)
+    assert not changed_root.exists()
+    await resumed.start()
+    # Explicit startup enables the upstream restrictions too: a live workspace
+    # still cannot be redirected by a capability.
+    with pytest.raises(ValueError, match=r"manifest.root"):
+        await _run_injected_command(resumed, "pwd", capabilities=[capability])
+    assert resumed.state.manifest.root == str(root)
+    await resumed.aclose()
+
+
+async def test_a_resumed_injected_session_with_unchanged_manifest_starts_normally(
+    client: MandalaSandboxClient, root: Path
+) -> None:
+    original = await client.create(
+        manifest=manifest(root, entries={"notes.txt": File(content=b"initial notes")}),
+        options=MandalaSandboxClientOptions(on_shutdown="stop"),
+    )
+    await original.start()
+    await original.write(Path("notes.txt"), io.BytesIO(b"edited notes"))
+    await original.aclose()
+    payload = client.serialize_session_state(original.state)
+    resumed = await client.resume(client.deserialize_session_state(payload))
+    output = await _run_injected_command(resumed, "pwd; cat notes.txt")
+    assert str(root) in output and "edited notes" in output
+    assert inner(resumed)._workspace_ready
+    await resumed.aclose()

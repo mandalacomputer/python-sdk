@@ -2547,6 +2547,11 @@ directly as `SandboxRunConfig(session=session)`. The runner prepares its
 workspace before the first tool call, including manifest files and any needed
 snapshot restore. The caller owns that session: call `await session.aclose()`
 after the run to save its workspace and apply its shutdown policy.
+If an agent's capabilities change a resumed session's manifest, such as adding
+`Skills`, call `await session.start()` before passing that session to the runner.
+This prepares the kept or restored workspace before the SDK applies the new
+entries. Without that explicit start, the client raises a `ConfigurationError`
+before changing the manifest, so capability files cannot be silently omitted.
 
 `MandalaSandboxClientOptions` decides what computer a session gets. Every field
 is optional, and `options` may be left out of `SandboxRunConfig` altogether:

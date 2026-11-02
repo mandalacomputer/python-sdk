@@ -380,6 +380,8 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._busy = 0
         #: The resume that made this session started the computer.
         self._started_by_resume = False
+        #: This session came from resume(), including a replacement computer.
+        self._resumed = False
         #: One save at a time, capture and store both, so saves land in order.
         self._save_lock = asyncio.Lock()
         #: A command start whose answer was lost: something may be running that
@@ -482,6 +484,40 @@ class MandalaSandboxSession(BaseSandboxSession):
 
     async def _validate_path_access(self, path: Path | str, *, for_write: bool = False) -> Path:
         return await self._validate_remote_path_access(path, for_write=for_write)
+
+    async def _validate_manifest_application(
+        self,
+        *,
+        only_ephemeral: bool = False,
+        manifest: Manifest | None = None,
+        session_running: bool | None = None,
+    ) -> None:
+        await super()._validate_manifest_application(
+            only_ephemeral=only_ephemeral,
+            manifest=manifest,
+            session_running=session_running,
+        )
+        if (
+            self._resumed
+            and not self._workspace_ready
+            and manifest is not None
+            and manifest != self.state.manifest
+        ):
+            # The runner has not replaced state.manifest yet. A preserved or
+            # restored workspace only reapplies ephemeral entries at start, so
+            # accepting new capability entries here could silently omit them.
+            # Once started, the SDK's live-session diff applies and validates
+            # those changes normally.
+            raise ConfigurationError(
+                message=(
+                    "Call await session.start() before injecting a resumed Mandala session "
+                    "with capabilities that change its manifest."
+                ),
+                error_code=ErrorCode.SANDBOX_CONFIG_INVALID,
+                op="start",
+                context={"backend": _BACKEND_ID, "reason": "resumed_manifest_change"},
+                retryable=False,
+            )
 
     def _mark_workspace_root_ready_from_probe(self) -> None:
         super()._mark_workspace_root_ready_from_probe()
@@ -1955,6 +1991,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 live=self._live,
                 owners=self._owners,
             )
+            inner._resumed = True
             inner._set_start_state_preserved(preserved, system=preserved)
             was_running = computer.status == "running"
             inner._started_by_resume = not was_running
@@ -2001,6 +2038,7 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             live=self._live,
             owners=self._owners,
         )
+        inner._resumed = True
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 

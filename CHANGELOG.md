@@ -16,6 +16,10 @@ This is the summary you read to decide whether to upgrade.
   rebuilt computer previously appeared ready before its manifest or snapshot
   was applied, causing commands to use the wrong directory and later snapshot
   saves to fail.
+- Resumed injected sessions now refuse capability manifest changes before
+  startup rather than silently omit new files from capabilities such as `Skills`.
+  Call `await session.start()` before injecting a resumed session with those
+  capabilities so the SDK can apply its normal live-session manifest update.
 
 ## [0.22.0] - 2026-11-01
 
