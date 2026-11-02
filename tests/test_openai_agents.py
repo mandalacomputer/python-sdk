@@ -3099,7 +3099,7 @@ async def test_resumed_injected_skills_require_start_before_manifest_changes(
     skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
     with pytest.raises(ConfigurationError, match=r"await session\.start\(\)") as caught:
         await _run_injected_command(resumed, "cat .agents/review/SKILL.md", capabilities=[skills])
-    assert caught.value.context["reason"] == "resumed_manifest_change"
+    assert caught.value.context["reason"] == "manifest_change_requires_start"
     assert resumed.state.manifest == before  # refusal must not record unapplied entries
     assert not (root / ".agents" / "review" / "SKILL.md").exists()
     assert not inner(resumed)._shut_down
@@ -3165,3 +3165,81 @@ async def test_a_resumed_injected_session_with_unchanged_manifest_starts_normall
     assert str(root) in output and "edited notes" in output
     assert inner(resumed)._workspace_ready
     await resumed.aclose()
+
+
+async def test_an_idle_suspended_session_requires_start_before_new_skills(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = await client.create(manifest=manifest(root))
+    await session.start()
+    await inner(session).computer.suspend()
+    assert inner(session)._workspace_ready
+    assert fake.computers["vm-1"]["status"] == "suspended"
+    before = session.state.manifest.model_copy(deep=True)
+    skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
+
+    # The real platform wakes an idle-suspended computer when a guest command
+    # is admitted. The fake normally omits that behavior; model it here to
+    # verify that the recommended start() actually sends the waking command.
+    execute = fake._exec
+    waking_commands: list[str] = []
+
+    def wake_on_exec(request: Any, rest: list[str], record: dict[str, Any]) -> Any:
+        if request.method == "POST" and not rest and record["status"] == "suspended":
+            waking_commands.append(json.loads(request.content)["command"])
+            record.update(status="running", running_ram_mb=1024)
+        return execute(request, rest, record)
+
+    monkeypatch.setattr(fake, "_exec", wake_on_exec)
+    with pytest.raises(ConfigurationError, match=r"await session\.start\(\)"):
+        await _run_injected_command(session, "cat .agents/review/SKILL.md", capabilities=[skills])
+    assert session.state.manifest == before
+    assert not waking_commands
+    assert not (root / ".agents" / "review" / "SKILL.md").exists()
+
+    await session.start()
+    assert waking_commands  # even an empty ephemeral manifest issues guest work
+    assert await session.running()
+    output = await _run_injected_command(
+        session, "cat .agents/review/SKILL.md", capabilities=[skills]
+    )
+    assert "skill body" in output
+    assert (root / ".agents" / "review" / "SKILL.md").read_text() == "skill body"
+    await session.aclose()
+
+
+@pytest.mark.parametrize("restorable", [False, True])
+async def test_fresh_injected_skills_follow_snapshot_startup_rules(
+    fake: FakePlatform, client: MandalaSandboxClient, root: Path, tmp_path: Path, restorable: bool
+) -> None:
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    snapshot: LocalSnapshotSpec | LocalSnapshot = LocalSnapshotSpec(base_path=store)
+    if restorable:
+        original = await client.create(manifest=manifest(root), snapshot=snapshot)
+        await original.start()
+        await original.write(Path("saved.txt"), io.BytesIO(b"saved workspace"))
+        await original.aclose()
+        assert isinstance(original.state.snapshot, LocalSnapshot)
+        snapshot = original.state.snapshot
+
+    # This is create(), including when it is given an existing snapshot; no
+    # resume flag should be needed to distinguish full apply from restoration.
+    session = await client.create(manifest=manifest(root), snapshot=snapshot)
+    skills = Skills(skills=[Skill(name="review", description="Review notes", content="skill body")])
+    if restorable:
+        before = session.state.manifest.model_copy(deep=True)
+        with pytest.raises(ConfigurationError, match=r"await session\.start\(\)"):
+            await _run_injected_command(
+                session, "cat .agents/review/SKILL.md", capabilities=[skills]
+            )
+        assert session.state.manifest == before
+        await session.start()
+        assert (root / "saved.txt").read_bytes() == b"saved workspace"
+    output = await _run_injected_command(
+        session, "cat .agents/review/SKILL.md", capabilities=[skills]
+    )
+    assert "skill body" in output
+    assert (root / ".agents" / "review" / "SKILL.md").read_text() == "skill body"
+    await session.aclose()
+    assert fake.computers == {}

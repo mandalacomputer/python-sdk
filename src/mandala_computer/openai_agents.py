@@ -380,8 +380,6 @@ class MandalaSandboxSession(BaseSandboxSession):
         self._busy = 0
         #: The resume that made this session started the computer.
         self._started_by_resume = False
-        #: This session came from resume(), including a replacement computer.
-        self._resumed = False
         #: One save at a time, capture and store both, so saves land in order.
         self._save_lock = asyncio.Lock()
         #: A command start whose answer was lost: something may be running that
@@ -498,10 +496,13 @@ class MandalaSandboxSession(BaseSandboxSession):
             session_running=session_running,
         )
         if (
-            self._resumed
-            and not self._workspace_ready
+            session_running is False
             and manifest is not None
             and manifest != self.state.manifest
+            and (
+                self._workspace_state_preserved_on_start()
+                or await self.state.snapshot.restorable(dependencies=self.dependencies)
+            )
         ):
             # The runner has not replaced state.manifest yet. A preserved or
             # restored workspace only reapplies ephemeral entries at start, so
@@ -510,12 +511,12 @@ class MandalaSandboxSession(BaseSandboxSession):
             # those changes normally.
             raise ConfigurationError(
                 message=(
-                    "Call await session.start() before injecting a resumed Mandala session "
-                    "with capabilities that change its manifest."
+                    "Call await session.start() before changing capability manifest entries "
+                    "on an injected Mandala session whose workspace will be kept or restored."
                 ),
                 error_code=ErrorCode.SANDBOX_CONFIG_INVALID,
                 op="start",
-                context={"backend": _BACKEND_ID, "reason": "resumed_manifest_change"},
+                context={"backend": _BACKEND_ID, "reason": "manifest_change_requires_start"},
                 retryable=False,
             )
 
@@ -1991,7 +1992,6 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
                 live=self._live,
                 owners=self._owners,
             )
-            inner._resumed = True
             inner._set_start_state_preserved(preserved, system=preserved)
             was_running = computer.status == "running"
             inner._started_by_resume = not was_running
@@ -2038,7 +2038,6 @@ class MandalaSandboxClient(BaseSandboxClient[MandalaSandboxClientOptions]):
             live=self._live,
             owners=self._owners,
         )
-        inner._resumed = True
         inner._set_start_state_preserved(preserved, system=preserved)
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
