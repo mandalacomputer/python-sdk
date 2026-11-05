@@ -5,7 +5,9 @@ on:
     branches: [main]
 jobs:
   chromium:
-    runs-on: ubuntu-latest
+    # Pinned (OPL-6333): Playwright does not yet support chromium on Ubuntu
+    # 26.04, which ubuntu-latest became. Move back once it does.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
