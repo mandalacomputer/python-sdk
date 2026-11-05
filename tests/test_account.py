@@ -29,7 +29,7 @@ def account_report() -> dict[str, Any]:
             "snapshot_storage_bytes": 107374182400,
         },
         "per_computer": {"max_vcpu": 16, "max_ram_mb": 16384, "max_disk_gb": 200},
-        "capabilities": {"windows": False},
+        "capabilities": {"windows": False, "macos": False},
         "complete": {"computers": True, "snapshots": True},
         "usage": {
             "kept_computers": 3,
@@ -189,7 +189,8 @@ NUMERIC_FIELDS = [
 ]
 
 
-@pytest.mark.parametrize("section,key", FIELDS)
+# ``capabilities.macos`` is the one optional field: older platforms omit it.
+@pytest.mark.parametrize("section,key", [f for f in FIELDS if f != ("capabilities", "macos")])
 def test_requires_every_field(section: str, key: str | None) -> None:
     data = account_report()
     if key:
@@ -198,6 +199,16 @@ def test_requires_every_field(section: str, key: str | None) -> None:
         del data[section]
     with pytest.raises(mc.MandalaError, match="expected an account quota report"):
         mc.AccountQuota.from_api(data)
+
+
+def test_macos_capability_absent_reads_false_and_granted_reads_true() -> None:
+    data = account_report()
+    data["capabilities"] = {"windows": True}
+    assert mc.AccountQuota.from_api(data).capabilities == mc.AccountCapabilities(
+        windows=True, macos=False
+    )
+    data["capabilities"] = {"windows": False, "macos": True}
+    assert mc.AccountQuota.from_api(data).capabilities.macos is True
 
 
 @pytest.mark.parametrize("section,key", NUMERIC_FIELDS)
@@ -237,6 +248,8 @@ def test_real_booleans_scope_advisory_and_observation() -> None:
         ("plan", "id", ""),
         ("plan", "label", 0),
         ("capabilities", "windows", "false"),
+        ("capabilities", "macos", "true"),
+        ("capabilities", "macos", None),
         ("complete", "computers", 1),
         ("complete", "snapshots", None),
     ] + [

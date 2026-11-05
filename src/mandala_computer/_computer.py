@@ -2355,6 +2355,11 @@ class ComputerFields:
 
     @property
     def os(self) -> str:
+        """The guest operating system: ``"linux"``, ``"windows"`` or ``"macos"``.
+
+        ``""`` where the platform did not say. An open set; compare rather
+        than assume these are the only values.
+        """
         return str(self._data.get("os") or "")
 
     @property
