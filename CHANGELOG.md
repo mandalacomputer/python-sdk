@@ -9,6 +9,13 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- macOS computers, available on request. `AccountQuota.capabilities` gains
+  `macos`: `True` only when this account may create macOS computers. Against a
+  platform that does not send it, it reads `False`. A computer's or template's
+  `os` can now be `macos` as well as `linux` and `windows`.
+
 ### Fixed
 
 - OpenAI Agents SDK sessions passed directly through `SandboxRunConfig(session=...)`

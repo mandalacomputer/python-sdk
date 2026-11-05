@@ -955,6 +955,7 @@ class VncConnect:
 class Template:
     name: str
     label: str
+    #: ``"linux"``, ``"windows"`` or ``"macos"``; an open set.
     os: str
     cpu: int
     ram_mb: int
@@ -1842,9 +1843,16 @@ class AccountPerComputer:
 
 @dataclass(frozen=True)
 class AccountCapabilities:
-    """Features permitted by the plan."""
+    """What the account may create beyond Linux computers.
+
+    ``windows``: whether the plan permits Windows computers. ``macos``: whether
+    this account may create macOS computers, which are granted per account on
+    request rather than by a plan. A platform that does not send ``macos``
+    reads ``False``.
+    """
 
     windows: bool
+    macos: bool = False
 
 
 @dataclass(frozen=True)
@@ -1980,7 +1988,10 @@ class AccountQuota:
                 max_disk_gb=quantity(per.get("max_disk_gb"), "per_computer.max_disk_gb"),
             ),
             capabilities=AccountCapabilities(
-                windows=flag(caps.get("windows"), "capabilities.windows")
+                windows=flag(caps.get("windows"), "capabilities.windows"),
+                macos=(
+                    False if "macos" not in caps else flag(caps.get("macos"), "capabilities.macos")
+                ),
             ),
             complete=AccountCompleteness(computers=computers, snapshots=snapshots),
             usage=AccountUsage(

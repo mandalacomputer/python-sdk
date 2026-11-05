@@ -1152,6 +1152,14 @@ def test_a_template_row_carries_its_ref() -> None:
     assert mc.Template.from_api({"name": "base"}).ref is None
 
 
+def test_macos_is_carried_through_as_a_template_and_computer_os(client: mc.Client) -> None:
+    t = mc.Template.from_api({"name": "mac", "label": "macOS", "os": "macos"})
+    assert t.os == "macos"
+    c = mc.Computer(client._t, {"id": "vm-1", "name": "mac-1", "status": "running", "os": "macos"})
+    assert c.os == "macos"
+    assert mc.AsyncComputer(client._t, {"id": "vm-1", "os": "macos"}).os == "macos"
+
+
 # --- what the second review pass found -------------------------------------
 
 

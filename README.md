@@ -3812,6 +3812,11 @@ inventory has numeric zeros. Missing or malformed required fields raise
 `MandalaError`; the SDK never turns them into an empty account. Unknown future
 fields remain available in `raw`.
 
+`capabilities.windows` says whether the plan permits Windows computers.
+`capabilities.macos` says whether this account may create macOS computers
+(`os == "macos"`), which are available on request rather than with a plan; it
+reads `False` against a platform that does not send it.
+
 Configured vCPU and disk GB include all kept computers, including stopped ones;
 disk is provisioned capacity, not filesystem occupancy. Running/reserved RAM MB
 includes pending reservations and excludes released stopped RAM. The separate
