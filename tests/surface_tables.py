@@ -462,7 +462,7 @@ PARAMETERS: dict[str, set[str]] = {
     "DELETE webhooks/:id": set(),
     "POST webhooks/:id/rotate": set(),
     "POST webhooks/:id/test": set(),
-    "GET webhooks/:id/deliveries": set(),
+    "GET webhooks/:id/deliveries": {"query:before", "query:limit", "query:state"},
     # A key is one OpenSSH public key line; `name` is optional.
     "GET ssh-keys": set(),
     "POST ssh-keys": {"body:public_key", "body:name"},

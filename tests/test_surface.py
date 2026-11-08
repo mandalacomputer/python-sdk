@@ -104,6 +104,13 @@ UNIMPLEMENTED_PARAMETERS = {
     # `store: false` there, and `true` is its default, so there is nothing for
     # this SDK to send (OPL-6084).
     "POST computers/:id/agent/runs  body:store",
+    # Not yet sent (platform OPL-6466): the deliveries listing gained paging
+    # (`before`, `limit`) and a `state` filter. This SDK still reads the first
+    # page only, which is the newest deliveries, as before. A gap to close, not
+    # a decision: remove these three when the listing takes them.
+    "GET webhooks/:id/deliveries  query:before",
+    "GET webhooks/:id/deliveries  query:limit",
+    "GET webhooks/:id/deliveries  query:state",
 }
 
 #: UNIMPLEMENTED in the spelling PARAMETERS is keyed by.
