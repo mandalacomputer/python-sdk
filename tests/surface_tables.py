@@ -129,6 +129,7 @@ ALLOWED = {
     # rather than the account, and whether SSH is on for one computer.
     ("GET", "ssh-keys"),
     ("POST", "ssh-keys"),
+    ("POST", "ssh-keys/challenge"),
     ("DELETE", "ssh-keys/:id"),
     ("GET", "computers/:id/ssh"),
     ("PUT", "computers/:id/ssh"),
@@ -469,7 +470,8 @@ PARAMETERS: dict[str, set[str]] = {
     "GET webhooks/:id/deliveries": {"query:before", "query:limit", "query:state"},
     # A key is one OpenSSH public key line; `name` is optional.
     "GET ssh-keys": set(),
-    "POST ssh-keys": {"body:public_key", "body:name"},
+    "POST ssh-keys": {"body:public_key", "body:name", "body:challenge", "body:signature"},
+    "POST ssh-keys/challenge": set(),
     "DELETE ssh-keys/:id": set(),
     "GET computers/:id/ssh": set(),
     "PUT computers/:id/ssh": {"body:enabled"},

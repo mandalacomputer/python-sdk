@@ -84,6 +84,11 @@ UNIMPLEMENTED = {
     # decision: remove these two when the SDK lists them.
     ("GET", "computers/:id/artifacts"),
     ("GET", "computers/:id/results"),
+
+    # No client method yet (platform OPL-6531): issues the challenge a caller
+    # signs to prove it holds an SSH key's private half before adding it. Leaves
+    # this set in the change that adds the method.
+    ("POST", "ssh-keys/challenge"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -117,6 +122,13 @@ UNIMPLEMENTED_PARAMETERS = {
     "GET webhooks/:id/deliveries  query:before",
     "GET webhooks/:id/deliveries  query:limit",
     "GET webhooks/:id/deliveries  query:state",
+    # Not yet sent (platform OPL-6531): adding a key can carry a signature over
+    # a challenge from `POST ssh-keys/challenge`, proving the caller holds the
+    # private half. A key added without one still registers, as before, and
+    # connects to a computer named by its id. A gap to close, not a decision:
+    # remove these two when the key method takes them.
+    "POST ssh-keys  body:challenge",
+    "POST ssh-keys  body:signature",
 }
 
 #: UNIMPLEMENTED in the spelling PARAMETERS is keyed by.
@@ -595,6 +607,10 @@ def pattern_for(path: str) -> str:
             # `computers/:id/secrets` is a literal third segment, never an id:
             # only the account store's `secrets/:id` is at position 1.
             if parts[i - 1] == "secrets" and i != 1:
+                return seg
+            # `challenge` is a literal after `ssh-keys` (platform OPL-6531); no
+            # key id is one, since every key id starts `sshk-`.
+            if parts[i - 1] == "ssh-keys" and seg == "challenge":
                 return seg
             return ":id"
         if i == 3 and parts[0] == "computers" and parts[2] == "activities":
