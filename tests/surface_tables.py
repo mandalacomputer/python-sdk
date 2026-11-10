@@ -31,6 +31,7 @@ ALLOWED = {
     ("POST", "builds"),
     ("GET", "builds"),
     ("GET", "builds/:id"),
+    ("POST", "builds/:id/cancel"),
     ("GET", "builds/:id/progress"),
     ("GET", "builds/:id/events"),
     ("GET", "sizes"),
@@ -220,6 +221,7 @@ PARAMETERS: dict[str, set[str]] = {
     # and only documented the way out of it in OPL-3840.
     "GET builds": {"query:allow_partial"},
     "GET builds/:id": set(),
+    "POST builds/:id/cancel": set(),
     "GET builds/:id/progress": set(),
     "GET builds/:id/events": set(),
     "GET sizes": set(),
