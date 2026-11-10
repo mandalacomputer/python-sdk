@@ -78,6 +78,12 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # Not yet wrapped (platform OPL-6465): the platform now lists a computer's
+    # retained artifacts and retained results, each with the computer's and the
+    # account's quota usage. Neither takes a parameter. A gap to close, not a
+    # decision: remove these two when the SDK lists them.
+    ("GET", "computers/:id/artifacts"),
+    ("GET", "computers/:id/results"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
