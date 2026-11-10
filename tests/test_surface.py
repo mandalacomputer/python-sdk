@@ -84,7 +84,6 @@ UNIMPLEMENTED = {
     # decision: remove these two when the SDK lists them.
     ("GET", "computers/:id/artifacts"),
     ("GET", "computers/:id/results"),
-
     # No client method yet (platform OPL-6531): issues the challenge a caller
     # signs to prove it holds an SSH key's private half before adding it. Leaves
     # this set in the change that adds the method.
