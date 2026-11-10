@@ -88,6 +88,9 @@ UNIMPLEMENTED = {
     # signs to prove it holds an SSH key's private half before adding it. Leaves
     # this set in the change that adds the method.
     ("POST", "ssh-keys/challenge"),
+    # No client method yet (platform OPL-6467): stops one of the account's
+    # running builds. Leaves this set in the change that adds the method.
+    ("POST", "builds/:id/cancel"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
