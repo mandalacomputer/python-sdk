@@ -40,6 +40,7 @@ from ._models import (
     AccountQuota,
     ApiKey,
     ApiKeyCreated,
+    ApiKeyRevoked,
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
@@ -64,6 +65,7 @@ from ._models import (
     Size,
     Snapshot,
     SshKey,
+    SshKeyChallenge,
     Template,
     TemplateBuild,
     TemplateCheck,
@@ -458,7 +460,12 @@ class Computers:
         data, headers = self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=sent
         )
-        record = _api.computer_record(data, "POST", _api.COMPUTERS)
+        made = _api.replayed_computer_id(data, "POST", _api.COMPUTERS)
+        if made is not None:
+            data = self._t.json_object("GET", _api.computer(made))
+            record = _api.computer_record(data, "GET", _api.computer(made))
+        else:
+            record = _api.computer_record(data, "POST", _api.COMPUTERS)
         return Computer(self._t, record), _api.exchange_end(start, headers)
 
     def launch(
@@ -963,6 +970,10 @@ class Snapshots:
             json=_api.snapshot_clone_body(name, memory, inherit_secrets),
             headers=_api.idempotency_headers(idempotency_key),
         )
+        made = _api.replayed_computer_id(data, "POST", path)
+        if made is not None:
+            data = self._t.json_object("GET", _api.computer(made))
+            return Computer(self._t, _api.computer_record(data, "GET", _api.computer(made)))
         return Computer(self._t, _api.computer_record(data, "POST", path))
 
     def delete(
@@ -1505,6 +1516,29 @@ class Builds:
         """What became of one build. ``error`` says why a failed one failed."""
         return TemplateBuild.from_api(self._t.json_object("GET", _api.build(build_id)))
 
+    def cancel(self, build_id: str) -> TemplateBuild:
+        """Stop one of your builds that is still running, and return it as it
+        stands — still ``"running"``: the build is stopped on its hypervisor,
+        usually within seconds, and its record says what became of it once it
+        has ended. :meth:`get` or :meth:`wait` reads that. A cancelled build is
+        ``"failed"``, its ``error`` says it was cancelled, and nothing is
+        published.
+
+        While another of the account's builds is running, :meth:`start` is
+        refused with a :class:`~mandala_computer.RateLimitError`; this is the
+        way out. A cancelled build still counts as the running build until it
+        has ended, and against the daily build allowance like any build that
+        failed, unless it was stopped before its hypervisor began copying its
+        base image.
+
+        A build that has already finished, or is finishing, is a
+        :class:`~mandala_computer.ConflictError`: there is nothing to stop, so
+        read it for its outcome. One that finished publishing before the stop
+        reached it stays ``"succeeded"``.
+        """
+        data = self._t.json_object("POST", _api.build_action(build_id, "cancel"))
+        return TemplateBuild.from_api(data)
+
     def progress(self, build_id: str, *, timeout_cap: float | None = None) -> BuildProgress:
         """What a build is DOING, as against what became of it.
 
@@ -2006,16 +2040,38 @@ class Webhooks:
         data = self._t.json_object("POST", _api.webhook_action(webhook_id, "test"))
         return WebhookDelivery.from_api(data)
 
-    def deliveries(self, webhook_id: str) -> builtins.list[WebhookDelivery]:
-        """The newest hundred deliveries, newest first, each with its state,
-        its attempt count and the status or one-line error of its newest
-        attempt.
+    def deliveries(
+        self,
+        webhook_id: str,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+        state: str | None = None,
+    ) -> builtins.list[WebhookDelivery]:
+        """One page of deliveries, newest first by when they were queued, each
+        with its state, its attempt count and the status or one-line error of
+        its newest attempt: the newest hundred, unless ``limit`` (1 to 100)
+        says fewer.
 
-        Finished deliveries are kept for seven days; pending ones until they
-        finish. This is where an ``exhausted`` delivery shows up — nothing is
-        dropped silently.
+        Finished deliveries are kept for seven days after they were queued;
+        pending ones until they finish. This is where an ``exhausted`` delivery
+        shows up — nothing is dropped silently while the account is active. A
+        delivery exhausts about fourteen hours after it was queued, so on a busy
+        subscription it is far from the newest: pass ``state="exhausted"`` (or
+        ``"pending"``, ``"in_flight"``, ``"delivered"``, ``"dropped"``), or page
+        back with ``before``, the :attr:`~mandala_computer.WebhookDelivery.id`
+        of the last delivery of the previous page. A page shorter than
+        ``limit`` is the last one. A ``before`` that is not a delivery to this
+        subscription, or one pruned since, is an
+        :class:`~mandala_computer.APIError` (400). A ``limit`` outside 1 to 100,
+        or a ``state`` not among those five, is a ``ValueError`` before
+        anything is sent.
         """
-        data = self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
+        data = self._t.json_array(
+            "GET",
+            _api.webhook_action(webhook_id, "deliveries"),
+            params=_api.delivery_params(before, limit, state),
+        )
         return [
             WebhookDelivery.from_api(d, f"GET webhooks/:id/deliveries: delivery {i}")
             for i, d in enumerate(data)
@@ -2177,7 +2233,30 @@ class SshKeys:
         rows = self._t.json_array("GET", _api.SSH_KEYS)
         return [SshKey.from_api(k, f"GET ssh-keys: key {i}") for i, k in enumerate(rows)]
 
-    def add(self, public_key: str, *, name: str | None = None) -> SshKey:
+    def challenge(self) -> SshKeyChallenge:
+        """A challenge to sign with the private half of a key you are about to
+        add, so that :meth:`add` registers it ``"proven"``.
+
+        Sign :attr:`~mandala_computer.SshKeyChallenge.challenge` exactly as it
+        is, in its :attr:`~mandala_computer.SshKeyChallenge.namespace`, and pass
+        both to :meth:`add`. A challenge is yours alone, works once, and
+        expires after a few minutes; asking for more than eight at once drops
+        the oldest. Refused where adding a key is, with a
+        :class:`~mandala_computer.PermissionDeniedError` (403): an API key
+        confined to a workspace, one that expires or is limited to computers,
+        or a holder who has not verified their email address.
+        """
+        data = self._t.json_object("POST", _api.SSH_KEY_CHALLENGE)
+        return SshKeyChallenge.from_api(data)
+
+    def add(
+        self,
+        public_key: str,
+        *,
+        name: str | None = None,
+        challenge: str | None = None,
+        signature: str | None = None,
+    ) -> SshKey:
         """Register one public key: a line from a ``.pub`` file, as read. It
         is bound to the account this client's API key acts on, and removed
         when that key is revoked.
@@ -2197,8 +2276,22 @@ class SshKeys:
         refused here. Adding it again is a conflict and this client cannot
         remove it, so to use that key on every account remove it and add it
         again from the dashboard; otherwise add a separate key here.
+
+        PROOF THAT THE KEY IS YOURS. Without ``challenge`` and ``signature`` the
+        key is registered ``"unproven"``
+        (:attr:`~mandala_computer.SshKey.possession`): it connects to a
+        computer named by its id, and one named by its name is refused. To
+        register it ``"proven"``, get a challenge from :meth:`challenge`, sign
+        it with the key's private half
+        (``printf '%s' '<challenge>' | ssh-keygen -Y sign -n <namespace> -f <key file>``)
+        and pass the challenge and the armored signature that prints. With a
+        valid signature, a key already registered without one, to you or to
+        anybody, is replaced rather than a conflict. A signature that does not
+        verify, or a challenge not issued to you, used or expired, is an
+        :class:`~mandala_computer.APIError` (400). Passing only one of the two
+        is a ``ValueError`` before anything is sent.
         """
-        body = _api.ssh_key_body(public_key, name)
+        body = _api.ssh_key_body(public_key, name, challenge, signature)
         return SshKey.from_api(self._t.json_object("POST", _api.SSH_KEYS, json=body))
 
     def remove(self, key_id: str) -> None:
@@ -2481,7 +2574,7 @@ class ApiKeys:
             )
         raise _api.key_limits_refusal(key_id, problem or "", revoked)
 
-    def revoke(self, key_id: str) -> None:
+    def revoke(self, key_id: str) -> ApiKeyRevoked:
         """Revoke one key; it is refused from its next request. A key may revoke
         itself, and the call that does so is the last it makes. An id out of
         this key's reach is a :class:`~mandala_computer.NotFoundError`, the same
@@ -2491,8 +2584,14 @@ class ApiKeys:
         Revoking a key does NOT revoke the keys it minted: they keep working.
         Each carries the minter's id in
         :attr:`~mandala_computer.ApiKey.minted_by_key_id`, so find them in
-        :meth:`list` and revoke them too."""
-        self._t.request("DELETE", _api.api_key(key_id))
+        :meth:`list` and revoke them too.
+
+        Nor does it disable the webhook subscriptions made through the key: they
+        keep delivering. The answer's
+        :attr:`~mandala_computer.ApiKeyRevoked.webhooks` names them, so disable
+        or delete any you no longer want."""
+        resp = self._t.request("DELETE", _api.api_key(key_id))
+        return ApiKeyRevoked.from_api(_api.json_or_none(resp))
 
 
 class Workspaces:

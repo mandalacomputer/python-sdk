@@ -184,6 +184,11 @@ _CODE_CLEARS = frozenset({"idempotency_in_progress", "WORKSPACE_MOVING"})
 #: is permanent, where an ordinary :class:`ConflictError` would read as worth
 #: sending again. A new screenshot, and the capture it names, is the fix.
 #:
+#: ``unsupported_on_macos`` is a request a macOS computer cannot have, such as
+#: SSH: a ``409`` with code ``UNSUPPORTED_ON_MACOS``. Nothing was stored, and
+#: the same request is refused the same way for as long as the computer runs
+#: macOS, so it is permanent.
+#:
 #: The "ordinary :class:`ConflictError`" each paragraph above warns about is
 #: the one from before OPL-5974: an unclassified 409 now answers ``False`` as
 #: well. The words still matter, because they are read before a ``code`` in
@@ -199,6 +204,7 @@ _REASON_PERMANENT = frozenset(
         "name_taken",
         "stale_revision",
         "stale_capture",
+        "unsupported_on_macos",
     }
 )
 
@@ -278,6 +284,14 @@ class APIError(MandalaError):
     #: ``"unavailable"`` on an exec that asked for ``retain_output`` and failed
     #: with no retained result published. ``None`` on every other error.
     retained_output: str | None = None
+    #: Beside :attr:`retained_output`, when a limit is why no retained result
+    #: was published: ``"computer_quota"`` or ``"account_quota"`` (that
+    #: retained quota is full, and it clears only when objects expire or are
+    #: deleted: list them with :meth:`~mandala_computer.Computer.results` and
+    #: :meth:`~mandala_computer.Computer.artifacts`) or ``"capacity"`` (shared
+    #: store capacity was full, which clears by itself). ``None`` for any other
+    #: reason, and on every other error. An open set.
+    retained_output_reason: str | None = None
 
     def __init__(
         self,
@@ -344,6 +358,15 @@ class APIError(MandalaError):
         ``None`` when there is none."""
         return _nonblank(self.body.get("operation_id") if isinstance(self.body, dict) else None)
 
+    @property
+    def computer_id(self) -> str | None:
+        """The body's ``computer_id``, when the platform sent one: on a ``409``
+        ``idempotency_in_progress`` to a keyed create or clone, the computer
+        that call has already made. Read it with
+        :meth:`~mandala_computer.Computers.get` rather than creating another.
+        ``None`` when there is none."""
+        return _nonblank(self.body.get("computer_id") if isinstance(self.body, dict) else None)
+
 
 class AuthenticationError(APIError):
     """A credential was refused (401); reason/challenge may classify the refusal."""
@@ -353,7 +376,13 @@ class PermissionDeniedError(APIError):
     """Authenticated, but not allowed (403): the credential is valid but lacks
     the role, the workspace membership or the permission (such as a key's
     permission to manage keys) the request needs, or the account or person is
-    suspended."""
+    suspended.
+
+    :attr:`~APIError.code` ``MACOS_LICENCE_REQUIRED`` is a macOS computer
+    asked to come up (a start, restart, restore or resume) on an account that
+    has not accepted Apple's macOS licence. An owner of the account accepts it
+    on the Billing page; the same request then succeeds. Sending it again
+    before that is refused the same way."""
 
 
 class NotFoundError(APIError):
@@ -372,7 +401,11 @@ class PlanLimitError(APIError):
     explanation of which limit was hit, and :attr:`~APIError.code` the kind:
     ``PLAN_REQUIRED`` is an account with no plan, or a trial that has ended;
     ``TRIAL_LIMIT`` is something a trial does not allow; ``TRIAL_CREATES_USED``
-    is a trial that has launched all it may. None clears by sending it again.
+    is a trial that has launched all it may; ``STORAGE_OVER_PLAN`` is an
+    account storing more than its plan allows, refused a create, clone,
+    start, restart or restore until what it stores fits the plan again:
+    delete snapshots or computers, or choose a larger plan. None clears by
+    sending it again.
 
     Not raised by the agent routes (:meth:`~mandala_computer.Computer.agent`,
     :meth:`~mandala_computer.Computer.agent_stream`,

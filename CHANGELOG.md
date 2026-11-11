@@ -15,8 +15,60 @@ This is the summary you read to decide whether to upgrade.
   `macos`: `True` only when this account may create macOS computers. Against a
   platform that does not send it, it reads `False`. A computer's or template's
   `os` can now be `macos` as well as `linux` and `windows`.
+- Proving an SSH key is yours. `ssh_keys.challenge()` returns an
+  `SshKeyChallenge` to sign with the key's private half, and `ssh_keys.add()`
+  takes `challenge=` and `signature=` (both or neither; one alone is a
+  `ValueError` before anything is sent). `SshKey.possession` says whether a key
+  is `"proven"`, `"unproven"` (connects to a computer named by its id only) or
+  `"legacy"`; `None` from a platform that does not send it. The CLI gains
+  `ssh-key challenge` and `ssh-key add --challenge ... --signature-file FILE`,
+  and says so on stderr when a key it added is unproven.
+- `builds.cancel(build_id)` stops a running build and returns it as it stands.
+  It is the way out of the `429` a second build gets while one is running.
+- `Computer.results()` and `Computer.artifacts()` (and the async computer's)
+  list a computer's published, unexpired retained results and artifacts with
+  the computer's and the account's quota usage (`RetainedResultListing`,
+  `ArtifactListing`, `RetainedUsage`, `RetainedQuota`). A listing with one row
+  this version cannot read is refused whole.
+- `webhooks.deliveries()` takes `before=`, `limit=` (1 to 100) and `state=`, to
+  page back past the newest hundred and to find `exhausted` or `dropped`
+  deliveries. The CLI's `webhooks deliveries` takes `--before`, `--limit` and
+  `--state`.
+- `Webhook.last_error` (a `WebhookLastError`: `at`, `status`, `error`,
+  `delivery`) and `Webhook.created_by`, on `WebhookCreated` too. `None` from a
+  platform that does not send them. `disabled_reason` is documented with
+  `creator_removed` and `key_revoked`.
+- `Computer.host_paused` (a `HostPaused`: `reason`, `since`) is set while a
+  running computer is held paused by its host to recover disk space, and
+  `Computer.egress_proxy_last_error` (an `EgressProxyLastError`: `reason`, `at`,
+  `count`) says why proxied connections are failing. Both are `None` otherwise.
+- `ExecResult.retained_output_reason` and `APIError.retained_output_reason` read
+  `X-GC-Retained-Output-Reason`: `"computer_quota"` or `"account_quota"` (clears
+  only when retained objects expire or are deleted) or `"capacity"` (clears by
+  itself), beside `retained_output == "unavailable"`.
+- `APIError.computer_id`: on a `409 idempotency_in_progress` to a keyed create
+  or clone, the computer that call has already made.
+
+### Changed
+
+- `api_keys.revoke()` returns an `ApiKeyRevoked` instead of `None`. Its
+  `webhooks` lists the webhook subscriptions made through the revoked key, which
+  the revoke leaves delivering; `None` when the answer does not say, which is
+  not the same as none. The CLI's `api-keys revoke` names each one still
+  delivering on stderr, and its `--json` gains `webhooks`.
+- The reason word `unsupported_on_macos` is final to `is_transient()`, read
+  before a `code` that would otherwise clear. The `STORAGE_OVER_PLAN` (402) and
+  `MACOS_LICENCE_REQUIRED` (403) codes are documented.
 
 ### Fixed
+
+- A keyed create or clone (`computers.create`, `launch`, `Computer.clone`,
+  `snapshots.clone`, sync and async) resent after its answer was lost is no
+  longer refused with "expected a computer". When the platform answers such a
+  resend, or a call whose answer was too large to keep, with the call's
+  operation, the SDK reads the computer the operation names and returns it.
+  When the operation names no computer yet, the `MandalaError` names the
+  operation to read.
 
 - OpenAI Agents SDK sessions passed directly through `SandboxRunConfig(session=...)`
   now prepare their workspace before the first tool call. A newly created or

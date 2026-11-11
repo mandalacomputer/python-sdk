@@ -12,6 +12,7 @@ from . import _api
 from ._exceptions import MandalaError
 
 __all__ = [
+    "ArtifactListing",
     "BackgroundResult",
     "ResultDiagnostic",
     "ResultObservation",
@@ -19,7 +20,12 @@ __all__ = [
     "ResultPrefix",
     "ResultStream",
     "RetainOutputOptions",
+    "RetainedArtifactEntry",
+    "RetainedQuota",
     "RetainedResult",
+    "RetainedResultEntry",
+    "RetainedResultListing",
+    "RetainedUsage",
     "SynchronousResult",
     "SynchronousResultPrefix",
 ]
@@ -339,3 +345,171 @@ def decode_result_output(
     ):
         raise invalid("output offsets or EOF")
     return ResultOutput(result_id, cast(ResultStream, stream), offset, end, eof == "true", data)
+
+
+# --- listings: GET computers/:id/results and /artifacts ---------------------
+
+
+@dataclass(frozen=True)
+class RetainedQuota:
+    """How full one retained quota is: objects and bytes charged now, out of
+    its maximum. Charged includes captures in progress and deleted objects not
+    yet cleaned up, which a listing does not show."""
+
+    objects: int
+    bytes: int
+    max_objects: int
+    max_bytes: int
+
+
+@dataclass(frozen=True)
+class RetainedUsage:
+    """Both quotas the next capture or publication by this account meets."""
+
+    #: This computer's quota. Objects recorded before a workspace move are not
+    #: charged here.
+    computer: RetainedQuota
+    #: The account's, across every computer and workspace, including objects
+    #: recorded before a workspace move.
+    account: RetainedQuota
+
+
+@dataclass(frozen=True)
+class RetainedResultEntry:
+    """One published, unexpired retained result, as a listing names it. Read
+    it whole with :meth:`~mandala_computer.Computer.result`."""
+
+    result_id: str
+    kind: Literal["background-output", "synchronous-output"]
+    #: Bytes charged for it: its retained stdout, stderr and diagnostic.
+    bytes: int
+    #: The workspace it was recorded in. One that differs from the computer's
+    #: current workspace was recorded before a move: nobody may read it, and
+    #: only an account owner on an account-wide credential may delete it.
+    workspace_id: str | None
+    #: The background execution it froze; ``None`` for synchronous output.
+    execution_id: str | None
+    #: When its capture began; expiry counts from here.
+    started_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class RetainedResultListing:
+    """A computer's published, unexpired retained results, oldest first, and
+    the quotas the next capture meets. Complete in one answer."""
+
+    results: tuple[RetainedResultEntry, ...]
+    usage: RetainedUsage
+
+
+@dataclass(frozen=True)
+class RetainedArtifactEntry:
+    """One published, unexpired artifact, as a listing names it. Read it
+    whole with :meth:`~mandala_computer.Computer.artifact`."""
+
+    artifact_id: str
+    size: int
+    #: As on :class:`RetainedResultEntry`.
+    workspace_id: str | None
+    execution_id: str | None
+    #: When its reservation began; expiry counts from here.
+    started_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class ArtifactListing:
+    """A computer's published, unexpired artifacts, oldest first, and the
+    quotas the next publication meets. Complete in one answer."""
+
+    artifacts: tuple[RetainedArtifactEntry, ...]
+    usage: RetainedUsage
+
+
+def _quota(value: object, field: str) -> RetainedQuota:
+    q = record(value, field)
+    return RetainedQuota(
+        integer(q.get("objects"), f"{field} objects"),
+        integer(q.get("bytes"), f"{field} bytes"),
+        integer(q.get("max_objects"), f"{field} max_objects", low=1),
+        integer(q.get("max_bytes"), f"{field} max_bytes", low=1),
+    )
+
+
+def _usage(value: object) -> RetainedUsage:
+    u = record(value, "usage")
+    return RetainedUsage(
+        _quota(u.get("computer"), "usage computer"), _quota(u.get("account"), "usage account")
+    )
+
+
+def _optional_scope(row: Mapping[str, Any], key: str) -> str | None:
+    if key not in row:
+        raise invalid(key)
+    return None if row[key] is None else scope(row[key], key)
+
+
+def _optional_execution(row: Mapping[str, Any]) -> str | None:
+    if "execution_id" not in row:
+        raise invalid("execution_id")
+    value = row["execution_id"]
+    return None if value is None else identity(value, None, "execution_id")
+
+
+def _rows(data: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+    rows = data.get(key)
+    if not isinstance(rows, list):
+        raise invalid(key)
+    return [record(row, key) for row in rows]
+
+
+def _span(row: Mapping[str, Any]) -> tuple[str, str]:
+    started, started_ns = timestamp(row.get("started_at"), "started_at")
+    expires, expires_ns = timestamp(row.get("expires_at"), "expires_at")
+    if not started_ns < expires_ns:
+        raise invalid("listing chronology")
+    return started, expires
+
+
+def decode_result_listing(data: Mapping[str, Any]) -> RetainedResultListing:
+    """Refused whole, as :class:`~mandala_computer.MandalaError`, on one row
+    it cannot read: a listing quietly one shorter would hide an object the
+    caller is looking for in order to delete it."""
+    entries: list[RetainedResultEntry] = []
+    for row in _rows(data, "results"):
+        kind = row.get("kind")
+        if kind not in ("background-output", "synchronous-output"):
+            raise invalid("kind")
+        execution = _optional_execution(row)
+        started, expires = _span(row)
+        entries.append(
+            RetainedResultEntry(
+                identity(row.get("result_id"), None, "result_id"),
+                cast(Literal["background-output", "synchronous-output"], kind),
+                integer(row.get("bytes"), "bytes"),
+                _optional_scope(row, "workspace_id"),
+                execution,
+                started,
+                expires,
+            )
+        )
+    return RetainedResultListing(tuple(entries), _usage(data.get("usage")))
+
+
+def decode_artifact_listing(data: Mapping[str, Any]) -> ArtifactListing:
+    """As :func:`decode_result_listing`, for artifacts."""
+    entries: list[RetainedArtifactEntry] = []
+    for row in _rows(data, "artifacts"):
+        started, expires = _span(row)
+        entries.append(
+            RetainedArtifactEntry(
+                identity(row.get("artifact_id"), None, "artifact_id"),
+                integer(row.get("size"), "size", high=_api.ARTIFACT_MAX_BYTES),
+                _optional_scope(row, "workspace_id"),
+                _optional_execution(row),
+                started,
+                expires,
+            )
+        )
+    return ArtifactListing(tuple(entries), _usage(data.get("usage")))
