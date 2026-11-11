@@ -53,6 +53,7 @@ from tests.surface_inventory import half, inventory, names, record_named_calls
 from tests.surface_tables import ALLOWED, PARAMETERS
 from tests.test_account import account_report
 from tests.test_artifacts import ARTIFACT_ID, artifact_manifest, download
+from tests.test_retained_listings import ARTIFACT_LISTING, RESULT_LISTING
 from tests.test_retained_results import EXECUTION_ID, RESULT_ID, page, result_manifest
 
 import mandala_computer as mc
@@ -78,19 +79,6 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
-    # Not yet wrapped (platform OPL-6465): the platform now lists a computer's
-    # retained artifacts and retained results, each with the computer's and the
-    # account's quota usage. Neither takes a parameter. A gap to close, not a
-    # decision: remove these two when the SDK lists them.
-    ("GET", "computers/:id/artifacts"),
-    ("GET", "computers/:id/results"),
-    # No client method yet (platform OPL-6531): issues the challenge a caller
-    # signs to prove it holds an SSH key's private half before adding it. Leaves
-    # this set in the change that adds the method.
-    ("POST", "ssh-keys/challenge"),
-    # No client method yet (platform OPL-6467): stops one of the account's
-    # running builds. Leaves this set in the change that adds the method.
-    ("POST", "builds/:id/cancel"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.
@@ -117,20 +105,6 @@ UNIMPLEMENTED_PARAMETERS = {
     # `store: false` there, and `true` is its default, so there is nothing for
     # this SDK to send (OPL-6084).
     "POST computers/:id/agent/runs  body:store",
-    # Not yet sent (platform OPL-6466): the deliveries listing gained paging
-    # (`before`, `limit`) and a `state` filter. This SDK still reads the first
-    # page only, which is the newest deliveries, as before. A gap to close, not
-    # a decision: remove these three when the listing takes them.
-    "GET webhooks/:id/deliveries  query:before",
-    "GET webhooks/:id/deliveries  query:limit",
-    "GET webhooks/:id/deliveries  query:state",
-    # Not yet sent (platform OPL-6531): adding a key can carry a signature over
-    # a challenge from `POST ssh-keys/challenge`, proving the caller holds the
-    # private half. A key added without one still registers, as before, and
-    # connects to a computer named by its id. A gap to close, not a decision:
-    # remove these two when the key method takes them.
-    "POST ssh-keys  body:challenge",
-    "POST ssh-keys  body:signature",
 }
 
 #: UNIMPLEMENTED in the spelling PARAMETERS is keyed by.
@@ -196,6 +170,13 @@ OPERATION = {
     "created_at": "2026-09-26T08:00:00.000Z",
     "updated_at": "2026-09-26T08:01:10.000Z",
     "finished_at": "2026-09-26T08:01:10.000Z",
+}
+SIGNATURE = "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----\n"
+SSH_KEY_CHALLENGE = {
+    "challenge": "sshkc-" + "0" * 64,
+    "namespace": "mandala-ssh-key",
+    "expires_at": "2026-09-16T12:10:00.000Z",
+    "sign_command": "printf '%s' 'sshkc-...' | ssh-keygen -Y sign -n mandala-ssh-key -f ~/.ssh/id_ed25519",
 }
 SSH_KEY = {
     "id": "sshk-74025eba1b658b99",
@@ -767,6 +748,11 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             201, json=result_manifest(execution_id=path.split("/executions/", 1)[1].split("/")[0])
         )
+    # A computer's retained listings (no parameters), before the per-id routes.
+    if path.endswith("/results") and get:
+        return httpx.Response(200, json=RESULT_LISTING)
+    if path.endswith("/artifacts") and get:
+        return httpx.Response(200, json=ARTIFACT_LISTING)
     if "/results/" in path:
         if request.method == "DELETE":
             return httpx.Response(204)
@@ -977,6 +963,8 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh-keys"):
         return httpx.Response(200 if get else 201, json=[SSH_KEY] if get else SSH_KEY)
+    if path.endswith("/ssh-keys/challenge"):
+        return httpx.Response(201, json=SSH_KEY_CHALLENGE)
     if "/ssh-keys/" in path:
         return httpx.Response(200, json={"ok": True})
     if path.endswith("/ssh"):
@@ -1079,6 +1067,7 @@ def exercise_everything(client: mc.Client) -> None:
     # OPL-3840 is what made the way out of it something a client can send.
     client.builds.list(allow_partial=True)
     client.builds.get("bld-1")
+    client.builds.cancel("bld-1")
     client.builds.progress("bld-1")
     # The poll on top of progress. It shares `GET builds/:id/progress` with the
     # call above, so the route half of this file cannot tell whether it was ever
@@ -1192,6 +1181,7 @@ def exercise_everything(client: mc.Client) -> None:
     c.result(RESULT_ID)
     c.result_output(RESULT_ID, stream="stdout", offset=0, limit=64)
     c.delete_result(RESULT_ID)
+    c.results()
     c.publish_artifact(
         "/tmp/a",
         expected_size=3,
@@ -1203,6 +1193,7 @@ def exercise_everything(client: mc.Client) -> None:
     c.artifact(ARTIFACT_ID)
     c.download_artifact(ARTIFACT_ID, max_bytes=64)
     c.delete_artifact(ARTIFACT_ID)
+    c.artifacts()
     c.exec("true", cwd="/tmp", env={"CI": "1"})
     # `desktop` is the wire's `session`, and the only value it takes.
     c.exec("true", desktop=True)
@@ -1382,12 +1373,17 @@ def exercise_everything(client: mc.Client) -> None:
     client.webhooks.rotate("whk-2b7d4c809f3c1a7e")
     client.webhooks.test("whk-2b7d4c809f3c1a7e")
     client.webhooks.deliveries("whk-2b7d4c809f3c1a7e")
+    client.webhooks.deliveries(
+        "whk-2b7d4c809f3c1a7e", before="whd-0123456789abcdef", limit=10, state="exhausted"
+    )
     client.webhooks.delete("whk-2b7d4c809f3c1a7e")
     # SSH access: the caller's keys, with and without a label, and one
     # computer's switch in both directions.
     client.ssh_keys.list()
     client.ssh_keys.add(SSH_KEY["public_key"])
     client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
+    issued = client.ssh_keys.challenge()
+    client.ssh_keys.add(SSH_KEY["public_key"], challenge=issued.challenge, signature=SIGNATURE)
     client.ssh_keys.remove(SSH_KEY["id"])
     connection = c.create_browser_connection(session_policy=mc.BrowserSessionPolicy())
     c.renew_browser_connection(connection.id)
@@ -1479,6 +1475,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.builds.list()
     await client.builds.list(allow_partial=True)
     await client.builds.get("bld-1")
+    await client.builds.cancel("bld-1")
     await client.builds.progress("bld-1")
     await client.builds.wait("bld-1")
     async for _ in client.builds.events("bld-1"):
@@ -1578,6 +1575,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.result(RESULT_ID)
     await c.result_output(RESULT_ID, stream="stdout", offset=0, limit=64)
     await c.delete_result(RESULT_ID)
+    await c.results()
     await c.publish_artifact(
         "/tmp/a",
         expected_size=3,
@@ -1589,6 +1587,7 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await c.artifact(ARTIFACT_ID)
     await c.download_artifact(ARTIFACT_ID, max_bytes=64)
     await c.delete_artifact(ARTIFACT_ID)
+    await c.artifacts()
     await c.exec("true", cwd="/tmp", env={"CI": "1"})
     await c.exec("true", desktop=True)
     await c.open("https://example.com")
@@ -1738,10 +1737,17 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.webhooks.rotate("whk-2b7d4c809f3c1a7e")
     await client.webhooks.test("whk-2b7d4c809f3c1a7e")
     await client.webhooks.deliveries("whk-2b7d4c809f3c1a7e")
+    await client.webhooks.deliveries(
+        "whk-2b7d4c809f3c1a7e", before="whd-0123456789abcdef", limit=10, state="exhausted"
+    )
     await client.webhooks.delete("whk-2b7d4c809f3c1a7e")
     await client.ssh_keys.list()
     await client.ssh_keys.add(SSH_KEY["public_key"])
     await client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
+    issued_async = await client.ssh_keys.challenge()
+    await client.ssh_keys.add(
+        SSH_KEY["public_key"], challenge=issued_async.challenge, signature=SIGNATURE
+    )
     await client.ssh_keys.remove(SSH_KEY["id"])
     connection = await c.create_browser_connection(session_policy=mc.BrowserSessionPolicy())
     await c.renew_browser_connection(connection.id)

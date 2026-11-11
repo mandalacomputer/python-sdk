@@ -441,7 +441,14 @@ if out.status != "succeeded":
 **Builds need an account-wide key.** Builds are the account's, like the
 templates they build: an API key confined to a workspace gets a
 `PermissionDeniedError` (403) from every `builds` method — `start`, `list`,
-`get`, `progress`, `events` and `wait` alike. It launches a computer from a
+`get`, `cancel`, `progress`, `events` and `wait` alike.
+
+**One build runs at a time per account.** While one is running, `start()` is
+refused with a `RateLimitError` (`429`). `client.builds.cancel(build.id)` stops a
+running build: it answers the build still `running`, and once it has stopped,
+usually within seconds, `get()` or `wait()` reads it `failed` with an `error`
+that says it was cancelled. Cancelling a build that has already finished is a
+`ConflictError`. It launches a computer from a
 published template by its ref instead.
 
 **Build secrets.** `spec.secrets` lets build steps read secrets you have stored,
@@ -810,6 +817,7 @@ c = client.computers.create(
 )
 c.egress_proxy  # EgressProxy(server='https://proxy.example.com:3128', credentials_secret_id='csec-…')
 c.egress_proxy_pending  # True until the host holds the credentials
+c.egress_proxy_last_error  # why proxied connections are failing, or None
 c.set_egress_proxy({"server": "socks5://proxy.example.com:1080"})  # no credentials now
 c.set_egress_proxy(None)  # traffic goes out directly again
 ```
@@ -1413,9 +1421,21 @@ if result.result_id is not None:
     metadata = c.result(result.result_id)  # explicit metadata read
 elif result.retained_output == "unavailable":
     ...  # asked for, and no retained result was published
+    # retained_output_reason says when a limit is why: "computer_quota" or
+    # "account_quota" (clears only when objects expire or are deleted) or
+    # "capacity" (clears by itself).
+
+# What the computer holds, and how full its and the account's quotas are.
+listing = c.results()
+for entry in listing.results:
+    print(entry.result_id, entry.kind, entry.bytes, entry.expires_at)
+print(listing.usage.computer.objects, "of", listing.usage.computer.max_objects)
 ```
 
 `retain_execution_output()` makes one POST and reads guest output explicitly.
+`results()` lists the computer's published, unexpired results, oldest first,
+complete in one answer, with `usage.computer` and `usage.account`; it is the way
+to find ids to delete once a full quota refuses a capture.
 `result()`, `result_output()` and `delete_result()` each make one retained request
 without guest I/O or waking a computer. Results use `res_` IDs, distinct from
 volatile `exec_` handles. Reads can use the optional transport retry policy;
@@ -1475,7 +1495,8 @@ c.delete_artifact(artifact.artifact_id)
 ```
 
 `publish_artifact()` makes one explicit guest capture POST. `artifact()` and
-`delete_artifact()` each make one retained request. The finite `Artifact` model
+`delete_artifact()` each make one retained request. `artifacts()` lists the
+computer's published, unexpired artifacts the same way `results()` lists results. The finite `Artifact` model
 contains the `art_` ID, computer/workspace, creation/expiry, size, digest and
 nullable `execution_association`; a caller-selected execution association does
 not prove that execution produced the file. Artifacts have no public account ID
@@ -3019,7 +3040,20 @@ silently dropped:
 for d in client.webhooks.deliveries(hook.id):  # newest hundred, newest first
     if d.is_finished and not d.is_delivered:
         print(d.id, d.event_type, d.state, d.attempts, d.last_error or d.last_status)
+
+# A delivery exhausts about fourteen hours after it was queued, so on a busy
+# subscription it is far from the newest: filter, or page back with `before`.
+exhausted = client.webhooks.deliveries(hook.id, state="exhausted", limit=50)
+older = client.webhooks.deliveries(hook.id, before=exhausted[-1].id) if exhausted else []
 ```
+
+`limit` is 1 to 100 and `state` one of `pending`, `in_flight`, `delivered`,
+`exhausted` or `dropped`; either outside that is a `ValueError` before anything
+is sent. A page shorter than `limit` is the last one. The subscription itself
+says why its newest attempt failed: `hook.last_error` is a `WebhookLastError`
+(`at`, `status`, `error` and the `delivery` it was for), or `None` once an
+attempt is accepted. `hook.created_by` names who created it or last changed its
+URL: a person's email, or `apikey:` and a key id.
 
 `last_error` is a line for a person — `timeout`, `dns`, `refused`, `reset`,
 `tls`, `status 503` and others the platform may add — not a vocabulary to
@@ -3032,7 +3066,11 @@ pending deliveries are dropped. `client.webhooks.update(hook.id, enabled=True)`
 starts it fresh. When the account moves to a plan without webhooks, its
 subscriptions read `disabled_reason="plan"` and `enabled=True` is refused
 (402); choosing a plan with webhooks enables them again, oldest first, as many
-as the plan allows. An update sends only what you name; `events=[]` or
+as the plan allows. A subscription reads `disabled_reason="creator_removed"`
+when the person in `created_by` was removed from the account, left it, or was
+made a viewer, and `"key_revoked"` when the key in `created_by` was revoked as
+leaked from the dashboard; neither comes back on its own, and an owner or
+member enables it again with an update. An update sends only what you name; `events=[]` or
 `computers=[]` clears that filter back to everything, and naming nothing is
 refused rather than sent. `client.webhooks.test(hook.id)` queues one signed
 delivery of a synthetic `webhook.test` event through the ordinary path, and the
@@ -3472,6 +3510,16 @@ A replayed answer (`Idempotent-Replayed: true`) is the stored one with the
 desktop credentials taken out: a replayed create, clone or rename comes back
 with `vnc` set to `None`. `c.refresh()` fetches them.
 
+A create or clone resent after its answer was lost, once the platform has
+learnt which computer the first call made, is answered with that call's
+operation rather than the computer; so is one whose answer was too large to
+keep. The SDK reads the computer the operation names and returns it, as if the
+answer had arrived. When the operation names no computer yet, it raises a
+`MandalaError` naming the operation: read it with `client.operations.get()`.
+A `409 idempotency_in_progress` to a create or clone that has already made its
+computer names it as `err.computer_id`: read that computer rather than creating
+another.
+
 Keys are kept per credential scope. `operations.list(idempotency_key=...)` finds
 only an operation that a credential of the same scope reserved: the same key
 sent by another workspace's API key, or by a workspace's key when yours is
@@ -3855,7 +3903,9 @@ with Client() as client:
     keys = client.api_keys.list()  # newest first; never a raw key
     ci = client.api_keys.create(name="ci")
     new_key = ci.key  # shown ONCE: store it now
-    client.api_keys.revoke(ci.id)
+    revoked = client.api_keys.revoke(ci.id)
+    for hook in revoked.webhooks or []:  # made through that key, and still sending
+        client.webhooks.update(hook.id, enabled=False)
 
     agent = client.api_keys.create(  # the shape for a key handed to an agent
         name="agent", expires_in_hours=24, computer_ids=["vm-0123456789ab"]
@@ -4238,6 +4288,14 @@ and deleting it again is what clears it. `wait_until_running()`,
 `wait_for_egress_proxy()` and `launch()` raise on it at once rather than
 waiting out their timeout. Treat a status outside the six as not startable, not as
 `stopped`.
+
+A `running` computer can be held paused by its host to recover disk space with
+its status still `running`. `c.host_paused` is then a `HostPaused` — `reason`
+(`disk_low`, `disk_emergency`, `disk_full` or `disk_recovery`) and `since` —
+and screenshots, input and commands stall or fail meanwhile. It resumes by
+itself once the host has space, and the field goes back to `None`; nothing
+needs doing. A stop meanwhile discards the paused session, and starting it
+again is refused with a `503` while the host is still low on disk space.
 
 ### Files
 
@@ -4624,6 +4682,8 @@ statuses on a trial. None of these has a class of its own, and none is
 | `TRIAL_CREATE_PENDING` | 409 | the trial's computer is still being created. It clears by itself: wait for that computer. Do not create again on a timer, which could make a second one |
 | `TRIAL_FULL` | 503 | every trial slot is taken. Nothing was sent and nothing used up, so send it again after `retry_after` |
 | `TRIAL_UNAVAILABLE` | 503 | trials are paused right now. Nothing was sent and nothing used up |
+| `STORAGE_OVER_PLAN` | 402 | the account stores more than its plan allows: a create, clone, start, restart or restore is refused until it fits again. Delete snapshots or computers, or choose a larger plan |
+| `MACOS_LICENCE_REQUIRED` | 403 | a macOS computer asked to start, restart, restore or resume on an account that has not accepted Apple's macOS licence: an owner accepts it on the Billing page, then the same request succeeds |
 
 `MoveRequiredError` is a 409 that does **not** clear, and it is a subclass
 of `ConflictError` so that an `except ConflictError` written before it existed
@@ -4783,8 +4843,9 @@ started, as above); `unavailable` (the computer is not
 running — start it), `running` (the computer IS running and the request needs
 it stopped, such as a resize — stop it; waiting never helps), `unsupported`,
 `exists`, `revoked`, `name_taken` (a secret name the account already uses —
-pick another) and `stale_revision` (a secret write naming a `revision_id` that
-has moved — read it again) make it answer `False`. The set is open: an absent
+pick another), `stale_revision` (a secret write naming a `revision_id` that
+has moved — read it again) and `unsupported_on_macos` (a macOS computer cannot
+have this, such as SSH) make it answer `False`. The set is open: an absent
 or unknown word is treated as unclassified, and an unclassified `ConflictError`
 answers `False`, because the platform says absent means no classification and
 that treating every 409 as transient loops forever. The exceptions are two
@@ -5162,6 +5223,8 @@ The pieces, one at a time:
 ```sh
 mandala-py ssh-key list               # --json for the rows
 mandala-py ssh-key add [PATH] [--name NAME]
+mandala-py ssh-key challenge          # a challenge to sign, to prove the key is yours
+mandala-py ssh-key add [PATH] --challenge sshkc-… --signature-file sig.txt
 mandala-py ssh-key rm sshk-74025eba1b658b99
 mandala-py ssh-access dev             # the status; --json for the object
 mandala-py ssh-access dev on          # or off
@@ -5179,6 +5242,39 @@ account cannot be added again here. An API key removes only a key whose reach is
 dashboard (or with an API key before keys were bound to an account) or one bound
 to another account, fails as if the id were unknown. Remove those from the
 dashboard.
+
+**Prove the key is yours to reach a computer by its name.** A public key is
+public, so a key added from its `.pub` line alone is `unproven`
+(`SshKey.possession`): it connects to a computer named by its id, and one named
+by its name is refused. To add it `proven`, sign a challenge with its private
+half:
+
+```python
+import subprocess
+from pathlib import Path
+
+home = Path.home() / ".ssh"
+issued = client.ssh_keys.challenge()
+signed = subprocess.run(
+    ["ssh-keygen", "-Y", "sign", "-n", issued.namespace, "-f", str(home / "id_ed25519")],
+    input=issued.challenge,
+    capture_output=True,
+    text=True,
+    check=True,
+)
+key = client.ssh_keys.add(
+    (home / "id_ed25519.pub").read_text(),
+    challenge=issued.challenge,
+    signature=signed.stdout,
+)
+assert key.possession == "proven"
+```
+
+`issued.sign_command` is that command, naming `~/.ssh/id_ed25519`. A challenge
+is yours alone, works once and expires within minutes. Adding an `unproven` or
+`legacy` key again with a signature replaces it and makes it `proven`; a
+`legacy` key (added before proof was asked for) connects by id or name as it
+always did. Pass both `challenge` and `signature`, or neither.
 
 #### Without the CLI: `ssh-config`, VS Code, scp and sftp
 

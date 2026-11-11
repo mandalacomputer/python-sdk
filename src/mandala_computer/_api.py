@@ -90,6 +90,7 @@ WEBHOOKS = "webhooks"
 #: The caller's own SSH public keys. A key belongs to a person rather than to an
 #: account, so the collection is the same whichever account a key acts on.
 SSH_KEYS = "ssh-keys"
+SSH_KEY_CHALLENGE = "ssh-keys/challenge"
 #: Who the credential is (platform OPL-5053): the person, the account and role
 #: it acts with, the workspace it is confined to, and the key itself. Needs no
 #: permission, and answers a suspended account too.
@@ -397,8 +398,18 @@ def artifact_id(value: str) -> str:
     return value
 
 
+def retained_results(computer_id: str) -> str:
+    return f"{computer(computer_id)}/results"
+
+
 def retained_result(computer_id: str, identity: str) -> str:
-    return f"{computer(computer_id)}/results/{result_id(identity)}"
+    return f"{retained_results(computer_id)}/{result_id(identity)}"
+
+
+#: The most a retained listing's answer may be. A listing is complete in one
+#: answer and an account holds at most 2,000 retained objects, each listed in
+#: well under 300 bytes, so this is room to spare rather than a page size.
+RETAINED_LISTING_MAX_BYTES = 2 * 1024 * 1024
 
 
 def artifacts(computer_id: str) -> str:
@@ -1134,6 +1145,81 @@ def computer_record(data: Any, method: str, path: str) -> dict[str, Any]:
     if not names_a_computer(payload):
         raise MandalaError(f"expected a computer from {method} {path}")
     return payload
+
+
+def json_or_none(resp: httpx.Response) -> Any:
+    """A response body as JSON, or ``None`` when it is empty or not JSON: for a
+    call that has already taken effect, whose answer is extra information."""
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def replayed_computer_id(data: Any, method: str, path: str, key: str | None = None) -> str | None:
+    """The computer a keyed create or clone made, when its answer is a replay
+    that names it only through its operation; ``None`` for any other answer.
+
+    A keyed ``POST`` resent after its first answer was lost, once the platform
+    has learnt which computer that call made, is answered ``200`` with
+    ``{"operation_id": ..., "operation": {...}}`` and ``Idempotent-Replayed:
+    true`` rather than with the computer. So is a keyed call whose answer was
+    too large to keep. That is the very resend an idempotency key exists for,
+    so it is not an error: the computer is ``operation.computer_id``, and the
+    caller reads it.
+
+    An answer of that shape whose operation is ``null`` or names no computer
+    cannot be turned into one, and is refused with a :class:`MandalaError`
+    that names the operation, which
+    :meth:`~mandala_computer.Operations.get` reads to see how the call ended,
+    and carries the call's ``key``: resending under it replays the operation
+    again, never a second computer.
+    Anything else (a computer, an envelope, an unreadable body) is ``None``
+    and goes on to :func:`computer_record`, which refuses what is not a
+    computer as before.
+    """
+    if not isinstance(data, Mapping) or "computer" in data or names_a_computer(data):
+        return None
+    operation_id = data.get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id or "operation" not in data:
+        return None
+    operation = data.get("operation")
+    if isinstance(operation, Mapping):
+        computer_id = operation.get("computer_id")
+        if isinstance(computer_id, str) and computer_id:
+            return str.__str__(computer_id)
+    err = MandalaError(
+        f"{method} {path} answered with its operation {operation_id} rather than a "
+        "computer, and the operation names no computer yet; read it with "
+        "operations.get() to see how the call ended"
+    )
+    err.idempotency_key = key
+    raise err
+
+
+def replay_read_failed(
+    err: MandalaError, key: str | None, computer_id: str, replayed: Mapping[str, Any]
+) -> None:
+    """Hand back the key of a keyed create or clone whose replayed answer
+    named its computer, when reading that computer failed.
+
+    The call itself was carried out: resending it under the same key replays
+    the same answer again and never makes a second computer. So the error
+    carries the call's key whatever went wrong with the read (a timeout, a
+    ``5xx``, a ``404``, an unreadable body), keeping its type, and its
+    message names the computer and the operation the replay answered with.
+    A key the read's own failure already set is left as it is.
+    """
+    if err.idempotency_key is None:
+        err.idempotency_key = key
+    operation_id = replayed.get("operation_id")
+    message = (
+        f"the call made computer {computer_id} (operation {operation_id}), "
+        f"but reading it failed: {err}"
+    )
+    err.args = (message, *err.args[1:])
 
 
 def workspace_move_record(
@@ -3224,6 +3310,31 @@ def webhook(webhook_id: str) -> str:
     return f"webhooks/{seg(webhook_id)}"
 
 
+#: The states ``GET webhooks/:id/deliveries`` filters on. Refused here when
+#: anything else is asked for, as the platform would refuse it (400).
+DELIVERY_STATES = ("pending", "in_flight", "delivered", "exhausted", "dropped")
+
+
+def delivery_params(before: object, limit: object, state: object) -> dict[str, str]:
+    """``GET webhooks/:id/deliveries``: only what was asked for. ``limit`` is
+    1 to 100; ``state`` one of :data:`DELIVERY_STATES`; ``before`` a
+    delivery id, the last of the previous page."""
+    params: dict[str, str] = {}
+    if before is not None:
+        value = canonical(before, "before")
+        if not value:
+            raise ValueError("before must be a delivery id")
+        params["before"] = value
+    if limit is not None:
+        params["limit"] = str(bounded_integer(limit, "limit", 1, 100))
+    if state is not None:
+        value = canonical(state, "state")
+        if value not in DELIVERY_STATES:
+            raise ValueError(f"state must be one of {', '.join(DELIVERY_STATES)}")
+        params["state"] = value
+    return params
+
+
 def webhook_action(webhook_id: str, action: str) -> str:
     """rotate | test | deliveries."""
     return f"webhooks/{seg(webhook_id)}/{action}"
@@ -3578,12 +3689,19 @@ def computer_ssh(computer_id: str) -> str:
     return computer_action(computer_id, "ssh")
 
 
-def ssh_key_body(public_key: object, name: object) -> dict[str, Any]:
+def ssh_key_body(
+    public_key: object, name: object, challenge: object = None, signature: object = None
+) -> dict[str, Any]:
     """``POST ssh-keys``: one ``.pub`` line, and a label only when one was given.
 
     Surrounding whitespace is dropped, so the contents of a ``.pub`` file can be
     passed as read, trailing newline and all. Anything else about the line is
     the platform's to judge, and a refusal names the rule it broke.
+
+    ``challenge`` and ``signature`` travel together or not at all: the platform
+    refuses one without the other, so that is refused here, before anything is
+    sent. Both are sent as given — the signature is the armored text
+    ``ssh-keygen -Y sign`` printed, and its line breaks are part of it.
     """
     line = canonical(public_key, "public_key").strip()
     if not line:
@@ -3591,6 +3709,11 @@ def ssh_key_body(public_key: object, name: object) -> dict[str, Any]:
     body: dict[str, Any] = {"public_key": line}
     if name is not None:
         body["name"] = canonical(name, "name")
+    if (challenge is None) != (signature is None):
+        raise ValueError("challenge and signature go together: pass both or neither")
+    if challenge is not None:
+        body["challenge"] = canonical(challenge, "challenge")
+        body["signature"] = canonical(signature, "signature")
     return body
 
 

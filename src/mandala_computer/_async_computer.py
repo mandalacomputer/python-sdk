@@ -50,6 +50,7 @@ from ._client import (
     AsyncTransport,
     _retained_exec_object,
     retained_output,
+    retained_output_reason,
 )
 from ._computer import (
     CAPTURING,
@@ -164,11 +165,15 @@ from ._models import (
     window_contradiction,
 )
 from ._results import (
+    ArtifactListing,
     ResultOutput,
     ResultStream,
     RetainedResult,
+    RetainedResultListing,
     RetainOutputOptions,
+    decode_artifact_listing,
     decode_result,
+    decode_result_listing,
     decode_result_output,
 )
 from ._uploads import FileUpload, UploadInterruptedError, attach_upload_id, read_chunk_async
@@ -371,12 +376,23 @@ class AsyncComputer(ComputerFields):
         :meth:`wait_until_built` before starting it.
         """
         path = _api.computer_action(self.id, "clone")
+        key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
         data = await self._t.json_object(
             "POST",
             path,
             json=_api.name_body(name),
-            headers=_api.idempotency_headers(idempotency_key),
+            headers={_api.IDEMPOTENCY_KEY_HEADER: key},
         )
+        made = _api.replayed_computer_id(data, "POST", path, key)
+        if made is not None:
+            try:
+                read = await self._t.json_object("GET", _api.computer(made))
+                return AsyncComputer(
+                    self._t, _api.computer_record(read, "GET", _api.computer(made))
+                )
+            except MandalaError as err:
+                _api.replay_read_failed(err, key, made, data)
+                raise
         return AsyncComputer(self._t, _api.computer_record(data, "POST", path))
 
     async def rename(self, name: str, *, idempotency_key: str | None = None) -> AsyncComputer:
@@ -2025,6 +2041,7 @@ class AsyncComputer(ComputerFields):
         result = replace(
             ExecResult.from_api(_retained_exec_object(response, path)),
             retained_output=retained_output(response),
+            retained_output_reason=retained_output_reason(response),
         )
         if response.status_code != 200:
             return result
@@ -2197,6 +2214,43 @@ class AsyncComputer(ComputerFields):
             max_bytes=params["limit"],
         )
         return decode_result_output(data, headers, result_id=identity, **params)
+
+    async def results(self) -> RetainedResultListing:
+        """This computer's published, unexpired retained results, oldest
+        first, with how full the computer's and the account's retained quotas
+        are. The way to find result ids to delete with :meth:`delete_result`
+        once a full quota refuses a capture (a ``409``
+        ``result_quota_exhausted``, which clears only when objects expire or
+        are deleted).
+
+        Complete in one answer; no guest calls. A workspace-scoped credential
+        sees only results recorded in its workspace. An account-wide one also
+        sees results recorded before the computer moved workspace, each with
+        the workspace it was recorded in: nobody may read those, and only an
+        account owner may delete them. Captures in progress and deleted
+        results awaiting cleanup are not listed but are charged in
+        :attr:`~mandala_computer.RetainedResultListing.usage`. A host outage is
+        an :class:`~mandala_computer.UnavailableError`, never an empty list.
+        """
+        data = await self._t.bounded_json_object(
+            "GET", _api.retained_results(self.id), max_bytes=_api.RETAINED_LISTING_MAX_BYTES
+        )
+        return decode_result_listing(data)
+
+    async def artifacts(self) -> ArtifactListing:
+        """This computer's published, unexpired artifacts, oldest first, with
+        how full the computer's and the account's retained quotas are: the way
+        to find artifact ids to delete with :meth:`delete_artifact` once a full
+        quota refuses a publication.
+
+        Scoped and complete as :meth:`results` is; in-progress and deleted
+        artifacts are charged in
+        :attr:`~mandala_computer.ArtifactListing.usage` but not listed.
+        """
+        data = await self._t.bounded_json_object(
+            "GET", _api.artifacts(self.id), max_bytes=_api.RETAINED_LISTING_MAX_BYTES
+        )
+        return decode_artifact_listing(data)
 
     async def delete_result(self, result_id: str) -> None:
         """Delete one retained version. Repeated deletion remains a 404 error."""

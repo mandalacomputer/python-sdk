@@ -2017,7 +2017,9 @@ def _cmd_webhooks_test(args: argparse.Namespace) -> int:
 
 def _cmd_webhooks_deliveries(args: argparse.Namespace) -> int:
     with _client() as client:
-        deliveries = client.webhooks.deliveries(args.id)
+        deliveries = client.webhooks.deliveries(
+            args.id, before=args.before, limit=args.limit, state=args.state
+        )
     if args.json:
         _json([d.raw for d in deliveries])
     elif deliveries:
@@ -2764,11 +2766,28 @@ def _cmd_api_keys_revoke(args: argparse.Namespace) -> int:
     # repeated) even where no credentials are configured.
     _api.not_a_raw_key(args.id)
     with _client() as client:
-        client.api_keys.revoke(args.id)
+        revoked = client.api_keys.revoke(args.id)
+    webhooks = revoked.webhooks
     if args.json:
-        _json({"id": args.id, "revoked": True})
-    else:
-        print(f"revoked {args.id}")
+        _json(
+            {
+                "id": args.id,
+                "revoked": True,
+                "webhooks": None if webhooks is None else [w.raw for w in webhooks],
+            }
+        )
+        return 0
+    print(f"revoked {args.id}")
+    # The revoke leaves these delivering; saying so is the point of the list.
+    # A disabled one sends nothing, so only the enabled ones are worth a line.
+    for w in webhooks or []:
+        if w.enabled:
+            print(
+                f"{PROG}: webhook {_shown(w.id)} ({_shown(w.url)}) was made through this key "
+                f"and is still delivering; `{PROG} webhooks update {_shown(w.id)} --disable` "
+                "or `webhooks delete` stops it",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -3698,8 +3717,19 @@ def _webhooks_parser(sub: Any) -> None:
     test.add_argument("--json", action="store_true", help=_ALREADY_JSON)
     test.set_defaults(fn=_cmd_webhooks_test)
 
-    deliveries = verbs.add_parser("deliveries", help="the newest hundred deliveries, newest first")
+    deliveries = verbs.add_parser(
+        "deliveries", help="one page of deliveries, newest first (the newest hundred by default)"
+    )
     deliveries.add_argument("id", metavar="ID")
+    deliveries.add_argument(
+        "--before",
+        metavar="DELIVERY",
+        help="the page before this delivery id: the last of the previous page",
+    )
+    deliveries.add_argument("--limit", type=int, help="how many, 1 to 100 (default 100)")
+    deliveries.add_argument(
+        "--state", choices=_api.DELIVERY_STATES, help="only deliveries in this state"
+    )
     deliveries.add_argument("--json", action="store_true", help="the rows as JSON")
     deliveries.set_defaults(fn=_cmd_webhooks_deliveries)
 
@@ -4071,14 +4101,53 @@ def _cmd_ssh_key_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
-    line = _openssh.read_public_key(_key_path(args.path))
+def _cmd_ssh_key_challenge(args: argparse.Namespace) -> int:
     with _client() as client:
-        key = client.ssh_keys.add(line, name=args.name)
+        issued = client.ssh_keys.challenge()
+    if args.json:
+        _json(issued.raw)
+        return 0
+    print(f"challenge   {_shown(issued.challenge)}")
+    print(f"namespace   {_shown(issued.namespace)}")
+    print(f"expires at  {_shown(issued.expires_at)}")
+    print(f"sign with   {_shown(issued.sign_command)}")
+    print(
+        f"{PROG}: replace the key file in that command with yours, save what it prints, then "
+        f"`{PROG} ssh-key add <.pub> --challenge <challenge> --signature-file <file>`",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _signature(path: str) -> str:
+    """The armored signature in a file, or on standard input for ``-``."""
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).expanduser().read_text()
+    except (OSError, UnicodeDecodeError) as err:
+        raise ValueError(f"cannot read the signature in {path}: {err}") from None
+
+
+def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
+    if (args.challenge is None) != (args.signature_file is None):
+        raise ValueError("--challenge and --signature-file go together: pass both or neither")
+    line = _openssh.read_public_key(_key_path(args.path))
+    signature = None if args.signature_file is None else _signature(args.signature_file)
+    with _client() as client:
+        key = client.ssh_keys.add(
+            line, name=args.name, challenge=args.challenge, signature=signature
+        )
     if args.json:
         _json(key.raw)
     else:
         print(f"added {_shown(key.id)}  {_shown(key.fingerprint)}  {_shown(key.name)}")
+        if key.possession == "unproven":
+            print(
+                f"{PROG}: this key is unproven, so it connects to a computer named by its id "
+                f"only; `{PROG} ssh-key challenge` says how to prove it is yours",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -4403,8 +4472,21 @@ def _ssh_parsers(sub: Any) -> None:
         help="a .pub file (default: the first of ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)",
     )
     add.add_argument("--name", help="a label (default: the key's comment)")
+    add.add_argument(
+        "--challenge", help="a challenge from `ssh-key challenge`, signed with this key"
+    )
+    add.add_argument(
+        "--signature-file",
+        metavar="FILE",
+        help="the signature `ssh-keygen -Y sign` printed for --challenge (- for stdin)",
+    )
     add.add_argument("--json", action="store_true", help="the key as JSON")
     add.set_defaults(fn=_cmd_ssh_key_add)
+    challenge = verbs.add_parser(
+        "challenge", help="a challenge to sign, to add a key as proven to be yours"
+    )
+    challenge.add_argument("--json", action="store_true", help="the challenge as JSON")
+    challenge.set_defaults(fn=_cmd_ssh_key_challenge)
     rm = verbs.add_parser("rm", help="remove a key")
     rm.add_argument("id", metavar="ID")
     rm.add_argument("--json", action="store_true", help="the result as JSON")

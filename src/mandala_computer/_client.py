@@ -340,9 +340,22 @@ INCOMPLETE_HEADER = "X-GC-Incomplete"
 RETAINED_OUTPUT_HEADER = "X-GC-Retained-Output"
 
 
+#: Beside ``X-GC-Retained-Output: unavailable``, when a limit is why:
+#: ``computer_quota``, ``account_quota`` or ``capacity``.
+RETAINED_OUTPUT_REASON_HEADER = "X-GC-Retained-Output-Reason"
+
+
 def retained_output(resp: httpx.Response) -> str | None:
     """What the platform said of a requested capture, or ``None`` if nothing."""
     return resp.headers.get(RETAINED_OUTPUT_HEADER) or None
+
+
+def retained_output_reason(resp: httpx.Response) -> str | None:
+    """Why a requested capture was not published, when a limit is why; ``None``
+    without :func:`retained_output`, which the reason only ever accompanies."""
+    if retained_output(resp) is None:
+        return None
+    return resp.headers.get(RETAINED_OUTPUT_REASON_HEADER) or None
 
 
 def _incomplete(resp: httpx.Response) -> int | None:
@@ -954,6 +967,7 @@ class _BaseTransport:
         error = _BaseTransport._classified_error(resp)
         error._redirected = bool(resp.history)
         error.retained_output = retained_output(resp)
+        error.retained_output_reason = retained_output_reason(resp)
         return error
 
     @staticmethod

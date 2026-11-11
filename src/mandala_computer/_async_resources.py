@@ -22,6 +22,7 @@ from ._models import (
     AccountQuota,
     ApiKey,
     ApiKeyCreated,
+    ApiKeyRevoked,
     BrowserProxy,
     BrowserProxyArgs,
     BuildProgress,
@@ -46,6 +47,7 @@ from ._models import (
     Size,
     Snapshot,
     SshKey,
+    SshKeyChallenge,
     Template,
     TemplateBuild,
     TemplateCheck,
@@ -420,7 +422,17 @@ class AsyncComputers:
         data, headers = await self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=sent
         )
-        record = _api.computer_record(data, "POST", _api.COMPUTERS)
+        key = sent[_api.IDEMPOTENCY_KEY_HEADER]
+        made = _api.replayed_computer_id(data, "POST", _api.COMPUTERS, key)
+        if made is not None:
+            try:
+                read = await self._t.json_object("GET", _api.computer(made))
+                record = _api.computer_record(read, "GET", _api.computer(made))
+            except MandalaError as err:
+                _api.replay_read_failed(err, key, made, data)
+                raise
+        else:
+            record = _api.computer_record(data, "POST", _api.COMPUTERS)
         return AsyncComputer(self._t, record), _api.exchange_end(start, headers)
 
     async def launch(
@@ -788,12 +800,23 @@ class AsyncSnapshots:
         check it before assuming the session came across.
         """
         path = _api.snapshot_action(snapshot_id, "clone")
+        key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
         data = await self._t.json_object(
             "POST",
             path,
             json=_api.snapshot_clone_body(name, memory, inherit_secrets),
-            headers=_api.idempotency_headers(idempotency_key),
+            headers={_api.IDEMPOTENCY_KEY_HEADER: key},
         )
+        made = _api.replayed_computer_id(data, "POST", path, key)
+        if made is not None:
+            try:
+                read = await self._t.json_object("GET", _api.computer(made))
+                return AsyncComputer(
+                    self._t, _api.computer_record(read, "GET", _api.computer(made))
+                )
+            except MandalaError as err:
+                _api.replay_read_failed(err, key, made, data)
+                raise
         return AsyncComputer(self._t, _api.computer_record(data, "POST", path))
 
     async def delete(
@@ -1049,6 +1072,10 @@ class AsyncBuilds:
     async def get(self, build_id: str) -> TemplateBuild:
         return TemplateBuild.from_api(await self._t.json_object("GET", _api.build(build_id)))
 
+    async def cancel(self, build_id: str) -> TemplateBuild:
+        data = await self._t.json_object("POST", _api.build_action(build_id, "cancel"))
+        return TemplateBuild.from_api(data)
+
     async def progress(self, build_id: str, *, timeout_cap: float | None = None) -> BuildProgress:
         data = await self._t.json_object(
             "GET", _api.build_action(build_id, "progress"), timeout_cap=timeout_cap
@@ -1168,6 +1195,7 @@ class AsyncBuilds:
         Builds.list.__doc__, ":meth:`Computers.list`", ":meth:`AsyncComputers.list`"
     )
     get.__doc__ = Builds.get.__doc__
+    cancel.__doc__ = Builds.cancel.__doc__
     progress.__doc__ = Builds.progress.__doc__
     wait.__doc__ = Builds.wait.__doc__
 
@@ -1384,8 +1412,19 @@ class AsyncWebhooks:
         data = await self._t.json_object("POST", _api.webhook_action(webhook_id, "test"))
         return WebhookDelivery.from_api(data)
 
-    async def deliveries(self, webhook_id: str) -> builtins.list[WebhookDelivery]:
-        data = await self._t.json_array("GET", _api.webhook_action(webhook_id, "deliveries"))
+    async def deliveries(
+        self,
+        webhook_id: str,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+        state: str | None = None,
+    ) -> builtins.list[WebhookDelivery]:
+        data = await self._t.json_array(
+            "GET",
+            _api.webhook_action(webhook_id, "deliveries"),
+            params=_api.delivery_params(before, limit, state),
+        )
         return [
             WebhookDelivery.from_api(d, f"GET webhooks/:id/deliveries: delivery {i}")
             for i, d in enumerate(data)
@@ -1569,14 +1608,26 @@ class AsyncSshKeys:
         rows = await self._t.json_array("GET", _api.SSH_KEYS)
         return [SshKey.from_api(k, f"GET ssh-keys: key {i}") for i, k in enumerate(rows)]
 
-    async def add(self, public_key: str, *, name: str | None = None) -> SshKey:
-        body = _api.ssh_key_body(public_key, name)
+    async def challenge(self) -> SshKeyChallenge:
+        data = await self._t.json_object("POST", _api.SSH_KEY_CHALLENGE)
+        return SshKeyChallenge.from_api(data)
+
+    async def add(
+        self,
+        public_key: str,
+        *,
+        name: str | None = None,
+        challenge: str | None = None,
+        signature: str | None = None,
+    ) -> SshKey:
+        body = _api.ssh_key_body(public_key, name, challenge, signature)
         return SshKey.from_api(await self._t.json_object("POST", _api.SSH_KEYS, json=body))
 
     async def remove(self, key_id: str) -> None:
         await self._t.request("DELETE", _api.ssh_key(key_id))
 
     list.__doc__ = SshKeys.list.__doc__
+    challenge.__doc__ = SshKeys.challenge.__doc__
     add.__doc__ = SshKeys.add.__doc__
     remove.__doc__ = SshKeys.remove.__doc__
 
@@ -1653,8 +1704,9 @@ class AsyncApiKeys:
             raise held
         return revoked
 
-    async def revoke(self, key_id: str) -> None:
-        await self._t.request("DELETE", _api.api_key(key_id))
+    async def revoke(self, key_id: str) -> ApiKeyRevoked:
+        resp = await self._t.request("DELETE", _api.api_key(key_id))
+        return ApiKeyRevoked.from_api(_api.json_or_none(resp))
 
     list.__doc__ = ApiKeys.list.__doc__
     create.__doc__ = ApiKeys.create.__doc__

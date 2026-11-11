@@ -47,6 +47,7 @@ __all__ = [
     "ActivityResults",
     "ApiKey",
     "ApiKeyCreated",
+    "ApiKeyRevoked",
     "BrowserProxy",
     "BrowserProxyArgs",
     "BuildProgress",
@@ -61,10 +62,12 @@ __all__ = [
     "DirectoryEntry",
     "EgressProxy",
     "EgressProxyArgs",
+    "EgressProxyLastError",
     "ExecResult",
     "ExecStatus",
     "FilePart",
     "GuestDirectory",
+    "HostPaused",
     "InputBatchActionResult",
     "InputBatchResult",
     "InputContext",
@@ -87,6 +90,7 @@ __all__ = [
     "PublishedTemplate",
     "Retention",
     "RetiredTemplates",
+    "RevokedKeyWebhook",
     "Schedule",
     "ScreenshotInfo",
     "Secret",
@@ -103,6 +107,7 @@ __all__ = [
     "SnapshotPurge",
     "SshAccess",
     "SshKey",
+    "SshKeyChallenge",
     "Template",
     "TemplateBuild",
     "TemplateCheck",
@@ -115,6 +120,7 @@ __all__ = [
     "Webhook",
     "WebhookCreated",
     "WebhookDelivery",
+    "WebhookLastError",
     "Whoami",
     "WhoamiAccount",
     "WhoamiUser",
@@ -3355,6 +3361,16 @@ class ExecResult:
     #: a platform that does not say. Keyword-only and out of equality, as
     #: :attr:`result_id` is.
     retained_output: str | None = field(default=None, kw_only=True, compare=False)
+    #: Beside :attr:`retained_output`, when a limit is why no retained result
+    #: was published: ``"computer_quota"`` or ``"account_quota"`` (that
+    #: retained quota is full, and it clears only when objects expire or are
+    #: deleted: list them with :meth:`~mandala_computer.Computer.results` and
+    #: :meth:`~mandala_computer.Computer.artifacts`) or ``"capacity"`` (shared
+    #: store capacity was full, which clears by itself, so the same command may
+    #: be retained later). ``None`` for any other reason, and whenever
+    #: :attr:`retained_output` is. An open set. Keyword-only and out of
+    #: equality, as :attr:`retained_output` is.
+    retained_output_reason: str | None = field(default=None, kw_only=True, compare=False)
 
     @property
     def stdout_text(self) -> str:
@@ -3460,6 +3476,41 @@ def _opt_text(value: Any) -> str | None:
 
 
 @dataclass(frozen=True)
+class WebhookLastError:
+    """Why a subscription's newest delivery attempt failed, from
+    :attr:`Webhook.last_error`."""
+
+    #: When the failure was recorded, RFC 3339: the answer, or the cut-off for
+    #: a timeout.
+    at: str
+    #: The HTTP status the endpoint answered, or ``None`` when it gave no answer.
+    status: int | None
+    #: The one-line error, as on the delivery: ``timeout``, ``dns``,
+    #: ``refused``, ``tls``, ``redirect``, ``status 503`` and so on. An open
+    #: set, as :attr:`WebhookDelivery.last_error` is: show it, do not branch on it.
+    error: str
+    #: The ``whd-`` id of the delivery the attempt was for. Its row is in
+    #: :meth:`~mandala_computer.Webhooks.deliveries` until it is pruned, seven
+    #: days after it was queued.
+    delivery: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, value: Any) -> WebhookLastError | None:
+        """``None`` for ``null``, an absent field, or anything that is not an
+        object: a subscription is still readable when this part of it is not."""
+        if not isinstance(value, Mapping):
+            return None
+        return cls(
+            at=_text(value.get("at")),
+            status=_opt_whole(value.get("status")),
+            error=_text(value.get("error")),
+            delivery=_text(value.get("delivery")),
+            raw=dict(value),
+        )
+
+
+@dataclass(frozen=True)
 class Webhook:
     """A subscription: POST this account's events, signed, at :attr:`url`.
 
@@ -3499,8 +3550,13 @@ class Webhook:
     #: ``"plan"`` when the account moved to a plan without webhooks. A
     #: ``"plan"`` subscription is enabled again, oldest first, as many as the
     #: plan allows, when the account chooses a plan that includes webhooks;
-    #: until then ``enabled=True`` is refused (402). A plain string, not a
-    #: closed set: the platform may add reasons. ``None`` while enabled.
+    #: until then ``enabled=True`` is refused (402). ``"creator_removed"`` when
+    #: the person behind :attr:`created_by` was removed from the account, left
+    #: it, or was made a viewer, and ``"key_revoked"`` when the API key in
+    #: :attr:`created_by` was revoked as leaked from the dashboard; neither
+    #: comes back on its own, and an owner or member enables it with an update.
+    #: A plain string, not a closed set: the platform may add reasons. ``None``
+    #: while enabled.
     disabled_reason: str | None
     #: RFC 3339, or ``None`` while enabled.
     disabled_at: str | None
@@ -3519,6 +3575,21 @@ class Webhook:
     #: :class:`Computer` follows for the same one.
     workspace_id: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    #: Why the newest delivery attempt failed: when, the status, the one-line
+    #: error and the delivery it was for. ``None`` before any attempt has
+    #: failed, once the newest attempt was accepted, and from a platform that
+    #: does not report it. An attempt still in flight does not count, nor does
+    #: a delivery the platform dropped without sending.
+    #:
+    #: KEYWORD-ONLY, after ``raw``, as :attr:`SshKey.reach` is: this class is
+    #: exported, so its field order is its constructor.
+    last_error: WebhookLastError | None = field(default=None, kw_only=True)
+    #: Who created it, or last changed its :attr:`url`: the email of a person
+    #: signed in to the dashboard, or ``apikey:`` and the ``key-`` id of the
+    #: API key used. This is whose removal, demotion to viewer or leaked key
+    #: disables it (:attr:`disabled_reason`). ``None`` to a workspace-scoped
+    #: key when it was a person, and from a platform that does not report it.
+    created_by: str | None = field(default=None, kw_only=True)
 
     @property
     def is_failing(self) -> bool:
@@ -3559,6 +3630,8 @@ class Webhook:
             "created_at": _text(d.get("created_at")),
             "updated_at": _text(d.get("updated_at")),
             "workspace_id": _text(d.get("workspace_id")),
+            "last_error": WebhookLastError.from_api(d.get("last_error")),
+            "created_by": _opt_text(d.get("created_by")),
             "raw": dict(d),
         }
 
@@ -3721,6 +3794,18 @@ class SshKey:
     #: is its constructor, and ``raw`` was the eighth positional slot before
     #: this field existed (see the note on :attr:`Template.ref`).
     reach: str | None = field(default=None, kw_only=True)
+    #: Whether whoever registered this key proved they hold its private half:
+    #: ``"proven"`` (added with a signature over a challenge, see
+    #: :meth:`~mandala_computer.SshKeys.challenge`; connects to a computer
+    #: named by its id or by its name), ``"unproven"`` (added from the public
+    #: line alone; connects to a computer named by its id, and a computer named
+    #: by its name is refused) or ``"legacy"`` (added before proof was asked
+    #: for; connects by id or name as it always did). Adding an ``"unproven"``
+    #: or ``"legacy"`` key again with a signature makes it ``"proven"``. Any
+    #: other string is a value a newer platform added, kept as it is. ``None``
+    #: from a platform that does not report it. Keyword-only, as :attr:`reach`
+    #: is.
+    possession: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_api(cls, d: Mapping[str, Any], where: str = "an SSH key") -> SshKey:
@@ -3735,6 +3820,47 @@ class SshKey:
             created_at=_text(d.get("created_at")),
             last_used_at=_opt_text(d.get("last_used_at")),
             reach=_nullable_text(d, "reach", "an SSH key"),
+            possession=_nullable_text(d, "possession", "an SSH key"),
+            raw=dict(d),
+        )
+
+
+@dataclass(frozen=True)
+class SshKeyChallenge:
+    """A challenge to sign with the private half of a key you are about to
+    add, from :meth:`~mandala_computer.SshKeys.challenge`.
+
+    Sign :attr:`challenge` exactly as it is, with
+    ``printf '%s' '<challenge>' | ssh-keygen -Y sign -n <namespace> -f <private key file>``
+    (or :attr:`sign_command`, with its key file replaced by yours), and pass
+    it and the armored signature that prints to
+    :meth:`~mandala_computer.SshKeys.add`. The key is then registered
+    ``"proven"``. A challenge is yours alone, works once, and expires at
+    :attr:`expires_at`.
+    """
+
+    #: ``sshkc-`` and 64 hex characters. Sign exactly this text.
+    challenge: str
+    #: The signature namespace (``ssh-keygen -Y sign -n``).
+    namespace: str
+    #: RFC 3339. Register the key before then.
+    expires_at: str
+    #: A shell command that signs the challenge and prints the signature. It
+    #: names ``~/.ssh/id_ed25519``; replace that with your private key file.
+    sign_command: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(
+        cls, d: Mapping[str, Any], where: str = "POST ssh-keys/challenge"
+    ) -> SshKeyChallenge:
+        """Refuses an answer without its ``challenge``, which is the one thing
+        a caller signs."""
+        return cls(
+            challenge=_row_id(d, "challenge", where),
+            namespace=_text(d.get("namespace")),
+            expires_at=_text(d.get("expires_at")),
+            sign_command=_text(d.get("sign_command")),
             raw=dict(d),
         )
 
@@ -4179,6 +4305,56 @@ class EgressProxyArgs(_EgressProxyServer, total=False):
     """
 
     credentials_secret_id: str | None
+
+
+@dataclass(frozen=True)
+class HostPaused:
+    """Why, and since when, a running computer is held paused by its host to
+    recover disk space: :attr:`~mandala_computer.Computer.host_paused`."""
+
+    #: ``"disk_low"`` (among the computers writing fastest while the host was
+    #: low on disk space), ``"disk_emergency"`` (the host was critically low and
+    #: paused every running computer on it), ``"disk_full"`` (a write the full
+    #: disk refused paused it) or ``"disk_recovery"`` (a suspend or memory
+    #: snapshot that failed for want of space left it held until the host
+    #: resumes it). Any other string is a value a newer platform added.
+    reason: str
+    #: When it was paused, RFC 3339.
+    since: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> HostPaused:
+        return cls(reason=_text(d.get("reason")), since=_text(d.get("since")), raw=dict(d))
+
+
+@dataclass(frozen=True)
+class EgressProxyLastError:
+    """Why a running computer's proxied connections are failing:
+    :attr:`~mandala_computer.Computer.egress_proxy_last_error`."""
+
+    #: Why the last connection was closed without a tunnel:
+    #: ``"credentials_refused"``, ``"credentials_required"``,
+    #: ``"credentials_unusable"``, ``"proxy_refused"``, ``"dns"``,
+    #: ``"proxy_unreachable"``, ``"refused_address"``, ``"tls"``,
+    #: ``"proxy_error"``, ``"budget_full"`` or ``"port_blocked"``. Any other
+    #: string is a value a newer platform added.
+    reason: str
+    #: When the last one failed, RFC 3339.
+    at: str
+    #: How many have failed since a connection last opened through the proxy,
+    #: the setting changed or the computer started. ``None`` when unreadable.
+    count: int | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, d: Mapping[str, Any]) -> EgressProxyLastError:
+        return cls(
+            reason=_text(d.get("reason")),
+            at=_text(d.get("at")),
+            count=_opt_whole(d.get("count")),
+            raw=dict(d),
+        )
 
 
 @dataclass(frozen=True)
@@ -5141,6 +5317,66 @@ class ApiKeyCreated(ApiKey):
                 f"{where}: expected the new key, which the platform answers once, and it is not here"
             )
         return cls(**{f: getattr(base, f) for f in base.__dataclass_fields__}, key=secret)
+
+
+@dataclass(frozen=True)
+class RevokedKeyWebhook:
+    """A webhook subscription made, or turned back on, through a key that was
+    just revoked: one row of :attr:`ApiKeyRevoked.webhooks`."""
+
+    #: The subscription, as :meth:`~mandala_computer.Webhooks.list` lists it.
+    id: str
+    #: Where it delivers.
+    url: str
+    #: Whether it is on. The revoke does not change it.
+    enabled: bool
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ApiKeyRevoked:
+    """What :meth:`~mandala_computer.ApiKeys.revoke` answers: the key is
+    revoked, and these are the webhook subscriptions made through it.
+
+    THE REVOKE LEAVES THOSE SUBSCRIPTIONS SENDING. Disable or delete any you
+    no longer want with :meth:`~mandala_computer.Webhooks.update` or
+    :meth:`~mandala_computer.Webhooks.delete`.
+    """
+
+    #: The subscriptions on this account that were made, or turned back on,
+    #: through the revoked key, oldest first; for a workspace-scoped key, only
+    #: those in its workspace. Empty when there are none. ``None`` when the
+    #: answer did not say — a platform that predates the list, or one this
+    #: version could not read — which is NOT the same as none: list the
+    #: account's webhooks to check. The key is revoked either way.
+    webhooks: builtins.list[RevokedKeyWebhook] | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_api(cls, data: Any) -> ApiKeyRevoked:
+        """Never raises: the revoke has already happened by the time this is
+        read, so an answer it cannot read is reported as ``webhooks=None``
+        rather than as a failed revoke."""
+        raw = dict(data) if isinstance(data, Mapping) else {}
+        rows = raw.get("webhooks")
+        webhooks: builtins.list[RevokedKeyWebhook] | None = None
+        if isinstance(rows, builtins.list) and all(
+            isinstance(r, Mapping)
+            and isinstance(r.get("id"), str)
+            and r.get("id")
+            and isinstance(r.get("enabled"), bool)
+            for r in rows
+        ):
+            webhooks = [
+                RevokedKeyWebhook(
+                    id=str.__str__(r["id"]),
+                    url=_text(r.get("url")),
+                    enabled=r["enabled"] is True,
+                    raw=dict(r),
+                )
+                for r in rows
+            ]
+        return cls(webhooks=webhooks, raw=raw)
 
 
 @dataclass(frozen=True)
