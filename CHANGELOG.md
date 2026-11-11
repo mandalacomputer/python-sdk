@@ -9,6 +9,8 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-11
+
 ### Added
 
 - macOS computers, available on request. `AccountQuota.capabilities` gains
@@ -1994,7 +1996,8 @@ No effect on the published surface, listed because it is most of the window.
 - Surface inventory parsing hardened in the same direction, before the scanner
   was retired.
 
-[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/mandalacomputer/python-sdk/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/mandalacomputer/python-sdk/compare/v0.19.0...v0.20.0
