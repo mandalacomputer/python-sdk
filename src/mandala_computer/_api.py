@@ -1158,7 +1158,7 @@ def json_or_none(resp: httpx.Response) -> Any:
         return None
 
 
-def replayed_computer_id(data: Any, method: str, path: str) -> str | None:
+def replayed_computer_id(data: Any, method: str, path: str, key: str | None = None) -> str | None:
     """The computer a keyed create or clone made, when its answer is a replay
     that names it only through its operation; ``None`` for any other answer.
 
@@ -1173,7 +1173,9 @@ def replayed_computer_id(data: Any, method: str, path: str) -> str | None:
     An answer of that shape whose operation is ``null`` or names no computer
     cannot be turned into one, and is refused with a :class:`MandalaError`
     that names the operation, which
-    :meth:`~mandala_computer.Operations.get` reads to see how the call ended.
+    :meth:`~mandala_computer.Operations.get` reads to see how the call ended,
+    and carries the call's ``key``: resending under it replays the operation
+    again, never a second computer.
     Anything else (a computer, an envelope, an unreadable body) is ``None``
     and goes on to :func:`computer_record`, which refuses what is not a
     computer as before.
@@ -1188,11 +1190,36 @@ def replayed_computer_id(data: Any, method: str, path: str) -> str | None:
         computer_id = operation.get("computer_id")
         if isinstance(computer_id, str) and computer_id:
             return str.__str__(computer_id)
-    raise MandalaError(
+    err = MandalaError(
         f"{method} {path} answered with its operation {operation_id} rather than a "
         "computer, and the operation names no computer yet; read it with "
         "operations.get() to see how the call ended"
     )
+    err.idempotency_key = key
+    raise err
+
+
+def replay_read_failed(
+    err: MandalaError, key: str | None, computer_id: str, replayed: Mapping[str, Any]
+) -> None:
+    """Hand back the key of a keyed create or clone whose replayed answer
+    named its computer, when reading that computer failed.
+
+    The call itself was carried out: resending it under the same key replays
+    the same answer again and never makes a second computer. So the error
+    carries the call's key whatever went wrong with the read (a timeout, a
+    ``5xx``, a ``404``, an unreadable body), keeping its type, and its
+    message names the computer and the operation the replay answered with.
+    A key the read's own failure already set is left as it is.
+    """
+    if err.idempotency_key is None:
+        err.idempotency_key = key
+    operation_id = replayed.get("operation_id")
+    message = (
+        f"the call made computer {computer_id} (operation {operation_id}), "
+        f"but reading it failed: {err}"
+    )
+    err.args = (message, *err.args[1:])
 
 
 def workspace_move_record(

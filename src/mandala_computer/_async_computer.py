@@ -376,16 +376,23 @@ class AsyncComputer(ComputerFields):
         :meth:`wait_until_built` before starting it.
         """
         path = _api.computer_action(self.id, "clone")
+        key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
         data = await self._t.json_object(
             "POST",
             path,
             json=_api.name_body(name),
-            headers=_api.idempotency_headers(idempotency_key),
+            headers={_api.IDEMPOTENCY_KEY_HEADER: key},
         )
-        made = _api.replayed_computer_id(data, "POST", path)
+        made = _api.replayed_computer_id(data, "POST", path, key)
         if made is not None:
-            data = await self._t.json_object("GET", _api.computer(made))
-            return AsyncComputer(self._t, _api.computer_record(data, "GET", _api.computer(made)))
+            try:
+                read = await self._t.json_object("GET", _api.computer(made))
+                return AsyncComputer(
+                    self._t, _api.computer_record(read, "GET", _api.computer(made))
+                )
+            except MandalaError as err:
+                _api.replay_read_failed(err, key, made, data)
+                raise
         return AsyncComputer(self._t, _api.computer_record(data, "POST", path))
 
     async def rename(self, name: str, *, idempotency_key: str | None = None) -> AsyncComputer:

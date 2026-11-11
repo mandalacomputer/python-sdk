@@ -77,8 +77,69 @@ async def test_a_replayed_operation_naming_no_computer_says_which_operation(
             200, json={"operation_id": OP_ID, "operation": op}, headers=REPLAYED
         )
     )
-    with pytest.raises(mc.MandalaError, match=OP_ID):
+    with pytest.raises(mc.MandalaError, match=OP_ID) as caught:
         await resolved(call(client))
+    # Resending under the key replays the operation again, never a second
+    # computer: the refusal hands it back.
+    assert caught.value.idempotency_key == "k"
+
+
+#: How the read of a replayed call's computer can fail, and the error class
+#: that failure is raised as — unchanged by the key it now carries.
+READ_FAILURES: list[tuple[str, Any, type[mc.MandalaError]]] = [
+    ("503", httpx.Response(503, json={"error": "x"}), mc.UnavailableError),
+    ("timeout", httpx.ReadTimeout("slow"), mc.RequestTimeoutError),
+    ("404", httpx.Response(404, json={"error": "gone"}), mc.NotFoundError),
+    ("not-a-computer", httpx.Response(200, json={"what": 1}), mc.MandalaError),
+]
+
+
+@pytest.mark.parametrize(
+    ("failure", "answer", "kind"), READ_FAILURES, ids=[f[0] for f in READ_FAILURES]
+)
+@pytest.mark.parametrize(("label", "route", "call"), MAKERS, ids=[m[0] for m in MAKERS])
+@respx.mock
+async def test_a_failed_read_of_a_replayed_computer_keeps_the_calls_key(
+    client: Any, label: str, route: str, call: Any, failure: str, answer: Any, kind: Any
+) -> None:
+    """The call was carried out, and resending it under its key replays it
+    again: the read's error carries that key, keeps its class, and names the
+    computer and the operation."""
+    respx.post(f"{BASE}/{route}").mock(
+        return_value=httpx.Response(200, json=LINKED, headers=REPLAYED)
+    )
+    if isinstance(answer, Exception):
+        respx.get(f"{BASE}/computers/vm-9").mock(side_effect=answer)
+    else:
+        respx.get(f"{BASE}/computers/vm-9").mock(return_value=answer)
+    with pytest.raises(kind) as caught:
+        await resolved(call(client))
+    assert type(caught.value) is kind
+    assert caught.value.idempotency_key == "k"
+    assert "vm-9" in str(caught.value) and OP_ID in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("failure", "answer", "kind"), READ_FAILURES[:2], ids=[f[0] for f in READ_FAILURES[:2]]
+)
+@respx.mock
+async def test_a_launch_whose_replayed_read_fails_hands_back_the_key_it_made(
+    client: Any, failure: str, answer: Any, kind: Any
+) -> None:
+    """launch() makes its own key when given none: that key, the one that
+    replays the create rather than building a second computer, is the one
+    the error carries."""
+    posted = respx.post(f"{BASE}/computers").mock(
+        return_value=httpx.Response(200, json=LINKED, headers=REPLAYED)
+    )
+    if isinstance(answer, Exception):
+        respx.get(f"{BASE}/computers/vm-9").mock(side_effect=answer)
+    else:
+        respx.get(f"{BASE}/computers/vm-9").mock(return_value=answer)
+    with pytest.raises(kind) as caught:
+        await resolved(client.computers.launch(template="base"))
+    sent = posted.calls.last.request.headers["Idempotency-Key"]
+    assert sent and caught.value.idempotency_key == sent
 
 
 @pytest.mark.parametrize(

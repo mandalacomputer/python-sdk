@@ -68,7 +68,11 @@ This is the summary you read to decide whether to upgrade.
   resend, or a call whose answer was too large to keep, with the call's
   operation, the SDK reads the computer the operation names and returns it.
   When the operation names no computer yet, the `MandalaError` names the
-  operation to read.
+  operation to read. Either way, and when reading the computer the operation
+  names fails (a timeout, a `5xx`, a `404`), the error keeps its class and
+  carries the call's `idempotency_key` (for `launch`, the one it made), so
+  resending under it replays the same call rather than building a second
+  computer; a failed read's message names the computer and the operation.
 
 - OpenAI Agents SDK sessions passed directly through `SandboxRunConfig(session=...)`
   now prepare their workspace before the first tool call. A newly created or

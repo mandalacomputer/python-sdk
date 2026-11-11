@@ -422,10 +422,15 @@ class AsyncComputers:
         data, headers = await self._t.json_object_with_headers(
             "POST", _api.COMPUTERS, json=body, headers=sent
         )
-        made = _api.replayed_computer_id(data, "POST", _api.COMPUTERS)
+        key = sent[_api.IDEMPOTENCY_KEY_HEADER]
+        made = _api.replayed_computer_id(data, "POST", _api.COMPUTERS, key)
         if made is not None:
-            data = await self._t.json_object("GET", _api.computer(made))
-            record = _api.computer_record(data, "GET", _api.computer(made))
+            try:
+                read = await self._t.json_object("GET", _api.computer(made))
+                record = _api.computer_record(read, "GET", _api.computer(made))
+            except MandalaError as err:
+                _api.replay_read_failed(err, key, made, data)
+                raise
         else:
             record = _api.computer_record(data, "POST", _api.COMPUTERS)
         return AsyncComputer(self._t, record), _api.exchange_end(start, headers)
@@ -795,16 +800,23 @@ class AsyncSnapshots:
         check it before assuming the session came across.
         """
         path = _api.snapshot_action(snapshot_id, "clone")
+        key = _api.idempotency_headers(idempotency_key)[_api.IDEMPOTENCY_KEY_HEADER]
         data = await self._t.json_object(
             "POST",
             path,
             json=_api.snapshot_clone_body(name, memory, inherit_secrets),
-            headers=_api.idempotency_headers(idempotency_key),
+            headers={_api.IDEMPOTENCY_KEY_HEADER: key},
         )
-        made = _api.replayed_computer_id(data, "POST", path)
+        made = _api.replayed_computer_id(data, "POST", path, key)
         if made is not None:
-            data = await self._t.json_object("GET", _api.computer(made))
-            return AsyncComputer(self._t, _api.computer_record(data, "GET", _api.computer(made)))
+            try:
+                read = await self._t.json_object("GET", _api.computer(made))
+                return AsyncComputer(
+                    self._t, _api.computer_record(read, "GET", _api.computer(made))
+                )
+            except MandalaError as err:
+                _api.replay_read_failed(err, key, made, data)
+                raise
         return AsyncComputer(self._t, _api.computer_record(data, "POST", path))
 
     async def delete(
