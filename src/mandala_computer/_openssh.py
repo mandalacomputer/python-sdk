@@ -661,6 +661,9 @@ def sign_challenge(
     The challenge goes to ``ssh-keygen`` on standard input exactly as issued,
     and the signature comes back exactly as printed: its line breaks are part
     of it. A passphrase is asked for on the terminal, not on standard input.
+
+    A ``KeyboardInterrupt`` while ``ssh-keygen`` runs is not a failure to
+    sign: it propagates, the child is killed, and no other key file is tried.
     """
     reason = "ssh-keygen printed no signature"
     for key in signing_keys(public_key):

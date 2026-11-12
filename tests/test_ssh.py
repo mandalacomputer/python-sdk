@@ -1176,7 +1176,35 @@ def test_setup_leaves_an_unproven_key_that_reaches_other_accounts(
     assert not add.called and not challenge.called and signer == []
     assert put.called
     err = capsys.readouterr().err
-    assert "is unproven (proving it from here would narrow it to this account" in err
+    assert f"key {FINGERPRINT} is unproven: mandala-py ssh dev connects" in err
+    assert err.rstrip().endswith("to prove it, remove it and add it again from the dashboard")
+
+
+@respx.mock
+def test_setup_does_not_move_an_unproven_key_bound_to_another_account(
+    pub: Path, signer: list[Path], capsys: Any
+) -> None:
+    """A signed add would move the key here; the existing refusal stands."""
+    add, put = mock_setup([{**KEY, "reach": "another_account", "possession": "unproven"}])
+    challenge = mock_challenge()
+    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 1
+    assert not add.called and not challenge.called and not put.called and signer == []
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "ssh_key_elsewhere"
+
+
+@respx.mock
+def test_setup_interrupted_while_signing_adds_nothing(
+    pub: Path, signer: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    add, put = mock_setup([])
+    mock_challenge()
+
+    def stopped(*a: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_cli._openssh, "sign_challenge", stopped)
+    assert _cli.main(["ssh", "--setup", "dev"]) == 130
+    assert not add.called and not put.called
 
 
 @respx.mock

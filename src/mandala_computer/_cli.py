@@ -4015,6 +4015,20 @@ def _conflict_hint(proof: _Proof | str | None, *, as_json: bool) -> None:
     )
 
 
+def _provable_here(key: SshKey) -> bool:
+    """Whether a signed add of ``key``, already held, may replace its
+    registration from here. A signed add binds the key to this credential's
+    account alone: a key that reaches other accounts would lose them, and one
+    bound to another account would move rather than be refused."""
+    return key.possession == "unproven" and key.reach == "this_account"
+
+
+def _how_to_prove(key: SshKey) -> str:
+    if key.reach in (None, "this_account"):
+        return f"`{PROG} ssh-key challenge` says how to prove it is yours"
+    return "to prove it, remove it and add it again from the dashboard"
+
+
 def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = False) -> int:
     path = _key_path(key)
     line = _openssh.read_public_key(path)
@@ -4051,26 +4065,22 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
                     _conflict_hint(proof, as_json=as_json)
                     raise
                 registered = existing
-        elif existing.possession == "unproven" and not no_proof:
+        elif _provable_here(existing) and not no_proof:
             registered = existing
-            if existing.reach != "this_account":
-                # A signed add from here binds the key to this account alone,
-                # which would take it away from every other account it reaches.
-                unproven_why = (
-                    "proving it from here would narrow it to this account; add it again "
-                    "from the dashboard"
-                )
+            proof = _prove(client, path)
+            if isinstance(proof, str):
+                unproven_why = proof
             else:
-                proof = _prove(client, path)
-                if isinstance(proof, str):
-                    unproven_why = proof
-                else:
-                    # A signed add replaces the unproven registration; the
-                    # label it had is kept.
-                    registered = _signed_add(client, line, proof, name=existing.name)
-                    proven_now = True
+                # A signed add replaces the unproven registration; the label
+                # it had is kept.
+                registered = _signed_add(client, line, proof, name=existing.name)
+                proven_now = True
         else:
+            # Proven, legacy, unreported, or held where a signed add from here
+            # would narrow or move it (see _provable_here): left as it is.
             registered = existing
+            if not no_proof:
+                unproven_why = ""
         # Listed is not accepted (platform OPL-5617): a key bound to another
         # of the person's accounts is refused here, so SSH is not switched on
         # for it and nothing reads as success.
@@ -4123,7 +4133,7 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
         print(
             f"{PROG}: key {_shown(registered.fingerprint)} is unproven{why}: {command} "
             "connects by the computer's id, so it works, but ssh to the computer by its "
-            f"name is refused; `{PROG} ssh-key challenge` says how to prove the key is yours",
+            f"name is refused; {_how_to_prove(registered)}",
             file=sys.stderr,
         )
     return 0
@@ -4233,13 +4243,21 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
                 signature=_signature(args.signature_file),
             )
         else:
-            proof = None if args.no_proof else _prove(client, path)
-            why = "--no-proof" if proof is None else proof if isinstance(proof, str) else ""
-            try:
-                key = _signed_add(client, line, proof, name=args.name)
-            except ConflictError:
-                _conflict_hint(proof, as_json=args.json)
-                raise
+            held = None
+            if not args.no_proof and shutil.which("ssh-keygen") is not None:
+                held = _own_key(client, _openssh.fingerprint(line))
+            if held is not None and not _provable_here(held):
+                # Already held where a signed add would narrow or move it:
+                # added unsigned, so it is refused as a duplicate as before.
+                key = client.ssh_keys.add(line, name=args.name)
+            else:
+                proof = None if args.no_proof else _prove(client, path)
+                why = "--no-proof" if proof is None else proof if isinstance(proof, str) else ""
+                try:
+                    key = _signed_add(client, line, proof, name=args.name)
+                except ConflictError:
+                    _conflict_hint(proof, as_json=args.json)
+                    raise
     if args.json:
         _json(key.raw)
     else:
@@ -4248,7 +4266,7 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
             shown = f" ({_shown(why)})" if why else ""
             print(
                 f"{PROG}: this key is unproven{shown}, so it connects to a computer named by "
-                f"its id only; `{PROG} ssh-key challenge` says how to prove it is yours",
+                f"its id only; {_how_to_prove(key)}",
                 file=sys.stderr,
             )
     return 0

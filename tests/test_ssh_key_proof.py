@@ -294,6 +294,7 @@ def test_sign_challenge_says_why_it_could_not(tmp_path: Path) -> None:
 def test_cli_add_signs_a_challenge_itself(
     keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
     route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
     signer = sign_with(monkeypatch, Signer())
@@ -308,6 +309,7 @@ def test_cli_add_signs_a_challenge_itself(
 def test_cli_add_that_cannot_sign_adds_unproven_and_says_why(
     keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
     route = respx.post(f"{BASE}/ssh-keys").mock(
         return_value=httpx.Response(201, json={**KEY, "possession": "unproven"})
@@ -324,6 +326,7 @@ def test_cli_add_that_cannot_sign_adds_unproven_and_says_why(
 def test_cli_add_against_a_platform_without_challenges_adds_unproven(
     keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/ssh-keys/challenge").mock(
         return_value=httpx.Response(404, json={"error": "Not found."})
     )
@@ -382,6 +385,7 @@ def test_cli_add_no_proof_with_a_signature_is_refused(
 def test_cli_add_conflict_without_proof_says_what_proof_would_change(
     keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], as_json: bool
 ) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
     respx.post(f"{BASE}/ssh-keys").mock(
         return_value=httpx.Response(409, json={"error": "That key is already registered."})
@@ -400,6 +404,7 @@ def test_cli_add_conflict_without_proof_says_what_proof_would_change(
 def test_cli_add_conflict_with_proof_is_the_platforms_refusal_alone(
     keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
     respx.post(f"{BASE}/ssh-keys").mock(
         return_value=httpx.Response(409, json={"error": "That key is already registered."})
@@ -407,3 +412,91 @@ def test_cli_add_conflict_with_proof_is_the_platforms_refusal_alone(
     sign_with(monkeypatch, Signer())
     assert _cli.main(["ssh-key", "add", str(keygen)]) == 1
     assert capsys.readouterr().err == "mandala-py: That key is already registered. (HTTP 409)\n"
+
+
+def test_sign_challenge_interrupted_tries_no_other_key(tmp_path: Path) -> None:
+    public = tmp_path / "id_ed25519.pub"
+    (tmp_path / "id_ed25519").write_text("private")
+    calls: list[Any] = []
+
+    def stopped(argv: list[str], **kw: Any) -> Any:
+        calls.append(argv)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _openssh.sign_challenge(KEYGEN, public, "ns", "c", run=stopped)
+    assert len(calls) == 1
+
+
+@respx.mock
+def test_cli_add_interrupted_while_signing_adds_nothing(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    route = respx.post(f"{BASE}/ssh-keys")
+
+    def stopped(*a: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_cli._openssh, "sign_challenge", stopped)
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 130
+    assert not route.called
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("held", "advice"),
+    [
+        ({"possession": "proven", "reach": "this_account"}, None),
+        ({"possession": "legacy", "reach": "this_account"}, None),
+        ({"possession": "unproven", "reach": "everywhere"}, "add it again from the dashboard"),
+        ({"possession": "unproven", "reach": "another_account"}, None),
+    ],
+)
+def test_cli_add_of_a_held_key_that_a_signed_add_would_narrow_is_not_signed(
+    keygen: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    held: dict[str, Any],
+    advice: str | None,
+) -> None:
+    """Signing would replace the registration with one bound to this account:
+    the add stays unsigned and is refused as a duplicate, with no hint."""
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[{**KEY, **held}]))
+    challenge = respx.post(f"{BASE}/ssh-keys/challenge")
+    route = respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(409, json={"error": "That key is already registered."})
+    )
+    signer = sign_with(monkeypatch, Signer())
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 1
+    assert not challenge.called and signer.calls == []
+    assert json.loads(route.calls.last.request.content) == {"public_key": f"{PUBLIC_KEY} me@laptop"}
+    assert capsys.readouterr().err == "mandala-py: That key is already registered. (HTTP 409)\n"
+
+
+@respx.mock
+def test_cli_add_signs_a_held_unproven_key_of_this_account(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held = {**KEY, "possession": "unproven", "reach": "this_account"}
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[held]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
+    sign_with(monkeypatch, Signer())
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 0
+    assert json.loads(route.calls.last.request.content)["signature"] == SIGNATURE
+
+
+@respx.mock
+def test_cli_add_of_an_unproven_key_reaching_elsewhere_points_at_the_dashboard(
+    pub: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(
+            201, json={**KEY, "possession": "unproven", "reach": "everywhere"}
+        )
+    )
+    assert _cli.main(["ssh-key", "add", str(pub)]) == 0
+    err = capsys.readouterr().err
+    assert err.rstrip().endswith("to prove it, remove it and add it again from the dashboard")
