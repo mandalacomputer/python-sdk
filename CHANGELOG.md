@@ -17,6 +17,8 @@ This is the summary you read to decide whether to upgrade.
   so it also reaches a computer by its name. When signing is not possible the
   key is added `unproven`, as before, with the reason on stderr; what
   `ssh-keygen` says (a security key asking to be touched) shows as it says it.
+  A passphrase is asked for on the terminal even where a display is set:
+  the challenge is signed from a private temporary file, not standard input.
   Only a registration challenge is signed: one naming any signature namespace
   but `ssh-key-registration@mandala.computer`, or not shaped like `sshkc-`
   and 64 lowercase hex digits, is refused (`unexpected_challenge`) before

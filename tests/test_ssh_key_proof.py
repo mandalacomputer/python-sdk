@@ -242,52 +242,67 @@ def test_signing_keys_try_the_pub_then_the_private_file_beside_it(tmp_path: Path
     assert _openssh.signing_keys(other) == [other]
 
 
-def runner(*answers: tuple[int, bytes, bytes]) -> tuple[Any, list[Any]]:
+def runner(*answers: tuple[int, str | None, str]) -> tuple[Any, list[Any]]:
+    """A stand-in ssh-keygen: each answer is its exit status, the signature it
+    writes beside the file it signs (or none), and its standard error."""
     seen: list[Any] = []
     queue = list(answers)
 
-    def run(argv: list[str], data: bytes, echo: Any) -> tuple[int, bytes, list[str]]:
-        seen.append((argv, data))
-        code, out, err = queue.pop(0)
-        return code, out, err.decode().splitlines()
+    def run(argv: list[str], echo: Any) -> tuple[int, list[str]]:
+        signed = Path(argv[-1])
+        seen.append((argv[:-1], signed.read_bytes(), oct(signed.stat().st_mode & 0o777)))
+        code, signature, err = queue.pop(0)
+        if signature is not None:
+            Path(f"{signed}.sig").write_text(signature)
+        return code, err.splitlines()
 
     return run, seen
 
 
-def test_sign_challenge_sends_the_challenge_exactly_and_keeps_the_signature(
+def test_sign_challenge_signs_a_private_file_holding_the_challenge_exactly(
     tmp_path: Path,
 ) -> None:
     public = tmp_path / "id_ed25519.pub"
-    run, seen = runner((0, SIGNATURE.encode(), b"Signing data on standard input\n"))
+    run, seen = runner((0, SIGNATURE, "Signing file /tmp/x/challenge\n"))
     got = _openssh.sign_challenge(KEYGEN, public, "ns", "sshkc-1", run=run)
     assert got == (SIGNATURE, "")
-    assert seen == [([KEYGEN, "-Y", "sign", "-n", "ns", "-f", str(public)], b"sshkc-1")]
+    assert seen == [([KEYGEN, "-Y", "sign", "-n", "ns", "-f", str(public)], b"sshkc-1", "0o600")]
+
+
+def test_sign_challenge_leaves_no_files_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_openssh.tempfile, "tempdir", str(tmp_path / "t"))
+    (tmp_path / "t").mkdir()
+    run, _ = runner((0, SIGNATURE, ""))
+    _openssh.sign_challenge(KEYGEN, tmp_path / "k.pub", "ns", "c", run=run)
+    run, _ = runner((1, None, "boom"))
+    _openssh.sign_challenge(KEYGEN, tmp_path / "k.pub", "ns", "c", run=run)
+    assert list((tmp_path / "t").iterdir()) == []
 
 
 def test_sign_challenge_falls_back_to_the_private_file(tmp_path: Path) -> None:
     public = tmp_path / "id_ed25519.pub"
     (tmp_path / "id_ed25519").write_text("private")
-    run, seen = runner(
-        (255, b"", b"Couldn't sign: agent refused operation\n"), (0, SIGNATURE.encode(), b"")
-    )
+    run, seen = runner((255, None, "Couldn't sign: agent refused operation\n"), (0, SIGNATURE, ""))
     assert _openssh.sign_challenge(KEYGEN, public, "ns", "c", run=run) == (SIGNATURE, "")
-    assert [argv[-1] for argv, _ in seen] == [str(public), str(tmp_path / "id_ed25519")]
+    assert [argv[-1] for argv, _, _ in seen] == [str(public), str(tmp_path / "id_ed25519")]
 
 
 def test_sign_challenge_says_why_it_could_not(tmp_path: Path) -> None:
     public = tmp_path / "id_ed25519.pub"
-    run, _ = runner((255, b"", b"Signing data on standard input\nNo private key found\n\n"))
+    run, _ = runner((255, None, "Signing file /tmp/x/challenge\nNo private key found\n\n"))
     assert _openssh.sign_challenge(KEYGEN, public, "ns", "c", run=run) == (
         None,
         "ssh-keygen: No private key found",
     )
-    run, _ = runner((0, b"not a signature", b""))
+    run, _ = runner((0, "not a signature", ""))
     assert _openssh.sign_challenge(KEYGEN, public, "ns", "c", run=run) == (
         None,
         "ssh-keygen exited 0 without a signature",
     )
 
-    def broken(argv: list[str], data: bytes, echo: Any) -> Any:
+    def broken(argv: list[str], echo: Any) -> Any:
         raise PermissionError(13, "Permission denied")
 
     assert _openssh.sign_challenge(KEYGEN, public, "ns", "c", run=broken) == (
@@ -427,7 +442,7 @@ def test_sign_challenge_interrupted_tries_no_other_key(tmp_path: Path) -> None:
     (tmp_path / "id_ed25519").write_text("private")
     calls: list[Any] = []
 
-    def stopped(argv: list[str], data: bytes, echo: Any) -> Any:
+    def stopped(argv: list[str], echo: Any) -> Any:
         calls.append(argv)
         raise KeyboardInterrupt
 
@@ -515,17 +530,15 @@ def test_run_keygen_passes_a_prompt_on_while_the_child_still_waits(tmp_path: Pat
     go = tmp_path / "touched"
     script = (
         "import sys, time, pathlib\n"
-        "data = sys.stdin.buffer.read()\n"
-        "sys.stderr.write('Signing data on standard input\\n')\n"
+        "sys.stderr.write('Signing file challenge\\n')\n"
         "sys.stderr.write('Confirm user presence for key ED25519-SK\\n'); sys.stderr.flush()\n"
         f"while not pathlib.Path({str(go)!r}).exists(): time.sleep(0.02)\n"
-        "sys.stdout.write('-----BEGIN SSH SIGNATURE-----\\n' + data.decode())\n"
     )
     shown: list[str] = []
     result: list[Any] = []
     worker = threading.Thread(
         target=lambda: result.append(
-            _openssh.run_keygen([sys.executable, "-c", script], b"sshkc-1", shown.append)
+            _openssh.run_keygen([sys.executable, "-c", script], shown.append)
         )
     )
     worker.start()
@@ -536,8 +549,8 @@ def test_run_keygen_passes_a_prompt_on_while_the_child_still_waits(tmp_path: Pat
     assert worker.is_alive()
     go.write_text("")
     worker.join(10)
-    code, out, said = result[0]
-    assert code == 0 and out == b"-----BEGIN SSH SIGNATURE-----\nsshkc-1"
+    code, said = result[0]
+    assert code == 0
     assert said[-1] == "Confirm user presence for key ED25519-SK"
 
 
@@ -557,7 +570,7 @@ def test_run_keygen_kills_the_child_when_interrupted() -> None:
         began = time.monotonic()
         with pytest.raises(KeyboardInterrupt):
             _openssh.run_keygen(
-                [sys.executable, "-c", "import time; time.sleep(60)"], b"", lambda line: None
+                [sys.executable, "-c", "import time; time.sleep(60)"], lambda line: None
             )
     assert time.monotonic() - began < 10
     assert started[0].poll() is not None
@@ -579,9 +592,9 @@ def test_cli_add_keeps_ssh_keygens_words_off_json_stderr(
     monkeypatch.setattr(_cli._openssh, "echo_terminal", on_tty.append)
     real = _openssh.sign_challenge
 
-    def refusing(argv: list[str], data: bytes, echo: Any) -> tuple[int, bytes, list[str]]:
+    def refusing(argv: list[str], echo: Any) -> tuple[int, list[str]]:
         echo("Couldn't sign: agent refused operation")
-        return 255, b"", ["Couldn't sign: agent refused operation"]
+        return 255, ["Couldn't sign: agent refused operation"]
 
     monkeypatch.setattr(
         _cli._openssh, "sign_challenge", lambda *a, **kw: real(*a, run=refusing, **kw)

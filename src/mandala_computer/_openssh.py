@@ -21,6 +21,7 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -656,49 +657,47 @@ def signing_keys(public_key: Path) -> list[Path]:
     return keys
 
 
-#: What ``ssh-keygen -Y sign`` always says, and so is not passed on.
-_KEYGEN_CHATTER = "Signing data on standard input"
+def _chatter(line: str) -> bool:
+    """What ``ssh-keygen -Y sign`` always says, and so is neither passed on
+    nor given as the reason it failed."""
+    text = line.strip()
+    return text.startswith(
+        ("Signing data on standard input", "Signing file ", "Write signature to ")
+    )
 
 
-def run_keygen(
-    argv: list[str], data: bytes, echo: Callable[[str], None]
-) -> tuple[int, bytes, list[str]]:
-    """Run ``argv`` with ``data`` on standard input: its exit status, what it
-    printed, and the lines it wrote to standard error.
+def run_keygen(argv: list[str], echo: Callable[[str], None]) -> tuple[int, list[str]]:
+    """Run ``argv``: its exit status and the lines it wrote to standard error.
 
-    Each standard-error line goes to ``echo`` as it is written, not when the
-    child exits: a security key's "touch it now" is said there, and the child
-    waits for it. Any exception while waiting, ``KeyboardInterrupt``
-    included, kills the child before it propagates.
+    Standard input is this process's own, so a passphrase prompt reaches the
+    terminal rather than ssh-askpass, and standard output is discarded. Each
+    standard-error line goes to ``echo`` as it is written, not when the child
+    exits: a security key's "touch it now" is said there, and the child waits
+    for it. Any exception while waiting, ``KeyboardInterrupt`` included, kills
+    the child before it propagates.
     """
     said: list[str] = []
-    child = subprocess.Popen(
-        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+    child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    assert child.stderr is not None
     errors = child.stderr
 
     def pump() -> None:
         for raw in errors:
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             said.append(line)
-            if line.strip() and line.strip() != _KEYGEN_CHATTER:
+            if line.strip() and not _chatter(line):
                 echo(line)
 
     reader = threading.Thread(target=pump, daemon=True)
     reader.start()
     try:
-        with suppress(BrokenPipeError):
-            child.stdin.write(data)
-            child.stdin.close()
-        out = child.stdout.read()
         code = child.wait()
     except BaseException:
         child.kill()
         child.wait()
         raise
     reader.join()
-    return code, out, said
+    return code, said
 
 
 def echo_stderr(line: str) -> None:
@@ -721,37 +720,53 @@ def sign_challenge(
     namespace: str,
     challenge: str,
     *,
-    run: Callable[[list[str], bytes, Callable[[str], None]], tuple[int, bytes, list[str]]] = (
-        run_keygen
-    ),
+    run: Callable[[list[str], Callable[[str], None]], tuple[int, list[str]]] = run_keygen,
     echo: Callable[[str], None] = echo_stderr,
 ) -> tuple[str | None, str]:
     """``(signature, "")`` for ``challenge`` signed with ``public_key``'s private
     half, or ``(None, why not)``.
 
-    The challenge goes to ``ssh-keygen`` on standard input exactly as issued,
-    and the signature comes back exactly as printed: its line breaks are part
-    of it. A passphrase is asked for on the terminal, not on standard input;
-    whatever ``ssh-keygen`` says on standard error (a security key asking to be
-    touched) goes to ``echo`` as it is said (standard error, unless the caller
-    says otherwise).
+    The challenge is written, exactly as issued, to a file only this user can
+    read, in a directory of its own that is removed afterwards, and
+    ``ssh-keygen`` signs that file: handed the data on standard input instead,
+    it asks for a passphrase through ssh-askpass whenever a display is set,
+    and fails where there is none. The signature is returned exactly as
+    written: its line breaks are part of it. Whatever ``ssh-keygen`` says on
+    standard error (a security key asking to be touched) goes to ``echo`` as
+    it is said.
 
     A ``KeyboardInterrupt`` while ``ssh-keygen`` runs is not a failure to
     sign: it propagates, the child is killed, and no other key file is tried.
     """
-    reason = "ssh-keygen printed no signature"
-    for key in signing_keys(public_key):
-        argv = [keygen, "-Y", "sign", "-n", namespace, "-f", str(key)]
-        try:
-            code, stdout, stderr = run(argv, challenge.encode(), echo)
-        except OSError as err:
-            return None, f"could not run ssh-keygen: {err.strerror or err}"
-        out = stdout.decode("utf-8", "replace")
-        if code == 0 and out.startswith(SIGNATURE_BEGIN):
-            return out, ""
-        said = [line.strip() for line in stderr if line.strip()]
-        said = [line for line in said if line != _KEYGEN_CHATTER] or said
-        reason = (
-            f"ssh-keygen: {said[-1]}" if said else f"ssh-keygen exited {code} without a signature"
-        )
-    return None, reason
+    reason = "ssh-keygen wrote no signature"
+    workdir = Path(tempfile.mkdtemp(prefix="mandala-sign-"))
+    try:
+        data = workdir / "challenge"
+        fd = os.open(data, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(challenge.encode())
+        signed = workdir / "challenge.sig"
+        for key in signing_keys(public_key):
+            with suppress(FileNotFoundError):
+                signed.unlink()
+            argv = [keygen, "-Y", "sign", "-n", namespace, "-f", str(key), str(data)]
+            try:
+                code, stderr = run(argv, echo)
+            except OSError as err:
+                return None, f"could not run ssh-keygen: {err.strerror or err}"
+            try:
+                text = signed.read_text()
+            except (OSError, UnicodeDecodeError):
+                text = ""
+            if code == 0 and text.startswith(SIGNATURE_BEGIN):
+                return text, ""
+            said = [line.strip() for line in stderr if line.strip()]
+            said = [line for line in said if not _chatter(line)] or said
+            reason = (
+                f"ssh-keygen: {said[-1]}"
+                if said
+                else f"ssh-keygen exited {code} without a signature"
+            )
+        return None, reason
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
