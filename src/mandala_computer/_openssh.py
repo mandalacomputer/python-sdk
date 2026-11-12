@@ -694,9 +694,18 @@ def run_keygen(
     return code, out, said
 
 
-def _echo_stderr(line: str) -> None:
+def echo_stderr(line: str) -> None:
+    """``line`` on standard error, now."""
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
+
+
+def echo_terminal(line: str) -> None:
+    """``line`` on the controlling terminal, or nowhere: for ``--json``, whose
+    standard error carries only the one error object, while a security key's
+    "touch it now" still has to reach the person."""
+    with suppress(OSError), open("/dev/tty", "w") as tty:
+        tty.write(line + "\n")
 
 
 def sign_challenge(
@@ -708,6 +717,7 @@ def sign_challenge(
     run: Callable[[list[str], bytes, Callable[[str], None]], tuple[int, bytes, list[str]]] = (
         run_keygen
     ),
+    echo: Callable[[str], None] = echo_stderr,
 ) -> tuple[str | None, str]:
     """``(signature, "")`` for ``challenge`` signed with ``public_key``'s private
     half, or ``(None, why not)``.
@@ -716,7 +726,8 @@ def sign_challenge(
     and the signature comes back exactly as printed: its line breaks are part
     of it. A passphrase is asked for on the terminal, not on standard input;
     whatever ``ssh-keygen`` says on standard error (a security key asking to be
-    touched) reaches this process's standard error as it is said.
+    touched) goes to ``echo`` as it is said (standard error, unless the caller
+    says otherwise).
 
     A ``KeyboardInterrupt`` while ``ssh-keygen`` runs is not a failure to
     sign: it propagates, the child is killed, and no other key file is tried.
@@ -725,7 +736,7 @@ def sign_challenge(
     for key in signing_keys(public_key):
         argv = [keygen, "-Y", "sign", "-n", namespace, "-f", str(key)]
         try:
-            code, stdout, stderr = run(argv, challenge.encode(), _echo_stderr)
+            code, stdout, stderr = run(argv, challenge.encode(), echo)
         except OSError as err:
             return None, f"could not run ssh-keygen: {err.strerror or err}"
         out = stdout.decode("utf-8", "replace")

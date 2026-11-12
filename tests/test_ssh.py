@@ -1118,7 +1118,9 @@ def signer(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     )
     signed: list[Path] = []
 
-    def sign(keygen: str, public_key: Path, namespace: str, challenge: str) -> tuple[str, str]:
+    def sign(
+        keygen: str, public_key: Path, namespace: str, challenge: str, **kw: Any
+    ) -> tuple[str, str]:
         assert (keygen, namespace, challenge) == (KEYGEN, "mandala-ssh-key", CHALLENGE["challenge"])
         signed.append(public_key)
         return SIGNATURE, ""
@@ -1181,7 +1183,7 @@ def test_setup_interrupted_while_signing_adds_nothing(
     add, put = mock_setup([])
     mock_challenge()
 
-    def stopped(*a: Any) -> Any:
+    def stopped(*a: Any, **kw: Any) -> Any:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(_cli._openssh, "sign_challenge", stopped)

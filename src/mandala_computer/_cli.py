@@ -3974,7 +3974,7 @@ def _key_path(given: str | None) -> Path:
 _Proof = tuple[str, str]
 
 
-def _prove(client: Client, public_key: Path) -> _Proof | str:
+def _prove(client: Client, public_key: Path, *, as_json: bool = False) -> _Proof | str:
     """``(challenge, signature)`` proving ``public_key`` is the caller's, or why
     not. Nothing is asked of the platform when there is no ``ssh-keygen`` to
     sign with."""
@@ -3985,8 +3985,14 @@ def _prove(client: Client, public_key: Path) -> _Proof | str:
         issued = client.ssh_keys.challenge()
     except NotFoundError:
         return "this platform does not issue challenges"
+    # Under --json, stderr is kept for the one error object: what ssh-keygen
+    # says goes to the terminal instead.
     signature, reason = _openssh.sign_challenge(
-        keygen, public_key, issued.namespace, issued.challenge
+        keygen,
+        public_key,
+        issued.namespace,
+        issued.challenge,
+        echo=_openssh.echo_terminal if as_json else _openssh.echo_stderr,
     )
     if signature is None:
         return reason
@@ -4057,7 +4063,7 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
         existing = _own_key(client, fingerprint)
         unproven_why = "--no-proof" if no_proof else ""
         if existing is None:
-            proof = None if no_proof else _prove(client, path)
+            proof = None if no_proof else _prove(client, path, as_json=as_json)
             if isinstance(proof, str):
                 unproven_why = proof
             try:
@@ -4246,7 +4252,7 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
                 # added unsigned, so it is refused as a duplicate as before.
                 key = client.ssh_keys.add(line, name=args.name)
             else:
-                proof = None if args.no_proof else _prove(client, path)
+                proof = None if args.no_proof else _prove(client, path, as_json=args.json)
                 why = "--no-proof" if proof is None else proof if isinstance(proof, str) else ""
                 try:
                     key = _signed_add(client, line, proof, name=args.name)

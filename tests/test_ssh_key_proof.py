@@ -214,9 +214,10 @@ class Signer:
         self.calls: list[tuple[str, Path, str, str]] = []
 
     def __call__(
-        self, keygen: str, public_key: Path, namespace: str, challenge: str
+        self, keygen: str, public_key: Path, namespace: str, challenge: str, *, echo: Any
     ) -> tuple[str | None, str]:
         self.calls.append((keygen, public_key, namespace, challenge))
+        self.echo = echo
         return self.signature, self.reason
 
 
@@ -441,7 +442,7 @@ def test_cli_add_interrupted_while_signing_adds_nothing(
     respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
     route = respx.post(f"{BASE}/ssh-keys")
 
-    def stopped(*a: Any) -> Any:
+    def stopped(*a: Any, **kw: Any) -> Any:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(_cli._openssh, "sign_challenge", stopped)
@@ -558,3 +559,37 @@ def test_run_keygen_kills_the_child_when_interrupted() -> None:
             )
     assert time.monotonic() - began < 10
     assert started[0].poll() is not None
+
+
+@respx.mock
+@pytest.mark.parametrize("as_json", [False, True])
+def test_cli_add_keeps_ssh_keygens_words_off_json_stderr(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    """Under --json a failed add's stderr is the one error object; what
+    ssh-keygen said goes to the terminal instead."""
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(409, json={"error": "That key is already registered."})
+    )
+    on_tty: list[str] = []
+    monkeypatch.setattr(_cli._openssh, "echo_terminal", on_tty.append)
+    real = _openssh.sign_challenge
+
+    def refusing(argv: list[str], data: bytes, echo: Any) -> tuple[int, bytes, list[str]]:
+        echo("Couldn't sign: agent refused operation")
+        return 255, b"", ["Couldn't sign: agent refused operation"]
+
+    monkeypatch.setattr(
+        _cli._openssh, "sign_challenge", lambda *a, **kw: real(*a, run=refusing, **kw)
+    )
+    argv = ["ssh-key", "add", str(keygen), *(["--json"] if as_json else [])]
+    assert _cli.main(argv) == 1
+    err = capsys.readouterr().err
+    if as_json:
+        assert err.count("\n") == 1 and json.loads(err)["error"]
+        assert on_tty == ["Couldn't sign: agent refused operation"]
+    else:
+        assert err.startswith("Couldn't sign: agent refused operation\n")
+        assert on_tty == []
