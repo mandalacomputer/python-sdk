@@ -5201,8 +5201,10 @@ registers the key `unproven` and says why on stderr; `mandala-py ssh` connects
 by the computer's id, so that still works. `--no-proof` skips the signing.
 
 `--setup` is safe to repeat: a key whose fingerprint is already registered is
-not uploaded again, except that an `unproven` one this account's credential
-added is added again with proof, keeping its label. It stops instead (`ssh_key_elsewhere`, exit 1, SSH left as
+left as it is, unsigned and not uploaded again. `mandala-py ssh-key add` proves
+an `unproven` one this account's API key added, which binds it to the API key
+it runs with; an unproven key that reaches other accounts is proven by removing
+it and adding it again from the dashboard. It stops instead (`ssh_key_elsewhere`, exit 1, SSH left as
 it was) when that key is bound to another of your accounts, because this
 account's computers would refuse it: remove it and add it again from the
 dashboard to use it on every account, or pass `--key` with a separate key. Then
@@ -5230,7 +5232,7 @@ The pieces, one at a time:
 
 ```sh
 mandala-py ssh-key list               # --json for the rows
-mandala-py ssh-key add [PATH] [--name NAME]   # signs a challenge with ssh-keygen, as --setup does
+mandala-py ssh-key add [PATH] [--name NAME]   # signs a challenge with ssh-keygen
 mandala-py ssh-key add [PATH] --no-proof      # unproven: reaches computers by id only
 mandala-py ssh-key challenge          # a challenge to sign yourself, to prove the key is yours
 mandala-py ssh-key add [PATH] --challenge sshkc-… --signature-file sig.txt

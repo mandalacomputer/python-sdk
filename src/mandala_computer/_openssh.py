@@ -22,7 +22,9 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -647,44 +649,91 @@ def signing_keys(public_key: Path) -> list[Path]:
     return keys
 
 
+#: What ``ssh-keygen -Y sign`` always says, and so is not passed on.
+_KEYGEN_CHATTER = "Signing data on standard input"
+
+
+def run_keygen(
+    argv: list[str], data: bytes, echo: Callable[[str], None]
+) -> tuple[int, bytes, list[str]]:
+    """Run ``argv`` with ``data`` on standard input: its exit status, what it
+    printed, and the lines it wrote to standard error.
+
+    Each standard-error line goes to ``echo`` as it is written, not when the
+    child exits: a security key's "touch it now" is said there, and the child
+    waits for it. Any exception while waiting, ``KeyboardInterrupt``
+    included, kills the child before it propagates.
+    """
+    said: list[str] = []
+    child = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+    errors = child.stderr
+
+    def pump() -> None:
+        for raw in errors:
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            said.append(line)
+            if line.strip() and line.strip() != _KEYGEN_CHATTER:
+                echo(line)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        with suppress(BrokenPipeError):
+            child.stdin.write(data)
+            child.stdin.close()
+        out = child.stdout.read()
+        code = child.wait()
+    except BaseException:
+        child.kill()
+        child.wait()
+        raise
+    reader.join()
+    return code, out, said
+
+
+def _echo_stderr(line: str) -> None:
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
 def sign_challenge(
     keygen: str,
     public_key: Path,
     namespace: str,
     challenge: str,
     *,
-    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+    run: Callable[[list[str], bytes, Callable[[str], None]], tuple[int, bytes, list[str]]] = (
+        run_keygen
+    ),
 ) -> tuple[str | None, str]:
     """``(signature, "")`` for ``challenge`` signed with ``public_key``'s private
     half, or ``(None, why not)``.
 
     The challenge goes to ``ssh-keygen`` on standard input exactly as issued,
     and the signature comes back exactly as printed: its line breaks are part
-    of it. A passphrase is asked for on the terminal, not on standard input.
+    of it. A passphrase is asked for on the terminal, not on standard input;
+    whatever ``ssh-keygen`` says on standard error (a security key asking to be
+    touched) reaches this process's standard error as it is said.
 
     A ``KeyboardInterrupt`` while ``ssh-keygen`` runs is not a failure to
     sign: it propagates, the child is killed, and no other key file is tried.
     """
     reason = "ssh-keygen printed no signature"
     for key in signing_keys(public_key):
+        argv = [keygen, "-Y", "sign", "-n", namespace, "-f", str(key)]
         try:
-            done = run(
-                [keygen, "-Y", "sign", "-n", namespace, "-f", str(key)],
-                input=challenge.encode(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
+            code, stdout, stderr = run(argv, challenge.encode(), _echo_stderr)
         except OSError as err:
             return None, f"could not run ssh-keygen: {err.strerror or err}"
-        out = done.stdout.decode("utf-8", "replace")
-        if done.returncode == 0 and out.startswith(SIGNATURE_BEGIN):
+        out = stdout.decode("utf-8", "replace")
+        if code == 0 and out.startswith(SIGNATURE_BEGIN):
             return out, ""
-        said = [line.strip() for line in done.stderr.decode("utf-8", "replace").splitlines()]
-        said = [line for line in said if line]
+        said = [line.strip() for line in stderr if line.strip()]
+        said = [line for line in said if line != _KEYGEN_CHATTER] or said
         reason = (
-            f"ssh-keygen: {said[-1]}"
-            if said
-            else f"ssh-keygen exited {done.returncode} without a signature"
+            f"ssh-keygen: {said[-1]}" if said else f"ssh-keygen exited {code} without a signature"
         )
     return None, reason

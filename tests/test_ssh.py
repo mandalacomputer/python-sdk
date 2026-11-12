@@ -1148,51 +1148,6 @@ def test_setup_signs_a_new_key(pub: Path, signer: list[Path], capsys: Any) -> No
 
 
 @respx.mock
-def test_setup_proves_a_listed_unproven_key_and_keeps_its_label(
-    pub: Path, signer: list[Path], capsys: Any
-) -> None:
-    listed = {**KEY, "name": "my label", "reach": "this_account", "possession": "unproven"}
-    add, _ = mock_setup([listed])
-    add.mock(return_value=httpx.Response(201, json={**listed, "possession": "proven"}))
-    mock_challenge()
-    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 0
-    sent = json.loads(add.calls.last.request.content)
-    assert sent["name"] == "my label" and sent["signature"] == SIGNATURE
-    printed = json.loads(capsys.readouterr().out)
-    assert printed["key_added"] is False
-    assert printed["key"]["possession"] == "proven"
-    assert _cli.main(["ssh", "--setup", "dev"]) == 0
-    assert "already registered, now proven yours" in capsys.readouterr().out
-
-
-@respx.mock
-@pytest.mark.parametrize("after", ["proven", "unproven", None])
-def test_setup_upgrade_racing_a_setup_that_proved_it_first(
-    pub: Path, signer: list[Path], capsys: Any, after: str | None
-) -> None:
-    listed = {**KEY, "reach": "this_account", "possession": "unproven"}
-    computers()
-    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
-    second = [] if after is None else [{**listed, "possession": after}]
-    respx.get(f"{BASE}/ssh-keys").mock(
-        side_effect=[httpx.Response(200, json=[listed]), httpx.Response(200, json=second)]
-    )
-    respx.post(f"{BASE}/ssh-keys").mock(
-        return_value=httpx.Response(409, json={"error": "That key is already registered."})
-    )
-    mock_challenge()
-    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
-    if after == "proven":
-        assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 0
-        printed = json.loads(capsys.readouterr().out)
-        assert printed["key_added"] is False and printed["key"]["possession"] == "proven"
-        assert put.called
-    else:
-        assert _cli.main(["ssh", "--setup", "dev"]) == 1
-        assert not put.called
-
-
-@respx.mock
 def test_setup_leaves_an_unproven_key_that_reaches_other_accounts(
     pub: Path, signer: list[Path], capsys: Any
 ) -> None:
@@ -1235,14 +1190,23 @@ def test_setup_interrupted_while_signing_adds_nothing(
 
 
 @respx.mock
-@pytest.mark.parametrize("possession", ["proven", "legacy", None])
-def test_setup_does_not_sign_a_key_already_good_by_name(
-    pub: Path, signer: list[Path], possession: str | None
+@pytest.mark.parametrize("possession", ["proven", "legacy", "unproven", None])
+def test_setup_leaves_a_held_key_as_it_is(
+    pub: Path, signer: list[Path], capsys: Any, possession: str | None
 ) -> None:
+    """A signed add would rebind the key to the credential running setup."""
     add, _ = mock_setup([{**KEY, "reach": "this_account", "possession": possession}])
     challenge = mock_challenge()
     assert _cli.main(["ssh", "--setup", "dev"]) == 0
     assert not add.called and not challenge.called and signer == []
+    err = capsys.readouterr().err
+    if possession == "unproven":
+        assert err.rstrip().endswith(
+            "to prove it, run mandala-py ssh-key add for it where ssh-keygen can use the "
+            "private key; that binds it to the API key it runs with"
+        )
+    else:
+        assert err == ""
 
 
 @respx.mock

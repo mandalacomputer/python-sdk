@@ -4023,10 +4023,17 @@ def _provable_here(key: SshKey) -> bool:
     return key.possession == "unproven" and key.reach == "this_account"
 
 
-def _how_to_prove(key: SshKey) -> str:
-    if key.reach in (None, "this_account"):
-        return f"`{PROG} ssh-key challenge` says how to prove it is yours"
-    return "to prove it, remove it and add it again from the dashboard"
+def _how_to_prove(key: SshKey, *, held: bool = False) -> str:
+    """The end of what is said about an unproven key. ``held``: ``--setup``,
+    which leaves a key it finds as it is."""
+    if key.reach not in (None, "this_account"):
+        return "to prove it, remove it and add it again from the dashboard"
+    if held:
+        return (
+            f"to prove it, run {PROG} ssh-key add for it where ssh-keygen can use the private "
+            "key; that binds it to the API key it runs with"
+        )
+    return f"`{PROG} ssh-key challenge` says how to prove it is yours"
 
 
 def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = False) -> int:
@@ -4049,7 +4056,6 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
             )
         existing = _own_key(client, fingerprint)
         unproven_why = "--no-proof" if no_proof else ""
-        proven_now = False
         if existing is None:
             proof = None if no_proof else _prove(client, path)
             if isinstance(proof, str):
@@ -4065,30 +4071,13 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
                     _conflict_hint(proof, as_json=as_json)
                     raise
                 registered = existing
-        elif _provable_here(existing) and not no_proof:
-            registered = existing
-            proof = _prove(client, path)
-            if isinstance(proof, str):
-                unproven_why = proof
-            else:
-                # A signed add replaces the unproven registration; the label
-                # it had is kept.
-                try:
-                    registered = _signed_add(client, line, proof, name=existing.name)
-                    proven_now = True
-                except ConflictError:
-                    # Another `--setup` of our own proved it first: a proven
-                    # key is a duplicate. Carry on with that registration.
-                    raced = _own_key(client, fingerprint)
-                    if raced is None or raced.possession == "unproven":
-                        raise
-                    registered = raced
         else:
-            # Proven, legacy, unreported, or held where a signed add from here
-            # would narrow or move it (see _provable_here): left as it is.
+            # A key already held is left as it is, and nothing is signed: a
+            # signed add would bind it to the credential running this, so
+            # revoking that credential would remove it, and a credential that
+            # may not add keys would fail a setup that needs no add.
             registered = existing
-            if not no_proof:
-                unproven_why = ""
+            unproven_why = ""
         # Listed is not accepted (platform OPL-5617): a key bound to another
         # of the person's accounts is refused here, so SSH is not switched on
         # for it and nothing reads as success.
@@ -4125,8 +4114,6 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
         )
     else:
         state = "already registered" if existing is not None else "registered"
-        if proven_now:
-            state += ", now proven yours"
         print(f"key {_shown(registered.fingerprint)} ({_shown(registered.name)}) {state}")
         print(f"SSH is on for {_shown(label)}")
         print(f"connect with: {command}")
@@ -4141,7 +4128,7 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
         print(
             f"{PROG}: key {_shown(registered.fingerprint)} is unproven{why}: {command} "
             "connects by the computer's id, so it works, but ssh to the computer by its "
-            f"name is refused; {_how_to_prove(registered)}",
+            f"name is refused; {_how_to_prove(registered, held=existing is not None)}",
             file=sys.stderr,
         )
     return 0

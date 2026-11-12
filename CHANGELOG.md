@@ -15,12 +15,14 @@ This is the summary you read to decide whether to upgrade.
   themselves: they sign a challenge with `ssh-keygen -Y sign` (through
   ssh-agent, or the private key beside the `.pub`) and add the key `proven`,
   so it also reaches a computer by its name. When signing is not possible the
-  key is added `unproven`, as before, with the reason on stderr. `--setup`
-  also adds an `unproven` key this account's credential added again with
-  proof, keeping its label. A key you already hold that reaches other accounts
-  (or is bound to another one) is never signed from here, since a signed add
-  would bind it to this account alone: `ssh-key add` stays the duplicate
-  refusal it was, and an unproven one is pointed at the dashboard. Ctrl-C
+  key is added `unproven`, as before, with the reason on stderr; what
+  `ssh-keygen` says (a security key asking to be touched) shows as it says it.
+  `--setup` leaves a key you already hold as it is, and says how to prove an
+  unproven one. `ssh-key add` proves an unproven key this account's API key
+  added, which binds it to the API key it runs with; a key you hold that
+  reaches other accounts (or is bound to another one) is never signed from
+  here, so that add stays the duplicate refusal it was, and an unproven one is
+  pointed at the dashboard. Ctrl-C
   while `ssh-keygen` runs ends the command with nothing added. `--no-proof` on
   either skips signing. A conflict
   on an add that carried no proof now says, on stderr, that a signed add

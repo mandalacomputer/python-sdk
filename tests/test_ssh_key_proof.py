@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -240,10 +245,10 @@ def runner(*answers: tuple[int, bytes, bytes]) -> tuple[Any, list[Any]]:
     seen: list[Any] = []
     queue = list(answers)
 
-    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[bytes]:
-        seen.append((argv, kw["input"]))
+    def run(argv: list[str], data: bytes, echo: Any) -> tuple[int, bytes, list[str]]:
+        seen.append((argv, data))
         code, out, err = queue.pop(0)
-        return subprocess.CompletedProcess(argv, code, out, err)
+        return code, out, err.decode().splitlines()
 
     return run, seen
 
@@ -281,7 +286,7 @@ def test_sign_challenge_says_why_it_could_not(tmp_path: Path) -> None:
         "ssh-keygen exited 0 without a signature",
     )
 
-    def broken(argv: list[str], **kw: Any) -> Any:
+    def broken(argv: list[str], data: bytes, echo: Any) -> Any:
         raise PermissionError(13, "Permission denied")
 
     assert _openssh.sign_challenge(KEYGEN, public, "ns", "c", run=broken) == (
@@ -419,7 +424,7 @@ def test_sign_challenge_interrupted_tries_no_other_key(tmp_path: Path) -> None:
     (tmp_path / "id_ed25519").write_text("private")
     calls: list[Any] = []
 
-    def stopped(argv: list[str], **kw: Any) -> Any:
+    def stopped(argv: list[str], data: bytes, echo: Any) -> Any:
         calls.append(argv)
         raise KeyboardInterrupt
 
@@ -500,3 +505,56 @@ def test_cli_add_of_an_unproven_key_reaching_elsewhere_points_at_the_dashboard(
     assert _cli.main(["ssh-key", "add", str(pub)]) == 0
     err = capsys.readouterr().err
     assert err.rstrip().endswith("to prove it, remove it and add it again from the dashboard")
+
+
+def test_run_keygen_passes_a_prompt_on_while_the_child_still_waits(tmp_path: Path) -> None:
+    """A security key's touch prompt must show before the child exits."""
+    go = tmp_path / "touched"
+    script = (
+        "import sys, time, pathlib\n"
+        "data = sys.stdin.buffer.read()\n"
+        "sys.stderr.write('Signing data on standard input\\n')\n"
+        "sys.stderr.write('Confirm user presence for key ED25519-SK\\n'); sys.stderr.flush()\n"
+        f"while not pathlib.Path({str(go)!r}).exists(): time.sleep(0.02)\n"
+        "sys.stdout.write('-----BEGIN SSH SIGNATURE-----\\n' + data.decode())\n"
+    )
+    shown: list[str] = []
+    result: list[Any] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            _openssh.run_keygen([sys.executable, "-c", script], b"sshkc-1", shown.append)
+        )
+    )
+    worker.start()
+    deadline = time.monotonic() + 10
+    while not shown and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert shown == ["Confirm user presence for key ED25519-SK"]
+    assert worker.is_alive()
+    go.write_text("")
+    worker.join(10)
+    code, out, said = result[0]
+    assert code == 0 and out == b"-----BEGIN SSH SIGNATURE-----\nsshkc-1"
+    assert said[-1] == "Confirm user presence for key ED25519-SK"
+
+
+def test_run_keygen_kills_the_child_when_interrupted() -> None:
+    """Ctrl-C while ssh-keygen waits (for a touch, say) ends it, promptly."""
+    started: list[subprocess.Popen[bytes]] = []
+    real = subprocess.Popen
+
+    def spy(*a: Any, **kw: Any) -> subprocess.Popen[bytes]:
+        child = real(*a, **kw)
+        started.append(child)
+        threading.Timer(0.3, os.kill, (os.getpid(), signal.SIGINT)).start()
+        return child
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_openssh.subprocess, "Popen", spy)
+        began = time.monotonic()
+        with pytest.raises(KeyboardInterrupt):
+            _openssh.run_keygen(
+                [sys.executable, "-c", "import time; time.sleep(60)"], b"", lambda line: None
+            )
+    assert time.monotonic() - began < 10
+    assert started[0].poll() is not None
