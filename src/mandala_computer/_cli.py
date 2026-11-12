@@ -3738,7 +3738,7 @@ def _webhooks_parser(sub: Any) -> None:
 
 SSH_USAGE = """\
 usage: mandala-py ssh <computer> [ssh-args ...]
-       mandala-py ssh --setup <computer> [--key PATH] [--json]
+       mandala-py ssh --setup <computer> [--key PATH] [--no-proof] [--json]
 
 Real OpenSSH to a computer, through the platform's SSH gateway, as `user`.
 Everything after the computer goes to ssh unchanged:
@@ -3749,7 +3749,10 @@ Everything after the computer goes to ssh unchanged:
 
 --setup registers your public key (--key PATH, or the first of
 ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub) unless it already is, and
-switches SSH on for the computer. Run it once per computer.
+switches SSH on for the computer. Run it once per computer. It proves the key
+is yours by signing a challenge with `ssh-keygen -Y sign` (through ssh-agent,
+or the private key beside the .pub, which may ask for its passphrase), so the
+key also reaches a computer by its name; --no-proof skips that.
 
 mandala-py ssh never falls back to `mandala-py terminal`, which needs no key.
 
@@ -3802,6 +3805,7 @@ class _SshWords:
     def __init__(self) -> None:
         self.setup = False
         self.key: str | None = None
+        self.no_proof = False
         self.json = False
         self.help = False
         self.target: str | None = None
@@ -3826,7 +3830,7 @@ def _parse_ssh(words: list[str]) -> _SshWords:
     """``mandala ssh``'s own options, the computer, and what goes to ssh.
 
     Our options come before the computer; everything after it is ssh's. With
-    ``--setup`` nothing goes to ssh, so ``--key`` and ``--json`` may follow the
+    ``--setup`` nothing goes to ssh, so ``--key``, ``--no-proof`` and ``--json`` may follow the
     computer too.
 
     A usage error is recorded and the reading goes on, so whether it is reported
@@ -3845,6 +3849,8 @@ def _parse_ssh(words: list[str]) -> _SshWords:
             parsed.setup = True
         elif word == "--json":
             parsed.json = True
+        elif word == "--no-proof":
+            parsed.no_proof = True
         elif word == "--key":
             if i + 1 >= len(words):
                 parsed.fail("--key needs a PATH")
@@ -3875,7 +3881,7 @@ def _cmd_ssh(parsed: _SshWords) -> int:
     if target is None:
         return _ssh_usage_error("name a computer", as_json=parsed.as_json)
     if parsed.setup:
-        return _ssh_setup(target, parsed.key, as_json=parsed.json)
+        return _ssh_setup(target, parsed.key, as_json=parsed.json, no_proof=parsed.no_proof)
     if parsed.json:
         # ``mandala``'s word and exit status for it: the mode is refused, not
         # the words, so not ``invalid_arguments``.
@@ -3888,6 +3894,8 @@ def _cmd_ssh(parsed: _SshWords) -> int:
             "--key goes with --setup; to connect with a particular key, pass -i PATH "
             "after the computer"
         )
+    if parsed.no_proof:
+        return _ssh_usage_error("--no-proof goes with --setup")
     return _ssh_connect(target, parsed.rest)
 
 
@@ -3962,7 +3970,101 @@ def _key_path(given: str | None) -> Path:
     return found
 
 
-def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
+#: ``(challenge, signature)``: what proves a key is the caller's.
+_Proof = tuple[str, str]
+
+
+def _prove(client: Client, public_key: Path, *, as_json: bool = False) -> _Proof | str:
+    """``(challenge, signature)`` proving ``public_key`` is the caller's, or why
+    not. Nothing is asked of the platform when there is no ``ssh-keygen`` to
+    sign with."""
+    keygen = shutil.which("ssh-keygen")
+    if keygen is None:
+        return "no ssh-keygen on PATH to sign with"
+    try:
+        issued = client.ssh_keys.challenge()
+    except NotFoundError:
+        return "this platform does not issue challenges"
+    # Checked before ssh-keygen runs: the endpoint is only as trusted as the
+    # base URL, and a signature is the private key vouching for these bytes.
+    if issued.namespace != _openssh.SIGNING_NAMESPACE:
+        _die(
+            lambda s: (
+                f"refusing to sign: the challenge names the signature namespace "
+                f"{s(issued.namespace)}, not {_openssh.SIGNING_NAMESPACE}"
+            ),
+            "unexpected_challenge",
+        )
+    if not _openssh.CHALLENGE_SHAPE.fullmatch(issued.challenge):
+        _die(
+            lambda s: (
+                f"refusing to sign: {s(issued.challenge)} is not a key registration challenge"
+            ),
+            "unexpected_challenge",
+        )
+    # Under --json, stderr is kept for the one error object: what ssh-keygen
+    # says goes to the terminal instead.
+    signature, reason = _openssh.sign_challenge(
+        keygen,
+        public_key,
+        issued.namespace,
+        issued.challenge,
+        # Spelled terminal-safe: a line ssh-keygen prints can quote a path or
+        # a key comment, which could hold an escape sequence.
+        echo=lambda line: (_openssh.echo_terminal if as_json else _openssh.echo_stderr)(
+            _shown(line)
+        ),
+    )
+    if signature is None:
+        return reason
+    return issued.challenge, signature
+
+
+def _signed_add(client: Client, line: str, proof: _Proof | str | None, **kw: Any) -> SshKey:
+    """Add ``line``, with ``proof`` when it is one."""
+    if isinstance(proof, tuple):
+        return client.ssh_keys.add(line, challenge=proof[0], signature=proof[1], **kw)
+    return client.ssh_keys.add(line, **kw)
+
+
+def _conflict_hint(proof: _Proof | str | None, *, as_json: bool) -> None:
+    """Before the platform's refusal of an add that carried no proof: what a
+    proof would have changed. A signed add's conflict is left as it is, and so
+    is one sent unsigned on purpose (``proof`` is ``""``); under ``--json`` the
+    refusal stays the one line on stderr."""
+    if isinstance(proof, tuple) or proof == "" or as_json:
+        return
+    why = "--no-proof" if proof is None else proof
+    print(
+        f"{PROG}: if somebody else registered this key without proving it is theirs, "
+        f"adding it with proof replaces that registration; this add carried none "
+        f"({_shown(why)})",
+        file=sys.stderr,
+    )
+
+
+def _provable_here(key: SshKey) -> bool:
+    """Whether a signed add of ``key``, already held, may replace its
+    registration from here. A signed add binds the key to this credential's
+    account alone: a key that reaches other accounts would lose them, and one
+    bound to another account would move rather than be refused."""
+    return key.possession == "unproven" and key.reach == "this_account"
+
+
+def _how_to_prove(key: SshKey, *, held: bool = False) -> str:
+    """The end of what is said about an unproven key. ``held``: ``--setup``,
+    which leaves a key it finds as it is."""
+    if key.reach not in (None, "this_account"):
+        return "to prove it, remove it and add it again from the dashboard"
+    if held:
+        return (
+            f"to prove it, run {PROG} ssh-key add for it where ssh-keygen can use the private "
+            "key; that binds it to the API key it runs with"
+        )
+    return f"`{PROG} ssh-key challenge` says how to prove it is yours"
+
+
+def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = False) -> int:
     path = _key_path(key)
     line = _openssh.read_public_key(path)
     fingerprint = _openssh.fingerprint(line)
@@ -3981,19 +4083,35 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
                 )
             )
         existing = _own_key(client, fingerprint)
+        unproven_why = "--no-proof" if no_proof else ""
         if existing is None:
+            proof = None if no_proof else _prove(client, path, as_json=as_json)
+            if isinstance(proof, str):
+                unproven_why = proof
+            # Signing can wait on a passphrase or a touch: a key registered
+            # meanwhile is kept as it is, not replaced by a signed add.
+            held = _own_key(client, fingerprint) if isinstance(proof, tuple) else None
             try:
-                registered = client.ssh_keys.add(line)
+                if held is not None:
+                    existing = registered = held
+                else:
+                    registered = _signed_add(client, line, proof)
             except ConflictError:
                 # Registered between the listing and the add — by another
                 # `--setup` of our own, or by somebody else. Only the first is
                 # ours to carry on with; the second keeps the platform's refusal.
                 existing = _own_key(client, fingerprint)
                 if existing is None:
+                    _conflict_hint(proof, as_json=as_json)
                     raise
                 registered = existing
         else:
+            # A key already held is left as it is, and nothing is signed: a
+            # signed add would bind it to the credential running this, so
+            # revoking that credential would remove it, and a credential that
+            # may not add keys would fail a setup that needs no add.
             registered = existing
+            unproven_why = ""
         # Listed is not accepted (platform OPL-5617): a key bound to another
         # of the person's accounts is refused here, so SSH is not switched on
         # for it and nothing reads as success.
@@ -4037,6 +4155,14 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool) -> int:
         print(
             f"{PROG}: {_shown(label)} has not received the setting yet; it is sent again "
             "automatically, and connecting sends it first",
+            file=sys.stderr,
+        )
+    if registered.possession == "unproven":
+        why = f" ({_shown(unproven_why)})" if unproven_why else ""
+        print(
+            f"{PROG}: key {_shown(registered.fingerprint)} is unproven{why}: {command} "
+            "connects by the computer's id, so it works, but ssh to the computer by its "
+            f"name is refused; {_how_to_prove(registered, held=existing is not None)}",
             file=sys.stderr,
         )
     return 0
@@ -4132,20 +4258,51 @@ def _signature(path: str) -> str:
 def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
     if (args.challenge is None) != (args.signature_file is None):
         raise ValueError("--challenge and --signature-file go together: pass both or neither")
-    line = _openssh.read_public_key(_key_path(args.path))
-    signature = None if args.signature_file is None else _signature(args.signature_file)
+    if args.no_proof and args.challenge is not None:
+        raise ValueError("--no-proof goes without --challenge and --signature-file")
+    path = _key_path(args.path)
+    line = _openssh.read_public_key(path)
+    why = ""
     with _client() as client:
-        key = client.ssh_keys.add(
-            line, name=args.name, challenge=args.challenge, signature=signature
-        )
+        if args.challenge is not None:
+            key = client.ssh_keys.add(
+                line,
+                name=args.name,
+                challenge=args.challenge,
+                signature=_signature(args.signature_file),
+            )
+        else:
+            held = None
+            if not args.no_proof and shutil.which("ssh-keygen") is not None:
+                held = _own_key(client, _openssh.fingerprint(line))
+            if held is not None and not _provable_here(held):
+                # Already held where a signed add would narrow or move it:
+                # added unsigned, so it is refused as a duplicate as before.
+                key = client.ssh_keys.add(line, name=args.name)
+            else:
+                proof = None if args.no_proof else _prove(client, path, as_json=args.json)
+                why = "--no-proof" if proof is None else proof if isinstance(proof, str) else ""
+                if isinstance(proof, tuple):
+                    # Signing can wait on a passphrase or a touch: a key held
+                    # by now where a signed add would narrow or move it is
+                    # sent unsigned, and refused as a duplicate.
+                    held = _own_key(client, _openssh.fingerprint(line))
+                    if held is not None and not _provable_here(held):
+                        proof = ""
+                try:
+                    key = _signed_add(client, line, proof, name=args.name)
+                except ConflictError:
+                    _conflict_hint(proof, as_json=args.json)
+                    raise
     if args.json:
         _json(key.raw)
     else:
         print(f"added {_shown(key.id)}  {_shown(key.fingerprint)}  {_shown(key.name)}")
         if key.possession == "unproven":
+            shown = f" ({_shown(why)})" if why else ""
             print(
-                f"{PROG}: this key is unproven, so it connects to a computer named by its id "
-                f"only; `{PROG} ssh-key challenge` says how to prove it is yours",
+                f"{PROG}: this key is unproven{shown}, so it connects to a computer named by "
+                f"its id only; {_how_to_prove(key)}",
                 file=sys.stderr,
             )
     return 0
@@ -4464,7 +4621,10 @@ def _ssh_parsers(sub: Any) -> None:
     listing = verbs.add_parser("list", help="your registered keys")
     listing.add_argument("--json", action="store_true", help="the rows as JSON")
     listing.set_defaults(fn=_cmd_ssh_key_list)
-    add = verbs.add_parser("add", help="register a public key")
+    add = verbs.add_parser(
+        "add",
+        help="register a public key, proven yours by signing a challenge with ssh-keygen",
+    )
     add.add_argument(
         "path",
         metavar="PATH",
@@ -4479,6 +4639,11 @@ def _ssh_parsers(sub: Any) -> None:
         "--signature-file",
         metavar="FILE",
         help="the signature `ssh-keygen -Y sign` printed for --challenge (- for stdin)",
+    )
+    add.add_argument(
+        "--no-proof",
+        action="store_true",
+        help="add it unproven, without running ssh-keygen: it reaches computers by id only",
     )
     add.add_argument("--json", action="store_true", help="the key as JSON")
     add.set_defaults(fn=_cmd_ssh_key_add)

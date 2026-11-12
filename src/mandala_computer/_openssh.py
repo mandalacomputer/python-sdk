@@ -2,8 +2,9 @@
 
 Everything here is pure or touches only local files: where the gateway is, the
 known_hosts file the CLI manages, the ``ssh`` command line, the
-``~/.ssh/config`` snippet, and finding and fingerprinting a public key. The
-commands that use them live in ``_cli``.
+``~/.ssh/config`` snippet, finding and fingerprinting a public key, and signing
+a challenge with ``ssh-keygen`` to prove the key is yours. The commands that use
+them live in ``_cli``.
 
 The platform's SSH gateway is a jump host. A connection is two hops: OpenSSH to
 the gateway on port 2222 as ``mandala``, and through it to the computer's own
@@ -20,9 +21,12 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -624,3 +628,145 @@ def fingerprint(public_key: str) -> str:
         raise ValueError("not an OpenSSH public key line") from None
     digest = base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
     return f"SHA256:{digest}"
+
+
+#: The only namespace this CLI signs in. A signature is good in its namespace
+#: alone, so signing whatever an endpoint names (``git``, say, over a commit)
+#: would hand out a signature usable somewhere else.
+SIGNING_NAMESPACE = "ssh-key-registration@mandala.computer"
+#: What a registration challenge looks like; nothing else is signed.
+CHALLENGE_SHAPE = re.compile(r"sshkc-[0-9a-f]{64}")
+
+#: The first line of the armored signature ``ssh-keygen -Y sign`` prints.
+SIGNATURE_BEGIN = "-----BEGIN SSH SIGNATURE-----"
+
+
+def signing_keys(public_key: Path) -> list[Path]:
+    """The ``-f`` files to try, in order, to sign with ``public_key``'s private half.
+
+    The ``.pub`` file itself first: ``ssh-keygen -Y sign`` handed a public key
+    signs through ssh-agent, and a recent one falls back to the private file
+    beside it. The private file beside it second, for an older ``ssh-keygen``
+    that only signs through the agent when given a ``.pub``.
+    """
+    keys = [public_key]
+    if public_key.name.endswith(".pub"):
+        private = public_key.with_name(public_key.name.removesuffix(".pub"))
+        if private.is_file():
+            keys.append(private)
+    return keys
+
+
+def _chatter(line: str) -> bool:
+    """What ``ssh-keygen -Y sign`` always says, and so is neither passed on
+    nor given as the reason it failed."""
+    text = line.strip()
+    return text.startswith(
+        ("Signing data on standard input", "Signing file ", "Write signature to ")
+    )
+
+
+def run_keygen(argv: list[str], echo: Callable[[str], None]) -> tuple[int, list[str]]:
+    """Run ``argv``: its exit status and the lines it wrote to standard error.
+
+    Standard input is this process's own, so a passphrase prompt reaches the
+    terminal rather than ssh-askpass, and standard output is discarded. Each
+    standard-error line goes to ``echo`` as it is written, not when the child
+    exits: a security key's "touch it now" is said there, and the child waits
+    for it. Any exception while waiting, ``KeyboardInterrupt`` included, kills
+    the child before it propagates.
+    """
+    said: list[str] = []
+    child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    assert child.stderr is not None
+    errors = child.stderr
+
+    def pump() -> None:
+        for raw in errors:
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            said.append(line)
+            if line.strip() and not _chatter(line):
+                echo(line)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        code = child.wait()
+    except BaseException:
+        child.kill()
+        child.wait()
+        raise
+    reader.join()
+    return code, said
+
+
+def echo_stderr(line: str) -> None:
+    """``line`` on standard error, now."""
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
+def echo_terminal(line: str) -> None:
+    """``line`` on the controlling terminal, or nowhere: for ``--json``, whose
+    standard error carries only the one error object, while a security key's
+    "touch it now" still has to reach the person."""
+    with suppress(OSError), open("/dev/tty", "w") as tty:
+        tty.write(line + "\n")
+
+
+def sign_challenge(
+    keygen: str,
+    public_key: Path,
+    namespace: str,
+    challenge: str,
+    *,
+    run: Callable[[list[str], Callable[[str], None]], tuple[int, list[str]]] = run_keygen,
+    echo: Callable[[str], None] = echo_stderr,
+) -> tuple[str | None, str]:
+    """``(signature, "")`` for ``challenge`` signed with ``public_key``'s private
+    half, or ``(None, why not)``.
+
+    The challenge is written, exactly as issued, to a file only this user can
+    read, in a directory of its own that is removed afterwards, and
+    ``ssh-keygen`` signs that file: handed the data on standard input instead,
+    it asks for a passphrase through ssh-askpass whenever a display is set,
+    and fails where there is none. The signature is returned exactly as
+    written: its line breaks are part of it. Whatever ``ssh-keygen`` says on
+    standard error (a security key asking to be touched) goes to ``echo`` as
+    it is said.
+
+    A ``KeyboardInterrupt`` while ``ssh-keygen`` runs is not a failure to
+    sign: it propagates, the child is killed, and no other key file is tried.
+    """
+    reason = "ssh-keygen wrote no signature"
+    workdir = Path(tempfile.mkdtemp(prefix="mandala-sign-"))
+    try:
+        data = workdir / "challenge"
+        fd = os.open(data, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(challenge.encode())
+        signed = workdir / "challenge.sig"
+        for key in signing_keys(public_key):
+            with suppress(FileNotFoundError):
+                signed.unlink()
+            argv = [keygen, "-Y", "sign", "-n", namespace, "-f", str(key), str(data)]
+            try:
+                code, stderr = run(argv, echo)
+            except OSError as err:
+                return None, f"could not run ssh-keygen: {err.strerror or err}"
+            try:
+                text = signed.read_text()
+            except (OSError, UnicodeDecodeError):
+                text = ""
+            if code == 0 and text.startswith(SIGNATURE_BEGIN):
+                return text, ""
+            said = [line.strip() for line in stderr if line.strip()]
+            said = [line for line in said if not _chatter(line)] or said
+            reason = (
+                f"ssh-keygen: {said[-1]}"
+                if said
+                else f"ssh-keygen exited {code} without a signature"
+            )
+        return None, reason
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
