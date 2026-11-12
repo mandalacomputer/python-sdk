@@ -4008,9 +4008,10 @@ def _signed_add(client: Client, line: str, proof: _Proof | str | None, **kw: Any
 
 def _conflict_hint(proof: _Proof | str | None, *, as_json: bool) -> None:
     """Before the platform's refusal of an add that carried no proof: what a
-    proof would have changed. A signed add's conflict is left as it is, and
-    under ``--json`` the refusal stays the one line on stderr."""
-    if isinstance(proof, tuple) or as_json:
+    proof would have changed. A signed add's conflict is left as it is, and so
+    is one sent unsigned on purpose (``proof`` is ``""``); under ``--json`` the
+    refusal stays the one line on stderr."""
+    if isinstance(proof, tuple) or proof == "" or as_json:
         return
     why = "--no-proof" if proof is None else proof
     print(
@@ -4066,8 +4067,14 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
             proof = None if no_proof else _prove(client, path, as_json=as_json)
             if isinstance(proof, str):
                 unproven_why = proof
+            # Signing can wait on a passphrase or a touch: a key registered
+            # meanwhile is kept as it is, not replaced by a signed add.
+            held = _own_key(client, fingerprint) if isinstance(proof, tuple) else None
             try:
-                registered = _signed_add(client, line, proof)
+                if held is not None:
+                    existing = registered = held
+                else:
+                    registered = _signed_add(client, line, proof)
             except ConflictError:
                 # Registered between the listing and the add — by another
                 # `--setup` of our own, or by somebody else. Only the first is
@@ -4254,6 +4261,13 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
             else:
                 proof = None if args.no_proof else _prove(client, path, as_json=args.json)
                 why = "--no-proof" if proof is None else proof if isinstance(proof, str) else ""
+                if isinstance(proof, tuple):
+                    # Signing can wait on a passphrase or a touch: a key held
+                    # by now where a signed add would narrow or move it is
+                    # sent unsigned, and refused as a duplicate.
+                    held = _own_key(client, _openssh.fingerprint(line))
+                    if held is not None and not _provable_here(held):
+                        proof = ""
                 try:
                     key = _signed_add(client, line, proof, name=args.name)
                 except ConflictError:

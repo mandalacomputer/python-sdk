@@ -593,3 +593,24 @@ def test_cli_add_keeps_ssh_keygens_words_off_json_stderr(
     else:
         assert err.startswith("Couldn't sign: agent refused operation\n")
         assert on_tty == []
+
+
+@respx.mock
+def test_cli_add_sends_unsigned_a_key_registered_elsewhere_while_it_was_signing(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    listing: list[dict[str, Any]] = []
+    respx.get(f"{BASE}/ssh-keys").mock(side_effect=lambda req: httpx.Response(200, json=listing))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    route = respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(409, json={"error": "That key is already registered."})
+    )
+
+    def sign(*a: Any, **kw: Any) -> tuple[str, str]:
+        listing.append({**KEY, "reach": "another_account", "possession": "unproven"})
+        return SIGNATURE, ""
+
+    monkeypatch.setattr(_cli._openssh, "sign_challenge", sign)
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 1
+    assert json.loads(route.calls.last.request.content) == {"public_key": f"{PUBLIC_KEY} me@laptop"}
+    assert capsys.readouterr().err == "mandala-py: That key is already registered. (HTTP 409)\n"

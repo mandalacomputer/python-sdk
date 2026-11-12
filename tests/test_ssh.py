@@ -1226,6 +1226,33 @@ def test_setup_no_proof_registers_unproven_and_says_what_that_means(
     assert "by its name is refused" in err
 
 
+@respx.mock
+def test_setup_keeps_a_key_registered_while_it_was_signing(
+    pub: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """Signing waited on a prompt and the key was registered meanwhile, bound
+    to another account: no signed add replaces it; the refusal applies."""
+    monkeypatch.setattr(
+        _cli.shutil, "which", lambda name: {"ssh": SSH, "ssh-keygen": KEYGEN}.get(name)
+    )
+    listing: list[dict[str, Any]] = []
+    computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
+    respx.get(f"{BASE}/ssh-keys").mock(side_effect=lambda req: httpx.Response(200, json=listing))
+    add = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
+    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
+    mock_challenge()
+
+    def sign(*a: Any, **kw: Any) -> tuple[str, str]:
+        listing.append({**KEY, "reach": "another_account", "possession": "unproven"})
+        return SIGNATURE, ""
+
+    monkeypatch.setattr(_cli._openssh, "sign_challenge", sign)
+    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 1
+    assert not add.called and not put.called
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "ssh_key_elsewhere"
+
+
 def test_no_proof_without_setup_is_a_usage_error(capsys: Any) -> None:
     assert _cli.main(["ssh", "--no-proof", "dev"]) == 2
     assert "--no-proof goes with --setup" in capsys.readouterr().err
