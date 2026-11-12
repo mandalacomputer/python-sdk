@@ -1619,8 +1619,9 @@ class AsyncSshKeys:
         name: str | None = None,
         challenge: str | None = None,
         signature: str | None = None,
+        replaces: str | None = _api._OMITTED,
     ) -> SshKey:
-        body = _api.ssh_key_body(public_key, name, challenge, signature)
+        body = _api.ssh_key_body(public_key, name, challenge, signature, replaces)
         return SshKey.from_api(await self._t.json_object("POST", _api.SSH_KEYS, json=body))
 
     async def remove(self, key_id: str) -> None:

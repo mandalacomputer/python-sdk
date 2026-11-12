@@ -2266,6 +2266,7 @@ class SshKeys:
         name: str | None = None,
         challenge: str | None = None,
         signature: str | None = None,
+        replaces: str | None = _api._OMITTED,
     ) -> SshKey:
         """Register one public key: a line from a ``.pub`` file, as read. It
         is bound to the account this client's API key acts on, and removed
@@ -2300,8 +2301,18 @@ class SshKeys:
         verify, or a challenge not issued to you, used or expired, is an
         :class:`~mandala_computer.APIError` (400). Passing only one of the two
         is a ``ValueError`` before anything is sent.
+
+        ONLY IF NOTHING CHANGED. ``replaces`` makes the add conditional on the
+        registration you last saw in :meth:`list`: the
+        :attr:`~mandala_computer.SshKey.id` of yours that the add may replace,
+        or ``None`` when you hold none. If yours is anything else by the time
+        the add runs (registered meanwhile, say through another of your
+        accounts, or removed), it is a :class:`~mandala_computer.ConflictError`
+        whose ``code`` is ``"registration_changed"``, nothing changes, and the
+        challenge stays usable. Leave it out for an unconditional add. Mainly
+        for a signed add, which replaces an unproven registration.
         """
-        body = _api.ssh_key_body(public_key, name, challenge, signature)
+        body = _api.ssh_key_body(public_key, name, challenge, signature, replaces)
         return SshKey.from_api(self._t.json_object("POST", _api.SSH_KEYS, json=body))
 
     def remove(self, key_id: str) -> None:

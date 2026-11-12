@@ -1383,7 +1383,9 @@ def exercise_everything(client: mc.Client) -> None:
     client.ssh_keys.add(SSH_KEY["public_key"])
     client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
     issued = client.ssh_keys.challenge()
-    client.ssh_keys.add(SSH_KEY["public_key"], challenge=issued.challenge, signature=SIGNATURE)
+    client.ssh_keys.add(
+        SSH_KEY["public_key"], challenge=issued.challenge, signature=SIGNATURE, replaces=None
+    )
     client.ssh_keys.remove(SSH_KEY["id"])
     connection = c.create_browser_connection(session_policy=mc.BrowserSessionPolicy())
     c.renew_browser_connection(connection.id)
@@ -1746,7 +1748,10 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.ssh_keys.add(SSH_KEY["public_key"], name="laptop")
     issued_async = await client.ssh_keys.challenge()
     await client.ssh_keys.add(
-        SSH_KEY["public_key"], challenge=issued_async.challenge, signature=SIGNATURE
+        SSH_KEY["public_key"],
+        challenge=issued_async.challenge,
+        signature=SIGNATURE,
+        replaces=None,
     )
     await client.ssh_keys.remove(SSH_KEY["id"])
     connection = await c.create_browser_connection(session_policy=mc.BrowserSessionPolicy())
