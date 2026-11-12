@@ -629,6 +629,13 @@ def fingerprint(public_key: str) -> str:
     return f"SHA256:{digest}"
 
 
+#: The only namespace this CLI signs in. A signature is good in its namespace
+#: alone, so signing whatever an endpoint names (``git``, say, over a commit)
+#: would hand out a signature usable somewhere else.
+SIGNING_NAMESPACE = "ssh-key-registration@mandala.computer"
+#: What a registration challenge looks like; nothing else is signed.
+CHALLENGE_SHAPE = re.compile(r"sshkc-[0-9a-f]{64}")
+
 #: The first line of the armored signature ``ssh-keygen -Y sign`` prints.
 SIGNATURE_BEGIN = "-----BEGIN SSH SIGNATURE-----"
 

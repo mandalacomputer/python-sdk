@@ -3985,6 +3985,23 @@ def _prove(client: Client, public_key: Path, *, as_json: bool = False) -> _Proof
         issued = client.ssh_keys.challenge()
     except NotFoundError:
         return "this platform does not issue challenges"
+    # Checked before ssh-keygen runs: the endpoint is only as trusted as the
+    # base URL, and a signature is the private key vouching for these bytes.
+    if issued.namespace != _openssh.SIGNING_NAMESPACE:
+        _die(
+            lambda s: (
+                f"refusing to sign: the challenge names the signature namespace "
+                f"{s(issued.namespace)}, not {_openssh.SIGNING_NAMESPACE}"
+            ),
+            "unexpected_challenge",
+        )
+    if not _openssh.CHALLENGE_SHAPE.fullmatch(issued.challenge):
+        _die(
+            lambda s: (
+                f"refusing to sign: {s(issued.challenge)} is not a key registration challenge"
+            ),
+            "unexpected_challenge",
+        )
     # Under --json, stderr is kept for the one error object: what ssh-keygen
     # says goes to the terminal instead.
     signature, reason = _openssh.sign_challenge(

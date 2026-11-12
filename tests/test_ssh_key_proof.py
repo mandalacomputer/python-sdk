@@ -37,7 +37,7 @@ KEY: dict[str, Any] = {
 }
 CHALLENGE: dict[str, Any] = {
     "challenge": "sshkc-" + "ab" * 32,
-    "namespace": "mandala-ssh-key",
+    "namespace": "ssh-key-registration@mandala.computer",
     "expires_at": "2026-11-11T12:10:00.000Z",
     "sign_command": "printf '%s' 'sshkc-…' | ssh-keygen -Y sign -n mandala-ssh-key -f ~/.ssh/id_ed25519",
 }
@@ -74,7 +74,7 @@ async def test_challenge_posts_with_no_body_and_reads_the_challenge(client: Any)
     assert route.calls.last.request.content == b""
     assert issued == mc.SshKeyChallenge(
         CHALLENGE["challenge"],
-        "mandala-ssh-key",
+        "ssh-key-registration@mandala.computer",
         CHALLENGE["expires_at"],
         CHALLENGE["sign_command"],
     )
@@ -150,7 +150,7 @@ def test_cli_challenge_prints_what_to_sign(pub: Path, capsys: pytest.CaptureFixt
     assert _cli.main(["ssh-key", "challenge"]) == 0
     captured = capsys.readouterr()
     assert f"challenge   {CHALLENGE['challenge']}" in captured.out
-    assert "namespace   mandala-ssh-key" in captured.out
+    assert "namespace   ssh-key-registration@mandala.computer" in captured.out
     assert "--signature-file" in captured.err
     assert _cli.main(["ssh-key", "challenge", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == CHALLENGE
@@ -305,7 +305,9 @@ def test_cli_add_signs_a_challenge_itself(
     route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
     signer = sign_with(monkeypatch, Signer())
     assert _cli.main(["ssh-key", "add", str(keygen)]) == 0
-    assert signer.calls == [(KEYGEN, keygen, "mandala-ssh-key", CHALLENGE["challenge"])]
+    assert signer.calls == [
+        (KEYGEN, keygen, "ssh-key-registration@mandala.computer", CHALLENGE["challenge"])
+    ]
     sent = json.loads(route.calls.last.request.content)
     assert (sent["challenge"], sent["signature"]) == (CHALLENGE["challenge"], SIGNATURE)
     assert capsys.readouterr().err == ""
@@ -614,3 +616,44 @@ def test_cli_add_sends_unsigned_a_key_registered_elsewhere_while_it_was_signing(
     assert _cli.main(["ssh-key", "add", str(keygen)]) == 1
     assert json.loads(route.calls.last.request.content) == {"public_key": f"{PUBLIC_KEY} me@laptop"}
     assert capsys.readouterr().err == "mandala-py: That key is already registered. (HTTP 409)\n"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "issued",
+    [
+        {**CHALLENGE, "namespace": "git"},
+        {**CHALLENGE, "challenge": "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+        {**CHALLENGE, "challenge": "sshkc-" + "AB" * 32},
+        {**CHALLENGE, "challenge": "sshkc-" + "ab" * 32 + "\n"},
+    ],
+)
+@pytest.mark.parametrize("command", [["ssh-key", "add"], ["ssh", "--setup", "dev"]])
+def test_an_unexpected_challenge_is_never_signed(
+    keygen: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    issued: dict[str, Any],
+    command: list[str],
+) -> None:
+    """A signature is good in its namespace: an endpoint naming another one,
+    or handing over something that is not a registration challenge, could
+    collect a signature usable elsewhere."""
+    respx.get(f"{BASE}/computers").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": "vm-9", "name": "dev", "status": "running", "os": "linux"}]
+        )
+    )
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(
+        return_value=httpx.Response(200, json={"computer": "vm-9", "enabled": False})
+    )
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=issued))
+    add = respx.post(f"{BASE}/ssh-keys")
+    signer = sign_with(monkeypatch, Signer())
+    argv = [*command, *([str(keygen)] if command[0] == "ssh-key" else ["--key", str(keygen)])]
+    assert _cli.main([*argv, "--json"]) == 1
+    assert signer.calls == [] and not add.called
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "unexpected_challenge"
+    assert error["message"].startswith("refusing to sign: ")

@@ -1104,7 +1104,7 @@ KEYGEN = "/usr/bin/ssh-keygen"
 SIGNATURE = "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ==\n-----END SSH SIGNATURE-----\n"
 CHALLENGE = {
     "challenge": "sshkc-" + "ab" * 32,
-    "namespace": "mandala-ssh-key",
+    "namespace": "ssh-key-registration@mandala.computer",
     "expires_at": "2026-11-11T12:10:00.000Z",
     "sign_command": "printf …",
 }
@@ -1121,7 +1121,11 @@ def signer(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     def sign(
         keygen: str, public_key: Path, namespace: str, challenge: str, **kw: Any
     ) -> tuple[str, str]:
-        assert (keygen, namespace, challenge) == (KEYGEN, "mandala-ssh-key", CHALLENGE["challenge"])
+        assert (keygen, namespace, challenge) == (
+            KEYGEN,
+            "ssh-key-registration@mandala.computer",
+            CHALLENGE["challenge"],
+        )
         signed.append(public_key)
         return SIGNATURE, ""
 

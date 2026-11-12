@@ -17,6 +17,11 @@ This is the summary you read to decide whether to upgrade.
   so it also reaches a computer by its name. When signing is not possible the
   key is added `unproven`, as before, with the reason on stderr; what
   `ssh-keygen` says (a security key asking to be touched) shows as it says it.
+  Only a registration challenge is signed: one naming any signature namespace
+  but `ssh-key-registration@mandala.computer`, or not shaped like `sshkc-`
+  and 64 lowercase hex digits, is refused (`unexpected_challenge`) before
+  `ssh-keygen` runs, so an endpoint cannot collect a signature usable
+  elsewhere.
   `--setup` leaves a key you already hold as it is, and says how to prove an
   unproven one. `ssh-key add` proves an unproven key this account's API key
   added, which binds it to the API key it runs with; a key you hold that
