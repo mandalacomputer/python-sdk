@@ -9,6 +9,14 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- `ssh_keys.add()` takes `replaces`: the id of your registration of the key
+  that the add may replace, or `None` when you hold none (sent as `null`; leave
+  it out for an unconditional add, as before). If yours has changed by the
+  time the add runs, it is a `ConflictError` whose `code` is
+  `registration_changed`, and nothing is replaced.
+
 ### Changed
 
 - `mandala-py ssh --setup` and `mandala-py ssh-key add` prove the key is yours
@@ -34,6 +42,12 @@ This is the summary you read to decide whether to upgrade.
   either skips signing. A conflict
   on an add that carried no proof now says, on stderr, that a signed add
   replaces somebody else's unproven registration.
+  The signed add names the registration the CLI saw (`replaces`), so a
+  registration of the same key made meanwhile, say through another of your
+  accounts, is not replaced: the CLI lists your keys again, says on stderr
+  what the key is registered as now, and exits non-zero without retrying.
+  Against a platform that does not know `replaces` yet, the add behaves as
+  before.
 
 ## [0.23.0] - 2026-11-11
 

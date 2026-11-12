@@ -3690,7 +3690,11 @@ def computer_ssh(computer_id: str) -> str:
 
 
 def ssh_key_body(
-    public_key: object, name: object, challenge: object = None, signature: object = None
+    public_key: object,
+    name: object,
+    challenge: object = None,
+    signature: object = None,
+    replaces: object = _OMITTED,
 ) -> dict[str, Any]:
     """``POST ssh-keys``: one ``.pub`` line, and a label only when one was given.
 
@@ -3702,6 +3706,10 @@ def ssh_key_body(
     refuses one without the other, so that is refused here, before anything is
     sent. Both are sent as given — the signature is the armored text
     ``ssh-keygen -Y sign`` printed, and its line breaks are part of it.
+
+    ``replaces`` is sent only when given, and ``None`` is sent as ``null``:
+    "I hold no registration of this key", which is a condition, unlike leaving
+    it out.
     """
     line = canonical(public_key, "public_key").strip()
     if not line:
@@ -3714,6 +3722,10 @@ def ssh_key_body(
     if challenge is not None:
         body["challenge"] = canonical(challenge, "challenge")
         body["signature"] = canonical(signature, "signature")
+    if replaces is not _OMITTED:
+        if replaces is not None and not canonical(replaces, "replaces").strip():
+            raise ValueError("replaces must be an SSH key id, or None")
+        body["replaces"] = None if replaces is None else canonical(replaces, "replaces")
     return body
 
 

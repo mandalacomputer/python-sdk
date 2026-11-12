@@ -1149,6 +1149,8 @@ def test_setup_signs_a_new_key(pub: Path, signer: list[Path], capsys: Any) -> No
         "public_key": f"{PUBLIC_KEY} me@laptop",
         "challenge": CHALLENGE["challenge"],
         "signature": SIGNATURE,
+        # On condition that it is still not registered to this person.
+        "replaces": None,
     }
     assert capsys.readouterr().err == ""
 
@@ -1255,6 +1257,44 @@ def test_setup_keeps_a_key_registered_while_it_was_signing(
     assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 1
     assert not add.called and not put.called
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "ssh_key_elsewhere"
+
+
+@respx.mock
+@pytest.mark.parametrize("now_held", [True, False], ids=["held-now", "gone-again"])
+def test_setup_registration_changed_keeps_what_it_finds_or_says_so(
+    pub: Path, signer: list[Path], capsys: Any, now_held: bool
+) -> None:
+    """The signed add is refused because a registration of the key landed
+    after the last listing: nothing was replaced. A key of the person's found
+    now is carried on with (and refused here when bound elsewhere); none found
+    says what happened."""
+    listing: list[dict[str, Any]] = []
+    computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
+    respx.get(f"{BASE}/ssh-keys").mock(side_effect=lambda req: httpx.Response(200, json=listing))
+
+    def refuse(req: httpx.Request) -> httpx.Response:
+        if now_held:
+            listing.append({**KEY, "reach": "another_account", "possession": "unproven"})
+        return httpx.Response(
+            409, json={"error": "Your registration changed.", "code": "registration_changed"}
+        )
+
+    add = respx.post(f"{BASE}/ssh-keys").mock(side_effect=refuse)
+    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
+    mock_challenge()
+    if now_held:
+        # Carried on with, then refused as any key bound elsewhere is.
+        with pytest.raises(SystemExit) as caught:
+            _cli.main(["ssh", "--setup", "dev"])
+        assert "registered for another of your accounts" in str(caught.value)
+        assert "nothing was replaced" not in capsys.readouterr().err
+    else:
+        assert _cli.main(["ssh", "--setup", "dev"]) == 1
+        assert "nothing was replaced; you hold no registration of it now" in (
+            capsys.readouterr().err
+        )
+    assert add.call_count == 1 and not put.called
 
 
 def test_no_proof_without_setup_is_a_usage_error(capsys: Any) -> None:

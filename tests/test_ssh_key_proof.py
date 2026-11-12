@@ -21,7 +21,7 @@ from tests.test_api_contract import BASE, resolved
 from tests.test_api_contract import client as client  # noqa: PLC0414
 
 import mandala_computer as mc
-from mandala_computer import _cli, _openssh
+from mandala_computer import _api, _cli, _openssh
 
 PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGqsBlqrbipXh/7n81gKS46IyjJY7nVv8mGtIAE+v76w"
 KEY: dict[str, Any] = {
@@ -325,6 +325,8 @@ def test_cli_add_signs_a_challenge_itself(
     ]
     sent = json.loads(route.calls.last.request.content)
     assert (sent["challenge"], sent["signature"]) == (CHALLENGE["challenge"], SIGNATURE)
+    # On condition that no registration of the key landed meanwhile.
+    assert sent["replaces"] is None
     assert capsys.readouterr().err == ""
 
 
@@ -508,7 +510,75 @@ def test_cli_add_signs_a_held_unproven_key_of_this_account(
     route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
     sign_with(monkeypatch, Signer())
     assert _cli.main(["ssh-key", "add", str(keygen)]) == 0
-    assert json.loads(route.calls.last.request.content)["signature"] == SIGNATURE
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["signature"] == SIGNATURE
+    # Naming the unproven registration it saw, so only that one is replaced.
+    assert sent["replaces"] == KEY["id"]
+
+
+CHANGED = {"error": "Your registration of this key changed.", "code": "registration_changed"}
+
+
+@respx.mock
+def test_cli_add_registration_changed_relists_says_what_it_is_now_and_retries_nothing(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    listing: list[dict[str, Any]] = []
+    respx.get(f"{BASE}/ssh-keys").mock(side_effect=lambda req: httpx.Response(200, json=listing))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    meanwhile = {
+        **KEY,
+        "id": "sshk-0000000000000099",
+        "possession": "unproven",
+        "reach": "another_account",
+    }
+
+    def refuse(req: httpx.Request) -> httpx.Response:
+        listing.append(meanwhile)
+        return httpx.Response(409, json=CHANGED)
+
+    route = respx.post(f"{BASE}/ssh-keys").mock(side_effect=refuse)
+    sign_with(monkeypatch, Signer())
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 1
+    assert route.call_count == 1
+    err = capsys.readouterr().err
+    assert (
+        "registered or removed elsewhere while it was being signed, so nothing was replaced" in err
+    )
+    assert "it is now sshk-0000000000000099 (unproven, reach another account" in err
+
+
+@respx.mock
+def test_cli_add_registration_changed_with_nothing_held_now_says_so(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(409, json=CHANGED))
+    sign_with(monkeypatch, Signer())
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 1
+    assert "you hold no registration of it now" in capsys.readouterr().err
+
+
+@respx.mock
+def test_cli_add_registration_changed_under_json_keeps_stderr_to_the_error(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(409, json=CHANGED))
+    sign_with(monkeypatch, Signer())
+    assert _cli.main(["ssh-key", "add", str(keygen), "--json"]) == 1
+    assert "nothing was replaced" not in capsys.readouterr().err
+
+
+def test_add_sends_replaces_null_included_and_leaves_it_out_when_not_given() -> None:
+    body = _api.ssh_key_body
+    assert body(PUBLIC_KEY, None, "c", "s", None)["replaces"] is None
+    assert body(PUBLIC_KEY, None, "c", "s", "sshk-1")["replaces"] == "sshk-1"
+    assert "replaces" not in body(PUBLIC_KEY, None, "c", "s")
+    with pytest.raises(ValueError, match="replaces"):
+        body(PUBLIC_KEY, None, "c", "s", " ")
 
 
 @respx.mock

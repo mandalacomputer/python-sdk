@@ -4020,11 +4020,42 @@ def _prove(client: Client, public_key: Path, *, as_json: bool = False) -> _Proof
     return issued.challenge, signature
 
 
-def _signed_add(client: Client, line: str, proof: _Proof | str | None, **kw: Any) -> SshKey:
-    """Add ``line``, with ``proof`` when it is one."""
+def _signed_add(
+    client: Client, line: str, proof: _Proof | str | None, replaces: str | None = None, **kw: Any
+) -> SshKey:
+    """Add ``line``, with ``proof`` when it is one. A signed add names the
+    registration of the caller's it may replace (``replaces``, ``None`` for
+    none), so one made since the last listing is refused, not replaced."""
     if isinstance(proof, tuple):
-        return client.ssh_keys.add(line, challenge=proof[0], signature=proof[1], **kw)
+        return client.ssh_keys.add(
+            line, challenge=proof[0], signature=proof[1], replaces=replaces, **kw
+        )
     return client.ssh_keys.add(line, **kw)
+
+
+def _registration_changed(err: ConflictError) -> bool:
+    """A signed add refused because the key's registration changed under it."""
+    return err.code == "registration_changed"
+
+
+def _registration_changed_hint(now: SshKey | None, *, as_json: bool) -> None:
+    """After a ``registration_changed`` refusal: nothing was replaced, and what
+    the key is registered as now. Nothing is retried: whatever changed it may
+    have meant to."""
+    if as_json:
+        return
+    if now is None:
+        state = "you hold no registration of it now"
+    else:
+        state = (
+            f"it is now {_shown(now.id)} ({_shown(now.possession or 'possession unknown')}, "
+            f"reach {_reach_label(now.reach)})"
+        )
+    print(
+        f"{PROG}: this key was registered or removed elsewhere while it was being signed, so "
+        f'nothing was replaced; {state}. Check "{PROG} ssh-key list" and run the command again',
+        file=sys.stderr,
+    )
 
 
 def _conflict_hint(proof: _Proof | str | None, *, as_json: bool) -> None:
@@ -4095,14 +4126,19 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
                 if held is not None:
                     existing = registered = held
                 else:
-                    registered = _signed_add(client, line, proof)
-            except ConflictError:
+                    # Signed on condition that it is still not ours: one
+                    # registered after that listing is refused, not replaced.
+                    registered = _signed_add(client, line, proof, replaces=None)
+            except ConflictError as err:
                 # Registered between the listing and the add — by another
                 # `--setup` of our own, or by somebody else. Only the first is
                 # ours to carry on with; the second keeps the platform's refusal.
                 existing = _own_key(client, fingerprint)
                 if existing is None:
-                    _conflict_hint(proof, as_json=as_json)
+                    if _registration_changed(err):
+                        _registration_changed_hint(None, as_json=as_json)
+                    else:
+                        _conflict_hint(proof, as_json=as_json)
                     raise
                 registered = existing
         else:
@@ -4282,17 +4318,28 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
             else:
                 proof = None if args.no_proof else _prove(client, path, as_json=args.json)
                 why = "--no-proof" if proof is None else proof if isinstance(proof, str) else ""
+                replaces: str | None = None
                 if isinstance(proof, tuple):
                     # Signing can wait on a passphrase or a touch: a key held
                     # by now where a signed add would narrow or move it is
-                    # sent unsigned, and refused as a duplicate.
+                    # sent unsigned, and refused as a duplicate. Otherwise the
+                    # add names what it saw (the unproven key, or none), so a
+                    # registration made after this listing is not replaced.
                     held = _own_key(client, _openssh.fingerprint(line))
                     if held is not None and not _provable_here(held):
                         proof = ""
+                    replaces = held.id if held is not None else None
                 try:
-                    key = _signed_add(client, line, proof, name=args.name)
-                except ConflictError:
-                    _conflict_hint(proof, as_json=args.json)
+                    key = _signed_add(client, line, proof, replaces=replaces, name=args.name)
+                except ConflictError as err:
+                    if _registration_changed(err):
+                        try:
+                            now = _own_key(client, _openssh.fingerprint(line))
+                        except APIError:
+                            now = None
+                        _registration_changed_hint(now, as_json=args.json)
+                    else:
+                        _conflict_hint(proof, as_json=args.json)
                     raise
     if args.json:
         _json(key.raw)
