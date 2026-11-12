@@ -5193,8 +5193,16 @@ mandala-py ssh --setup dev            # uses ~/.ssh/id_ed25519.pub, id_ecdsa.pub
 mandala-py ssh --setup dev --key ~/.ssh/work.pub
 ```
 
+`--setup` proves the key is yours (see below) by signing a challenge with
+`ssh-keygen -Y sign`: through ssh-agent, or with the private key beside the
+`.pub`, which may ask for its passphrase. When it cannot sign (no `ssh-keygen`
+on PATH, the key in neither place, a platform that issues no challenges), it
+registers the key `unproven` and says why on stderr; `mandala-py ssh` connects
+by the computer's id, so that still works. `--no-proof` skips the signing.
+
 `--setup` is safe to repeat: a key whose fingerprint is already registered is
-not uploaded again. It stops instead (`ssh_key_elsewhere`, exit 1, SSH left as
+not uploaded again, except that an `unproven` one this account's credential
+added is added again with proof, keeping its label. It stops instead (`ssh_key_elsewhere`, exit 1, SSH left as
 it was) when that key is bound to another of your accounts, because this
 account's computers would refuse it: remove it and add it again from the
 dashboard to use it on every account, or pass `--key` with a separate key. Then
@@ -5222,8 +5230,9 @@ The pieces, one at a time:
 
 ```sh
 mandala-py ssh-key list               # --json for the rows
-mandala-py ssh-key add [PATH] [--name NAME]
-mandala-py ssh-key challenge          # a challenge to sign, to prove the key is yours
+mandala-py ssh-key add [PATH] [--name NAME]   # signs a challenge with ssh-keygen, as --setup does
+mandala-py ssh-key add [PATH] --no-proof      # unproven: reaches computers by id only
+mandala-py ssh-key challenge          # a challenge to sign yourself, to prove the key is yours
 mandala-py ssh-key add [PATH] --challenge sshkc-… --signature-file sig.txt
 mandala-py ssh-key rm sshk-74025eba1b658b99
 mandala-py ssh-access dev             # the status; --json for the object

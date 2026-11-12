@@ -2587,8 +2587,9 @@ def test_api_keys_create_escapes_the_id_it_reports(capsys: pytest.CaptureFixture
 
 @respx.mock
 def test_ssh_key_add_escapes_the_line_it_prints(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(_cli.shutil, "which", lambda name: None)
     pub = tmp_path / "id.pub"
     pub.write_text(SSH_KEY_ROW["public_key"] + "\n")
     respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=SSH_KEY_ROW))

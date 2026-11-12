@@ -2,8 +2,9 @@
 
 Everything here is pure or touches only local files: where the gateway is, the
 known_hosts file the CLI manages, the ``ssh`` command line, the
-``~/.ssh/config`` snippet, and finding and fingerprinting a public key. The
-commands that use them live in ``_cli``.
+``~/.ssh/config`` snippet, finding and fingerprinting a public key, and signing
+a challenge with ``ssh-keygen`` to prove the key is yours. The commands that use
+them live in ``_cli``.
 
 The platform's SSH gateway is a jump host. A connection is two hops: OpenSSH to
 the gateway on port 2222 as ``mandala``, and through it to the computer's own
@@ -22,7 +23,7 @@ import re
 import shlex
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -624,3 +625,63 @@ def fingerprint(public_key: str) -> str:
         raise ValueError("not an OpenSSH public key line") from None
     digest = base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
     return f"SHA256:{digest}"
+
+
+#: The first line of the armored signature ``ssh-keygen -Y sign`` prints.
+SIGNATURE_BEGIN = "-----BEGIN SSH SIGNATURE-----"
+
+
+def signing_keys(public_key: Path) -> list[Path]:
+    """The ``-f`` files to try, in order, to sign with ``public_key``'s private half.
+
+    The ``.pub`` file itself first: ``ssh-keygen -Y sign`` handed a public key
+    signs through ssh-agent, and a recent one falls back to the private file
+    beside it. The private file beside it second, for an older ``ssh-keygen``
+    that only signs through the agent when given a ``.pub``.
+    """
+    keys = [public_key]
+    if public_key.name.endswith(".pub"):
+        private = public_key.with_name(public_key.name.removesuffix(".pub"))
+        if private.is_file():
+            keys.append(private)
+    return keys
+
+
+def sign_challenge(
+    keygen: str,
+    public_key: Path,
+    namespace: str,
+    challenge: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> tuple[str | None, str]:
+    """``(signature, "")`` for ``challenge`` signed with ``public_key``'s private
+    half, or ``(None, why not)``.
+
+    The challenge goes to ``ssh-keygen`` on standard input exactly as issued,
+    and the signature comes back exactly as printed: its line breaks are part
+    of it. A passphrase is asked for on the terminal, not on standard input.
+    """
+    reason = "ssh-keygen printed no signature"
+    for key in signing_keys(public_key):
+        try:
+            done = run(
+                [keygen, "-Y", "sign", "-n", namespace, "-f", str(key)],
+                input=challenge.encode(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as err:
+            return None, f"could not run ssh-keygen: {err.strerror or err}"
+        out = done.stdout.decode("utf-8", "replace")
+        if done.returncode == 0 and out.startswith(SIGNATURE_BEGIN):
+            return out, ""
+        said = [line.strip() for line in done.stderr.decode("utf-8", "replace").splitlines()]
+        said = [line for line in said if line]
+        reason = (
+            f"ssh-keygen: {said[-1]}"
+            if said
+            else f"ssh-keygen exited {done.returncode} without a signature"
+        )
+    return None, reason

@@ -1090,9 +1090,124 @@ def test_setup_refuses_a_key_somebody_else_owns(
     out, err = capsys.readouterr()
     assert out == ""
     assert err == (
+        "mandala-py: if somebody else registered this key without proving it is theirs, "
+        "adding it with proof replaces that registration; this add carried none "
+        "(no ssh-keygen on PATH to sign with)\n"
         "mandala-py: That key is already registered. A key can belong to one person only."
         " (HTTP 409)\n"
     )
+
+
+# --- --setup proves the key is yours ---------------------------------------
+
+KEYGEN = "/usr/bin/ssh-keygen"
+SIGNATURE = "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ==\n-----END SSH SIGNATURE-----\n"
+CHALLENGE = {
+    "challenge": "sshkc-" + "ab" * 32,
+    "namespace": "mandala-ssh-key",
+    "expires_at": "2026-11-11T12:10:00.000Z",
+    "sign_command": "printf …",
+}
+
+
+@pytest.fixture
+def signer(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """ssh-keygen on PATH and a signer that always signs; the files it signed with."""
+    monkeypatch.setattr(
+        _cli.shutil, "which", lambda name: {"ssh": SSH, "ssh-keygen": KEYGEN}.get(name)
+    )
+    signed: list[Path] = []
+
+    def sign(keygen: str, public_key: Path, namespace: str, challenge: str) -> tuple[str, str]:
+        assert (keygen, namespace, challenge) == (KEYGEN, "mandala-ssh-key", CHALLENGE["challenge"])
+        signed.append(public_key)
+        return SIGNATURE, ""
+
+    monkeypatch.setattr(_cli._openssh, "sign_challenge", sign)
+    return signed
+
+
+def mock_challenge() -> Any:
+    return respx.post(f"{BASE}/ssh-keys/challenge").mock(
+        return_value=httpx.Response(201, json=CHALLENGE)
+    )
+
+
+@respx.mock
+def test_setup_signs_a_new_key(pub: Path, signer: list[Path], capsys: Any) -> None:
+    add, _ = mock_setup([])
+    mock_challenge()
+    assert _cli.main(["ssh", "--setup", "dev"]) == 0
+    assert signer == [pub]
+    assert json.loads(add.calls.last.request.content) == {
+        "public_key": f"{PUBLIC_KEY} me@laptop",
+        "challenge": CHALLENGE["challenge"],
+        "signature": SIGNATURE,
+    }
+    assert capsys.readouterr().err == ""
+
+
+@respx.mock
+def test_setup_proves_a_listed_unproven_key_and_keeps_its_label(
+    pub: Path, signer: list[Path], capsys: Any
+) -> None:
+    listed = {**KEY, "name": "my label", "reach": "this_account", "possession": "unproven"}
+    add, _ = mock_setup([listed])
+    add.mock(return_value=httpx.Response(201, json={**listed, "possession": "proven"}))
+    mock_challenge()
+    assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 0
+    sent = json.loads(add.calls.last.request.content)
+    assert sent["name"] == "my label" and sent["signature"] == SIGNATURE
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["key_added"] is False
+    assert printed["key"]["possession"] == "proven"
+    assert _cli.main(["ssh", "--setup", "dev"]) == 0
+    assert "already registered, now proven yours" in capsys.readouterr().out
+
+
+@respx.mock
+def test_setup_leaves_an_unproven_key_that_reaches_other_accounts(
+    pub: Path, signer: list[Path], capsys: Any
+) -> None:
+    listed = {**KEY, "reach": "everywhere", "possession": "unproven"}
+    add, put = mock_setup([listed])
+    challenge = mock_challenge()
+    assert _cli.main(["ssh", "--setup", "dev"]) == 0
+    assert not add.called and not challenge.called and signer == []
+    assert put.called
+    err = capsys.readouterr().err
+    assert "is unproven (proving it from here would narrow it to this account" in err
+
+
+@respx.mock
+@pytest.mark.parametrize("possession", ["proven", "legacy", None])
+def test_setup_does_not_sign_a_key_already_good_by_name(
+    pub: Path, signer: list[Path], possession: str | None
+) -> None:
+    add, _ = mock_setup([{**KEY, "reach": "this_account", "possession": possession}])
+    challenge = mock_challenge()
+    assert _cli.main(["ssh", "--setup", "dev"]) == 0
+    assert not add.called and not challenge.called and signer == []
+
+
+@respx.mock
+def test_setup_no_proof_registers_unproven_and_says_what_that_means(
+    pub: Path, signer: list[Path], capsys: Any
+) -> None:
+    add, _ = mock_setup([])
+    add.mock(return_value=httpx.Response(201, json={**KEY, "possession": "unproven"}))
+    challenge = mock_challenge()
+    assert _cli.main(["ssh", "--setup", "dev", "--no-proof"]) == 0
+    assert not challenge.called and signer == []
+    assert json.loads(add.calls.last.request.content) == {"public_key": f"{PUBLIC_KEY} me@laptop"}
+    err = capsys.readouterr().err
+    assert f"key {FINGERPRINT} is unproven (--no-proof): mandala-py ssh dev connects" in err
+    assert "by its name is refused" in err
+
+
+def test_no_proof_without_setup_is_a_usage_error(capsys: Any) -> None:
+    assert _cli.main(["ssh", "--no-proof", "dev"]) == 2
+    assert "--no-proof goes with --setup" in capsys.readouterr().err
 
 
 #: What --setup says for a listed key bound to another account (OPL-5617).

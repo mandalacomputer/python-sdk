@@ -9,6 +9,18 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- `mandala-py ssh --setup` and `mandala-py ssh-key add` prove the key is yours
+  themselves: they sign a challenge with `ssh-keygen -Y sign` (through
+  ssh-agent, or the private key beside the `.pub`) and add the key `proven`,
+  so it also reaches a computer by its name. When signing is not possible the
+  key is added `unproven`, as before, with the reason on stderr. `--setup`
+  also adds an `unproven` key this account's credential added again with
+  proof, keeping its label. `--no-proof` on either skips signing. A conflict
+  on an add that carried no proof now says, on stderr, that a signed add
+  replaces somebody else's unproven registration.
+
 ## [0.23.0] - 2026-11-11
 
 ### Added
