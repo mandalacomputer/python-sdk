@@ -4073,8 +4073,16 @@ def _ssh_setup(target: str, key: str | None, *, as_json: bool, no_proof: bool = 
             else:
                 # A signed add replaces the unproven registration; the label
                 # it had is kept.
-                registered = _signed_add(client, line, proof, name=existing.name)
-                proven_now = True
+                try:
+                    registered = _signed_add(client, line, proof, name=existing.name)
+                    proven_now = True
+                except ConflictError:
+                    # Another `--setup` of our own proved it first: a proven
+                    # key is a duplicate. Carry on with that registration.
+                    raced = _own_key(client, fingerprint)
+                    if raced is None or raced.possession == "unproven":
+                        raise
+                    registered = raced
         else:
             # Proven, legacy, unreported, or held where a signed add from here
             # would narrow or move it (see _provable_here): left as it is.

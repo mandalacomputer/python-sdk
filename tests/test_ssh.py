@@ -1166,6 +1166,33 @@ def test_setup_proves_a_listed_unproven_key_and_keeps_its_label(
 
 
 @respx.mock
+@pytest.mark.parametrize("after", ["proven", "unproven", None])
+def test_setup_upgrade_racing_a_setup_that_proved_it_first(
+    pub: Path, signer: list[Path], capsys: Any, after: str | None
+) -> None:
+    listed = {**KEY, "reach": "this_account", "possession": "unproven"}
+    computers()
+    respx.get(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=UNASKED))
+    second = [] if after is None else [{**listed, "possession": after}]
+    respx.get(f"{BASE}/ssh-keys").mock(
+        side_effect=[httpx.Response(200, json=[listed]), httpx.Response(200, json=second)]
+    )
+    respx.post(f"{BASE}/ssh-keys").mock(
+        return_value=httpx.Response(409, json={"error": "That key is already registered."})
+    )
+    mock_challenge()
+    put = respx.put(f"{BASE}/computers/vm-9/ssh").mock(return_value=httpx.Response(200, json=ON))
+    if after == "proven":
+        assert _cli.main(["ssh", "--setup", "dev", "--json"]) == 0
+        printed = json.loads(capsys.readouterr().out)
+        assert printed["key_added"] is False and printed["key"]["possession"] == "proven"
+        assert put.called
+    else:
+        assert _cli.main(["ssh", "--setup", "dev"]) == 1
+        assert not put.called
+
+
+@respx.mock
 def test_setup_leaves_an_unproven_key_that_reaches_other_accounts(
     pub: Path, signer: list[Path], capsys: Any
 ) -> None:
