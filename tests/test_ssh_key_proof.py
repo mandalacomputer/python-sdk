@@ -670,3 +670,23 @@ def test_an_unexpected_challenge_is_never_signed(
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["code"] == "unexpected_challenge"
     assert error["message"].startswith("refusing to sign: ")
+
+
+@respx.mock
+def test_cli_shows_ssh_keygens_lines_terminal_safe(
+    keygen: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/ssh-keys/challenge").mock(return_value=httpx.Response(201, json=CHALLENGE))
+    respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
+    real = _openssh.sign_challenge
+
+    def touch(argv: list[str], echo: Any) -> tuple[int, list[str]]:
+        echo("Confirm user presence for key ED25519-SK \x1b]0;owned\x07")
+        Path(f"{argv[-1]}.sig").write_text(SIGNATURE)
+        return 0, []
+
+    monkeypatch.setattr(_cli._openssh, "sign_challenge", lambda *a, **kw: real(*a, run=touch, **kw))
+    assert _cli.main(["ssh-key", "add", str(keygen)]) == 0
+    err = capsys.readouterr().err
+    assert "Confirm user presence for key ED25519-SK" in err and "\x1b" not in err

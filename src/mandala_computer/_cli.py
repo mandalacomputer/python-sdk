@@ -4009,7 +4009,11 @@ def _prove(client: Client, public_key: Path, *, as_json: bool = False) -> _Proof
         public_key,
         issued.namespace,
         issued.challenge,
-        echo=_openssh.echo_terminal if as_json else _openssh.echo_stderr,
+        # Spelled terminal-safe: a line ssh-keygen prints can quote a path or
+        # a key comment, which could hold an escape sequence.
+        echo=lambda line: (_openssh.echo_terminal if as_json else _openssh.echo_stderr)(
+            _shown(line)
+        ),
     )
     if signature is None:
         return reason
