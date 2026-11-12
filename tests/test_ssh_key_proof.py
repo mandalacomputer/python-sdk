@@ -160,6 +160,7 @@ def test_cli_challenge_prints_what_to_sign(pub: Path, capsys: pytest.CaptureFixt
 def test_cli_add_sends_the_signature_from_a_file(
     pub: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
     sig = tmp_path / "sig"
     sig.write_text(SIGNATURE)
@@ -167,11 +168,41 @@ def test_cli_add_sends_the_signature_from_a_file(
     assert _cli.main([*argv, "--signature-file", str(sig)]) == 0
     sent = json.loads(route.calls.last.request.content)
     assert (sent["challenge"], sent["signature"]) == (CHALLENGE["challenge"], SIGNATURE)
+    # Conditional on holding no registration of it, as listed just before.
+    assert sent["replaces"] is None
     assert capsys.readouterr().err == ""
 
 
 @respx.mock
+def test_cli_add_with_a_given_signature_names_the_registration_it_saw(
+    pub: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    held = {**KEY, "possession": "unproven", "reach": "this_account"}
+    listing = [held]
+    respx.get(f"{BASE}/ssh-keys").mock(side_effect=lambda req: httpx.Response(200, json=listing))
+    route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
+    sig = tmp_path / "sig"
+    sig.write_text(SIGNATURE)
+    argv = ["ssh-key", "add", str(pub), "--challenge", CHALLENGE["challenge"]]
+    assert _cli.main([*argv, "--signature-file", str(sig)]) == 0
+    assert json.loads(route.calls.last.request.content)["replaces"] == KEY["id"]
+
+    # Refused because it changed: listed again, said, not retried.
+    def refuse(req: httpx.Request) -> httpx.Response:
+        listing[:] = [{**held, "id": "sshk-0000000000000099", "reach": "another_account"}]
+        return httpx.Response(409, json={"error": "changed", "code": "registration_changed"})
+
+    route.mock(side_effect=refuse)
+    before = route.call_count
+    assert _cli.main([*argv, "--signature-file", str(sig)]) == 1
+    assert route.call_count == before + 1
+    err = capsys.readouterr().err
+    assert "nothing was replaced; it is now sshk-0000000000000099" in err
+
+
+@respx.mock
 def test_cli_add_reads_the_signature_from_stdin(pub: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    respx.get(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(200, json=[]))
     route = respx.post(f"{BASE}/ssh-keys").mock(return_value=httpx.Response(201, json=KEY))
     monkeypatch.setattr("sys.stdin", io.StringIO(SIGNATURE))
     argv = ["ssh-key", "add", str(pub), "--challenge", CHALLENGE["challenge"]]

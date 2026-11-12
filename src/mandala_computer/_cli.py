@@ -4038,6 +4038,18 @@ def _registration_changed(err: ConflictError) -> bool:
     return err.code == "registration_changed"
 
 
+def _report_registration_changed(client: Client, line: str, *, as_json: bool) -> None:
+    """Listed again after a ``registration_changed`` refusal, so the hint says
+    what the key is registered as now."""
+    if as_json:
+        return
+    try:
+        now = _own_key(client, _openssh.fingerprint(line))
+    except APIError:
+        now = None
+    _registration_changed_hint(now, as_json=as_json)
+
+
 def _registration_changed_hint(now: SshKey | None, *, as_json: bool) -> None:
     """After a ``registration_changed`` refusal: nothing was replaced, and what
     the key is registered as now. Nothing is retried: whatever changed it may
@@ -4301,12 +4313,24 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
     why = ""
     with _client() as client:
         if args.challenge is not None:
-            key = client.ssh_keys.add(
-                line,
-                name=args.name,
-                challenge=args.challenge,
-                signature=_signature(args.signature_file),
-            )
+            signature = _signature(args.signature_file)
+            # A signed add replaces an unproven registration: it names the one
+            # held now (or none), so one made after this listing is refused
+            # rather than replaced. Which key may be signed for is the
+            # caller's call here, as it always was: the signature is theirs.
+            held = _own_key(client, _openssh.fingerprint(line))
+            try:
+                key = client.ssh_keys.add(
+                    line,
+                    name=args.name,
+                    challenge=args.challenge,
+                    signature=signature,
+                    replaces=held.id if held is not None else None,
+                )
+            except ConflictError as err:
+                if _registration_changed(err):
+                    _report_registration_changed(client, line, as_json=args.json)
+                raise
         else:
             held = None
             if not args.no_proof and shutil.which("ssh-keygen") is not None:
@@ -4333,11 +4357,7 @@ def _cmd_ssh_key_add(args: argparse.Namespace) -> int:
                     key = _signed_add(client, line, proof, replaces=replaces, name=args.name)
                 except ConflictError as err:
                     if _registration_changed(err):
-                        try:
-                            now = _own_key(client, _openssh.fingerprint(line))
-                        except APIError:
-                            now = None
-                        _registration_changed_hint(now, as_json=args.json)
+                        _report_registration_changed(client, line, as_json=args.json)
                     else:
                         _conflict_hint(proof, as_json=args.json)
                     raise
