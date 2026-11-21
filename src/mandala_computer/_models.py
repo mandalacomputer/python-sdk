@@ -769,11 +769,12 @@ class VncConnect:
         :meth:`Computer.clipboard` and :meth:`Computer.set_clipboard` are the
         route to build on — the reliable one, not merely the fallback — because
         they need nothing of the HARDWARE: no cold boot, and no permission from
-        a browser. What they do want is a Linux guest with a display and its
-        desktop's clipboard tool in the image (``xclip`` on X11,
-        ``wl-clipboard`` on Wayland), since they drive the guest's own desktop
-        session; Windows is refused outright, and a computer whose image lacks
-        that tool gets a permanent 400 that names it. That is a
+        a browser. What they do want is a guest with a desktop session they can
+        drive: on Linux a display and its desktop's clipboard tool in the image
+        (``xclip`` on X11, ``wl-clipboard`` on Wayland), where a computer whose
+        image lacks that tool gets a permanent 400 that names it; on Windows an
+        account signed in to the desktop, without which the request answers
+        409. That is a
         much smaller set than the socket's two conditions, and unlike them it is
         stated in the answer rather than left to be inferred. Where the socket
         does carry the clipboard the two do not fight over it — those methods
@@ -1875,6 +1876,7 @@ class AccountUsage:
 
     kept_computers: int | None
     #: Configured CPU and disk include stopped computers. Disk is provisioned GB.
+    #: Disk leaves out kept template builds; see ``kept_build_gb``.
     configured_vcpu: int | None
     configured_disk_gb: int | None
     running_or_reserved_computers: int | None
@@ -1883,6 +1885,16 @@ class AccountUsage:
     running_or_reserved_ram_mb: int | None
     #: Indexed stored bytes, excluding in-flight capture reservations.
     snapshot_storage_bytes: int | None
+    #: Nominal GB of the template builds the account keeps, including builds
+    #: still running. They share the disk pool with ``configured_disk_gb``: a
+    #: create or a disk resize is checked against ``configured_disk_gb +
+    #: kept_build_gb``, so the room it has is ``limits.disk_pool_gb -
+    #: configured_disk_gb - kept_build_gb`` (``remaining.configured_disk_gb``
+    #: does not subtract the builds). Independent of ``complete``: None while
+    #: the build history could not be read, when a create or disk growth can be
+    #: refused with a 503 until it is, and None from a platform that does not
+    #: report it.
+    kept_build_gb: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1891,6 +1903,9 @@ class AccountRemaining:
 
     kept_computers: int | None
     configured_vcpu: int | None
+    #: Disk ceiling minus configured disk. Kept template builds are not
+    #: subtracted; subtract ``usage.kept_build_gb`` too for the room a create
+    #: or disk resize has.
     configured_disk_gb: int | None
     running_or_reserved_ram_mb: int | None
     #: Indexed-byte headroom does not predict snapshot capture admission.
@@ -2029,6 +2044,11 @@ class AccountQuota:
                     usage.get("snapshot_storage_bytes", missing),
                     "usage.snapshot_storage_bytes",
                     snapshots,
+                ),
+                kept_build_gb=(
+                    None
+                    if usage.get("kept_build_gb") is None
+                    else quantity(usage.get("kept_build_gb"), "usage.kept_build_gb")
                 ),
             ),
             remaining=AccountRemaining(
@@ -3553,7 +3573,9 @@ class Webhook:
     #: until then ``enabled=True`` is refused (402). ``"creator_removed"`` when
     #: the person behind :attr:`created_by` was removed from the account, left
     #: it, or was made a viewer, and ``"key_revoked"`` when the API key in
-    #: :attr:`created_by` was revoked as leaked from the dashboard; neither
+    #: :attr:`created_by` was revoked as leaked from the dashboard, and
+    #: ``"session_revoked"`` when the dashboard session it was made, retargeted
+    #: or turned back on from was signed out as leaked; none of these three
     #: comes back on its own, and an owner or member enables it with an update.
     #: A plain string, not a closed set: the platform may add reasons. ``None``
     #: while enabled.
@@ -3587,7 +3609,9 @@ class Webhook:
     #: Who created it, or last changed its :attr:`url`: the email of a person
     #: signed in to the dashboard, or ``apikey:`` and the ``key-`` id of the
     #: API key used. This is whose removal, demotion to viewer or leaked key
-    #: disables it (:attr:`disabled_reason`). ``None`` to a workspace-scoped
+    #: disables it (:attr:`disabled_reason`); a leaked dashboard session it was
+    #: made, retargeted or turned back on from disables it too
+    #: (``"session_revoked"``). ``None`` to a workspace-scoped
     #: key when it was a person, and from a platform that does not report it.
     created_by: str | None = field(default=None, kw_only=True)
 

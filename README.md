@@ -640,9 +640,9 @@ rather than going stale. Keep the route below whichever you get.
 
 [`clipboard()` and `set_clipboard()`](#the-clipboard) are the route to build on
 — the reliable one, not merely the fallback — because they need nothing of the
-*hardware*: no cold boot, no permission from a browser. They ask one thing of
-the image (its desktop's clipboard tool: `xclip` on X11, `wl-clipboard` on
-Wayland) and say so in the answer when it is missing, which is one condition
+*hardware*: no cold boot, no permission from a browser. On Linux they ask one
+thing of the image (its desktop's clipboard tool: `xclip` on X11,
+`wl-clipboard` on Wayland) and say so in the answer when it is missing, which is one condition
 stated instead of two inferred. Where
 the socket *does* carry the clipboard the two do not fight over it: those
 methods write the same X `CLIPBOARD` selection the agent then offers onward.
@@ -1587,15 +1587,21 @@ five windows, four of which are not applications. Linux only.
 ### The clipboard
 
 The desktop's `CLIPBOARD` selection — what Ctrl-C writes and Ctrl-V pastes —
-read and written from outside the guest. Linux only, and it needs nothing of
-the *hardware*: no cold boot, no permission from a browser. What it does need is
-the desktop's clipboard tool in the guest — `xclip` on an X11 image, or
+read and written from outside the guest. It needs nothing of the *hardware*:
+no cold boot, no permission from a browser. On a Linux guest what it does need
+is the desktop's clipboard tool in the guest — `xclip` on an X11 image, or
 `wl-clipboard` (`wl-paste`/`wl-copy`) on a Wayland one such as Omarchy, and
 `c.desktop` says which — and every current image carries the tool its desktop
 needs. So in practice this is the road that works on every computer, and where
 it is not, the refusal says so. (The other road is RFB extended cut text over
 the desktop socket, which is live and conditional; see
 [Showing somebody the desktop](#showing-somebody-the-desktop).)
+
+Windows guests are served too, through the desktop session of the account
+signed in there: with nobody signed in to the desktop the request answers 409,
+and a session that does not run it in time answers 409 with no `reason`, which
+may clear on a bounded retry. `paste()` writes the clipboard the same way, so
+the same holds for it.
 
 ```python
 c.set_clipboard("https://mandala.computer")
@@ -3068,9 +3074,11 @@ subscriptions read `disabled_reason="plan"` and `enabled=True` is refused
 (402); choosing a plan with webhooks enables them again, oldest first, as many
 as the plan allows. A subscription reads `disabled_reason="creator_removed"`
 when the person in `created_by` was removed from the account, left it, or was
-made a viewer, and `"key_revoked"` when the key in `created_by` was revoked as
-leaked from the dashboard; neither comes back on its own, and an owner or
-member enables it again with an update. An update sends only what you name; `events=[]` or
+made a viewer, `"key_revoked"` when the key in `created_by` was revoked as
+leaked from the dashboard, and `"session_revoked"` when the dashboard session
+it was made, retargeted or turned back on from was signed out as leaked; none
+of these three comes back on its own, and an owner or member enables it again
+with an update. An update sends only what you name; `events=[]` or
 `computers=[]` clears that filter back to everything, and naming nothing is
 refused rather than sent. `client.webhooks.test(hook.id)` queues one signed
 delivery of a synthetic `webhook.test` event through the ordinary path, and the

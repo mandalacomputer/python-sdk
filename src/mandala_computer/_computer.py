@@ -144,7 +144,15 @@ from ._results import (
     decode_result_listing,
     decode_result_output,
 )
-from ._uploads import FileUpload, UploadInterruptedError, attach_upload_id, read_chunk
+from ._uploads import (
+    FileUpload,
+    UploadInterruptedError,
+    attach_upload_id,
+    chunk_busy_wait,
+    read_chunk,
+    resumed_offset,
+    status_busy_wait,
+)
 
 __all__ = ["BackgroundCommand", "Computer"]
 
@@ -4659,7 +4667,10 @@ class Computer(ComputerFields):
 
         The fast way to insert text, Unicode included: 1 to 8192 bytes of UTF-8,
         no NUL. ``shift=True`` presses Ctrl+Shift+V, which terminals want.
-        Linux only; a guest without working clipboard support refuses it.
+        It writes the clipboard as :meth:`set_clipboard` does, so it has the same
+        needs: a Linux guest without its desktop's clipboard tool refuses it,
+        and a Windows guest is served through the signed-in desktop session
+        (see :meth:`clipboard` for its two 409s).
 
         The clipboard is replaced and left that way. Success means the write and
         the shortcut were delivered, not that the application inserted the
@@ -5466,6 +5477,14 @@ class Computer(ComputerFields):
 
         Keep path, upload_id, size, overwrite and source contents unchanged.
         The final chunk publishes atomically. No partial destination is exposed.
+
+        Send one chunk per computer at a time. While another chunk for this
+        computer is in flight, or the account already has its share of the
+        host's upload buffers in use (two chunks, or one when only the last
+        buffer is free), the chunk is refused with
+        :class:`~mandala_computer.RateLimitError` (429, ``retry_after`` 5 s)
+        and nothing is staged: wait, read :meth:`file_upload`, then resend from
+        its offset. :meth:`upload_file` does this itself.
         """
         params = _api.file_chunk_params(path, upload_id, offset, size, data, overwrite, no_wake)
         try:
@@ -5529,6 +5548,12 @@ class Computer(ComputerFields):
         """Upload a seekable binary file in bounded chunks; retain the unchanged source.
 
         Supply an existing upload_id to resume; a missing receipt stays a 404.
+        A chunk refused with 429 because other chunks for this computer or
+        account are in flight is waited out (``Retry-After``, at most 30 s),
+        then the upload reads status and resends from the staged offset. A
+        status read refused while that chunk is still in flight (429, or 409
+        ``contention``) is waited out the same way. After 12 such waits in a
+        row the last refusal is raised.
         Typed API and validation errors keep their classes; other interruptions
         use UploadInterruptedError. Errors carry upload_id for status/cleanup.
         On success call cancel_file_upload to remove the receipt.
@@ -5549,18 +5574,46 @@ class Computer(ComputerFields):
             if progress is not None and progress.complete:
                 return progress
             offset = progress.offset if progress is not None else 0
+            waits = 0
             while True:
                 length = min(4 * 1024 * 1024, size - offset)
                 data = read_chunk(source, offset, length)
-                progress = self.write_file_chunk(
-                    path,
-                    data,
-                    upload_id=identity,
-                    offset=offset,
-                    size=size,
-                    overwrite=overwrite,
-                    no_wake=no_wake,
-                )
+                try:
+                    progress = self.write_file_chunk(
+                        path,
+                        data,
+                        upload_id=identity,
+                        offset=offset,
+                        size=size,
+                        overwrite=overwrite,
+                        no_wake=no_wake,
+                    )
+                except RateLimitError as busy:
+                    # Another chunk for this computer or account is in flight;
+                    # nothing was staged. Wait, read status, resend from there.
+                    delay = chunk_busy_wait(busy, waits)
+                    if delay is None:
+                        raise
+                    waits += 1
+                    time.sleep(delay)
+                    if progress is not None:
+                        # A receipt exists only once a chunk has landed. The
+                        # in-flight chunk can make the status read busy too.
+                        while True:
+                            try:
+                                progress = self.file_upload(path, identity, no_wake=no_wake)
+                                break
+                            except APIError as status_busy:
+                                delay = status_busy_wait(status_busy, waits)
+                                if delay is None:
+                                    raise
+                                waits += 1
+                                time.sleep(delay)
+                        if progress.complete:
+                            return progress
+                        offset = resumed_offset(progress, size)
+                    continue
+                waits = 0
                 if progress.complete:
                     return progress
                 offset = progress.offset
@@ -5726,13 +5779,19 @@ class Computer(ComputerFields):
         The X ``CLIPBOARD`` selection — what Ctrl-C writes and Ctrl-V pastes —
         not the ``PRIMARY`` selection that middle-click uses.
 
+        Windows guests are served too, through the signed-in account's desktop
+        session: one with nobody signed in to the desktop answers 409, and a
+        session that does not run the request in time answers 409 with no
+        ``reason`` (it may clear on a retry; bound yours). The image-tool
+        requirement below is for Linux guests.
+
         This is the road that needs nothing of the HARDWARE — no cold boot, and
         no permission from a browser. The other road is RFB extended cut text
         over the desktop socket, which is live and needs a virtio-serial channel
         a computer only acquires on a cold boot — see
         :class:`~mandala_computer.VncConnect`.
 
-        It does want one thing of the IMAGE, and unlike the socket's conditions
+        On Linux it does want one thing of the IMAGE, and unlike the socket's conditions
         it is stated in the answer rather than left to be inferred: the
         desktop's clipboard tool in the guest — ``xclip`` on an X11 image,
         ``wl-clipboard`` (``wl-paste``/``wl-copy``) on a Wayland one such as
@@ -5761,8 +5820,6 @@ class Computer(ComputerFields):
         ``Range`` on a selection, so :meth:`read_file_part` and
         :meth:`download_file` have no equivalent. The text is either under the
         cap or out of reach.
-
-        Linux only.
         """
         data = self._t.json_object("GET", _api.computer_action(self.id, "clipboard"))
         return _clipboard_text(data)
@@ -5796,13 +5853,14 @@ class Computer(ComputerFields):
         ``False`` for it: read the computer's state before deciding to retry,
         and bound any retry of your own.
 
-        And two 400s here never clear at all, which matters more on this method
-        than on the read for exactly that reason: the guest needs its desktop's
-        clipboard tool in its image (``xclip`` on X11, ``wl-clipboard`` on
-        Wayland; see :meth:`clipboard`), and Windows is refused outright. Both
-        say which they are.
+        And one 400 here never clears at all, which matters more on this method
+        than on the read for exactly that reason: a Linux guest needs its
+        desktop's clipboard tool in its image (``xclip`` on X11,
+        ``wl-clipboard`` on Wayland; see :meth:`clipboard`), and the refusal
+        names it.
 
-        Linux only.
+        Windows guests are served through the signed-in account's desktop
+        session, as :meth:`clipboard` describes, with the same two 409s.
         """
         self._t.json_object(
             "PUT",

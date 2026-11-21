@@ -39,6 +39,7 @@ def account_report() -> dict[str, Any]:
             "running_or_reserved_vcpu": 6,
             "running_or_reserved_ram_mb": 8192,
             "snapshot_storage_bytes": 1073741825,
+            "kept_build_gb": 40,
         },
         "remaining": {
             "kept_computers": 2,
@@ -55,6 +56,8 @@ def partial(computers: bool, snapshots: bool) -> dict[str, Any]:
     data["complete"] = {"computers": computers, "snapshots": snapshots}
     for section in ("usage", "remaining"):
         for key in data[section]:
+            if key == "kept_build_gb":
+                continue  # independent of complete
             if not (snapshots if key == "snapshot_storage_bytes" else computers):
                 data[section][key] = None
     return data
@@ -184,13 +187,16 @@ FIELDS = [
     for section, value in account_report().items()
     for key in (value if isinstance(value, dict) else [None])
 ]
+# Optional fields: older platforms omit them.
+OPTIONAL_FIELDS = [("capabilities", "macos"), ("usage", "kept_build_gb")]
 NUMERIC_FIELDS = [
-    pair for pair in FIELDS if pair[0] in ("limits", "per_computer", "usage", "remaining")
+    pair
+    for pair in FIELDS
+    if pair[0] in ("limits", "per_computer", "usage", "remaining") and pair not in OPTIONAL_FIELDS
 ]
 
 
-# ``capabilities.macos`` is the one optional field: older platforms omit it.
-@pytest.mark.parametrize("section,key", [f for f in FIELDS if f != ("capabilities", "macos")])
+@pytest.mark.parametrize("section,key", [f for f in FIELDS if f not in OPTIONAL_FIELDS])
 def test_requires_every_field(section: str, key: str | None) -> None:
     data = account_report()
     if key:
@@ -229,6 +235,8 @@ def test_numeric_domains(section: str, key: str) -> None:
 def test_incomplete_fields_require_explicit_null() -> None:
     for section in ("usage", "remaining"):
         for key in account_report()[section]:
+            if key == "kept_build_gb":
+                continue
             for bad in [0, "unknown", False]:
                 data = partial(False, False)
                 data[section][key] = bad
@@ -238,6 +246,32 @@ def test_incomplete_fields_require_explicit_null() -> None:
             del data[section][key]
             with pytest.raises(mc.MandalaError, match="null when incomplete"):
                 mc.AccountQuota.from_api(data)
+
+
+def test_kept_build_gb_is_read_independently_of_complete() -> None:
+    quota = mc.AccountQuota.from_api(account_report())
+    assert quota.usage.kept_build_gb == 40
+    room = (
+        quota.limits.disk_pool_gb
+        - (quota.usage.configured_disk_gb or 0)
+        - (quota.usage.kept_build_gb or 0)
+    )
+    assert room == 240
+    # Builds are read apart from the computers inventory.
+    assert mc.AccountQuota.from_api(partial(False, False)).usage.kept_build_gb == 40
+    data = account_report()
+    data["usage"]["kept_build_gb"] = None  # build history unread
+    assert mc.AccountQuota.from_api(data).usage.kept_build_gb is None
+    del data["usage"]["kept_build_gb"]  # a platform that does not report it
+    assert mc.AccountQuota.from_api(data).usage.kept_build_gb is None
+    for good in [0, 1.0, 2**53 - 1]:
+        data["usage"]["kept_build_gb"] = good
+        value = mc.AccountQuota.from_api(data).usage.kept_build_gb
+        assert value == good and type(value) is int
+    for bad in [True, False, -1, 1.5, "0", float("nan"), float("inf"), 2**53]:
+        data["usage"]["kept_build_gb"] = bad
+        with pytest.raises(mc.MandalaError, match="usage.kept_build_gb must be"):
+            mc.AccountQuota.from_api(data)
 
 
 def test_real_booleans_scope_advisory_and_observation() -> None:

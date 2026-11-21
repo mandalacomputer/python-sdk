@@ -3055,6 +3055,10 @@ def screenshot_region(region: Sequence[int]) -> str:
 MAX_STEPS = 100
 #: Background runs accept more actions; foreground runs retain their cap.
 MAX_BACKGROUND_STEPS = 500
+#: How long the platform lets one agent run go on, in seconds, mirrored from
+#: the platform's own bound and checked by ``scripts/check_surface.py``. The
+#: default local wait for a run is derived from it.
+MAX_AGENT_RUN_SECONDS = 3600
 #: The range a funded run's ``max_cost_usd`` must fall in, in dollars. The
 #: platform's default, when it is left out, is $2.
 MIN_MAX_COST_USD = 0.25
