@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import IO, Any
 
-from ._exceptions import MandalaError
+from ._exceptions import MandalaError, RateLimitError
+
+CHUNK_BUSY_WAITS = 12
+"""How many 429s in a row :meth:`Computer.upload_file` waits out before raising."""
+
+CHUNK_BUSY_DEFAULT_WAIT = 5.0
+"""Seconds to wait after a chunk 429 that carries no usable ``Retry-After``."""
+
+CHUNK_BUSY_MAX_WAIT = 30.0
+"""The longest single wait after a chunk 429, whatever ``Retry-After`` says."""
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,30 @@ class UploadInterruptedError(MandalaError):
         super().__init__(
             f"Upload {upload_id} interrupted. Resume with this upload_id and the unchanged source, or cancel_file_upload to remove staging. {cause}"
         )
+
+
+def chunk_busy_wait(error: RateLimitError, waits: int) -> float | None:
+    """Seconds to wait out a 429 on a chunk, or None once ``waits`` are spent.
+
+    The platform refuses a chunk with 429 while another chunk for the same
+    computer, or too many for the account, are still in flight. Nothing was
+    staged, so the remedy is to wait ``Retry-After``, read status and resend.
+    """
+    if waits >= CHUNK_BUSY_WAITS:
+        return None
+    delay = error.retry_after
+    if delay is None or not math.isfinite(delay) or delay < 0:
+        delay = CHUNK_BUSY_DEFAULT_WAIT
+    return min(delay, CHUNK_BUSY_MAX_WAIT)
+
+
+def resumed_offset(progress: FileUpload, size: int) -> int:
+    """The offset to resend from after a wait, checked against the source size."""
+    if progress.size != size:
+        raise MandalaError(
+            "Upload status no longer matches the source size; read upload status before retrying"
+        )
+    return progress.offset
 
 
 def read_chunk(source: IO[bytes], offset: int, length: int) -> bytes:

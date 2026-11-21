@@ -2274,6 +2274,36 @@ def test_a_watching_row_with_no_path_is_dropped_rather_than_carried_empty() -> N
     assert [t.path for t in hello.watching] == ["/ok"]
     # Still recoverable: the frame survives whole.
     assert len(hello.raw["watching"]) == 3
+    assert hello.watching_incomplete == 2
+    assert hello.windows_incomplete is None
+
+
+def test_hello_counts_what_it_dropped_per_collection() -> None:
+    """A dropped row is said, not left in the arithmetic, and one collection's
+    shortfall never moves the other's count."""
+    whole = to_hello(
+        {"type": "hello", "windows": [{"id": "0x1"}], "watching": [{"path": "/a", "armed": True}]}
+    )
+    assert whole is not None
+    assert (whole.windows_incomplete, whole.watching_incomplete) == (None, None)
+    short = to_hello(
+        {"type": "hello", "windows": [{"id": "0x1"}, "bad", 7], "watching": [{"path": "/a"}]}
+    )
+    assert short is not None and short.windows is not None
+    assert len(short.windows) == 1
+    assert (short.windows_incomplete, short.watching_incomplete) == (2, None)
+    # Absent or null is "said nothing"; present but not a list cannot be sized.
+    absent = to_hello({"type": "hello", "windows": None})
+    assert absent is not None
+    assert (absent.windows, absent.windows_incomplete) == (None, None)
+    assert absent.watching_incomplete is None
+    garbled = to_hello({"type": "hello", "windows": "x", "watching": {"path": "/a"}})
+    assert garbled is not None
+    assert (garbled.windows, garbled.windows_incomplete) == (None, 0)
+    assert (garbled.watching, garbled.watching_incomplete) == (None, 0)
+    empty = to_hello({"type": "hello", "windows": [], "watching": []})
+    assert empty is not None
+    assert (empty.windows_incomplete, empty.watching_incomplete) == (None, None)
 
 
 @pytest.mark.parametrize(

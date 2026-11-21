@@ -9,6 +9,49 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- `AccountUsage.kept_build_gb`: the nominal GB of the template builds the
+  account keeps. They share the disk pool with `configured_disk_gb`, and
+  `remaining.configured_disk_gb` does not subtract them, so the room a create
+  or disk resize has is `limits.disk_pool_gb - configured_disk_gb -
+  kept_build_gb`. `None` while the build history could not be read (a create
+  or disk growth can then be refused with a 503), and from a platform that does
+  not report it. Read whatever `complete` says.
+- `Hello.windows_incomplete` and `Hello.watching_incomplete`: how many
+  `windows` or `watching` entries of the opening frame this client could not
+  use, `None` when it used them all, and `0` when the field was present but
+  not a list. Check `watching_incomplete` before reading `len(hello.watching)`
+  as what the host accepted of your nominations.
+
+### Changed
+
+- `upload_file()` waits out a chunk the platform refuses with 429 because
+  another chunk for the same computer, or the account's share of the host's
+  upload buffers, is in flight: it sleeps for `Retry-After` (5 s when absent,
+  at most 30 s), reads the upload's status and resends from the staged offset.
+  After 12 such refusals in a row it raises the `RateLimitError`, carrying
+  `upload_id`, as before. Uploading to several computers of one account at
+  once no longer ends a transfer on the first refusal.
+- The default timeout of `agent_runs.wait()` is now derived from the
+  platform's agent run limit, mirrored as `MAX_AGENT_RUN_SECONDS` (3600) and
+  checked against the platform, rather than written out; it is still 3900 s.
+
+### Documentation
+
+- `clipboard()`, `set_clipboard()` and `paste()` work on Windows guests,
+  through the signed-in account's desktop session, rather than being refused:
+  with nobody signed in to the desktop the request answers 409, and a session
+  that does not run it in time answers 409 with no `reason`. The `xclip` /
+  `wl-clipboard` requirement is for Linux guests. The docstrings and README
+  said Windows was refused outright.
+- `write_file_chunk()` documents the 429 a chunk gets while another chunk for
+  the computer or account is in flight, and what to do about it.
+- `Webhook.disabled_reason` documents `"session_revoked"`: the dashboard
+  session the subscription was made, retargeted or turned back on from was
+  signed out as leaked. Like `"creator_removed"` and `"key_revoked"`, it does
+  not come back on its own; an owner or member enables it with an update.
+
 ## [0.24.0] - 2026-11-17
 
 ### Added

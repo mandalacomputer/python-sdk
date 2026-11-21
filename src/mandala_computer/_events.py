@@ -490,6 +490,19 @@ class Hello:
     #: Keyword-only and last, like every field added to a released record on
     #: this surface: the positional order is a promise already made.
     watching: list[WatchedTree] | None = field(default=None, kw_only=True)
+    #: How many :attr:`windows` entries this client could not use, or ``None``
+    #: when it used them all. Presence says the list above is shorter than what
+    #: the host sent; a caller told the picture is short can re-read
+    #: :meth:`~mandala_computer.Computer.windows`. ``0`` is the one count that
+    #: is not a count: the host sent a ``windows`` that is not a list at all, so
+    #: the shortfall is real but cannot be sized, and :attr:`windows` is
+    #: ``None``.
+    windows_incomplete: int | None = field(default=None, kw_only=True)
+    #: How many :attr:`watching` entries this client could not use, or ``None``
+    #: when it used them all, by :attr:`windows_incomplete`'s rule. Check it
+    #: before reading ``len(watching)`` as what the host accepted of your
+    #: nominations; an unreadable window does not move it.
+    watching_incomplete: int | None = field(default=None, kw_only=True)
 
 
 def _str(value: Any) -> str:
@@ -637,6 +650,19 @@ def to_watched_tree(row: Any) -> WatchedTree | None:
     return WatchedTree(path=path, armed=_wire(row, "armed") is _Wire.TRUE, raw=dict(row))
 
 
+def _shortfall(rows: Any, items: list[Any] | None) -> int | None:
+    """How many of an opening-frame collection's rows were dropped.
+
+    ``None`` when the field is absent (or ``null``) or every row was used;
+    ``0`` when it is present but not a list, a shortfall that cannot be sized.
+    """
+    if rows is None:
+        return None
+    if not isinstance(rows, list) or items is None:
+        return 0
+    return (len(rows) - len(items)) or None
+
+
 def _watching(rows: Any) -> list[WatchedTree] | None:
     """``hello.watching``, keeping "nominated nothing" apart from "nothing armed"."""
     if not isinstance(rows, list):
@@ -654,6 +680,8 @@ def to_hello(frame: Any) -> Hello | None:
         if isinstance(rows, list)
         else None
     )
+    trees = frame.get("watching")
+    watching = _watching(trees)
     return Hello(
         computer=_str(frame.get("computer")),
         cursor=_str(frame.get("cursor")),
@@ -676,7 +704,12 @@ def to_hello(frame: Any) -> Hello | None:
         # `windows`: absent is a stream that nominated nothing, on which no
         # `file.changed` can arrive at all. A list is kept even when every row
         # in it was unreadable, because the field's presence is the fact.
-        watching=_watching(frame.get("watching")),
+        watching=watching,
+        # Dropped rows are counted per collection rather than left in the
+        # arithmetic: a window the host could not describe says nothing about
+        # the trees a caller nominated.
+        windows_incomplete=_shortfall(rows, windows),
+        watching_incomplete=_shortfall(trees, watching),
     )
 
 

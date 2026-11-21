@@ -247,3 +247,100 @@ async def test_cancellation_waits_for_the_source_reader_before_returning():
         assert len(captured[0].upload_id) == 32
         source.close()
     assert chunks.call_count == 0
+
+
+def busy(retry_after="0"):
+    return httpx.Response(
+        429,
+        headers={"Retry-After": retry_after},
+        json={"error": "another chunk for this computer is still in flight"},
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_busy_chunk_is_waited_out_then_resumed_from_status(asynchronous, monkeypatch):
+    import mandala_computer._computer as sync_module
+
+    sleeps = []
+    if not asynchronous:
+        monkeypatch.setattr(sync_module.time, "sleep", sleeps.append)
+    size = 6 * 1024 * 1024
+    staged = 0
+    answers = []
+
+    def put(request):
+        nonlocal staged
+        # The second chunk is refused twice, as while another one is in flight.
+        if staged and len(answers) < 3:
+            answers.append(429)
+            # Sync sleeps are recorded, not slept; async ones really sleep.
+            return busy("0" if asynchronous else "2")
+        assert int(request.url.params["offset"]) == staged
+        staged += len(request.content)
+        answers.append(200)
+        return httpx.Response(200, json=receipt(staged, size))
+
+    status = respx.get(ROUTE).mock(
+        side_effect=lambda request: httpx.Response(200, json=receipt(staged, size))
+    )
+    chunks = respx.put(ROUTE).mock(side_effect=put)
+    async with computer(asynchronous) as c:
+        done = await result(
+            c.upload_file(PATH, io.BytesIO(b"x" * size), size=size, upload_id=UPLOAD)
+        )
+    assert done.complete and done.offset == size
+    assert answers == [200, 429, 429, 200]
+    assert chunks.call_count == 4
+    assert status.call_count == 3  # the resume, then once after each wait
+    if not asynchronous:
+        assert sleeps == [2.0, 2.0]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_busy_first_chunk_resends_without_a_receipt(asynchronous):
+    calls = []
+
+    def put(request):
+        calls.append(int(request.url.params["offset"]))
+        if len(calls) == 1:
+            return busy("0")
+        answer = {**receipt(3, 3), "upload_id": request.url.params["upload_id"]}
+        return httpx.Response(200, json=answer)
+
+    status = respx.get(ROUTE).mock(httpx.Response(404, json={"error": "missing"}))
+    respx.put(ROUTE).mock(side_effect=put)
+    async with computer(asynchronous) as c:
+        done = await result(c.upload_file(PATH, io.BytesIO(b"abc"), size=3))
+    assert done.complete
+    assert calls == [0, 0]
+    assert status.call_count == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_busy_chunk_gives_up_after_bounded_waits(asynchronous):
+    from mandala_computer import RateLimitError
+    from mandala_computer._uploads import CHUNK_BUSY_WAITS
+
+    chunks = respx.put(ROUTE).mock(return_value=busy("0"))
+    async with computer(asynchronous) as c:
+        with pytest.raises(RateLimitError) as error:
+            await result(c.upload_file(PATH, io.BytesIO(b"abc"), size=3))
+    assert chunks.call_count == CHUNK_BUSY_WAITS + 1
+    assert isinstance(error.value.upload_id, str)
+
+
+def test_busy_wait_honours_retry_after_within_bounds():
+    from mandala_computer import RateLimitError
+    from mandala_computer._uploads import CHUNK_BUSY_WAITS, chunk_busy_wait
+
+    def err(retry_after):
+        return RateLimitError("busy", status=429, retry_after=retry_after)
+
+    assert chunk_busy_wait(err(5.0), 0) == 5.0
+    assert chunk_busy_wait(err(None), 0) == 5.0
+    assert chunk_busy_wait(err(float("nan")), 0) == 5.0
+    assert chunk_busy_wait(err(3600.0), 0) == 30.0
+    assert chunk_busy_wait(err(5.0), CHUNK_BUSY_WAITS) is None

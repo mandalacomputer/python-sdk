@@ -72,6 +72,7 @@ MANIFEST_VERSION = 1
 LIMITS = [
     ("MAX_STEPS", "agent.maxSteps"),
     ("MAX_BACKGROUND_STEPS", "agent.maxBackgroundSteps"),
+    ("MAX_AGENT_RUN_SECONDS", "agent.runTimeoutSeconds"),
     ("MAX_CLIPBOARD_BYTES", "clipboard.writeMaxBytes"),
     ("MAX_ENV_ENTRIES", "exec.maxEnvEntries"),
     ("MAX_ENV_ENTRY_BYTES", "exec.maxEnvEntryBytes"),
