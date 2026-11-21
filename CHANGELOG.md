@@ -30,8 +30,10 @@ This is the summary you read to decide whether to upgrade.
   another chunk for the same computer, or the account's share of the host's
   upload buffers, is in flight: it sleeps for `Retry-After` (5 s when absent,
   at most 30 s), reads the upload's status and resends from the staged offset.
-  After 12 such refusals in a row it raises the `RateLimitError`, carrying
-  `upload_id`, as before. Uploading to several computers of one account at
+  A status read refused while that chunk is still being written (429, or 409
+  with reason `contention`) is waited out the same way; any other status error
+  still ends the upload. After 12 such waits in a row it raises the last
+  refusal, carrying `upload_id`, as before. Uploading to several computers of one account at
   once no longer ends a transfer on the first refusal.
 - The default timeout of `agent_runs.wait()` is now derived from the
   platform's agent run limit, mirrored as `MAX_AGENT_RUN_SECONDS` (3600) and

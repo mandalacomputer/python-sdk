@@ -184,6 +184,7 @@ from ._uploads import (
     chunk_busy_wait,
     read_chunk_async,
     resumed_offset,
+    status_busy_wait,
 )
 
 __all__ = ["AsyncBackgroundCommand", "AsyncComputer"]
@@ -2581,8 +2582,10 @@ class AsyncComputer(ComputerFields):
         Supply an existing upload_id to resume; a missing receipt stays a 404.
         A chunk refused with 429 because other chunks for this computer or
         account are in flight is waited out (``Retry-After``, at most 30 s),
-        then the upload reads status and resends from the staged offset; after
-        12 such refusals in a row the RateLimitError is raised.
+        then the upload reads status and resends from the staged offset. A
+        status read refused while that chunk is still in flight (429, or 409
+        ``contention``) is waited out the same way. After 12 such waits in a
+        row the last refusal is raised.
         Typed API and validation errors keep their classes; other interruptions
         use UploadInterruptedError. The raised exception is tagged with upload_id;
         asyncio can replace cancellation exceptions across task boundaries,
@@ -2629,8 +2632,18 @@ class AsyncComputer(ComputerFields):
                     waits += 1
                     await asyncio.sleep(delay)
                     if progress is not None:
-                        # A receipt exists only once a chunk has landed.
-                        progress = await self.file_upload(path, identity, no_wake=no_wake)
+                        # A receipt exists only once a chunk has landed. The
+                        # in-flight chunk can make the status read busy too.
+                        while True:
+                            try:
+                                progress = await self.file_upload(path, identity, no_wake=no_wake)
+                                break
+                            except APIError as status_busy:
+                                delay = status_busy_wait(status_busy, waits)
+                                if delay is None:
+                                    raise
+                                waits += 1
+                                await asyncio.sleep(delay)
                         if progress.complete:
                             return progress
                         offset = resumed_offset(progress, size)

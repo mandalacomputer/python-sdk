@@ -344,3 +344,132 @@ def test_busy_wait_honours_retry_after_within_bounds():
     assert chunk_busy_wait(err(float("nan")), 0) == 5.0
     assert chunk_busy_wait(err(3600.0), 0) == 30.0
     assert chunk_busy_wait(err(5.0), CHUNK_BUSY_WAITS) is None
+
+
+def echo(request, offset, size):
+    return {**receipt(offset, size), "upload_id": request.url.params["upload_id"]}
+
+
+def contended():
+    return httpx.Response(
+        409,
+        json={"error": "the guest agent is busy", "reason": "contention"},
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_busy_status_read_after_a_busy_chunk_is_waited_out(asynchronous, monkeypatch):
+    import mandala_computer._async_computer as async_module
+    import mandala_computer._computer as sync_module
+
+    sleeps = []
+
+    async def fake_async_sleep(delay):
+        sleeps.append(delay)
+
+    if asynchronous:
+        monkeypatch.setattr(async_module.asyncio, "sleep", fake_async_sleep)
+    else:
+        monkeypatch.setattr(sync_module.time, "sleep", sleeps.append)
+    size = 6 * 1024 * 1024
+    staged = 0
+    puts = []
+
+    def put(request):
+        nonlocal staged
+        if staged and len(puts) == 1:
+            puts.append(429)
+            return busy("2")
+        assert int(request.url.params["offset"]) == staged
+        staged += len(request.content)
+        puts.append(200)
+        return httpx.Response(200, json=echo(request, staged, size))
+
+    reads = []
+
+    def get(request):
+        reads.append(len(reads))
+        if len(reads) == 1:
+            return contended()
+        return httpx.Response(200, json=echo(request, staged, size))
+
+    respx.get(ROUTE).mock(side_effect=get)
+    respx.put(ROUTE).mock(side_effect=put)
+    async with computer(asynchronous) as c:
+        done = await result(c.upload_file(PATH, io.BytesIO(b"x" * size), size=size))
+    assert done.complete and done.offset == size
+    assert puts == [200, 429, 200]
+    assert len(reads) == 2
+    assert sleeps == [2.0, 5.0]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_status_read_that_stays_contended_ends_within_the_budget(asynchronous, monkeypatch):
+    import mandala_computer._async_computer as async_module
+    import mandala_computer._computer as sync_module
+    from mandala_computer._uploads import CHUNK_BUSY_WAITS
+
+    sleeps = []
+
+    async def fake_async_sleep(delay):
+        sleeps.append(delay)
+
+    if asynchronous:
+        monkeypatch.setattr(async_module.asyncio, "sleep", fake_async_sleep)
+    else:
+        monkeypatch.setattr(sync_module.time, "sleep", sleeps.append)
+    size = 6 * 1024 * 1024
+    puts = []
+
+    def put(request):
+        puts.append(int(request.url.params["offset"]))
+        if len(puts) == 1:
+            return httpx.Response(200, json=echo(request, 4 * 1024 * 1024, size))
+        return busy("0")
+
+    status = respx.get(ROUTE).mock(return_value=contended())
+    respx.put(ROUTE).mock(side_effect=put)
+    async with computer(asynchronous) as c:
+        with pytest.raises(ConflictError) as error:
+            await result(c.upload_file(PATH, io.BytesIO(b"x" * size), size=size))
+    assert error.value.reason == "contention"
+    assert isinstance(error.value.upload_id, str) and len(error.value.upload_id) == 32
+    assert len(puts) == 2
+    assert status.call_count == CHUNK_BUSY_WAITS
+    assert len(sleeps) == CHUNK_BUSY_WAITS
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@respx.mock
+async def test_missing_receipt_during_busy_recovery_is_raised_at_once(asynchronous, monkeypatch):
+    import mandala_computer._async_computer as async_module
+    import mandala_computer._computer as sync_module
+
+    sleeps = []
+
+    async def fake_async_sleep(delay):
+        sleeps.append(delay)
+
+    if asynchronous:
+        monkeypatch.setattr(async_module.asyncio, "sleep", fake_async_sleep)
+    else:
+        monkeypatch.setattr(sync_module.time, "sleep", sleeps.append)
+    size = 6 * 1024 * 1024
+    puts = []
+
+    def put(request):
+        puts.append(int(request.url.params["offset"]))
+        if len(puts) == 1:
+            return httpx.Response(200, json=echo(request, 4 * 1024 * 1024, size))
+        return busy("0")
+
+    status = respx.get(ROUTE).mock(httpx.Response(404, json={"error": "missing"}))
+    respx.put(ROUTE).mock(side_effect=put)
+    async with computer(asynchronous) as c:
+        with pytest.raises(NotFoundError) as error:
+            await result(c.upload_file(PATH, io.BytesIO(b"x" * size), size=size))
+    assert isinstance(error.value.upload_id, str)
+    assert status.call_count == 1
+    assert len(sleeps) == 1

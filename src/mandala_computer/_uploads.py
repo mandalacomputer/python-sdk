@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import IO, Any
 
-from ._exceptions import MandalaError, RateLimitError
+from ._exceptions import APIError, MandalaError, RateLimitError
 
 CHUNK_BUSY_WAITS = 12
 """How many 429s in a row :meth:`Computer.upload_file` waits out before raising."""
@@ -71,6 +71,21 @@ def chunk_busy_wait(error: RateLimitError, waits: int) -> float | None:
     if delay is None or not math.isfinite(delay) or delay < 0:
         delay = CHUNK_BUSY_DEFAULT_WAIT
     return min(delay, CHUNK_BUSY_MAX_WAIT)
+
+
+def status_busy_wait(error: APIError, waits: int) -> float | None:
+    """Seconds to wait out a busy upload status read, or None to raise ``error``.
+
+    While another chunk for the same computer is being written, the status
+    read can be refused with 429, or with 409 ``contention`` because that
+    chunk holds the computer's file channel. Both clear by waiting and share
+    the chunk budget. Every other error answers None and is raised as is.
+    """
+    if isinstance(error, RateLimitError):
+        return chunk_busy_wait(error, waits)
+    if error.status == 409 and error.reason == "contention" and waits < CHUNK_BUSY_WAITS:
+        return CHUNK_BUSY_DEFAULT_WAIT
+    return None
 
 
 def resumed_offset(progress: FileUpload, size: int) -> int:
