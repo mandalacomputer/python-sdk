@@ -33,8 +33,8 @@ This is the summary you read to decide whether to upgrade.
   A status read refused while that chunk is still being written (429, or 409
   with reason `contention`) is waited out the same way; any other status error
   still ends the upload. After 12 such waits in a row it raises the last
-  refusal, carrying `upload_id`, as before. Uploading to several computers of one account at
-  once no longer ends a transfer on the first refusal.
+  refusal, carrying `upload_id`, as before. Uploading to several computers of
+  one account at once no longer ends a transfer on the first refusal.
 - The default timeout of `agent_runs.wait()` is now derived from the
   platform's agent run limit, mirrored as `MAX_AGENT_RUN_SECONDS` (3600) and
   checked against the platform, rather than written out; it is still 3900 s.

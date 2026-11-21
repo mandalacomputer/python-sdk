@@ -12,7 +12,8 @@ from typing import IO, Any
 from ._exceptions import APIError, MandalaError, RateLimitError
 
 CHUNK_BUSY_WAITS = 12
-"""How many 429s in a row :meth:`Computer.upload_file` waits out before raising."""
+"""How many busy refusals in a row (chunk 429s and busy status reads)
+:meth:`Computer.upload_file` waits out before raising."""
 
 CHUNK_BUSY_DEFAULT_WAIT = 5.0
 """Seconds to wait after a chunk 429 that carries no usable ``Retry-After``."""
