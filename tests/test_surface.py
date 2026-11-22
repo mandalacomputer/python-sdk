@@ -79,6 +79,12 @@ UNIMPLEMENTED = {
     # obligation with no user. The TypeScript SDK leaves it out for the same
     # reason, in the same set.
     ("POST", "chat/completions"),
+    # Guest identity tokens (OPL-6715): whether programs on a computer may
+    # fetch a short-lived token for it, and the owner's switch. Not wrapped
+    # yet: a release that does will name it, alongside a helper that fetches
+    # the token from inside the computer.
+    ("GET", "computers/:id/guest-token"),
+    ("PUT", "computers/:id/guest-token"),
 }
 
 # Parameters the SDK does not yet send or deliberately omits.

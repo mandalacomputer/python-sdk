@@ -16,6 +16,9 @@ ALLOWED = {
     ("GET", "computers/:id/credential-gateway"),
     ("POST", "computers/:id/credential-gateway"),
     ("DELETE", "computers/:id/credential-gateway/:binding"),
+    # Guest identity tokens (OPL-6715); see UNIMPLEMENTED.
+    ("GET", "computers/:id/guest-token"),
+    ("PUT", "computers/:id/guest-token"),
     ("GET", "templates"),
     # The template document format (platform OPL-3568): the published JSON
     # Schema, and a check of a document against it that stores nothing.
@@ -185,6 +188,8 @@ ALLOWED = {
 PARAMETERS: dict[str, set[str]] = {
     "GET computers/:id/credential-gateway": set(),
     "DELETE computers/:id/credential-gateway/:binding": set(),
+    "GET computers/:id/guest-token": set(),
+    "PUT computers/:id/guest-token": {"body:enabled"},
     "POST computers/:id/credential-gateway": {
         "body:auth_header",
         "body:methods",
