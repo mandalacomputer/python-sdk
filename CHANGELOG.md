@@ -9,6 +9,16 @@ This is the summary you read to decide whether to upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- `client.agent_schedules` (and `AsyncClient.agent_schedules`): background
+  agent runs started on a timetable. `create(computer_id, cron, prompt, *,
+  timezone, model, max_steps, max_cost_usd, thread_id, name, paused)`, `list`,
+  `get`, `update`, `pause`, `resume` and `delete`, answering `AgentSchedule`,
+  whose `recent_fires` (`AgentScheduleFire`) say how each fire went and whose
+  `paused_reason` says why it is paused. Scheduled runs spend Mandala AI
+  credits, so a schedule takes no model key or system prompt.
+
 ## [0.25.0] - 2026-11-21
 
 ### Added

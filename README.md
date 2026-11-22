@@ -1964,6 +1964,38 @@ run, so list the computer's runs before sending it again. The one exception is
 the refusal during a platform update (`reason == "draining"`, above), which says
 nothing started; a client with `retries` sends that start again itself.
 
+#### Runs on a schedule
+
+`client.agent_schedules` starts a background run on a timetable: at each time a
+five-field `cron` expression names, in its `timezone`, a run starts on the
+computer with the schedule's prompt.
+
+```python
+schedule = client.agent_schedules.create(
+    "vm-1",
+    "0 9 * * MON-FRI",
+    "Check the overnight build and file a summary in ~/reports",
+    timezone="America/New_York",
+    max_steps=60,
+)
+read = client.agent_schedules.get(schedule.id)
+print(read.next_fire_at, [(f.outcome, f.run_id) for f in read.recent_fires])
+```
+
+Scheduled runs spend the account's Mandala AI credits: nothing is there to send
+a model key when one fires, so a schedule takes no `model_key` and no `system`.
+A schedule acts as the API key that created it, or last changed it; a key that
+expires, or is limited to specific computers, cannot make one. If that key is
+deleted, or its holder can no longer start runs on the computer, the schedule
+pauses and `paused_reason` says why. A fire is skipped while the previous run is
+still going or the computer is not running, and one the platform could not send
+within five minutes of its time is `missed`, never sent late. Each fire is in
+`recent_fires` with the `run_id` it started, read with
+`client.agent_runs.get(run_id)`. `update(schedule_id, ...)` changes any field
+(`thread_id=None` and `name=None` clear one); `pause` and `resume` are that with
+`paused`; `list(computer_id=..., limit=..., before=...)` pages like the runs;
+`delete` stops it for good. `AsyncClient.agent_schedules` is the same, awaited.
+
 #### OpenAI-compatible computer agent
 
 An existing OpenAI client can drive the same computer agent through

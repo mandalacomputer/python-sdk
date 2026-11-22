@@ -172,6 +172,12 @@ ALLOWED = {
     ("GET", "agent/runs"),
     ("GET", "agent/runs/:run"),
     ("POST", "agent/runs/:run/cancel"),
+    # Agent schedules: background runs started on a timetable.
+    ("POST", "computers/:id/agent/schedules"),
+    ("GET", "agent/schedules"),
+    ("GET", "agent/schedules/:schedule"),
+    ("PATCH", "agent/schedules/:schedule"),
+    ("DELETE", "agent/schedules/:schedule"),
 }
 
 # Every query, header and body field the platform documents, by route —
@@ -416,6 +422,33 @@ PARAMETERS: dict[str, set[str]] = {
     "GET agent/runs": {"query:computer_id", "query:status", "query:limit", "query:before"},
     "GET agent/runs/:run": set(),
     "POST agent/runs/:run/cancel": set(),
+    "POST computers/:id/agent/schedules": {
+        "body:cron",
+        "body:max_cost_usd",
+        "body:max_steps",
+        "body:model",
+        "body:name",
+        "body:paused",
+        "body:prompt",
+        "body:provider",
+        "body:thread_id",
+        "body:timezone",
+    },
+    "GET agent/schedules": {"query:before", "query:computer_id", "query:limit"},
+    "GET agent/schedules/:schedule": set(),
+    "PATCH agent/schedules/:schedule": {
+        "body:cron",
+        "body:max_cost_usd",
+        "body:max_steps",
+        "body:model",
+        "body:name",
+        "body:paused",
+        "body:prompt",
+        "body:provider",
+        "body:thread_id",
+        "body:timezone",
+    },
+    "DELETE agent/schedules/:schedule": set(),
     # An upload's body is the file itself, raw — there are no named fields to
     # mirror. A download's `Range` is the one header a *caller* sets that
     # reaches the daemon; see `Computer.read_file_part`.

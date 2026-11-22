@@ -3248,6 +3248,18 @@ def computer_agent_runs(computer_id: str) -> str:
     return f"computers/{seg(computer_id)}/agent/runs"
 
 
+#: Agent schedules: background runs started on a timetable.
+AGENT_SCHEDULES = "agent/schedules"
+
+
+def agent_schedule(schedule_id: str) -> str:
+    return f"agent/schedules/{seg(schedule_id)}"
+
+
+def computer_agent_schedules(computer_id: str) -> str:
+    return f"computers/{seg(computer_id)}/agent/schedules"
+
+
 def agent_page_params(
     computer_id: object, limit: object, before: object, status: object = None
 ) -> dict[str, str] | None:
