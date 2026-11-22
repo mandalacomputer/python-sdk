@@ -393,6 +393,27 @@ AGENT_RESULT = {"steps": 1, "stop": "end_turn", "text": "done"}
 # says there is more so that a walk's `before` is a real id.
 THREAD_ID = "thr_0123456789abcdef01234567"
 RUN_ID = "run_0123456789abcdef01234567"
+SCHEDULE_ID = "sch_0123456789abcdef01234567"
+AGENT_SCHEDULE = {
+    "id": SCHEDULE_ID,
+    "computer_id": "vm-1",
+    "thread_id": None,
+    "name": None,
+    "cron": "0 9 * * *",
+    "timezone": "UTC",
+    "prompt": "do the thing",
+    "model": "claude-sonnet-5-5",
+    "max_steps": 20,
+    "max_cost_usd": 2,
+    "paused": False,
+    "paused_reason": None,
+    "next_fire_at": "2026-11-24T09:00:00.000Z",
+    "last_fire_at": None,
+    "last_run_id": None,
+    "created_at": "2026-11-22T09:00:00.000Z",
+    "updated_at": "2026-11-22T09:00:00.000Z",
+    "recent_fires": [],
+}
 AGENT_THREAD_SUMMARY = {
     "id": THREAD_ID,
     "computer_id": "vm-1",
@@ -622,6 +643,8 @@ def pattern_for(path: str) -> str:
             return ":thread"
         if i == 2 and parts[0] == "agent" and parts[1] == "runs":
             return ":run"
+        if i == 2 and parts[0] == "agent" and parts[1] == "schedules":
+            return ":schedule"
         return seg
 
     # A template ref's two halves, pinned to a THREE-segment path under
@@ -729,6 +752,15 @@ def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(202, json={**AGENT_RUN, "status": "running", "ended_at": None})
     if "/agent/runs/" in path:
         return httpx.Response(200, json=AGENT_RUN)
+    # Agent schedules: a listing is a page, a delete an ack, anything else the schedule.
+    if path.endswith("/agent/schedules"):
+        if get:
+            return httpx.Response(200, json={"schedules": [AGENT_SCHEDULE], "has_more": True})
+        return httpx.Response(201, json=AGENT_SCHEDULE)
+    if "/agent/schedules/" in path:
+        return httpx.Response(
+            200, json={"ok": True} if request.method == "DELETE" else AGENT_SCHEDULE
+        )
     if path.endswith("/agent/threads"):
         return httpx.Response(200, json={"threads": [AGENT_THREAD_SUMMARY], "has_more": True})
     if "/agent/threads/" in path:
@@ -1321,6 +1353,40 @@ def exercise_everything(client: mc.Client) -> None:
     client.agent_runs.list(computer_id=c.id, status="completed", limit=5, before=RUN_ID)
     client.agent_runs.wait(run)
     client.agent_runs.cancel(run.id)
+    # Agent schedules: every field on the create and on a change, the listing
+    # with each parameter, a read, a pause, a resume and the delete.
+    sch = client.agent_schedules.create(
+        c.id,
+        "0 9 * * *",
+        "do the thing",
+        timezone="UTC",
+        model="claude-sonnet-5-5",
+        provider="anthropic",
+        max_steps=5,
+        max_cost_usd=1,
+        thread_id=THREAD_ID,
+        name="nightly",
+        paused=False,
+    )
+    client.agent_schedules.update(
+        sch.id,
+        cron="0 10 * * *",
+        prompt="do another thing",
+        timezone="Europe/London",
+        model="claude-opus-5-5",
+        provider="anthropic",
+        max_steps=6,
+        max_cost_usd=2,
+        thread_id=None,
+        name=None,
+        paused=True,
+    )
+    client.agent_schedules.list()
+    client.agent_schedules.list(computer_id=c.id, limit=5, before=SCHEDULE_ID)
+    client.agent_schedules.get(sch.id)
+    client.agent_schedules.pause(sch.id)
+    client.agent_schedules.resume(sch.id)
+    client.agent_schedules.delete(sch.id)
     client.agent_threads.list()
     client.agent_threads.list(computer_id=c.id, limit=5, before=THREAD_ID)
     client.agent_threads.get(THREAD_ID)
@@ -1699,6 +1765,38 @@ async def exercise_everything_async(client: mc.AsyncClient) -> None:
     await client.agent_runs.list(computer_id=c.id, status="completed", limit=5, before=RUN_ID)
     await client.agent_runs.wait(run)
     await client.agent_runs.cancel(run.id)
+    sch = await client.agent_schedules.create(
+        c.id,
+        "0 9 * * *",
+        "do the thing",
+        timezone="UTC",
+        model="claude-sonnet-5-5",
+        provider="anthropic",
+        max_steps=5,
+        max_cost_usd=1,
+        thread_id=THREAD_ID,
+        name="nightly",
+        paused=False,
+    )
+    await client.agent_schedules.update(
+        sch.id,
+        cron="0 10 * * *",
+        prompt="do another thing",
+        timezone="Europe/London",
+        model="claude-opus-5-5",
+        provider="anthropic",
+        max_steps=6,
+        max_cost_usd=2,
+        thread_id=None,
+        name=None,
+        paused=True,
+    )
+    await client.agent_schedules.list()
+    await client.agent_schedules.list(computer_id=c.id, limit=5, before=SCHEDULE_ID)
+    await client.agent_schedules.get(sch.id)
+    await client.agent_schedules.pause(sch.id)
+    await client.agent_schedules.resume(sch.id)
+    await client.agent_schedules.delete(sch.id)
     await client.agent_threads.list()
     await client.agent_threads.list(computer_id=c.id, limit=5, before=THREAD_ID)
     await client.agent_threads.get(THREAD_ID)

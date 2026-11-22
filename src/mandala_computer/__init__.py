@@ -74,6 +74,7 @@ from ._async_resources import (
     AsyncWebhooks,
     AsyncWorkspaces,
 )
+from ._async_schedules import AsyncAgentSchedules
 from ._browser_connection import BrowserConnection, BrowserSessionLease, BrowserSessionPolicy
 from ._client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, AsyncTransport, Transport
 from ._computer import SCREEN_HEIGHT, SCREEN_WIDTH, BackgroundCommand, Computer
@@ -261,6 +262,7 @@ from ._results import (
     SynchronousResult,
     SynchronousResultPrefix,
 )
+from ._schedules import AgentSchedule, AgentScheduleFire, AgentSchedulePage, AgentSchedules
 from ._uploads import FileUpload, UploadInterruptedError
 from ._webhooks import REPLAY_WINDOW_S, verify
 
@@ -302,6 +304,9 @@ __all__ = [
     "AgentRunError",
     "AgentRunPage",
     "AgentRunStatus",
+    "AgentSchedule",
+    "AgentScheduleFire",
+    "AgentSchedulePage",
     "AgentStep",
     "AgentStepEvent",
     "AgentText",
@@ -504,6 +509,7 @@ class Client:
         )
         self.account = Account(self._t)
         self.agent_runs = AgentRuns(self._t)
+        self.agent_schedules = AgentSchedules(self._t)
         self.agent_threads = AgentThreads(self._t)
         self.builds = Builds(self._t)
         self.computers = Computers(self._t)
@@ -572,6 +578,7 @@ class AsyncClient:
         )
         self.account = AsyncAccount(self._t)
         self.agent_runs = AsyncAgentRuns(self._t)
+        self.agent_schedules = AsyncAgentSchedules(self._t)
         self.agent_threads = AsyncAgentThreads(self._t)
         self.builds = AsyncBuilds(self._t)
         self.computers = AsyncComputers(self._t)
