@@ -266,7 +266,7 @@ from ._schedules import AgentSchedule, AgentScheduleFire, AgentSchedulePage, Age
 from ._uploads import FileUpload, UploadInterruptedError
 from ._webhooks import REPLAY_WINDOW_S, verify
 
-__version__ = "0.25.0"
+__version__ = "0.26.0"
 
 
 __all__ = [
